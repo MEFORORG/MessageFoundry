@@ -3656,6 +3656,88 @@ jobs:
       - name: Install project (dev + sqlserver extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
+      # TEMPORARY DIAGNOSTIC, 2022 LEG ONLY (vault BACKLOG #3533 item 2, engine PR 2978). The 2022
+      # server refuses the strict pinned login with error 17821, "A valid TLS certificate is not
+      # configured to accept strict (TDS 8.0 and above) connections", while 2025 takes the same
+      # certificate. This probes which server TLS setting or certificate shape 2022 needs, one
+      # restart each, prints one PROBE line per variant, restores the step above's configuration, and
+      # always exits 0: the check below still decides the leg. It is removed once the fix is known.
+      - name: Probe what the 2022 server needs for a strict login (temporary diagnostic)
+        if: matrix.label == '2022'
+        timeout-minutes: 15
+        env:
+          MSSQL: ${{ job.services.mssql.id }}
+        run: |
+          set -uo pipefail
+          tls="$RUNNER_TEMP/mssql-tls"
+          dir="$RUNNER_TEMP/mssql-probe"
+          mkdir -p "$dir"
+          cp "$tls/server.pem" "$dir/base.pem"
+          cp "$tls/server.key" "$dir/base.key"
+          cp "$tls/req.cnf" "$dir/ku.cnf"
+          echo 'keyUsage = critical,digitalSignature,keyEncipherment' >> "$dir/ku.cnf"
+          openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 7 -config "$dir/ku.cnf" \
+            -keyout "$dir/ku.key" -out "$dir/ku.pem" 2>/dev/null
+          openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -days 7 \
+            -config "$dir/ku.cnf" -keyout "$dir/ec.key" -out "$dir/ec.pem" 2>/dev/null
+          uid="$(docker exec "$MSSQL" id -u)"
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          serve() {  # serve <cert stem> [network lines...]
+            local stem="$1"; shift
+            printf '%s\n' '[network]' 'tlscert = /var/opt/mssql/tls/server.pem' \
+              'tlskey = /var/opt/mssql/tls/server.key' "$@" > "$dir/mssql.conf"
+            docker cp "$dir/$stem.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
+            docker cp "$dir/$stem.key" "$MSSQL:/var/opt/mssql/tls/server.key"
+            docker cp "$dir/mssql.conf" "$MSSQL:/var/opt/mssql/mssql.conf"
+            docker exec -u 0 "$MSSQL" chown -R "${uid}:0" /var/opt/mssql/tls /var/opt/mssql/mssql.conf
+            docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
+            docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
+            docker restart "$MSSQL" > /dev/null
+            for i in $(seq 1 60); do
+              "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1 && return 0
+              sleep 2
+            done
+            echo "server did not come back"
+            return 1
+          }
+          probe() {  # probe <name> <cert stem> [network lines...]
+            local name="$1" stem="$2"
+            shift 2
+            echo "::group::probe $name"
+            if serve "$stem" "$@"; then
+              python - "$dir/$stem.pem" "$name" <<'PY'
+          import sys
+
+          import pyodbc
+
+          dsn = (
+              "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=master;"
+              "UID=sa;PWD={Str0ng_P@ssw0rd!};Encrypt=strict;ServerCertificate={" + sys.argv[1] + "};"
+          )
+          try:
+              pyodbc.connect(dsn, timeout=10).close()
+              print(f"PROBE {sys.argv[2]}: CONNECTED")
+          except pyodbc.Error as exc:
+              print(f"PROBE {sys.argv[2]}: REFUSED: {exc.args[-1] if exc.args else exc}")
+          PY
+            else
+              echo "PROBE $name: SERVER DID NOT START"
+            fi
+            docker logs --since 90s "$MSSQL" 2>&1 | grep -E 'TLS|17821|strict|loaded for encryption' | cut -c1-260 | tail -8
+            echo "::endgroup::"
+          }
+          probe "rsa, tlsprotocols 1.2" base 'tlsprotocols = 1.2'
+          probe "rsa, tlsprotocols 1.3" base 'tlsprotocols = 1.3'
+          probe "rsa, tlsprotocols 1.2,1.3" base 'tlsprotocols = 1.2,1.3'
+          probe "rsa keyUsage, default protocols" ku
+          probe "rsa keyUsage, tlsprotocols 1.2" ku 'tlsprotocols = 1.2'
+          probe "ecdsa p-256, default protocols" ec
+          probe "rsa, forceencryption 1, tlsprotocols 1.2" base 'forceencryption = 1' 'tlsprotocols = 1.2'
+          echo "::group::restore the step above's configuration"
+          serve base || echo "::warning::restoring the base configuration did not bring the server back"
+          echo "::endgroup::"
+          exit 0
+
       # Two driver logins, so a leg whose server cannot be verified reds HERE with a clear message,
       # not as a store suite failure: the store's (Encrypt=strict, pinning the certificate with
       # ServerCertificate, TDS 8.0) and the DATABASE connector's (Encrypt=yes, verified against the
