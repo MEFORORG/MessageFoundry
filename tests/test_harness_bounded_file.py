@@ -135,17 +135,172 @@ def test_the_file_sink_records_an_over_cap_file_as_refused_and_unread(tmp_path: 
     assert by_name["big.hl7"].meta["refused"].endswith(f"over the {len(_BODY)}-byte cap; not read")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privilege on Windows")
-def test_the_file_sink_does_not_follow_a_symlink(tmp_path: Path) -> None:
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if sys.platform != "win32":
+            raise  # POSIX makes a symlink unprivileged: a failure here is a broken test
+        pytest.skip(f"no symlink privilege here (Developer Mode off): {exc}")
+
+
+def test_the_file_sink_reports_a_symlink_unread_with_where_it_resolves(tmp_path: Path) -> None:
+    """A symlink is not followed, and it is not skipped either: it is recorded unread, so a link
+    out of the directory reads as an escape rather than as nothing at all."""
     outside = tmp_path / "outside.txt"
     outside.write_bytes(_BODY)
     out = tmp_path / "out"
     out.mkdir()
     with FileSink(out) as sink:
         (out / "ok.hl7").write_bytes(_BODY)
-        (out / "link.hl7").symlink_to(outside)
-        names = [r.meta["name"] for r in sink.records()]
-    assert len(names) >= 1 and names == ["ok.hl7"]
+        _symlink_or_skip(out / "link.hl7", outside)
+        _symlink_or_skip(out / "in.hl7", out / "ok.hl7")
+        # A name the sink skips for a file (a dot-file, an engine temp) does not hide a link.
+        _symlink_or_skip(out / ".dot", outside)
+        _symlink_or_skip(out / "x.part", outside)
+        records = sink.records()
+        assert sink.records() == records  # recorded once, not on every scan
+    by_name = {r.meta["name"]: r for r in records}
+    assert set(by_name) == {"ok.hl7", "link.hl7", "in.hl7", ".dot", "x.part"}
+    assert {by_name[n].meta["inside"] for n in (".dot", "x.part")} == {"false"}
+    assert by_name["ok.hl7"].payload == _BODY and "symlink" not in by_name["ok.hl7"].meta
+    for name, inside in (("link.hl7", "false"), ("in.hl7", "true")):
+        record = by_name[name]
+        assert record.payload == b"", name  # never read through the link
+        assert record.meta["refused"] == NOT_REGULAR
+        assert record.meta["symlink"] == "true"
+        assert record.meta["inside"] == inside, name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows reparse point")
+def test_the_file_sink_reports_a_junction_as_a_link_not_a_directory(tmp_path: Path) -> None:
+    """``S_ISLNK`` does not report a junction, so the sink reads the reparse tag as well: a junction
+    out of the directory is recorded as a link that resolves outside, and never walked through, so
+    nothing beyond it is listed or read. One to a folder inside is the control: it reads inside."""
+    import _winapi  # type: ignore[import-not-found,unused-ignore]
+
+    junction = _winapi.CreateJunction  # type: ignore[attr-defined,unused-ignore]
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "secret.hl7").write_bytes(_BODY)
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    with FileSink(out) as sink:
+        junction(str(outside), str(out / "j.hl7"))
+        junction(str(out / "sub"), str(out / "jin.hl7"))
+        junction(str(out), str(out / "loop"))
+        records = sink.records()
+    by_name = {r.meta["name"]: r for r in records}
+    assert set(by_name) == {"j.hl7", "jin.hl7", "loop"}  # nothing read through any of them
+    assert all(r.meta["symlink"] == "true" and r.payload == b"" for r in records)
+    assert by_name["j.hl7"].meta["inside"] == "false"
+    assert by_name["jin.hl7"].meta["inside"] == "true"
+
+
+def test_the_file_sink_reports_a_symlink_loop_as_not_inside(tmp_path: Path) -> None:
+    with FileSink(tmp_path) as sink:
+        _symlink_or_skip(tmp_path / "loop.hl7", tmp_path / "loop.hl7")
+        records = sink.records()
+    assert [(r.meta["name"], r.meta["inside"]) for r in records] == [("loop.hl7", "false")]
+
+
+def test_the_file_sink_reports_a_path_it_cannot_resolve_as_not_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolve that fails mid-scan neither ends the scan nor passes for inside: the file is still
+    recorded, judged not inside, and the files after it are still read."""
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.hl7").write_bytes(_BODY)
+        (tmp_path / "b.hl7").write_bytes(_BODY)
+        real = Path.resolve
+
+        def resolve(self: Path, strict: bool = False) -> Path:
+            if self.name == "sub":
+                raise OSError(errno.ENOENT, "gone mid-scan")
+            return real(self, strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+        records = sink.records()
+    inside = {r.meta["relpath"]: r.meta["inside"] for r in records}
+    assert inside == {"sub/a.hl7": "false", "b.hl7": "true"}
+
+
+def test_the_file_sink_records_a_file_changed_while_read_once_it_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file replaced between the scan's lstat and its read is not recorded under the stale
+    signature, which would record the new bytes a second time on the next scan."""
+    import harness.sinks.file as file_sink
+
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(b"MSH|first\r")
+        real = read_capped
+
+        def swap_then_read(
+            path: Path, cap: int, *, follow_symlinks: bool = True
+        ) -> tuple[bytes, str]:
+            monkeypatch.setattr(file_sink, "read_capped", real)
+            target.write_bytes(_BODY)  # a different size: the signature moves
+            return real(path, cap, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(file_sink, "read_capped", swap_then_read)
+        assert sink.records() == []  # changed while read: not recorded yet
+        settled = sink.records()
+        assert sink.records() == settled
+    assert [r.payload for r in settled] == [_BODY]
+
+
+def test_the_file_sink_records_a_file_removed_right_after_its_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file read whole and then moved away is still a delivery, judged inside by its folder."""
+    import harness.sinks.file as file_sink
+
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+
+        def read_then_remove(
+            path: Path, cap: int, *, follow_symlinks: bool = True
+        ) -> tuple[bytes, str]:
+            result = read_capped(path, cap, follow_symlinks=follow_symlinks)
+            path.unlink()
+            return result
+
+        monkeypatch.setattr(file_sink, "read_capped", read_then_remove)
+        records = sink.records()
+    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]
+
+
+def test_the_file_sink_does_not_record_a_chmod_as_a_write(tmp_path: Path) -> None:
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+        first = sink.records()
+        target.chmod(0o444)
+        try:
+            assert sink.records() == first
+        finally:
+            target.chmod(0o644)
+    assert len(first) == 1
+
+
+def test_the_file_sink_records_a_file_overwritten_in_place(tmp_path: Path) -> None:
+    """A file present at start is ignored only while it is unchanged, and a recorded file that is
+    written again is recorded again: an in-place overwrite is a delivery, not a repeat."""
+    old = tmp_path / "old.hl7"
+    old.write_bytes(b"MSH|stale\r")
+    with FileSink(tmp_path) as sink:
+        assert sink.records() == []
+        old.write_bytes(_BODY)
+        first = sink.records()
+        assert [r.payload for r in first] == [_BODY]
+        assert sink.records() == first  # unchanged since: not recorded again
+        old.write_bytes(_BODY + b"PID|1\r")
+        again = sink.records()
+    assert [r.payload for r in again] == [_BODY, _BODY + b"PID|1\r"]
 
 
 @pytest.mark.parametrize("code", [errno.ELOOP, errno.EMLINK], ids=["ELOOP", "EMLINK"])
@@ -154,7 +309,7 @@ def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
 ) -> None:
     """Where O_NOFOLLOW exists, a file swapped for a symlink between the lstat and the open fails the
     open with ELOOP (EMLINK on FreeBSD). Not following, that is NOT_REGULAR, as a symlink seen by the
-    lstat is, so every caller skips it alike; following, or for any other errno, it still raises."""
+    lstat is, so every caller treats it alike; following, or for any other errno, it still raises."""
     target = tmp_path / "f.hl7"
     target.write_bytes(b"MSH|")
 

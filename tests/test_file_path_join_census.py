@@ -445,6 +445,22 @@ SITES: dict[str, Site] = {
         "harness/sinks/_sftp_server.py::_confined",
         called=True,
     ),
+    "harness/sinks/file.py::FileSink._entries": Site(
+        1,
+        GUARDED,
+        "A bare name from listing the sink's directory, which the engine under test writes, or a "
+        "folder under it; a listing name is one component, never `.` or `..`. A folder is entered "
+        "only if `_is_link` reads its `lstat` as no link, but a folder swapped for a link after "
+        "that check is listed and read through the link: an open race, not a containment guard.",
+        "harness/sinks/file.py::_is_link",
+        called=True,
+    ),
+    "harness/sinks/file.py::FileSink._inside": Site(
+        1,
+        REVIEWED,
+        "A listed file's name onto its folder's strict resolution, built only to compare against "
+        "the root; nothing is opened through it. Under the `_entries` race it can read as inside.",
+    ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),

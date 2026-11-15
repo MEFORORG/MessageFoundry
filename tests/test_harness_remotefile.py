@@ -29,6 +29,7 @@ import pytest
 
 from harness import drivers, sinks
 from harness.__main__ import main
+from harness.bounded_file import NOT_REGULAR
 from harness.drivers.file import _UNSAFE, MAX_DROP_NAME_BYTES
 from harness.drivers.remotefile import RemoteFileDriver
 from harness.endpoints import Endpoints
@@ -551,3 +552,9 @@ def test_verify_written_catches_changed_bytes_and_a_misplaced_file() -> None:
     assert not verify_written(scenario, [nested], sent, "p").ok
     escaped = Record(_hl7("C1"), {"relpath": "C1.hl7", "inside": "false"})
     assert not verify_written(scenario, [escaped], sent, "p").ok
+    # A link is recorded unread, so it has no control id to match; it fails the check anyway.
+    link = Record(b"", {"relpath": "L.hl7", "inside": "false", "symlink": "true"})
+    result = verify_written(scenario, [good, link], sent, "p")
+    assert not result.ok and "non-file entry appeared in the outbox (L.hl7)" in result.detail
+    fifo = Record(b"", {"relpath": "F.hl7", "inside": "true", "refused": NOT_REGULAR})
+    assert not verify_written(scenario, [good, fifo], sent, "p").ok
