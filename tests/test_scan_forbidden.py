@@ -1269,6 +1269,13 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ),
     # A cell whose "never" and CI verb go on to a verdict state states a verdict (step 10's boundary).
     ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
+    # Review round-4f580a28dd's losses, each flagged by main: a sentence or a cell that goes on, after
+    # step 10's CI verb, to a verdict state or a record verb before a verdict states a verdict.
+    ("10", "verdict", f"For {_REQ} the row is not failing but stays {_PARTIAL}."),
+    ("10", "verdict", f"For {_REQ} the row is not failing: {_PARTIAL}."),
+    ("10", "verdict", f"For {_REQ} the row is not passing yet, it remains {_PARTIAL}."),
+    ("10", "verdict", f"| {_REQ} | the parser | is never failing; stays failing |"),
+    ("10", "verdict", f"| {_REQ} | the parser | is never failing; re-scored as failing |"),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1603,6 +1610,9 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # two whole readings, and a long run of spaces, which the sentence split rescanned per space.
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass" + chr(0x200B) + chr(0x2028),
         _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
+        # Step 10's "goes on to a verdict" search after "never" and a CI verb, over a markup run.
+        f"| {_REQ} | x | is never failing; stays" + "*" * 80000 + " |",
+        f"| {_REQ} | x | is never failing; stays" + " " * 80000 + " |",
     ],
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:

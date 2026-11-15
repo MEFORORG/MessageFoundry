@@ -580,8 +580,14 @@ _PR_CELL_VERDICT = re.compile(
 #: "never fails" and "never passing" describe a component, not a verdict: the CI verbs after "never"
 #: bind only a marked row. "never met" and "never partial" are verdict states and still bind.
 _PR_NEVER = re.compile(rf"(?i){_PR_NB}never{_PR_NA}")
-#: A verdict state later in a cell than its "never" and CI verb, which makes the cell a verdict again.
-_PR_CELL_STATE_AFTER = re.compile(rf"(?i){_PR_NB}{_PR_VERDICT_STATE}")
+#: A verdict stated after step 10's CI verb, in a cell or a sentence: a verdict state ("is never
+#: failing; partial"), or a record verb before any verdict ("is not failing but stays failing", "re-scored
+#: as failing"). Either makes the text a verdict again, so step 10 does not exempt it. No markup class
+#: after _PR_SEP, which already takes markup: the two overlap and backtrack quadratically on a long run
+#: of markup in a cell, which has no length limit.
+_PR_GOES_ON_TO_VERDICT = re.compile(
+    rf"(?i){_PR_NB}(?:{_PR_VERDICT_STATE}|{_PR_STRONG_VERB}{_PR_SEP}{_PR_QUALIFIER}{_PR_VERDICT})"
+)
 #: The cell openings that state a verdict whatever follows: "unchanged" and a record verb.
 _PR_CELL_RECORD_PREFIX = re.compile(rf"(?i)(?:unchanged|{_PR_STRONG_VERB}){_PR_NA}")
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
@@ -950,13 +956,15 @@ def _pr_prose_verdict(window: str, marked: bool) -> bool:
     # "row" is also a store row and a test-table row: "the row is not failing" beside an unmarked
     # identifier is CI prose, so a negated state verb and a CI verb after "row" bind only a marked one.
     # Every other form binds as before: "cell" is record vocabulary, and "the row is failing" and "the
-    # row went from failing to partial" state a verdict.
+    # row went from failing to partial" state a verdict, and so does a sentence that goes on to one
+    # ("the row is not failing but stays partial").
     if marked:
         return bool(_PR_PROSE_VERDICT.search(window) or _PR_BARE_HOLD.search(window))
     if any(
         hit.group("row") is None
         or hit.group("row_negated") is None
         or hit.group("row_verdict").lower() not in _PR_CI_VERDICTS
+        or _PR_GOES_ON_TO_VERDICT.search(window, hit.end()) is not None
         for hit in _PR_PROSE_VERDICT.finditer(window)
     ):
         return True
@@ -997,8 +1005,8 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
             and hit.group("verdict").lower() in _PR_CI_VERDICTS
             # Anywhere before the verdict: "never fails", and "has never been failing" too.
             and _PR_NEVER.search(hit.string, hit.start(), hit.start("verdict")) is not None
-            # A cell that goes on to a verdict state ("is never failing; partial") states a verdict.
-            and _PR_CELL_STATE_AFTER.search(hit.string, hit.end()) is None
+            # A cell that goes on to a verdict ("is never failing; partial") states a verdict.
+            and _PR_GOES_ON_TO_VERDICT.search(hit.string, hit.end()) is None
         )
 
     def is_verdict(cell: str) -> bool:
