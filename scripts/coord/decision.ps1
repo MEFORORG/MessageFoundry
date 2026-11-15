@@ -375,10 +375,9 @@ function Invoke-DecisionGate {
         $closed = $false
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
-        # A roster alias is the same seat, so a decision logged as `mgr` is the manager's (#5604).
-        $canonSeat = Resolve-DecisionSeat $Seat
-        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
-                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id)) -and (Resolve-DecisionSeat ([string]$_.seat)) -eq $canonSeat
+        # -Seat applies the reversals-only alias ruling (#5604); Get-DecisionCalibration says how.
+        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Seat $Seat -Decisions @($all | Where-Object {
+                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
             })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")

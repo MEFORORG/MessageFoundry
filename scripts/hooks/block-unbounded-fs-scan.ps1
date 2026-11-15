@@ -91,7 +91,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
 # backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
 # quote and blank the command after them. -Plain keeps the toggle this guard had before, which
-# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote.
+# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote. The same toggle
+# also runs beside the bash reading, as a floor; the call site says why.
 #
 # A HEREDOC BODY IS DATA, and it is blanked here too, line for line. Hide-HeredocBodies runs on the
 # output of this function, so a quote in a body (`don't`) would otherwise open a span here that
@@ -329,17 +330,30 @@ try {
     # same offsets, gives its operands. Quotes are masked before heredocs, for the reason above.
     # Read safely: under strict mode a missing tool_name would throw, and the catch would allow.
     $tool = if ($j.PSObject.Properties['tool_name']) { [string]$j.tool_name } else { '' }
-    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain:($tool -ceq 'PowerShell'))
+    # THE PLAIN TOGGLE IS A FLOOR UNDER THE BASH READING, NOT REPLACED BY IT (BACKLOG #5607). The
+    # bash reading was added to deny walks the toggle blanked, but a misreading of its own blanks a
+    # walk the toggle sees: measured, an arithmetic `$((...))` holding a substitution, `$((cmd) )`,
+    # `cat<<` with no space, two heredocs on one line, and a `#` comment holding an apostrophe inside
+    # "$(...)". So a bash command is scanned under BOTH views and denied if either denies: the bash
+    # reading can only add denies to the toggle's, never remove one.
+    # Most commands mask the same under both, and then one scan is enough.
+    $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
+    if ($tool -cne 'PowerShell') {
+        $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
+        if ($bashScan -cne $scans[0]) { $scans += $bashScan }
+    }
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.
-    $bounds = New-Object 'System.Collections.Generic.List[int[]]'
-    $cursor = 0
-    foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
-        $bounds.Add(@($cursor, ($m.Index - $cursor)))
-        $cursor = $m.Index + $m.Length
+    $bounds = New-Object 'System.Collections.Generic.List[object[]]'
+    foreach ($scan in $scans) {
+        $cursor = 0
+        foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
+            $bounds.Add(@($scan, $cursor, ($m.Index - $cursor)))
+            $cursor = $m.Index + $m.Length
+        }
+        $bounds.Add(@($scan, $cursor, ($scan.Length - $cursor)))
     }
-    $bounds.Add(@($cursor, ($scan.Length - $cursor)))
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
     # pattern or path. Only separate-word options belong here: listing an attached-value one such
@@ -363,9 +377,9 @@ try {
                "enumerates network and WSL shares with no bound. " + $UNSTOPPABLE
 
     foreach ($b in $bounds) {
-        if ($b[1] -le 0) { continue }
-        $s = $scan.Substring($b[0], $b[1]).Trim()
-        $rawSeg = $cmd.Substring($b[0], $b[1]).Trim()
+        if ($b[2] -le 0) { continue }
+        $s = $b[0].Substring($b[1], $b[2]).Trim()
+        $rawSeg = $cmd.Substring($b[1], $b[2]).Trim()
         if (-not $s) { continue }
 
         # Program position is decided on the blanked view; a first token carrying a quote is the

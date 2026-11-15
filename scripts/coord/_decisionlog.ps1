@@ -602,8 +602,20 @@ function Get-DecisionCalibration {
       pass), and the reversal rate over the decisions logged on -RecentDays (a breach above 5
       percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
       reads Calibrated.
+
+      With -Seat, -Decisions is one class's pool for every seat, and the samples are the decisions
+      logged under -Seat as given. A roster alias of it is the same seat for REVERSALS ONLY (owner
+      ruling 2026-11-15, BACKLOG #5604): its reversed decisions are charged to this rate, and nothing
+      else of its is read. Its ratings never count toward the 60 samples and its unreversed decisions
+      never dilute the rate, because either would let a name with no record of its own borrow its
+      seat's calibration. The gate and the digest both pass -Seat, so they apply the ruling alike.
     #>
-    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays)
+    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays, [string]$Seat)
+    $aliasDecisions = @()
+    if ($PSBoundParameters.ContainsKey('Seat')) {
+        $aliasDecisions = @(Get-DecisionAliasDecisions $Decisions $Seat)
+        $Decisions = @($Decisions | Where-Object { [string]$_.seat -eq $Seat })
+    }
     # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
     # the latest one, 60 newer ratings must pass before the class is calibrated again.
     $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
@@ -625,6 +637,9 @@ function Get-DecisionCalibration {
     $recent = @($Decisions | Where-Object {
             $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and
             ([string]$_.gate -ne 'HALT' -or (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed')
+        })
+    $recent += @($aliasDecisions | Where-Object {
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed'
         })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
     $revRate = if ($recent.Count) { $revd / $recent.Count } else { 0 }
@@ -786,6 +801,17 @@ function Resolve-DecisionSeat([string]$Seat) {
     }
     if ($script:DecisionSeatAliases.ContainsKey($s)) { return [string]$script:DecisionSeatAliases[$s] }
     return $s
+}
+
+function Get-DecisionAliasDecisions($Decisions, [string]$Seat) {
+    # The decisions of -Seat's roster seat logged under any OTHER of its names: for -Seat `mgr`,
+    # those logged as `manager` or another alias of it. Get-DecisionCalibration reads only their
+    # reversals; the calibration pool itself stays the decisions logged under -Seat as given.
+    $canon = Resolve-DecisionSeat $Seat
+    if (-not $canon) { return @() }
+    return @($Decisions | Where-Object {
+            [string]$_.seat -ne $Seat -and (Resolve-DecisionSeat ([string]$_.seat)) -eq $canon
+        })
 }
 
 function Test-DecisionLanderSeat([string]$Seat) {

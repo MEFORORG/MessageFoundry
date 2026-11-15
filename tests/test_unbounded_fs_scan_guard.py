@@ -679,6 +679,39 @@ def test_a_powershell_string_does_not_hide_the_walk_after_it(command: str) -> No
     assert_denied(run_guard(bash(command, tool="PowerShell")))
 
 
+# THE BASH READING MUST NEVER ALLOW WHAT THE PLAIN TOGGLE DENIED. Each row was denied by the toggle
+# alone, before the bash reading existed, and allowed once the bash reading replaced it: its own
+# misreading blanked a walk the toggle left visible. The quote in each row is what sends it through
+# the masker at all; a command with none is never masked.
+TOGGLE_FLOOR_DENY = [
+    # `$((` opens arithmetic, whose body was blanked whole, substitution and all.
+    pytest.param(
+        "x='a'; echo $(( $(find /proc | wc -l) + 1 ))", id="substitution-inside-arithmetic"
+    ),
+    # `$((cmd) )` is a subshell in a substitution, not arithmetic: the `) )` never closes `$((`.
+    pytest.param("echo 'a'; echo $((find /proc) )", id="subshell-substitution-read-as-arithmetic"),
+    # `cat<<` with no space was no heredoc opener, so the apostrophe in its body opened a span.
+    pytest.param(
+        "git commit -m \"$(cat<<'EOF'\nFix: don't break it\nEOF\n)\" && grep -r foo /proc",
+        id="unspaced-heredoc-inside-a-quoted-substitution",
+    ),
+    # Only the second delimiter was kept, so the first terminator line was blanked as body.
+    pytest.param(
+        'echo "a"; cat <<A <<B\nx\nA\ny\nB\nfind /proc', id="two-heredocs-opened-on-one-line"
+    ),
+    # A comment is not quoting, so the apostrophe in it opened a span.
+    pytest.param(
+        'echo "$(echo a # don\'t\n)" && grep -r x /proc',
+        id="apostrophe-in-a-comment-inside-a-quoted-substitution",
+    ),
+]
+
+
+@pytest.mark.parametrize("command", TOGGLE_FLOOR_DENY)
+def test_a_walk_the_plain_toggle_denied_is_still_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
 # ============================================ the corpora must not quietly shrink
 
 
@@ -706,6 +739,7 @@ EXPECTED_ROW_COUNTS = {
     "QUOTED_SUBSTITUTION_DENY": 13,
     "QUOTED_PROSE_ALLOW": 6,
     "POWERSHELL_QUOTE_DENY": 2,
+    "TOGGLE_FLOOR_DENY": 5,
 }
 
 

@@ -1001,9 +1001,11 @@ def _with_roster(sb: Sandbox) -> None:
     shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
 
 
-# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT (BACKLOG #5604). A decision logged as
-# `mgr` is the manager's, so its reversal is charged to the manager's budget and rate; reading the
-# seat as a bare string would under-charge the seat and leave its no-review path open.
+# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT, FOR REVERSALS ONLY (BACKLOG #5604;
+# owner ruling 2026-11-15, "Reversals only"). A decision logged as `mgr` is the manager's, so its
+# reversal is charged to the manager's budget and rate; reading the seat as a bare string would
+# under-charge the seat and leave its no-review path open. Its CALIBRATION SAMPLES are not pooled:
+# that would let a name with no record of its own borrow its seat's calibration.
 
 
 def test_a_reversal_logged_under_a_seat_alias_is_charged_to_the_seat(sb: Sandbox) -> None:
@@ -1022,7 +1024,29 @@ def test_a_gate_asked_under_an_alias_reads_the_seats_budget(sb: Sandbox) -> None
     seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
     code, doc = gate(sb, seat="mgr")
     assert code == REVIEW and "two reversals of mgr's decisions" in why(doc), why(doc)
-    assert "not calibrated" not in why(doc), "the alias did not read the seat's calibration"
+    # Reversals only: the manager's 60 samples do not calibrate `mgr`, which has none of its own.
+    assert "mgr's Class B is not calibrated (review path, 0/60 samples" in why(doc), why(doc)
+
+
+def test_an_alias_with_no_samples_does_not_inherit_its_seats_calibration(sb: Sandbox) -> None:
+    """Nothing else stands against `mgr`, so pooling the manager's samples would answer NO-REVIEW."""
+    _with_roster(sb)
+    seed_vault(sb, calibrated("manager"))
+    assert gate(sb)[0] == NO_REVIEW, "the control: the manager itself is calibrated"
+    code, doc = gate(sb, seat="mgr")
+    assert code == REVIEW, why(doc)
+    assert "mgr's Class B is not calibrated (review path, 0/60 samples" in why(doc), why(doc)
+
+
+def test_an_aliass_unreversed_decisions_do_not_dilute_the_seats_rate(sb: Sandbox) -> None:
+    """The manager's one decision in the window was reversed; nineteen acted `mgr` ones beside it
+    would put the rate at 5.0 percent, inside the breach line, if the alias's samples were pooled."""
+    _with_roster(sb)
+    mine = rec(at=ago(days=4), seat="manager", item="x")
+    theirs = [rec(at=ago(days=4, minutes=i + 1), seat="mgr", item=f"y{i}") for i in range(19)]
+    seed_vault(sb, [*calibrated("manager"), mine, *theirs, reversal(mine, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
 
 
 def test_a_reversal_under_an_alias_counts_in_the_seats_14_day_rate(sb: Sandbox) -> None:
@@ -1635,17 +1659,20 @@ def _git(repo: Path, *args: str, stdin: str = "") -> str:
 
 
 def test_the_digest_folds_a_seat_alias_as_the_gate_does(sb: Sandbox) -> None:
-    """Decisions logged as `mgr` are the manager's in both digest tables, as the gate charges them."""
+    """Reversals only, as the gate reads them: `mgr`'s reversals are charged to the manager's budget
+    and rate, while each name keeps its own calibration row."""
     _with_roster(sb)
-    mine = [rec(at=ago(days=20), seat="mgr", item=f"x{i}") for i in range(2)]
-    seed_vault(sb, mine)
+    mine = [rec(at=ago(days=4), seat="mgr", item=f"x{i}") for i in range(2)]
+    own = rec(at=ago(days=4), seat="manager", item="y")
+    seed_vault(sb, [*mine, own])
     seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
     proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     out = proc.stdout
-    assert "| manager | B |" in out, out
+    # The manager's row: its one acted decision plus `mgr`'s two reversed ones.
+    assert "| manager | B | 0 | 0 | review path, 0/60 samples | 3 | 2 | 66.7% BREACH |" in out, out
+    assert "| mgr | B | 0 | 0 | review path, 0/60 samples | 2 | 2 | 100.0% BREACH |" in out, out
     assert "| manager | 2 of 2 in the trailing 24 hours; CLOSED" in out, out
-    assert "| mgr |" not in out, out
 
 
 def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(

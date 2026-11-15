@@ -281,12 +281,14 @@ $md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
-# The seat is folded through the roster, as decision.ps1 -Gate folds it, so an alias's decisions
-# land in its seat's row and this table agrees with what the gate answers.
+# A row is the seat as logged, and a roster alias's reversals reach its rate, as decision.ps1 -Gate
+# reads them (reversals only, #5604), so this table agrees with what the gate answers.
 $calibration = @{}
-foreach ($g in @($decisions | Group-Object { "$(Resolve-DecisionSeat ([string]$_.seat))|$($_.class)" } | Sort-Object Name)) {
+$byClass = @{}
+foreach ($g in @($decisions | Group-Object { [string]$_.class })) { $byClass[$g.Name] = $g.Group }
+foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
-    $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
+    $c = Get-DecisionCalibration -Decisions $byClass[$class] -Seat $seat -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
     $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
 }
@@ -319,7 +321,7 @@ if ($dayEnd -gt $now) {
 $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
-foreach ($s in @($decisions | ForEach-Object { Resolve-DecisionSeat ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
     $cal = $calibration["$s|B"]
     $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
 }
