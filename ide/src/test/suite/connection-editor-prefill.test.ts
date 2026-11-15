@@ -302,10 +302,11 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     // validator.
     const p = load({ groups });
     const port = p.window.document.querySelector('#settings [data-key="port"]');
+    assert.strictEqual(port.type, "text", "a number field must not be a number box");
     port.value = "66x2";
     assert.strictEqual(saved(p, false).port, "66x2", "the typed text must be posted for the engine to refuse");
     // Text a number box would have refused is not converted either: the engine sees what was typed.
-    for (const typed of ["0x1F90", "0b1", "0o17", "+6662", "Infinity"]) {
+    for (const typed of ["0x1F90", "0b1", "0o17", "+6662", "Infinity", "1e400", "-1e309"]) {
       const h = load({ groups });
       h.window.document.querySelector('#settings [data-key="port"]').value = typed;
       assert.strictEqual(saved(h, false).port, typed, `${typed} must be posted as typed`);

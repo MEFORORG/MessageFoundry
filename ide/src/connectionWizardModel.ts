@@ -177,9 +177,9 @@ export function buildConnObj(state: WizardState): WizardConnObj {
  * so a new workspace can still edit its connections.
  *
  * Start and Restart read the setting through this same function (`startServiceConfigValue` in
- * engineControlModel.ts is it), so the two never resolve one setting to two files. The alert and
- * security editors and the certificate inventory do not use it yet: they pass the setting as it
- * is, so a blank one is refused there.
+ * engineControlModel.ts is it), so the two never resolve one setting to two files. Not every
+ * surface uses it yet: at least the alert and security editors and the certificate inventory pass
+ * the setting as it is, so a blank one is refused there.
  */
 export function connectionServiceConfig(setting: unknown, isSet: boolean): string | undefined {
   if (!isSet) {

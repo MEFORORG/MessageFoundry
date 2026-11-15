@@ -360,10 +360,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       try { return JSON.parse(text); } catch (e) { return text; }
     }
 
-    // Edited text for a schema field, read by the field's declared type, as coerce in
-    // connectionForm.ts reads it: a table, or a value the record held as a table, parses as JSON; a
-    // select takes the matching choice with its JSON type; a number or a bool is converted when the
-    // text is one; anything else, and text that does not convert, is posted verbatim, so the
+    // Edited text for a schema field, read by the field's declared type: a table, or a value the
+    // record held as a table, parses as JSON; a select takes the matching choice with its JSON type;
+    // a bool is converted when the text is one; a number only when the text is a finite decimal,
+    // which is narrower than coerce in connectionForm.ts, since a text box here takes any text; anything else, and text that does not convert, is posted verbatim, so the
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
@@ -373,8 +373,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         return hit !== undefined ? hit : raw;
       }
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
-      // and a leading '+', which would post a number the user never typed.
-      if (f.type === 'int' || f.type === 'float') return DECIMAL_TEXT.test(raw) ? Number(raw) : raw;
+      // and a leading '+', which would post a number the user never typed. An exponent that
+      // overflows is posted as typed too, since Infinity would cross to the host as null.
+      if (f.type === 'int' || f.type === 'float') {
+        const n = DECIMAL_TEXT.test(raw) ? Number(raw) : NaN;
+        return Number.isFinite(n) ? n : raw;
+      }
       if (f.type === 'bool') return raw === 'true' ? true : raw === 'false' ? false : raw;
       return raw;
     }

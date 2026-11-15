@@ -474,6 +474,9 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
         [AI_POLICY_DENY_KEY]: { [aiPolicyCacheKey(OTHER)]: bad, [aiPolicyCacheKey(CENTRAL)]: policy({ mode: "off" }) },
       });
       assert.strictEqual(assistantState(await unreachable(mixed, LOCAL, cliByo, false)).enabled, false, label);
+      // The way out: the issuer's authoritative permit clears it.
+      await answered(store, CENTRAL, policy({ assistPermitted: true }));
+      assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, true, `not cleared: ${label}`);
     }
   });
 

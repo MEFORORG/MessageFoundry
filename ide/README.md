@@ -196,11 +196,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
-  user or workspace settings (a folder value is ignored), every connection edit passes it as
-  `--service-config`, whether or not the file exists, so a missing file fails the edit with
+  user or workspace settings (a folder value is ignored), every connection edit passes it, unless
+  it is blank, as `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
-  setting counts as unset for connection edits, as it does for Start and Restart, so the flag is
-  left off. Setting it to the default name, in
+  setting leaves the flag off for connection edits, as it does for Start and Restart. A blank
+  workspace value still hides a user value, so the default file applies, not the user's. Setting it to the default name, in
   user settings too, counts as set, so a workspace without that file cannot save a connection edit
   until the file exists or the setting is cleared. The flag is left off at least when
   the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
