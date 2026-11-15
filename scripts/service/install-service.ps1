@@ -1243,7 +1243,7 @@ function Reset-ConfigTreeAcl {
       nothing when the tree is locked. A problem is at least: $Path still inheriting, lacking
       $Account's read or carrying a deny entry, an owner other than Administrators or SYSTEM, an
       entry for anyone but SYSTEM, Administrators and $Account, a DACL that could not be reset or
-      read, or a link. An entry a child only inherits is named once, where it comes from.
+      read, or a link the listing shows as one. An entry a child only inherits is named once, where it comes from.
 
       THE WALK IS DONE HERE, NOT WITH `icacls /T`. Measured: `icacls <dir>\* /reset /T /C` reset a
       file in a junction's target outside <dir>, with /L or without. So each item is set on its own,
@@ -1251,8 +1251,9 @@ function Reset-ConfigTreeAcl {
       volume) is neither changed nor entered, and is named instead: what it points at was not locked, and the guard may still load
       a module through it. A queued folder is read again before it is listed, in case it has become
       one since. A file reparse point of another kind, such as a cloud-file placeholder, is a file
-      and is locked as one. So is a file link whose own DACL hides its link type from the listing;
-      the per-item calls pass /L, so they change the link itself and never its target.
+      and is locked as one. So is a file link whose own DACL hides its link type from the listing:
+      the link check does not name it, and the per-item calls pass /L, so they change the link's own
+      owner and DACL and leave its target as it was, not locked.
 
       A FILE THE LISTING SHOWS AS HARD-LINKED keeps its own entries and is named. Its other names,
       perhaps outside $Path, share its DACL, and the entries it inherits still follow $Path, as any

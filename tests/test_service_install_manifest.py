@@ -1679,7 +1679,8 @@ def test_the_walk_changes_a_link_itself_never_its_target() -> None:
 @_windows_only
 def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Path) -> None:
     """The behaviour behind the static pin above. Creating a symbolic link needs the privilege an
-    unelevated account has only in Developer Mode, so the test skips without it."""
+    unelevated account has only in Developer Mode, so the test skips without it. Unelevated, no
+    owner can be set with /L or without, so only an elevated run (CI) witnesses the owner arm."""
     probe = tmp_path / "symlink-probe"
     try:
         probe.symlink_to(tmp_path)

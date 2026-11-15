@@ -740,10 +740,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   instead of the "locked" line: at least an entry for another account, an owner it could not set,
   a missing read for the run-as account, and a deny entry on the dir. The lockdown skips at least a
   junction and any other folder reparse point, and names each in a warning. It skips and names a
-  file link or a hard-linked file only when it can read the item's link type. Its owner and
-  permission changes act on a link itself, never on its target. A hard-linked file it does not
-  skip is changed under every name it has. A write grant the run-as account held below the dir
-  becomes read, and
+  file link or a hard-linked file only when it can read the item's link type. It changes each item
+  in the dir with icacls /L, so a file link it does not skip has its own owner and permissions
+  changed, not its target's. A hard-linked file it does not skip is changed under every name it
+  has. A write grant the run-as account held below the dir becomes read, and
   is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.
