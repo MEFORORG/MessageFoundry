@@ -5,8 +5,9 @@
 # <dir>/server.key.
 #
 # WHY: the engine refuses a store login over trust_server_certificate=true or encrypt=false at
-# every posture, and so does a SQL Server DATABASE connection login (owner ruling 2026-11-14,
-# vault BACKLOG #3533 item 2). So a CI database must serve a certificate the engine can verify.
+# every posture, and so does a SQL Server DATABASE connection login unless the connection declares
+# tls_hop_attested (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). So a CI database must
+# serve a certificate the engine can verify.
 # The legs pin this file, or add it to the runner's trust store, and never weaken TLS.
 #
 # The shape is the strict-encryption pin test's (vault BACKLOG #3714 item 6, in ci.yml): Server

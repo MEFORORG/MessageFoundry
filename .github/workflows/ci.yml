@@ -3596,7 +3596,8 @@ jobs:
 
       # THE ENGINE NEVER WEAKENS TLS TO THIS SERVER (owner ruling 2026-11-14, vault BACKLOG #3533
       # item 2): a store or DATABASE connection login over trust_server_certificate=true or
-      # encrypt=false is refused, whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says.
+      # encrypt=false is refused, whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says,
+      # except a DATABASE connection that declares tls_hop_attested, which no leg here does.
       # So the service container serves a certificate generated here, and every engine step below
       # pins it with MEFOR_STORE_SSL_ROOT_CERT. The runner's trust store holds it too, for the
       # DATABASE connector, which has no pin. A `services:` container starts before any step, so
@@ -3655,10 +3656,13 @@ jobs:
       - name: Install project (dev + sqlserver extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
-      # Two logins, so a leg that cannot verify reds HERE with a clear message, not as a store
-      # suite failure: the store's (Encrypt=strict, pinning the certificate with ServerCertificate,
-      # TDS 8.0) and the DATABASE connector's (Encrypt=yes, verified against the runner's trust
-      # store and the host name). The engine never sends TrustServerCertificate=yes to this server.
+      # Two driver logins, so a leg whose server cannot be verified reds HERE with a clear message,
+      # not as a store suite failure: the store's (Encrypt=strict, pinning the certificate with
+      # ServerCertificate, TDS 8.0) and the DATABASE connector's (Encrypt=yes, verified against the
+      # runner's trust store and the host name). It checks the driver's TLS only. The engine's own
+      # pin checks (check_pinned_certificate: the anchor file's permissions, its single-certificate
+      # parse, its validity window) run at store open, so a pin they refuse still reds the suites.
+      # The engine never sends TrustServerCertificate=yes to this server.
       - name: Check the engine's two verified logins to SQL Server
         timeout-minutes: 3
         run: |

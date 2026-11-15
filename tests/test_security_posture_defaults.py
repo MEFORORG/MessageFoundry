@@ -4098,7 +4098,7 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # Security-relevant and gated ELSEWHERE, not by this registry. Extending it over them is real
         # work with its own SECURITY-LOOSENING.md entries — recorded as owed, not done silently.
         "encrypt",  # the keyless-PHI serve gate refuses it in its own right
-        "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
+        "trust_server_certificate",  # the store refuses it at every posture (vault BACKLOG #3533 item 2)
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
         # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
         # pins that it is reported, and its own tests pin the file-backed condition.

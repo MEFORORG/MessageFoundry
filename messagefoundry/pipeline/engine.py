@@ -1834,8 +1834,8 @@ class Engine:
             # read cache from the shared snapshot. NullCoordinator (single-node) is always leader, so
             # this materializes from source every pass exactly as before.
             coordinator=self._coordinator,
-            # Vault BACKLOG #2354: the posture the reference sync's hop cells read. Its weakened-TLS
-            # refusal reads none: it refuses at every posture (vault BACKLOG #3533 item 2).
+            # Vault BACKLOG #2354 handed the sync this posture for its hop cells. Since vault BACKLOG
+            # #3533 item 2 none of them reads it: the weakened-TLS refusal holds at every posture.
             hop_posture=self._hop_posture,
         )
 

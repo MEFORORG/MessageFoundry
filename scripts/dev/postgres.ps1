@@ -58,6 +58,9 @@ $env:MEFOR_STORE_PASSWORD = $Password
 $env:MEFOR_STORE_ENCRYPT = "true"
 $env:MEFOR_STORE_TRUST_SERVER_CERTIFICATE = "false"
 if ($RootCert) { $env:MEFOR_STORE_SSL_ROOT_CERT = $RootCert } else { Remove-Item Env:MEFOR_STORE_SSL_ROOT_CERT -ErrorAction SilentlyContinue }
+# An earlier version of this script exported MEFOR_ALLOW_INSECURE_TLS=1 into this shell. Clear it,
+# so the suites below do not run with the escape armed for the cells it still opens.
+Remove-Item Env:MEFOR_ALLOW_INSECURE_TLS -ErrorAction SilentlyContinue
 
 Write-Host "Running Postgres store tests against $Username@${DbServer}:$Port/$Database ..." -ForegroundColor Cyan
 if ($Full) {

@@ -3073,11 +3073,12 @@ class RegistryRunner:
         for name, spec in self.registry.lookups.items():
             refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
-        # #200 (ADR 0092): stamp the derived posture around the live executor build, so the cells it
-        # builds that read one (the attestation audit line, the generic dialect's cleartext guard)
-        # read THIS instance's. engine.start()/reload build the executor here WITHOUT going through
-        # build_check_registry's active_hop_posture scope. The weakened-TLS refusal in _build_dsn
-        # reads no posture: it refuses at every posture (vault BACKLOG #3533 item 2).
+        # #200 (ADR 0092): stamp the derived posture around the live executor build. engine.start()/
+        # reload build the executor here WITHOUT going through build_check_registry's
+        # active_hop_posture scope. Since vault BACKLOG #3533 item 2 nothing this build reaches reads
+        # a posture: the executor calls _build_dsn, the SQL Server preset, never the generic dialect's
+        # cleartext guard, and _build_dsn's weakened-TLS refusal and attestation audit line read none.
+        # The stamp is therefore inert; whether to remove it is left open rather than decided here.
         with active_hop_posture(self._hop_posture):
             return DatabaseLookupExecutor(resolved, egress=self._egress)
 

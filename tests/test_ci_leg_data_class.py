@@ -4,8 +4,8 @@
 
 THE RULE, AND WHAT CHANGED IT. Owner ruling 2026-11-14 (vault BACKLOG #3533 item 2): a store login
 over ``trust_server_certificate=true`` or ``encrypt=false`` is refused, and so is a SQL Server
-DATABASE connection login over the same, whatever ``MEFOR_ALLOW_INSECURE_TLS`` or
-``[security].enforcement`` says. So a CI leg that still sets ``MEFOR_STORE_TRUST_SERVER_CERTIFICATE``
+DATABASE connection login over the same unless it declares ``tls_hop_attested``, whatever
+``MEFOR_ALLOW_INSECURE_TLS`` or ``[security].enforcement`` says. So a CI leg that still sets ``MEFOR_STORE_TRUST_SERVER_CERTIFICATE``
 true or ``MEFOR_STORE_ENCRYPT`` false cannot open its store on any posture. The server-DB legs serve
 a certificate generated in a step (``scripts/ci/db-tls-cert.sh``) and pin it or trust it instead.
 
@@ -22,6 +22,7 @@ connection string is outside it.
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import Any
 
@@ -39,7 +40,9 @@ _RUN_WEAKENED = re.compile(
 )
 
 
+@functools.cache
 def _workflows() -> dict[str, dict[str, Any]]:
+    """Every workflow, parsed once per module: callers only read it."""
     yaml = pytest.importorskip("yaml")
     from tests._workflow_contexts import WORKFLOWS
 

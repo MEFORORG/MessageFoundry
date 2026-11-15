@@ -101,7 +101,8 @@ jobs:
       MEFOR_STORE_USERNAME: mefor_ci
       MEFOR_STORE_AUTH: sql
       # NO WEAKENED TLS. A store or DATABASE connection login over trust_server_certificate=true or
-      # encrypt=false is refused whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says
+      # encrypt=false is refused whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says,
+      # except a DATABASE connection that declares tls_hop_attested, which this leg does not
       # (owner ruling 2026-11-14, vault BACKLOG #3533 item 2), so this leg no longer sets either.
       # The box's SQL Server must serve a certificate issued for `localhost`. The store pins it with
       # MEFOR_STORE_SSL_ROOT_CERT, a path in the runner's machine environment like the password, to

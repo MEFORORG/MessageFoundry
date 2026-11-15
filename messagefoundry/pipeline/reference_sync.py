@@ -203,7 +203,9 @@ def reference_statement(settings: Mapping[str, Any], *, name: str | None = None)
 
 
 def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
-    """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
+    """Build a DATABASE reference source's DSN, refusing weakened TLS unless the set is attested.
+
+    The refusal reads no hop posture: it holds at every posture (vault BACKLOG #3533 item 2).
 
     The one place both callers build it: the sync, just before it dials, and ``build_check``, so
     weakened TLS that every sync would refuse also fails ``messagefoundry check``, dry-run and
@@ -262,8 +264,10 @@ async def _load_database_source(
     then keeps the last-good snapshot, as for any source failure.
 
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
-    every ``active_hop_posture`` scope, so the cells that read a posture need it handed down. The
-    weakened-TLS refusal in ``_build_dsn`` is not one of them: it refuses a DatabaseRef with
+    every ``active_hop_posture`` scope, so it is handed down and stamped here. Since vault BACKLOG
+    #3533 item 2 no cell under that stamp reads it, so it is inert: a DatabaseRef is always the SQL
+    Server preset, and the weakened-TLS refusal and attestation audit line in ``_build_dsn`` read
+    none. The refusal refuses a DatabaseRef with
     ``encrypt=false`` or ``trust_server_certificate=true`` at every posture, unless the set is
     attested, even with ``MEFOR_ALLOW_INSECURE_TLS`` set at ``[security].enforcement = warn``
     (vault BACKLOG #3533 item 2). ``None``

@@ -4724,8 +4724,10 @@ async def open_store(
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
     server-DB backends for the checks that read one, at least the SQL Server pin's anchor checks and
-    the PostgreSQL revocation guard. ``None`` reads the ambient posture, and with none those checks
-    take the enforcing branch (vault BACKLOG #2354). The engine<->store weakened-TLS refusal
+    the PostgreSQL revocation guard. ``None`` reads the ambient posture. With none, the SQL Server pin's
+    anchor checks take the enforcing branch (vault BACKLOG #2354), but the PostgreSQL revocation
+    guard does NOT run: it is a no-op on an unstamped posture, so a caller that opens a PostgreSQL
+    store with no posture crosses its hop with no revocation check. The engine<->store weakened-TLS refusal
     (``connection_string`` / ``_build_ssl``) reads no posture: a weakened store hop is refused at
     every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at
     ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2).
