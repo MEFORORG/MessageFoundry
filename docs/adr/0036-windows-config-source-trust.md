@@ -15,7 +15,8 @@
   **Amended 2026-11-14 (Amendment E, BACKLOG #5622):** the grantee and owner rules are corrected
   for conditional and object entries, LocalService and NetworkService run-as accounts,
   TrustedInstaller, and domain admin groups. The amendment is inline in Decision 1; read Decisions
-  1 and 3, and the cures under *Consequences*, as it amends them.
+  1 and 3, and the cures under *Consequences*, as it amends them. An owner ruling of 2026-11-15
+  keeps its consequence for the config editors fail-closed, at the end of Amendment E.
 - **Built:** yes — [`_assert_safe_config_source`](../../messagefoundry/config/wiring.py) now dispatches
   to a real Windows check (`_assert_safe_config_source_windows` + the pure `_evaluate_config_dacl`
   policy) instead of an unconditional early-return; [`install-service.ps1`](../../scripts/service/install-service.ps1)
@@ -68,6 +69,13 @@ could drop/rewrite a config module that executes as the service account on the n
      the owner stays refused, the built-in Administrator (RID 500) included. An account that
      **owns** the object is still trusted once the owner arm resolves it, as Amendment A decided.
    - A definite refusal is reported ahead of an entry the checks cannot judge.
+
+   **Consequence kept fail-closed (owner ruling 2026-11-15, in a batch 482 Manager session).** An
+   engine run as LocalService or NetworkService could no longer use the config editors under its
+   own account, which self-trust allowed before: the folders they write into, and the files they
+   leave, would be refused. The remedy is an engine account that is its own, not a relaxed rule.
+   What fails, the messages and the remedy are stated once, in `docs/SERVICE.md`, *Lock down the
+   config directory (CONFIG-2)*.
 
    **Amended 2026-09-18 (BACKLOG #1647): the owner is vetted, not trusted unconditionally.** As
    originally built, `_evaluate_config_dacl` added the owner SID to the trusted set with no check, so a
