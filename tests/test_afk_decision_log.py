@@ -20,6 +20,7 @@ import pytest
 from tests._fake_gh import (
     COORD,
     GUARDED_TIMEOUT_S,
+    ROOT,
     Sandbox,
     id_day,
     make_sandbox,
@@ -59,7 +60,12 @@ B_DECISION = (*B_UNREVIEWED, "-Reviewed", "yes", "-ReviewedBy", "a fresh-context
 
 @pytest.fixture
 def sb(tmp_path: Path) -> Sandbox:
-    return make_sandbox(tmp_path)
+    s = make_sandbox(tmp_path)
+    # -List -Seat joins aliases through the roster, as a checkout has it (BACKLOG #5597).
+    roster = s.repo / "docs" / "roles"
+    roster.mkdir(parents=True)
+    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
+    return s
 
 
 def _comments(sb: Sandbox) -> list[str]:
@@ -186,6 +192,16 @@ def test_list_merges_the_spool_marks_it_and_filters_by_seat_and_item(sb: Sandbox
     assert [r["item"] for r in _list(sb, "-Seat", "lander")] == ["77"]
     assert [r["item"] for r in _list(sb, "-Item", "3905")] == ["3905"]
     assert _list(sb, "-Day", "2001-01-01") == []
+
+
+def test_list_by_seat_matches_an_alias_and_flags_a_missing_roster(sb: Sandbox) -> None:
+    """BACKLOG #5597: -List -Seat matches by roster name, and without the roster says it is partial."""
+    other = ("-Log", "-Item", "77", "-Class", "C", "-Seat", " Land ", "-Recommendation", "ask")
+    assert sb.run(DECISION, *other, "-NoPost").returncode == 0
+    assert [r["item"] for r in _list(sb, "-Seat", "lander")] == ["77"]
+    (sb.repo / "docs" / "roles" / "seats.json").unlink()
+    proc = sb.run(DECISION, "-List", "-Json", "-Days", "2", "-Seat", "lander")
+    assert proc.returncode == 4 and "seat roster" in proc.stderr, (proc.stdout, proc.stderr)
 
 
 def test_a_record_posted_twice_lists_once(sb: Sandbox) -> None:
