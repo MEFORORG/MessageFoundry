@@ -504,8 +504,8 @@ pure-Python equivalent:
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
-- Config edit owner check: `config/atomic_edit.py`, which calls `advapi32`'s `ConvertStringSidToSidW`
-  on a SID string
+- Config edit owner check: `config/atomic_edit.py`, which calls at least `advapi32`'s
+  `ConvertStringSidToSidW`, on a SID string
 - Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
   a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
   `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own

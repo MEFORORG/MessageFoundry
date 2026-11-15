@@ -132,9 +132,14 @@ _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 #: ``OSError``, so it is not reported as a permission. The stat gate has its own rule (:func:`is_file`).
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
-#: A chown is refused by ``EINVAL`` as well as by ``EPERM``: an owner id the mount or user namespace
-#: cannot map (an id-mapped mount, a container). Either way the edit stops before the rename.
-_CHOWN_REFUSED = _REFUSED | {errno.EINVAL}
+#: A chown is refused by ``EINVAL`` or ``EOVERFLOW`` as well as by ``EPERM``: an owner id the user
+#: namespace or an id-mapped mount cannot map (a container, a mount inside one). Either way the edit
+#: stops before the rename.
+_CHOWN_REFUSED = _REFUSED | {errno.EINVAL, errno.EOVERFLOW}
+
+#: The ``step`` of root's chown of the candidate, which :func:`_refusal` advises on differently: the
+#: directory is writable and the cause is the owner's id, so the write advice would mislead.
+_CHOWN_STEP = "give its edit candidate the file's owner"
 
 #: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
 #: directory refuses no read, so the write advice would send an operator to the wrong fix.
@@ -372,7 +377,8 @@ def replace_validated(
     On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
     the new candidate. With ``refused_error`` set, a refusal building the candidate or making the
     replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
-    did not pass; ``EINVAL`` too for root's chown of the candidate, ``_CHOWN_REFUSED``) is raised as
+    did not pass; ``EINVAL`` and ``EOVERFLOW`` too for root's chown of the candidate,
+    ``_CHOWN_REFUSED``) is raised as
     ``refused_error(message)``. Those steps leave the live file as it
     was, since a rename that fails has not happened. What follows the replace, any other
     ``OSError`` past that companion stat, and whatever ``validate`` raises are never converted."""
@@ -402,7 +408,7 @@ def replace_validated(
                     with refused_as(
                         path,
                         refused_error,
-                        "give its edit candidate the file's owner",
+                        _CHOWN_STEP,
                         refusals=_CHOWN_REFUSED,
                     ):
                         os.fchown(handle.fileno(), *live.posix_owner)
@@ -614,6 +620,12 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
             f"{path.name} could not be read: {reason}. It or a folder above it may be a link, or "
             "on a share, that cannot be reached, so it was not taken to be absent. Restore the "
             "share or the link's target, or remove the link"
+        )
+    if step == _CHOWN_STEP:
+        return (
+            f"{path.name} was not changed: this account could not give the edited file back to the "
+            f"account that owns it: {reason}. That account's id may not exist on this mount or in "
+            "this container; edit the file as the account that owns it, or where its id maps"
         )
     if step == READ_STEP:
         return (

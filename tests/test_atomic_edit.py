@@ -32,7 +32,7 @@ from messagefoundry.config import (
 )
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.wiring import WiringError, load_config
-from tests._win_acl import assert_owner_only_rewrite, protected_entries
+from tests._win_acl import assert_rewritten_to_grantee, born_explicit_sids, protected_entries
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 
@@ -328,8 +328,9 @@ def test_an_account_editing_its_own_file_changes_no_owner(
         # An owner id this mount or user namespace cannot map: the chown is refused all the same,
         # and must reach the operator as a refused edit rather than a raw OSError.
         OSError(errno.EINVAL, "Invalid argument"),
+        OSError(errno.EOVERFLOW, "Value too large for defined data type"),
     ],
-    ids=["EPERM", "EINVAL"],
+    ids=["EPERM", "EINVAL", "EOVERFLOW"],
 )
 def test_a_refused_chown_leaves_the_live_file_as_it_was(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
@@ -342,7 +343,7 @@ def test_a_refused_chown_leaves_the_live_file_as_it_was(
 
     _as_root(monkeypatch, _refused)
 
-    with pytest.raises(WiringError, match="give its edit candidate the file's owner"):
+    with pytest.raises(WiringError, match="could not give the edited file back"):
         atomic_edit.replace_validated(path, b"x = 1\n", _noop, refused_error=WiringError)
 
     assert path.read_bytes() == before
@@ -465,11 +466,14 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
         return True
 
     monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", _hand_back)
+    # The candidate is born in a fresh private directory beside the file; a file born the same way
+    # shows what such a file carries explicitly before any rewrite.
+    carried = born_explicit_sids(tmp_path)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
-    assert_owner_only_rewrite(path, owner)
+    assert_rewritten_to_grantee(path, owner, carried)
 
 
 @windows_only
