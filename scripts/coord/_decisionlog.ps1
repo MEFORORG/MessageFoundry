@@ -603,19 +603,17 @@ function Get-DecisionCalibration {
       percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
       reads Calibrated.
 
-      With -Seat, -Decisions is one class's pool for every seat, and the samples are the decisions
-      logged under -Seat as given. A roster alias of it is the same seat for REVERSALS ONLY (owner
+      -Decisions is one class's pool for every seat, and the samples are the decisions logged
+      under -Seat as given. -Seat is mandatory, so no caller can pool every seat by leaving it out. A roster alias of it is the same seat for REVERSALS ONLY (owner
       ruling 2026-11-15, BACKLOG #5604): its reversed decisions are charged to this rate, and nothing
       else of its is read. Its ratings never count toward the 60 samples and its unreversed decisions
       never dilute the rate, because either would let a name with no record of its own borrow its
-      seat's calibration. The gate and the digest both pass -Seat, so they apply the ruling alike.
+      seat's calibration. The gate and the digest both call this, so they apply the ruling alike.
     #>
-    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays, [string]$Seat)
-    $aliasDecisions = @()
-    if ($PSBoundParameters.ContainsKey('Seat')) {
-        $aliasDecisions = @(Get-DecisionAliasDecisions $Decisions $Seat)
-        $Decisions = @($Decisions | Where-Object { [string]$_.seat -eq $Seat })
-    }
+    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Seat)
+    $aliasDecisions = @(Get-DecisionAliasDecisions $Decisions $Seat)
+    $Decisions = @($Decisions | Where-Object { [string]$_.seat -eq $Seat })
     # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
     # the latest one, 60 newer ratings must pass before the class is calibrated again.
     $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |

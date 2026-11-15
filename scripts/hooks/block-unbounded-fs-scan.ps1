@@ -125,6 +125,10 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     $depths = [System.Collections.Generic.List[int]]::new()
     $kinds.Add('top'); $depths.Add(0)
     $prevDollar = $false
+    # Whether the next unquoted character starts a word, which is where a `#` starts a comment, and
+    # the depth of unquoted `${...}`, inside which it never does.
+    $wordStart = $true
+    $braceDepth = 0
     # The delimiter of a heredoc opened on this line, then of the body being blanked.
     $pending = $null
     $bodyTerm = $null
@@ -148,13 +152,13 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         if ($kind -ceq 'arith') {
             # Arithmetic still runs a substitution, so that is left visible as in double quotes.
             if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
-                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $n += 2; continue
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
             }
-            if ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $n++; continue }
+            if ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $wordStart = $true; $n++; continue }
             if ($ch -ceq '(') { $depths[$top]++; [void]$sb.Append(' ') }
             elseif ($ch -ceq ')' -and $depths[$top] -gt 0) { $depths[$top]--; [void]$sb.Append(' ') }
             elseif ($ch -ceq ')' -and $next -ceq ')') {
-                $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append('))'); $n += 2; continue
+                $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append('))'); $wordStart = $false; $n += 2; continue
             }
             elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
             else { [void]$sb.Append(' ') }
@@ -184,9 +188,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
             }
             if ($ch -ceq '"') { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch) }
             elseif ($ch -ceq '$' -and $next -ceq '(') {
-                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $n += 2; continue
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
             }
-            elseif ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch) }
+            elseif ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $wordStart = $true }
             elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
             else { [void]$sb.Append(' ') }
             $n++; continue
@@ -195,7 +199,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
         # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
         if ($ch -ceq "`n" -and $null -ne $pending) {
-            [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false
+            [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false; $wordStart = $true
             $n++; continue
         }
         if ($ch -ceq '<' -and $next -ceq '<' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])) -and
@@ -205,13 +209,15 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
                 $pending = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
                     Where-Object { $_ } | Select-Object -First 1
             }
-            [void]$sb.Append('<<'); $prevDollar = $false
+            [void]$sb.Append('<<'); $prevDollar = $false; $wordStart = $false
             $n += 2; continue
         }
         # A `#` starting a word starts a comment, which bash never runs and in which a quote opens
         # nothing. It is blanked up to the newline (or, in a backtick substitution, the closing
-        # backtick), keeping the `#`.
-        if ($ch -ceq '#' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or ';&|()'.IndexOf($Text[$n - 1]) -ge 0)) {
+        # backtick), keeping the `#`. A word starts after unquoted, unescaped whitespace, `;`, `&`,
+        # `|`, `(` or an opening `$(` or backtick -- never after a `)`, a quote or an escape, nor
+        # inside `${...}`, where bash carries the word on (`$(echo a)#b` and `a\ #b` are words).
+        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) {
             $end = $Text.IndexOf("`n", $n)
             if ($end -lt 0) { $end = $Text.Length }
             if ($kind -ceq 'bt') {
@@ -225,7 +231,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         if ($ch -ceq '\') {
             [void]$sb.Append($ch)
             if ($null -ne $next) { [void]$sb.Append($next) }
-            $prevDollar = $false
+            $prevDollar = $false; $wordStart = $false
             $n += 2; continue
         }
         if ($ch -ceq "'") {
@@ -237,12 +243,19 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
             if ($depths[$top] -gt 0) { $depths[$top]-- } else { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
         }
         elseif ($kind -ceq 'bt' -and $ch -ceq '`') { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
-        elseif ($kind -ceq 'sub' -and $ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0) }
+        # A top-level backtick is pushed too, only so that a comment inside it ends at its close.
+        elseif (($kind -ceq 'sub' -or $kind -ceq 'top') -and $ch -ceq '`') {
+            $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $prevDollar = $false; $wordStart = $true
+            $n++; continue
+        }
         elseif ($kind -cne 'top' -and $ch -ceq '$' -and $next -ceq '(') {
-            $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $prevDollar = $false
+            $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $prevDollar = $false; $wordStart = $true
             $n += 2; continue
         }
+        elseif ($ch -ceq '{' -and $prevDollar) { $braceDepth++ }
+        elseif ($ch -ceq '}' -and $braceDepth -gt 0) { $braceDepth-- }
         [void]$sb.Append($ch)
+        $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
         $prevDollar = ($ch -ceq '$') -and -not $prevDollar
         $n++
     }

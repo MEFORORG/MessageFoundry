@@ -275,7 +275,7 @@ $md.Add('')
 
 $md.Add('## Calibration, per seat and class')
 $md.Add('')
-$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day.")
+$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. A row's acted and reversed counts also hold the reversed decisions logged under another name of its roster seat, which the gate charges to it (reversals only, #5604), so one reversal can show in several rows.")
 $md.Add('')
 $md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
@@ -287,9 +287,10 @@ $calibration = @{}
 $byClass = @{}
 foreach ($g in @($decisions | Group-Object { [string]$_.class })) { $byClass[$g.Name] = $g.Group }
 foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
-    $seat, $class = $g.Name -split '\|', 2
-    # The pool's key is read from a record, not the name: a seat holding `|` splits the name wrongly.
-    $c = Get-DecisionCalibration -Decisions $byClass[[string]$g.Group[0].class] -Seat ([string]$g.Group[0].seat) -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
+    # Read from a record, not split from the name: a seat holding `|` splits the name wrongly.
+    $seat = [string]$g.Group[0].seat
+    $class = [string]$g.Group[0].class
+    $c = Get-DecisionCalibration -Decisions $byClass[$class] -Seat $seat -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
     $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
 }

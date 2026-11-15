@@ -716,6 +716,24 @@ TOGGLE_FLOOR_DENY = [
 ]
 
 
+# A `#` STARTS A COMMENT ONLY WHERE BASH STARTS A WORD. Each `#` below carries a word on, so blanking
+# from it as a comment would hide the walk after it, which sits where the plain toggle blanks it too.
+# The last row's comment is real, but it ends at the closing backtick, not the newline.
+COMMENT_BOUNDARY_DENY = [
+    pytest.param('echo "$(echo $(echo a)#b; find /proc)"', id="hash-after-a-substitution"),
+    pytest.param('echo "$(echo $((1+2))#b; find /proc)"', id="hash-after-arithmetic"),
+    pytest.param(r'echo "$(echo a\ #b; find /proc)"', id="hash-after-an-escaped-space"),
+    pytest.param('echo "$(echo a\\\n#b; find /proc)"', id="hash-after-a-line-continuation"),
+    pytest.param('echo "$(echo ${x:- #a}; find /proc)"', id="hash-inside-a-parameter-expansion"),
+    pytest.param(r"echo \"`echo a #x`; find /proc #\"", id="comment-ends-at-a-top-level-backtick"),
+]
+
+
+@pytest.mark.parametrize("command", COMMENT_BOUNDARY_DENY)
+def test_a_hash_that_carries_a_word_on_hides_no_walk(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
 @pytest.mark.parametrize("command", TOGGLE_FLOOR_DENY)
 def test_a_walk_the_plain_toggle_denied_is_still_denied(command: str) -> None:
     assert_denied(run_guard(bash(command)))
@@ -749,6 +767,7 @@ EXPECTED_ROW_COUNTS = {
     "QUOTED_PROSE_ALLOW": 7,
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
+    "COMMENT_BOUNDARY_DENY": 6,
 }
 
 
