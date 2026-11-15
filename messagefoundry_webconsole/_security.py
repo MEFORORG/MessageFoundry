@@ -273,7 +273,8 @@ def build_ui_csp(nonce: str) -> str:
     """The /ui CSP for an effective-https response: the static self-only base with ``script-src``
     upgraded to a per-response nonce + ``strict-dynamic`` (3.4.7/3.4.8) and CSP reporting wired to
     :data:`CSP_REPORT_PATH`. ``strict-dynamic`` intentionally drops the host allowlist for scripts —
-    only the nonce'd first-party ``app.js`` (and anything it loads) runs; there is no inline script."""
+    only nonce'd first-party scripts (``app.js``, the shell's inline nonce'd scripts, and anything
+    they load) run."""
     return (
         f"default-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src 'self'; "
         "img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; "
@@ -383,7 +384,9 @@ class UiFetchMetadataMiddleware:
     cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
     what lets them ship without assuming any browser sends fetch metadata -- the version table in
     ``docs/BROWSER-SUPPORT.md`` documents a floor, and nothing enforces it -- and it is exactly what
-    an ABSENCE rule could not claim. Measured
+    an ABSENCE rule could not claim. A browser can speak only PART of the family: that table records
+    Safari sending ``Sec-Fetch-Site`` and never ``Sec-Fetch-User``, so the user-activation rule
+    below refuses Safari's same-site navigation even when the user clicked. Measured
     2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
     reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
     browser-support decision, not a code change, and it is not taken here.
