@@ -202,12 +202,11 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
     assert guard.status()[0].state == "unwritable"
 
 
-def test_a_flapping_sink_past_the_bound_pages_once_not_once_per_roll(tmp_path: Path) -> None:
-    # BACKLOG #5812. Writing ``rolled`` before escalating made record_unwritable read its latch from
-    # the state record_rollover had just overwritten, so every roll past the bound paged and asked
-    # for a stop again. Driven by real rolls: a sink that heals on every roll and breaks on every
-    # record, well past the bound. NEGATIVE CONTROL: on the unfixed code this collects one
-    # ``unwritable`` event per roll past the bound (four here), not one.
+def test_every_roll_past_the_bound_pages_and_asks_for_the_stop_as_before(tmp_path: Path) -> None:
+    # BACKLOG #5812. The latch never pages less than the bound alone: every roll past the bound
+    # pages and asks for the stop, as on main, so a lost page is re-sent on the next one. Driven by
+    # real rolls: a sink that heals on every roll and breaks on every record, well past the bound.
+    # NEGATIVE CONTROL: at 375a4aa8e the latch paged only the first of these four.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -217,15 +216,15 @@ def test_a_flapping_sink_past_the_bound_pages_once_not_once_per_roll(tmp_path: P
         _break_the_open_handle(handler)
         handler.emit(_record("break"))
 
-    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"]
-    assert sum(e.stop_requested for e in events) == 1
+    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 4
+    assert sum(e.stop_requested for e in events) == 4
     status = guard.status()[0]
     assert status.state == "unwritable"
-    # The rolls the latch swallowed are still counted, the stage-2 cause the operator was paged with
-    # is kept, and the rolled-aside path is the NEWEST roll's (the highest roll sequence number).
+    # Every roll is counted, the newest verdict is on /status, and the rolled-aside path is the
+    # NEWEST roll's (the highest roll sequence number).
     assert status.rollovers == _MAX_ROLLS_PER_WINDOW + 4
     assert status.last_event is not None
-    assert f"rolling {_MAX_ROLLS_PER_WINDOW + 1} times" in status.last_event
+    assert f"rolling {_MAX_ROLLS_PER_WINDOW + 4} times" in status.last_event
     aside = [p for p in tmp_path.iterdir() if ".broken-" in p.name]
     newest = max(aside, key=lambda p: int(p.name.rsplit("-", 1)[1]))
     assert status.rolled_aside == str(newest)
@@ -251,13 +250,15 @@ def _flap(handler: GuardedFileHandler, clock: _FakeClock, *, rolls: int, every: 
         handler.emit(_record("break"))
 
 
-def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable_and_pages_once(
+def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #5812, across windows. A sink rolling every 10 seconds for five minutes is one break.
-    # NEGATIVE CONTROL: on the unfixed code the streak reset a window after its FIRST roll, so the
-    # sink flipped back to ``rolled`` (can_log() True with no probe) and paged again every window,
-    # on top of paging on every roll past the bound inside one.
+    # The bound's window restarts a minute after its first roll, and on main the sink then flipped
+    # back to ``rolled`` (can_log() True with no probe) until the bound tripped again. The latch keeps
+    # it ``unwritable`` throughout, with no ``rolled`` event, while still paging on every roll past
+    # the bound as main did (two per 70 s window here, eight in all). NEGATIVE CONTROL: on main the
+    # state reads ``rolled`` at the first roll of each new window.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
@@ -265,11 +266,15 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable_and_pages_on
     guard.set_escalation(events.append)
     handler = _file_handler(tmp_path / "app.log", guard)
 
-    _flap(handler, clock, rolls=30, every=10.0)
+    _flap(handler, clock, rolls=_MAX_ROLLS_PER_WINDOW + 1, every=10.0)
+    for _ in range(30 - (_MAX_ROLLS_PER_WINDOW + 1)):
+        _flap(handler, clock, rolls=1, every=10.0)
+        assert guard.status()[0].state == "unwritable"
+        assert guard.can_log() is False
 
-    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"]
-    assert guard.status()[0].state == "unwritable"
-    assert guard.can_log() is False
+    stages = [e.stage for e in events]
+    assert stages == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 8
+    assert all(e.stop_requested for e in events if e.stage == "unwritable")
 
     # The operator path still recovers it, by writing a real record.
     assert guard.revalidate() is True
@@ -334,6 +339,34 @@ def test_the_latch_never_trips_later_than_the_bound_alone(
     assert guard.status()[0].state == "unwritable"
     assert guard.can_log() is False
     assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+
+
+def test_a_stage2_failure_on_a_sink_the_latch_alone_holds_still_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812, never fewer pages than main. Six rolls trip the bound; a roll at 62 s is a heal
+    # to the bound alone (its window started at 0 s) but the latch holds the sink. A stage-2 failure
+    # at 63 s then paged on main, whose sink read ``rolled``, so it must page here too.
+    # NEGATIVE CONTROL: at 375a4aa8e the sink already read ``unwritable`` and the page was dropped.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+    _at(clock, 62)
+    guard.record_rollover("file", reason="lock", rolled_aside=None)
+    assert guard.status()[0].state == "unwritable"
+    paged = len(events)
+
+    _at(clock, 63)
+    guard.record_unwritable("file", reason="the replacement failed too")
+
+    assert len(events) == paged + 1
+    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    # ...and a second stage-2 failure is the ordinary latch, as on main.
+    _at(clock, 64)
+    guard.record_unwritable("file", reason="the replacement failed too")
+    assert len(events) == paged + 1
 
 
 def test_continuous_stage2_failure_is_not_a_quiet_window(monkeypatch: pytest.MonkeyPatch) -> None:
