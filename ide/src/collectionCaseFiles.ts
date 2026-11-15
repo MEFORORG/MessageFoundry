@@ -71,7 +71,7 @@ function unlinkWithRetries(file: string, retries: number): void {
 /**
  * Delete a run's directory without recursing. This docblock and sweepStaleCaseDirs's are the source
  * of record for what the Test Bench's temp-file cleanup does (ADR 0121, BACKLOG #5415); other
- * documents point here rather than restate it.
+ * documents point here.
  *
  * What it does, in order:
  * 1. lstat `dir`. Anything but a plain directory, a symlink or junction included, throws, and
@@ -79,25 +79,31 @@ function unlinkWithRetries(file: string, retries: number): void {
  * 2. List `dir`. An entry whose name matches CASE_FILE (`case_`, at least four digits, `.hl7`) and
  *    that lstats as a regular file is unlinked. Every other entry is left, at least a name that does
  *    not match and a matching name that is a directory, a link or another non-regular entry. No
- *    entry is entered, so a link among the entries is never followed.
+ *    entry is entered, so a link among the entries is not followed.
  * 3. An unlink that fails with EBUSY or EPERM is tried `retries` more times, 100 ms apart, each wait
- *    blocking the calling thread; removeCaseDir passes 3 and sweepStaleCaseDirs 0. An entry already
- *    gone is skipped. An entry whose lstat or unlink still fails does not stop the others: once the
- *    listing is done, the first such error is thrown and `dir` is not removed.
- * 4. Otherwise `dir` is removed with rmdir, which throws, and leaves it, if any entry is still in it.
+ *    blocking the calling thread; removeCaseDir passes 3 and sweepStaleCaseDirs 0. An lstat is not
+ *    retried. An entry already gone is skipped. An entry whose lstat fails, or whose unlink still
+ *    fails, does not stop the others: once the listing is done, the first such error is thrown and
+ *    `dir` is not removed.
+ * 4. Otherwise `dir` is removed with rmdir, which is not retried. It throws, and leaves `dir`, if
+ *    any entry is still in it or the rmdir fails for any other reason.
  *
- * So the directory goes only once it is empty. At least an entry step 2 leaves, or a case file step
- * 3 cannot unlink, keeps the directory, and that file, on disk. Each unlink also updates `dir`'s
- * modification time (measured on NTFS), which sweepStaleCaseDirs's age gate reads.
+ * So the directory goes only once it is empty, and not always then. At least an entry step 2
+ * leaves, or a case file step 3 cannot unlink, keeps the directory, and that file, on disk. Each
+ * unlink also updates `dir`'s modification time (measured on NTFS), which sweepStaleCaseDirs's age
+ * gate reads.
  *
  * Why no recursive rmSync: in the VS Code extension host (measured on its Node v24.21.0) a recursive
  * rmSync follows a junction and deletes its target's files.
  *
- * Open limit, at least this one: `dir` is checked once, by the lstat of step 1, and the listing,
- * every lstat and unlink of steps 2 and 3, and the rmdir all go by path. If `dir`, or a directory
- * above it, is swapped for a link after that lstat and before the last unlink, the retry waits
- * included, the listing reads the link's target, and regular files named as case files there are
- * unlinked.
+ * Open limits, at least these. `dir` is checked once, by the lstat of step 1, and each entry once, by
+ * its lstat in step 2; the listing, every lstat and unlink, and the rmdir all go by path.
+ * - If `dir`, or a directory above it, is swapped for a link after the step 1 lstat and before the
+ *   last unlink, the retry waits included, the rest acts in the link's target: a swap before the
+ *   listing lists the target's entries, a later one lstats and unlinks the listed names there.
+ *   Either way regular files named as case files in the target can be unlinked.
+ * - If an entry is swapped between its lstat and its unlink, whatever is then at that name is
+ *   unlinked, a link included (the link itself, not its target); a directory there fails to unlink.
  */
 function deleteCaseDir(dir: string, retries: number): void {
   if (!fs.lstatSync(dir).isDirectory()) {
@@ -125,9 +131,10 @@ function deleteCaseDir(dir: string, retries: number): void {
   fs.rmdirSync(dir);
 }
 
-/** Delete a run's directory as deleteCaseDir does, with 3 retries for each case file. Any error is
- *  dropped, with no log line or notice, so a cleanup error cannot mask the run's own result; what
- *  it can leave is in deleteCaseDir, and when a later sweep tries again is in sweepStaleCaseDirs. */
+/** Delete a run's directory as deleteCaseDir does, with 3 retries for each case file's unlink. Any
+ *  error is dropped, with no log line or notice, so a cleanup error cannot mask the run's own
+ *  result; what it can leave is in deleteCaseDir, and when a later sweep tries again is in
+ *  sweepStaleCaseDirs. */
 export function removeCaseDir(dir: string): void {
   try {
     deleteCaseDir(dir, 3);
@@ -147,8 +154,8 @@ export function removeCaseDir(dir: string): void {
  *
  * Which entries it tries: a name starting with CASE_DIR_PREFIX that lstats as a directory, not a
  * symlink or junction, last modified more than `maxAgeMs` (STALE_CASE_DIR_MS, one hour) before
- * `now`, and, on POSIX, owned by this process's effective uid, since the OS temp directory is shared
- * there. On Windows no owner is checked: the default TEMP is per-user, but a TEMP pointed at a shared
+ * `now`, and, on POSIX, owned by this process's effective uid, since the OS temp directory can be
+ * shared there, as `/tmp` is. On Windows no owner is checked: the default TEMP is per-user, but a TEMP pointed at a shared
  * directory is not. Each is deleted by deleteCaseDir with no in-pass retry, and any error is dropped,
  * with no log line or notice. A directory that is not removed is tried again by each later sweep that
  * finds it past these gates. So a case file a sweep could not unlink goes once a later sweep can
@@ -160,10 +167,16 @@ export function removeCaseDir(dir: string): void {
  * hour ago can have its case files unlinked by any later sweep, from another window included, while
  * its dry-run may still read them.
  *
- * What stays until a sweep reaches it, at least: a directory left by a process that ended before the
- * run's `finally` ran, such as a crash, or a window close or reload while the dry-run is pending
- * (deactivate removes nothing), and anything deleteCaseDir left. Returns how many directories it
- * removed; an unreadable `base` returns 0.
+ * At least these stay until a sweep that reaches them can remove them: a directory left by a process
+ * that ended before the run's `finally` ran, such as a crash, or a window close or reload while the
+ * dry-run is pending (deactivate removes nothing), and a case file deleteCaseDir could not unlink. A
+ * directory holding an entry deleteCaseDir leaves stays on every sweep, as above.
+ *
+ * Open limit, at least this one, besides deleteCaseDir's: the gates are read from one lstat, and
+ * deleteCaseDir re-checks only that the entry is a plain directory, so a directory swapped in between
+ * is tried without the owner and age gates.
+ *
+ * Returns how many directories it removed; an unreadable `base` returns 0.
  */
 export function sweepStaleCaseDirs(
   base: string = os.tmpdir(),
