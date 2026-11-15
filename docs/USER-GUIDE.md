@@ -461,7 +461,7 @@ The engine ships validators for some of these formats. All are opt-in: nothing r
 
 | Format | Call | What it checks |
 |---|---|---|
-| X12 | `check_integrity`, in `messagefoundry.parsing.x12` | Whether the envelope agrees with itself: the control-number pairs (ISA13 with IEA02, GS06 with GE02, ST02 with SE02) and the group, set and segment counts |
+| X12 | `check_integrity`, in `messagefoundry.parsing.x12` | Whether the envelope agrees with itself: the control-number pairs (ISA13 with IEA02, GS06 with GE02, ST02 with SE02), the group, set and segment counts, and at least a header or trailer with no partner |
 | X12 | `validate`, in `messagefoundry.parsing.x12.validate` | The interchange against an implementation guide. It needs the `[x12]` extra |
 | XML | `validate_against`, in `messagefoundry.parsing.xml.schema` | The document against an XML Schema you supply. It needs the `[xml]` extra |
 | FHIR | `FhirResource.parse`, in `messagefoundry.parsing.fhir.resource` | The resource's structure and cardinality. It needs the `[fhir]` extra |

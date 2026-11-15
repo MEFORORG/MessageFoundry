@@ -86,12 +86,52 @@ def encode_segment(
 
 def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
-    with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components. Uses the
-    alphabetic group; ``()`` for an absent name."""
+    with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
+
+    DICOM PS3.5 (the PN value representation) orders the groups alphabetic, ideographic, phonetic,
+    and lets any of them be absent. Which group to use is this project's choice, not the
+    standard's: the alphabetic group is used whenever any of its family, given or middle
+    components is non-blank, because it is the group most likely to stay ASCII under an ``MSH``
+    that declares ASCII. Otherwise the ideographic group, then the phonetic group, is checked for a
+    family name, and failing that the ideographic group, then the phonetic group, for a given or
+    middle name. So an ideographic-only name is not lost, and a group holding only a prefix or
+    suffix is passed over. It returns ``()`` when no group has a family, given or middle name. A
+    blank (spaces-only) component is written empty. A name taken from the ideographic or phonetic group
+    carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a receiver that
+    reads ``XPN-8`` which group it is. It does not make the text decode. This helper sets no
+    character set, and with ``MSH-18`` empty the message declares ASCII. For any non-ASCII name,
+    from any group, the Handler that builds ``MSH`` must declare the set in ``MSH-18``, and the
+    outbound connection's ``encoding``, which encodes the bytes sent, must agree with it. ``XPN``
+    puts the suffix before the prefix (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix
+    and suffix swap places. A PN has five components; anything past the fifth is malformed and
+    dropped rather than written into ``XPN-6`` onward, which are coded fields. Trailing blank
+    components are dropped too (BACKLOG #5804)."""
     if not patient_name:
         return ()
-    alphabetic = patient_name.split("=", 1)[0]
-    return tuple(alphabetic.split("^"))
+    # Alphabetic, ideographic, phonetic; each cut to its five components, a blank one made empty.
+    candidates = [
+        [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
+        for group in patient_name.split("=")[:3]
+    ]
+    # The alphabetic group first, as the one most likely to stay ASCII; a prefix or suffix alone
+    # names nobody, so it never decides the choice.
+    alternates = list(enumerate(candidates))[1:]
+    group_index: int | None = 0 if any(candidates[0][:3]) else None
+    if group_index is None:
+        group_index = next((i for i, parts in alternates if parts[0]), None)
+    if group_index is None:
+        group_index = next((i for i, parts in alternates if any(parts[1:3])), None)
+    if group_index is None:
+        return ()
+    parts = candidates[group_index]
+    parts[3], parts[4] = parts[4], parts[3]
+    if group_index:
+        parts += ["", "", "IP"[group_index - 1]]  # XPN-6 and XPN-7 empty, then XPN-8
+    # Every pass above chose a group with a non-empty family, given or middle component, so this
+    # stops before the list is empty.
+    while not parts[-1]:
+        parts.pop()
+    return tuple(parts)
 
 
 def obx_from_measurement(
