@@ -758,6 +758,9 @@ _PR_QUOTE = re.compile(r"(?:>\s?)+")
 #: Quote markers as GFM reads them for a blank line: only a space or tab after each ">", so a ">" then
 #: a no-break space is a line with content, not a blank one.
 _PR_QUOTE_BLANK = re.compile(r"^(?:[ \t]*>[ \t]?)+")
+#: A line GFM opens with a quote marker: at most three spaces before the first ">". Four spaces or a
+#: tab make an indented code line at the top level, not a quote.
+_PR_QUOTE_OPEN = re.compile(r" {0,3}>")
 #: The line endings str.splitlines reads, as main numbered the body's lines: GFM's three ("\n", "\r\n",
 #: "\r") and the separators only str.splitlines ends a line at (a form feed, U+2028 and their kin).
 _PR_LINE_END = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
@@ -780,8 +783,9 @@ def _pr_lines(body: str) -> tuple[list[str], list[int], list[int]]:
     number main reported, and the numbers of its blank lines as GFM counts them, in two lists.
 
     A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs.
-    A quote blank is one holding only quote markers besides, a blank line inside a quote; it ends
-    only a quoted table (_pr_table_starts). A ">" then a no-break space is a quoted line with
+    A quote blank is one that opens with a quote marker GFM reads as one (_PR_QUOTE_OPEN) and holds
+    only quote markers besides, a blank line inside a quote; it ends only a quoted table
+    (_pr_table_starts). A ">" then a no-break space is a quoted line with
     content, neither. A separator only str.splitlines reads (a form feed, U+2028) ends a line here
     but never makes a blank one: the line it ends, or the empty line it opens, lies inside a GFM line
     with content, so it ends no table (step 9)."""
@@ -792,7 +796,7 @@ def _pr_lines(body: str) -> tuple[list[str], list[int], list[int]]:
     def classify(line: str) -> None:
         if not line.strip(" \t"):
             blanks.append(len(lines))
-        elif not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
+        elif _PR_QUOTE_OPEN.match(line) and not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
             quote_blanks.append(len(lines))
 
     start = 0
@@ -1016,35 +1020,34 @@ def _pr_table_starts(
     a blank line (only spaces and tabs, as GFM reads one) lies between them. A line holding only a
     no-break space emits no unit either, but GFM does not count it blank, so it ends no table.
 
-    A quote blank (only quote markers) between two rows ends the run only inside a quoted table: the
-    run's first row, the row above and the row below all open with a quote marker. Anywhere else, a
-    lone ">" between rows does not end the run, as main read no blank line at all."""
+    A quote blank (only quote markers) between two rows ends the run only inside a quoted table:
+    every row since the last unit that is not a row, through the row below the quote blank, opens
+    with a quote marker GFM reads as one (at most three spaces before it, _PR_QUOTE_OPEN). Blank
+    lines emit no unit, so that span reaches across them to a header above a blank line. Anywhere
+    else, a lone ">" between rows does not end the run, as main read no blank line at all."""
 
     def between(found: list[int], above: int, below: int) -> bool:
         return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
 
-    def quoted(lineno: int) -> bool:
-        return _PR_QUOTE_BLANK.match(lines[lineno - 1]) is not None
-
     starts = []
-    run_line = 0
+    # Whether every row since the last unit that is not a row opens with a quote marker.
+    block_quoted = True
     for index, (marks, _, is_row) in enumerate(units):
         above = units[index - 1] if index else None
         line = marks[0][1]
-        start = is_row and (
-            above is None
-            or not above[2]
-            or between(blanks, above[0][0][1], line)
-            or (
-                between(quote_blanks, above[0][0][1], line)
-                and quoted(run_line)
-                and quoted(above[0][0][1])
-                and quoted(line)
+        if not is_row:
+            block_quoted = True
+        else:
+            block_quoted = block_quoted and _PR_QUOTE_OPEN.match(lines[line - 1]) is not None
+        starts.append(
+            is_row
+            and (
+                above is None
+                or not above[2]
+                or between(blanks, above[0][0][1], line)
+                or (block_quoted and between(quote_blanks, above[0][0][1], line))
             )
         )
-        if start:
-            run_line = line
-        starts.append(start)
     return starts
 
 

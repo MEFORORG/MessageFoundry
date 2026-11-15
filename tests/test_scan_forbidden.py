@@ -1226,6 +1226,28 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ),
     ("9", "verdict", f"> | ASVS | Note | Result |\n>\n> |---|---|---|\n> {_ROW}"),
     ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}\n> {_ROW}"),
+    # Review round-b3037cd314's losses, each flagged by main: a quote-marker-only line ends a table
+    # only where every row since the last non-row unit is quoted. An unquoted header above a blank
+    # line, an unquoted header under a quoted pipe line, an unquoted delimiter or data row, and a
+    # ">" behind four spaces or a tab (a code line, not a quote) each keep the mark.
+    ("9", "verdict", f"{_HEAD}\n> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"| ASVS | Note | Result |\n\n> |---|---|---|\n> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"> | Summary |\n{_HEAD}> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"> | ASVS | Note | Result |\n|---|---|---|\n> | a | b | c |\n>\n> {_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"> | ASVS | Note | Result |\n> |---|---|---|\n| a | b | c |\n> | d | e | f |\n>\n> {_ROW}",
+    ),
+    *(
+        (
+            "9",
+            "verdict",
+            f"{lead}> | ASVS | Note | Result |\n{lead}> |---|---|---|\n{lead}> | a | b | c |\n"
+            f"{lead}>\n{lead}> {_ROW}",
+        )
+        for lead in ("    ", "\t")
+    ),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
