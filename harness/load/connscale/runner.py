@@ -1795,7 +1795,7 @@ def _build_record(
         no_loss = replace(no_loss, detail=f"{no_loss.detail}; {post.summary()}")
         # The per-message audit can PROVE what the counts could only leave open: an accept-ACKed
         # message absent from the store is a loss, so the step is not INCONCLUSIVE (BACKLOG #5574).
-        if post.verdict == intake_audit.VERDICT_INVARIANT_SUSPECT:
+        if post.engine_suspect:
             no_loss = replace(no_loss, inconclusive=False)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
@@ -2144,7 +2144,7 @@ def _reconcile(
     if counter_reset is not None:
         unproven.append(
             f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
-            f"sends, so the intake, delivery and drain arms were not judged"
+            f"sends, so the intake and delivery arms were not judged"
         )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")

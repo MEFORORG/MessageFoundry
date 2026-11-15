@@ -1470,3 +1470,27 @@ def test_batchbox_aggregate_escapes_a_band_reset_text_to_one_line() -> None:
     rec = bb.aggregate_cell_record(_cell(), [_band(counter_reset="engine went\nRESULT ok")])
     assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
     assert "\n" not in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_a_blind_band_is_not_called_undrained() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(engine_read=0, engine_written=0, backlog=-1)])
+    assert rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "not drained" not in rec.no_loss.detail
+
+
+def test_rig_reconciles_a_reset_does_not_claim_the_drain_arm_went_unjudged() -> None:
+    # The pipeline gauges are not deltas, so a reset leaves the drain arm judged; the reason text
+    # must not say otherwise beside a "not drained" clause.
+    staged = _staged(read=30, written=30, in_pipeline=4)
+    base = _sample(read=100, written=100)
+    for result in (
+        connscale_reconcile(
+            _RIG_CLEAN, base, staged, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+        ),
+        estate_reconcile(
+            _RIG_CLEAN, base, staged, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+        ),
+    ):
+        assert result.inconclusive, result.detail
+        assert "not drained" in result.detail
+        assert "drain arms were not judged" not in result.detail

@@ -463,7 +463,9 @@ def aggregate_cell_record(
 
     read_short = agg_sent - engine_read
     deliver_short = engine_written - agg_sink_received
-    drained = backlog == 0
+    # A negative backlog is the metrics-unavailable stand-in, refused below as no reading; only a
+    # positive one is rows left in the pipeline.
+    drained = backlog <= 0
     lost = read_short > 0 or deliver_short > 0
     # Reasons the cell cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or

@@ -389,3 +389,22 @@ def test_an_inconclusive_baseline_is_no_resilience_win_and_fails_the_row() -> No
     assert cmp is not None and len(cmp.rows) == 1
     assert not cmp.rows[0].resilience_win
     assert not cmp.rows[0].ok
+
+
+def test_an_inconclusive_arm_is_labelled_inconclusive_not_a_breach() -> None:
+    from dataclasses import replace as _replace
+
+    from harness.load.connscale.compare import _loss_label
+
+    base = _record(claim_mode="per_lane", count=10, achieved_read=100.0, idle_poll=1.0)
+    pooled = _record(claim_mode="pooled", count=10, achieved_read=100.0, idle_poll=0.0)
+    unsure_base = _replace(base, no_loss=_replace(base.no_loss, ok=False, inconclusive=True))
+    cmp = build_comparison([unsure_base, pooled], ("per_lane", "pooled"))
+    assert cmp is not None and len(cmp.rows) == 1
+    assert _loss_label(cmp.rows[0]).startswith("BASELINE INCONCLUSIVE")
+    assert cmp.baseline_zero_loss_breaches == 0
+    unsure_pooled = _replace(pooled, no_loss=_replace(pooled.no_loss, ok=False, inconclusive=True))
+    cmp = build_comparison([base, unsure_pooled], ("per_lane", "pooled"))
+    assert cmp is not None and len(cmp.rows) == 1
+    assert not cmp.rows[0].ok
+    assert _loss_label(cmp.rows[0]).startswith("CANDIDATE INCONCLUSIVE")

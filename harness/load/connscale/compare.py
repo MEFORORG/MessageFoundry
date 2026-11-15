@@ -234,7 +234,12 @@ class ClaimModeComparison:
     def baseline_zero_loss_breaches(self) -> int:
         """Counts where per_lane breached the at-least-once reconcile (context for the resilience
         story; it also marks those counts' throughput comparison unsound)."""
-        return sum(1 for row in self.rows if not row.baseline.no_loss_ok)
+        # An INCONCLUSIVE baseline is not a breach (BACKLOG #5574); it fails its row instead.
+        return sum(
+            1
+            for row in self.rows
+            if not row.baseline.no_loss_ok and not row.baseline.no_loss_inconclusive
+        )
 
     @property
     def resilience_wins(self) -> int:
@@ -603,11 +608,23 @@ def _tnr_label(value: bool | None) -> str:
 
 
 def _loss_label(row: ComparisonRow) -> str:
+    # An INCONCLUSIVE arm still fails its row (fail closed), but it is named for what it is, not
+    # as a breach: nothing proved a message lost (BACKLOG #5574).
+    if row.candidate_lost and row.candidate is not None and row.candidate.no_loss_inconclusive:
+        return (
+            f"CANDIDATE INCONCLUSIVE -- pooled could not clear zero-loss and proved no loss "
+            f"({row.candidate.no_loss_detail})"
+        )
     if row.candidate_lost:
         detail = row.candidate.no_loss_detail if row.candidate is not None else ""
         return f"CANDIDATE LOST -- pooled breached zero-loss ({detail})"
     if row.candidate is not None and not row.candidate.drain_completed:
         return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
+    if row.baseline.no_loss_inconclusive:
+        return (
+            f"BASELINE INCONCLUSIVE -- per_lane could not clear zero-loss, so the row has no "
+            f"sound basis ({row.baseline.no_loss_detail})"
+        )
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
     return "both clean"

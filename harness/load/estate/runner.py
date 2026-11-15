@@ -552,7 +552,7 @@ def _reconcile(
     if counter_reset is not None:
         unproven.append(
             f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
-            f"sends, so the intake, delivery and drain arms were not judged"
+            f"sends, so the intake and delivery arms were not judged"
         )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")
