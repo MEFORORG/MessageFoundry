@@ -501,12 +501,13 @@ def minimal_nav(*, session: bool = True) -> Markup:
     """The **confinement chrome**: the brand wordmark plus the one-click POST Sign-out form, and
     nothing else (ASVS 7.4.4).
 
-    ``session`` says whether the request this page answers carries a live session. Only then does
-    the chrome carry the Sign-out form and the session watchdog. A page that may be served without
+    Only with ``session`` true does the chrome carry the Sign-out form and the session watchdog.
+    It is not always what the request presents: a page served at the cross-site IdP callback gets
+    no ``SameSite=Strict`` session cookie and keeps the default. A page that may be served without
     one, at least the OIDC "leaving this site" page and the IdP hop, passes what its route found:
     with no session the watchdog's first probe gets a 303 from ``GET /ui/session-status`` and sends
     the browser to the login page, so such a page would never be usable, and it has no session to
-    sign out of. The default is ``True`` for the pages only a live session can reach.
+    sign out of. The default is ``True``.
 
     Authenticated pages that deliberately drop the full nav — step-up re-auth, the forced
     must-change-password page, passkey enrolment, the federated landing hop — used to render

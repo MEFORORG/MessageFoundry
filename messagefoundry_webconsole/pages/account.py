@@ -273,9 +273,7 @@ def leaving_site(
     ``Sec-Fetch-Site`` check — which also closes the pre-existing hole where any external page could
     start a federated sign-in just by linking to the start leg.
 
-    Continue and Cancel need no JavaScript, so the page asks for no ``script-src`` relaxation. It
-    is not script-free: with a live session its nav carries the session watchdog, which ``app.js``
-    runs (``minimal_nav``).
+    Continue and Cancel need no JavaScript, so the page asks for no ``script-src`` relaxation.
     """
     warn = (
         el(
