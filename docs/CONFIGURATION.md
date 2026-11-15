@@ -487,7 +487,10 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running
   instance resolves it from `<base_dir>/<dir>/<active-env>.toml` overlaid by **`MEFOR_VALUE_<KEY>`**
-  env vars (secrets — never the file; env wins). Keys are `lower_snake_case`.
+  env vars (secrets — never the file; env wins). Keys are `lower_snake_case`. Under a Windows
+  service, never in its NSSM list, where `serve` refuses any `MEFOR_VALUE_*`
+  ([why](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment)):
+  a secret goes in [the secrets directory](#the-secrets-directory-mefor_secrets_directory).
 - **Anchoring the value files (`base_dir` / `--project-root`).** A standalone **config repo** (ADR
   0017) keeps `environments/` at its root — a *sibling* of the `--config` dir. With the default
   (empty) `base_dir`, the files resolve relative to the **process working directory**, so a `serve`

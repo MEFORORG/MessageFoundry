@@ -328,7 +328,7 @@ no file in the secrets directory, and every secret moved there is missing, with 
 the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
-settings there. Where it knows the service but could not read them, they refuse only a store key
+settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
 or retired store key found in their own environment, never another secret setting. Use the DPAPI
 key file for
 the store key, and the secrets directory for the rest (see
@@ -692,8 +692,10 @@ NSSM environment.
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
   service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
-  list, and not if it could not (the previous bullet links where that is stated);
-  a `MEFOR_VALUE_*` value there is not refused.
+  list, and not if it could not (the previous bullet links where that is stated).
+  A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
+  active environment's value file if it is not a secret and is the same for every instance (the
+  previous bullet's link says when and why).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

@@ -2599,7 +2599,20 @@ count is above `0` (vault BACKLOG #2613).
   key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
   other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
   names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). They also
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
+  `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
+  a password, since the engine cannot tell which `env()` value is a secret (owner ruling
+  2026-11-14, vault BACKLOG #8212). The refusal never spells one, since the name was read from
+  the registry and may hold a value typed in the wrong place. It counts them: the names are
+  de-duplicated without regard to case, and each is counted once, under the first registry value
+  that sets it, so a name a later value also sets is not counted there. It sends each to the
+  secrets directory, or a value that is not a secret and is the same for every instance to the
+  active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
+  reference names is refused too, and the secrets directory does not supply it, since that
+  provider reads the environment only; the refusal says to drop the reference and put the
+  credential in the secrets directory under the setting it stands for, or else to use
+  `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
+  the bare name `MEFOR_VALUE_`, rather than move it. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
@@ -2608,8 +2621,9 @@ count is above `0` (vault BACKLOG #2613).
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
   is named, with the refusal's finding and remedy, only where the refusal would fire
   (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
-  engine finds its own service* below says, and either an engine secret is in that service's lists
-  or the lists could not be read and a store key is in the engine's own environment. A
+  engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
+  variable is in that service's lists, or the lists could not be read and a store key is in the
+  engine's own environment. A
   console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
   interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
   find its service there and this entry is not named. The reading is taken once per process, and
@@ -2641,11 +2655,17 @@ count is above `0` (vault BACKLOG #2613).
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
   the first reading an app built without them takes.
-- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
-  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+- **How to clear them:** remove each variable the entry names or counts from the registry value
+  it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
+  environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  a variable named by a `[secrets].provider = "env"` reference, whose name only your config
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
+  other than a store key that reaches the engine from the machine-wide environment, which is
+  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
+  reference.
 
 ---
 
