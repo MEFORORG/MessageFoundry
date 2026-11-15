@@ -70,12 +70,11 @@ could drop/rewrite a config module that executes as the service account on the n
      **owns** the object is still trusted once the owner arm resolves it, as Amendment A decided.
    - A definite refusal is reported ahead of an entry the checks cannot judge.
 
-   **Consequence kept fail-closed (owner ruling 2026-11-15, in a batch 482 Manager session).** An
-   engine run as LocalService or NetworkService could no longer use the config editors under its
-   own account, which self-trust allowed before: the folders they write into, and the files they
-   leave, would be refused. The remedy is an engine account that is its own, not a relaxed rule.
-   What fails, the messages and the remedy are stated once, in `docs/SERVICE.md`, *Lock down the
-   config directory (CONFIG-2)*.
+   **Consequence kept fail-closed (owner ruling 2026-11-15, in a batch 482 Manager session).** The
+   LocalService and NetworkService rule also changes what the config editors' output earns when
+   they run as such an engine's own account. The owner ruled to keep that fail-closed rather than
+   relax the rule. What fails, the messages and the remedy are in
+   [`docs/SERVICE.md`](../SERVICE.md), *Lock down the config directory (CONFIG-2)*.
 
    **Amended 2026-09-18 (BACKLOG #1647): the owner is vetted, not trusted unconditionally.** As
    originally built, `_evaluate_config_dacl` added the owner SID to the trusted set with no check, so a

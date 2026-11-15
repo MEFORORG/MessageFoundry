@@ -788,30 +788,43 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
       first one and leaving the rest on the old owner — check its summary line for skipped files.
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
-    - **An engine run as LocalService or NetworkService could not use the config editors under
-      its own account.** The `connection`, `codeset`, `alert` and `security` editors write through
-      `atomic_edit.replace_validated`, which makes its candidate and its lock in the edited file's
-      folder. So the account an editor runs as needs write on that folder, and the file it leaves
-      is owned by that account. When that account is LocalService (`S-1-5-19`) or NetworkService
-      (`S-1-5-20`), the guard refuses both the folder and the file, because other services share
-      that SID (ADR 0036 Amendment E). Before that amendment, self-trust passed both. The guard
-      vets the config directory and `codesets` ahead of the files in them, so the folder is what a
-      load or `/config/reload` names. Where the folder grants the shared account write directly,
-      the message has this shape:
-      ```text
-      refusing to load config from writable-by-others path D:\hl7\config: the account the engine runs as (S-1-5-19) has write access, but other services share that identity, so it is not trusted as the engine's own; see docs/SERVICE.md for required permissions
-      ```
-      The `connection` editor validates an edit by loading the directory, so it refuses the edit
-      with that message before it writes anything. The `alert` and `security` editors write the
-      settings file, which `serve` vets at start ahead of its folder, so the next start prints a
-      refusal of that file, such as `error: refusing to start from writable-by-others path
-      <settings file>: the owner (S-1-5-19) is the account the engine runs as, but other services
-      share that identity, ...`, and, once that file is fixed, a refusal of its folder. The
-      refusal is deliberate, and it stays (owner ruling 2026-11-15). The remedy is an engine account that is its own: the installer's default
-      per-service virtual account, or a dedicated local account or gMSA passed with
-      `-ServiceAccount` (no run has exercised either of those end to end yet; see the run-as
-      section above). Keep the config folders read-only to that account, as `-LockConfigDir` sets
-      them.
+  - **A LocalService or NetworkService engine account could not also be the account that runs the
+    config editors.** The engine and the web console never run an editor. They run from the CLI,
+    as whoever starts them, and the VS Code editor shells the `connection` CLI as its own user.
+    So this case needs an editor deliberately started as the engine's account, for example from a
+    scheduled task. Each editor that writes a file takes its lock (`atomic_edit.edit_lock`) in the
+    edited file's folder, and `atomic_edit.replace_validated` makes its candidate there. So the
+    account an editor runs as needs write on that folder, and the file it leaves is owned by that
+    account. That is at least `connection upsert` and `remove`, `codeset upsert`, `alert add` and
+    `remove`, and `security set`. When the account is LocalService (`S-1-5-19`) or NetworkService
+    (`S-1-5-20`), the guard refuses both the folder and the file, because other services share
+    that SID (ADR 0036 Amendment E). Before that amendment, self-trust passed both. The config
+    directory and `codesets` are vetted ahead of the files in them, so the folder is what a load
+    names: at start, or in the engine log on a `/config/reload`, whose caller gets only `422
+    invalid configuration`. Where the folder grants the shared account write directly, the
+    message has this shape:
+    ```text
+    refusing to load config from writable-by-others path D:\hl7\config: the account the engine runs as (S-1-5-19) has write access, but other services share that identity, so it is not trusted as the engine's own; see docs/SERVICE.md for required permissions
+    ```
+    - The `connection` editor validates an edit by loading the directory, so it refuses the edit
+      with that message before it replaces `connections.toml`. Its lock file stays behind.
+    - A `codeset upsert` does not run this check, so it completes, and the next load refuses the
+      `codesets` folder, then the table.
+    - The `alert` and `security` editors write the settings file, which `serve` vets at start
+      ahead of its folder. The next start prints a refusal of that file, such as `error: refusing
+      to start from writable-by-others path <settings file>: the owner (S-1-5-19) is the account
+      the engine runs as, but other services share that identity, ...`, and, once that file is
+      fixed, a refusal of its folder.
+
+    The refusal is deliberate, and it stays (owner ruling 2026-11-15). The remedy is an engine
+    account that is its own: the installer's default per-service virtual account, or a dedicated
+    local account or gMSA passed with `-ServiceAccount`. *Restrict the service token* above
+    records that no run has exercised a named account, and that the installer's read-back refuses
+    the `HOST\user` spelling today (BACKLOG #3938). Keep the config folders read-only to that
+    account, as `-LockConfigDir` sets them. That remedy clears this refusal. It does not make an
+    editor run under another account safe to use: `store._secure_file` would leave the edited file
+    granting only the account that ran the editor, so the engine's inherited read would be gone.
+    That gap is not settled here.
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable

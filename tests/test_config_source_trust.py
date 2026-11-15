@@ -342,6 +342,17 @@ def test_shared_service_owner_with_unresolvable_membership_names_the_shared_iden
     assert "could not be resolved" in reason
 
 
+def test_shared_service_folder_refusal_matches_the_documented_text() -> None:
+    """docs/SERVICE.md (CONFIG-2) quotes this reason in full for a config folder that grants a
+    LocalService engine account write, the folder a config editor run as that account needs. The
+    owner ruled on 2026-11-15 to keep that refusal, so a change of wording must change the doc."""
+    aces = [(_ALLOW, _FULL, _ADMINS), (_ALLOW, _MODIFY, _LOCAL_SERVICE)]
+    assert _evaluate_config_dacl(_ADMINS, aces, _LOCAL_SERVICE, _never_admin) == (
+        "the account the engine runs as (S-1-5-19) has write access, but other services share "
+        "that identity, so it is not trusted as the engine's own"
+    )
+
+
 def test_trusted_installer_grantee_passes() -> None:
     # TrustedInstaller is the servicing identity; it can replace any system file already.
     aces = [(_ALLOW, _FULL, _SELF), (_ALLOW, _FULL, _TRUSTED_INSTALLER)]
