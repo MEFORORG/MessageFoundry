@@ -91,8 +91,6 @@ class _ArmMetrics:
         all-trials and a timed-out drain counts against it: ``await_drain`` never saw the whole-pipeline
         gauge reach 0, so rows were stranded somewhere, which is the fusion comparator's reading too.
         Rates are trial means; peaks and tail latencies are the worst trial."""
-        if not recs:
-            raise ValueError("an arm needs at least one record")
         last = recs[-1]
         failures: list[str] = []
         for i, r in enumerate(recs):
