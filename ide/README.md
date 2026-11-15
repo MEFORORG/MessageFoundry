@@ -205,8 +205,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   until the file exists or the setting is cleared. The flag is left off at least when
   the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
   one, the file this setting's default names, and no file if not. The status bar's Start and
-  Restart pass the same value as `--service-config`, and refuse one that names no file in the
-  workspace before they start or stop anything. A value set to the default name counts too, so in
+  Restart pass the same value as `--service-config`, and refuse one that names no existing file
+  before they start or stop anything. A relative value is read from the workspace folder. A value set to the default name counts too, so in
   a workspace without that file they refuse rather than offer to create a new engine; clear the
   setting to get that offer back.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by

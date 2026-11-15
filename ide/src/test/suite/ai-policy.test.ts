@@ -102,8 +102,13 @@ function fakeCtx(seed?: AiPolicy): {
     globalState: {
       get: (key: string): unknown => store.get(key),
       keys: (): readonly string[] => [...store.keys()],
+      // As VS Code's Memento does, an undefined value deletes the key, so keys() no longer lists it.
       update: async (key: string, v: unknown): Promise<void> => {
-        store.set(key, v);
+        if (v === undefined) {
+          store.delete(key);
+        } else {
+          store.set(key, v);
+        }
         if (key === LOOPBACK_KEY) {
           updates++;
         }
@@ -322,9 +327,13 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     return {
       globalState: {
         get: (key: string): unknown => store.get(key),
-      keys: (): readonly string[] => [...store.keys()],
+        keys: (): readonly string[] => [...store.keys()],
         update: async (key: string, v: unknown): Promise<void> => {
-          store.set(key, v);
+          if (v === undefined) {
+            store.delete(key);
+          } else {
+            store.set(key, v);
+          }
         },
       },
     } as unknown as vscode.ExtensionContext;
