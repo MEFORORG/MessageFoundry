@@ -195,6 +195,313 @@ def test_a_successful_edit_leaves_the_file_owner_only(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+# --- vault BACKLOG #5619: an edit keeps the file's owner, and never replaces a link ---------------
+
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
+
+
+def _make_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        # An account without the Windows symlink privilege; a Linux runner always reaches the test.
+        pytest.skip(f"this account cannot create a link: {exc}")
+
+
+@EDITORS
+def test_an_edit_of_a_link_is_refused_and_leaves_the_link_and_its_target(
+    tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]]
+) -> None:
+    """The replace renames over the LINK, so the edit would have left a detached regular file where
+    the link was and its target unedited. It is refused before anything is written."""
+    path, edit = make(tmp_path)
+    target = tmp_path / "elsewhere" / path.name
+    target.parent.mkdir()
+    target.write_bytes(path.read_bytes())
+    before = target.read_bytes()
+    path.unlink()
+    _make_link(path, target)
+
+    # Each refusal type is a ValueError. The code-set editor already refused a table that resolves
+    # outside its folder before it reached the write path; the others reach the new refusal.
+    with pytest.raises(ValueError, match="it is a link|escapes the codesets directory"):
+        edit(_noop)
+
+    assert path.is_symlink() and path.resolve() == target.resolve()
+    assert target.read_bytes() == before
+    assert _leftovers(path.parent) == []
+
+
+def test_a_link_with_no_refusal_type_is_an_os_error(tmp_path: Path) -> None:
+    target = tmp_path / "real.toml"
+    target.write_text("x = 1\n", encoding="utf-8")
+    link = tmp_path / "linked.toml"
+    _make_link(link, target)
+
+    with pytest.raises(OSError, match="it is a link") as caught:
+        atomic_edit.replace_validated(link, b"x = 2\n", _noop)
+
+    assert caught.value.errno == errno.ELOOP
+    assert target.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_a_code_set_table_linked_inside_its_folder_is_refused(tmp_path: Path) -> None:
+    # The code-set editor refuses a table that resolves outside codesets/ on its own, so the
+    # parametrized test above cannot tell whether a link inside the folder reaches the new refusal.
+    _, edit = _codeset(tmp_path)
+    folder = tmp_path / "codesets"
+    target = folder / "meals.csv"
+    target.write_bytes((folder / "diets.csv").read_bytes())
+    before = target.read_bytes()
+    (folder / "diets.csv").unlink()
+    _make_link(folder / "diets.csv", target)
+
+    with pytest.raises(WiringError, match="it is a link"):
+        edit(_noop)
+
+    assert (folder / "diets.csv").is_symlink()
+    assert target.read_bytes() == before
+
+
+def _a_file_root_does_not_own(tmp_path: Path) -> tuple[Path, os.stat_result]:
+    """A live connections.toml owned by an account other than root, even on a runner that is root."""
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    if os.geteuid() == 0:
+        os.chown(path, 12345, 12345)
+    return path, path.stat()
+
+
+def _as_root(monkeypatch: pytest.MonkeyPatch, chown: Callable[..., None]) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "getegid", lambda: 0)
+    monkeypatch.setattr(os, "fchown", chown)
+
+
+@posix_only
+def test_root_gives_the_replaced_file_back_to_its_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root used to leave the edited file owned by root at 0600, so the service account that owns
+    it could no longer read it. The chown is simulated, so this runs as any account."""
+    path, st = _a_file_root_does_not_own(tmp_path)
+    chowned: list[tuple[int, int]] = []
+
+    def _record(_fd: int, uid: int, gid: int) -> None:
+        chowned.append((uid, gid))
+
+    _as_root(monkeypatch, _record)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert chowned == [(st.st_uid, st.st_gid)]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_bytes() == b"x = 1\n"
+
+
+@posix_only
+def test_an_account_editing_its_own_file_changes_no_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    st = path.stat()
+
+    def _forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an edit by the file's own account changed its owner")
+
+    monkeypatch.setattr(os, "geteuid", lambda: st.st_uid)
+    monkeypatch.setattr(os, "getegid", lambda: st.st_gid)
+    monkeypatch.setattr(os, "fchown", _forbidden)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert path.read_bytes() == b"x = 1\n"
+
+
+@posix_only
+def test_a_refused_chown_leaves_the_live_file_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = _a_file_root_does_not_own(tmp_path)
+    before = path.read_bytes()
+
+    def _refused(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    _as_root(monkeypatch, _refused)
+
+    with pytest.raises(WiringError, match="give its edit candidate the file's owner"):
+        atomic_edit.replace_validated(path, b"x = 1\n", _noop, refused_error=WiringError)
+
+    assert path.read_bytes() == before
+    assert _leftovers(tmp_path) == []
+
+
+@posix_only
+def test_a_lock_file_root_makes_is_given_to_the_folders_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Root gives the edited file back to its owner, so a root-owned 0600 lock file would refuse
+    # that owner's next edit. Simulated: the lock reads as root's and the folder as another's.
+    path, _ = _a_file_root_does_not_own(tmp_path)
+    given: list[tuple[int, int]] = []
+    real_fstat, real_stat = os.fstat, os.stat
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fstat", lambda fd: _with_uid(real_fstat(fd), 0))
+    monkeypatch.setattr(
+        os,
+        "stat",
+        lambda p, **kw: (
+            _with_uid(real_stat(p, **kw), 777) if Path(p) == tmp_path else real_stat(p, **kw)
+        ),
+    )
+    monkeypatch.setattr(os, "fchown", lambda _fd, uid, gid: given.append((uid, gid)))
+
+    with atomic_edit.edit_lock(path):
+        pass
+
+    assert given == [(777, real_stat(tmp_path).st_gid)]
+
+
+def _with_uid(st: os.stat_result, uid: int) -> os.stat_result:
+    fields = list(st)
+    fields[stat.ST_UID] = uid
+    return os.stat_result(fields)
+
+
+@posix_only
+def test_a_lock_name_planted_as_a_hard_link_is_never_handed_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The folder's owner could hard-link the lock name to a file root owns; the hand-over must not
+    # chown it. Simulated as root, like the test above.
+    path, _ = _a_file_root_does_not_own(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"root's")
+    os.link(victim, atomic_edit.lock_path_for(path))
+    given: list[tuple[int, int]] = []
+    real_fstat = os.fstat
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fstat", lambda fd: _with_uid(real_fstat(fd), 0))
+    monkeypatch.setattr(os, "fchown", lambda _fd, uid, gid: given.append((uid, gid)))
+
+    with atomic_edit.edit_lock(path):
+        pass
+
+    assert given == []
+
+
+#: An editing account no real account here is, reported through the token seam.
+_EDITOR_SID = "S-1-5-21-1000000001-1000000002-1000000003-4242"
+
+
+def _owner_and_grants(path: Path) -> tuple[str | None, list[str]]:
+    """The owner and the granted SIDs of ``path``, each in ``S-1-...`` form."""
+    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    assert sddl is not None
+    parsed = _parse_sddl_dacl(sddl)
+    assert parsed is not None and parsed.protected, sddl
+    owner = atomic_edit._canonical_sid(parsed.owner) if parsed.owner else None
+    return owner, [atomic_edit._canonical_sid(ace[3]) or ace[3] for ace in parsed.aces]
+
+
+def _real_owner(path: Path) -> str:
+    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl
+
+    match = _SDDL_OWNER.search(_read_dacl_sddl(path, owner=True) or "")
+    assert match is not None
+    sid = atomic_edit._canonical_sid(match.group(1))
+    assert sid is not None
+    return sid
+
+
+@windows_only
+def test_a_file_another_account_owns_stays_that_accounts_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An elevated administrator editing a file the service account owns used to restrict it to the
+    administrator alone, so the service could no longer read it. Here the file's real owner plays
+    the service account, and the token seam reports another account as the editor."""
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
+    # On Windows Server the owner is Administrators; it must still count as another account here.
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert _owner_and_grants(path) == (owner, [owner, _EDITOR_SID])
+    assert path.read_bytes() == b"x = 1\n"
+
+
+@windows_only
+def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control: the edit's own-account path is the owner-only rewrite it always was. The token
+    # seam reports the file's real owner, so the test means the same on every runner.
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert _owner_and_grants(path)[1] == [owner]
+
+
+@windows_only
+@pytest.mark.parametrize(
+    ("owner", "editor", "admins", "foreign"),
+    [
+        ("LS", "S-1-5-19", False, None),
+        ("BA", _EDITOR_SID, True, None),
+        ("BA", _EDITOR_SID, False, "S-1-5-32-544"),
+        ("SY", _EDITOR_SID, True, "S-1-5-18"),
+        ("BU", _EDITOR_SID, False, None),
+        ("WD", _EDITOR_SID, False, None),
+        ("SY", None, False, None),
+    ],
+    ids=[
+        "alias-is-self",
+        "administrators-elevated",
+        "administrators-not-held",
+        "system",
+        "users-is-never-granted",
+        "everyone-is-never-granted",
+        "no-token",
+    ],
+)
+def test_who_counts_as_another_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+    editor: str | None,
+    admins: bool,
+    foreign: str | None,
+) -> None:
+    # SDDL spells well-known owners by alias, so an editor running as LOCAL SERVICE must still
+    # recognise its own file, and an elevated administrator its Administrators-owned one.
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+
+    sddl = f"O:{owner}D:P"
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _path, owner=False: sddl)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: editor)
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: admins)
+
+    assert atomic_edit._foreign_windows_owner(tmp_path / "x.toml") == foreign
+
+
 @EDITORS
 def test_validation_reads_a_candidate_while_the_live_file_is_unchanged(
     tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]]

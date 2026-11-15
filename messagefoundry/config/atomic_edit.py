@@ -12,10 +12,23 @@ restriction (vault BACKLOG #2782). One copy here replaces the four.
 inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
 On Windows those modes are ignored and the candidate carries the directory's inherited access list
-until ``store._secure_file`` restricts the replaced file, the same window the old ``mkstemp`` writer
+until the replaced file is restricted (``store._secure_file``, or as the next paragraph says), the same window the old ``mkstemp`` writer
 had; the directory's own access list is the control there (``docs/SERVICE.md``). The caller's ``validate`` runs against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
+
+The replaced file keeps its OWNER (vault BACKLOG #5619). An edit restricts it to its owner, and an
+edit run as another account, such as root or an elevated administrator editing a file the service
+account owns, would otherwise have left it owned by and restricted to the editing account, so the
+account that reads it could no longer. On POSIX, root gives the candidate the live file's owner and
+group before the rename, and the mode is still 0600. On Windows, a live file another account owns
+is restricted to that account and the editing one rather than to the editing account alone, and
+its ownership is given back where Windows lets this account do that (it needs the restore privilege
+enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
+a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
+file Administrators owns, is the owner-only rewrite it always was.
+A config file that is itself a link is refused rather than replaced: the rename would put a detached
+regular file where the link was and leave its target unedited.
 
 The candidate keeps the live file's NAME because the loaders read meaning from it: a code set's name is
 its file stem and its format is its suffix, and ``connections.toml`` is found by name. ``companions``
@@ -55,6 +68,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from messagefoundry.config.key_file_access import _UNREACHABLE_WINERRORS
@@ -132,6 +146,10 @@ _STAT_STEP = "stat it"
 #: ``ERROR_ACCESS_DENIED`` as a true denial (both measured on Windows 11). So the wording on Windows
 #: names both causes.
 _WINDOWS = sys.platform == "win32"
+
+#: The bit of a reparse tag that marks a name surrogate: a symbolic link, a junction or another
+#: link-like reparse point such as a WSL symlink. The value ``uploads._NAME_SURROGATE_TAG`` holds.
+_NAME_SURROGATE_TAG = 0x20000000
 
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -268,7 +286,8 @@ def edit_lock(
     # locked it. The refusal names the lock file, though its advice speaks of owners, not modes.
     # Owner-only, like the files it guards: every edit leaves the edited file 0600, so an account
     # that could not open a lock an editor created could not edit that file either, and root opens
-    # a 0600 file regardless. Wider access gains nothing.
+    # a 0600 file regardless. Wider access gains nothing. A root edit gives the file back to its
+    # owner, so root hands a lock it holds to the folder's owner too (_give_root_lock_to_folder_owner).
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
     flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
@@ -286,6 +305,7 @@ def edit_lock(
         raise busy_error(
             f"{lock_path} is a link; an edit of {path} will not lock through it -- remove it"
         ) from exc
+    _give_root_lock_to_folder_owner(fd, path.parent)
     try:
         locked = _acquire(fd, lock_path, path, busy_error, timeout)
         held.add(key)
@@ -300,6 +320,28 @@ def edit_lock(
         # editor waits on its open handle would let a third editor lock a new file beside it.
         with contextlib.suppress(OSError):
             os.close(fd)
+
+
+def _give_root_lock_to_folder_owner(fd: int, folder: Path) -> None:
+    """Hand a lock file root holds to the owner of its folder. Best-effort and POSIX only.
+
+    A root edit gives the edited file back to its owner (:func:`replace_validated`), so a lock file
+    left owned by root at 0600 would refuse every later edit by that owner, who could otherwise
+    edit the file (vault BACKLOG #5619). The folder's owner stands for the file's: one lock guards
+    every file in the folder."""
+    if sys.platform == "win32" or os.geteuid() != 0:
+        return
+    try:
+        lock = os.fstat(fd)
+        owner = os.stat(folder)
+        # Only a lock file that is nothing else: the folder's owner could have planted the lock name
+        # as a hard link to a file root owns, and the chown would hand that file over.
+        if not stat.S_ISREG(lock.st_mode) or lock.st_nlink != 1:
+            return
+        if lock.st_uid == 0 and owner.st_uid != 0:
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+    except OSError as exc:
+        _log.warning("could not give the edit lock in %s to its folder's owner: %s", folder, exc)
 
 
 def replace_validated(
@@ -317,7 +359,10 @@ def replace_validated(
     fails stops the edit (:func:`is_file`), since a candidate without it would prove nothing. ``validate``
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
-    ``path`` and re-restricted to its owner. The private directory is removed either way, and a
+    ``path`` and re-restricted to its owner, which stays the live file's owner (vault BACKLOG #5619,
+    as the module docstring says). A ``path`` that is itself a link is refused before anything is
+    written, as ``refused_error(message)``, or with no ``refused_error`` as an ``OSError``
+    (``ELOOP``). The private directory is removed either way, and a
     stale one a killed editor of ``path`` left behind is removed first.
 
     On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
@@ -329,6 +374,8 @@ def replace_validated(
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
+    _refuse_a_link(path, refused_error)
+    live = _live_security(path)
     _remove_stale_candidates(path)
     with refused_as(path, refused_error, "create its edit candidate"):
         private = Path(
@@ -343,6 +390,14 @@ def replace_validated(
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
                 os.fsync(handle.fileno())
+                if live.posix_owner is not None and sys.platform != "win32":
+                    # Through the handle, never by path: the folder's owner could swap the private
+                    # directory before a chown by name. Before the rename, so a chown that fails
+                    # leaves the live file as it was.
+                    with refused_as(
+                        path, refused_error, "give its edit candidate the file's owner"
+                    ):
+                        os.fchown(handle.fileno(), *live.posix_owner)
         for companion in companions:
             # The stat gate: a companion read as absent would validate the candidate without it.
             if is_file(companion, refused_error=refused_error):
@@ -354,7 +409,155 @@ def replace_validated(
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
-    _secure_file(path)
+    if live.windows_owner is None or not _restrict_to_owner_and_editor(path, live.windows_owner):
+        _secure_file(path)
+
+
+@dataclass(frozen=True)
+class _LiveSecurity:
+    """Whose the replaced file must stay. ``posix_owner`` is the live file's ``(uid, gid)`` when
+    root is editing a file it does not own as root; ``windows_owner`` is the live file's owner SID
+    when that is another account. Each is ``None`` when the owner-only restriction for the editing
+    account is already right, as for a file the edit creates."""
+
+    posix_owner: tuple[int, int] | None = None
+    windows_owner: str | None = None
+
+
+def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None) -> None:
+    """Refuse an edit of ``path`` when ``path`` itself is a link: ``os.replace`` replaces the link,
+    not its target, so the edit would land in a detached regular file and leave the target as it
+    was (vault BACKLOG #5619). A folder above it that is a link is followed, as every reader does."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return  # nothing there, or a stat the editors' own gates already answered for
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    surrogate = reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    if not (stat.S_ISLNK(info.st_mode) or surrogate):
+        return
+    message = (
+        f"{path.name} was not changed: it is a link, and an edit would replace the link with a "
+        "copy rather than change the file it points to. Edit the file it points to, in its own "
+        "folder, or replace the link with that file"
+    )
+    if refused_error is None:
+        raise OSError(errno.ELOOP, message, str(path))
+    raise refused_error(message)
+
+
+def _live_security(path: Path) -> _LiveSecurity:
+    """Whose the live file is, where the edit must keep it so; see :class:`_LiveSecurity`."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return _LiveSecurity()  # a file the edit creates
+    except OSError as exc:
+        _log.warning(
+            "could not read who owns %s; the edit restricts it to this account: %s", path, exc
+        )
+        return _LiveSecurity()
+    if not stat.S_ISREG(st.st_mode):
+        return _LiveSecurity()
+    if sys.platform == "win32":
+        return _LiveSecurity(windows_owner=_foreign_windows_owner(path))
+    euid = os.geteuid()
+    if euid == 0 and (st.st_uid, st.st_gid) != (euid, os.getegid()):
+        return _LiveSecurity(posix_owner=(st.st_uid, st.st_gid))
+    return _LiveSecurity()
+
+
+def _canonical_sid(sid: str) -> str | None:
+    """``sid`` as Windows renders it in ``S-1-...`` form, an SDDL alias such as ``LS`` or ``BA``
+    included, or ``None`` when it does not convert. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return None
+    import ctypes
+
+    from messagefoundry.restricted_file import _render_sid, _sid_libraries
+
+    advapi32, kernel32 = _sid_libraries()
+    pointer = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
+        return None
+    try:
+        return _render_sid(pointer)
+    finally:
+        kernel32.LocalFree(pointer)
+
+
+def _foreign_windows_owner(path: Path) -> str | None:
+    """The SID of the account that owns ``path`` when that is not this process's account, else
+    ``None``. ``None`` too when the owner, the token or the token's groups cannot be read, and for
+    an owner many accounts hold, such as Users; the edit then makes the owner-only rewrite it always
+    made.
+
+    Administrators as the owner is this account's own when its token holds Administrators enabled:
+    that is the default owner of an elevated administrator's files on Windows Server, and such a
+    file is the administrator's own."""
+    from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
+    from messagefoundry.restricted_file import (
+        RestrictedFileError,
+        _is_broad_group,
+        _is_package_sid,
+        administrators_enabled,
+    )
+    from messagefoundry.store.store import _SDDL_OWNER, _current_user_sid, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    match = _SDDL_OWNER.search(sddl) if sddl is not None else None
+    owner = _canonical_sid(match.group(1)) if match is not None else None
+    editor = _current_user_sid()
+    if owner is None or editor is None or owner == editor:
+        return None
+    # An owner many accounts hold is never granted the file: the owner-only rewrite drops it.
+    if _is_broad_group(owner) or _is_package_sid(owner):
+        return None
+    if owner == ADMINISTRATORS_SID:
+        try:
+            if administrators_enabled():
+                return None
+        except RestrictedFileError as exc:
+            _log.warning("could not read this process's groups for %s: %s", path, exc)
+            return None
+    return owner
+
+
+def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
+    """Restrict ``path`` to the account that owned the live file and the editing account, and give
+    the ownership back; ``False``, logged, when the access list could not be written. Windows only.
+
+    The owner-only rewrite would grant the editing account alone, so an elevated administrator's
+    edit of a file the service account owns would leave the service unable to read it (vault
+    BACKLOG #5619). The editor keeps its entry because it already held write access to the file.
+    Naming another account as the owner needs the restore privilege, which an elevated
+    administrator holds but does not enable; when that is refused the access list alone is written
+    and the refusal is logged, since the access list is what lets the owner read it."""
+    from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
+
+    editor = _current_user_sid()
+    grants = dict.fromkeys(sid for sid in (owner, editor) if sid)
+    sddl = f"O:{owner}D:P" + "".join(f"(A;;FA;;;{sid})" for sid in grants)
+    result = _set_security_from_sddl(path, sddl, protected=True)
+    if result.failure is not None:
+        _log.warning("could not restrict %s to its owner after the edit: %s", path, result.failure)
+        return False
+    if result.owner_status not in (None, 0):
+        _log.warning(
+            "%s is restricted to its owner %s after the edit, but the ownership could not be "
+            "given back (Win32 status %s); this account owns it now",
+            path,
+            owner,
+            result.owner_status,
+        )
+    if result.owner_status != 0 and result.dacl_status != 0:
+        _log.warning(
+            "could not restrict %s to its owner after the edit (Win32 status %s)",
+            path,
+            result.dacl_status,
+        )
+        return False
+    return True
 
 
 @contextlib.contextmanager
