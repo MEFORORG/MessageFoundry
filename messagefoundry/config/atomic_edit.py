@@ -132,14 +132,9 @@ _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 #: ``OSError``, so it is not reported as a permission. The stat gate has its own rule (:func:`is_file`).
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
-#: A chown is refused by ``EINVAL`` or ``EOVERFLOW`` as well as by ``EPERM``: an owner id the user
-#: namespace or an id-mapped mount cannot map (a container, a mount inside one). Either way the edit
-#: stops before the rename.
-_CHOWN_REFUSED = _REFUSED | {errno.EINVAL, errno.EOVERFLOW}
-
-#: The ``step`` of root's chown of the candidate, which :func:`_refusal` advises on differently: the
-#: directory is writable and the cause is the owner's id, so the write advice would mislead.
-_CHOWN_STEP = "give its edit candidate the file's owner"
+#: ``errno`` values from a chown meaning the owner's id has no mapping here: a user namespace or an
+#: id-mapped mount (a container, a mount inside one).
+_UNMAPPED_ID = frozenset({errno.EINVAL, errno.EOVERFLOW})
 
 #: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
 #: directory refuses no read, so the write advice would send an operator to the wrong fix.
@@ -377,8 +372,7 @@ def replace_validated(
     On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
     the new candidate. With ``refused_error`` set, a refusal building the candidate or making the
     replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
-    did not pass; ``EINVAL`` and ``EOVERFLOW`` too for root's chown of the candidate,
-    ``_CHOWN_REFUSED``) is raised as
+    did not pass), and any failure of root's chown of the candidate, is raised as
     ``refused_error(message)``. Those steps leave the live file as it
     was, since a rename that fails has not happened. What follows the replace, any other
     ``OSError`` past that companion stat, and whatever ``validate`` raises are never converted."""
@@ -405,13 +399,9 @@ def replace_validated(
                     # Through the handle, never by path: the folder's owner could swap the private
                     # directory before a chown by name. Before the rename, so a chown that fails
                     # leaves the live file as it was.
-                    with refused_as(
-                        path,
-                        refused_error,
-                        _CHOWN_STEP,
-                        refusals=_CHOWN_REFUSED,
-                    ):
-                        os.fchown(handle.fileno(), *live.posix_owner)
+                    _give_candidate_the_owner(
+                        handle.fileno(), live.posix_owner, path, refused_error
+                    )
         for companion in companions:
             # The stat gate: a companion read as absent would validate the candidate without it.
             if is_file(companion, refused_error=refused_error):
@@ -436,6 +426,42 @@ class _LiveSecurity:
 
     posix_owner: tuple[int, int] | None = None
     windows_owner: str | None = None
+
+
+def _give_candidate_the_owner(
+    fd: int,
+    owner: tuple[int, int],
+    path: Path,
+    refused_error: Callable[[str], Exception] | None,
+) -> None:
+    """Give the candidate open on ``fd`` the live file's ``owner`` (POSIX, root only). Any failure
+    is raised as ``refused_error(message)``, or unchanged with no ``refused_error``: it comes before
+    the rename, so the live file is as it was whatever the cause. The message names the cause the
+    ``errno`` points to, since none of them is a read-only or foreign-owned directory."""
+    if sys.platform == "win32":  # pragma: no cover - the caller is POSIX only; for the type checker
+        return
+    try:
+        os.fchown(fd, *owner)
+    except OSError as exc:
+        if refused_error is None:
+            raise
+        _log.warning(
+            "this account could not give the edit candidate for %s its owner: %s",
+            scrub_log_argument(str(path)),
+            scrub_log_argument(str(exc)),
+        )
+        cause = (
+            "That account's id may not exist on this mount or in this container"
+            if exc.errno in _UNMAPPED_ID
+            else "This account may not change a file's owner here, as a root that NFS squashes or "
+            "a container without the chown capability cannot, or the file system does not keep "
+            "owners"
+        )
+        raise refused_error(
+            f"{path.name} was not changed: this account could not give the edited file back to "
+            f"the account that owns it: {_reason(exc)}. {cause}; edit the file as the account that owns "
+            "it"
+        ) from exc
 
 
 def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None) -> None:
@@ -576,20 +602,16 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
 
 @contextlib.contextmanager
 def refused_as(
-    path: Path,
-    refused_error: Callable[[str], Exception] | None,
-    step: str,
-    *,
-    refusals: frozenset[int] = _REFUSED,
+    path: Path, refused_error: Callable[[str], Exception] | None, step: str
 ) -> Iterator[None]:
-    """Raise a refusal (an ``errno`` in ``refusals``, ``_REFUSED`` unless a step names more) from the
-    body, which does ``step`` to ``path``, as ``refused_error(message)``; any other ``OSError``, or
-    any at all when ``refused_error`` is ``None``, propagates unchanged. Only for a step that leaves
-    ``path`` as it was when it fails, because the message says so."""
+    """Raise a refusal (``_REFUSED``) from the body, which does ``step`` to ``path``, as
+    ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
+    ``None``, propagates unchanged. Only for a step that leaves ``path`` as it was when it fails,
+    because the message says so."""
     try:
         yield
     except OSError as exc:
-        if refused_error is None or exc.errno not in refusals:
+        if refused_error is None or exc.errno not in _REFUSED:
             raise
         raise refused_error(_refusal(path, exc, step)) from exc
 
@@ -607,8 +629,7 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
         scrub_log_argument(str(path)),  # a name from a directory listing, which nothing has checked
         scrub_log_argument(str(exc)),
     )
-    code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
-    reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
+    reason = _reason(exc)
     held = (
         "Another program may have the file open, such as an editor or a virus scanner, so try "
         "again once it closes it. If that is not it: "
@@ -621,12 +642,6 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
             "on a share, that cannot be reached, so it was not taken to be absent. Restore the "
             "share or the link's target, or remove the link"
         )
-    if step == _CHOWN_STEP:
-        return (
-            f"{path.name} was not changed: this account could not give the edited file back to the "
-            f"account that owns it: {reason}. That account's id may not exist on this mount or in "
-            "this container; edit the file as the account that owns it, or where its id maps"
-        )
     if step == READ_STEP:
         return (
             f"{path.name} could not be read: {reason}. {held}Another account owns the file or its "
@@ -638,6 +653,12 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
         "read-only config directory is, or another account owns the file named; change the file "
         "where this account can write it, or as the account that owns it"
     )
+
+
+def _reason(exc: OSError) -> str:
+    """The error's text and its ``errno`` name, as an operator message quotes them."""
+    code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
+    return (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
 
 
 def _acquire(

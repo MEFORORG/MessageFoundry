@@ -32,7 +32,7 @@ from messagefoundry.config import (
 )
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.wiring import WiringError, load_config
-from tests._win_acl import assert_rewritten_to_grantee, born_explicit_sids, protected_entries
+from tests._win_acl import assert_rewritten_to_grantee, protected_entries
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 
@@ -322,18 +322,20 @@ def test_an_account_editing_its_own_file_changes_no_owner(
 
 @posix_only
 @pytest.mark.parametrize(
-    "refusal",
+    ("refusal", "cause"),
     [
-        PermissionError(errno.EPERM, "Operation not permitted"),
-        # An owner id this mount or user namespace cannot map: the chown is refused all the same,
-        # and must reach the operator as a refused edit rather than a raw OSError.
-        OSError(errno.EINVAL, "Invalid argument"),
-        OSError(errno.EOVERFLOW, "Value too large for defined data type"),
+        (PermissionError(errno.EPERM, "Operation not permitted"), "may not change a file's owner"),
+        # An owner id this mount or user namespace cannot map: the chown fails all the same, and
+        # must reach the operator as a refused edit rather than a raw OSError.
+        (OSError(errno.EINVAL, "Invalid argument"), "id may not exist"),
+        (OSError(errno.EOVERFLOW, "Value too large for defined data type"), "id may not exist"),
+        # A file system that keeps no owners: any failure here is before the rename.
+        (OSError(errno.ENOSYS, "Function not implemented"), "may not change a file's owner"),
     ],
-    ids=["EPERM", "EINVAL", "EOVERFLOW"],
+    ids=["EPERM", "EINVAL", "EOVERFLOW", "ENOSYS"],
 )
 def test_a_refused_chown_leaves_the_live_file_as_it_was(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError, cause: str
 ) -> None:
     path, _ = _a_file_root_does_not_own(tmp_path)
     before = path.read_bytes()
@@ -343,8 +345,10 @@ def test_a_refused_chown_leaves_the_live_file_as_it_was(
 
     _as_root(monkeypatch, _refused)
 
-    with pytest.raises(WiringError, match="could not give the edited file back"):
+    with pytest.raises(WiringError, match="could not give the edited file back") as refused:
         atomic_edit.replace_validated(path, b"x = 1\n", _noop, refused_error=WiringError)
+
+    assert cause in str(refused.value)
 
     assert path.read_bytes() == before
     assert _leftovers(tmp_path) == []
@@ -466,14 +470,33 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
         return True
 
     monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", _hand_back)
-    # The candidate is born in a fresh private directory beside the file; a file born the same way
-    # shows what such a file carries explicitly before any rewrite.
-    carried = born_explicit_sids(tmp_path)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
-    assert_rewritten_to_grantee(path, owner, carried)
+    assert_rewritten_to_grantee(path, owner)
+
+
+@windows_only
+def test_the_rewrite_check_fails_on_an_inherited_entry_or_a_broad_group(tmp_path: Path) -> None:
+    """The control for :func:`assert_rewritten_to_grantee`: it must be able to fail."""
+    import subprocess
+
+    import messagefoundry.store.store as store_mod
+
+    grantee = store_mod._current_user_sid()
+    assert grantee is not None
+    untouched = tmp_path / "untouched"
+    untouched.write_bytes(b"x")
+    broad = tmp_path / "broad"
+    broad.write_bytes(b"x")
+    store_mod._secure_file(broad)
+    subprocess.run(  # nosec B603 B607 - a fixed system tool, no shell, test-only
+        ["icacls", str(broad), "/grant", "*S-1-5-32-545:R"], check=True, capture_output=True
+    )
+    for path in (untouched, broad):
+        with pytest.raises(AssertionError):
+            assert_rewritten_to_grantee(path, grantee)
 
 
 @windows_only
