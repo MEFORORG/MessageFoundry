@@ -382,28 +382,36 @@ describes the shipped module exactly stops being true here: section 1 does not d
 below.
 
 **What was wrong.** On every roll past the bound, `record_rollover` wrote the sink's state as `rolled`
-and only then escalated, so the stage-2 latch read the state it had just overwritten. And the bound's
-window restarts a minute after its first roll, so a sink still rolling every few seconds flipped back
-to `rolled`, and `can_log()` read True with no probe, until the bound tripped again.
+and only then escalated, so for that interval another thread read the sink as writable. And the
+bound's window restarts a minute after its first roll, so a sink still rolling every few seconds
+flipped back to `rolled`, and `can_log()` read True with no probe, until the bound tripped again. The
+page and stop request on every roll past the bound are NOT among what was wrong: they are kept.
 
 **The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).**
 
 - The prior state and the streak are read, and the verdict written, in one hold of the guard's lock.
 - A sink the bound declared unwritable stays unwritable on a later roll that the bound alone would
   call a heal, while that roll comes within 60 seconds of the sink's last roll or stage-2 failure.
-  That roll pages nothing. It is counted, its rolled-aside path is recorded (the previous one is kept
-  when it moved nothing aside), and the stage-2 cause stays on `GET /status`.
+  Only the state differs from the bound alone: that roll still sends its stage-1 page, and its cause
+  is the newest on `GET /status`, as is its rolled-aside path unless it moved nothing aside, when
+  the previous path is kept.
 - A stage-2 failure refreshes that 60-second clock, so a sink failing outright never reads as quiet.
   A stage-2 failure on a sink the latch alone holds pages, as it would have on the `rolled` sink the
   bound alone left.
-- The first roll after 60 seconds with no roll and no stage-2 failure moves the sink to `rolled` and
-  pages, as section 1 says. A latched sink that heals and never rolls again stays unwritable until
-  the operator recovery's `revalidate()` writes a record to it.
+- The first roll after 60 seconds with no roll and no stage-2 failure moves the sink to `rolled`, as
+  section 1 says. A latched sink that heals and never rolls again stays unwritable until the
+  operator recovery's `revalidate()` writes a record to it.
 - A sink stage 2 declared dead is not latched by this. Its healing roll moves it to `rolled` unless
   the bound itself says it is flapping.
+- **Stricter than section 1, and stated rather than hidden.** A sink the latch holds reads
+  unwritable while it may be accepting records. With two sinks, a stage-2 failure on the other one
+  then asks for the stop, where the bound alone would not have. Section 1 and `record_unwritable`
+  call a halt while another sink keeps accepting writes a control resting on a false premise; the
+  latch accepts that cost in exchange for never reading a flapping sink writable.
 
-**The verdict is the bound's OR the latch**, so the latch never reads a sink writable, pages, or asks
-for a stop less often than the bound alone. That property was checked by running this guard beside
-the one before this amendment, under a fake clock, over random sequences of rolls, stage-2 failures
-and recoveries on one and on two sinks; the comparison found violations in earlier drafts of this
-change and none in this one. `tests/test_log_write_guard.py` pins the cases it found.
+**The verdict is the bound's OR the latch**, so the latch never reads a sink writable, sends a stage-1
+or stage-2 page, or asks for a stop less often than the bound alone. That property was checked by
+running this guard beside the one before this amendment, under a fake clock, over random sequences of
+rolls, stage-2 failures and recoveries on one and on two sinks, comparing state, `can_log()`, stop
+requests, stage-2 pages and stage-1 pages at every step; the comparison found violations in earlier
+drafts of this change and none in this one. `tests/test_log_write_guard.py` pins the cases it found.
