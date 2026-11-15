@@ -12605,7 +12605,7 @@ class AuthService:
         It refuses, ends and reports a session as :meth:`identity_for_token` does, with one
         exception: a session whose owner's temporary credential has lapsed reads ``False`` and is
         left as it is, so the sign-in callback's supersession ends it and records the lapse
-        (BACKLOG #3749). Unlike that method, this one touches no session.
+        (BACKLOG #3749). Unlike that method, this one never refreshes a session's idle clock.
         """
         if not token:
             return False
