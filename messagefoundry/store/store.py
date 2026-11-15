@@ -20757,8 +20757,8 @@ class MessageStore:
             await self._commit()
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
-        issuance for an MFA-delegated AD/Kerberos login."""
+        """Stamp a session's second-factor as satisfied (WP-14), after a factor ceremony. A sign-in
+        that owes no factor is stamped in ``create_session``'s own INSERT instead (BACKLOG #5624)."""
         stamp = mfa_stamp(time.time() if now is None else now)
         async with _writer_txn(self._db, self._lock):
             await self._write_session(token_hash, stamp)

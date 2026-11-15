@@ -15104,11 +15104,8 @@ class SqlServerStore:
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
-        # issuer. BACKLOG #5613: the columns are BIN2, so this compares byte for byte, as SQLite and
-        # Postgres do. It is not only a veto: the federated sign-in SELECTS its account through it
-        # (AuthService._complete_oidc_login), and the bind refuses on the row it returns, so under a
-        # case-insensitive collation a second subject differing only in case could neither bind nor
-        # sign in. A store whose columns predate the BIN2 DDL is refused at open by the schema check.
+        # issuer. Byte-exact through the columns' BIN2 collation (BACKLOG #5613); the base
+        # protocol's docstring says why that matters.
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )

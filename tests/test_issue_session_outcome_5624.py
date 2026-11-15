@@ -14,6 +14,7 @@ It is now told apart and audited as ``account_deleted``.
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -133,6 +134,7 @@ async def test_issue_session_names_a_deleted_account_and_a_binding_change_apart(
                 idp_auth_time=None,
             )
         assert gone.value.account_deleted is True
+        assert copy.copy(gone.value).account_deleted is True  # rebuilt from its args
     finally:
         await store.close()
 

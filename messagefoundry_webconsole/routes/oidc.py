@@ -237,6 +237,9 @@ _REASON_TO_CODE = {
     # a site where every account is federated.
     "federated_subject_not_bound": "oidc_not_linked",
     "federated_subject_unbound": "oidc_not_linked",
+    # BACKLOG #5624: the bound account was deleted mid-login. Reached by the same visitor as the
+    # mid-login case above, so it keeps the code that refusal had before it was named.
+    "account_deleted": "oidc_not_linked",
 }
 
 

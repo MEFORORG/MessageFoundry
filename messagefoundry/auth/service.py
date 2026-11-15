@@ -1943,8 +1943,9 @@ class _BindingChangedMidLogin(Exception):
     for its binding, because the guarded insert refuses a present row only on its pair.
     """
 
-    def __init__(self, *, account_deleted: bool = False) -> None:
-        super().__init__("account deleted" if account_deleted else "binding changed")
+    def __init__(self, account_deleted: bool = False) -> None:
+        # The flag is the only argument, so ``cls(*exc.args)`` rebuilds it (copy, pickle).
+        super().__init__(account_deleted)
         self.account_deleted = account_deleted
 
 
@@ -13242,7 +13243,12 @@ class AuthService:
         its seal says, so a bind must ask the raw row, not :meth:`_load_user_by_federated_subject`,
         which reads a failing holder as none."""
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
-        return holder is not None and holder.id != user_id
+        if holder is None or holder.id == user_id:
+            return False
+        # Checked for its report alone: a holder whose record fails its seal is reported as the
+        # checked loader would report it (BACKLOG #2592), so the refusal is not its only trace.
+        await self._verified(holder)
+        return True
 
     async def _verified(self, user: UserRecord | None) -> _SealCheck:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):

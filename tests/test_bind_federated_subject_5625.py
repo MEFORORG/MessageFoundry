@@ -98,6 +98,8 @@ async def test_a_rebind_onto_a_pair_an_unsealed_row_holds_keeps_the_current_bind
     assert [
         a for a in await store.list_audit() if a["action"] == "auth.federated_subject_unbound"
     ] == []
+    # The failing holder is still reported, as the checked loader reported it before.
+    assert [a for a in await store.list_audit() if a["action"] == "integrity.authority_seal_failed"]
 
 
 async def test_a_case_variant_id_binds_under_the_id_the_row_holds(
