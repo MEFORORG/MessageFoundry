@@ -470,8 +470,14 @@ _REFUSED_POSTURES = pytest.mark.parametrize(
             probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
             environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE},
         ),
+        _service([f"MEFOR_VALUE_PARTNER_PASSWORD={_PASSWORD_VALUE}"]),
     ],
-    ids=["store-password-listed", "store-key-listed", "unreadable-list-key-in-environment"],
+    ids=[
+        "store-password-listed",
+        "store-key-listed",
+        "unreadable-list-key-in-environment",
+        "env-value-listed",
+    ],
 )
 
 
@@ -607,7 +613,7 @@ _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
     [
         _CONSOLE_SCRIPT_LAUNCHER,
         ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE),
-        _service(["MEFOR_AI_ENVIRONMENT=prod", "MEFOR_VALUE_PARTNER_HOST="]),
+        _service(["MEFOR_AI_ENVIRONMENT=prod", "MEFOR_VALUE_PARTNER_HOST"]),
         _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE),
         read_service_env_posture(
             probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
@@ -634,12 +640,12 @@ def test_an_embedded_app_builds_where_serve_would_not_refuse(
 
 def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -> None:
     """A setting that is not secret-class, and the secrets directory's own path, are left alone.
-    An empty ``MEFOR_VALUE_*`` entry sets nothing, so it is not read as one."""
+    A ``MEFOR_VALUE_*`` entry with no ``=`` sets no variable, so it is not read as one."""
     posture = _service(
         [
             "MEFOR_AI_ENVIRONMENT=prod",
             "MEFOR_SECURITY_REQUIRE_MFA=false",
-            "MEFOR_VALUE_PARTNER_HOST=",
+            "MEFOR_VALUE_PARTNER_HOST",
             "MEFOR_SECRETS_DIRECTORY=C:/ProgramData/MessageFoundry-secrets",
         ]
     )
@@ -649,13 +655,19 @@ def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -
 
 @pytest.mark.parametrize(
     "entry",
-    ["MEFOR_VALUE_REGISTRY_PASSWORD=synthetic-value", "mefor_value_partner_host=example.test"],
+    [
+        "MEFOR_VALUE_REGISTRY_PASSWORD=synthetic-value",
+        "mefor_value_partner_host=example.test",
+        "MEFOR_VALUE_PARTNER_HOST=",
+        "MEFOR_VALUE_PARTNER_HOST=   ",
+    ],
 )
 def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     """Vault BACKLOG #8212 item 7, the owner's ruling of 2026-11-14: every ``MEFOR_VALUE_*``
     variable in the service's lists refuses, a host name as well as a password, since the engine
-    cannot tell which is a secret. The remedy names both ways in: the secrets directory for a
-    secret, the environment's value file for anything else."""
+    cannot tell which is a secret. An empty or blank one refuses too: the engine still overlays it
+    on the value file. The remedy names both ways in: the secrets directory for a secret, the
+    environment's value file for anything else."""
     name = entry.split("=", 1)[0].upper()
     posture = _service([entry, "MEFOR_AI_ENVIRONMENT=prod"])
     assert posture.listed_value_names == (name,)
@@ -671,7 +683,9 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
-    assert entry.split("=", 1)[1] not in refusal, "the value must never reach the refusal"
+    value = entry.split("=", 1)[1]
+    assert not value.strip() or value not in refusal, "the value must never reach the refusal"
+    assert '"[environments]"' in refusal
     [(loosening, twin)] = service_env_loosenings(posture)
     assert loosening == "secret_in_service_environment"
     _assert_twin_of(refusal, twin)
@@ -686,10 +700,12 @@ def test_an_env_value_name_that_is_not_plain_is_counted_and_never_spelled() -> N
     assert "ODD NAME" not in refusal and "synthetic-value" not in refusal
     assert (
         "MEFOR_VALUE_PLAIN (in Parameters\\AppEnvironmentExtra), 1 more MEFOR_VALUE_* name(s) "
-        "not spelled here"
+        "(not spelled here: not the prefix followed by letters, digits and underscores) is set in"
     ) in refusal
-    only_odd = service_env_refusal(_service(["MEFOR_VALUE_ODD NAME=synthetic-value"]))
-    assert only_odd is not None and only_odd.startswith("1 more MEFOR_VALUE_* name(s)")
+    assert "rename that env() key to letters, digits and underscores first" in refusal
+    for odd in ("MEFOR_VALUE_ODD NAME=synthetic-value", "MEFOR_VALUE_=synthetic-value"):
+        only_odd = service_env_refusal(_service([odd]))
+        assert only_odd is not None and only_odd.startswith("1 more MEFOR_VALUE_* name(s)")
 
 
 def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None:

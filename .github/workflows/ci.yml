@@ -5295,7 +5295,8 @@ jobs:
           # service as MEFOR_SECRETS_DIRECTORY. The path is read back from the service's list here,
           # because `nssm set` below replaces that list and must name it again. WriteAllText creates
           # each file, so it takes the directory's restricted access list; a moved file would keep
-          # its old one. Then the engine's own check runs on the directory and prints names only.
+          # its old one. Then the engine's own check runs on the directory, prints names only, and
+          # fails unless it read exactly the names written.
           $parametersKey = "HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters"
           $secretsEntry = @((Get-ItemProperty -LiteralPath $parametersKey -Name AppEnvironmentExtra).AppEnvironmentExtra |
             Where-Object { $_ -like "MEFOR_SECRETS_DIRECTORY=*" })
@@ -5312,8 +5313,8 @@ jobs:
           foreach ($name in $registryValues.Keys) {
             [System.IO.File]::WriteAllText((Join-Path $secretsDir $name), $registryValues[$name])
           }
-          python -c "import sys; from messagefoundry.engine_secrets import open_secrets_directory as o; d = o({'MEFOR_SECRETS_DIRECTORY': sys.argv[1]}); print(sorted(d.read_values()) if d else 'none')" $secretsDir
-          if ($LASTEXITCODE -ne 0) { throw "the engine refuses the secrets directory '$secretsDir' (exit $LASTEXITCODE)" }
+          python -c "import sys; from messagefoundry.engine_secrets import open_secrets_directory as o; d = o({'MEFOR_SECRETS_DIRECTORY': sys.argv[1]}); got = sorted(d.read_values()) if d else []; print(got); sys.exit(0 if got == sorted(sys.argv[2:]) else 3)" $secretsDir @($registryValues.Keys)
+          if ($LASTEXITCODE -ne 0) { throw "the engine refuses the secrets directory '$secretsDir', or did not read the registry values from it (exit $LASTEXITCODE)" }
           # The service's own environment. With sign-in on it carries two things for the rig account:
           # require_mfa off (provision-admin enrols an authenticator app at a terminal and offers no
           # other way, so the account has none; the bind is loopback), and an [alerts] channel (an

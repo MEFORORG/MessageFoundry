@@ -10364,7 +10364,8 @@ def security_loosenings(
     ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
     Windows service, whether its registry-held environment lists could be read, and whether a
-    store key reaches it through its environment. An engine secret in those lists refuses the
+    store key reaches it through its environment. An engine secret or any ``MEFOR_VALUE_*``
+    variable in those lists refuses the
     start of ``serve`` and ``supervise``, and the build of ``create_app`` and
     ``create_managed_app``, which never reach this registry then; a caller that reads it with no
     refusal of its own gets what they refuse as ``secret_in_service_environment``, where the

@@ -39,8 +39,9 @@ by something else, such as a shell, even when that shell itself runs under some 
 **What it does not cover**, at least: a service host other than NSSM, an ``nssm.exe`` renamed to
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or
 the ``messagefoundry`` launcher, and a variable an operator names as a ``[secrets].provider =
-"env"`` reference, whose name the engine does not read here. An ``env()`` value's
-``MEFOR_VALUE_*`` name is covered.
+"env"`` reference, whose name the engine does not read here; and any secret or ``MEFOR_VALUE_*``
+variable, other than a store key, that reaches the engine from the machine-wide environment. An
+``env()`` value's ``MEFOR_VALUE_*`` name in the service's own lists is covered.
 
 **Not a refusal when the read fails, with one exception.** An engine that cannot walk its
 ancestors, or cannot read its service's lists, reports ``service_environment_unobservable`` and
@@ -53,7 +54,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -91,11 +91,6 @@ _DIRECTORY_VARIABLE = "MEFOR_SECRETS_DIRECTORY"
 
 #: The prefix of an ``env()`` value's variable. Every listed name that starts with it refuses.
 _VALUE_PREFIX = _setting_names.VALUE_PREFIX
-
-#: A value name a refusal may spell: letters, digits and underscores, the rule the secrets
-#: directory holds its own ``MEFOR_VALUE_*`` file names to. The names here come from the registry,
-#: not from a fixed list, so any other spelling is counted rather than printed.
-_PLAIN_VALUE_NAME = re.compile(r"MEFOR_VALUE_[A-Z0-9_]+")
 
 #: Names that take either the secret itself or a path to a file that holds it. Only the inline
 #: form is a secret, the rule ``settings._FILE_INLINE_PEM_KEYS`` applies to the config file.
@@ -161,8 +156,9 @@ class ServiceEnvPosture:
 
     @property
     def listed_value_names(self) -> tuple[str, ...]:
-        """The ``MEFOR_VALUE_*`` names the service's environment lists set, as read from the
-        registry. Unlike the two properties above, these are not from a fixed list."""
+        """The ``MEFOR_VALUE_*`` names the service's environment lists set, upper-cased as the
+        engine's own environment holds them on Windows. Unlike the two properties above, these
+        come from the registry, not from a fixed list."""
         return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
 
     def named_with_source(self, names: Sequence[str]) -> str:
@@ -276,15 +272,19 @@ class _WindowsProbe:
 
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     """The upper-cased names of the variables that ``NAME=value`` entries set to a secret. The
-    value is dropped here and never kept. An empty value sets nothing, and a path in a name that
-    takes either a key or its path is not a secret, so neither name is kept. Windows compares
+    value is dropped here and never kept. An empty value sets nothing, so its name is not kept,
+    except a ``MEFOR_VALUE_*`` name, whose empty value the engine still overlays on the value
+    file. A path in a name that takes either a key or its path is not a secret, so that name is
+    not kept either. Windows compares
     environment names without case, so this does too. Each name is returned with the first
     registry value that sets it."""
     names: dict[str, str] = {}
     for where, entry in entries:
-        name, _, value = entry.partition("=")
+        name, equals, value = entry.partition("=")
         name = name.strip().upper()
-        if not name or not value.strip():
+        # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
+        # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
+        if not name or not (value.strip() or (equals and name.startswith(_VALUE_PREFIX))):
             continue
         if name in _INLINE_PEM_NAMES and "-----BEGIN" not in value:
             continue
@@ -423,15 +423,17 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     keys = posture.listed_keys
     others = posture.listed_directory_names
     values = posture.listed_value_names
+    # The secrets directory's own name rule, judged on the name as the engine's environment holds
+    # it. A registry string that breaks it is not known to be a name, so it is counted.
+    plain = tuple(name for name in values if _setting_names.is_value_name(name))
+    hidden = len(values) - len(plain)
     if keys or others or values:
-        plain = tuple(name for name in values if _PLAIN_VALUE_NAME.fullmatch(name))
         shown = (*keys, *others, *plain)
         named = [posture.named_with_source(shown)] if shown else []
-        if len(values) > len(plain):
-            # Not spelled: a registry string that breaks the name rule is not known to be a name.
+        if hidden:
             named.append(
-                f"{len(values) - len(plain)} more MEFOR_VALUE_* name(s) not spelled here, since "
-                "each holds a character other than a letter, a digit or an underscore"
+                f"{hidden} more MEFOR_VALUE_* name(s) (not spelled here: not the prefix followed "
+                "by letters, digits and underscores)"
             )
         found = f"{', '.join(named)} is set in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
@@ -464,13 +466,20 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
             "one restricted file per setting named as its variable"
         )
+        cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
         if values:
             step += (
                 ", and any other MEFOR_VALUE_* value in the active environment's value file, "
                 "environments/<env>.toml by default, keyed by the name after MEFOR_VALUE_ in "
                 "lower case"
             )
-        steps.append(f'{step}. See docs/CONFIGURATION.md, "The secrets directory"')
+            cite += ' and "[environments]"'
+        if hidden:
+            step += (
+                ". A name not spelled above is not one the secrets directory accepts either, so "
+                "rename that env() key to letters, digits and underscores first"
+            )
+        steps.append(f"{step}. {cite}")
         if _DIRECTORY_VARIABLE not in posture.listed:
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
