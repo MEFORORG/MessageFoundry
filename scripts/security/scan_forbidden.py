@@ -77,7 +77,6 @@ self-test failure (an instrument that cannot see is not a content hit; the two n
 from __future__ import annotations
 
 import bisect
-import itertools
 import json
 import os
 import re
@@ -474,13 +473,7 @@ _PR_VERDICT_WORDS = rf"{_RECORD_VERDICT}|na|needs review|not met|unmet|met"
 _PR_VERDICT_TAIL = r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
 #: The verbs CI prose uses of a test as often as a record uses of a requirement.
 _PR_CI_VERDICT_WORDS = "passes|fails|passing|failing"
-_PR_CI_VERDICTS = frozenset(_PR_CI_VERDICT_WORDS.split("|"))
 _PR_VERDICT = rf"(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
-#: Any verdict word, without _PR_VERDICT_TAIL's failure-mode exclusions ("fails closed" counts here).
-#: Step 10 drops a hit only where its exempt clauses hold every one in the sentence or row.
-_PR_STATUS_WORD = re.compile(
-    rf"(?i){_PR_EB}(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS})(?![A-Za-z0-9/-])"
-)
 #: The verdict words that name a STATE, without "passing"/"failing"/"passes"/"fails": a test "kept
 #: failing" or "keeps passing", and that is CI prose, not a requirement held at a verdict.
 _PR_VERDICT_STATE = rf"(?:{_PR_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
@@ -580,15 +573,7 @@ _PR_VERDICT_BEFORE = re.compile(
     rf"(?i){_PR_EB}{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$"
 )
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
-_PR_CELL_VERDICT = re.compile(
-    rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}(?P<verdict>{_PR_VERDICT})"
-)
-#: "never fails" and "never passing" describe a component, not a verdict: a cell clause with a CI verb
-#: after "never" is one of step 10's exempt clauses (_pr_step10_blank). "never met" and "never partial"
-#: are verdict states, not exempt.
-_PR_NEVER = re.compile(rf"(?i){_PR_NB}never{_PR_NA}")
-#: The cell openings that state a verdict whatever follows: "unchanged" and a record verb.
-_PR_CELL_RECORD_PREFIX = re.compile(rf"(?i)(?:unchanged|{_PR_STRONG_VERB}){_PR_NA}")
+_PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
 #: The dashes a cell sets a verdict off with: "unchanged - partial", "partial -- no build".
 _PR_CELL_DASH = r"\s+(?:--?|\u2013|\u2014)"
@@ -600,16 +585,11 @@ _PR_CELL_GOES_ON = (
 #: so with no "unchanged" or state verb before it, it binds only a row whose identifier is marked.
 _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
-    rf"{_PR_QUALIFIER}(?P<verdict>{_PR_VERDICT}){_PR_FMT}"
-    rf"(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)"
+    rf"{_PR_QUALIFIER}{_PR_VERDICT}{_PR_FMT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)"
     rf"|(?P<goes_on>\s+(?:{_PR_CELL_GOES_ON})\b)|$)"
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
-#: The characters _PR_MARKUP matches, as a set, for a per-character test.
-_PR_MARKUP_CHARS = frozenset("*`_\"'")
-#: Where step 10's prose clause can start: _PR_PROSE_VERDICT is tried only at these.
-_PR_ROW_WORD = re.compile(r"(?i)row")
 #: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
 #: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
@@ -649,20 +629,12 @@ _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
 #: A requirement lead ("ASVS", "ASVS V", "V") before a cell's identifier, dropped from both sides of
 #: the comparison, since an identifier's match carries its lead only when the lead touches the digits.
 _PR_CELL_ID_LEAD = re.compile(r"(?i)(?<![A-Za-z0-9])(?:asvs[\s:-]*v?|v)(?=\d)")
-#: A negated state verb: "is not", "isn't", "is no longer", "has not been". Only this before a CI verb
-#: after "row" is the step 10 false positive ("the row is not failing for <version> batches").
-_PR_NEGATED_STATE = (
-    r"(?:(?:is|was|are|were)(?:n(?:'|\N{RIGHT SINGLE QUOTATION MARK})t| not| no longer)"
-    r"|(?:has|have|had)(?: not|n(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)"
-    r"(?: (?:since|still|now|yet|never|already))* been)"
-)
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
 _PR_PROSE_VERDICT = re.compile(
-    rf"(?i){_PR_EB}(?:cells?|(?P<row>row)){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
-    rf"(?:(?P<row_negated>{_PR_NEGATED_STATE})|{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}"
-    rf"{_PR_FMT}(?P<row_verdict>{_PR_VERDICT})"
+    rf"(?i){_PR_EB}(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
+    rf"(?:{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
     rf"|{_PR_EB}held{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
     rf"|{_PR_EB}re-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
     rf"(?:to|reach(?:es|ed)?){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
@@ -673,6 +645,31 @@ _PR_PROSE_VERDICT = re.compile(
 _PR_BARE_HOLD = re.compile(
     rf"(?i){_PR_NB}{_PR_HOLD_VERB}(?:{_PR_SEP}(?:it|them|both|each))?{_PR_SEP}(?:at{_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
+)
+#: Step 10's false-positive shapes, each read against a WHOLE unit (paragraph or table row): CI prose
+#: saying a row "is not failing" for a dotted number written bare ("The row is not failing for 2.5.1
+#: batches.", "Since 2.5.1 the row is not failing."), and a three-cell component row whose last cell
+#: says it "never fails" ("| 2.5.1 | parser | never fails |"). Anything else in the unit -- another
+#: sentence, a label or bind character, markup, a lead such as "ASVS", another cell -- fails the
+#: match, so main's hit stays.
+_PR_STEP10_ID = r"(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?"
+_PR_STEP10_NOT = r"is(?:\s+not|n['’]t|\s+no\s+longer)"
+_PR_STEP10_PROSE = re.compile(
+    rf"(?i)the\s+row\s+{_PR_STEP10_NOT}\s+(?:failing|passing)\s+for\s+{_PR_STEP10_ID}"
+    r"(?:\s+(?P<word>[a-z]+))?\.?"
+    rf"|since\s+{_PR_STEP10_ID},?\s+the\s+row\s+{_PR_STEP10_NOT}\s+(?:failing|passing)\.?"
+)
+_PR_STEP10_ROW = re.compile(
+    rf"(?i)\|\s*{_PR_STEP10_ID}\s*\|\s*(?P<word>[a-z]+)\s*\|\s*"
+    r"(?:never\s+(?:fails|passes)|is\s+never\s+(?:failing|passing)"
+    r"|has\s+never\s+been\s+(?:failing|passing))\.?\s*\|"
+)
+#: What the one free word of a step 10 shape must not be: a verdict word, a record verb, or a record
+#: noun ("| <id> | partial | never fails |", "| <id> | unchanged | never fails |").
+_PR_STEP10_RECORD_WORD = re.compile(
+    rf"(?i)(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS}|unchanged|{_PR_PLAIN_STATE_VERB}"
+    rf"|{_PR_STATE_VERB}|{_PR_HOLD_VERB}|cells?|rows?|requirements?|anchors?|limbs?|grounds?"
+    r"|clauses?|asvs|scorecards?|scored?|verdicts?|grades?|graded|records?|recorded|re-?reads?)"
 )
 _PR_GAP = re.compile(
     rf"(?i){_PR_EB}(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
@@ -923,14 +920,8 @@ def _pr_marked(text: str, m: re.Match[str]) -> bool:
 
 
 def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) -> bool:
-    return _pr_verdict_bound_at(text, m.start(), m.end(), version, marked)
-
-
-def _pr_verdict_bound_at(text: str, start: int, end: int, version: bool, marked: bool) -> bool:
-    """_pr_verdict_bound for the identifier at text[start:end]. It reads only the 60 characters
-    before the identifier and the 80 after it."""
-    before = text[max(0, start - 60) : start]
-    after = text[end : end + 80]
+    before = text[max(0, m.start() - 60) : m.start()]
+    after = text[m.end() : m.end() + 80]
     if not version and (
         _PR_VERDICT_BEFORE.search(before) or (marked and _PR_VERB_BEFORE.search(before))
     ):
@@ -961,9 +952,7 @@ def _pr_verdict_bound_at(text: str, start: int, end: int, version: bool, marked:
 
 
 def _pr_prose_verdict(window: str, marked: bool) -> bool:
-    """The record's nouns and hold verbs carrying a verdict a clause away from the identifier, as main
-    reads them. Step 10's exemption is not here: it is an overlay over the whole binding
-    (_pr_step10_blank)."""
+    """The record's nouns and hold verbs carrying a verdict a clause away from the identifier."""
     if _PR_PROSE_VERDICT.search(window):
         return True
     return any(
@@ -1222,148 +1211,35 @@ def _pr_scan_unit(
 ) -> None:
     """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
     marks, unit_text, is_row = unit
+    step10 = _pr_step10_false_positive(unit_text, is_row)
     for start, sentence in _pr_sentences(unit_text, is_row):
-        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns)
+        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns, step10)
         for kind_index, kind in enumerate(PR_BODY_REASONS):
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
-def _pr_joined_to_a_word(text: str, start: int) -> bool:
-    """Whether the word at ``start`` sits behind a run of markup that follows a word character, so
-    GFM renders the two as one word ("nar**row**", "nar`row`")."""
-    at = start
-    while at > 0 and text[at - 1] in _PR_MARKUP_CHARS:
-        at -= 1
-    return at < start and at > 0 and (text[at - 1].isalnum() or text[at - 1] == "_")
-
-
-def _blank(text: str, spans: list[tuple[int, int]]) -> str | None:
-    """The text with each span replaced by spaces, so every offset stays, or None with no span."""
-    if not spans:
-        return None
-    chars = list(text)
-    for left, right in spans:
-        chars[left:right] = " " * (right - left)
-    return "".join(chars)
-
-
-def _pr_step10_prose_window(
-    sentence: str, left: int, right: int, ident: re.Match[str], status: list[tuple[int, int]]
-) -> str | None:
-    """One candidate's prose window, sentence[left:right], with step 10's exempt clauses in it
-    replaced by spaces, or None where it holds none or where step 10 must not drop the candidate.
-
-    Step 10 drops only its false-positive shape: an identifier beside an exempt clause and no other
-    verdict. So the window is None where a verdict word stands outside the clauses anywhere in the
-    sentence (``status``, the spans of the sentence's _PR_STATUS_WORD matches, in order: "for <id>
-    the row is not failing, it is partial"), and where anything but letters and spaces stands
-    between the identifier and a clause ("<id> -> the row is not failing", "the row is not failing:
-    <id>"). Either way the hit main reports stays.
-
-    A clause is "row", a negated state verb and a CI verb ("the row is not failing"). Each candidate
-    is checked on its own window, blanked only with the clauses found in it: a clause one window
-    cuts before a word that unbinds it (" over") is no clause in another window that reads on. The
-    pattern runs only inside the window, as main reads a window: _PR_PROSE_VERDICT backtracks
-    quadratically on a long markup run, so a search over the whole sentence, which has no length
-    limit, would make the gate far slower than main on such a body. It is tried only where "row"
-    stands, and it reads the sentence itself, not a slice, so the character before the window still
-    counts: "narrow" cut at a window's edge is not "row". Nor is "row" behind markup that joins it
-    to a word ("nar**row**", which GFM renders as one word)."""
-    spans: list[tuple[int, int]] = []
-    for row in _PR_ROW_WORD.finditer(sentence, left, right):
-        hit = _PR_PROSE_VERDICT.match(sentence, row.start(), right)
-        if (
-            hit is not None
-            and hit.group("row") is not None
-            and hit.group("row_negated") is not None
-            and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
-            and not _pr_joined_to_a_word(sentence, row.start())
-        ):
-            spans.append((hit.start(), hit.end()))
-    if not spans:
-        return None
-    # A verdict word before or after the window lies outside every clause; one inside it must lie
-    # wholly inside a clause.
-    first, last = bisect.bisect_left(status, (left,)), bisect.bisect_left(status, (right,))
-    if first > 0 or last < len(status):
-        return None
-    for start, end in status[first:last]:
-        if not any(a <= start and end <= b for a, b in spans):
-            return None
-    for a, b in spans:
-        gap = sentence[ident.end() : a] if a >= ident.end() else sentence[b : ident.start()]
-        if not all(c.isalpha() or c.isspace() for c in gap):
-            return None
-    return _blank(sentence[left:right], [(a - left, b - left) for a, b in spans])
-
-
-def _pr_step10_blank_row(sentence: str) -> str | None:
-    """A table row with step 10's exempt cell clauses replaced by spaces, so every offset stays, or
-    None where it holds none or where step 10 must not drop the row's hits.
-
-    Step 10 drops only its false-positive shape: a cell that is nothing but an exempt clause, in a
-    row with no other verdict. So the row is None where a verdict word (_PR_STATUS_WORD) stands
-    outside the clauses anywhere in it ("| <id> | is never failing; remains at failing |"), and where
-    a cell holding a clause holds a letter or digit outside it ("| never fails: <id> |"). Either way
-    the hit main reports stays.
-
-    A clause is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
-    fails", "is never failing; "), unless the cell opens with "unchanged" or a record verb. A cell is
-    read trimmed and with its markup deleted, as _pr_table_verdict reads it; each reading's clause is
-    mapped back to the characters of the row it came from."""
-    spans: list[tuple[int, int]] = []
-    covered = [False] * len(sentence)
-    edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
-    for left, right in itertools.pairwise(edges):
-        cell_spans = len(spans)
-        cell = sentence[left + 1 : right]
-        offset = left + 1
-        lead = len(cell) - len(cell.lstrip(_PR_CELL_EDGE))
-        trimmed = (cell.strip(_PR_CELL_EDGE), [offset + lead + i for i in range(len(cell))])
-        kept = [i for i, ch in enumerate(cell) if ch not in _PR_MARKUP_CHARS]
-        plain = "".join(cell[i] for i in kept)
-        skip = len(plain) - len(plain.lstrip())
-        deleted = (plain.strip(), [offset + kept[skip + i] for i in range(len(plain) - skip)])
-        for text, where in (trimmed, deleted):
-            for hit in (_PR_CELL_VERDICT.fullmatch(text), _PR_CELL_VERDICT_LEAD.match(text)):
-                if (
-                    hit is not None
-                    and hit.end() > 0
-                    and _PR_CELL_RECORD_PREFIX.match(text) is None
-                    and hit.group("verdict").lower() in _PR_CI_VERDICTS
-                    and _PR_NEVER.search(text, hit.start(), hit.start("verdict")) is not None
-                ):
-                    spans.append((where[hit.start()], where[hit.end() - 1] + 1))
-        if len(spans) == cell_spans:
-            continue
-        for a, b in spans[cell_spans:]:
-            covered[a:b] = [True] * (b - a)
-        if any(sentence[i].isalnum() and not covered[i] for i in range(left + 1, right)):
-            return None
-    if spans and any(
-        not all(covered[m.start() : m.end()]) for m in _PR_STATUS_WORD.finditer(sentence)
-    ):
-        return None
-    return _blank(sentence, spans)
+def _pr_step10_false_positive(unit: str, is_row: bool) -> bool:
+    """Whether a whole unit is one of step 10's false-positive shapes (_PR_STEP10_PROSE,
+    _PR_STEP10_ROW) and its free word, where it has one, is no record word."""
+    shape = (_PR_STEP10_ROW if is_row else _PR_STEP10_PROSE).fullmatch(unit.strip())
+    if shape is None:
+        return False
+    word = shape.group("word")
+    return word is None or _PR_STEP10_RECORD_WORD.fullmatch(word) is None
 
 
 def _pr_sentence_found(
-    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int]
+    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int], step10: bool
 ) -> dict[str, list[int]]:
     """Every binding in one sentence of a unit, by kind, as offsets into it.
 
-    Step 10 is an overlay on this full reading, never a change inside it. A verdict that an
-    identifier the text does not mark binds, or that an unmarked row binds, is checked again on the
-    sentence with step 10's exempt clauses blanked out (_pr_step10_prose_window,
-    _pr_step10_blank_row), and dropped only if that check no longer binds it and the sentence or row
-    is step 10's false-positive shape, with no verdict outside the clauses. Only the binding predicates run again, on the same identifiers with
-    the version and mark the full reading gave them, so blanking cannot change what an identifier is
-    or which tight pair is found; a tight pair's verdict is never dropped."""
+    ``step10`` says the whole unit is one of step 10's false-positive shapes
+    (_pr_step10_false_positive). Only then is a verdict dropped, and only one that an identifier the
+    text does not mark binds, or that an unmarked row binds; a marked identifier's verdict, a tight
+    pair's, and every gap and map stay."""
     # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
     # earlier identifier bind must not move a hit off the line main reported it at.
     found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
-    # The unmarked identifiers that bound a verdict, which step 10 may exempt.
-    exemptable: list[tuple[re.Match[str], bool]] = []
     # The tree scan's tight pair, before the version filter can set its identifier aside: what
     # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
     # requirement shape, since the tree scan's own shape admits every dotted triple.
@@ -1397,13 +1273,11 @@ def _pr_sentence_found(
         )
         previous = (m.end(), marked)
         row_marked = row_marked or marked
-        if _pr_verdict_bound(sentence, m, version, marked) or (
-            not version and not is_row and _pr_prose_verdict(window, marked)
+        if (marked or not step10) and (
+            _pr_verdict_bound(sentence, m, version, marked)
+            or (not version and not is_row and _pr_prose_verdict(window, marked))
         ):
-            if marked:
-                found["verdict"].append(m.start())
-            else:
-                exemptable.append((m, version))
+            found["verdict"].append(m.start())
         if version:
             continue
         if evidence is None or not is_row:
@@ -1414,38 +1288,14 @@ def _pr_sentence_found(
         if code or (symbol and marked):
             found["map"].append(m.start())
     requirement_ids = {m.group(0) for m, version in ids if not version}
-    # A row's own verdict is read whether or not an identifier bound one: step 10 may drop the
-    # identifier's, and the row's line must keep any other verdict it holds.
-    row_verdict = is_row and _pr_table_verdict(sentence, requirement_ids, row_marked)
-    if row_verdict and row_marked:
+    # A row's own verdict is read whether or not an identifier bound one, so the row's line keeps
+    # it however the identifiers read.
+    if (
+        is_row
+        and (row_marked or not step10)
+        and _pr_table_verdict(sentence, requirement_ids, row_marked)
+    ):
         found["verdict"].append(0)
-    if not exemptable and not (row_verdict and not row_marked):
-        return found
-    if is_row:
-        # A row is one window for every identifier in it.
-        blanked = _pr_step10_blank_row(sentence)
-        for m, version in exemptable:
-            if blanked is None or _pr_verdict_bound(blanked, m, version, False):
-                found["verdict"].append(m.start())
-        if (
-            row_verdict
-            and not row_marked
-            and (blanked is None or _pr_table_verdict(blanked, requirement_ids, False))
-        ):
-            found["verdict"].append(0)
-        return found
-    status = [w.span() for w in _PR_STATUS_WORD.finditer(sentence)]
-    for m, version in exemptable:
-        # The candidate's own prose window holds every character its re-check reads (the binding
-        # reads 60 before the identifier and 80 after it), so it is blanked and read alone.
-        left = max(0, m.start() - _PR_WINDOW)
-        own = _pr_step10_prose_window(sentence, left, m.end() + _PR_WINDOW, m, status)
-        if (
-            own is None
-            or _pr_verdict_bound_at(own, m.start() - left, m.end() - left, version, False)
-            or (not version and _pr_prose_verdict(own, False))
-        ):
-            found["verdict"].append(m.start())
     return found
 
 

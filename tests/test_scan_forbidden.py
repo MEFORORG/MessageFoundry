@@ -1267,14 +1267,13 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
         )
         for code in (0x0C, 0x85, 0x2028)
     ),
-    # Step 10 is an overlay: an exempt clause is blanked and the rest is read as main reads it. Where
-    # the rest of a cell is a verdict cell on its own, the row still binds.
+    # Step 10 drops only a whole unit of its false-positive shape: a cell that goes on past "never
+    # failing" keeps the row bound.
     ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; stays failing |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; re-scored as failing |"),
-    # Review round-4aa302cd29's losses, each flagged by main: blanking an exempt clause must not make
-    # an identifier read as a version (a version-lead word or "HL7" now beside it), nor move which
-    # tight pair is found, so a verdict that never needed the clause stays.
+    # Review round-4aa302cd29's losses, each flagged by main: a verdict that never needed the clause
+    # stays, beside a version-lead word, "HL7" or a tight pair.
     (
         "10",
         "verdict",
@@ -1294,13 +1293,12 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
 ]
-#: Bodies main flags through step 10's exempt clause or beside it, which step 10 must not drop: a
-#: verdict word outside the clause anywhere in the sentence or row, a label or bind character between
-#: the clause and the identifier, or a clause cell that also holds the identifier. Each must fire on
-#: main and on head, at main's lines. The first ten are the Lander's hold on engine PR 2980 (blocking
-#: points 1 to 3); the rest are the bodies review rounds 4f580a28dd and b628ef8690 listed, which an
-#: earlier draft of step 10 dropped by name and the hold's point 4 kept flagged. The first two of
-#: those carry "pass" and "fail" beside the clause, so they fire too.
+#: Bodies main flags through a "row is not failing" or "never fails" clause, or beside one, that are
+#: not step 10's false-positive shape, so step 10 must not drop them. Each must fire on main and on
+#: head, at main's lines. The first ten are the Lander's hold on engine PR 2980 (blocking points 1 to
+#: 3); the next nineteen are the bodies review rounds 4f580a28dd and b628ef8690 listed, which an
+#: earlier draft of step 10 dropped by name and the hold's point 4 kept flagged (the first two of
+#: them say "tests pass" or "will fail" after the clause); the rest are review round-cc2be34b's.
 _PR_STEP10_MUST_FIRE: list[str] = [
     f"The row is not failing: {_REQ} here.",
     f"| never fails: {_REQ} |",
@@ -1332,6 +1330,30 @@ _PR_STEP10_MUST_FIRE: list[str] = [
     f"For {_REQ} the row is not failing - stays - failing.",
     f"For {_REQ} the row is not failing -> failing.",
     f"For {_REQ} the row is not failing; it reads failing.",
+    # Review round-cc2be34b: emphasis, a second sentence or line, record words that carry no verdict
+    # word, a second identifier on a later line, and a record word in a shape's free slot.
+    f"For {_REQ} the row is not failing, it is ___{_PARTIAL}___.",
+    f"| {_REQ} | never fails | it is ___{_PARTIAL}___ |",
+    f"For {_REQ} the row is not failing. It stays {_PARTIAL}.",
+    f"For {_REQ} the row is not failing.\nIt stays {_PARTIAL}.",
+    f"- For {_REQ} the row is not failing.\n  It stays {_PARTIAL}.",
+    "The row is not failing for 2.5.1 batches.\nAll twelve tests pass.",
+    f"For {_REQ} the row is not failing; it passed.",
+    f"For {_REQ} the row is not failing (re-scored last week).",
+    f"For {_REQ} the row is not failing; the verdict is unchanged.",
+    f"| {_REQ} | never fails | stays at the same grade |",
+    f"For {_REQ} the row is not failing for\nASVS 1.2.3.",
+    "Since 2.5.1 the row is not failing for\nASVS 1.2.3.",
+    f"For {_REQ} the row is not failing:\n1.2.3 here.",
+    f"| {_REQ} | unchanged | never fails |",
+    f"| {_REQ} | {_PARTIAL} | never fails |",
+    f"| {_REQ} | graded | never fails |",
+    f"The row is not failing for {_REQ} {_PARTIAL}.",
+    f"The row is not failing for {_REQ} unchanged.",
+    f"The row is not failing for ASVS {_REQ} batches.",
+    f"The row is not failing for {_REQ}: batches.",
+    f"Since {_REQ} the row is not failing: {_PARTIAL}.",
+    f"Since **{_REQ}** the row is not failing.",
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1748,11 +1770,9 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     ids=["underscore", "star", "backtick", "cell-underscore"],
 )
 def test_step_ten_reads_a_long_markup_run_as_fast_as_main(sf, body: str) -> None:
-    """Step 10's overlay searches for an exempt clause only inside each candidate identifier's
-    window, as main reads a window, never over the whole sentence, where _PR_PROSE_VERDICT
-    backtracks quadratically on a markup run. Each body scans in about 3 ms here, against about 2 ms
-    on main and 12 to 23 seconds when the search ran over the whole sentence. The bound is 1 second,
-    loose for a slow runner."""
+    """Step 10 must not search _PR_PROSE_VERDICT over the whole sentence, where it backtracks
+    quadratically on a markup run: an earlier draft took 12 to 23 seconds on these bodies. The bound
+    is 1 second, loose for a slow runner."""
     began = time.perf_counter()
     sf.scan_pr_body(body)
     assert time.perf_counter() - began < 1
