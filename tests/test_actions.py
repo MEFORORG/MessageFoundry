@@ -574,33 +574,49 @@ def test_date_diff_field_offsets_move_the_day_count() -> None:
     assert m["ZTS-3"] == str(23 * 60)
 
 
-def test_date_diff_field_years_with_offsets_reads_the_utc_calendar() -> None:
-    # 1980-06-15 01:00 at +0200 is 1980-06-14 23:00Z, so the 2026-06-14 23:30Z end is the UTC
-    # anniversary: 46 years either way round. NEGATIVE CONTROL: the unfixed code read the wall dates,
-    # June 15 then June 14, and wrote 45.
-    m = _two_stamps("198006150100+0200", "202606142330+0000")
+def test_date_diff_field_years_counts_each_stamps_own_date() -> None:
+    # An age is counted on the local calendar: an evening before the birthday, in the birth zone, is
+    # still the year before, even though in UTC it is already the birthday. Either way round.
+    m = _two_stamps("198006150800-0500", "202606141930-0500")
     date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
-    assert m["ZTS-3"] == "46"
+    assert m["ZTS-3"] == "45"
     date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit="years")
-    assert m["ZTS-3"] == "-46"
+    assert m["ZTS-3"] == "-45"
 
 
-def test_date_diff_field_one_offset_beside_a_time_of_day_raises() -> None:
-    # Only one stamp has an offset and the other has a time of day: there is no instant to compare it
-    # with, so the wall-clock gap (6) would be a guess. Either way round.
-    m = _two_stamps("202603010800", "202603011400+0000")
-    with pytest.raises(ValueError, match="cannot be compared as instants"):
-        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
-    with pytest.raises(ValueError, match="cannot be compared as instants"):
-        date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit="hours")
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("202603010800", "202603011400+0000"),  # a time of day beside an offset
+        ("20260301", "202603010200-0500"),  # a date beside a time with an offset
+    ],
+)
+def test_date_diff_field_one_offset_raises_for_a_clock_unit(start: str, end: str) -> None:
+    # Only one stamp has an offset: there is no instant to compare the other with, so a wall-clock
+    # gap would be a guess. Either way round.
+    m = _two_stamps(start, end)
+    units: tuple[Literal["hours", "minutes", "days"], ...] = ("hours", "minutes", "days")
+    for unit in units:
+        with pytest.raises(ValueError, match="cannot be compared as instants"):
+            date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
+        with pytest.raises(ValueError, match="cannot be compared as instants"):
+            date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit=unit)
     assert m["ZTS-3"] is None
 
 
-def test_date_diff_field_a_date_only_stamp_beside_an_offset_reads_as_its_date() -> None:
+def test_date_diff_field_a_date_only_stamp_beside_an_offset_is_an_age() -> None:
     # Age at an event: a date-only date of birth beside an event time that carries an offset.
     m = _two_stamps("19800615", "202606150200-0500")
     date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
     assert m["ZTS-3"] == "46"
+
+
+def test_date_diff_field_two_dates_are_a_calendar_difference_whatever_their_offsets() -> None:
+    # Midnight at +1200 and midnight at -1200 are 48 hours apart in UTC, but the dates the sender
+    # wrote are one day apart.
+    m = _two_stamps("20260301+1200", "20260302-1200")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "1"
 
 
 @pytest.mark.parametrize(
@@ -628,12 +644,27 @@ def test_date_diff_field_reads_a_composite_ts_by_its_first_component() -> None:
     assert m["ZTS-3"] == "84"
 
 
-@pytest.mark.parametrize("start", ["^D", "20260101~20270101"])
-def test_date_diff_field_refuses_a_ts_field_with_no_time_or_two(start: str) -> None:
-    # A precision with no time, and a repeating field, both raise rather than writing a number.
+@pytest.mark.parametrize("start", ["^D", "^", "~"])
+def test_date_diff_field_a_ts_field_with_no_time_is_empty(start: str) -> None:
+    # A precision with no time, or empty components, hold no timestamp: a no-op, as an empty field is.
     m = _two_stamps(start, "20260104")
-    with pytest.raises(ValueError):
-        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
+
+
+@pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
+def test_date_diff_field_refuses_a_repeating_ts_field(path: str) -> None:
+    # A timestamp field holds one value, so a second repetition raises however it is addressed.
+    m = _two_stamps("20260101~20270101", "20260104")
+    with pytest.raises(ValueError, match="repeats"):
+        date_diff_field(m, path, "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
+
+
+def test_date_diff_field_a_repeating_field_beside_an_empty_one_is_a_no_op() -> None:
+    # An open encounter (no end yet) stays the no-op the docstring promises, even beside a bad start.
+    m = _two_stamps("20260101~20270101", "")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] is None
 
 

@@ -37,7 +37,7 @@ from typing import Literal
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import parse_path
-from messagefoundry.timezone import _TIME_PRECISIONS, _offset_to_timedelta, parse_hl7_timestamp
+from messagefoundry.timezone import _offset_to_timedelta, parse_hl7_timestamp
 
 __all__ = [
     "copy_field",
@@ -318,18 +318,21 @@ def date_diff_field(
     ``"years"`` (whole calendar years), ``"hours"``, or ``"minutes"``.
 
     A whole-field path reads the field's **first component**, so a composite ``TS`` such as
-    ``20260101120000^S`` (HL7 v2.3's time plus degree of precision) reads as its time; when that
-    component is empty the whole field is read, as :meth:`Message.age` does, and a field holding a
-    second repetition raises :class:`ValueError`. When **both** timestamps carry a ``±HHMM`` offset
-    they are compared as UTC instants, on the UTC calendar for ``"years"``. A pair where only one
-    carries an offset raises :class:`ValueError` when the one without it has a time of day, since
-    there is no instant to compare it with; a date-only stamp there (a date of birth beside an event
-    time, say) is read as its date. A pair with no offset is read as the wall clocks it states, so a
-    span that crosses a daylight-saving change is an hour off: use
-    :func:`~messagefoundry.timezone.length_of_stay` with a ``zone`` where that matters. The interval
-    is **truncated toward zero** in every unit, so swapping the two fields negates it: an end 12
-    hours before the start is ``0`` days, not ``-1``, and a span a day short of a year either way
-    is ``0`` years.
+    ``20260101120000^S`` (HL7 v2.3's time plus degree of precision) reads as its time, and one whose
+    first component is empty (``^D``) is empty. A field holding a second repetition raises
+    :class:`ValueError` whichever way it is addressed: a timestamp field holds one value.
+
+    Every ``±HHMM`` offset present is validated. ``"years"`` counts on each stamp's own stated date,
+    as an age does (a birthday is a local date), offsets or not. ``"days"``, ``"hours"`` and
+    ``"minutes"`` take two date-only stamps as their calendar difference; otherwise, when **both**
+    carry an offset they are compared as UTC instants, when only one does :class:`ValueError` is
+    raised (there is no instant to compare it with, as
+    :func:`~messagefoundry.timezone.length_of_stay` also refuses), and when neither does they are
+    read as the wall clocks they state, so a span that crosses a daylight-saving change is an hour
+    off: use :func:`~messagefoundry.timezone.length_of_stay` with a ``zone`` where that matters. The
+    interval is **truncated toward zero** in every unit, so swapping the two fields negates it: an
+    end 12 hours before the start is ``0`` days, not ``-1``, and a span a day short of a year either
+    way is ``0`` years.
 
     **Field-to-field only** — it never reads the wall clock, so a re-run re-derives an identical value
     (the at-least-once invariant holds; now-relative age stays native Python by design). A no-op if
@@ -345,25 +348,26 @@ def date_diff_field(
     end_raw = _timestamp_value(msg, end_path)
     if not start_raw or not end_raw:
         return
+    _refuse_repetition(msg, start_path)
+    _refuse_repetition(msg, end_path)
     start_dt, start_prec, start_off = parse_hl7_timestamp(start_raw)
     end_dt, end_prec, end_off = parse_hl7_timestamp(end_raw)
-    # Every offset present is validated, whether or not the pair is compared as instants.
     start_shift = None if start_off is None else _offset(start_off)
     end_shift = None if end_off is None else _offset(end_off)
-    if start_shift is not None and end_shift is not None:
-        try:
-            start_dt, end_dt = start_dt - start_shift, end_dt - end_shift
-        except OverflowError as exc:
+    both_dates = start_prec not in _TIME_PRECISIONS and end_prec not in _TIME_PRECISIONS
+    if unit != "years" and not both_dates:
+        if start_shift is not None and end_shift is not None:
+            try:
+                start_dt, end_dt = start_dt - start_shift, end_dt - end_shift
+            except OverflowError as exc:
+                raise ValueError(
+                    "date_diff_field: a timestamp falls outside years 1 to 9999 in UTC"
+                ) from exc
+        elif start_shift is not None or end_shift is not None:
             raise ValueError(
-                "date_diff_field: a timestamp falls outside years 1 to 9999 in UTC"
-            ) from exc
-    elif (start_shift is None and start_prec in _TIME_PRECISIONS and end_shift is not None) or (
-        end_shift is None and end_prec in _TIME_PRECISIONS and start_shift is not None
-    ):
-        raise ValueError(
-            f"date_diff_field: only one of {start_path} and {end_path} carries an offset, and the "
-            "other has a time of day, so the two cannot be compared as instants"
-        )
+                f"date_diff_field: only one of {start_path} and {end_path} carries an offset, so "
+                "the two cannot be compared as instants"
+            )
     # Count forwards from the earlier stamp and apply the sign last, so every unit truncates toward
     # zero and a swapped pair is the exact negation (BACKLOG #5822).
     sign = -1 if end_dt < start_dt else 1
@@ -372,12 +376,16 @@ def date_diff_field(
     if unit == "days":
         interval = delta.days
     elif unit == "hours":
-        interval = int(delta.total_seconds() // 3600)
+        interval = delta // timedelta(hours=1)
     elif unit == "minutes":
-        interval = int(delta.total_seconds() // 60)
+        interval = delta // timedelta(minutes=1)
     else:  # "years": whole calendar years, one fewer while the anniversary is still ahead
         interval = late.year - early.year - ((late.month, late.day) < (early.month, early.day))
     msg.set(dst, str(sign * interval))
+
+
+#: The :func:`parse_hl7_timestamp` precision tokens of a stamp that carries a time of day.
+_TIME_PRECISIONS = ("hour", "minute", "second")
 
 
 def _offset(offset: str) -> timedelta:
@@ -390,15 +398,17 @@ def _offset(offset: str) -> timedelta:
 
 
 def _timestamp_value(msg: Message, path: str) -> str | None:
-    """The timestamp text at ``path``: a component path as read; for a whole field its first
-    component, so a composite ``TS`` (``time^degree-of-precision``) parses rather than being refused
-    whole, falling back to the whole field when that is empty, as :meth:`Message.age` does. A
-    timestamp field holds one value, so a second repetition raises rather than being dropped."""
-    if parse_path(path)[2] is not None:
-        return msg.field(path)
-    if msg.field(path, repetition=2) is not None:
-        raise ValueError(f"date_diff_field: {path} repeats; a timestamp field holds one value")
-    return msg.field(f"{path}.1") or msg.field(path)
+    """The timestamp text at ``path``: a component path as read, a whole field's first component,
+    so a composite ``TS`` (``time^degree-of-precision``) parses rather than being refused whole."""
+    return msg.field(path if parse_path(path)[2] is not None else f"{path}.1")
+
+
+def _refuse_repetition(msg: Message, path: str) -> None:
+    """Raise when the field ``path`` addresses holds a second repetition, rather than silently
+    reading the first: a timestamp field holds one value."""
+    seg, fld, _comp, _sub = parse_path(path)
+    if msg.field(f"{seg}-{fld}", repetition=2) is not None:
+        raise ValueError(f"date_diff_field: {seg}-{fld} repeats; a timestamp field holds one value")
 
 
 def copy_segment(
