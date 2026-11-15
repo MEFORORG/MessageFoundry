@@ -9973,8 +9973,9 @@ def _evaluate_config_dacl(
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
     this loader executes as the service account no matter what the DACL currently says. The owner
-    passes as the current process user, as a well-known admin SID (:func:`_is_well_known_admin_sid`),
-    or as a resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
+    passes as the current process user (unless that user is LocalService or NetworkService, which
+    other services share), as a well-known admin SID (:func:`_is_well_known_admin_sid`), or as a
+    resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
     membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
     ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
     The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is

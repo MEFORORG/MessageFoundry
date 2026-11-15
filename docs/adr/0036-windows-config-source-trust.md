@@ -12,6 +12,10 @@
   `[security].enforcement = enforce`. It is honoured only at `warn`, and it is then a reported
   loosening. Wherever this ADR says the escape downgrades a refusal, read "where Amendment C lets
   it". The amendment has its own section below.
+  **Amended 2026-11-14 (Amendment E, BACKLOG #5622):** the grantee and owner rules are corrected
+  for conditional and object entries, LocalService and NetworkService run-as accounts,
+  TrustedInstaller, and domain admin groups. The amendment is inline in Decision 1; read Decisions
+  1 and 3, and the cures under *Consequences*, as it amends them.
 - **Built:** yes — [`_assert_safe_config_source`](../../messagefoundry/config/wiring.py) now dispatches
   to a real Windows check (`_assert_safe_config_source_windows` + the pure `_evaluate_config_dacl`
   policy) instead of an unconditional early-return; [`install-service.ps1`](../../scripts/service/install-service.ps1)
@@ -48,7 +52,7 @@ could drop/rewrite a config module that executes as the service account on the n
    filters to write-class rights only. A **NULL/absent DACL** (everyone implicitly allowed) is
    **refused**.
 
-   **Amended 2026-11-14 (BACKLOG #5622): corrections to the grantee and owner rules.** At least
+   **Amended 2026-11-14 (Amendment E, BACKLOG #5622): corrections to the grantee and owner rules.** At least
    these changed:
    - A compound, object or callback allow entry (types 0x04, 0x05, 0x09, 0x0B) carrying a
      write-class right is refused, because its trustee or condition cannot be judged. Before, the
@@ -339,7 +343,8 @@ Item 5 is left as written, as the record of what was decided on its date.
 - **Amendment A widens what can be refused, and one shape is worth stating plainly.** A config
   directory owned by an IT account whose administrator rights come only through a nested domain group
   is refused, because the membership lookup is deliberately local. The cures are to re-own the
-  directory to `Administrators`, `SYSTEM` or the service account — which
+  directory to `Administrators`, `SYSTEM` or the service account (not LocalService or
+  NetworkService, which Amendment E refuses as owner because other services share them) — which
   `install-service.ps1 -LockConfigDir` now does for you (Decision 4 as amended: it sets the owner as
   well as the DACL, since a DACL-only lockdown left this refusal in place); to point `-Config` at an
   admin-owned directory; or, for a dev/CI checkout, `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`. Run
