@@ -9851,8 +9851,9 @@ _WIN_ADMIN_SIDS = frozenset(
     }
 )
 
-# SIDs trusted to hold write on executed config (the current process user and the directory owner are
-# added at evaluation time): the admin SIDs above, plus two owner-relative placeholders.
+# SIDs trusted to hold write on executed config (the directory owner, and the current process user
+# unless it is LocalService or NetworkService, are added at evaluation time): the admin SIDs above,
+# plus two owner-relative placeholders.
 #
 # CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) are trusted because neither names a principal
 # this ACL can be read against, so refusing them would refuse on no evidence: S-1-3-4 carries the
@@ -9884,6 +9885,10 @@ _WIN_ADMIN_RIDS = frozenset(
     }
 )
 
+# The admin RIDs above that name a GROUP (Domain, Schema, Enterprise Admins): the only ones a
+# grantee may carry (:func:`_is_domain_admin_group_sid`). 500 is an account.
+_WIN_ADMIN_GROUP_RIDS = frozenset({512, 518, 519})
+
 # ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE, the only granting type whose
 # trustee the reader parses.
 _WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
@@ -9897,10 +9902,6 @@ _WIN_GRANTING_ACE_TYPES = frozenset({0x00, 0x04, 0x05, 0x09, 0x0B})
 # LocalService and NetworkService run many services, so the engine running as one of them does not
 # make that SID the engine's alone: self-trust skips them, as a grantee and as an owner.
 _WIN_SHARED_SERVICE_SIDS = frozenset({"S-1-5-19", "S-1-5-20"})
-
-# ACE_HEADER.AceFlags bit for an entry that only propagates to children and grants nothing on the
-# object it sits on.
-_WIN_INHERIT_ONLY_ACE = 0x08
 
 
 def _is_well_known_admin_sid(sid: str) -> bool:
@@ -9940,12 +9941,13 @@ def _is_domain_admin_group_sid(sid: str) -> bool:
     These are the only domain-relative grantees the DACL pass trusts, and only once the local
     Administrators lookup resolves them (BACKLOG #5622). A group, not an account: UAC marks these
     groups deny-only in an unelevated token, so a write grant to one is usable only by an elevated
-    administrator, who could take ownership anyway. A grant to an administrator's own user SID (RID
-    500 included) works from the unelevated session and stays refused."""
+    administrator, who could take ownership anyway. A user account's own SID is never deny-only, so
+    a grant to one does not depend on elevation, and a non-owner account stays refused as a grantee
+    (the built-in Administrator, RID 500, included)."""
     return (
         _is_well_known_admin_sid(sid)
         and sid not in _WIN_ADMIN_SIDS
-        and int(sid.rsplit("-", 1)[1]) != 500
+        and int(sid.rsplit("-", 1)[1]) in _WIN_ADMIN_GROUP_RIDS
     )
 
 
@@ -10029,28 +10031,42 @@ def _evaluate_config_dacl(
                     "Administrators membership could not be resolved"
                 )
                 continue
-        return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
-    if unsure is not None:
-        return unsure
+        return (
+            f"a non-owner, non-admin principal ({trustee_sid}) has write access: only SYSTEM, "
+            "Administrators, TrustedInstaller, the engine's own account or a resolved admins group "
+            "may hold it"
+        )
+    # A definite owner refusal is reported ahead of an entry the scan could not judge.
+    return _config_owner_problem(owner_sid, self_sid, engine_sid, owner_in_admins) or unsure
+
+
+def _config_owner_problem(
+    owner_sid: str,
+    self_sid: str | None,
+    engine_sid: str | None,
+    owner_in_admins: Callable[[str], bool | None],
+) -> str | None:
+    """The owner arm of :func:`_evaluate_config_dacl`: a refusal reason, or ``None``."""
     if self_sid is None or owner_sid == engine_sid or _is_well_known_admin_sid(owner_sid):
         return None
     owner_is_admin = owner_in_admins(owner_sid)
+    if owner_is_admin:
+        return None
+    if owner_sid == self_sid:
+        who = "is the account the engine runs as, but other services share that identity"
+    else:
+        who = "is not the account the engine runs as"
     if owner_is_admin is None:
         return (
-            f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
-            f"membership could not be resolved"
+            f"the owner ({owner_sid}) {who}, and its Administrators membership could not be "
+            "resolved"
         )
-    if not owner_is_admin and owner_sid == self_sid:
-        return (
-            f"the owner ({owner_sid}) is the account the engine runs as, but other services share "
-            f"that identity, so it can rewrite the code this loader executes"
-        )
-    if not owner_is_admin:
-        return (
-            f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
-            f"so it can rewrite the code this loader executes"
-        )
-    return None
+    if owner_sid == self_sid:
+        return f"the owner ({owner_sid}) {who}, so it can rewrite the code this loader executes"
+    return (
+        f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
+        f"so it can rewrite the code this loader executes"
+    )
 
 
 # ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
@@ -10569,12 +10585,8 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 # is read for all of them: the policy refuses a callback or object entry granting a
                 # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
-                mask = int(allowed.Mask)
                 trustee = ""  # parsed for type 0x00 only
-                if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-                    if header.AceFlags & _WIN_INHERIT_ONLY_ACE:
-                        mask = 0  # grants nothing on this object; each child is read itself
-                else:
+                if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
                     # The trustee SID begins at the SidStart field offset within the ACE structure.
                     sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
                     sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
@@ -10582,7 +10594,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                     if parsed is None:
                         return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                     trustee = parsed
-                aces.append((header.AceType, mask, trustee))
+                aces.append((header.AceType, int(allowed.Mask), trustee))
             return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:
             if sd_ptr:

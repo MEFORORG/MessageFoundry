@@ -298,8 +298,9 @@ def test_write_granting_conditional_or_object_ace_refused(ace_type: int) -> None
 
 
 def test_config_guard_sets_match_the_anchor_path_rule() -> None:
-    """The config guard and the anchor-path rule judge the same Windows ACLs; a SID or ACE type added
-    to one and not the other would quietly loosen whichever was missed."""
+    """Pins the constants the config guard and the anchor-path rule share, so a SID or ACE type added
+    to one is not missed in the other. It pins constants only: the two grantee rules differ (the
+    anchor-path rule trusts any resolved Administrators member), which this does not test."""
     from messagefoundry.auth import anchor_path
     from messagefoundry.config import wiring
 
@@ -322,6 +323,7 @@ def test_shared_service_identity_is_not_self_trusted_as_grantee(shared: str) -> 
     reason = _evaluate_config_dacl(_SYSTEM, aces, shared, _never_admin)
     assert reason is not None
     assert shared in reason
+    assert "other services share that identity" in reason
 
 
 @pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
@@ -332,18 +334,12 @@ def test_shared_service_identity_is_not_self_trusted_as_owner(shared: str) -> No
     assert "other services share that identity" in reason
 
 
-@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
-def test_shared_service_grantee_refusal_names_the_shared_identity(shared: str) -> None:
-    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, shared)]
-    reason = _evaluate_config_dacl(_SYSTEM, aces, shared, _never_admin)
+def test_shared_service_owner_with_unresolvable_membership_names_the_shared_identity() -> None:
+    aces = [(_ALLOW, _READ_EXEC, _USERS)]
+    reason = _evaluate_config_dacl(_LOCAL_SERVICE, aces, _LOCAL_SERVICE, _unresolvable)
     assert reason is not None
     assert "other services share that identity" in reason
-
-
-def test_shared_service_sid_still_trusted_when_it_is_not_the_engine() -> None:
-    # Only SELF-trust is withdrawn: the owner arm and the rest of the rule are unchanged for others.
-    aces = [(_ALLOW, _FULL, _SELF), (_ALLOW, _READ_EXEC, _LOCAL_SERVICE)]
-    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
+    assert "could not be resolved" in reason
 
 
 def test_trusted_installer_grantee_passes() -> None:
@@ -425,10 +421,11 @@ def test_definite_bad_ace_reported_ahead_of_an_unjudged_one(
     assert _EVERYONE in reason
 
 
-def test_unjudged_ace_reported_ahead_of_a_bad_owner() -> None:
+def test_bad_owner_reported_ahead_of_an_unjudged_ace() -> None:
+    # Definite ahead of indefinite: the low-privilege owner is named, not the callback entry.
     reason = _evaluate_config_dacl(_OWNER, [(0x09, _MODIFY, "")], _SELF, _never_admin)
     assert reason is not None
-    assert "type 0x09" in reason
+    assert "so it can rewrite the code this loader executes" in reason
 
 
 @pytest.mark.parametrize(
@@ -937,7 +934,7 @@ def _set_dacl_sddl(path: Path, sddl: str) -> None:
 def test_reader_records_the_mask_of_a_callback_ace_windows(tmp_path: Path) -> None:
     """BACKLOG #5622: the reader used to record every non-0x00 entry with a zero mask, so the policy
     could not see a callback entry granting write. Through the real reader, a write-granting
-    callback ACE now reaches the policy with its mask, and an inherit-only one with none."""
+    callback ACE now reaches the policy with its mask, and the policy refuses it."""
     from messagefoundry.config.wiring import _win32_config_source_probes
 
     target = tmp_path / "cfg.py"
@@ -949,14 +946,9 @@ def test_reader_records_the_mask_of_a_callback_ace_windows(tmp_path: Path) -> No
     assert len(callback) == 1
     assert callback[0][1] & 0x10000000 or callback[0][1] & 0x2  # write-class bits survive
     assert sec.owner_sid is not None
-    assert _evaluate_config_dacl(sec.owner_sid, sec.aces, sec.owner_sid, _never_admin) is not None
-
-    folder = tmp_path / "sub"
-    folder.mkdir()
-    _set_dacl_sddl(folder, "D:P(A;OICI;FA;;;SY)(XA;OICIIO;FA;;;WD;(Member_of {SID(BA)}))")
-    sec = _win32_config_source_probes().read_path(folder)
-    assert sec.aces is not None
-    assert [ace[1] for ace in sec.aces if ace[0] == 0x09] == [0]
+    reason = _evaluate_config_dacl(sec.owner_sid, sec.aces, sec.owner_sid, _never_admin)
+    assert reason is not None
+    assert "type 0x09" in reason
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL check needs Windows")

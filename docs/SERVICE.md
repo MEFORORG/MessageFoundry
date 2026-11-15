@@ -747,7 +747,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
-    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). A `NULL` DACL (everyone allowed)
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). The principals that may hold one
+    are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the owner, the run-as account (never
+    LocalService or NetworkService, which other services share) and a Domain, Schema or Enterprise
+    Admins group the local Administrators lookup resolves. A grant to any other account is refused,
+    an administrator's own account included, because it works without elevation. A conditional,
+    object or compound allow entry with a write-class right is refused too, since the guard cannot
+    tell whom it applies to (ADR 0036, amended for BACKLOG #5622). A `NULL` DACL (everyone allowed)
     is likewise refused. If the guard **cannot finish its read**, it **refuses** to load: a check
     that could not finish has not shown the code safe to run. That covers at least a Win32 API
     error, an owner SID it cannot resolve, a DACL it cannot enumerate, and this process's own token

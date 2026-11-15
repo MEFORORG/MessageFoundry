@@ -151,7 +151,7 @@ function Get-BroadWriteHolders {
       assuming one answers the other's.
     #>
     param([Parameter(Mandatory)][string]$Path)
-    # The same four principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts for the
+    # Four of the principals messagefoundry/config/wiring.py's _WIN_TRUSTED_SIDS trusts (not TrustedInstaller), for the
     # same reason, plus OWNER RIGHTS: that module's comment records that S-1-3-0 and S-1-3-4 both
     # appear on ordinary inherited ACLs and must not be refused. Omitting S-1-3-4 would be a false
     # REFUSAL, and in install-net-helper.ps1 its only escape is -AllowBroadAcl, which downgrades the

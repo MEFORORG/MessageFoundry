@@ -48,19 +48,22 @@ could drop/rewrite a config module that executes as the service account on the n
    filters to write-class rights only. A **NULL/absent DACL** (everyone implicitly allowed) is
    **refused**.
 
-   **Amended 2026-11-14 (BACKLOG #5622): three corrections to the grantee rule.** A compound,
-   object or callback allow entry (types 0x04, 0x05, 0x09, 0x0B) carrying a write-class right is
-   refused, because its trustee or condition cannot be judged; before, the reader recorded such
-   entries with no rights and the policy skipped them. An inherit-only entry of those types grants
-   nothing on the object it sits on and is not counted there. A process user of LocalService
-   (`S-1-5-19`) or NetworkService (`S-1-5-20`) earns no self-trust, as grantee or owner, because other
-   services share the SID. TrustedInstaller is trusted with SYSTEM and Administrators, as owner and
-   grantee. A Domain, Schema or Enterprise Admins **group** (RID 512, 518, 519) is trusted as a
-   grantee only once the local Administrators lookup resolves it a direct member; an unresolved
-   lookup refuses. UAC makes those groups deny-only in an unelevated token, so the grant is usable
-   only elevated. Any user account, the built-in Administrator included, stays refused as a grantee,
-   because its grant works from an unelevated session. The checks run past an entry they cannot
-   judge, so a definite insecure entry later in the DACL is the one reported.
+   **Amended 2026-11-14 (BACKLOG #5622): corrections to the grantee and owner rules.** At least
+   these changed:
+   - A compound, object or callback allow entry (types 0x04, 0x05, 0x09, 0x0B) carrying a
+     write-class right is refused, because its trustee or condition cannot be judged. Before, the
+     reader recorded such entries with no rights and the policy skipped them. Inherit-only entries
+     are still counted on the object they sit on, as type 0x00 ones always were.
+   - A process user of LocalService (`S-1-5-19`) or NetworkService (`S-1-5-20`) earns no
+     self-trust, as grantee or owner, because other services share the SID.
+   - TrustedInstaller is trusted with SYSTEM and Administrators, as owner and grantee.
+   - A Domain, Schema or Enterprise Admins **group** (RID 512, 518, 519) is trusted as a grantee
+     only once the local Administrators lookup resolves it a direct member; an unresolved lookup
+     refuses. UAC makes those groups deny-only in an unelevated token, so such a grant is usable
+     only elevated. A user account's SID is never deny-only, so a grant to an account that is not
+     the owner stays refused, the built-in Administrator (RID 500) included. An account that
+     **owns** the object is still trusted once the owner arm resolves it, as Amendment A decided.
+   - A definite refusal is reported ahead of an entry the checks cannot judge.
 
    **Amended 2026-09-18 (BACKLOG #1647): the owner is vetted, not trusted unconditionally.** As
    originally built, `_evaluate_config_dacl` added the owner SID to the trusted set with no check, so a
