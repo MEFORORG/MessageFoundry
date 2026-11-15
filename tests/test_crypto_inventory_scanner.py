@@ -278,7 +278,9 @@ def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
     gate = _gate()
     prose = (
         "// WHY Math.random() cannot be used here: it is xorshift128+.\n"
+        "/**\n"
         " * A doc comment mentioning Math.random() is not a call.\n"
+        " */\n"
         "/* Math.random() in a block comment is not a call either. */\n"
     )
     assert gate.randomness_tokens_in(prose) == set()
@@ -706,7 +708,7 @@ def test_each_non_python_operation_pattern_fires(line: str, token: str) -> None:
 
 def test_a_comment_naming_an_operation_is_not_an_operation() -> None:
     gate = _gate()
-    text = "// we do not call createHash( here\n * rejectUnauthorized: false is refused\n"
+    text = "// we do not call createHash( here\n/*\n * rejectUnauthorized: false is refused\n */\n"
     assert gate.non_python_operation_tokens_in(text) == set()
 
 
@@ -1337,3 +1339,90 @@ def test_the_positive_control_covers_sibling_and_augmented_matchers(
     empty = () if rule_table == "SIBLING_IMPORT_ROOTS" else frozenset()
     monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
     assert gate.operations_self_test(), rule_table
+
+
+# --- BACKLOG #5578: a line that merely STARTS with /* or * is not thereby a comment -----------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("/* seed */ const n = Math.random();\n", id="after-an-inline-block"),
+        pytest.param("/* a */ /* b */ const n = Math.random();\n", id="after-two-inline-blocks"),
+        pytest.param("const n = 1000\n  * Math.random();\n", id="star-continuation-line"),
+        pytest.param("/*\n * prose\n */ const n = Math.random();\n", id="after-a-block-close"),
+        pytest.param("const a = 1; /* opens\nconst n = Math.random();\n", id="mid-line-opener"),
+        pytest.param("const u = 'http://x/*';\nconst n = Math.random();\n", id="opener-in-string"),
+    ],
+)
+def test_a_weak_draw_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("/* legacy */ createHash('md5')\n", id="after-an-inline-block"),
+        pytest.param("const d = x\n  * createHash('md5')\n", id="star-continuation-line"),
+    ],
+)
+def test_an_operation_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
+    assert "hash:createHash[md5]" in _gate().non_python_operation_tokens_in(text)
+
+
+def test_a_multi_line_block_comment_still_hides_its_prose() -> None:
+    # The other half: inside a real block, a call named in prose (with or without a leading *) is
+    # not a call. cspNonce.ts depends on this; test_the_real_cspnonce_draw_is_not_a_false_positive
+    # holds it on the real file.
+    text = "/**\n * Math.random() is xorshift128+.\n   createHash('md5') too.\n */\n"
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == set()
+    assert gate.non_python_operation_tokens_in(text) == set()
+
+
+# --- BACKLOG #5579: a name imported twice keeps both bindings ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "token"),
+    [
+        pytest.param(
+            "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+            "def other():\n    from mylib import thing as hashlib\n    return hashlib\n",
+            "hash:hashlib.md5",
+            id="local-import-reuses-a-crypto-module-name",
+        ),
+        pytest.param(
+            "from mylib import thing as secrets\n\n\ndef a():\n    import secrets\n"
+            "    return secrets.token_bytes(16)\n",
+            "csprng:secrets.token_bytes",
+            id="module-import-shadows-a-local-crypto-import",
+        ),
+        pytest.param(
+            "try:\n    import hashlib as h\nexcept ImportError:\n    import mylib as h\n\n\n"
+            "def a(b):\n    return h.sha1(b)\n",
+            "hash:hashlib.sha1",
+            id="fallback-import-of-the-same-name",
+        ),
+    ],
+)
+def test_a_reused_import_name_does_not_hide_a_crypto_call(source: str, token: str) -> None:
+    ops = _gate().crypto_operations
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert token in found.get("messagefoundry/x.py", frozenset()), found
+
+
+def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
+    # The provider half of #5579: a function-local import that reuses a first-party provider's name
+    # used to replace the module-level binding, so the call through the provider vanished.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/seam.py": "import ssl\n\n\ndef build():\n    return ssl.create_default_context()\n",
+        "messagefoundry/plain.py": "def build():\n    return 1\n",
+        "messagefoundry/user.py": (
+            "from messagefoundry.seam import build\n\n\ndef go():\n    return build()\n\n\n"
+            "def other():\n    from messagefoundry.plain import build\n    return build\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found.get("messagefoundry/user.py") == frozenset({"tls_context:via messagefoundry.seam"})

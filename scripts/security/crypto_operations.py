@@ -56,7 +56,10 @@ seen:
   walked roots and suffixes;
 * for the PowerShell arm: a ``<#`` inside a string or here-string that opens a line with it. The
   comment stripper cannot tell it from a real block comment and hides the lines up to the next
-  ``#>``.
+  ``#>``;
+* for the TypeScript/JavaScript arms, the same shape: a line of a multi-line string or template
+  literal that opens with ``/*``. The comment stripper reads it as a block comment and hides the
+  lines up to the next ``*/``.
 
 Stdlib only, like the gate that imports it.
 """
@@ -370,21 +373,31 @@ def _resolve_relative(mod: str, is_init: bool, level: int, target: str | None) -
     return base
 
 
-def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, str]:
-    """Local name -> fully qualified target, for every import anywhere in the module.
+def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, list[str]]:
+    """Local name -> EVERY fully qualified target an import anywhere in the module binds it to.
 
-    Function-local imports are included and scoping is ignored: a name bound by an import anywhere
-    in the file resolves the same way everywhere in it. That can over-resolve a shadowed name, which
-    errs toward reporting an operation, never toward hiding one."""
-    aliases: dict[str, str] = {}
+    Function-local imports are included and scoping is ignored, so a name bound by an import
+    anywhere in the file resolves the same way everywhere in it. A name bound more than once keeps
+    ALL its targets (BACKLOG #5579). It was last-write-wins, so a function-local
+    ``from x import y as hashlib`` replaced the module-level ``hashlib`` for the whole file and hid
+    every real ``hashlib`` call in it. A call is now resolved under each binding and counted when any
+    one of them is an operation. That can over-resolve a shadowed name, which errs toward reporting
+    an operation, never toward hiding one."""
+    aliases: dict[str, list[str]] = {}
+
+    def bind(local: str, target: str) -> None:
+        targets = aliases.setdefault(local, [])
+        if target not in targets:
+            targets.append(target)
+
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.asname:
-                    aliases[alias.asname] = alias.name
+                    bind(alias.asname, alias.name)
                 else:
                     head = alias.name.split(".", 1)[0]
-                    aliases.setdefault(head, head)
+                    bind(head, head)
         elif isinstance(node, ast.ImportFrom):
             source = (
                 _resolve_relative(mod, is_init, node.level, node.module)
@@ -394,22 +407,24 @@ def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, s
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                aliases[alias.asname or alias.name] = f"{source}.{alias.name}"
+                bind(alias.asname or alias.name, f"{source}.{alias.name}")
     return aliases
 
 
-def dotted(expr: ast.expr, aliases: dict[str, str], mod: str, local_defs: set[str]) -> str | None:
-    """The qualified name an expression refers to, or ``None`` when it cannot be resolved."""
+def dotted(
+    expr: ast.expr, aliases: dict[str, list[str]], mod: str, local_defs: set[str]
+) -> list[str]:
+    """Every qualified name an expression can refer to; empty when it cannot be resolved. A name
+    both imported and defined in the module keeps both readings, for the reason
+    :func:`import_aliases` gives."""
     if isinstance(expr, ast.Name):
-        if expr.id in aliases:
-            return aliases[expr.id]
-        if expr.id in local_defs:
-            return f"{mod}.{expr.id}"
-        return None
+        out = list(aliases.get(expr.id, ()))
+        if expr.id in local_defs and f"{mod}.{expr.id}" not in out:
+            out.append(f"{mod}.{expr.id}")
+        return out
     if isinstance(expr, ast.Attribute):
-        base = dotted(expr.value, aliases, mod, local_defs)
-        return f"{base}.{expr.attr}" if base else None
-    return None
+        return [f"{base}.{expr.attr}" for base in dotted(expr.value, aliases, mod, local_defs)]
+    return []
 
 
 def classify_qualified(name: str) -> str | None:
@@ -431,11 +446,11 @@ class ParsedModule:
     mod: str
     tree: ast.Module
     nodes: list[ast.AST]  # one walk, reused by every pass over the module
-    aliases: dict[str, str]
+    aliases: dict[str, list[str]]
     local_defs: set[str]
     functions: set[str]
 
-    def resolve(self, expr: ast.expr) -> str | None:
+    def resolve(self, expr: ast.expr) -> list[str]:
         return dotted(expr, self.aliases, self.mod, self.local_defs)
 
 
@@ -466,13 +481,14 @@ def _resolve_siblings(modules: list[ParsedModule]) -> None:
         if not m.mod.startswith(SIBLING_IMPORT_ROOTS):
             continue
         package = m.mod.rpartition(".")[0]
-        for local, target in list(m.aliases.items()):
-            head = target.split(".", 1)[0]
-            # The SIBLING module must exist as a file. Accepting any known prefix instead would let
-            # one ``__init__.py`` in the directory rewrite ``import hashlib`` into a first-party name
-            # and silently drop every operation in the file.
-            if head not in known and f"{package}.{head}" in known:
-                m.aliases[local] = f"{package}.{target}"
+        for targets in m.aliases.values():
+            for i, target in enumerate(targets):
+                head = target.split(".", 1)[0]
+                # The SIBLING module must exist as a file. Accepting any known prefix instead would
+                # let one ``__init__.py`` in the directory rewrite ``import hashlib`` into a
+                # first-party name and silently drop every operation in the file.
+                if head not in known and f"{package}.{head}" in known:
+                    targets[i] = f"{package}.{target}"
 
 
 def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
@@ -485,15 +501,26 @@ def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
     return owner
 
 
-def _resolve_reexport(name: str, reexports: dict[str, str]) -> str:
+def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> list[str]:
     """Follow ``pkg.name -> real.target`` re-export links, so a call through a package ``__init__``
-    lands on the function that is actually defined. Bounded, so a cycle cannot hang the gate."""
+    lands on the function that is actually defined. A name re-exported more than once follows every
+    link (BACKLOG #5579). Returns ``name`` and every name reached, so the caller keeps any of them
+    that is a first-party function. Bounded, so a cycle cannot hang the gate."""
+    reached = {name: None}  # an ordered set
+    frontier = [name]
     for _ in range(8):
-        target = reexports.get(name)
-        if target is None or target == name:
-            return name
-        name = target
-    return name
+        frontier = list(
+            dict.fromkeys(t for n in frontier for t in reexports.get(n, ()) if t not in reached)
+        )
+        if not frontier:
+            break
+        reached.update(dict.fromkeys(frontier))
+    return list(reached)
+
+
+def _lands_on(qualified: str, reexports: dict[str, list[str]], known_functions: set[str]) -> bool:
+    """Whether a qualified callee reaches a first-party module-level function."""
+    return any(name in known_functions for name in _resolve_reexport(qualified, reexports))
 
 
 def _canonical_algorithm(name: str) -> str | None:
@@ -515,24 +542,18 @@ _ALGORITHM_KEYS: dict[str, str] = {
 def _algorithms_in(call: ast.Call, m: ParsedModule) -> list[str]:
     """Hash algorithms named anywhere in a call's ARGUMENTS, nested calls included
     (``key.sign(data, ec.ECDSA(hashes.SHA256()))``), so the token can carry them."""
-    found: set[str] = set()
+    found: set[str | None] = set()
     for arg in [*call.args, *(kw.value for kw in call.keywords)]:
         for node in ast.walk(arg):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                algo = _canonical_algorithm(node.value)
+                found.add(_canonical_algorithm(node.value))
             elif isinstance(node, (ast.Name, ast.Attribute)):
-                qualified = m.resolve(node)
-                algo = (
+                found.update(
                     _canonical_algorithm(qualified.rpartition(".")[2])
-                    if qualified is not None
-                    and qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
-                    else None
+                    for qualified in m.resolve(node)
+                    if qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
                 )
-            else:
-                algo = None
-            if algo is not None:
-                found.add(algo)
-    return sorted(found)
+    return sorted(algo for algo in found if algo is not None)
 
 
 def _value_label(value: ast.expr, m: ParsedModule) -> str:
@@ -544,7 +565,7 @@ def _value_label(value: ast.expr, m: ParsedModule) -> str:
         inner = _value_label(value.operand, m)
         return f" ~{inner.strip()}" if inner else ""
     qualified = m.resolve(value)
-    return f" {qualified.rpartition('.')[2]}" if qualified else ""
+    return f" {qualified[0].rpartition('.')[2]}" if qualified else ""
 
 
 _AUG_OPERATORS: dict[type[ast.operator], str] = {
@@ -587,7 +608,7 @@ def _posture_targets(node: ast.AST) -> list[tuple[str, ast.expr | None]]:
 
 
 def _direct_operations(
-    m: ParsedModule, known_functions: set[str], reexports: dict[str, str]
+    m: ParsedModule, known_functions: set[str], reexports: dict[str, list[str]]
 ) -> list[tuple[ast.AST, int, str, str]]:
     """``(node, line, class, callee)`` for every direct operation in one module."""
     found: list[tuple[ast.AST, int, str, str]] = []
@@ -603,23 +624,21 @@ def _direct_operations(
                 label = _value_label(node.args[2], m) if len(node.args) >= 3 else ""
                 found.append((node, node.lineno, "tls_context", f".{node.args[1].value} ={label}"))
                 continue
-            qualified = m.resolve(node.func)
-            if qualified is not None:
-                op = classify_qualified(qualified)
-                if op is not None:
-                    algorithms = _algorithms_in(node, m)
+            candidates = m.resolve(node.func)
+            hits = [(q, op) for q in candidates if (op := classify_qualified(q)) is not None]
+            if hits:
+                algorithms = _algorithms_in(node, m)
+                for qualified, op in hits:
                     label = f"{qualified}[{','.join(algorithms)}]" if algorithms else qualified
                     found.append((node, node.lineno, op, label))
-                    continue
+                continue
             if isinstance(node.func, ast.Attribute) and node.func.attr in METHOD_RULES:
-                if (
-                    qualified is not None
-                    and _resolve_reexport(qualified, reexports) in known_functions
-                ):
+                if candidates and all(_lands_on(q, reexports, known_functions) for q in candidates):
                     # A call that lands on a first-party module-level FUNCTION is handled by provider
                     # propagation, which knows whether that function really performs crypto; a
                     # method-name guess would not. Anything else (a first-party class's method, a
-                    # module-level instance, an unresolvable receiver) keeps the method rule.
+                    # module-level instance, an unresolvable receiver, or a name that only SOME of
+                    # its bindings resolve to a first-party function) keeps the method rule.
                     continue
                 op_class: str | None = METHOD_RULES[node.func.attr]
                 override = METHOD_OVERRIDES.get((m.path, node.func.attr))
@@ -671,10 +690,10 @@ def discover_operations_in(sources: dict[str, str]) -> list[Operation]:
 def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operation]:
     """:func:`discover_operations` over modules already parsed by :func:`parse_sources`."""
     # Module-level re-exports: ``pkg.name -> target`` for every name a module binds by import.
-    reexports: dict[str, str] = {}
+    reexports: dict[str, list[str]] = {}
     for m in modules:
-        for local, target in m.aliases.items():
-            reexports.setdefault(f"{m.mod}.{local}", target)
+        for local, targets in m.aliases.items():
+            reexports.setdefault(f"{m.mod}.{local}", []).extend(targets)
     # Every first-party module-level function: the only things that can become providers.
     known_functions = {f"{m.mod}.{name}" for m in modules for name in m.functions}
 
@@ -699,11 +718,13 @@ def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operatio
         for node in m.nodes:
             if not isinstance(node, ast.Call):
                 continue
-            qualified = m.resolve(node.func)
-            if qualified is None:
-                continue
-            target = _resolve_reexport(qualified, reexports)
-            if target in known_functions:
+            landed = {
+                target
+                for qualified in m.resolve(node.func)
+                for target in _resolve_reexport(qualified, reexports)
+                if target in known_functions
+            }
+            for target in sorted(landed):
                 first_party_calls.append((m, node, owner.get(id(node)), target))
 
     # Fixed point. Who BECOMES a provider is the noise budget, so it is rationed:

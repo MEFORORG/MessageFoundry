@@ -2379,30 +2379,69 @@ def find_violations(
     return undocumented, stale
 
 
-def _is_comment_only(line: str) -> bool:
-    """True for a line that is nothing but a ``//`` or block-comment line.
+def _strip_comments(text: str, line_comment: str, block_open: str, block_close: str) -> list[str]:
+    """The code of a source, one entry per line, with comments removed. Shared by the JS/TS and
+    PowerShell arms so a fix to one stripper reaches the other.
 
-    DELIBERATELY CONSERVATIVE, and the direction matters. A code line carrying a TRAILING comment is
-    still scanned in full, so a call cannot be hidden by putting a ``//`` earlier on the same line;
-    the cost is that a line beginning with ``*`` for some non-comment reason is skipped. The error
-    this can make is a false POSITIVE (flagging a call quoted inside a string), never a false
-    negative, which is the only safe direction for a security gate. Stripping comments properly would
+    A line whose code starts with ``line_comment`` is a comment. ``block_open`` opens a block
+    comment only where it STARTS the remaining code on a line, and the lines up to its
+    ``block_close`` are skipped; code after the close on the same line is kept. An opener anywhere
+    else (after code, in a string, in a trailing line comment) never opens a block, so it cannot
+    hide the lines that follow. Every choice errs toward scanning too much, never too little, except
+    the one the residual in crypto_operations.py names: a string line that STARTS with the opener."""
+    width = len(block_close)
+    code: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw
+        if in_block:
+            end = line.find(block_close)
+            if end < 0:
+                continue
+            line = line[end + width :]
+            in_block = False
+        while True:
+            stripped = line.lstrip()
+            if not stripped.startswith(block_open):
+                break
+            end = stripped.find(block_close, len(block_open))
+            if end < 0:
+                in_block = True
+                line = ""
+                break
+            line = stripped[end + width :]
+        stripped = line.strip()
+        if stripped and not stripped.startswith(line_comment):
+            code.append(line)
+    return code
+
+
+def _js_code(text: str) -> list[str]:
+    """The code of a TypeScript/JavaScript source, one entry per line, with comments removed.
+
+    A line whose code starts with ``//`` is a comment. A ``/*`` opens a block comment only where it
+    STARTS the remaining code on a line, and the lines up to its ``*/`` are skipped; code after the
+    ``*/`` on the same line is kept and scanned. A line that begins with ``*`` is skipped only INSIDE
+    such a block, so ``* Math.random()`` continuing an expression is scanned (BACKLOG #5578: the old
+    rule skipped every line starting ``/*`` or ``*``, which hid a call after an inline ``/* */`` and
+    a call on a ``*`` continuation line). A ``/*`` anywhere else on a line (after code, in a string,
+    in a trailing ``//`` comment) never opens a block, so it cannot hide the lines that follow, and a
+    trailing comment never hides the code before it. Every choice errs toward scanning too much,
+    never too little, except the one the residual in crypto_operations.py names: a line of a
+    multi-line string or template literal that STARTS with ``/*``. Stripping comments exactly would
     need a JS lexer, and a naive strip would cut a line at the ``//`` of a URL and hide what follows.
 
-    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` uses the same rule
-    for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it is unusable.
-    """
-    stripped = line.lstrip()
-    return stripped.startswith(("//", "*", "/*"))
+    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
+    lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
+    is unusable."""
+    return _strip_comments(text, "//", "/*", "*/")
 
 
 def randomness_tokens_in(text: str) -> set[str]:
     """The randomness-source tokens (strong and weak) a non-Python source draws from."""
     found: set[str] = set()
     patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
-    for line in text.splitlines():
-        if _is_comment_only(line):
-            continue
+    for line in _js_code(text):
         for token, pattern in patterns.items():
             if token not in found and pattern.search(line):
                 found.add(token)
@@ -2737,12 +2776,11 @@ def _pattern_tokens(
 
 
 def non_python_operation_tokens_in(text: str) -> set[str]:
-    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comment-only lines
-    are skipped by the same conservative rule as the randomness arm (:func:`_is_comment_only`)."""
+    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comments are
+    removed by the same conservative rule as the randomness arm (:func:`_js_code`)."""
     found: set[str] = set()
-    for line in text.splitlines():
-        if not _is_comment_only(line):
-            found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
+    for line in _js_code(text):
+        found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
     # A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
     # ``_CIPHER_STRING`` for why.
     names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}
@@ -2993,30 +3031,7 @@ def _powershell_code(text: str) -> list[str]:
     block, so it cannot hide the lines that follow. A single-line ``<# ... #>`` after code is left in
     place and scanned. Every choice here errs toward scanning too much, never too little, except the
     one the residual in crypto_operations.py names: a string that STARTS a line with ``<#``."""
-    code: list[str] = []
-    in_block = False
-    for raw in text.splitlines():
-        line = raw
-        if in_block:
-            end = line.find("#>")
-            if end < 0:
-                continue
-            line = line[end + 2 :]
-            in_block = False
-        while True:
-            stripped = line.lstrip()
-            if not stripped.startswith("<#"):
-                break
-            end = stripped.find("#>", 2)
-            if end < 0:
-                in_block = True
-                line = ""
-                break
-            line = stripped[end + 2 :]
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            code.append(line)
-    return code
+    return _strip_comments(text, "#", "<#", "#>")
 
 
 def powershell_operation_tokens_in(text: str) -> set[str]:
