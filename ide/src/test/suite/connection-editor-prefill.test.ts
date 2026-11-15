@@ -347,28 +347,40 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.ok(!("tls_key_password" in saved(p, false)), "the removed credential came back on save");
   });
 
-  test("edit: a secret env reference's key emptied and retyped, with no transport change, drops its inline default", () => {
-    const p = load({ groups });
-    const box = p.window.document.querySelector('#settings [data-key="db_password"]');
-    const type = (text: string): void => {
-      box.value = text;
-      box.dispatchEvent(new p.window.Event("input"));
-    };
-    type("");
-    type("DB_PW2");
-    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW2" }, "the cleared inline default came back");
-    // However the key is replaced, the old credential does not become the new key's default.
-    const q = load({ groups });
-    const qbox = q.window.document.querySelector('#settings [data-key="db_password"]');
-    qbox.value = "DB_PW3";
-    qbox.dispatchEvent(new q.window.Event("input"));
-    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW3" }, "a replaced key kept the old default");
+  test("edit: a secret env reference given another key does not take its inline default", () => {
+    for (const typed of ["DB_PW2", " DB_PW3 "]) {
+      const p = load({ groups });
+      p.window.document.querySelector('#settings [data-key="db_password"]').value = typed;
+      assert.deepStrictEqual(saved(p, false).db_password, { env: typed.trim() }, `a replaced key kept the old default: ${typed}`);
+    }
+  });
+
+  test("edit: a removed setting kept again while its rebuild is pending never writes the raw credential", () => {
+    for (const clone of [false, true]) {
+      const p = load({ clone, groups });
+      const doc = p.window.document;
+      const drop = doc.querySelector('#settings [data-remove-key="db_password"]');
+      drop.click();
+      const transport = doc.getElementById("transport");
+      transport.value = "file";
+      transport.dispatchEvent(new p.window.Event("change"));
+      // No reply arrives; the user keeps the setting again and saves.
+      drop.click();
+      if (!clone) {
+        doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW2";
+      }
+      const written = saved(p, clone).db_password;
+      assert.ok(!JSON.stringify(written).includes(INLINE_DEFAULT), `${clone ? "clone" : "edit"} wrote the raw credential`);
+    }
   });
 
   test("edit: an untouched save keeps an inline default recorded under a key with surrounding whitespace", () => {
-    const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: " DB_PW ", default: INLINE_DEFAULT } } };
-    const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
-    assert.strictEqual(saved(p, false).db_password.default, INLINE_DEFAULT, "an untouched save dropped the credential");
+    // A text box keeps spaces but strips line breaks, so both shapes are what an untouched box shows.
+    for (const env of [" DB_PW ", "DB_\r\nPW"]) {
+      const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env, default: INLINE_DEFAULT } } };
+      const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+      assert.strictEqual(saved(p, false).db_password.default, INLINE_DEFAULT, `an untouched save dropped the credential: ${JSON.stringify(env)}`);
+    }
   });
 
   test("edit: the original key typed back after a transport round trip keeps the inline default", () => {
@@ -428,8 +440,9 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
         const asked = p.posted.filter((m) => m.command === "fields");
         p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
       }
-      doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW2";
-      assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW2" }, "the removed inline default came back");
+      // The original key: only removing or emptying the setting can drop the default here.
+      doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW";
+      assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW" }, `the ${how} inline default came back`);
     });
   }
 

@@ -140,10 +140,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // declare comes back showing the mark rather than the credential. The save swaps the value back.
     const HELD_MARK = '[held inline credential, not shown]';
     const HELD_SECRETS = new Map();
-    const HELD_DEFAULTS = new Map();
-    // The env key each held default was recorded under, trimmed: the default goes back only with
+    // Each entry is { value, envKey }: the default and the env key it was recorded under, as an
+    // untouched box shows it (line breaks stripped) and trimmed. The default goes back only with
     // that key, however many rebuilds came between.
-    const HELD_DEFAULT_KEYS = new Map();
+    const HELD_DEFAULTS = new Map();
     // Keys whose inline credential the user chose to remove; the save then writes no value for them.
     const REMOVED_SECRETS = new Set();
     function heldSecret(f) {
@@ -175,8 +175,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       lab.title = f.help || '';
       if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) HELD_SECRETS.set(f.key, f.preserveValue);
       if (f.secret && f.envDefault !== undefined && f.envDefault !== HELD_MARK) {
-        HELD_DEFAULTS.set(f.key, f.envDefault);
-        HELD_DEFAULT_KEYS.set(f.key, String(f.envKey ?? '').trim());
+        HELD_DEFAULTS.set(f.key, { value: f.envDefault, envKey: String(f.envKey ?? '').replace(/[\\r\\n]/g, '').trim() });
       }
       let control;
       const useEnv = f.isEnvRef || f.secretOnlyEnv;
@@ -301,7 +300,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
       // A setting removed before a rebuild is gone: its held default does not return with its key.
-      for (const k of REMOVED_KEYS) { HELD_DEFAULTS.delete(k); HELD_DEFAULT_KEYS.delete(k); }
+      // So is one whose env key box is empty: the request leaves it out, as it does a removed one.
+      for (const k of REMOVED_KEYS) HELD_DEFAULTS.delete(k);
+      for (const el of document.querySelectorAll('#settings [data-key][data-env="1"]')) {
+        if (!el.value.trim()) HELD_DEFAULTS.delete(el.dataset.key);
+      }
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -448,9 +451,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           // trimmed, so an untouched key and the original key typed back after a rebuild keep it,
           // and a replaced key does not take the old credential as its default. A setting the user
           // removed loses its held default when the fields are rebuilt (requestFields).
-          if (HELD_DEFAULTS.has(key)) {
-            if (envKey === HELD_DEFAULT_KEYS.get(key)) ref.default = HELD_MARK;
-          } else if (f.envDefault !== undefined) {
+          // A secret's default is never written from the descriptor: only as the mark, so resolveHeld
+          // decides it and a clone never copies it.
+          const held = HELD_DEFAULTS.get(key);
+          if (held !== undefined) {
+            if (envKey === held.envKey) ref.default = HELD_MARK;
+          } else if (f.envDefault !== undefined && !f.secret) {
             ref.default = f.envDefault;
           }
           settings[key] = ref;
@@ -511,9 +517,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         } else if (value !== null && typeof value === 'object' && value.default === HELD_MARK) {
           // A copy: the value may be a descriptor's own recorded object.
           const ref = { ...value };
-          const dflt = HELD_DEFAULTS.get(key);
-          if (dflt === undefined || CLONE) delete ref.default;
-          else ref.default = dflt;
+          const held = HELD_DEFAULTS.get(key);
+          if (held === undefined || CLONE) delete ref.default;
+          else ref.default = held.value;
           settings[key] = ref;
         }
       }
