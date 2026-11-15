@@ -74,8 +74,10 @@ function unlinkWithRetries(file: string, retries: number): void {
  * the VS Code extension host (measured on its Node v24.21.0) a recursive rmSync follows a junction
  * and deletes its target's files. A case file that cannot be removed does not stop the others: the
  * rest are still unlinked, then the first error is thrown. Throws on any failure, a directory
- * already gone included. Open limit: `dir` is checked once, by path, so a directory swapped for a
- * link between that lstat and the listing is followed.
+ * already gone included. Open limit: `dir` is checked once, by its lstat, and the listing, every
+ * lstat and unlink of a case file, and the final rmdir all act by path. So a directory swapped for
+ * a link at any point after that lstat, at least until the last unlink and the retry waits
+ * included, is followed, and case-named regular files in the link's target are unlinked.
  */
 function deleteCaseDir(dir: string, retries: number): void {
   if (!fs.lstatSync(dir).isDirectory()) {
@@ -103,7 +105,8 @@ function deleteCaseDir(dir: string, retries: number): void {
   fs.rmdirSync(dir);
 }
 
-/** Remove a run's directory. Best effort: a cleanup error must not mask the run's own result. */
+/** Remove a run's case files, then its directory if it is then empty (deleteCaseDir). Best effort:
+ *  a cleanup error must not mask the run's own result. */
 export function removeCaseDir(dir: string): void {
   try {
     deleteCaseDir(dir, 3);

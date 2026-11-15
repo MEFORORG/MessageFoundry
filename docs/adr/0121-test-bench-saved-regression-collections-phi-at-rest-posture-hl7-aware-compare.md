@@ -73,9 +73,11 @@ of volatile fields (MSH-7, MSH-10).**
 - **Rerun.** Because the `dryrun` CLI takes only file paths (`--messages`, no stdin), a rerun
   **materializes each case's stored input to a fresh per-run temp directory** (`os.tmpdir()`),
   dry-runs it (`--show-phi`, so expected/actual bodies are full), compares each case's new deliveries
-  against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
-  `finally`**. A hard crash can still leave the directory behind; *Consequences* says what removes
-  it (amended 2026-11-14, BACKLOG #5415). Pass/fail is shown per case;
+  against its stored `expected` via `compareMessages`, and in a `finally` **deletes the run's case
+  files, then the temp directory if it is then empty**. At least a case file that cannot be
+  unlinked, and any entry not named as a case file, stay, and with them the directory. A hard crash
+  can also leave the directory behind; *Consequences* says what removes it (amended 2026-11-14,
+  BACKLOG #5415). Pass/fail is shown per case;
   a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
 - **A case must also end where it did (amended 2026-11-14, BACKLOG #5416).** An errored Router or
   Handler delivers nothing, so the delivery compare alone passed a case that expects no delivery. A
@@ -140,14 +142,17 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 **Negative / risks** — A **new PHI-at-rest surface**: message bodies persist in `workspaceState`
 (machine-local, but plaintext in VS Code's per-workspace storage). Mitigated by the synthetic-case
 steer (ADR 0030) and the in-UI notice; workspaceState is not encrypted, so authors must not save real
-PHI. Rerun writes transient PHI to a temp dir — always cleaned in `finally`, but a hard crash mid-run
-could leave a temp file. *Amended 2026-11-14 (BACKLOG #5415):* the run's directory is owner-only
+PHI. Rerun writes transient PHI to a temp dir. A `finally` deletes the run's case files, then the
+directory if it is then empty, but at least a case file that cannot be unlinked, an entry not named
+as a case file with the directory holding it, and what a hard crash mid-run leaves can stay. *Amended 2026-11-14 (BACKLOG #5415):* the run's directory is owner-only
 (`0700`) and each case file is created exclusively and owner-only (`0600`) on POSIX; on Windows
 those modes do nothing and the temp directory's own ACL governs, which is owner-only for the default
-per-user TEMP but not for a shared directory TEMP is pointed at. A directory a crash left behind is
-deleted when the Test Bench next opens or next runs a collection, once it is over an hour old, and
-not before, so a run in another window survives; on POSIX only a directory this user owns is
-deleted. Until then it stays on disk, with no bound if the Test Bench is not used again. The dry-run is handed the directory, not one path per case, so a large
+per-user TEMP but not for a shared directory TEMP is pointed at. A directory left behind has its
+case files deleted, then is removed if it is then empty, when the Test Bench next opens or next runs
+a collection, once it is over an hour old, and not before, so a run in another window survives; on
+POSIX only a directory this user owns is touched. Until then it stays on disk, with no bound if the
+Test Bench is not used again. One that still holds a case file the sweep cannot unlink, or any
+entry not named as a case file, stays after that sweep too, and after every later one. The dry-run is handed the directory, not one path per case, so a large
 collection no longer grows the command line (`ide/src/collectionCaseFiles.ts`). The volatile policy is a fixed default;
 a feed with other volatile fields (e.g. a bespoke timestamp segment) may show a false regression until
 a future per-collection override lands.
@@ -196,7 +201,7 @@ message files. A command to delete every saved collection, including stranded on
 
 **What it does not change.** Case bodies are still PHI when an author saves real messages, so the
 synthetic-case steer and the in-UI notice stay. The rerun still materializes inputs to a temp
-directory and deletes it in `finally`.
+directory and, in `finally`, deletes its case files, then the directory if it is then empty.
 
 ## Amendment 2026-10-20 -- the SecretStorage key carries a scheme version (BACKLOG #3426)
 
