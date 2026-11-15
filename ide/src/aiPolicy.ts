@@ -2,8 +2,9 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // AI-assistance policy resolution for the IDE. The policy is centrally governed by the engine; the
 // IDE reads it (never sets it) and gates the @messagefoundry chat assistant accordingly. Resolution
-// is authoritative-engine-first, falling back to the local CLI (which reads messagefoundry.toml) when
-// the engine is unreachable.
+// is authoritative-engine-first, falling back, when the engine is unreachable, to that engine's
+// cached answer, and to the local CLI (which reads messagefoundry.toml) only where pickOfflinePolicy
+// allows it.
 //
 // The policy has TWO halves and they are answered differently:
 //   - `mode` is identity-INDEPENDENT, so a central "off" is honored even by a tokenless client;
@@ -15,14 +16,17 @@ import { peekToken } from "./auth";
 import {
   type AiPolicy,
   type CachedAiPolicy,
-  UNVERIFIED_POLICY,
-  cachedPolicyOffline,
+  aiPolicyCacheKey,
+  carryDeniesOffline,
+  carryDeniesOnline,
   evaluatedPermission,
+  heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  pickOfflinePolicy,
 } from "./aiPolicyModel";
-import { engineUrl, runJson, workspaceDir } from "./cli";
+import { engineTargetIsSet, engineUrl, environments, runJson, workspaceDir } from "./cli";
 import { getJson } from "./engineClient";
-import { ASSIST_GATE_PLAN } from "./engineStatusModel";
+import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
 
 // The policy shape lives in the zero-import aiPolicyModel so the merge rule below it can be asserted
@@ -45,11 +49,13 @@ export interface AiPolicyWire {
   reason: string | null;
 }
 
-// globalState key holding the last authoritative (engine) policy, so a previously-seen central
-// "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is
-// stamped with when the engine answered, so a cached answer that ENABLES assistance expires
-// (BACKLOG #1154; see cachedPolicyOffline).
-const LAST_POLICY_KEY = "messagefoundry.lastAiPolicy";
+// The last authoritative (engine) policy is kept in globalState, so a previously-seen central "off" /
+// ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is stamped with
+// when the engine answered, so a cached answer that ENABLES assistance expires (BACKLOG #1154; see
+// cachedPolicyOffline), and it is keyed by the engine that answered (aiPolicyCacheKey, BACKLOG #5564),
+// so one engine's answer never stands in for another's. A DENY is the exception: the deny carrier
+// (carryDeniesOnline / carryDeniesOffline) takes it to every target with no answer of its own, so a
+// retarget or another spelling of the URL cannot leave it behind.
 
 /**
  * Wire → resolved policy. `AiPolicyWire` is a claim about a response, not a guarantee: `JSON.parse`
@@ -67,30 +73,9 @@ function fromWire(w: AiPolicyWire): AiPolicy {
   };
 }
 
-/**
- * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
- *   (a) the last cached authoritative (engine) policy, if any, as {@link cachedPolicyOffline} lets it
- *       stand — so a previously-seen central "off" / ai:assist deny survives going offline, and a
- *       cached answer that enables assistance stops doing so once it is too old (BACKLOG #1154); else
- *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"); else
- *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
- *
- * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
- * engine, which is the authority; a local file must not outrank it once its answer expires.
- */
-export function pickOfflinePolicy(
-  cached: CachedAiPolicy | null,
-  cli: AiPolicy | null,
-  nowMs: number = Date.now(),
-): AiPolicy {
-  if (cached) {
-    return cachedPolicyOffline(cached, nowMs);
-  }
-  if (cli) {
-    return cli;
-  }
-  return UNVERIFIED_POLICY;
-}
+// pickOfflinePolicy moved to the zero-import aiPolicyModel (BACKLOG #5564), so its fail-closed order
+// is asserted on the node-side leg; re-exported so existing importers are unchanged.
+export { pickOfflinePolicy } from "./aiPolicyModel";
 
 /**
  * The injectable IO seam for {@link resolveAiPolicy}. It exists so the fetch-and-cache path — where
@@ -104,6 +89,20 @@ export interface AiPolicyIo {
   getCliPolicy: () => Promise<AiPolicyWire>;
   /** The clock the cache is stamped and aged by, in epoch milliseconds. Defaults to `Date.now`. */
   now?: () => number;
+  /** Whether the operator configured the engine target (`engineUrl` set, or any `environments`).
+   *  Absent reads as not configured, the default target. See {@link pickOfflinePolicy}. */
+  targetConfigured?: () => boolean;
+}
+
+/**
+ * The engine the AI policy is read from, and the one an engine-brokered chat request goes to: the
+ * engine the status bar and the live view target (BACKLOG #5564). With named `environments`
+ * configured, that is the first environment, not `engineUrl`. Reading the policy from `engineUrl`
+ * there asked a different engine than the one the IDE works against, so the target's central "off"
+ * or `ai:assist` deny was never seen.
+ */
+export function aiPolicyEngineUrl(): string {
+  return resolveEngineStatusTarget(engineUrl(), environments()).url;
 }
 
 /**
@@ -113,19 +112,25 @@ export interface AiPolicyIo {
  * before every request, and `ensureToken` would pop an interactive sign-in modal out of it. The two
  * functions are structurally identical, so the type system cannot tell them apart — the control is the
  * test that asserts this field IS `peekToken` by identity, not this comment.
+ *
+ * `url` is {@link aiPolicyEngineUrl}.
  */
 export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
-  url: engineUrl,
+  url: aiPolicyEngineUrl,
   readToken: peekToken,
   getPolicy: (url, route, token) => getJson<AiPolicyWire>(url, route, token),
   getCliPolicy: () => runJson<AiPolicyWire>(["ai-policy"], workspaceDir()),
+  targetConfigured: engineTargetIsSet,
 };
 
 /**
  * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
- * identity-dependent `assist_permitted`; cached on success]; (b) when the engine is unreachable, the
- * last cached authoritative policy; (c) the local CLI [reads messagefoundry.toml]; (d) a fail-closed
- * "unverified" policy (assistance disabled) so a central "off" can't be bypassed by going offline.
+ * identity-dependent `assist_permitted`; cached on success, per engine]; (b) when the engine is
+ * unreachable, that engine's last cached authoritative policy; (c) the local CLI [reads
+ * messagefoundry.toml], only where {@link pickOfflinePolicy} allows it; (d) a fail-closed "unverified" policy (assistance disabled) so a central "off" can't be bypassed
+ * by going offline or retargeting.
+ * Every result passes through the deny carrier, so a deny any engine issued reaches a target that
+ * has no authoritative answer of its own.
  *
  * The read is AUTHENTICATED (BACKLOG #330). `assist_permitted` is computed from the acting identity, so
  * a tokenless read can only ever answer `null` and the `ai:assist` deny branch could never fire — half
@@ -138,8 +143,12 @@ export async function resolveAiPolicy(
   io: AiPolicyIo = DEFAULT_AI_POLICY_IO,
 ): Promise<AiPolicy> {
   const now = io.now ?? Date.now;
+  // The cache key names the engine asked (BACKLOG #5564). Undefined only if reading the target
+  // threw, and then no engine's cache may answer for it.
+  let cacheKey: string | undefined;
   try {
     const url = io.url();
+    cacheKey = aiPolicyCacheKey(url);
     const plan = ASSIST_GATE_PLAN[0];
     // SEC-005 (ADR 0035 / engineTarget.ts): never send a bearer in clear to a non-loopback http://
     // target. Same shape as the liveStatus poll's guard. peekToken, never ensureToken — see
@@ -151,29 +160,50 @@ export async function resolveAiPolicy(
     // GUARDED write. An answer the engine could not attribute to an identity carries
     // `assist_permitted: null`, and writing that raw would overwrite a cached, authoritatively-observed
     // deny — a degraded read UPGRADING assistance a central policy had switched off. The merge keeps
-    // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way.
+    // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way. Only THIS
+    // engine's cache is consulted (BACKLOG #5564): no state crosses engines.
     const merged = mergeAuthoritativePolicy(
-      ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null,
+      ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null,
       fresh,
     );
     // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
     const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
-    await ctx.globalState.update(LAST_POLICY_KEY, stamped);
-    return merged;
+    await ctx.globalState.update(cacheKey, stamped);
+    // A deny another engine issued, or that this one answered at another spelling of its URL, still
+    // reaches an answer that could not evaluate the permission (carryDeniesOnline).
+    return await carryDeniesOnline(ctx.globalState, cacheKey, fresh, merged);
   } catch {
     // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
   }
-  const cached = ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null;
+  const cached =
+    cacheKey === undefined ? null : (ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null);
+  // An operator-configured target that is unreachable and has no cache of its own fails closed:
+  // the local CLI is not that engine (pickOfflinePolicy). Unreadable settings count as configured.
+  let targetConfigured = true;
+  try {
+    targetConfigured = io.targetConfigured?.() ?? false;
+  } catch {
+    // Keep the fail-closed reading.
+  }
+  // Once any engine has answered, the local CLI does not answer for this target either: it must not
+  // outrank an engine's answer that has expired or that disables (pickOfflinePolicy). Read before
+  // the carrier runs, which may delete the old key.
+  const answeredBefore = heldAuthoritativeAnswer(ctx.globalState);
   let cli: AiPolicy | null = null;
-  // pickOfflinePolicy never reads the CLI's answer while a cache exists, so do not spawn it.
-  if (cached === null) {
+  // pickOfflinePolicy never reads the CLI's answer while a cache exists, for a configured target,
+  // or once an engine has answered, so do not spawn it then.
+  if (cached === null && !targetConfigured && !answeredBefore) {
     try {
       cli = fromWire(await io.getCliPolicy());
     } catch {
       // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
     }
   }
-  return pickOfflinePolicy(cached, cli, now());
+  // Unreachable, so no answer of its own: any deny an engine issued applies (carryDeniesOffline).
+  return carryDeniesOffline(
+    ctx.globalState,
+    pickOfflinePolicy(cached, cli, now(), targetConfigured, answeredBefore),
+  );
 }
 
 /** Fetch the current policy and surface it to the user (command: messagefoundry.showAiPolicy). */
