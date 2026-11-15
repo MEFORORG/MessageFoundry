@@ -385,6 +385,8 @@ class _EchoTransport(Transport):
     """Answers every complete frame AA, echoing the control id it carries."""
 
     kind = "mllp"
+    #: The MSA-1 every reply carries.
+    code = "AA"
 
     def __init__(self, delay: float = 0.0) -> None:
         self.delay = delay
@@ -393,7 +395,7 @@ class _EchoTransport(Transport):
     def send(self, data: bytes) -> Exchange:
         time.sleep(self.delay)
         self.sent.append(data)
-        replies = tuple(_plain_ack(payload) for payload in frames(data))
+        replies = tuple(_plain_ack(payload, self.code) for payload in frames(data))
         return Exchange(REPLY if replies else CLOSED, replies)
 
     def probe(self) -> str:
@@ -520,10 +522,7 @@ def test_silence_on_a_well_framed_message_breaks_the_reply_invariant(tmp_path: P
 class _NakTransport(_EchoTransport):
     """Answers every complete frame AR: an engine that refuses everything it is sent."""
 
-    def send(self, data: bytes) -> Exchange:
-        self.sent.append(data)
-        replies = tuple(_plain_ack(payload, "AR") for payload in frames(data))
-        return Exchange(REPLY if replies else CLOSED, replies)
+    code = "AR"
 
 
 def test_a_campaign_that_checked_no_stored_row_is_not_a_pass(tmp_path: Path) -> None:
@@ -597,7 +596,7 @@ def test_each_positive_ack_of_a_doubled_case_owes_its_own_row(tmp_path: Path) ->
     one_row = cast(EngineClient, _OneRowClient(transport))
     result = replay(one_row, transport, [kept], config, emit=lambda _: None)
     assert not result.ok
-    assert "is not in the store (1 row(s), 1 before the send)" in result.failures[0].reason
+    assert "is not in the store (1 row(s), more than 1 owed)" in result.failures[0].reason
     # Control: a store that keeps both rows passes, with both ACKs checked.
     transport = _EchoTransport()
     both = cast(EngineClient, _FakeClient(transport))

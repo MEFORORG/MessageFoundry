@@ -72,7 +72,8 @@ class FuzzConfig:
 
 @dataclass(frozen=True)
 class Failure:
-    """One broken invariant. ``case`` is None for a batch-level failure."""
+    """One broken invariant. ``case`` is None for a batch-level failure, and for the run-level
+    one a vacuous run records (:attr:`CampaignResult.vacuous`), which keeps no file."""
 
     reason: str
     case: Case | None
@@ -211,7 +212,9 @@ class _Session:
         sent: list[Case] = []
         acknowledgements = 0
         try:
-            predicted = {c.control_id for c in cases if c.control_id is not None}
+            # Every frame's id, not only the first's: each positive ACK is checked against the
+            # rows its own id had before the batch.
+            predicted = {cid for c in cases for f in frames(c.data) if (cid := control_id_of(f))}
             before = {cid: rows_for(self.client, cid) for cid in predicted if queryable(cid)}
             for case in cases:
                 if deadline is not None and time.monotonic() >= deadline:

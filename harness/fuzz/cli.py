@@ -81,8 +81,10 @@ def main(
         # once the campaign runs is recorded in the result, never raised, so it still exits 1.
         return fail_setup(str(exc))
     if not result.ok:
-        # A vacuous run kept no file, so it has nothing to replay.
-        if any(f.replay for f in result.failures) and not replay_files:
+        # A vacuous run's one failure names no case, so there is nothing to replay. A real
+        # failure whose file could not be written still gets the hint: its seed rebuilds it.
+        vacuous_only = [f.reason for f in result.failures] == [result.vacuous]
+        if not vacuous_only and not replay_files:
             where = f"--fuzz-driver {driver}" + (f" --fuzz-endpoint {endpoint}" if endpoint else "")
             print(f"replay with: python -m harness --fuzz-replay FILE {where} (seed {seed})")
         return EXIT_INVARIANT

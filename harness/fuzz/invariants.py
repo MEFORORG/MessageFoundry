@@ -31,7 +31,8 @@ decoder), then a clean close; an incomplete frame owes nothing, so a case whose 
 broke may end in silence. An inbound configured with ``ack_mode = "none"`` never answers and is not
 a target for the MLLP transport. A timeout, a reset, a refused connection, a reply cut off
 mid-frame, bytes outside a reply frame, a frame whose trailer is not exactly FS CR (BACKLOG
-#5421) or a reply that is not an acknowledgement breaks the reply invariant. Any API call answering 5xx breaks the API invariant, and ``/health`` must answer ``ok``.
+#5421) or a reply that is not an acknowledgement breaks the reply invariant. Any API call answering
+5xx breaks the API invariant, and ``/health`` must answer ``ok``.
 
 Nothing here quotes a message or reply body: problems name codes, counts and control ids.
 """
@@ -196,7 +197,8 @@ def check_health(client: EngineClient) -> str:
 
 def check_stored(client: EngineClient, control_id: str, before: int, settle: float) -> str:
     """Empty when more than ``before`` stored rows carry ``control_id``, the newest with a
-    disposition. Polls for up to ``settle`` seconds: ACK-on-receipt makes the row visible before
+    disposition. ``before`` is the pre-send count plus the rows earlier positive ACKs of the batch
+    already matched. Polls for up to ``settle`` seconds: ACK-on-receipt makes the row visible before
     the ACK, so a deploying site's store should need none of it."""
     deadline = time.monotonic() + settle
     query = partial(client.list_messages, control_id=control_id, limit=1)
@@ -208,7 +210,7 @@ def check_stored(client: EngineClient, control_id: str, before: int, settle: flo
                 return ""
             return f"control id {shown(control_id)} is stored with unknown status {shown(status)}"
         if time.monotonic() >= deadline:
-            have = f"{listing.total} row(s), {before} before the send"
+            have = f"{listing.total} row(s), more than {before} owed"
             return f"positively ACKed control id {shown(control_id)} is not in the store ({have})"
         time.sleep(_POLL_SECONDS)
 
