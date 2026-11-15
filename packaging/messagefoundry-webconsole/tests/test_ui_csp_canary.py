@@ -884,8 +884,9 @@ def _items(cell: str) -> dict[str, str]:
 
 
 def _policy_directives() -> set[str]:
-    """Every directive name in the console's nonce policy and the attachment download's policy."""
-    policies = (security.build_ui_csp("n"), engine_app._ATTACHMENT_CSP)
+    """Every directive name in the console's policies, the nonce one and the static one served under
+    the opt-out, and the attachment download's policy."""
+    policies = (security.build_ui_csp("n"), webconsole_auth.UI_CSP, engine_app._ATTACHMENT_CSP)
     return {part.split()[0] for policy in policies for part in policy.split(";") if part.strip()}
 
 
@@ -895,7 +896,11 @@ def _version(cell: str) -> tuple[int, ...] | None:
     assert _VERSION_CELL_RE.fullmatch(cell), (
         f"a version cell must be a version number or one of {_NO_VERSION}, not {cell!r}"
     )
-    return tuple(int(part) for part in cell.split("."))
+    parts = [int(part) for part in cell.split(".")]
+    # "16" and "16.0" are one version, so trailing zeros do not make two
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> None:
@@ -910,12 +915,15 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     those cannot be deleted to lift a floor. The request headers the server reads are held to the
     same table by ``test_browser_support_doc.py``, which derives them.
 
-    Names are matched by backticked token rather than by substring, as the degrade-table check does,
+    Names are matched against each row's lead, its first backticked token, rather than by substring,
     because this table splits ``Content-Security-Policy`` into one row per directive."""
     header, rows = _version_table(_FEATURE_TABLE_HEADING)
     columns = {browser: header.index(browser) for browser in _BROWSERS}
     source = header.index("Source")
-    named = set().union(*(_row_features(row[0]) for row in rows))
+    # a feature is covered by a row FOR it, never by a row that only mentions it, and no two rows
+    # are for one feature, so a cell keyed by its row's lead names exactly one row
+    leads = {_lead(row[0]) for row in rows}
+    assert len(leads) == len(rows), sorted(_lead(row[0]) for row in rows)
     required = set(_emitted_browser_security_headers())
     required |= {f"window.{feature}" for feature in _detected_browser_security_features()}
     required |= _session_cookie_attributes()
@@ -924,7 +932,7 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     assert {"Content-Security-Policy", "window.PublicKeyCredential", "__Host-"} <= required, (
         required
     )
-    missing = sorted(required - named)
+    missing = sorted(required - leads)
     assert not missing, (
         f"docs/BROWSER-SUPPORT.md's version table has no row for {missing}, which the console uses, "
         f"so the floor it states was not derived from every feature"
@@ -935,8 +943,6 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     section = " ".join(re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0].split())
     assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
     listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
-    # a directive is covered by a row FOR it, never by a row that only mentions it
-    leads = {_lead(row[0]) for row in rows}
     unnamed = sorted(d for d in directives if d not in leads and f"`{d}`" not in listed)
     assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
     # The referrer tag and the two passkey options are read from source text. Each read asserts
@@ -952,7 +958,7 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
         ('"credProps"', "credProps"),
     ):
         assert marker in passkeys, f"{marker} moved in the registration options; re-derive this"
-        assert feature in named, f"the registration options use {feature}, which has no row"
+        assert feature in leads, f"the registration options use {feature}, which has no row"
     assert any('`<meta name="referrer">`' in row[0] for row in rows), "the referrer tag row"
     nonce_rows = [row for row in rows if "'nonce-...'" in _row_features(row[0])]
     assert len(nonce_rows) == 1, (
@@ -1021,8 +1027,12 @@ def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
         for version, row in known:
             assert (row[0] in setters) == (version == latest), (floor_row[0], row[0])
             assert (row[0] in missing) == (version is None), (floor_row[0], row[0])
-            if row[column] == "not verified":
-                assert missing[row[0]].endswith("(not verified)"), (floor_row[0], row[0])
+            if version is None:
+                # the suffix says "not verified" exactly where the cell does, so a known "none"
+                # cannot be passed off as merely unverified
+                assert missing[row[0]].endswith("(not verified)") == (
+                    row[column] == "not verified"
+                ), (floor_row[0], row[0])
 
 
 def _runbook_contract_table() -> str:

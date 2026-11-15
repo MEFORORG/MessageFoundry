@@ -384,9 +384,9 @@ class UiFetchMetadataMiddleware:
     cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
     what lets them ship without assuming any browser sends fetch metadata -- the version table in
     ``docs/BROWSER-SUPPORT.md`` documents a floor, and nothing enforces it -- and it is exactly what
-    an ABSENCE rule could not claim. A browser can speak only PART of the family: that table records
-    Safari sending ``Sec-Fetch-Site`` and never ``Sec-Fetch-User``, so the user-activation rule
-    below refuses Safari's same-site navigation even when the user clicked. Measured
+    an ABSENCE rule could not claim. A browser can speak only PART of the family; which browsers do,
+    and what that costs, is that table and its ``Sec-Fetch-User`` rows, not restated here (SDS-3.5).
+    Measured
     2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
     reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
     browser-support decision, not a code change, and it is not taken here.

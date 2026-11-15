@@ -176,10 +176,11 @@ _VERSION_FEATURES_HEADING = "### Each feature"
 
 
 def test_every_request_header_the_server_reads_has_a_version_row() -> None:
-    """The version table's floor must count each header the server reads (BACKLOG #3316 item 11).
+    """The version table must have a row for each header the server reads (BACKLOG #3316 item 11).
 
     ``test_ui_csp_canary.py`` holds that table to the response headers, detects and cookie
-    attributes; this is the request-header half, from the same derivation as the test above."""
+    attributes; this is the request-header half, from the same derivation as the test above. Whether
+    such a row counts toward the floor is that module's ``_OUT_OF_FLOOR``, not this test."""
     derived = _request_headers_read()
     # positive control, as above
     assert {"Sec-Fetch-Site", "Sec-Fetch-User", "Origin"} <= derived, derived

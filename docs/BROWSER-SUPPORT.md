@@ -33,9 +33,10 @@ browser does with them.
 >   response header, a `window.<Feature>` detect or a session-cookie attribute the code uses. It
 >   fails too if [the version table](#supported-browser-versions) has no row for one of those, or
 >   names neither as a row nor in its list of other directives a directive of the console's or the
->   attachment download's policy, if it has no row for the in-page referrer tag, if a row leaves
->   the floor without a reason the page states, or if a browser's floor stops being the latest
->   version in its column.
+>   attachment download's policy, if it has no row for the in-page referrer tag or the two passkey
+>   options, if two rows are for one feature, if a row names no dataset entry, if a row leaves the
+>   floor without a reason the page states, if a cell with no version is added or removed, or if a
+>   browser's floor, its `Set by` column or its last column stops matching the rows.
 > - `test_browser_support_doc.py` fails if a `Sec-Fetch-*` or `Origin` header it finds read in the
 >   console's code, or in the engine's WebSocket check, has no row in the request-header table or
 >   in the version table, if a row's
@@ -164,7 +165,7 @@ feature in the last column does not raise the floor: either no version of that b
 or neither dataset gives a number for it. Its row in the tables above, or its note, says what holds
 without it. At least two of them change what a user sees. Safari sends no `Sec-Fetch-User`, so under
 the `Sec-Fetch-User` row a link into the console from a same-site page, such as another port on the
-same host, is refused. And in Chrome and Edge the `Clear-Site-Data` value can hang the page for
+same host or another subdomain of the same domain, is refused. And in Chrome and Edge the `Clear-Site-Data` value can hang the page for
 seconds (note 3). Both were read from the code and the dataset, not measured in a browser.
 
 ### Each feature
@@ -218,6 +219,12 @@ navigates to the identity provider by meta refresh, with a Continue link as the 
 console's `form-action 'self'` does not govern it, and the policy names no identity provider. The
 redirect these forms answered with before was measured blocked in headless Edge 157. No browser
 measurement of the page that replaced it is recorded.
+
+Read from the code and not measured: where the identity provider is on the same site as the
+console, such as another subdomain of the same domain, its redirect back to `/ui/oidc/callback` is
+a same-site navigation, so the `Sec-Fetch-User` row applies to it. Safari is then refused on every
+federated sign-in, and every browser that sends fetch metadata is refused when the identity
+provider signs the user in without a click.
 
 ### Where the numbers come from
 
