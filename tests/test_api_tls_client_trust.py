@@ -26,6 +26,7 @@ All material is synthetic and minted here. No PHI.
 from __future__ import annotations
 
 import datetime
+import gc
 import inspect
 import ipaddress
 import logging
@@ -56,12 +57,18 @@ from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import harden_crl_check
 from messagefoundry.credential import VERIFIED_ISSUER_KEY
+from messagefoundry.pipeline import crl_reload
 from messagefoundry.pki import IssuerIndex
+from tests import test_crl_reload as _reload_suite
 from tests.test_api_tls import _new_ca, _pem, _shim_view
 from tests.test_trust_anchor_byte_binding import _handshake
 
 _NOW = datetime.datetime.now(datetime.UTC)
 _DAY = datetime.timedelta(days=1)
+
+# The reload suite's autouse fixture, bound here by name so pytest applies it in this module too:
+# no held copies, refusals or reload pass state carried in from another test.
+_fresh_registry = _reload_suite._fresh_registry
 
 
 # --- a two-tier PKI: root, intermediate, leaf --------------------------------------------------------
@@ -604,6 +611,72 @@ def test_a_missing_crl_still_refuses_with_its_own_message(
 ) -> None:
     with pytest.raises(ValueError, match="does not exist"):
         build_api_ssl_context(_settings(two_tier, tmp_path / "absent.pem"))
+
+
+def test_a_ca_whose_akid_fit_cannot_be_read_has_no_crl_of_its_own(
+    rollover: _Rollover, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before the fix: where reading the CA for the authority key identifier match raised,
+    :func:`pki._signed_by` took the CA as fitting, so a CRL its key verified counted as its own,
+    while :func:`pki._signature_state` takes such a CA as fitting nothing. It fails closed now:
+    the CA cannot be shown to have a CRL of its own. The control is the same CA and CRL read."""
+    new = x509.load_pem_x509_certificate(rollover.new_root.read_bytes())
+    ders = [new.public_bytes(serialization.Encoding.DER)]
+    own = _crl("Client Root", rollover.new_key, None)
+    assert pki_module.cas_without_own_crl(ders, own) == []  # the control: read, it is its own
+    real = pki_module._akid_fit
+
+    def fit(akid: Any, ca: Any) -> bool | None:
+        if ca.cert == new:
+            raise x509.UnsupportedGeneralNameType("x400Address is not supported")
+        return real(akid, ca)
+
+    monkeypatch.setattr(pki_module, "_akid_fit", fit)
+    assert pki_module.cas_without_own_crl(ders, own) == [
+        (new.subject.rfc4514_string(), new.serial_number)
+    ]
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_reload_refuses_a_file_a_start_would_refuse_for_a_ca_without_its_own_crl(
+    rollover: _Rollover,
+) -> None:
+    """Red before the fix: the running-hop reload did not apply the own-CRL rule, so a
+    replacement carrying a newer CRL from the old key that names no key, which a start refuses
+    (:func:`test_a_newer_crl_naming_no_key_beside_each_cas_own_refuses_the_build`), loaded live.
+    Now the reload refuses it as a file to fix, and the hop keeps the copy it holds, which still
+    admits the new key's client. The control is a proper refresh, which the reload applies."""
+    old_own = _crl("Client Root", rollover.old_key, None, age=2 * _DAY)
+    new_own = _crl("Client Root", rollover.new_key, None, age=2 * _DAY)
+    crl = rollover.crl("held.pem", old_own, new_own)
+    ctx = build_api_ssl_context(rollover.settings([rollover.old_root, rollover.new_root], crl))
+    _handshake(rollover.client(), ctx)
+
+    def one_pass() -> crl_reload.ReloadOutcome:
+        gc.collect()
+        (mine,) = [o for o in crl_reload.reload_replaced_crls() if Path(o.path) == crl.resolve()]
+        return mine
+
+    crl.write_bytes(
+        _crl("Client Root", rollover.old_key, None, age=_DAY / 2)
+        + _crl("Client Root", rollover.new_key, None, age=_DAY / 2)
+        + _crl("Client Root", rollover.old_key, None, akid=False, age=_DAY / 4)
+    )
+    outcome = one_pass()
+    assert outcome.refusal is not None and outcome.refusal.remedy == crl_reload.FIX
+    assert "have no CRL of their own" in outcome.refusal.reason
+    new_serial = x509.load_pem_x509_certificate(rollover.new_root.read_bytes()).serial_number
+    assert f"(serial number {new_serial:#x})" in outcome.refusal.reason
+    assert outcome.reloaded == 0
+    _handshake(rollover.client(), ctx)  # the copy it holds still admits the client
+
+    crl.write_bytes(
+        _crl("Client Root", rollover.old_key, None, age=_DAY / 2)
+        + _crl("Client Root", rollover.new_key, None, age=_DAY / 2)
+    )
+    control = one_pass()
+    assert control.refusal is None and control.reloaded == 1
+    _handshake(rollover.client(), ctx)
 
 
 # --- #5628: a declared proxy's certificate -------------------------------------------------------------

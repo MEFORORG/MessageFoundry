@@ -1256,12 +1256,39 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
     return missing
 
 
+def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
+    """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
+    after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
+    named with its serial number, since two CAs can share a name."""
+    named = ", ".join(
+        f"{quoted_issuer(subject)} (serial number {serial:#x})" for subject, serial in missing
+    )
+    return (
+        f"the loaded client CA(s) {named} have no CRL of their own in it. Each needs a CRL that "
+        "carries its name and that its key signed, and every other CRL under its name that it "
+        "fits must be signed by it too, since OpenSSL may judge its clients by any of them. The "
+        "whole client chain is checked against this file, so every client under such a CA would "
+        "be refused. Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
+        "authority key identifier that rules the other CA out: one naming the signing CA's key "
+        "separates two CAs that each carry a subject key identifier, and one naming the signing "
+        "CA's issuer and serial number separates two CAs unless they share both. A CA with no "
+        "subject key identifier fits every CRL whose authority key identifier names a key alone, "
+        "so beside another CA of its name it stays refused until that CA's CRLs also name their "
+        "signer's issuer and serial number, or it is reissued with a subject key identifier"
+    )
+
+
 def _signed_by(
     crl: x509.CertificateRevocationList, akid: _CrlAkid | None, ca: _ListedCa
 ) -> bool | None:
     """Whether ``ca``, which carries ``crl``'s issuer name, signed it: ``None`` when the CRL's
     Authority Key Identifier ``akid`` rules the CA out (:func:`_akid_fit`), so the CRL is no
-    candidate for it. A CA whose AKID fit raises one of :data:`_UNREADABLE_CA` is not ruled out.
+    candidate for it.
+
+    **A CA whose AKID fit raises one of** :data:`_UNREADABLE_CA` **is False, fail closed**, as
+    :func:`_signature_state` credits such a CA with no CRL. The engine cannot rule the CRL out as
+    a candidate OpenSSL may judge the CA's clients by, nor show it is the CA's own, so whatever the
+    CA's key says, the CA has no CRL of its own.
 
     Otherwise True when the CA's key verifies the CRL, or when the engine cannot check the
     signature and the CRL names the CA's key by key identifier, which a start loads with a warning
@@ -1270,7 +1297,7 @@ def _signed_by(
     try:
         names_key = _akid_fit(akid, ca)
     except _UNREADABLE_CA:
-        names_key = False
+        return False
     if names_key is None:
         return None
     verified = _verifies(crl, ca.cert)

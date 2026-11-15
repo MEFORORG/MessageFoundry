@@ -165,10 +165,11 @@ def _refuse_a_loaded_ca_without_its_own_crl(
     issued, a leaf or an intermediate a client sends, and refuses each client with ``unable to
     get certificate CRL`` when it is missing: a context that builds and then refuses every client
     under that CA, which this says at start instead. Which CRL is a CA's own is
-    :func:`messagefoundry.pki.cas_without_own_crl`'s to say; each CA is named with its serial
-    number, since two CAs can share a name. An intermediate only the client sends is not loaded,
-    so its own CRL cannot be checked here. Raises ``ValueError`` naming ``setting``."""
-    from messagefoundry.pki import cas_without_own_crl, quoted_issuer
+    :func:`messagefoundry.pki.cas_without_own_crl`'s to say, and the words are
+    :func:`messagefoundry.pki.own_crl_refusal`'s, which the running-hop reload says too. An
+    intermediate only the client sends is not loaded, so its own CRL cannot be checked here.
+    Raises ``ValueError`` naming ``setting``."""
+    from messagefoundry.pki import cas_without_own_crl, own_crl_refusal
 
     try:
         pem = Path(crl_file).read_bytes()
@@ -181,17 +182,7 @@ def _refuse_a_loaded_ca_without_its_own_crl(
             f"{setting} could not be checked against [api].tls_client_ca_file: {exc}"
         ) from exc
     if missing:
-        named = ", ".join(
-            f"{quoted_issuer(subject)} (serial number {serial:#x})" for subject, serial in missing
-        )
-        raise ValueError(
-            f"{setting}: the loaded client CA(s) {named} have no CRL of their own in it. Each "
-            "needs a CRL that carries its name and that its key signed, and every other CRL under "
-            "its name that it fits must be signed by it too, since OpenSSL may judge its clients "
-            "by any of them. The whole client chain is checked against this file, so every client "
-            "under such a CA would be refused. Add each one's CRL, and where two loaded CAs share "
-            "a name, give each CRL an authority key identifier naming its key"
-        )
+        raise ValueError(f"{setting}: {own_crl_refusal(missing)}")
 
 
 class ApiHandshakeRecord:

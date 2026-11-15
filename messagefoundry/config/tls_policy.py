@@ -863,6 +863,13 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
     return bool(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
 
 
+def context_checks_chain_revocation(ctx: ssl.SSLContext) -> bool:
+    """Whether ``ctx`` consults a CRL for every certificate in the peer's chain, not the leaf alone
+    (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627). That flag carries the leaf flag's bit too
+    (:func:`context_checks_revocation` says how that was measured), so both bits must be set."""
+    return ctx.verify_flags & ssl.VERIFY_CRL_CHECK_CHAIN == ssl.VERIFY_CRL_CHECK_CHAIN
+
+
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**
 #: (``0x200000``, unchanged since OpenSSL 1.0.2 through 3.x). It disables the time checks during
 #: chain verification: the certificate validity period (both ``notBefore`` AND ``notAfter``), and
