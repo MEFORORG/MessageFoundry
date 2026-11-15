@@ -1159,6 +1159,10 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # A version-lead word in underscore emphasis is no lead, as main reads it, so the id stays one.
     ("11", "gap", f"This applies _to_ {_REQ}, which is not yet implemented."),
     ("11", "gap", f"_Section_ {_REQ} is not yet implemented."),
+    # Review round-6565ebbf's new loss: "row" with a CI verb that is not negated still binds an
+    # unmarked id, whether "the row" follows the id directly or a clause away.
+    ("10", "verdict", f"For {_REQ} the row is failing."),
+    ("10", "verdict", f"{_REQ} was reviewed; the row is still failing."),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.

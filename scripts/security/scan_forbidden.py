@@ -632,9 +632,16 @@ _PR_CELL_ID_LEAD = re.compile(r"(?i)(?<![A-Za-z0-9])(?:asvs[\s:-]*v?|v)(?=\d)")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
+#: A negated state verb: "is not", "isn't", "is no longer", "has not been". Only this before a CI verb
+#: after "row" is the step 10 false positive ("the row is not failing for <version> batches").
+_PR_NEGATED_STATE = (
+    r"(?:(?:is|was|are|were)(?:n(?:'|\N{RIGHT SINGLE QUOTATION MARK})t| not| no longer)"
+    r"|(?:has|have|had)(?: not|n(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)"
+    r"(?: (?:since|still|now|yet|never|already))* been)"
+)
 _PR_PROSE_VERDICT = re.compile(
     rf"(?i){_PR_EB}(?:cells?|(?P<row>row)){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
-    rf"(?:(?P<row_strong>{_PR_STRONG_VERB})|{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}"
+    rf"(?:(?P<row_negated>{_PR_NEGATED_STATE})|{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}"
     rf"{_PR_FMT}(?P<row_verdict>{_PR_VERDICT})"
     rf"|{_PR_EB}held{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
     rf"|{_PR_EB}re-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
@@ -866,13 +873,14 @@ def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) 
 def _pr_prose_verdict(window: str, marked: bool) -> bool:
     """The record's nouns and hold verbs carrying a verdict a clause away from the identifier."""
     # "row" is also a store row and a test-table row: "the row is not failing" beside an unmarked
-    # identifier is CI prose, so a CI verb after it binds only a marked one. "cell" is record vocabulary,
-    # and so is a record verb: "the row went from failing to partial" names both verdicts.
+    # identifier is CI prose, so a negated state verb and a CI verb after "row" bind only a marked one.
+    # Every other form binds as before: "cell" is record vocabulary, and "the row is failing" and "the
+    # row went from failing to partial" state a verdict.
     if marked:
         return bool(_PR_PROSE_VERDICT.search(window) or _PR_BARE_HOLD.search(window))
     if any(
         hit.group("row") is None
-        or hit.group("row_strong") is not None
+        or hit.group("row_negated") is None
         or hit.group("row_verdict").lower() not in _PR_CI_VERDICTS
         for hit in _PR_PROSE_VERDICT.finditer(window)
     ):
