@@ -365,6 +365,43 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW3" }, "a replaced key kept the old default");
   });
 
+  test("edit: an untouched save keeps an inline default recorded under a key with surrounding whitespace", () => {
+    const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: " DB_PW ", default: INLINE_DEFAULT } } };
+    const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    assert.strictEqual(saved(p, false).db_password.default, INLINE_DEFAULT, "an untouched save dropped the credential");
+  });
+
+  test("edit: the original key typed back after a transport round trip keeps the inline default", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    const box = (): DomNode => doc.querySelector('#settings [data-key="db_password"]');
+    box().value = "DB_PW2";
+    const transport = doc.getElementById("transport");
+    for (const to of ["file", "mllp"]) {
+      transport.value = to;
+      transport.dispatchEvent(new p.window.Event("change"));
+      const asked = p.posted.filter((m) => m.command === "fields");
+      p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+    }
+    box().value = "DB_PW";
+    assert.deepStrictEqual(saved(p, false).db_password, RECORD.settings.db_password, "the restored key lost its default");
+  });
+
+  test("edit: a setting removed before a round trip does not get its inline default back with its old key", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    doc.querySelector('#settings [data-remove-key="db_password"]').click();
+    const transport = doc.getElementById("transport");
+    for (const to of ["file", "mllp"]) {
+      transport.value = to;
+      transport.dispatchEvent(new p.window.Event("change"));
+      const asked = p.posted.filter((m) => m.command === "fields");
+      p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+    }
+    doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW";
+    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW" }, "a removed credential came back");
+  });
+
   test("edit: a secret env reference's key emptied and then restored keeps its inline default", () => {
     const p = load({ groups });
     const box = p.window.document.querySelector('#settings [data-key="db_password"]');
@@ -572,6 +609,27 @@ suite("connection editor: create mode shows the transport whose fields are drawn
         // Schema fields are drawn only under the picker that names their transport.
         assert.strictEqual(p.window.document.getElementById("transport").value, opts.fieldGroupsFor?.transport, label);
       }
+    }
+  });
+
+  test("no edit or clone load, and no fields reply, leaves the settings area empty", () => {
+    const filled = (p: Page): number => p.window.document.querySelectorAll("#settings input, #settings select").length;
+    for (const clone of [false, true]) {
+      const p = load({ clone, groups: [] });
+      assert.ok(filled(p) > 0, `the settings area is empty: ${clone ? "clone" : "edit"} with no fields`);
+    }
+    // A rebuild that draws nothing, for a create and an edit page.
+    const pages: Array<Parameters<typeof load>[0]> = [
+      { initial: null, groups: buildForm(SCHEMA, "mllp", "inbound", {}), fieldGroupsFor: { transport: "mllp", direction: "inbound" } },
+      { groups: buildForm(SCHEMA, "mllp", "outbound", RECORD.settings) },
+    ];
+    for (const opts of pages) {
+      const p = load(opts);
+      const transport = p.window.document.getElementById("transport");
+      transport.value = "file";
+      transport.dispatchEvent(new p.window.Event("change"));
+      p.deliver({ command: "fields", groups: [] });
+      assert.ok(filled(p) > 0, `an empty fields reply emptied the settings area: ${opts.initial === null ? "create" : "edit"}`);
     }
   });
 });

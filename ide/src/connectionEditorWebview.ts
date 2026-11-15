@@ -141,6 +141,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     const HELD_MARK = '[held inline credential, not shown]';
     const HELD_SECRETS = new Map();
     const HELD_DEFAULTS = new Map();
+    // The env key each held default was recorded under, trimmed: the default goes back only with
+    // that key, however many rebuilds came between.
+    const HELD_DEFAULT_KEYS = new Map();
     // Keys whose inline credential the user chose to remove; the save then writes no value for them.
     const REMOVED_SECRETS = new Set();
     function heldSecret(f) {
@@ -171,7 +174,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
       lab.title = f.help || '';
       if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) HELD_SECRETS.set(f.key, f.preserveValue);
-      if (f.secret && f.envDefault !== undefined && f.envDefault !== HELD_MARK) HELD_DEFAULTS.set(f.key, f.envDefault);
+      if (f.secret && f.envDefault !== undefined && f.envDefault !== HELD_MARK) {
+        HELD_DEFAULTS.set(f.key, f.envDefault);
+        HELD_DEFAULT_KEYS.set(f.key, String(f.envKey ?? '').trim());
+      }
       let control;
       const useEnv = f.isEnvRef || f.secretOnlyEnv;
       // A checkbox only while the recorded value is a boolean: a checkbox would read any other value
@@ -277,6 +283,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         for (const f of g.fields) { renderField(f, box); }
         host.appendChild(box);
       }
+      // Fields that draw nothing, at load in any mode or in a rebuild's reply: the free-text row,
+      // a working form, rather than an empty settings area.
+      if (!host.querySelector('[data-key]')) settingRow('', '', false, '');
     }
 
     /** Legacy path: no schema fields to draw, so the free-text key/value rows. Rows already drawn,
@@ -291,6 +300,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
+      // A setting removed before a rebuild is gone: its held default does not return with its key.
+      for (const k of REMOVED_KEYS) { HELD_DEFAULTS.delete(k); HELD_DEFAULT_KEYS.delete(k); }
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -347,8 +358,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('name').placeholder = 'new name (was ' + INITIAL.name + ')';
       prefillFieldsFromInitial();
       setTimeout(() => $('name').focus(), 0);
-    } else if (FIELD_GROUPS && FIELD_GROUPS.some((g) => Array.isArray(g.fields) && g.fields.length > 0) &&
-        FIELD_GROUPS_FOR && TRANSPORTS.includes(FIELD_GROUPS_FOR.transport) &&
+    } else if (FIELD_GROUPS && FIELD_GROUPS_FOR && TRANSPORTS.includes(FIELD_GROUPS_FOR.transport) &&
         [...$('direction').options].some((o) => o.value === FIELD_GROUPS_FOR.direction)) {
       // Create: the pickers show the transport and direction the host built the fields for, so the
       // two agree from the first draw and the host's default (MLLP) stays the default.
@@ -356,8 +366,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('direction').value = FIELD_GROUPS_FOR.direction;
       renderGroups(FIELD_GROUPS);
     } else {
-      // Create with no schema, or with fields that draw nothing or that were built for a transport
-      // or direction the pickers cannot show: the free-text row, a working form that names no
+      // Create with no schema, or with fields built for a transport or direction the pickers
+      // cannot show: the free-text row, a working form that names no
       // transport's fields. With a schema, a transport or direction change still asks for that
       // transport's fields, carrying what was typed.
       prefillHints();
@@ -434,13 +444,14 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
-          // A held inline default goes back only with the env key it was recorded under, and only
-          // where this descriptor still carries one (the record's own, or the mark a rebuild was
-          // sent). A key the request left out, because the user removed or cleared it, carries none;
-          // a key replaced, however it was typed, does not take the old credential as its default.
-          if (f.envDefault !== undefined) {
-            if (!HELD_DEFAULTS.has(key)) ref.default = f.envDefault;
-            else if (envKey === f.envKey) ref.default = HELD_MARK;
+          // A held inline default goes back only with the env key it was recorded under, compared
+          // trimmed, so an untouched key and the original key typed back after a rebuild keep it,
+          // and a replaced key does not take the old credential as its default. A setting the user
+          // removed loses its held default when the fields are rebuilt (requestFields).
+          if (HELD_DEFAULTS.has(key)) {
+            if (envKey === HELD_DEFAULT_KEYS.get(key)) ref.default = HELD_MARK;
+          } else if (f.envDefault !== undefined) {
+            ref.default = f.envDefault;
           }
           settings[key] = ref;
           continue;
