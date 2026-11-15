@@ -77,10 +77,10 @@ class FileSink(Sink):
     def _entries(self) -> list[tuple[Path, os.stat_result]]:
         """``(path, lstat)`` for each candidate under the directory, sorted by path.
 
-        The walk descends into plain directories only. A link, a junction included, is a candidate
-        whatever its name, and is never walked through, so nothing outside the directory is listed
-        by way of one. A folder swapped for a link after it is listed is not caught here; the
-        settle check in :meth:`records` drops what was read through it. A path gone before its
+        The walk enters only entries that ``lstat`` reads as plain directories. A link, a junction
+        included, is a candidate whatever its name and is not entered. A folder swapped for a link
+        between that ``lstat`` and its listing is not detected: it is listed through the link, and
+        what it reaches is read. That is an open race. A path gone before its
         ``lstat``, or a folder gone before it is listed, is left out: nothing is there to record or
         to ignore."""
         found: list[tuple[Path, os.stat_result]] = []
