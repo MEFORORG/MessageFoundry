@@ -229,18 +229,40 @@ def _bound_refusal() -> TimeoutError:
     return refusal
 
 
-def _assert_bound_left_behind(out: str, *, names_the_setting: bool) -> None:
+def _assert_bound_left_behind(out: str, *, names_the_setting: bool, runs_ddl: bool = True) -> None:
     """The pass runs after the open's schema step and salt bind, so the text never says nothing
-    was written: it says which rows were not, and what the open may already have changed."""
+    was written: it says which rows were not, and what the open may already have changed. Under
+    external schema management the open runs no DDL, so the schema is not named."""
     assert "synthetic_table" in out, out
     assert _BOUND_NO_ROW in out, out
     assert _BOUND_MAY_HAVE in out, out
+    assert "the store's salt record" in out, out
+    assert ("the schema, which the open creates or migrates" in out) is runs_ddl, out
     assert "nothing was written" not in out.lower(), out
     assert (_RCSI in out) is names_the_setting, out
     assert "Traceback" not in out, out
 
 
-@pytest.mark.parametrize(("backend", "management"), _STORES)
+#: ``(backend, schema_management)`` -> whether the bound's text names the snapshot options, and
+#: whether it names the schema the open creates or migrates.
+_BOUND_STORES = {
+    ("sqlserver", "auto"): (True, True),
+    ("postgres", "auto"): (False, True),
+    ("postgres", "external"): (False, False),
+    ("sqlserver", "external"): (False, False),
+}
+
+
+def _open_refuses_with(monkeypatch: pytest.MonkeyPatch, refusal: Exception) -> None:
+    from messagefoundry.store import base
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise refusal
+
+    monkeypatch.setattr(base, "open_store", refusing)
+
+
+@pytest.mark.parametrize(("backend", "management"), _BOUND_STORES)
 def test_provision_admin_invocation_bound_store_error_at_the_pre_check_is_could_not_start(
     backend: str,
     management: str,
@@ -251,18 +273,29 @@ def test_provision_admin_invocation_bound_store_error_at_the_pre_check_is_could_
     """The pre-check open, before the prompt, runs the same strict pass on an existing store, so
     its store error takes the write open's exit 2, not the floor's exit 1.
 
-    Mutation: drop the pre-check's ``_InvocationBoundOpenRefused`` raise; the exit is then 1."""
-    from messagefoundry.store import base
-
-    async def refusing(*_args: object, **_kwargs: object) -> object:
-        raise _bound_refusal()
-
-    monkeypatch.setattr(base, "open_store", refusing)
+    Mutation: drop the pre-check's ``_raise_if_bound_refused`` call; the exit is then 1."""
+    _open_refuses_with(monkeypatch, _bound_refusal())
     out = _run(_provision(_settings(shell, backend, management)), capsys)
     assert "Refusing to provision" in out, out
     assert "cannot open the store at 127.0.0.1/mefor" in out, out
-    _assert_bound_left_behind(out, names_the_setting=_STORES[backend, management])
+    names_the_setting, runs_ddl = _BOUND_STORES[backend, management]
+    _assert_bound_left_behind(out, names_the_setting=names_the_setting, runs_ddl=runs_ddl)
     assert _UNUSED_ENTRY not in out, "no key was shown before the pre-check"
+
+
+def test_a_defect_carrying_the_bound_note_is_not_reported_as_could_not_start(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bug the bound's pass re-raised is a defect, not a store that could not open, so it reaches
+    the dispatch floor's exit 1. CONTROL for the arm above: without the defect check it exits 2."""
+    from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
+
+    defect = NotImplementedError("synthetic defect")
+    defect.add_note(INVOCATION_BOUND_NOTE)
+    _open_refuses_with(monkeypatch, defect)
+    assert main(_provision(_settings(shell, "postgres", "auto"))) == 1
+    out = "".join(capsys.readouterr())
+    assert "The open stopped where" not in out, out
 
 
 def test_provision_admin_invocation_bound_store_error_at_the_write_open_names_the_entry(

@@ -9162,15 +9162,20 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
 
 
 def _open_switches_snapshot_options(store: StoreSettings) -> bool:
-    """Whether a writable open of ``store`` switches the database's READ_COMMITTED_SNAPSHOT and
-    ALLOW_SNAPSHOT_ISOLATION options on (``SqlServerStore._ensure_database_options``): SQL Server
-    under ``[store].schema_management = auto``. Nothing switches them back."""
-    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+    """Whether a writable open of ``store`` switches the database's snapshot options on, as
+    :func:`_open_refusal_left_behind` describes."""
+    from messagefoundry.config.settings import StoreBackend
 
-    return (
-        store.backend is StoreBackend.SQLSERVER
-        and store.resolved_schema_management() is SchemaManagement.AUTO
-    )
+    return store.backend is StoreBackend.SQLSERVER and _open_runs_schema_ddl(store)
+
+
+def _open_runs_schema_ddl(store: StoreSettings) -> bool:
+    """Whether a writable open of ``store`` runs schema DDL itself: ``[store].schema_management``
+    resolves to ``auto``, as it always does on SQLite. Under ``external`` the open only verifies
+    the schema (#305)."""
+    from messagefoundry.config.settings import SchemaManagement
+
+    return store.resolved_schema_management() is SchemaManagement.AUTO
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -9195,15 +9200,30 @@ def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
 
 def _invocation_bound_open_errors() -> tuple[type[Exception], ...]:
     """What a store error the invocation bound's pass re-raised at the open can be, at least: the
-    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`),
-    ``sqlite3.Error``, the root beneath which ``sqlite3.InterfaceError`` sits, the engine's own
-    ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed connection.
-    Built on each call, as ``store_driver_errors`` is, never cached; a command builds it once,
-    before its event loop runs, since naming a server driver imports it. Each of its open arms
-    catches this set, by where it arose, and passes on all but the bound's (BACKLOG #5608)."""
+    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`), the
+    engine's own ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed
+    connection. Built on each call, as ``store_driver_errors`` is, never cached; a command builds
+    it once, before its event loop runs, since naming a server driver imports it. Each of its open
+    arms catches this set, by where it arose, and hands it to :func:`_raise_if_bound_refused`."""
     from messagefoundry.store.base import store_open_errors
 
-    return (RuntimeError, ValueError, sqlite3.Error, *store_open_errors())
+    return (RuntimeError, ValueError, *store_open_errors())
+
+
+def _raise_if_bound_refused(exc: BaseException, errors: tuple[type[Exception], ...]) -> None:
+    """Raise :class:`_InvocationBoundOpenRefused` from ``exc`` when it is a store error the AES-GCM
+    invocation bound's pass re-raised at the open (BACKLOG #5608): one of ``errors``
+    (:func:`_invocation_bound_open_errors`), carrying the bound's note, and no defect. A defect
+    (``AUDIT_WRITE_DEFECTS``) is left to reach the dispatch floor as one, as every other open arm
+    leaves it. Otherwise return, and the caller re-raises ``exc``."""
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
+
+    if (
+        isinstance(exc, errors)
+        and not isinstance(exc, AUDIT_WRITE_DEFECTS)
+        and _raised_by_the_invocation_bound(exc)
+    ):
+        raise _InvocationBoundOpenRefused(exc) from exc
 
 
 def _invocation_bound_left_behind(store: StoreSettings) -> str:
@@ -9211,25 +9231,27 @@ def _invocation_bound_left_behind(store: StoreSettings) -> str:
     last with no full stop, as :func:`_open_refusal_left_behind` returns them.
 
     The strict pass runs late in a writable open: after the schema step, the store pin's read and
-    the salt bind, which commits a salt row on a store that had none, and on SQL Server under
-    ``[store].schema_management = auto`` after the open switched the database's snapshot options
-    on. It runs before the open appends its audit genesis row, and the command writes no account
-    or audit row until its open returns. So the text says no account or audit row was written, and
-    never that nothing was: the open's own steps may have written, and a minting
-    ``provision-admin`` run wrote its key file before the open, which its caller names."""
-    left = (
+    the salt bind, which commits a salt row on a store that had none. Under ``auto`` the schema
+    step runs DDL (:func:`_open_runs_schema_ddl`), and on SQL Server the open first switches the
+    snapshot options on (:func:`_open_switches_snapshot_options`). It runs before the open appends
+    its audit genesis row, and the command writes no account or audit row until its open returns.
+    So the text says no account or audit row was written, and never that nothing was: the open's
+    own steps may have written, and a minting ``provision-admin`` run wrote its key file before
+    the open, which its caller names."""
+    changed = ["the store's salt record"]
+    if _open_runs_schema_ddl(store):
+        changed.insert(0, "the schema, which the open creates or migrates")
+    if _open_switches_snapshot_options(store):
+        changed.append(
+            "the database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options, which "
+            "under [store].schema_management = auto the open switches on and does not switch back"
+        )
+    listed = changed[0] if len(changed) == 1 else f"{', '.join(changed[:-1])} and {changed[-1]}"
+    return (
         "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
         "account or audit row was written, but the steps the open runs before that read may "
-        "already have changed the database: at least the schema step, which creates or migrates "
-        "the schema, and the store's salt record"
+        f"already have changed the database: at least {listed}"
     )
-    if _open_switches_snapshot_options(store):
-        left += (
-            ", and under [store].schema_management = auto the database's READ_COMMITTED_SNAPSHOT "
-            "and ALLOW_SNAPSHOT_ISOLATION options, which the open switches on and does not switch "
-            "back"
-        )
-    return left
 
 
 class _InvocationBoundOpenRefused(Exception):
@@ -9250,7 +9272,8 @@ def _invocation_bound_refusal(
     a server's text, which can quote a stored value, shows as its class and SQLSTATE while an
     engine refusal keeps its remedy, then ``refusing``, then what the open left behind
     (:func:`_invocation_bound_left_behind`), with no full stop."""
-    rendered = _sentence(_transit_store_error_text(failure))
+    # The class stands in for an engine refusal raised with no text, so the line names a cause.
+    rendered = _sentence(_transit_store_error_text(failure) or type(failure).__name__)
     return (
         f"cannot open the store at {_store_label(store)}: {rendered} "
         f"{refusing}{_invocation_bound_left_behind(store)}"
@@ -9563,9 +9586,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except bound_open_errors as exc:
             # An existing store's open runs the bound's strict pass too (BACKLOG #5608): could
             # not start, as at the write's open below. Any other error propagates as before.
-            if not _raised_by_the_invocation_bound(exc):
-                raise
-            raise _InvocationBoundOpenRefused(exc) from exc
+            _raise_if_bound_refused(exc, bound_open_errors)
+            raise
         store_slot.current = store
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
@@ -9950,8 +9972,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 kept_key = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
-            if isinstance(exc, bound_open_errors) and _raised_by_the_invocation_bound(exc):
-                raise _InvocationBoundOpenRefused(exc) from exc  # BACKLOG #5608
+            _raise_if_bound_refused(exc, bound_open_errors)  # BACKLOG #5608
             if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
                 raise
             # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
@@ -10415,9 +10436,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
             # arrived as the `CipherError` above: could not start, reported below. Any other
             # error propagates as before.
-            if not _raised_by_the_invocation_bound(exc):
-                raise
-            raise _InvocationBoundOpenRefused(exc) from exc
+            _raise_if_bound_refused(exc, bound_open_errors)
+            raise
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
