@@ -1680,11 +1680,11 @@ def _quoted_false_hint(value: object) -> str:
 
 
 def _bool_remedy(key: str, value: object) -> str:
-    """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`.
+    """The remedy every refusal of a non-bool literal ends with, :func:`_quoted_false_hint` first.
     A hop-policy flag refuses ``env()`` (:func:`refuse_unresolved_hop_flags`), so it gets that
     flag's own remedy, :func:`_flag_hint`, rather than advice to write a reference. It gets no
-    quoted-false hint either: its readers refuse a string (``flag_from_settings``) or read a false
-    spelling as false, so no reader takes a quoted false on it as true."""
+    quoted-false hint either, since at least ``flag_from_settings`` refuses a string rather than
+    reading a quoted false as true."""
     if key in HOP_POLICY_FLAGS:
         return _flag_hint(value)
     return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
@@ -1709,7 +1709,7 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     A factory calls it too, on one of its own arguments, where a check inside the factory reads
     that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
     itself as ``where``, since it runs before the declaration has a name. Problems are joined with
-    `` | ``, because each already holds a ``;`` before its remedy."""
+    `` | ``, because a problem can hold a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
         raise WiringError(f"{where}: " + " | ".join(problems))
 
@@ -6622,7 +6622,8 @@ class Registry:
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
         registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
         ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
-        (:func:`_refuse_bool_literals`), so this pass is the one that sees the rest. ``None`` passes where the setting has one default on every factory: there an
+        (:func:`_refuse_bool_literals`); this pass sees the rest, a lookup's and a composer's
+        included. ``None`` passes where the setting has one default on every factory: there an
         explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
         a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
         and on a setting with no single default. ``env()`` references are read strictly once

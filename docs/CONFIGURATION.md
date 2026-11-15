@@ -549,9 +549,10 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   already refused anything but `true` or `false` for the ones it takes. Not every reading is
   covered. The rule covers the settings a connection, lookup or reference factory takes and the
   composers' `enabled` flags, in a graph the loader validates, and the flags `inbound()` and
-  `outbound()` take, whenever a connection is declared. Some checks inside a factory still read
-  one of the factory's own settings before this one does, so a quoted value there can stop the
-  load with an error about the flag's effect instead. At least some checks
+  `outbound()` take, whenever a connection is declared. A check inside a factory that reads one
+  of the factory's own settings before this one does can stop the load with an error about the
+  flag's effect instead. `MLLP`, `DICOMweb` and `Http` refuse a non-bool `tls` or `verify_tls`
+  before such a check of theirs reads it, naming the factory and not the connection. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
   boolean `cast=bool`.

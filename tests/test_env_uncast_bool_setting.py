@@ -318,7 +318,7 @@ def test_every_bad_literal_on_one_connection_is_named_in_one_error(tmp_path: Pat
     assert "setting 'persistent' must be true or false, not str" in msg
     assert "setting 'no_ack' must be true or false, not str" in msg
     assert msg.count("outbound connection 'OB_X'") == 1
-    # Each problem holds a ";" before its remedy, so problems are split by a separator it lacks.
+    # A problem can hold a ";" before its remedy, so problems are split by a separator none holds.
     assert len(msg.split(" | ")) == 2
 
 
