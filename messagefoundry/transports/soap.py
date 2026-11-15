@@ -32,13 +32,15 @@ retry), with the one OAuth2 exception at the end of this paragraph. A **Sender/C
 Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
-error retries. With OAuth2 client credentials configured, an HTTP 401 drops the cached bearer and
-retries, as the REST and FHIR connectors do, unless its body is a WS-Security fault a fresh bearer
-cannot fix, which stays permanent: any such fault on a connection that sends a UsernameToken, and a
-MessageExpired fault on any connection. So on a connection sending no UsernameToken, a 401
-FailedAuthentication or InvalidSecurityToken retries once with a fresh bearer; if the connection's
-next answer from the endpoint is again such a 401, it is permanent (BACKLOG #5798). Fault bodies are **not**
-echoed into errors/logs (they may carry PHI) — only the SOAP fault role + HTTP status are.
+error retries. With a bearer provider configured (OAuth2 client credentials or SMART), an HTTP 401
+drops the cached bearer and retries, as the REST and FHIR connectors do, unless its body is a
+WS-Security fault a fresh bearer cannot fix, which stays permanent: any such fault on a connection
+whose transport stamps a UsernameToken (``ws_security`` with ``ws_username``), and a MessageExpired
+fault on any connection. Elsewhere a 401 FailedAuthentication or InvalidSecurityToken retries once
+with a fresh bearer; if the connection's next answer from the endpoint is again such a 401, it is
+permanent. A UsernameToken a Handler writes into its own envelope is not seen, so on an ordered (FIFO)
+lane a wrong one is resent once per message (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may
+carry PHI) — only the SOAP fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
 in WS-\* mode — correct WS-\* retry semantics). The service operation **must be idempotent** and its
