@@ -410,10 +410,17 @@ def test_a_bundle_holding_a_non_ca_imports_nothing(
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert "Nothing was imported" in out
-    # A whole line: PowerShell's error view rewraps at the console width, and at the 80 columns of
-    # a Linux runner that split the thumbprint from its reason.
-    reason = f"  {_thumb(chain['leaf'][0])}: its basic constraints say it is not a CA"
-    assert reason in out.splitlines(), out
+    leaf, root = _thumb(chain["leaf"][0]), _thumb(chain["root"][0])
+    # The printed list holds the leaf's reason as a whole line, and only it: pwsh's error view
+    # rewraps at the console width, and at the 80 columns of a Linux runner that split the
+    # thumbprint from its reason.
+    lines = proc.stdout.splitlines()
+    assert "Refused:" in lines, out
+    refused = lines[lines.index("Refused:") + 1 :]
+    assert refused == [f"  {leaf}: its basic constraints say it is not a CA"], out
+    # The error itself names the refused thumbprint and not the CA beside it. The error view's
+    # source-line excerpt shows code, not a thumbprint, so this reads the message.
+    assert leaf in proc.stderr and root not in proc.stderr, proc.stderr
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
 
