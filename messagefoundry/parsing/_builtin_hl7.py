@@ -256,8 +256,9 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     componentized access). MSH segments are never lazy.
 
     The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone shares
-    this tree until one side writes, so under free-threaded Python another thread can read the
-    segment mid-split. A reader that looks at ``_lazy`` before ``fields`` then sees either the raw
+    this tree until one side writes, so another thread can read the segment mid-split. That is not
+    only a free-threaded build: a GIL build can also switch threads between storing the fields and
+    the ``pop``, or inside a deepcopy's loop. A reader that looks at ``_lazy`` before ``fields`` then sees either the raw
     line or the full field list, never an empty segment (BACKLOG #5801). That holds for at least the
     readers in this module and the copy-on-write ``copy.deepcopy``, because :func:`parse` puts
     ``_lazy`` first in the dict; a new reader must keep the same order. It does not make a deepcopy
