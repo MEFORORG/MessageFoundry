@@ -46,7 +46,8 @@ from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, AckMode
 def _parse_field(spec: str) -> tuple[str, int]:
     """Parse a ``SEG-FIELD`` token (e.g. ``MSH-10``, ``PID-3``) into ``(segment_id, field_no)``."""
     seg, _, num = spec.partition("-")
-    if not seg or not num.isdigit():
+    if not seg or not num.isdigit() or int(num) < 1:
+        # Field 0 is the segment id, not a field: as a key it pairs nothing, as a blank it erases the id.
         raise argparse.ArgumentTypeError(f"expected SEG-FIELD (e.g. MSH-10), got {spec!r}")
     return (seg.upper(), int(num))
 
@@ -99,7 +100,7 @@ def _run_compare(args: argparse.Namespace) -> int:
         print(f"compare: {exc}{hint}", file=sys.stderr)
         return 2
     except (OSError, ValueError) as exc:
-        # Unreadable or undecodable input is exit 2 too: 1 means "the outputs differ". A malformed
+        # Unreadable or undecodable input is exit 2 too: 1 means "not clean". A malformed
         # JSONL line is a LoadError above, which names the line and never its content.
         # By class only: a decode or JSON error can quote the input, which may be a message.
         print(f"compare: an input could not be read ({type(exc).__name__})", file=sys.stderr)

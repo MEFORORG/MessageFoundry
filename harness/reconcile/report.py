@@ -79,7 +79,7 @@ def render_text(result: ReconcileResult, *, max_diffs: int = 20) -> str:
         lines.append(f"  Corepoint-only keys: {_keys(result.corepoint_only[:20])}")
     if result.duplicate_keys:
         lines.append(
-            f"  duplicate keys (only the last copy compared): {_keys(result.duplicate_keys[:20])}"
+            f"  duplicate keys (earlier copies never compared): {_keys(result.duplicate_keys[:20])}"
         )
     if not result.pairs:
         lines.append("  no key was found on both sides, so nothing was compared")

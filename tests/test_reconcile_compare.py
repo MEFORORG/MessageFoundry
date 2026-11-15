@@ -343,6 +343,10 @@ def test_reconcile_is_not_clean_when_nothing_was_compared() -> None:
     whether both inputs were empty or every message was unkeyed on both sides."""
     assert not reconcile([], [], key=("MSH", 10)).clean
     assert not reconcile([_msg("")], [_msg("")], key=("MSH", 10)).clean
+    # Keyed on both sides, nothing unkeyed, but no key in common: only the pair check fails it.
+    disjoint = reconcile([_msg("A")], [_msg("B")], key=("MSH", 10))
+    assert not disjoint.pairs and not disjoint.unkeyed_mefor and not disjoint.unkeyed_corepoint
+    assert not disjoint.clean
     text = render_text(reconcile([], []))
     assert "nothing was compared" in text and "DIFFERENCES" in text
 
@@ -370,6 +374,11 @@ def test_compare_cli_exits_non_zero_over_empty_inputs_and_duplicate_keys(tmp_pat
     once.write_text(_msg("A"), encoding="latin-1")
     assert reconcile_main(["compare", "--mefor", str(doubled), "--corepoint", str(once)]) == 1
     assert reconcile_main(["compare", "--mefor", str(once), "--corepoint", str(once)]) == 0
+    # Field 0 is the segment id: as a key it would pair nothing, so it is refused at parse time.
+    with pytest.raises(SystemExit):
+        reconcile_main(
+            ["compare", "--mefor", str(once), "--corepoint", str(once), "--key", "PID-0"]
+        )
 
 
 def test_compare_cli_exits_two_when_the_report_cannot_be_written(
@@ -389,17 +398,18 @@ def test_compare_cli_exits_two_when_the_report_cannot_be_written(
 
 def test_load_messages_batch_strips_a_utf8_bom_and_refuses_a_wide_one(tmp_path: Path) -> None:
     """BACKLOG #5423: an HL7 file was decoded as latin-1 with its byte-order mark kept, so the first
-    message's line no longer began with ``MSH`` and the message was dropped. A UTF-8 mark now means
-    UTF-8; a UTF-16 or UTF-32 mark is refused, since latin-1 would read it as noise."""
+    message's line no longer began with ``MSH`` and the message was dropped. The mark is now dropped
+    where it leads an ``MSH``, the file still read as latin-1 like the capture, so bytes compare as
+    bytes; a UTF-16 or UTF-32 mark is refused, since latin-1 would read it as noise."""
+    bom8 = b"\xef\xbb\xbf"
     batch = tmp_path / "export.hl7"
-    batch.write_bytes(b"\xef\xbb\xbf" + (_msg("A") + _msg("B", name="MÜLLER^J")).encode())
+    batch.write_bytes(bom8 + (_msg("A") + _msg("B", name="M\u00dcLLER^J")).encode())
     msgs = load_messages(batch)
     assert [field_value(m, ("MSH", 10)) for m in msgs] == ["A", "B"]
-    assert field_value(msgs[1], ("PID", 5)) == "MÜLLER^J"
-    batch.write_bytes(b"\xef\xbb\xbf" + _msg("A").encode() + b"\xff")
-    with pytest.raises(LoadError, match="byte-order mark but is not UTF-8") as bad:
-        load_messages(batch)
-    assert bad.value.__context__ is None and not bad.value.over_cap
+    assert field_value(msgs[1], ("PID", 5)) == "M\u00dcLLER^J".encode().decode("latin-1")
+    # Two BOM-led files concatenated into one, as `copy /b a+b` makes, are still two messages.
+    batch.write_bytes(bom8 + _msg("A").encode() + bom8 + _msg("B").encode())
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A", "B"]
     for bom in (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff"):
         batch.write_bytes(bom + _msg("A").encode("utf-16-le"))
         with pytest.raises(LoadError, match="UTF-16 or UTF-32"):
@@ -423,6 +433,9 @@ def test_load_messages_batch_keeps_text_with_no_msh_line_as_an_unkeyed_entry(
     assert load_messages(batch) == ["PID|1||MRN"]
     result = reconcile(load_messages(batch), [_msg("A")], key=("MSH", 10))
     assert result.unkeyed_mefor == 1 and not result.clean
+    # Batch-protocol envelope headers hold no message, so they are not an unkeyed entry.
+    batch.write_text("FHS|^~\\&|S\rBHS|^~\\&|S\r" + _msg("A"), encoding="latin-1")
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A"]
     # MLLP framing bytes and blank lines alone are not content.
     batch.write_bytes(b"\x0b" + _msg("A").encode() + b"\x1c\r\n\r\n")
     assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A"]

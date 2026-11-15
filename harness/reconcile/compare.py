@@ -110,19 +110,14 @@ def _record(path: Path, number: int, line: str) -> str:
 #: and no line begins with ``MSH``. UTF-32 LE begins with UTF-16 LE's mark, so it is covered.
 _WIDE_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)
 
+#: A UTF-8 byte-order mark as the latin-1 decode reads it. HL7 files are read as latin-1, the same
+#: decode the capture sink gives the wire bytes, so the mark is dropped where it leads an ``MSH``
+#: line rather than by decoding the file as UTF-8: at the start of a file, or of each file a tool
+#: concatenated into one.
+_LATIN1_BOM = codecs.BOM_UTF8.decode("latin-1")
 
-def _hl7_text(path: Path, data: bytes) -> str:
-    """One HL7 file's text: latin-1, which reads any byte, unless a byte-order mark names the
-    encoding. A UTF-8 mark is dropped and the rest read as UTF-8; kept, it hid the first ``MSH``."""
-    if data.startswith(codecs.BOM_UTF8):
-        try:
-            return data.decode("utf-8-sig")  # drops the mark without copying the bytes first
-        except UnicodeDecodeError:
-            pass  # refused below, outside the handler, so no decode error (holding the bytes) chains
-        raise LoadError(
-            f"{path}: starts with a UTF-8 byte-order mark but is not UTF-8", over_cap=False
-        )
-    return data.decode("latin-1")
+#: Batch-protocol envelope headers, which may precede the first ``MSH`` and hold no message.
+_ENVELOPE_HEADERS = ("FHS", "BHS")
 
 
 def _parse(path: Path, data: bytes) -> list[str]:
@@ -133,7 +128,7 @@ def _parse(path: Path, data: bytes) -> list[str]:
             over_cap=False,
         )
     if path.suffix != ".jsonl":
-        return _split_batch(_hl7_text(path, data))
+        return _split_batch(data.decode("latin-1"))
     # utf-8-sig drops a byte-order mark, which some Windows tools write before UTF-8 text.
     text = data.decode("utf-8-sig")
     msgs: list[str] = []
@@ -199,23 +194,25 @@ def _split_batch(text: str) -> list[str]:
     """Split concatenated HL7 into messages: each ``MSH`` line starts a new one (MLLP wrappers, if any,
     are tolerated since we key off the ``MSH`` prefix of a stripped line).
 
-    Content before the first ``MSH`` line, which is all of a file that has none, is kept as one more
-    entry rather than dropped: it has no header, so the pairing counts it as unkeyed, and the result
-    cannot read clean with it."""
+    A UTF-8 byte-order mark before an ``MSH`` is dropped (see :data:`_LATIN1_BOM`). Content before
+    the first ``MSH`` line, which is all of a file that has none, is kept as one more entry rather
+    than dropped, except ``FHS``/``BHS`` envelope headers: it has no header, so the pairing counts it
+    as unkeyed, and the result cannot read clean with it."""
     norm = _normalize_line_endings(text)
     msgs: list[str] = []
     current: list[str] = []
     preamble: list[str] = []
     for line in norm.split("\r"):
-        if line.lstrip("\x0b").startswith("MSH"):
+        head = line.lstrip("\x0b").removeprefix(_LATIN1_BOM)
+        if head.startswith("MSH"):
             if current:
                 msgs.append("\r".join(current))
-            current = [line.lstrip("\x0b")]
+            current = [head]
         elif current:
             stripped = line.rstrip("\x1c\x0d")
             if stripped:
                 current.append(stripped)
-        elif line.strip("\x0b\x1c \t\n"):
+        elif line.strip("\x0b\x1c \t\n") and not head.startswith(_ENVELOPE_HEADERS):
             preamble.append(line)
     if current:
         msgs.append("\r".join(current))

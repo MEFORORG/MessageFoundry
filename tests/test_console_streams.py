@@ -170,8 +170,8 @@ def test_compare_prints_its_report_and_a_non_cp1252_label(tmp_path: Path) -> Non
 def test_control_compare_aborts_without_the_hardening(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The pre-fix behaviour: an ASCII label and empty inputs still abort, because the report's own
-    result line carries a mark cp1252 cannot encode. No source scan saw it: the character lives in
+    """The pre-fix behaviour: an ASCII label and one plain message a side still abort, because the
+    report's own result line carries a mark cp1252 cannot encode. No source scan saw it: the character lives in
     harness/reconcile/report.py and reaches print() through a variable."""
     _unhardened(monkeypatch)
     args = _compare_args(tmp_path)
