@@ -83,9 +83,8 @@ class NoLoss:
     #: `no-loss: OK` the normal shape of a contended CI log. Defaulted, so every existing positional
     #: construction is unchanged.
     heavily_stranded: bool = False
-    #: ``ok`` is False and nothing proved a loss: the run cannot clear itself (BACKLOG #5574) --
-    #: nothing sent or delivered, a timed-out drain, rows still in a stage, or an engine whose
-    #: cumulative counters reset mid-run. Rendered INCONCLUSIVE, not LOSS; it still fails zero_loss.
+    #: ``ok`` is False and nothing proved a loss: the run cannot clear itself (BACKLOG #5574).
+    #: ``_reconcile`` holds the reasons. Rendered INCONCLUSIVE, not LOSS; it still fails zero_loss.
     inconclusive: bool = False
 
 
@@ -667,16 +666,16 @@ def _reconcile(
     # undercounting. No intake or delivery verdict rests on it (BACKLOG #5574). The whole sample run
     # is read, not only its two ends, so a reset hidden by regrowth is still seen. At least this
     # misses a restart of one shard of a cluster whose summed counters and max uptime kept rising.
-    # The dead-ACK-path signature reads no engine counter, so it still proves a loss here.
+    # The dead-ACK-path signature reads no engine counter, so it still proves a loss here; it is
+    # computed here, once, for both paths (its reasoning is at its use below).
+    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
     reset = _counter_reset(poller)
     if reset is not None:
-        dead = sent > 0 and counters.acked + counters.nak == 0
         detail = (
-            f"engine counters went backwards or the engine restarted ({reset}) — an engine "
-            f"restart, a stats reset or a purge of counted rows; the read/written deltas cannot "
-            f"be reconciled against this run's sends"
+            f"{reset} — the read/written deltas cannot be reconciled against this run's sends, "
+            f"and the drain and delivery arms were not judged"
         )
-        if dead:
+        if ack_path_dead:
             detail = f"{sent} sent and the sender saw no reply at all — a dead ACK path; {detail}"
         return NoLoss(
             False,
@@ -687,7 +686,7 @@ def _reconcile(
             backlog,
             0,
             detail,
-            inconclusive=not dead,
+            inconclusive=not ack_path_dead,
         )
     at_least_once = max(0, sink_received - written)
     # Only a SHORTFALL is loss; an excess is benign. Intake: read < sent means the engine never
@@ -770,8 +769,8 @@ def _reconcile(
     # `drained`, the same three arms rearranged. So ON A RUN WHOSE SAMPLER SETTLED, all three hold
     # by construction and, among the LOSS arms, `ok` is decided by `ack_path_dead` alone; the three
     # only carry information on a run that exhausted `drain_timeout_s` without settling. The
-    # INCONCLUSIVE reasons further down (nothing sent, nothing delivered, a timed-out drain, a
-    # counter reset; BACKLOG #5574) are independent of the sampler and can fail a settled run too.
+    # INCONCLUSIVE reasons (BACKLOG #5574), among them at least the counter reset above and the
+    # `unproven` list below, are independent of the sampler and can fail a settled run too.
     #
     # The coupling is not new — the sampler has always stopped on the reconcile's own condition, and
     # `read_short` has always been that condition. WHAT IS NEW is that the retired floor was the one
@@ -824,7 +823,6 @@ def _reconcile(
     # a handful of sends. A floor is deliberately NOT added: it would be one more tuned number in a
     # function whose defect was tuned numbers, and every profile this copy serves offers two orders
     # of magnitude more than that. Revisit if a genuinely tiny load profile ever ships.
-    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
     deliver_ok = deliver_short <= tolerance
@@ -914,16 +912,23 @@ def _counter_reset(poller: EnginePoller) -> str | None:
     the harness's own monotonic time since the previous sample -- it started after that sample.
 
     Uptime is compared to the elapsed gap rather than to the previous uptime because the engine
-    derives uptime from the wall clock, so a small clock step back is not a restart."""
+    derives uptime from the wall clock, so a clock step back is not a restart. At least a restart
+    of one shard whose summed counters and max uptime kept rising is missed here."""
     for prev, cur in pairwise(poller.samples):
-        if cur.read < prev.read:
-            return f"read {prev.read} -> {cur.read}"
-        if cur.written < prev.written:
-            return f"written {prev.written} -> {cur.written}"
-        if cur.uptime_s < cur.elapsed_s - prev.elapsed_s:
+        # A counter step back is a restart, a stats reset or a purge of counted rows; this cannot
+        # tell which, so it says so.
+        if cur.read < prev.read or cur.written < prev.written:
             return (
-                f"uptime {cur.uptime_s:.1f}s is shorter than the "
-                f"{cur.elapsed_s - prev.elapsed_s:.1f}s since the previous sample"
+                f"engine counters went backwards (read {prev.read} -> {cur.read}, written "
+                f"{prev.written} -> {cur.written}): an engine restart, a stats reset or a purge"
+            )
+        # The engine clamps a negative wall-clock uptime to 0.0, so 0.0 is a large clock step back
+        # on a running engine rather than evidence of a restart, and is not read as one.
+        gap = cur.elapsed_s - prev.elapsed_s
+        if 0.0 < cur.uptime_s < gap:
+            return (
+                f"the engine restarted mid-run (uptime {cur.uptime_s:.1f}s is shorter than the "
+                f"{gap:.1f}s since the previous sample)"
             )
     return None
 

@@ -145,6 +145,14 @@ def test_a_zero_rate_stretch_does_not_burst_on_the_way_back_up(
     assert gov._counters.deferred == 0
 
 
+def test_a_phase_integrating_below_one_still_offers_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 0.05 msg/s for 10 s integrates to 0.5. The phase offers the ceiling, as the old schedule did.
+    gov = _run(_ramp(0.05, 0.05), monkeypatch)
+    assert len(gov.emitted) == 1
+
+
 def test_zero_rate_phase_offers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     gov = _run(_ramp(0.0, 0.0, duration=2.0), monkeypatch)
     assert gov.emitted == []

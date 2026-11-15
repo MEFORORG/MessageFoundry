@@ -1063,7 +1063,7 @@ def test_load_reconcile_a_reset_hidden_by_regrowth_is_still_caught() -> None:
         unconfirmed_budget=4,
     )
     assert not result.ok and result.inconclusive, result.detail
-    assert "restarted" in result.detail
+    assert "went backwards (read 50 -> 2" in result.detail
 
 
 def test_load_reconcile_a_restart_with_rising_counters_is_caught_by_uptime() -> None:
@@ -1083,6 +1083,17 @@ def test_load_reconcile_a_wall_clock_step_back_is_not_a_restart() -> None:
     # two polls while the engine keeps running and the counters keep rising. Not a restart.
     base = _staged(read=0, written=0, uptime_s=100.5, elapsed_s=10.0)
     final = _staged(read=90, written=90, uptime_s=100.2, elapsed_s=11.0)
+    result = load_reconcile(
+        _CLEAN, _poller(final, samples=[base, final]), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+
+
+def test_load_reconcile_a_large_clock_step_back_reading_zero_uptime_is_not_a_restart() -> None:
+    # The engine clamps a negative uptime to 0.0, so a clock step back larger than the engine's age
+    # reads 0.0 on a running engine.
+    base = _staged(read=0, written=0, uptime_s=40.0, elapsed_s=10.0)
+    final = _staged(read=90, written=90, uptime_s=0.0, elapsed_s=11.0)
     result = load_reconcile(
         _CLEAN, _poller(final, samples=[base, final]), 1.0, tolerance=0, unconfirmed_budget=4
     )

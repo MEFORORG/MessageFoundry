@@ -246,7 +246,7 @@ tracking. `--baseline run.json --tolerance 0.1` flags regressions (throughput be
 
 - `sent == engine_read` — every message the harness sent was received (ACK-on-receipt), and
 - `sink_received == engine_written` — every delivery the engine made arrived at the sink, and
-- backlog drained to zero.
+- the pipeline drained to zero in every stage (an undrained run is INCONCLUSIVE, below).
 
 This is **fan-out-agnostic** (it never assumes 1:1), so it holds for any fan-out factor. At-least-once
 re-deliveries are reported as a derived count (`sink_received − engine_written`).

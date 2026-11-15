@@ -97,6 +97,11 @@ class RateGovernor:
                 self._counters.deferred_schedule += behind
                 credit -= behind
             if elapsed >= phase.duration_s:
+                # Offer the part-send the curve left at the end, so a phase offers the CEILING of
+                # its integral, as the old schedule (first send at t=0) did: a phase integrating
+                # to 0.5 sends one, not none.
+                if credit > _CREDIT_EPSILON and emitted < _BATCH_CAP:
+                    self._emit_one(sampler)
                 return
             if rate <= 0.0:
                 await asyncio.sleep(_IDLE_SLEEP)
