@@ -83,6 +83,11 @@ def test_each_lock_gets_a_freshly_cleared_venv() -> None:
         assert i > 0 and "-m venv --clear" in code[i - 1], (
             f"{_JOB}'s install {code[i]!r} does not follow a `python -m venv --clear`"
         )
+        # ...and installs INTO the venv just cleared, not some other interpreter.
+        venv = code[i - 1].rsplit(" ", 1)[-1].strip('"')
+        assert f'--python "{venv}/Scripts/python.exe"' in code[i], (
+            f"{_JOB}'s install {code[i]!r} does not target the venv {venv!r} cleared before it"
+        )
 
 
 def test_the_lock_list_matches_the_dep1_runtime_exports() -> None:

@@ -67,16 +67,13 @@ on:
     branches-ignore:
       - main
 
-concurrency:
-  # ONE GROUP PER RUN, so no push's scan is ever cancelled or dropped (BACKLOG #5595). This used to be
-  # per-ref with cancel-in-progress, on the premise that "the newer push runs the same scan over a
-  # superset of the same refs". That premise is FALSE: each run scans the commits ITS push added, and a
-  # later push's range starts where the earlier one ended, so the earlier range is not in it. A
-  # force-push can also drop the earlier commits from the branch, yet they stay public by SHA. A
-  # per-ref group with cancel-in-progress set to false would not fix it either, because GitHub keeps
-  # one pending run per group and cancels the older pending one.
-  group: branch-leak-scan-${{ github.run_id }}
-  cancel-in-progress: false
+# NO `concurrency:` BLOCK, so no push's scan is ever cancelled or dropped (BACKLOG #5595). This used
+# to be a per-ref group with cancel-in-progress, on the premise that "the newer push runs the same scan
+# over a superset of the same refs". That premise is FALSE: each run scans the commits ITS push added,
+# and a later push's range starts where the earlier one ended, so the earlier range is not in it. A
+# force-push can also drop the earlier commits from the branch, yet they stay public by SHA. A per-ref
+# group without cancel-in-progress would not fix it either: GitHub keeps one pending run per group and
+# cancels the older pending one. tests/test_branch_leak_scan_range.py refuses the block's return.
 
 permissions:
   contents: read
@@ -160,7 +157,9 @@ jobs:
             raw="$snap/$sha.raw"
             base=(--root)
             if git rev-parse -q --verify "${sha}^1" >/dev/null; then base=("${sha}^1"); fi
-            git diff-tree -r -z --raw --no-renames "${base[@]}" "$sha" > "$raw"
+            # --no-commit-id: with --root, diff-tree otherwise writes the commit id first, which shifts
+            # every meta/path pair below by one and skipped every file of a root commit.
+            git diff-tree -r -z --raw --no-renames --no-commit-id "${base[@]}" "$sha" > "$raw"
             n=0
             # -z raw records are ":oldmode newmode oldsha newsha status" NUL path NUL.
             while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
@@ -174,8 +173,23 @@ jobs:
                   echo "::error::pushed commit $sha names an unsafe path; refusing to write it." >&2
                   exit 2
                   ;;
+                # The scanner's SKIP_DIRS (tests/test_branch_leak_scan_range.py pins the two lists
+                # equal). Writing these out would only make the scanner examine zero files and refuse.
+                */.venv/*|*/venv/*|*/node_modules/*|*/__pycache__/*|*/.mypy_cache/*|*/.ruff_cache/*|*/.pytest_cache/*|*/build/*|*/dist/*)
+                  continue
+                  ;;
               esac
-              mkdir -p "$root/$(dirname -- "$path")"
+              # The scanner skips this path so a working-tree scan on the owner's machine does not
+              # trip on the git-ignored real token list. Inside a pushed COMMIT it is committed by
+              # definition, so its presence is the leak.
+              if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
+                echo "::error::pushed commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
+                exit 1
+              fi
+              case "$path" in
+                */*) mkdir -p "$root/${path%/*}" ;;
+                *) mkdir -p "$root" ;;
+              esac
               git cat-file blob "$blob" > "$root/$path"
               n=$((n + 1))
             done < "$raw"
@@ -195,8 +209,10 @@ jobs:
       - name: Say what a failure here does and does not mean
         if: failure()
         run: |
-          echo "::warning::This branch carries forbidden content and it is ALREADY PUBLIC -- the push"
-          echo "::warning::completed before this ran. This job detects; it cannot prevent."
+          echo "::warning::Either this branch carries forbidden content, or the scan could not run. Read"
+          echo "::warning::the scan step's log: a FORBIDDEN CONTENT report or an ::error:: naming a leak means"
+          echo "::warning::the content is ALREADY PUBLIC -- the push completed before this ran; this job"
+          echo "::warning::detects, it cannot prevent. Any other refusal is the instrument failing, not a leak."
           echo "::warning::Respond: delete the branch, assess what was exposed, and check whether the"
           echo "::warning::pre-push guard was bypassed (--no-verify) or simply never installed"
           echo "::warning::(pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1)."

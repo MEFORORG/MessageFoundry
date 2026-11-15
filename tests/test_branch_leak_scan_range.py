@@ -13,7 +13,9 @@ out what to scan, never the scanner's detectors.
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -21,6 +23,8 @@ import pytest
 from _bash_resolver import probe_env, require_bash
 
 from tests._workflow_contexts import jobs_of, load_workflow
+
+_REPO = Path(__file__).resolve().parents[1]
 
 _WORKFLOW = "branch-leak-scan.yml"
 _STEP = "Scan the pushed tree and every pushed commit for forbidden content"
@@ -224,10 +228,56 @@ def test_a_malformed_push_sha_fails_closed(bad: str, bash: str, tmp_path: Path) 
 
 
 def test_no_push_scan_is_cancelled_by_a_later_one() -> None:
-    """A later push's range starts where the earlier one ended, so cancelling loses a range."""
-    conc = load_workflow(_WORKFLOW)["concurrency"]
-    assert str(conc["group"]).replace(" ", "") == "branch-leak-scan-${{github.run_id}}", conc
-    assert conc["cancel-in-progress"] is False, conc
+    """A later push's range starts where the earlier one ended, so cancelling loses a range, and a
+    per-ref group without cancel-in-progress still drops an older PENDING run. So no group at all."""
+    doc = load_workflow(_WORKFLOW)
+    assert "concurrency" not in doc, doc.get("concurrency")
+    assert all("concurrency" not in job for job in jobs_of(_WORKFLOW).values())
+
+
+def test_an_orphan_branch_root_commit_is_scanned(bash: str, tmp_path: Path) -> None:
+    """A root commit has no parent to diff against. The orphan branch is the realistic leak shape: a
+    branch cut from another history, whose first commit can carry what a later commit removes."""
+    repo = _Repo(tmp_path)
+    _git(repo.path, "switch", "-q", "--orphan", "orphan")
+    _commit(repo.path, "root", {"docs/security/note.md": f"{_MARKER}\n"})
+    after = _commit(repo.path, "remove", {"docs/security/note.md": None, "a.txt": "x\n"})
+    rc, out, _ = _run(bash, repo.path, tmp_path, _ZERO, after)
+    assert rc == 1 and "HIT docs/security/note.md" in out, f"rc={rc}\n{out}"
+
+
+def test_a_push_touching_only_skipped_dirs_is_not_a_refusal(bash: str, tmp_path: Path) -> None:
+    """The scanner skips these directories and refuses a scan that examined nothing, so the step must
+    not hand it a root holding only skipped files (a rebuilt dist/ bundle, say)."""
+    repo = _Repo(tmp_path)
+    after = _commit(repo.path, "bundle", {"tool/dist/index.js": "x\n"})
+    rc, out, calls = _run(bash, repo.path, tmp_path, repo.main, after)
+    assert rc == 0, f"rc={rc}\n{out}"
+    assert calls == ["--path ."], calls
+
+
+def test_a_committed_real_token_list_is_a_hit(bash: str, tmp_path: Path) -> None:
+    """The scanner exempts this path for working-tree scans; in a pushed commit it is the leak."""
+    repo = _Repo(tmp_path)
+    _commit(repo.path, "oops", {"scripts/security/scan-tokens.local.txt": "x\n"})
+    after = _commit(repo.path, "undo", {"scripts/security/scan-tokens.local.txt": None})
+    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
+    assert rc == 1 and "scan-tokens.local.txt" in out, f"rc={rc}\n{out}"
+
+
+def test_the_skipped_dirs_match_the_scanner() -> None:
+    """The step's skip list is a copy of scan_forbidden.SKIP_DIRS (less .git, which it refuses)."""
+    source = (_REPO / "scripts" / "security" / "scan_forbidden.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    skip = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "SKIP_DIRS" for t in node.targets)
+    )
+    line = next(ln for ln in _body().splitlines() if "*/node_modules/*" in ln)
+    step = set(re.findall(r"\*/([^/|*]+)/\*", line))
+    assert step == set(skip) - {".git"}, (sorted(step), sorted(skip))
 
 
 def test_checkout_fetches_full_history() -> None:

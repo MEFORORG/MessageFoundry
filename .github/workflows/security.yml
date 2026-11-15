@@ -751,9 +751,10 @@ jobs:
     # flags, and zeroing sspilib's hashes in a copy of the core lock fails the install with a hash
     # mismatch.
     #
-    # NOT A REQUIRED CONTEXT. It hard-fails and reports on every pull request and merge-group run, so
-    # a red is visible on the PR; whether branch protection reads it is the owner's call, recorded in
-    # `.github/required-contexts.txt`. tests/test_security_posture.py files it as pending promotion.
+    # NOT YET A REQUIRED CONTEXT. It hard-fails and reports on every pull request and merge-group run,
+    # so a red is visible on the PR, but until branch protection reads it a red does not stop a merge.
+    # tests/test_security_posture.py files it as pending promotion; promoting it is a branch-protection
+    # change the owner makes, recorded in `.github/required-contexts.txt`.
     runs-on: windows-latest
     # Four hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
     timeout-minutes: 20
