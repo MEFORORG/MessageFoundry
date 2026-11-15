@@ -71,8 +71,11 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    repository's `.vscode/settings.json` can set): the path, as spelled, must lie inside the
  *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
  *    refused. On Windows, a path whose folder or file name below the workspace folder ends in a dot
- *    or a space is refused before any file-system call: Node reads such a name as written, while
- *    the CLI's open strips the dot or space and opens another entry. Then every existing path below
+ *    or a space is refused before any file-system call. Node reads such a name as written, while
+ *    the CLI's open can drop the ending and open another entry: measured on Python 3.14.7, it drops
+ *    every trailing dot and space from the file name and one trailing dot from a folder name, but
+ *    keeps a folder name's trailing space. The check refuses every such name, the ones the open
+ *    keeps as written included. Then every existing path below
  *    the workspace folder, down to the target, must lstat as
  *    not a link, a dangling one included; the walk stops at the first that does not exist. The
  *    deepest existing one must then realpath to the folder's own realpath joined with the same
@@ -127,7 +130,7 @@ export function securityConfigTarget(
       ok: false,
       problem:
         "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that ends in " +
-        "a dot or a space, which Windows reads as a different name. Remove the trailing dot or space",
+        "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space",
     };
   }
   if (!noLinkBelow(root, rel, fsx)) {

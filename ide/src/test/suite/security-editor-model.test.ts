@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -51,6 +52,34 @@ function modelFs(entries: Record<string, string>, realpaths: Record<string, stri
   };
 }
 
+/** Unlinks every link at or below `dir`, a junction included, without following any. The VS Code
+ *  extension host's recursive rmSync follows a junction into its target, and fails with "The name of
+ *  the file cannot be resolved by the system" on two junctions that lead into each other, as the
+ *  open-limit test below makes; measured on its Node v24.21.0, while plain Node v24.20.0 does
+ *  neither. So the teardown removes the links before it removes the folders. */
+function unlinkLinks(dir: string): void {
+  for (const name of fs.readdirSync(dir)) {
+    const p = path.join(dir, name);
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink()) {
+      fs.unlinkSync(p);
+    } else if (st.isDirectory()) {
+      unlinkLinks(p);
+    }
+  }
+}
+
+/** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it. It is `long`
+ *  itself where the volume makes no short names. */
+function shortName(long: string): string {
+  const r = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${long}") do @echo %~sI"`], {
+    encoding: "utf8",
+    windowsVerbatimArguments: true,
+  });
+  assert.strictEqual(r.status, 0, `cmd failed: ${r.stderr}`);
+  return r.stdout.trim();
+}
+
 suite("security editor host checks", () => {
   let ws: string;
   let outside: string;
@@ -60,6 +89,8 @@ suite("security editor host checks", () => {
     outside = fs.mkdtempSync(path.join(os.tmpdir(), "mf-secedit-out-"));
   });
   teardown(() => {
+    unlinkLinks(ws);
+    unlinkLinks(outside);
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
   });
@@ -163,7 +194,8 @@ suite("security editor host checks", () => {
         const t = securityConfigTarget(root, setting, scope, modelFs({ ...plain, [linked]: "link" }));
         assert.strictEqual(t.ok, false, `${linked} ${fromWorkspace}`);
       }
-      // The workspace folder itself may be a link: the repository cannot make it one.
+      // The workspace folder itself may be a link: it is taken as given and not checked, as the
+      // securityConfigTarget docblock says, a folder a repository's `.code-workspace` chose included.
       assert.ok(securityConfigTarget(root, setting, scope, modelFs({ ...plain, [root]: "link" })).ok, "the folder as a link");
       // A `..` is collapsed as text before the check, so the link at `away` is never consulted, and
       // the CLI is handed the collapsed path.
@@ -190,9 +222,59 @@ suite("security editor host checks", () => {
     }
   });
 
+  test("a workspace folder under an 8.3 short-name ancestor is checked against its realpath, which spells it in full", () => {
+    // os.tmpdir() on the CI runner spells the profile folder by its 8.3 short name (RUNNER~1), and
+    // realpath spells it in full. Both sides of the realpath comparison go through realpath, so the
+    // short spelling of the folder passes and every refusal below it still holds.
+    const short = path.resolve(path.sep, "Users", "RUNNER~1", "ws");
+    const long = path.resolve(path.sep, "Users", "runneradmin", "ws");
+    const setting = path.join("conf", "messagefoundry.toml");
+    const conf = path.join(short, "conf");
+    const plain = { [short]: "plain", [conf]: "plain" };
+    const realpaths = { [short]: long, [conf]: path.join(long, "conf") };
+    for (const fromWorkspace of [true, false]) {
+      const scope = { fromWorkspace, trusted: true };
+      // THE CONTROL: the folder spelled short is accepted, and the path returned keeps its spelling.
+      assert.deepStrictEqual(securityConfigTarget(short, setting, scope, modelFs(plain, realpaths)), { ok: true, path: path.join(short, setting) });
+      const linked = modelFs({ ...plain, [conf]: "link" }, realpaths);
+      assert.strictEqual(securityConfigTarget(short, setting, scope, linked).ok, false, `a link below the folder ${fromWorkspace}`);
+      const away = modelFs(plain, { ...realpaths, [conf]: path.resolve(path.sep, "elsewhere") });
+      assert.strictEqual(securityConfigTarget(short, setting, scope, away).ok, false, `a path below resolving elsewhere ${fromWorkspace}`);
+    }
+    assert.strictEqual(securityConfigTarget(short, "../messagefoundry.toml", { fromWorkspace: true, trusted: true }, modelFs(plain, realpaths)).ok, false, "outside the folder");
+  });
+
+  test("a real workspace folder reached through an 8.3 short-name ancestor is accepted, and a link below it refused", function () {
+    if (process.platform !== "win32") {
+      this.skip();
+    }
+    const longDir = path.join(ws, "mf-secedit-long-folder-name");
+    fs.mkdirSync(path.join(longDir, "ws", "conf"), { recursive: true });
+    const shortDir = shortName(longDir);
+    if (path.basename(shortDir).toLowerCase() === path.basename(longDir).toLowerCase()) {
+      // Measured: cmd's %~s printed the long name back, so this volume makes no 8.3 names. The
+      // model test above still ran.
+      this.skip();
+    }
+    try {
+      fs.symlinkSync(outside, path.join(longDir, "ws", "linked"), "junction");
+    } catch {
+      this.skip();
+    }
+    const root = path.join(shortDir, "ws");
+    const setting = path.join("conf", "messagefoundry.toml");
+    for (const fromWorkspace of [true, false]) {
+      const scope = { fromWorkspace, trusted: true };
+      // THE CONTROL: the folder spelled short, as os.tmpdir() spells the runner's, is accepted.
+      assert.deepStrictEqual(securityConfigTarget(root, setting, scope, real), { ok: true, path: path.join(root, setting) });
+      assert.strictEqual(securityConfigTarget(root, "linked/messagefoundry.toml", scope, real).ok, false, `${fromWorkspace}`);
+    }
+  });
+
   test("on Windows, a component ending in a dot or a space is refused before any file-system call", function () {
-    // Node reads such a component verbatim and finds nothing, while the CLI's open strips the dot
-    // or space and follows a link the repository holds (round 2 review, finding 1).
+    // Node reads such a component verbatim and finds nothing, while the CLI's open can drop the
+    // ending, at least one trailing dot from a folder name, and follow a link the repository holds
+    // (round 2 review, finding 1). A folder name ending in a space is refused too.
     if (process.platform !== "win32") {
       this.skip();
     }
