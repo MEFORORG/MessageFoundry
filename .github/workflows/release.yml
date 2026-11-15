@@ -181,6 +181,7 @@ jobs:
       contents: read   # the compare and branch endpoints, and the checkout
       checks: read     # the check runs on the tagged commit
       statuses: read   # the commit statuses on the tagged commit
+      actions: read    # the workflow runs on the tagged commit, which give each check suite its event
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

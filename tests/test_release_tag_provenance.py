@@ -24,8 +24,13 @@ from scripts.release.tag_provenance import Report, reports_from, verdict
 _REQUIRED = ("CI gate", "cla")
 
 
-def _check(id_: int, name: str, conclusion: str, state: str = "completed") -> Report:
-    return Report(id=id_, context=name, kind="check", state=state, conclusion=conclusion)
+def _check(
+    id_: int, name: str, conclusion: str, state: str = "completed", suite: int = 1
+) -> Report:
+    # One suite by default, so a higher id is a re-run that supersedes; #5591's tests vary it.
+    return Report(
+        id=id_, context=name, kind="check", state=state, conclusion=conclusion, suite=suite
+    )
 
 
 def _status(id_: int, name: str, state: str) -> Report:
@@ -262,10 +267,11 @@ def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(
             ],
             [],
         ],
-        "commits/abc/check-runs?per_page=100": [
+        "commits/abc/check-runs?filter=all&per_page=100": [
             {"check_runs": [{"id": 1, "name": "a", "status": "completed", "conclusion": "success"}]}
         ],
         "commits/abc/statuses?per_page=100": [[{"id": 2, "context": "b", "state": "success"}]],
+        "actions/runs?head_sha=abc&per_page=100": [{"workflow_runs": []}],
     }
     calls: list[list[str]] = []
 
@@ -280,5 +286,108 @@ def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(
     assert [r.context for r in reports] == ["a", "b"]
     paginated = [c[-1] for c in calls if "--paginate" in c]
     assert all("--slurp" in c for c in calls if "--paginate" in c)
-    assert len(paginated) == 3, calls
+    assert len(paginated) == 4, calls
     assert calls[0][1:] == ["--jq", "{status}"], calls[0]
+
+
+def _run(id_: int, suite: int | None, status: str, conclusion: str | None = None) -> dict[str, Any]:
+    run: dict[str, Any] = {"id": id_, "name": "CI gate", "status": status, "conclusion": conclusion}
+    if suite is not None:
+        run["check_suite"] = {"id": suite}
+    return run
+
+
+def _runs(*runs: dict[str, Any], events: dict[int, str] | None = None) -> list[Report]:
+    workflow_runs = [{"check_suite_id": k, "event": v} for k, v in (events or {}).items()]
+    return reports_from([{"check_runs": list(runs)}], [], [{"workflow_runs": workflow_runs}])
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        # A red in one suite, then a green in another: the green does not supersede the red.
+        (_run(10, 100, "completed", "failure"), _run(11, 200, "completed", "success")),
+        # A run still going in one suite, then a green in another.
+        (_run(10, 100, "in_progress"), _run(11, 200, "completed", "success")),
+        # No suite named: each run stands alone, so the red is never superseded.
+        (_run(10, None, "completed", "failure"), _run(11, None, "completed", "success")),
+    ],
+    ids=["red-then-green-other-suite", "running-then-green-other-suite", "no-suite-id"],
+)
+def test_a_green_in_another_suite_does_not_hide_a_red_or_running_run(
+    runs: tuple[dict[str, Any], ...],
+) -> None:
+    """BACKLOG #5591: only a later run of the SAME suite supersedes an earlier one."""
+    problems = verdict("behind", ["CI gate"], _runs(*runs))
+    assert len(problems) == 1 and "did not pass" in problems[0], problems
+
+
+def test_unfinished_sees_a_run_still_going_in_another_suite() -> None:
+    reports = _runs(_run(10, 100, "in_progress"), _run(11, 200, "completed", "success"))
+    assert tp.unfinished(["CI gate"], reports) == ["CI gate"]
+
+
+def test_a_rerun_in_the_same_suite_supersedes_the_failed_attempt() -> None:
+    """POSITIVE CONTROL for #5591: the documented remedy, re-running the failed job, still works."""
+    reports = _runs(
+        _run(10, 100, "completed", "failure"),
+        _run(11, 200, "completed", "success"),
+        _run(12, 100, "completed", "success"),
+    )
+    assert verdict("behind", ["CI gate"], reports) == []
+    assert tp.unfinished(["CI gate"], reports) == []
+
+
+def test_comment_driven_suites_pool_so_a_later_comment_run_supersedes_a_red_one() -> None:
+    """Each issue_comment run adds a suite to main's tip without testing it. Held per suite, one red
+    comment run would block releasing the tip for good; pooled, a later one supersedes it, as every
+    suite was judged before #5591. The validating suite (merge_group) is still held on its own."""
+    events = {100: "merge_group", 300: "issue_comment", 400: "pull_request_target"}
+    red_comment = [_run(10, 100, "completed", "success"), _run(11, 300, "completed", "failure")]
+    problems = verdict("behind", ["CI gate"], _runs(*red_comment, events=events))
+    assert len(problems) == 1 and "event issue_comment" in problems[0], problems
+    healed = _runs(*red_comment, _run(12, 400, "completed", "success"), events=events)
+    assert verdict("behind", ["CI gate"], healed) == []
+    # A pooled green never hides a red in a validating suite.
+    red_merge = _runs(
+        _run(10, 100, "completed", "failure"), _run(12, 300, "completed", "success"), events=events
+    )
+    assert len(verdict("behind", ["CI gate"], red_merge)) == 1
+
+
+def test_pooling_never_passes_what_the_pre_5591_rule_refused() -> None:
+    """The newest run of a context, whatever its suite, is a latest report under both rules."""
+    events = {100: "push", 300: "issue_comment"}
+    for last in ("push", "comment"):
+        suite = 100 if last == "push" else 300
+        reports = _runs(
+            _run(10, 100, "completed", "success"),
+            _run(11, 300, "completed", "success"),
+            _run(12, suite, "completed", "failure"),
+            events=events,
+        )
+        assert verdict("behind", ["CI gate"], reports), last
+
+
+def test_a_failure_names_its_run_suite_and_event() -> None:
+    """The remedy is re-running THAT workflow run, so the refusal must say which one it is."""
+    problems = verdict(
+        "behind", ["CI gate"], _runs(_run(10, 100, "completed", "failure"), events={100: "push"})
+    )
+    assert "run 10, suite 100, event push" in problems[0], problems
+
+
+def test_main_refuses_at_once_on_a_red_suite_waiting_cannot_fix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run still going in one suite cannot supersede a red in another, so nothing is waited for."""
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("CI gate\n", encoding="utf-8")
+    reports = _runs(_run(10, 100, "completed", "failure"), _run(11, 200, "in_progress"))
+    monkeypatch.setattr(tp, "read_server", lambda *_a: ("behind", [], reports))
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main(args) == 1
+    assert sleeps == []
+    assert "completed/failure" in capsys.readouterr().out
