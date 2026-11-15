@@ -1298,3 +1298,127 @@ def test_a_payload_read_that_throws_is_a_visible_hook_error(tmp_path: Path) -> N
     assert proc.stdout == ""
     control = _proc([*argv, str(silent), str(probe)], raw)
     assert (control.returncode, control.stdout, control.stderr) == (0, "", "")
+
+
+# ================================================================== context pass-through
+
+
+# THE EQUIVALENCE CORPUS ABOVE NEVER MAKES A GUARD EMIT CONTEXT (BACKLOG #5606), so it would pass a
+# dispatcher that dropped a guard's additionalContext, joined several wrongly, or wrote a context
+# and exited 0 over a guard that threw. These stub guards pin each, and the mutated copies of the
+# dispatcher at the end are the control that the assertions can see each mistake.
+
+_CONTEXT = (
+    "$null = [Console]::In.ReadToEnd()\n"
+    "[Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+    "additionalContext='%s'}} | ConvertTo-Json -Compress))"
+)
+_ASK_WITH_CONTEXT = (
+    "$null = [Console]::In.ReadToEnd()\n"
+    "[Console]::Out.Write((@{hookSpecificOutput=@{hookEventName='PreToolUse';"
+    "permissionDecision='ask';permissionDecisionReason='asked';additionalContext='%s'}} | "
+    "ConvertTo-Json -Compress))"
+)
+_FAILED_NOTICE = "at least one shell guard FAILED OPEN on this call"
+
+
+def _context_guards(tmp_path: Path) -> dict[str, Path]:
+    return {
+        "a": _guard(tmp_path, "ctx_a.ps1", _CONTEXT % "context A"),
+        "b": _guard(tmp_path, "ctx_b.ps1", _CONTEXT % "context B"),
+        "ask": _guard(tmp_path, "ask_own.ps1", _ASK_WITH_CONTEXT % "own context"),
+        "throws": _guard(tmp_path, "throws.ps1", "throw 'broken guard'"),
+        "silent": _guard(tmp_path, "silent.ps1", "$null = [Console]::In.ReadToEnd()"),
+        "deny": _guard(tmp_path, "deny.ps1", "$null = [Console]::In.ReadToEnd()\n" + _DENY % "no"),
+    }
+
+
+def _context_checks(dispatcher: Path, g: dict[str, Path]) -> list[str]:
+    """Every context property, run against ``dispatcher``; returns the ones that did not hold."""
+    raw = json.dumps(bash("git status"))
+    failed: list[str] = []
+
+    def run(*names: str) -> subprocess.CompletedProcess[str]:
+        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(dispatcher)]
+        return _proc(argv + [str(g[n]) for n in names], raw)
+
+    def hso(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        decision = _decision(proc.stdout) or {}
+        out: dict[str, Any] = decision.get("hookSpecificOutput") or {}
+        return out
+
+    one = run("a")
+    if (one.returncode, hso(one)) != (
+        0,
+        {"hookEventName": "PreToolUse", "additionalContext": "context A"},
+    ):
+        failed.append(f"a lone context was not passed through: {one}")
+
+    two = run("a", "silent", "b")
+    if two.returncode != 0 or hso(two).get("additionalContext") != "context A\n\ncontext B":
+        failed.append(f"two contexts were not joined in guard order: {two}")
+    if "permissionDecision" in hso(two):
+        failed.append(f"a context-only run invented a decision: {two.stdout}")
+
+    kept = run("a", "ask", "b")
+    out = hso(kept)
+    if (
+        kept.returncode != 0
+        or out.get("permissionDecision") != "ask"
+        or out.get("additionalContext") != "own context\n\ncontext A\n\ncontext B"
+    ):
+        failed.append(f"the kept decision did not carry its own context first: {kept}")
+
+    denied = run("a", "deny")
+    if (
+        denied.returncode != 0
+        or "additionalContext" in hso(denied)
+        or hso(denied).get("permissionDecision") != "deny"
+    ):
+        failed.append(f"a deny did not write only itself: {denied}")
+
+    threw = run("a", "throws")
+    if threw.returncode != 0 or _FAILED_NOTICE not in str(hso(threw).get("additionalContext")):
+        failed.append(f"a context hid a failed guard: {threw}")
+    if not hso(threw).get("additionalContext", "").startswith("context A"):
+        failed.append(f"a failed guard cost another guard its context: {threw}")
+
+    silent_fail = run("silent", "throws")
+    if (silent_fail.returncode, silent_fail.stdout) != (1, ""):
+        failed.append(f"a failed guard beside a silent allow did not exit 1: {silent_fail}")
+    return failed
+
+
+def test_guard_context_is_passed_through_joined_and_a_failure_still_shows(
+    tmp_path: Path,
+) -> None:
+    assert _context_checks(DISPATCHER, _context_guards(tmp_path)) == []
+
+
+_JOIN = '$ShellGuardJoined = @(@($ShellGuardOwn) + $ShellGuardContexts | Where-Object { $_ }) -join "`n`n"'
+_COLLECT = "if ($ShellGuardContext) { $ShellGuardContexts.Add($ShellGuardContext) }"
+_FAIL_EXIT = "if ($ShellGuardFailed) { exit 1 }\nexit 0"
+_NOTICE_ADD = "if ($ShellGuardFailed) {\n        $ShellGuardContexts.Add("
+
+
+@pytest.mark.parametrize(
+    ("label", "old", "new"),
+    [
+        ("contexts dropped", _COLLECT, "$null = $ShellGuardContext"),
+        ("joined with one newline", _JOIN, _JOIN.replace('"`n`n"', '"`n"')),
+        (
+            "own context last",
+            _JOIN,
+            _JOIN.replace(
+                "@(@($ShellGuardOwn) + $ShellGuardContexts",
+                "@(@($ShellGuardContexts) + $ShellGuardOwn",
+            ),
+        ),
+        ("failure exits 0", _FAIL_EXIT, "exit 0\nexit 0"),
+        ("failure notice dropped", _NOTICE_ADD, "if ($false) {\n        $ShellGuardContexts.Add("),
+    ],
+)
+def test_each_context_mistake_is_caught(tmp_path: Path, label: str, old: str, new: str) -> None:
+    """The control for the test above: a dispatcher carrying each mistake fails at least one check."""
+    mutated = _dispatcher_copy(tmp_path / "dispatch_mutated.ps1", (old, new))
+    assert _context_checks(mutated, _context_guards(tmp_path)), f"{label} went unnoticed"
