@@ -438,5 +438,15 @@ async def test_a_death_inside_a_batch_hands_the_extras_to_the_respawn(
             extras_out=held if per_lane else None,
         )
     assert held == ([head.id, *extras] if per_lane else [head.id])
-    # Nothing was re-pended here on either path: the per-lane respawn does it, the pooled half waits.
-    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB": (3, 2.0)}
+    # The extras are left for the respawn on the per-lane path. The head is charged with the death
+    # there, a failed send that re-pends it with its attempts kept, so a poison head reaches the
+    # lane's cap; the pooled half writes nothing.
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {
+        "OB": (2, 2.0) if per_lane else (3, 2.0)
+    }
+    cur = await store._db.execute("SELECT status, attempts FROM queue WHERE id=?", (head.id,))
+    row = await cur.fetchone()
+    assert row is not None
+    assert (str(row["status"]), int(row["attempts"])) == (
+        ("pending", 1) if per_lane else ("inflight", 1)
+    )

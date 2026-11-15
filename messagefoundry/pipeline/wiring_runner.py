@@ -7719,16 +7719,34 @@ class RegistryRunner:
         It composes with the worker-death cap: a dying ingress, routed or response row is counted
         in ``worker_deaths``, which ``reschedule_claimed`` does not touch, and dead-lettered at
         :data:`_WORKER_DEATH_LIMIT`, after which the guarded re-pend skips it. A dying outbound row
-        on a per-lane lane is already re-pended by :meth:`_record_worker_death` as a failed send,
-        so its ``attempts`` count survives and the lane's own cap applies."""
+        on a per-lane lane, a batch head included, is already re-pended by
+        :meth:`_record_worker_death` as a failed send, so its ``attempts`` count survives and the
+        lane's own cap applies. A death no row is charged with (one outside the per-item bodies, or
+        one whose count the store failed to write) is retried on this backoff with no cap, as the
+        fault arm retries a persistent ``Exception``.
+
+        The write is a deferred one for a task that is gone, so it is sent only while the dead
+        task's lease still holds (:meth:`RependFence.may_write`): on a node demoted since, or one
+        leading under a newer lease, the rows are the successor's promotion recovery's, as
+        :meth:`_release_tail_on_stop` says, and they are left alone."""
         if dead is not None and dead.ids:
+            if dead.fence is not None and not dead.fence.may_write():
+                log.warning(
+                    "%s worker %r: the dead worker's %d held row(s) were claimed under a lease "
+                    "this node no longer holds; leaving them to the successor's recovery",
+                    worker,
+                    name,
+                    len(dead.ids),
+                )
+                await work(name)
+                return
             # Taken over by this task first, so a death during the re-pend hands the same rows on.
             held = self._held_rows()
             held.ids[:] = dead.ids
             held.fence = dead.fence
             log.warning(
-                "%s worker %r: re-pending %d row(s) the dead worker held in flight before the "
-                "replacement claims",
+                "%s worker %r: re-pending the %d row(s) the dead worker held (those still in "
+                "flight) before the replacement claims",
                 worker,
                 name,
                 len(held.ids),
@@ -7744,8 +7762,9 @@ class RegistryRunner:
             )
             if ended is HoldResult.STOPPED:
                 return  # stopped while holding them: they stay INFLIGHT for the next start
-            if ended is HoldResult.LANDED:
-                held.ids.clear()
+            # Cleared on every other end, as each fault arm clears: the loop re-stamps the fence
+            # with its own lease, under which a later re-pend of these rows would pass unfenced.
+            held.ids.clear()
             if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                 return
         await work(name)
@@ -11031,14 +11050,7 @@ class RegistryRunner:
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
-        except BaseException as exc:
-            if extras_out is not None and not isinstance(exc, Exception):
-                # A death (#1611 step 2, per-lane half): the worker's arm never runs, but its
-                # respawn re-pends what this task held, which must include the extras.
-                extras_out.extend(it.id for it in members[1:])
-                raise
-            if not isinstance(exc, Exception):
-                raise  # the pooled serializer is not respawned; that half of #4607 is held
+        except Exception:
             # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
             # dead-lettered / re-pended failed) or handed them back (leadership lost, a pause, the
             # #122 halt), so a `finally`
@@ -11076,6 +11088,18 @@ class RegistryRunner:
                         len(extras),
                         held.name.lower(),
                     )
+            raise
+        except BaseException as exc:
+            if extras_out is None:
+                raise  # the pooled serializer is not respawned; that half of #4607 is held
+            # A death on the per-lane path (#1611 step 2): the worker's arm never runs, but its
+            # respawn re-pends what this task held, so the extras go on the list too, and the head
+            # is charged with the death as the single-row body's wrapper charges it. Without that
+            # charge the respawn's reschedule_claimed undoes the head's attempts and a poison head
+            # is re-claimed forever. A cancellation or close appends harmlessly: it respawns nothing.
+            extras_out.extend(it.id for it in members[1:])
+            if _kills_the_worker(exc):
+                await self._record_worker_death("delivery", name, head, exc)
             raise
 
     async def _deliver_coalesced_batch(

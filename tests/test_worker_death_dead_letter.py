@@ -540,31 +540,27 @@ async def test_the_migration_adds_the_column_to_an_existing_store(tmp_path: Path
         await s.close()
 
 
-async def test_a_live_per_lane_engine_dead_letters_the_killer_across_restarts(
-    tmp_path: Path, store: MessageStore
+async def test_a_live_per_lane_engine_dead_letters_the_killer_in_one_start(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End to end in per_lane mode. The first start re-claims the killer after each death,
-    since the respawned router worker re-pends what the dead one held (#1611 step 2), so that one
-    start dead-letters it at the cap; the next message routes only after that, in FIFO order. The
-    later starts find it dead and re-claim nothing."""
+    """End to end in per_lane mode. The respawned router worker re-pends what the dead one held
+    (#1611 step 2), so the killer is re-claimed after each death and one start dead-letters it at
+    the cap, with no restart; the next message routes only after that, in FIFO order. Counting
+    across real restarts is pinned by the store tests above
+    (``test_the_count_survives_recovery_and_a_claim_never_raises_it``)."""
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.02)
     calls: list[str] = []
     killer = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
     after = await store.enqueue_ingress(channel_id="IB", raw=_hl7("OK"))
-    reg = _registry(tmp_path, router=_kill_on("KILL", calls))
-    for death in range(1, LIMIT + 1):
-        await _restart(store)  # the engine's start runs this before the runner's
-        runner = _runner(reg, store, "per_lane")
-        await runner.start()
-        try:
-            deadline = time.monotonic() + 10.0
-            while (await _row(store, killer, Stage.INGRESS))[2] < death:
-                assert time.monotonic() < deadline, calls
-                await asyncio.sleep(0.02)
-            while await _status(store, after) == MessageStatus.RECEIVED.value:
-                assert time.monotonic() < deadline, calls
-                await asyncio.sleep(0.02)
-        finally:
-            await runner.stop()
+    runner = _runner(_registry(tmp_path, router=_kill_on("KILL", calls)), store, "per_lane")
+    await runner.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while await _status(store, after) == MessageStatus.RECEIVED.value:
+            assert time.monotonic() < deadline, calls
+            await asyncio.sleep(0.02)
+    finally:
+        await runner.stop()
     assert calls.count("KILL") == LIMIT
     assert calls[: LIMIT + 1] == ["KILL"] * LIMIT + ["OK"]  # FIFO: OK after the last death
     # attempts 1: each in-process re-pend undoes its claim's increment, as the fault arm's does.
