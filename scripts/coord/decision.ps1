@@ -36,7 +36,8 @@
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     NO-REVIEW needs all of: the kill switch reads exactly OFF (afk-kill.ps1 -Status); the seat's
-    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration);
+    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration,
+    under which a roster alias earns its own 60 samples; owner ruling 2026-11-15, option c);
     no decision on the item was reversed in the 60 days read; the reversal budget is open (plan 4.5:
     3 reversals fleet-wide or 2 of the seat's own decisions inside 24 hours close it for 24 hours);
     the chain is no deeper than two (plan 4.6, below); and the cost rung is not hit (plan 4.7).

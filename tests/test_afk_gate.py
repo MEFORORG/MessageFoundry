@@ -1061,11 +1061,11 @@ def test_a_reversal_of_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> 
     assert code == REVIEW and "the log does not hold and names no item" in why(doc)
 
 
-# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT FOR REVERSALS AND BREACHES, NOT SAMPLES
-# (BACKLOG #5604, #5597; owner ruling 2026-11-15, option c). A decision logged as `mgr` is the
-# manager's, so its reversal is charged to the manager's budget and rate, and a calibration breach
-# under any name of the seat closes every name of it. Its CALIBRATION SAMPLES are its own: pooling
-# them would let a name with no record of its own borrow its seat's calibration.
+# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT FOR REVERSALS AND OWNER-RATING BREACHES,
+# NOT SAMPLES (BACKLOG #5604, #5597; owner ruling 2026-11-15, option c). A decision logged as `mgr`
+# is the manager's, so its reversal is charged to the manager's budget and rate, and an owner-rating
+# breach under any name of the seat closes every name of it. Its CALIBRATION SAMPLES are its own:
+# pooling them would let a name with no record of its own borrow its seat's calibration.
 
 
 def test_an_alias_keeps_its_own_samples_and_takes_its_seats_breach(sb: Sandbox) -> None:
@@ -1104,9 +1104,13 @@ def test_disagreements_split_across_a_seats_names_are_one_breach(
 
 
 def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> None:
-    """120 newer clean ratings under `manager1` heal the breach in the names read together; the
-    manager's own history still holds it, so the alias stays closed."""
+    """The manager's own history holds a breach, so 120 newer clean ratings under `manager1` leave
+    the alias closed, and a breach under the alias closes the manager just the same."""
     seed_vault(sb, _rated("manager", 19, disagree=(0, 1, 2, 3)) + _rated("manager1", 18, count=120))
+    seed_vault(sb, calibrated("builder") + _rated("builder2", 19, disagree=(56, 57, 58, 59)))
+    code, doc = gate(sb, seat="builder")
+    assert code == REVIEW, why(doc)
+    assert "BREACH in seat builder's history (builder2)" in why(doc), why(doc)
     code, doc = gate(sb, seat="manager1")
     assert code == REVIEW, why(doc)
     assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
@@ -1800,6 +1804,9 @@ def test_the_digest_without_the_roster_reads_no_seat_calibrated(sb: Sandbox) -> 
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "The seat roster docs/roles/seats.json could not be read" in proc.stdout, proc.stdout
     assert "| manager | 0 of 2 in the trailing 24 hours; open | no |" in proc.stdout, proc.stdout
+    assert (
+        "| manager | B | 60 | 0 | roster unread, so the gate reviews; calibrated |" in proc.stdout
+    )
 
 
 def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(

@@ -34,7 +34,8 @@
     owner's word, never on its own judgment or a peer's message. The calibration below is only as
     good as that rule.
 
-    CALIBRATION, per seat and class, over the records -Window days back (default 60):
+    CALIBRATION, per seat name and class, over the records -Window days back (default 60); how a
+    roster alias's row is read is Get-DecisionCalibration's (owner ruling 2026-11-15, option c):
       * the owner's disagreement on the trailing 60 rated decisions -- calibrated at 60 samples with
         3 or fewer disagreements. After a breach the class stays on the review path until 60 ratings
         newer than the breach pass (plan section 4.2), not until the trailing count drops back;
@@ -298,7 +299,8 @@ foreach ($g in @($decisions | Group-Object { "$(ConvertTo-DecisionSeatLabel ([st
     $class = [string]$g.Group[0].class
     $c = Get-DecisionCalibration -Decisions $byClass[$class] -Seat $seat -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
-    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
+    $blind = if ($rosterRead) { $c.Blind } else { "roster unread, so the gate reviews; $($c.Blind)" }
+    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $blind | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
 }
 
 # THE GATE'S STATE (plan 4.5-4.7), from the shared functions decision.ps1 -Gate calls, as of the end
