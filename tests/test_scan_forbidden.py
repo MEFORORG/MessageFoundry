@@ -1310,7 +1310,8 @@ _PR_2893_FALSE_POSITIVE_BODIES = (
 #: next nineteen are the bodies review rounds 4f580a28dd and b628ef8690 listed (the first two of them
 #: say "tests pass" or "will fail" after the clause); then review rounds cc2be34b's and df2d868b's;
 #: then the final round's on head 28bcdc34ef; then the six PR 2893 bodies, one-step edits of them,
-#: and tables whose last row is one of them.
+#: and tables whose last row is one of them. A body listed twice (an edit that is also hand-written)
+#: runs once.
 _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     f"The row is not failing: {_REQ} here.",
     f"| never fails: {_REQ} |",
@@ -1448,6 +1449,7 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     ),
     f"{_HEAD}| a | b | c |\n\n| 2.5.1 | parser | never fails |",
 ]
+_PR_ROW_CLAUSE_MUST_FIRE = list(dict.fromkeys(_PR_ROW_CLAUSE_MUST_FIRE))
 #: Step 9's deliberate drop: a blank line ends an ASVS-headed table, so a headerless pipe block after
 #: it is unmarked.
 _STEP9_QUIET_BODY = f"{_HEAD}| a | b | c |\n\n{_ROW}"

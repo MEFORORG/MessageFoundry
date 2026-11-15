@@ -680,15 +680,15 @@ _PR_SYMBOL = re.compile(
     r"[A-Za-z_]\w*)+)"
     r"(?:\s*->[^`\n]*)?)`"
 )
-#: An identifier the text itself marks as a requirement: "ASVS <id>", "cell <id>", "<id> row". Weaker
-#: evidence may bind it. A bare `V` lead does not mark one: "V2.1.3" is also how a version is written,
-#: and so is a possessive ("2.5.1's segment grammar"). "ASVS" does, however it is set off from the
-#: identifier ("ASVS V<id>", "ASVS `<id>`", "ASVS: <id>", "asvs <id>").
 #: "ASVS 5", "ASVS v5", "ASVS 5.0", "ASVS v5.0.0": the standard's own version, before an identifier.
 _PR_ASVS_VERSION = r"asvs[\s*`_:]+v?\d+(?:\.\d+){0,2}[\s*`_:]*"
 #: The same, ending where an identifier starts. "v5" there is the standard's version, not a word
 #: carrying a digit, so it does not make the identifier after it a version (_pr_requirement_ids).
 _PR_ASVS_VERSION_BEFORE = re.compile(rf"(?i){_PR_NB}{_PR_ASVS_VERSION}$")
+#: An identifier the text itself marks as a requirement: "ASVS <id>", "cell <id>", "<id> row". Weaker
+#: evidence may bind it. A bare `V` lead does not mark one: "V2.1.3" is also how a version is written,
+#: and so is a possessive ("2.5.1's segment grammar"). "ASVS" does, however it is set off from the
+#: identifier ("ASVS V<id>", "ASVS `<id>`", "ASVS: <id>", "asvs <id>").
 _PR_MARK_BEFORE = re.compile(
     # "ASVS 5 <id>", "ASVS 5.0 <id>", "ASVS v5.0.0 V<id>", and the version-prefixed form "v5.0.0-<id>".
     rf"(?i){_PR_NB}(?:(?:cells?|requirements?|asvs)[\s*`_:]*|{_PR_ASVS_VERSION}"
