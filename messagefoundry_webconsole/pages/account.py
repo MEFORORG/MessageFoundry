@@ -4,8 +4,8 @@
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
 The account pages carry the normal chrome. A page that drops the full nav for focus/confinement
-renders ``nav=minimal_nav()``: the wordmark plus, when the request carries a live session, the same
-one-click POST Sign-out form (ASVS 7.4.4) and the session watchdog. A page that may be served
+renders ``nav=minimal_nav()``: the wordmark plus, by default, the same one-click POST Sign-out form
+(ASVS 7.4.4) and the session watchdog. ``minimal_nav`` does not read the request. A page that may be served
 either way, at least the OIDC "leaving this site" page and the IdP hop, passes
 ``minimal_nav(session=...)`` with what its route found, because the watchdog on a page with no
 session sends the browser to the login page. The sign-in entry pages, at least sign-in and the

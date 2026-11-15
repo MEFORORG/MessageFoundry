@@ -284,8 +284,8 @@ _KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
-#: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
-#: There are at least four emitters: :func:`clear_session_cookie` (a route that deletes the
+#: ASVS 14.3.1 — the header that ends a session's browser-visible life, sent by the emitters below.
+#: Not every landing after a termination carries it. There are at least four emitters: :func:`clear_session_cookie` (a route that deletes the
 #: cookie — sign-out, and the password change that revokes every session), :func:`_login_redirect`
 #: / :func:`login_redirect_response` (every SERVER-driven expiry, revoke or disable redirect), the
 #: login RENDER in :mod:`.routes.core` (a post-termination landing reached by bookmark or Back,
