@@ -316,8 +316,6 @@ def test_5550_a_one_line_key_and_a_swept_json_key_are_hidden(line: str, kept: st
     (
         "connect failed MEFOR_DB_PASSWORD=b'zq-R1_A zq-R1_B' retrying",
         "connect failed MEFOR_API_TOKEN=b'zq-R1_A zq-R1_B' retrying",
-        "x password=b'zq-R1_A zq-R1_B': y",
-        "x token=b'zq-R1_A zq-R1_B':retry",
         "set MEFOR_VALUE_PW=b'zq-R1_A zq-R1_B'|next",
         "connect failed MEFOR_VALUE_PW=b'zq-R1_A zq-R1_B'.",
         'Authorization: Digest  username = "zq-R1_A" , nonce = "zq-R1_B", response="zq-R1_C"',
@@ -365,6 +363,11 @@ def test_prose_between_two_banners_is_no_key_body(line: str) -> None:
         ),
         ("new-address path", "/api/x token=<redacted>'" + "A" * 230 + "' x/zq-tail-value"),
         ("new-address path", "/api/x password=b'" + "A" * 230 + "' x/zq-tail-value"),
+        # The fourth review's: a JSON key a quoted remnant took, which the PHI pass reads its value
+        # by on the settled reading, and a MEFOR_ remnant opening on a line break.
+        ("new-address path", '/api/{"token": {"family": "zqfamA\nzq-tail-value"}}'),
+        ("new-address path", '/api/MEFOR_X=zqA\nzqB;token={"u":1}/zq-tail-value'),
+        ("new-address path", '/api/MEFOR_DB_PASSWORD=zqA\nzqB,token=b"zqC"/zq-tail-value'),
     ),
 )
 def test_a_long_hidden_value_pulls_no_cut_text_into_view(surface: str, text: str) -> None:
@@ -390,6 +393,24 @@ def test_a_mefor_remnant_is_hidden_to_white_space_on_the_settled_reading(path: s
     with pytest.MonkeyPatch.context() as patch:
         without_the_added_stage(patch)
         assert "zq-tail-value" not in _new_ip_path_field(path)
+
+
+def test_a_quoted_key_after_a_placeholder_is_left_for_the_phi_pass() -> None:
+    """A quoted run followed by ":" is a key, which the PHI pass reads a value by, so the stage leaves
+    it. A bytes literal followed by ":" prints as it did before the stage."""
+    line = '{"token": {"family": "zq-Fam_A"}}'
+    assert '"family":' in scrub_credentials(line)
+    assert "zq-Fam_A" not in _through_the_chain(line)
+
+
+def test_a_pgp_header_holding_a_backslash_is_still_a_header() -> None:
+    """A Windows path in a ``Comment:`` header keeps the armor-header walk on its line, so on the
+    write-time chain, where only the line-by-line form reads the PHI pass's marker, the body hides."""
+    line = (
+        f"-----BEGIN PGP {_PK} BLOCK-----\nComment: C:\\keys\\ops.asc\n\nlQOYBFzq-Pgp_A\n"
+        f"zq-Pgp_B\n-----END PGP {_PK} BLOCK-----"
+    )
+    _assert_hidden(line, ("lQOYBFzq-Pgp_A", "zq-Pgp_B"))
 
 
 def test_a_key_body_and_an_empty_username_password_keep_a_label_a_pass_read() -> None:
@@ -654,6 +675,12 @@ def _seeded_corpus(count: int, seed: int) -> list[str]:
         "MIIEow",
         "DOE^JANE",
         "PID|1|",
+        '{"token": {',
+        '"family": "',
+        "{",
+        "}",
+        ";token=",
+        "MEFOR_X=",
     )
     rng = random.Random(seed)
     lines = []
@@ -780,6 +807,10 @@ def _clip_corpus(surface: str) -> list[str]:
             if lead >= 0:
                 # "w/" pairs: no escape widens them, and they join no label or value.
                 lines.append("w/" * (lead // 2) + probe + tail)
+    if surface == "new-address path":
+        # The field reads the chain until it settles, which can take four passes or more, so the
+        # seeded lines are read there too, as paths, uncut.
+        lines += ["/api/" + line for line in _seeded_corpus(600, 5547)]
     return lines
 
 
@@ -843,13 +874,17 @@ def test_the_cut_guard_can_fail(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _width_readings(text: str) -> tuple[int, ...]:
     """``text``'s length as written, and after each escape a surface applies after the stage: the
-    control-character escape, a JSON string's, a repr's, and the bounded log field's."""
+    control-character escape, a JSON string's, a repr's, the first followed by either of the next
+    two, as the JSON formatter writes a scrubbed record, and the bounded log field's."""
     literals = (CREDENTIAL_PLACEHOLDER, redaction._REDACTED)
+    escaped = scrub_control_chars(text)
     return (
         len(text),
-        len(scrub_control_chars(text)),
+        len(escaped),
         len(json.dumps(text)),
         len(repr(text)),
+        len(json.dumps(escaped)),
+        len(repr(escaped)),
         len(log_field_token(text, 10**9, literals=literals)),
     )
 
@@ -867,7 +902,7 @@ def test_the_stage_never_shortens_what_it_reads(monkeypatch: pytest.MonkeyPatch)
         return out
 
     replace_the_added_stage(monkeypatch, recording)
-    wide = "password=b'\\\\ \"\U0001f511\u200b\n\u00e9' tail"
+    wide = "password=b'\\\\ \"\U0001f511\u200b\U000e0001\n\u00e9' tail"
     corpus = [*_OLD_BRANCH_PROBES, *_seeded_corpus(1500, 5551), wide]
     _surface_outputs(corpus)
     for surface, apply in _CLIP_SURFACES:

@@ -1523,13 +1523,17 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1", count: int = 2) 
     repeat = _new_ip_path_field(path)
     over = _new_ip_path_field(path, seen_text)
     main_tail = _seen_tail(seen_text)
+    with pytest.MonkeyPatch.context() as patch:
+        # Main's lines as main wrote them, before the credential stage of BACKLOG #5546 to #5550,
+        # so the field is held to main and not to this branch's own handlers.
+        without_the_added_stage(patch)
+        main_repeat = _sink_lines(_REPEAT_HEAD + "%s", path, count=count)
+        main_over = _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail, count=count)
+        tails = (main_tail, _last_sink_line("%s", main_tail, count=count))
     pairs = (
+        (main_repeat, _sink_lines(_REPEAT_HEAD + "%s", repeat, count=count)),
         (
-            _sink_lines(_REPEAT_HEAD + "%s", path, count=count),
-            _sink_lines(_REPEAT_HEAD + "%s", repeat, count=count),
-        ),
-        (
-            _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail, count=count),
+            main_over,
             _sink_lines(
                 _OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over, count=count
             ),
@@ -1540,7 +1544,6 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1", count: int = 2) 
     opening = "a request from a new client address must re-verify; the address "
     assert all(line.startswith(opening) for pair in pairs for side in pair for line in side)
     words = set(re.findall(r"[A-Za-z0-9]{3,}", path))
-    tails = (main_tail, _last_sink_line("%s", main_tail, count=count))
     shown = []
     for (main, ours), head, after in zip(
         pairs, (_REPEAT_HEAD, _OVER_HEAD + "path="), (("",), tails), strict=True

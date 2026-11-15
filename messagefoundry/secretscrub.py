@@ -1911,8 +1911,8 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # dashes, so two blocks' bodies never share a character; a block with no end marker is read twice,
 # once by each of the other forms. A second-form chunk holds no "[" or "<", so its walk ends before
 # the next marker in the PHI pass's spelling, and its short chunk cannot open on five dashes. A
-# header line ends at a line break, a backslash or five dashes, so a header walk never passes a
-# later marker.
+# header line ends at a line break, an escaped one or five dashes, so a header walk never passes a
+# later marker; a backslash before any other character, as in a Windows path, stays in the header.
 _KEY_END_MARKER = r"(-----(?:END [A-Z0-9 ]{0,40}|" + _STAGE_PHI_MARKER + r"[A-Z0-9 ]{0,40})-----)"
 _KEY_ESCAPED_BREAK = r"\\++(?:[rn]|(?=" + _STAGE_PLACEHOLDER + r"))"
 _KEY_BREAK = r"(?:\s|" + _KEY_ESCAPED_BREAK + r")"
@@ -1932,7 +1932,7 @@ _KEY_FORM_ONE_LINE = (
 )
 _KEY_FORM_LINES = (
     r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"))"
-    r"(?:" + _KEY_BREAK + r"*+[A-Z][A-Za-z-]*+:[^\S\r\n](?:[^\r\n\\-]++|-(?!----))*+"
+    r"(?:" + _KEY_BREAK + r"*+[A-Z][A-Za-z-]*+:[^\S\r\n](?:[^\r\n\\-]++|-(?!----)|\\(?![rn]))*+"
     r"(?=\r?\n|\\++[rn]))*+"
     r"(?:" + _KEY_BREAK + r"*+(?:(?:" + _KEY_CHARS + r"++|\\/)++|" + _STAGE_PLACEHOLDER + r")"
     r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"|\\*+['\"](?=[\s,)\]}]|\Z)|\Z)))++"
@@ -2030,7 +2030,10 @@ _PADDED_TOKEN_AFTER_PLACEHOLDER = re.compile(
 # The closing quote must close a value: white space, punctuation that ends one, an HL7 separator, a
 # quote of either kind (an exception's or a KeyError's repr around the literal) or the end follows
 # it. So in a JSON log record, ``"message": "password=<redacted>", "exception": ...``,
-# the ``", "`` between two fields is no remnant. A run that reaches a later placeholder, or the line's
+# the ``", "`` between two fields is no remnant. A ":" or "=" after the closing quote is no closer
+# either: a quoted run then is a key, as ``{"token": {"family": ...}}`` leaves ``"family":`` after
+# the placeholder, and the PHI pass reads its value by that key, there and on every later reading.
+# So ``password=b'v w': y`` prints as it did before. A run that reaches a later placeholder, or the line's
 # end, before such a closer is left, as it printed before: a literal cut short, or a value that would
 # take a later label whose value a pass already hid. What it costs: a quoted run a pass left right
 # after a placeholder is hidden, as ``{"session": {"u": 1}}``'s ``"u"``, where the pass took only the
@@ -2044,7 +2047,7 @@ _QUOTED_AFTER_PLACEHOLDER = re.compile(
     r"(" + _STAGE_PLACEHOLDER + r")"
     r"(?:'(?:(?!" + _STAGE_PLACEHOLDER + r")[^'\\\r\n]|\\.)*+'"
     r"|\"(?:(?!" + _STAGE_PLACEHOLDER + r")[^\"\\\r\n]|\\.)*+\")"
-    r"(?=[\s,;:=.)\]}>|&^~'\"!/]|\Z)"
+    r"(?=[\s,;.)\]}>|&^~'\"!/]|\Z)"
 )
 
 # A BYTES LITERAL UNDER A ``MEFOR_`` NAME (BACKLOG #5547). ``_MEFOR_SECRET``'s plain value takes an
@@ -2079,13 +2082,18 @@ _QUOTED_AFTER_PLACEHOLDER = re.compile(
 # inside it is passed over with it. The run after white space ends at the next placeholder at the
 # latest.
 _MEFOR_VALUE_CLOSER = r"['\"](?=[\s,;:.)\]}|&>^~'\"!/]|\Z)"
-_MEFOR_GLUE = r"(?:\S|[\r\n\x0b\x0c\x1c-\x1f\x85\u2028\u2029])"
+#: A quoted key before a quoted value, which the PHI pass reads a JSON or dict string value by. A
+#: key before any other value is glue, as a later reading of ``_MEFOR_SECRET`` takes it.
+_MEFOR_NOT_A_KEY = r"(?!['\"][\w$-]*+['\"][^\S\r\n]*+:[^\S\r\n]*+['\"])"
+_MEFOR_GLUE = r"(?:" + _MEFOR_NOT_A_KEY + r"(?:\S|[\r\n\x0b\x0c\x1c-\x1f\x85\u2028\u2029]))"
 _MEFOR_GLUED_AFTER_PLACEHOLDER = re.compile(
     r"(\bMEFOR_[A-Z0-9_]++=" + _STAGE_PLACEHOLDER + r")"
-    r"(?:(?=[^\s'\"(){}\[\],;:.])"
+    r"(?:(?=[^\s'\"(){}\[\],;:.]|[\r\n\x0b\x0c\x1c-\x1f\x85  ])"
     r"(?:(?:(?!"
     + _STAGE_PLACEHOLDER
-    + r")[^'\"\r\n]|['\"](?![\s,;:.)\]}|&>^~'\"!/]|\Z))*+"
+    + r")[^'\"\r\n]|"
+    + _MEFOR_NOT_A_KEY
+    + r"['\"](?![\s,;:.)\]}|&>^~'\"!/]|\Z))*+"
     + _MEFOR_VALUE_CLOSER
     + _MEFOR_GLUE
     + r"*+|"
@@ -2100,18 +2108,28 @@ _MEFOR_GLUED_AFTER_PLACEHOLDER = re.compile(
 #: the value the placeholder already stands for, and a second handler or the support bundle then
 #: removed it, which gave back the shortening :func:`scrub_added_shapes` exists not to make. A space
 #: is no label, value, base64, separator or marker character, so it completes no pattern here.
+#: A record break in the span is kept where it stood instead: a log or bundle reader splits a line
+#: there, and a surface that escapes it reads it as the same escape it was.
 _FILL = " "
+#: What ``str.splitlines`` splits at, each kept by :func:`_fill`.
+_FILL_KEPT_BREAK = re.compile(r"([\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]++)")
 #: A later escape may write a backslash or a quote as two characters, as JSON or a repr writes
-#: them, and a character this matches as up to twelve (anything outside printable ASCII: a line break as
-#: ``\\n``, a format character as ``\\u200b``, one past U+FFFF as a JSON surrogate pair).
+#: them, and a character this matches as up to fourteen: anything outside printable ASCII, as a
+#: line break as ``\\n`` or a format character as ``\\u200b``, and one past U+FFFF, which the
+#: control-character escape writes as twelve characters holding two backslashes that a JSON or repr
+#: escape after it doubles.
 _FILL_WIDE = re.compile(r"[^ -~]")
 
 
 def _fill(span: str) -> str:
-    """Spaces at least as wide as ``span`` under any escape a surface applies after the stage."""
+    """Spaces at least as wide as ``span`` under any escape a surface applies after the stage,
+    with each record break kept in its place."""
+    if _FILL_KEPT_BREAK.search(span):
+        pieces = _FILL_KEPT_BREAK.split(span)
+        return "".join(p if i % 2 else _fill(p) for i, p in enumerate(pieces))
     width = len(span) + span.count("\\") + span.count("'") + span.count('"')
     if not (span.isascii() and span.isprintable()):
-        width += 11 * len(_FILL_WIDE.findall(span))
+        width += 13 * len(_FILL_WIDE.findall(span))
     return _FILL * width
 
 
@@ -2133,17 +2151,17 @@ def scrub_added_shapes(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> 
 
     IT NEVER SHORTENS TEXT, AND IT ONLY HIDES MORE. This is the one place that says so. Each span it
     takes is written as spaces after the placeholder already there, or as the placeholder and then
-    spaces, and :func:`_fill` makes those spaces at least as many as the span's characters, and as
+    spaces, a record break in it kept where it stood, and :func:`_fill` makes those spaces at least as many as the span's characters, and as
     wide as the span under any escape a surface applies after this stage: the control-character
-    escape, a JSON or repr escape, or ``controlchars.log_field_token``. So every character of the
-    result sits at or after where its input character stood, and that holds after the escape too.
+    escape, a JSON or repr escape, the control-character escape followed by a JSON or repr one, or
+    ``controlchars.log_field_token``. So every character of the result sits at or after where its
+    input character stood, and that holds after those escapes too.
     A slice or a bound taken after this stage, at any site, keeps no input text the same cut of the
     input kept not, and the stage writes no input text a pass hid. That is a property of one reading.
     A surface that reads its own output again, as a second handler or a bounded log field's settled
     reading does, runs the passes over the spaces, and the comment above the patterns says what that
     can change. What it costs: the spaces show roughly how long the hidden value was,
-    and a value with line breaks or non-ASCII characters widens the line by up to twelve spaces for
-    each. That is accepted, since every alternative either moved later text earlier or needed every
+    and a value with non-ASCII characters widens the line by up to fourteen spaces for each. That is accepted, since every alternative either moved later text earlier or needed every
     cut site to change."""
     if "-----" in text:
 
@@ -2160,11 +2178,13 @@ def scrub_added_shapes(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> 
     if _STAGE_PLACEHOLDERS[0] in text or _STAGE_PLACEHOLDERS[1] in text:
         if "://" in text:
             text = _DSN_AT_IN_PASSWORD.sub(_keep_dsn_host, text)
+        # The MEFOR_ run first: it is taken whole, and spaces another pattern wrote inside it would
+        # end the glue a later reading takes, as its comment says.
+        if "MEFOR_" in text:
+            text = _MEFOR_GLUED_AFTER_PLACEHOLDER.sub(_keep_head, text)
         text = _DIGEST_PARAMS_AFTER_PLACEHOLDER.sub(_keep_head, text)
         text = _PADDED_TOKEN_AFTER_PLACEHOLDER.sub(_keep_head, text)
         text = _QUOTED_AFTER_PLACEHOLDER.sub(_keep_head, text)
-        if "MEFOR_" in text:
-            text = _MEFOR_GLUED_AFTER_PLACEHOLDER.sub(_keep_head, text)
     return text
 
 
