@@ -911,10 +911,8 @@ from typing import Any
 #:
 #: The OIDC start legs' session read: ``AuthService`` gained ``session_shows_signed_in``, a read
 #: that ends no session, which the console's "leaving this site" page and IdP hop call to decide
-#: whether they show Sign-out and the session watchdog. ``identity_for_token`` there ended a
-#: session whose temporary credential lapsed before the callback's supersession could record it.
-#: A method the console calls, so a skew would be an AttributeError at request time. Unnumbered.
-#: Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
+#: whether they show Sign-out and the session watchdog. A method the console calls, so a skew
+#: would be an AttributeError at request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

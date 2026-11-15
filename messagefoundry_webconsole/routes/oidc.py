@@ -350,7 +350,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         )
         if not live and session_token(request):
             # ASVS 14.3.1, as on the login page: a cookie that no longer authenticates is a
-            # terminated session, so its cached pages are dropped wherever it lands.
+            # terminated session, so its cached pages are dropped here.
             resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
         return resp
 
