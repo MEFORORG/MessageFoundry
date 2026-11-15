@@ -5,9 +5,10 @@ graded with a written reason and derived from the code, so a new site of those s
 build until graded.
 
 A file path should come from internally generated or trusted data, or a supplied name should pass a
-named guard before it is joined. This module grades each join it can see, with its command and its
-positive control, and fails when a join of those shapes appears, goes, or changes count in a graded
-function (BACKLOG #1130). It is a drift check, not a proof: see *Not derived* below.
+named guard before it is joined; where neither holds, the row says so with the ``unguarded``
+grade. This module grades each join it can see, with its command and its positive control, and
+fails when a join of those shapes appears, goes, or changes count in a graded function (BACKLOG
+#1130). It is a drift check, not a proof: see *Not derived* below.
 
 **The command.** :func:`derived_python_sites` walks the AST of every ``.py`` file under
 :data:`PY_ROOTS`. A site is any of these:
@@ -55,6 +56,9 @@ owner ruling R3 of 2026-10-02 puts the directory in scope, and R1 of 2026-10-05 
   still there. For TypeScript the guard is a fragment of code that must still be present.
 - ``reviewed``: the path is built only to compare or test for existence, and nothing is opened,
   read, written, moved or deleted through it.
+- ``unguarded``: a part another party may choose is joined with no guard before the join, and the
+  path is used. The row names no guard. Its reason says what bounds the part and what is left open,
+  and cites the BACKLOG row that tracks the gap, which the test checks is cited.
 
 **Not derived, so not proved here:** at least a join spelled as string concatenation (``d + "/" +
 n``) or an f-string that is not passed straight to ``Path`` or ``open``, a ``/`` whose operands carry
@@ -101,7 +105,8 @@ INTERNAL = "internal"
 OPERATOR = "operator"
 GUARDED = "guarded"
 REVIEWED = "reviewed"
-GRADES = frozenset({INTERNAL, OPERATOR, GUARDED, REVIEWED})
+UNGUARDED = "unguarded"
+GRADES = frozenset({INTERNAL, OPERATOR, GUARDED, REVIEWED, UNGUARDED})
 
 
 class Site(NamedTuple):
@@ -447,19 +452,19 @@ SITES: dict[str, Site] = {
     ),
     "harness/sinks/file.py::FileSink._entries": Site(
         1,
-        GUARDED,
+        UNGUARDED,
         "A bare name from listing the sink's directory, which the engine under test writes, or a "
-        "folder under it; a listing name is one component, never `.` or `..`. A folder is entered "
-        "only if `_is_link` reads its `lstat` as no link, but a folder swapped for a link after "
-        "that check is listed and read through the link: an open race, not a containment guard.",
-        "harness/sinks/file.py::_is_link",
-        called=True,
+        "folder under it, joined onto that folder with no check before the join; a listing name is "
+        "one component, never `.` or `..`. A folder is entered only if `_is_link`, after the join, "
+        "reads its `lstat` as not a link. A folder swapped for a link after that check is an open "
+        "race, stated in the `_entries` docstring (BACKLOG #5426).",
     ),
     "harness/sinks/file.py::FileSink._inside": Site(
         1,
         REVIEWED,
         "A listed file's name onto its folder's strict resolution, built only to compare against "
-        "the root; nothing is opened through it. Under the `_entries` race it can read as inside.",
+        "the root; nothing is opened through it. A file read through a folder swapped for a link "
+        "reads as inside only if the folder is swapped back before this check: the `_entries` race.",
     ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
@@ -1168,6 +1173,8 @@ def _guard_problems(graded: dict[str, Site]) -> list[str]:
             problems.append(f"{key}: unknown grade {site.grade!r}")
         if not site.reason.strip():
             problems.append(f"{key}: no reason")
+        if site.grade == UNGUARDED and not re.search(r"BACKLOG #\d+", site.reason):
+            problems.append(f"{key}: graded unguarded but cites no BACKLOG row")
         if site.grade != GUARDED:
             if site.guard or site.called:
                 problems.append(f"{key}: names a guard but is graded {site.grade}")
@@ -1320,6 +1327,8 @@ def test_a_missing_row_and_a_stale_row_are_both_named() -> None:
         (Site(1, INTERNAL, "x", "harness/drivers/file.py::drop_name"), "names a guard"),
         (Site(1, GUARDED, "x", "harness/drivers/file.py::no_such_guard"), "is not defined there"),
         (Site(1, INTERNAL, "x", called=True), "names a guard"),
+        (Site(1, UNGUARDED, "x"), "cites no BACKLOG row"),
+        (Site(1, UNGUARDED, "x BACKLOG #1", "harness/sinks/file.py::_is_link"), "names a guard"),
         (Site(1, GUARDED, "x", "ide/src/newRoute.ts::A-Za-z", called=True), "Python guard only"),
         (Site(1, GUARDED, "x", "ide/src/newRoute.ts::no such fragment"), "is not in the code"),
         # unique_path builds a name but never calls _check_contained; drop_atomic does.
@@ -1343,6 +1352,7 @@ def test_a_bad_grade_is_named(site: Site, expected: str) -> None:
         ),
         ("harness/x.py::f", Site(1, GUARDED, "x", "harness/drivers/file.py::_check_contained")),
         ("ide/src/newRoute.ts", Site(1, GUARDED, "x", "ide/src/newRoute.ts::A-Za-z0-9_-")),
+        ("harness/x.py::f", Site(1, UNGUARDED, "x, an open race (BACKLOG #1)")),
     ],
 )
 def test_a_guard_that_holds_passes(key: str, site: Site) -> None:
