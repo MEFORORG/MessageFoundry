@@ -196,7 +196,7 @@ def enriched_app_state(
 
 
 def client_cert_http_protocol_class(
-    base: type[Any], *, trusted_proxies: Sequence[str] = ()
+    base: type[Any], *, trusted_proxies: Sequence[str]
 ) -> type[asyncio.Protocol]:
     """An HTTP-protocol subclass that stashes the verified peer cert into ``app_state`` post-handshake.
 
@@ -207,15 +207,10 @@ def client_cert_http_protocol_class(
     behaviour is inherited.
 
     ``trusted_proxies`` is ``[api].trusted_proxies``, which ``serve`` passes: a certificate a
-    declared proxy presents is never stashed (:func:`enriched_app_state`, BACKLOG #5628), and that
-    is warned about once here, since a proxy's certificate in the map would then match nothing."""
+    declared proxy presents is never stashed (:func:`enriched_app_state`, BACKLOG #5628). It is
+    required, with no default, so no caller leaves the proxies out by accident. The start
+    WARNING for the pair is ``build_api_ssl_context``'s, logged once logging is configured."""
     proxies = parse_trusted_proxies(trusted_proxies)
-    if proxies:
-        log.warning(
-            "[api].trusted_proxies is set beside [api].tls_client_cert_identities: a client "
-            "certificate presented by a declared proxy maps to no principal, because the proxy "
-            "forwards other callers' requests"
-        )
 
     # Dynamic base class (a `type[Any]` *value*, which mypy cannot check as a static base) — hence
     # the localized ignore, not a blanket one.

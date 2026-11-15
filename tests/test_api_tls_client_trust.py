@@ -161,6 +161,8 @@ class _TwoTier:
     client_key: Path
     revokes_intermediate: Path  # the root's CRL revoking the intermediate, + the intermediate's CRL
     revokes_nothing: Path  # both CRLs, revoking nothing
+    inter_file: Path  # the intermediate alone
+    inter_crl_file: Path  # the intermediate's CRL alone
 
 
 @pytest.fixture(scope="module")
@@ -182,6 +184,8 @@ def two_tier(tmp_path_factory: pytest.TempPathFactory) -> _TwoTier:
         "client-key.pem": _key_pem(leaf_key),
         "revokes-inter.pem": _crl("Client Root", root_key, inter) + inter_crl,
         "revokes-nothing.pem": _crl("Client Root", root_key, None) + inter_crl,
+        "inter.pem": _pem(inter),
+        "inter-crl.pem": inter_crl,
     }
     for name, data in files.items():
         (d / name).write_bytes(data)
@@ -193,6 +197,8 @@ def two_tier(tmp_path_factory: pytest.TempPathFactory) -> _TwoTier:
         d / "client-key.pem",
         d / "revokes-inter.pem",
         d / "revokes-nothing.pem",
+        d / "inter.pem",
+        d / "inter-crl.pem",
     )
 
 
@@ -309,6 +315,24 @@ def test_a_writable_crl_warns_and_loads_under_warn(
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_loaded_intermediate_whose_issuer_has_no_crl_refuses_the_build(
+    two_tier: _TwoTier, tmp_path: Path
+) -> None:
+    """Root and intermediate loaded, only the intermediate's CRL in the file: under the chain
+    check every client would be refused at the handshake, so the build refuses instead."""
+    ca_file = tmp_path / "root-and-inter.pem"
+    ca_file.write_bytes(two_tier.root_file.read_bytes() + two_tier.inter_file.read_bytes())
+    crl_file = tmp_path / "inter-crl-only.pem"
+    crl_file.write_bytes(two_tier.inter_crl_file.read_bytes())
+    settings = _settings(two_tier, crl_file).model_copy(update={"tls_client_ca_file": str(ca_file)})
+    with pytest.raises(ValueError, match="holds no CRL from 'CN=Client Root'"):
+        build_api_ssl_context(settings)
+    # The control: with the root's CRL added, the same CA file builds.
+    crl_file.write_bytes(two_tier.revokes_nothing.read_bytes())
+    build_api_ssl_context(settings)
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
 def test_a_missing_crl_still_refuses_with_its_own_message(
     two_tier: _TwoTier, tmp_path: Path
 ) -> None:
@@ -364,9 +388,7 @@ def test_a_peer_that_cannot_be_placed_counts_as_a_proxy(peer: object) -> None:
     assert not peer_is_trusted_proxy(transport, ())
 
 
-def test_the_shim_class_skips_a_declared_proxys_certificate(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_the_shim_class_skips_a_declared_proxys_certificate() -> None:
     class _Base:
         def __init__(self) -> None:
             self.app_state: dict[str, Any] = {}
@@ -374,9 +396,7 @@ def test_the_shim_class_skips_a_declared_proxys_certificate(
         def connection_made(self, transport: object) -> None:
             pass
 
-    with caplog.at_level(logging.WARNING):
-        cls: Any = client_cert_http_protocol_class(_Base, trusted_proxies=["10.0.0.5"])
-    assert any("[api].trusted_proxies" in r.getMessage() for r in caplog.records)
+    cls: Any = client_cert_http_protocol_class(_Base, trusted_proxies=["10.0.0.5"])
     from_proxy, direct = cls(), cls()
     from_proxy.connection_made(_Transport(("10.0.0.5", 1), _CERT))
     direct.connection_made(_Transport(("10.0.0.6", 1), _CERT))
@@ -384,11 +404,44 @@ def test_the_shim_class_skips_a_declared_proxys_certificate(
     assert MF_CLIENT_PEERCERT_STATE_KEY in direct.app_state
 
 
-def test_serve_must_name_the_proxies_when_it_builds_the_shim() -> None:
+@pytest.mark.parametrize("build", [_client_cert_shim, client_cert_http_protocol_class])
+def test_every_shim_builder_must_be_given_the_proxies(build: Any) -> None:
     """Keyword-only with no default, so a call site that forgot them fails rather than skips."""
-    parameter = inspect.signature(_client_cert_shim).parameters["trusted_proxies"]
+    parameter = inspect.signature(build).parameters["trusted_proxies"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
+
+
+def test_the_resolvers_transport_fallback_skips_a_declared_proxys_certificate() -> None:
+    """The fallback in peer_cert_from_request reads scope['transport'] for a server that puts it
+    there; the proxy rule must hold on that path too."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    from messagefoundry.api.security import peer_cert_from_request
+
+    app = SimpleNamespace(state=SimpleNamespace(trusted_proxies=("10.0.0.5",)))
+    for peer, expected in ((("10.0.0.5", 1), None), (("10.0.0.6", 1), _CERT["subject"])):
+        scope = {"type": "http", "headers": [], "app": app, "transport": _Transport(peer, _CERT)}
+        cert = peer_cert_from_request(Request(scope))
+        assert (cert["subject"] if cert else None) == expected, peer
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_the_proxy_and_cert_map_warning_is_logged_when_the_context_is_built(
+    two_tier: _TwoTier, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Logged by build_api_ssl_context, which serve calls once logging is configured."""
+    settings = _settings(two_tier, two_tier.revokes_nothing).model_copy(
+        update={
+            "tls_client_cert_identities": {"CN=Client Root": {"CN:svc": "0" * 32}},
+            "trusted_proxies": ["10.0.0.5"],
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        build_api_ssl_context(settings)
+    assert any("declared proxy maps to no principal" in r.getMessage() for r in caplog.records)
 
 
 def test_trusted_proxies_parse_to_both_ipv4_spellings() -> None:
@@ -444,6 +497,22 @@ def test_only_client_auth_names_an_issuer_when_it_is_required() -> None:
         assert index.issuer_of(der, require_client_auth=True) == expected, label
         # Not asked for, the extended key usage changes nothing: the other listeners' behaviour.
         assert index.issuer_of(der) == "CN=Service CA", label
+
+
+def test_a_leaf_with_a_duplicated_extension_names_no_issuer_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cryptography raises DuplicateExtension, which is not a ValueError, when it reads a leaf
+    listing one extension twice. issuer_of promises never to raise, so it names no issuer."""
+    ca = _new_ca(_name("Service CA"))
+    index = IssuerIndex(_pem(ca[0]).decode("ascii"))
+    der = _leaf_der(ca, [ExtendedKeyUsageOID.CLIENT_AUTH])
+
+    def _duplicated(_leaf: x509.Certificate) -> bool:
+        raise x509.DuplicateExtension("listed twice", ExtendedKeyUsageOID.CLIENT_AUTH)
+
+    monkeypatch.setattr(pki_module, "_names_client_auth", _duplicated)
+    assert index.issuer_of(der, require_client_auth=True) == ""
 
 
 # --- #5628: the issuer lookup is remembered, and bounded -----------------------------------------------

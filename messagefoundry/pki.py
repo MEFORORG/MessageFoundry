@@ -1215,6 +1215,20 @@ def crl_pem_blocks(pem: bytes) -> list[bytes]:
     return list(_crl_blocks(pem))
 
 
+def cas_without_issuer_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[str, str]]:
+    """Each CA in ``ca_ders`` that is not self-issued and whose issuer signed no CRL in
+    ``crl_pem``, as ``(ca subject, issuer)`` in RFC 4514 form (vault BACKLOG #5627). Under a
+    whole-chain CRL check OpenSSL needs that CRL for every peer under the CA. Raises
+    ``ValueError`` when a certificate or CRL block does not parse."""
+    issuers = {x509.load_pem_x509_crl(block).issuer for block in _crl_blocks(crl_pem)}
+    missing: list[tuple[str, str]] = []
+    for der in ca_ders:
+        ca = x509.load_der_x509_certificate(der)
+        if ca.issuer != ca.subject and ca.issuer not in issuers:
+            missing.append((ca.subject.rfc4514_string(), ca.issuer.rfc4514_string()))
+    return missing
+
+
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
     """Yield each ``X509 CRL`` PEM block in ``pem`` whose BEGIN marker starts a line, in file order.
 
@@ -1756,7 +1770,8 @@ class IssuerIndex:
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
                 if (anchor.ca or anchor.der == leaf_der) and _directly_issued(leaf, anchor.cert)
             ]
-        except _UNREADABLE_CA:
+        except (*_UNREADABLE_CA, x509.DuplicateExtension):
+            # DuplicateExtension: a leaf listing one extension twice, read by _names_client_auth.
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:

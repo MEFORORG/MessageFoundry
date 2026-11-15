@@ -128,6 +128,14 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         ctx.verify_mode = ssl.CERT_REQUIRED
         if api.tls_client_cert_identities:
             _attach_issuer_index(ctx, cadata, api.tls_client_cert_identities)
+            if api.trusted_proxies:
+                # Vault BACKLOG #5628. Here rather than where the shim is built, which is before
+                # serve configures logging, so the line reaches the operator's handlers.
+                log.warning(
+                    "[api].trusted_proxies is set beside [api].tls_client_cert_identities: a client "
+                    "certificate presented by a declared proxy maps to no principal, because the "
+                    "proxy forwards other callers' requests"
+                )
         # Opt-in revocation (#1005). NOTE THE POSITION: harden_verify_flags runs ABOVE, before the
         # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
         # loading it before the CA yields a context with the check flag set and zero CRLs -- which
@@ -142,7 +150,33 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
                 enforced_anchor(crl, enforcing=enforcing)
             # And the whole chain is checked, so a revoked intermediate refuses its clients too.
             harden_crl_check(ctx, crl.path, setting=crl.setting, chain=True)
+            _refuse_a_loaded_ca_without_its_issuers_crl(ctx, crl.path, setting=crl.setting)
     return ctx
+
+
+def _refuse_a_loaded_ca_without_its_issuers_crl(
+    ctx: ssl.SSLContext, crl_file: str, *, setting: str
+) -> None:
+    """Refuse the build when a loaded client CA's issuer has no CRL in ``crl_file`` (vault BACKLOG
+    #5627). With the whole chain checked, OpenSSL needs that CRL for every client under the CA,
+    and refuses each one with ``unable to get certificate CRL`` when it is missing: a context that
+    builds and then refuses every client, which this says at start instead. A self-issued CA is
+    the end of its chain and needs none. An intermediate only the client sends cannot be checked
+    here. Raises ``ValueError`` naming ``setting``."""
+    from messagefoundry.pki import cas_without_issuer_crl
+
+    try:
+        missing = cas_without_issuer_crl(
+            ctx.get_ca_certs(binary_form=True), Path(crl_file).read_bytes()
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{setting} could not be read again after loading: {exc}") from exc
+    for subject, issuer in missing:
+        raise ValueError(
+            f"{setting} holds no CRL from {issuer!r}, the issuer of the loaded client CA "
+            f"{subject!r}. The whole client chain is checked against this file, so every client "
+            "under that CA would be refused. Add that issuer's CRL to the file"
+        )
 
 
 class ApiHandshakeRecord:

@@ -2728,7 +2728,7 @@ class _StubProtocolBase:
 
 
 def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
-    cls = client_cert_http_protocol_class(base=_StubProtocolBase)
+    cls = client_cert_http_protocol_class(base=_StubProtocolBase, trusted_proxies=())
     proto = cls()
     transport = _FakeTransport(_FakeSSL(_peercert("svc.internal")))
     proto.connection_made(transport)  # type: ignore[attr-defined]
@@ -2744,7 +2744,7 @@ def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
 
 
 def test_client_cert_protocol_no_cert_is_byte_identical() -> None:
-    cls = client_cert_http_protocol_class(base=_StubProtocolBase)
+    cls = client_cert_http_protocol_class(base=_StubProtocolBase, trusted_proxies=())
     proto = cls()
     before = proto.app_state  # type: ignore[attr-defined]
     proto.connection_made(_FakeTransport(_FakeSSL({})))  # type: ignore[attr-defined]
