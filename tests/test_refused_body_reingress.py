@@ -15,7 +15,6 @@ import base64
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -293,47 +292,70 @@ async def test_a_reply_holding_the_document_marker_is_refused(store: MessageStor
     assert control_id is not None and message_type is not None
 
 
-def test_a_reply_head_that_will_not_encode_is_a_guard_refusal() -> None:
-    """BACKLOG #5616: a lone surrogate in a text loopback reply's sniffed head is the guard's own
-    ``decode``-phase refusal, not a ``UnicodeEncodeError`` raised past it. The reason carries no
-    character of the body."""
-    from messagefoundry.pipeline.ingress_guards import reingress_body_error
+def test_only_a_reply_no_store_can_bind_is_unstorable() -> None:
+    """BACKLOG #5616: a lone surrogate anywhere in a reply makes it unstorable, and the reason names
+    a position, never the character. ASCII and other encodable text is the control."""
+    from messagefoundry.pipeline.wiring_runner import _unstorable_reply
 
-    for ct in (ContentType.JSON, ContentType.FHIR, ContentType.XML, ContentType.X12):
-        refused = reingress_body_error(_loopback(ct), '{"a": "\udc80"}')
-        assert refused is not None and refused.startswith("encode error (utf-8):"), ct
-        assert "\udc80" not in refused
-    # The control: the same reply with an encodable character is admitted on a JSON loopback.
-    assert reingress_body_error(_loopback(ContentType.JSON), '{"a": "é"}') is None
+    for body in ('{"a": "\udc80"}', '{"abcdefghij": "\udc80"}', "MSH|^~\\&|P\rNTE|1||\udfff\r"):
+        reason = _unstorable_reply(body)
+        assert reason is not None and "surrogates not allowed" in reason, repr(body)
+        assert "\udc80" not in reason and "\udfff" not in reason
+    for body in ("", '{"a": 1}', '{"a": "é中"}'):
+        assert _unstorable_reply(body) is None, repr(body)
 
 
-async def test_a_reply_head_that_will_not_encode_reaches_the_handoff_as_a_refusal(
+async def test_a_reply_no_store_can_hold_is_dead_lettered_and_the_lane_drains(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5616: the re-ingress step hands a lone-surrogate reply to ``ingress_handoff`` as a
-    refusal rather than raising out of the step. No store can capture such a reply (a capture's
-    encode refuses it), so the body read is substituted, and the handoff is recorded rather than
-    run, since the refused child's raw would hold the surrogate too."""
-    from tests._reingress_refused_body_contract import LOOP, _allowance, _runner
+    """BACKLOG #5616: a reply holding a lone surrogate is dead-lettered, its reference kept, and
+    the next reply on the loopback lane still re-ingresses. Before the fix the guards' head sniff
+    raised on it, and a refused child would have held it as its raw and raised in the handoff, so
+    the worker re-pended the token at the lane's head on every pass.
 
-    body = '{"a": "\udc80"}'
-    calls: list[dict[str, Any]] = []
+    No store can capture such a reply, since the capture binds it too, so the body read is
+    substituted for the bad token only."""
+    from messagefoundry.store import OutboxStatus, Stage
+    from messagefoundry.store.store import MessageStore as _Store
+    from tests._reingress_refused_body_contract import DEST, LOOP, RAW, _allowance, _runner
 
-    async def _read(_row_id: str) -> str:
-        return body
+    reply = '{"ack": "synthetic"}'
 
-    async def _handoff(**kwargs: Any) -> bool:
-        calls.append(kwargs)
-        return False
+    async def capture(now: float) -> str:
+        origin = await store.enqueue_message(
+            channel_id="IB_REAL", raw=RAW, deliveries=[(DEST, "q")], now=now
+        )
+        [item] = await store.claim_ready(destination_name=DEST, now=now)
+        await store.complete_with_response(
+            item.id, body=reply, outcome="accepted", reingress_to=LOOP, now=now
+        )
+        return str(origin)
+
+    bad, good = await capture(1.0), await capture(2.0)
+    bad_token = await store.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+    assert bad_token is not None and bad_token.message_id == bad
+    real_read = store.response_body_for_work_row
+
+    async def _read(row_id: str) -> str | None:
+        held = await real_read(row_id)
+        return '{"a": "\udc80"}' if row_id == bad_token.id else held
 
     monkeypatch.setattr(store, "response_body_for_work_row", _read)
-    monkeypatch.setattr(store, "ingress_handoff", _handoff)
     runner = _runner(store, _allowance(10_000), ContentType.JSON)
-    work = SimpleNamespace(id="resp-1", message_id="origin-1")
-    await runner._process_response_item(LOOP, work)  # type: ignore[arg-type]
-    [call] = calls
-    assert call["peek_failed"] is True
-    assert call["peek_error"].startswith("encode error (utf-8):")
+    await runner._process_response_item(LOOP, bad_token)  # the bad head must not raise
+    cur = await store._db.execute("SELECT status, payload FROM queue WHERE id=?", (bad_token.id,))
+    row = await cur.fetchone()
+    assert row is not None and row["status"] == OutboxStatus.DEAD.value and row["payload"]
+    dead = [e for e in await store.events_for(bad) if e["event"] == "dead"]
+    assert [e for e in dead if "unstorable re-ingress reply" in str(e["detail"])]
+    assert all("\udc80" not in str(e["detail"]) for e in dead)
+    # The lane keeps draining: the next reply re-ingresses as a routed child.
+    good_token = await store.claim_next_fifo(LOOP, now=4.0, stage=Stage.RESPONSE.value)
+    assert good_token is not None and good_token.message_id == good
+    await runner._process_response_item(LOOP, good_token)
+    child = await store.get_message(_Store._reingress_message_id(good, DEST, 1, reply))
+    assert child is not None and child["status"] == MessageStatus.RECEIVED.value
+    assert child["raw"] == reply
 
 
 async def test_a_faulting_content_guard_is_recorded_and_the_lane_drains(

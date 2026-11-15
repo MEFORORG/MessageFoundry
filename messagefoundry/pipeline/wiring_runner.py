@@ -1408,12 +1408,29 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
     return f"parse error: peek read failed ({type(exc).__name__})"
 
 
+def _unstorable_reply(body: str) -> str | None:
+    """Why no store can hold ``body``, or ``None`` when one can (BACKLOG #5616). Every backend binds
+    text as UTF-8, so a lone surrogate, which no charset decode yields, is the case. The reason names
+    a position and never the character (``safe_exc``), and is built after the handler ends, so the
+    caught error, whose ``.object`` is the body, is on no chain."""
+    if body.isascii():
+        return None
+    try:
+        body.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        reason = safe_exc(exc)
+    else:
+        return None
+    return reason
+
+
 def _guard_loopback_body(ic: InboundConnection, body: str) -> str | None:
     """:func:`reingress_body_error` inside the read-fault guard :func:`_peek_for_loopback` runs the
-    peek in (BACKLOG #5616). A guard that raises anything but its own refusal would otherwise escape
-    the re-ingress step, so the worker's fault arm re-pends the token at the lane's head on every
-    pass. Here it is a recorded refusal instead, so the reply is an ERROR child and the lane drains.
-    Only the exception TYPE is logged or recorded, as :func:`_peek_read_fault` does."""
+    peek in (BACKLOG #5616): a guard that raises one of :data:`PEEK_READ_FAULTS` instead of its own
+    refusal is a recorded refusal, so the reply is an ERROR child and the lane drains. Outside this
+    guard such a fault escaped the re-ingress step, and the worker's fault arm re-pended the token at
+    the lane's head on every pass. Another exception type still takes the fault arm, as it does from
+    the peek. Only the exception TYPE is logged or recorded, as :func:`_peek_read_fault` does."""
     try:
         return reingress_body_error(ic, body)
     except PEEK_READ_FAULTS as exc:
@@ -11858,6 +11875,21 @@ class RegistryRunner:
             await self.store.dead_letter_now(
                 item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
             )
+            return _ItemOutcome.PROCESSED, None
+        unstorable = _unstorable_reply(body)
+        if unstorable is not None:
+            # BACKLOG #5616: a reply holding a lone surrogate. No backend can bind it, so the guards'
+            # head sniff raised on it, and a refused child would hold it as its raw and raise in the
+            # handoff: either way the fault arm re-pended it at the head of this FIFO lane forever.
+            # Dead-letter the token instead, as the undecryptable arm above does; it keeps its
+            # reference for a replay.
+            log.warning(
+                "response worker %r: reply body of %s cannot be stored (%s); dead-lettering",
+                name,
+                item.id,
+                unstorable,
+            )
+            await self.store.dead_letter_now(item.id, f"unstorable re-ingress reply: {unstorable}")
             return _ItemOutcome.PROCESSED, None
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
