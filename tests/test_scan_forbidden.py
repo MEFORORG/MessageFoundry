@@ -16,9 +16,11 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 
 from __future__ import annotations
 
+import bisect
 import importlib.util
 import io
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -1589,3 +1591,251 @@ def test_an_unquoted_or_second_tag_in_a_run_is_still_a_tag(sf, line: str) -> Non
     """An unquoted value is a value, and a tag the previous split's trailing space reached still
     splits, so neither leaves a version-shaped target in the text as a requirement id."""
     assert sf.scan_pr_body(line) == [], line
+
+
+# --- The baseline: the PR-body scan reports at least what origin/main's did (BACKLOG #5582) -----------
+#
+# The oracle below is origin/main's PR-body reading, copied here verbatim rather than imported from the
+# scanner's own baseline pass, so a later edit to that pass cannot also move the yardstick. It reuses
+# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change.
+
+_MAIN_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+_MAIN_QUOTE = re.compile(r"(?:>\s?)+")
+_MAIN_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+
+
+def _main_pr_units(sf, body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    marks: list[tuple[int, int]] = []
+    parts: list[str] = []
+
+    def flush() -> None:
+        if parts:
+            units.append((list(marks), " ".join(parts), False))
+            marks.clear()
+            parts.clear()
+
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        line = _MAIN_MD_LINK.sub(r"\1", _MAIN_QUOTE.sub("", raw.strip(), count=1).strip())
+        if not line:
+            flush()
+            continue
+        if line.startswith("|") or sf._PR_HEADING.match(line):
+            flush()
+            units.append(([(0, lineno)], line, line.startswith("|")))
+            continue
+        if sf._PR_LIST_ITEM.match(line):
+            flush()
+        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
+        marks.append((offset, lineno))
+        parts.append(line)
+    flush()
+    return units
+
+
+def _main_pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+    if is_row:
+        return [(0, unit)]
+    sentences, start = [], 0
+    for split in _MAIN_SENTENCE_SPLIT.finditer(unit):
+        sentences.append((start, unit[start : split.start()]))
+        start = split.end()
+    sentences.append((start, unit[start:]))
+    return sentences
+
+
+def _main_scan_pr_body(sf, body: str) -> list[str]:
+    hits: list[str] = []
+    units = _main_pr_units(sf, body)
+    asvs_columns: set[int] = set()
+    for index, (marks, unit, is_row) in enumerate(units):
+        if not is_row:
+            asvs_columns = set()
+        elif (
+            not sf._pr_is_delimiter(unit)
+            and index + 1 < len(units)
+            and sf._pr_is_delimiter(units[index + 1][1])
+        ):
+            asvs_columns = sf._pr_asvs_columns(unit)
+        for start, sentence in _main_pr_sentences(unit, is_row):
+            found: dict[str, int] = {}
+            for p in sf._RECORD_PAIR:
+                pair = p.search(sentence)
+                if pair is not None and sf._PR_REQ_ID.search(sentence, pair.start(), pair.end()):
+                    found["verdict"] = pair.start()
+                    break
+            ids = sf._pr_requirement_ids(sentence)
+            evidence = None
+            row_marked = False
+            previous: tuple[int, bool] | None = None
+            pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if asvs_columns else []
+            for m, version in ids:
+                window = (
+                    sentence
+                    if is_row
+                    else sentence[max(0, m.start() - sf._PR_WINDOW) : m.end() + sf._PR_WINDOW]
+                )
+                marked = not version and (
+                    sf._pr_marked(sentence, m)
+                    or (
+                        previous is not None
+                        and previous[1]
+                        and sf._pr_in_list(sentence, previous[0], m)
+                    )
+                    or (
+                        bool(asvs_columns)
+                        and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns
+                    )
+                )
+                previous = (m.end(), marked)
+                row_marked = row_marked or marked
+                if "verdict" not in found and (
+                    sf._pr_verdict_bound(sentence, m, version, marked)
+                    or (not version and not is_row and sf._pr_prose_verdict(window, marked))
+                ):
+                    found["verdict"] = m.start()
+                if version or ("gap" in found and "map" in found):
+                    continue
+                if evidence is None or not is_row:
+                    evidence = sf._pr_evidence(window)
+                gap, marked_gap, code, symbol = evidence
+                if "gap" not in found and (gap or (marked_gap and marked)):
+                    found["gap"] = m.start()
+                if "map" not in found and (code or (symbol and marked)):
+                    found["map"] = m.start()
+            requirement_ids = {m.group(0) for m, version in ids if not version}
+            if (
+                is_row
+                and "verdict" not in found
+                and sf._pr_table_verdict(sentence, requirement_ids, row_marked)
+            ):
+                found["verdict"] = 0
+            for kind in sf.PR_BODY_REASONS:
+                if kind in found:
+                    line = sf._pr_line_at(marks, start + found[kind])
+                    hit = f"pr-body:{line}: {sf.PR_BODY_REASONS[kind]}"
+                    if hit not in hits:
+                        hits.append(hit)
+    return hits
+
+
+#: The shapes the fourth review round found origin/main catching and 6652dd2f missing, by cause: a
+#: target holding parens, an id after a mid-line ``->`` read as a pin, a closing inline tag that no
+#: longer ended the clause, and tags the bounded grammar rejects no longer splitting.
+_MAIN_CAUGHT_BRANCH_MISSED = [
+    pytest.param(
+        f"ASVS {_REQ} is enforced in "
+        "[the guard](https://learn.example.com/x(v=vs.85)/pkg/example_guard.py).",
+        id="paren-target",
+    ),
+    pytest.param(f"Next steps -> {_REQ} has a residual gap", id="arrow-pin"),
+    pytest.param(f"ASVS {_REQ} is met</b> over time", id="closing-inline-tag"),
+    pytest.param(f"ASVS {_REQ} passes</b> through review", id="closing-inline-tag-2"),
+    pytest.param(f"Done<br >{_REQ} has a residual gap", id="space-before-close"),
+    pytest.param(f'Done<p xml:lang="en">{_REQ} has a residual gap', id="colon-attribute"),
+    pytest.param(f'Done<p title="{"x" * 600}">{_REQ} has a residual gap', id="long-value"),
+]
+
+
+@pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
+def test_a_body_origin_main_caught_is_still_caught(sf, body: str) -> None:
+    """Review round 4 on 6652dd2f. The oracle must fire, or the containment asserts nothing."""
+    main_hits = _main_scan_pr_body(sf, body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(body)), body
+
+
+def _harvested_pr_bodies(cap: int) -> list[str]:
+    """Every string a PR-body fixture in this module holds: the module-level lists and every
+    parametrize value. A string over the baseline cap is left out: the property is stated under it,
+    and the oracle is quadratic on the long timing shapes."""
+    found: list[str] = []
+
+    def take(value: object) -> None:
+        if isinstance(value, str):
+            found.append(value)
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                take(v)
+        elif hasattr(value, "values") and hasattr(value, "marks"):  # a pytest.param
+            take(value.values)
+
+    for name, value in list(globals().items()):
+        if name.startswith("_PR_"):
+            take(value)
+        for mark in getattr(value, "pytestmark", []):
+            if mark.name == "parametrize":
+                take(list(mark.args[1]))
+    return [s for s in dict.fromkeys(found) if len(s) <= cap]
+
+
+def _generated_pr_bodies(count: int = 600) -> list[str]:
+    """A seeded corpus of the joins the four misses came from: leads, ids, tags, links and verdicts."""
+    rng = random.Random(5582)
+    leads = [
+        "",
+        "ASVS ",
+        "V",
+        "version ",
+        "Next steps -> ",
+        "Bumps lib to ",
+        "n<max; ",
+        "| ASVS | ",
+    ]
+    joins = [
+        " ",
+        "</b> ",
+        "<b>",
+        "<br >",
+        "<br>",
+        ". ",
+        "\n",
+        "\n\n",
+        "> ",
+        " -> ",
+        "<p a=1>",
+        " | ",
+    ]
+    tails = [
+        f"stays {_PARTIAL}",
+        "is met",
+        "has a residual gap",
+        "is enforced in pkg/example_guard.py",
+        "passes over time",
+        "[guard](a(v=1)/pkg/example_guard.py)",
+        "<code>pkg/example_guard.py</code>",
+        f"| {_PASS} |",
+        "will pass in this PR",
+    ]
+    bodies = []
+    for _ in range(count):
+        parts: list[str] = []
+        for _ in range(rng.randint(1, 3)):
+            ident = rng.choice([_REQ, _REQ_B, "6.1.2"])
+            parts += [rng.choice(leads), ident, rng.choice(joins), rng.choice(tails)]
+            parts.append(rng.choice(joins))
+        bodies.append("".join(parts))
+    return bodies
+
+
+def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf) -> None:
+    """The structural property: the baseline is one pass of the union, so this holds by construction,
+    and the test pins it against an oracle the scanner does not share."""
+    harvested = _harvested_pr_bodies(sf._PR_BASE_CAP)
+    assert len(harvested) > 100, "control: the harvest must find the fixtures, or it proves nothing"
+    fired = 0
+    for body in harvested + _generated_pr_bodies():
+        main_hits = set(_main_scan_pr_body(sf, body))
+        fired += bool(main_hits)
+        missed = main_hits - set(sf.scan_pr_body(body))
+        assert not missed, (body, sorted(missed))
+    assert fired > 100, "control: the oracle must fire on much of the corpus"
+
+
+def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:
+    body = f"ASVS {_REQ} stays {_PARTIAL}, a residual gap in pkg/example_guard.py\n\nx\n\n" * 2
+    hits = sf.scan_pr_body(body)
+    assert len(hits) == len(set(hits)), hits
+    order = list(sf.PR_BODY_REASONS.values())
+    keys = [(int(h.split(":")[1]), order.index(h.split(": ", 1)[1])) for h in hits]
+    assert keys == sorted(keys) and len(keys) == 6, hits

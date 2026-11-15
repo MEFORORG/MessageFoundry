@@ -710,11 +710,25 @@ _PR_INLINE_TAG = re.compile(
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
+#: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
+#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reports at least every hit
+#: that reading reported: the rewrites above found more, and missed some main caught, three review
+#: rounds running. Do not tighten them: a change here is a change to the floor.
+_PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+_PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
+_PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+#: The most of a line, and of a paragraph, the baseline reads. Its link and split patterns are quadratic
+#: on a long run of `[` or of whitespace, so each sees at most this much and the scan stays linear in the
+#: body: about 0.3 s at GitHub's 65,536-character limit, worst shape. Past the cap only the readings
+#: above see the text, so the at-least-main property holds for a line and a paragraph under it.
+_PR_BASE_CAP = 2000
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
     "map": "requirement-to-code map (a requirement id beside a code path)",
 }
+#: Hits on one line sort in this order, so the union of the readings prints the same way every run.
+_PR_REASON_ORDER = {reason: i for i, reason in enumerate(PR_BODY_REASONS.values())}
 
 
 def _pr_inline(line: str, targets: bool) -> str:
@@ -758,6 +772,39 @@ def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, in
         # A line that held only inline tags is transparent, not a paragraph break.
         if unquoted and not line:
             continue
+        if not line:
+            flush()
+            continue
+        if line.startswith("|") or _PR_HEADING.match(line):
+            flush()
+            units.append(([(0, lineno)], line, line.startswith("|")))
+            continue
+        if _PR_LIST_ITEM.match(line):
+            flush()
+        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
+        marks.append((offset, lineno))
+        parts.append(line)
+    flush()
+    return units
+
+
+def _pr_base_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+    """:func:`_pr_units` as origin/main had it, the baseline reading: links read as their text, the
+    first `>` of a line taken out wherever it sits, and every HTML tag left for the split to end a
+    sentence at. Each line and paragraph is cut at ``_PR_BASE_CAP`` (see there)."""
+    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    marks: list[tuple[int, int]] = []
+    parts: list[str] = []
+
+    def flush() -> None:
+        if parts:
+            units.append((list(marks), " ".join(parts)[:_PR_BASE_CAP], False))
+            marks.clear()
+            parts.clear()
+
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        stripped = raw[:_PR_BASE_CAP].strip()
+        line = _PR_BASE_MD_LINK.sub(r"\1", _PR_BASE_QUOTE.sub("", stripped, count=1).strip())
         if not line:
             flush()
             continue
@@ -913,11 +960,13 @@ def _pr_asvs_columns(header: str) -> set[int]:
     }
 
 
-def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+def _pr_sentences(
+    unit: str, is_row: bool, splitter: re.Pattern[str] = _PR_SENTENCE_SPLIT
+) -> list[tuple[int, str]]:
     if is_row:
         return [(0, unit)]
     sentences, start = [], 0
-    for split in _PR_SENTENCE_SPLIT.finditer(unit):
+    for split in splitter.finditer(unit):
         sentences.append((start, unit[start : split.start()]))
         start = split.end()
     sentences.append((start, unit[start:]))
@@ -930,24 +979,32 @@ def scan_pr_body(body: str) -> list[str]:
     Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
     restate a verdict on the same line report it once, rather than storming.
 
-    Read twice: with each link as its text, and with each link's target kept beside it (BACKLOG
-    #5582). The first keeps an identifier beside a verdict its link text sits next to; the second sees
-    a code path that only a target names. Both readings keep every line where it was, so the hits merge.
+    Read three times, and the hits are the union (BACKLOG #5582). The baseline is origin/main's reading
+    (:func:`_pr_base_units`, ``_PR_BASE_SENTENCE_SPLIT``), so no rewrite of the readings below it can
+    report less than it did, on any line and paragraph within ``_PR_BASE_CAP``. The second reads each link as its text and each inline tag as no edge,
+    and the third keeps each link's target beside it, so a code path only a target names is seen. Every
+    reading keeps each line where it was, so the hits merge by (line, kind), sorted by line and then in
+    ``PR_BODY_REASONS`` order.
     """
+    hits = _pr_unit_hits(_pr_base_units(body), _PR_BASE_SENTENCE_SPLIT)
     as_text = _pr_units(body)
-    hits = _pr_unit_hits(as_text)
-    # No link and no tag means no target, so the second reading would only repeat the first.
+    hits += _pr_unit_hits(as_text)
+    # No link and no tag means no target, so the third reading would only repeat the second.
     with_targets = _pr_units(body, targets=True) if "](" in body or "<" in body else as_text
     if with_targets != as_text:
-        # Only a map: the second reading exists so a target's code path counts, and a target's words
+        # Only a map: the third reading exists so a target's code path counts, and a target's words
         # are a URL's, not the body's own verdict or gap.
-        extra = [h for h in _pr_unit_hits(with_targets) if h.endswith(PR_BODY_REASONS["map"])]
-        hits = list(dict.fromkeys(hits + extra))
-        hits.sort(key=lambda h: int(h.split(":", 2)[1]))
-    return hits
+        hits += [h for h in _pr_unit_hits(with_targets) if h.endswith(PR_BODY_REASONS["map"])]
+    return sorted(
+        dict.fromkeys(hits),
+        key=lambda h: (int(h.split(":", 2)[1]), _PR_REASON_ORDER[h.split(": ", 1)[1]]),
+    )
 
 
-def _pr_unit_hits(units: list[tuple[list[tuple[int, int]], str, bool]]) -> list[str]:
+def _pr_unit_hits(
+    units: list[tuple[list[tuple[int, int]], str, bool]],
+    splitter: re.Pattern[str] = _PR_SENTENCE_SPLIT,
+) -> list[str]:
     hits: list[str] = []
     asvs_columns: set[int] = set()
     for index, (marks, unit, is_row) in enumerate(units):
@@ -959,7 +1016,7 @@ def _pr_unit_hits(units: list[tuple[list[tuple[int, int]], str, bool]]) -> list[
             and _pr_is_delimiter(units[index + 1][1])
         ):
             asvs_columns = _pr_asvs_columns(unit)
-        for start, sentence in _pr_sentences(unit, is_row):
+        for start, sentence in _pr_sentences(unit, is_row, splitter):
             found: dict[str, int] = {}
             # The tree scan's tight pair, before the version filter can set its identifier aside: what
             # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
