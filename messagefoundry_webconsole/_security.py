@@ -384,10 +384,9 @@ class UiFetchMetadataMiddleware:
     cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
     what lets them ship without assuming any browser sends fetch metadata -- the version table in
     ``docs/BROWSER-SUPPORT.md`` documents a floor, and nothing enforces it -- and it is exactly what
-    an ABSENCE rule could not claim. A browser can speak only PART of the family; which browsers do,
-    and what that costs, is that table and its ``Sec-Fetch-User`` rows, not restated here (SDS-3.5).
-    Measured
-    2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
+    an ABSENCE rule could not claim. A browser can speak only PART of the family; which browsers do
+    is that table's ``Sec-Fetch-User`` row, and what that costs is the request-header table's, not
+    restated here (SDS-3.5). Measured 2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
     reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
     browser-support decision, not a code change, and it is not taken here.
 
@@ -401,8 +400,10 @@ class UiFetchMetadataMiddleware:
     * It does NOT strip the cookie from a SAME-site request. "Site" ignores the port, so on the
       shipped loopback default ``http://127.0.0.1:9999`` is same-site to the console: a page there can
       script ``window.open`` at a /ui URL and the operator's cookie rides along. ``Sec-Fetch-User``
-      is what separates the operator's own click from that script, and it is safe to demand HERE
-      precisely because no federated-login leg is same-site.
+      is what separates the operator's own click from that script. It was judged safe to demand
+      HERE because a federated-login leg is cross-site, which does NOT hold for an IdP on the same
+      site as the console, such as a sibling subdomain: its redirect back to the callback is then
+      same-site and refused without ``?1`` (``docs/BROWSER-SUPPORT.md``, federated sign-in).
 
     **WHY ``Sec-Fetch-User`` IS NOT DEMANDED ON THE CROSS-SITE HALF, THOUGH IT WOULD LOOK SYMMETRICAL.**
     The IdP's redirect back is a server-driven 302. When the IdP session is already established there
