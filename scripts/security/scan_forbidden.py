@@ -647,11 +647,11 @@ _PR_BARE_HOLD = re.compile(
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
 )
 #: Step 10's false positives: the six bodies engine PR 2893's review named, CI prose and a component
-#: row about HL7 v2.5.1. scan_pr_body compares each, case-sensitively and byte for byte, with the
-#: WHOLE pull request body as given, surrounding whitespace included. Only a body equal to one of them
-#: drops a verdict, and only one an unmarked identifier or an unmarked row binds. Any other body,
-#: however close (another case, a heading, a table header, a quote marker, an indent, a link, a
-#: trailing newline, a second line), keeps every verdict.
+#: row about HL7 v2.5.1. scan_pr_body compares each, case-sensitively and character for character,
+#: with the WHOLE string it is given, surrounding whitespace included. Only for a body equal to one of
+#: them does step 10 drop a verdict, and only one an unmarked identifier or an unmarked row binds.
+#: Step 10 drops nothing from any other body, however close (another case, a heading, a table header,
+#: a quote marker, an indent, a link, a trailing newline, a second line).
 _PR_STEP10_BODIES = frozenset(
     {
         "The row is not failing for 2.5.1 batches.",
@@ -1172,10 +1172,9 @@ def scan_pr_body(body: str) -> list[str]:
     starts = _pr_table_starts(units, blanks, quote_blanks, quoted)
     asvs = _pr_table_columns(units, starts)
     loose = _pr_loose_columns(units, starts)
-    # The raw body as given, not a unit or a rendered reading of it: see _PR_STEP10_BODIES.
     step10 = body in _PR_STEP10_BODIES
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
-        _pr_scan_unit(unit, unit_asvs, unit_loose, step10, found)
+        _pr_scan_unit(unit, unit_asvs, unit_loose, found, step10=step10)
     # Where the body holds an invisible character, it is read again with each one deleted. A unit
     # whose text and columns that leaves unchanged reads the same, so only the others are scanned.
     if _PR_INVISIBLE.search(body) is not None:
@@ -1190,7 +1189,7 @@ def scan_pr_body(body: str) -> list[str]:
             strict=True,
         ):
             if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
-                _pr_scan_unit(unit, unit_asvs, unit_loose, step10, found)
+                _pr_scan_unit(unit, unit_asvs, unit_loose, found, step10=step10)
     # One hit per kind per line, in line order, however many readings found it.
     kinds = list(PR_BODY_REASONS)
     return [f"pr-body:{line}: {PR_BODY_REASONS[kinds[kind]]}" for line, kind in sorted(found)]
@@ -1200,26 +1199,24 @@ def _pr_scan_unit(
     unit: tuple[list[tuple[int, int]], str, bool],
     asvs_columns: set[int],
     loose_columns: set[int],
-    step10: bool,
     hits: set[tuple[int, int]],
+    *,
+    step10: bool,
 ) -> None:
-    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind).
-    ``step10`` says the whole body is one of _PR_STEP10_BODIES."""
+    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
     marks, unit_text, is_row = unit
     for start, sentence in _pr_sentences(unit_text, is_row):
-        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns, step10)
+        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns, step10=step10)
         for kind_index, kind in enumerate(PR_BODY_REASONS):
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
 def _pr_sentence_found(
-    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int], step10: bool
+    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int], *, step10: bool
 ) -> dict[str, list[int]]:
     """Every binding in one sentence of a unit, by kind, as offsets into it.
 
-    ``step10`` says the whole pull request body is one of _PR_STEP10_BODIES. Only then is a verdict
-    dropped, and only one that an identifier the text does not mark binds, or that an unmarked row
-    binds; a marked identifier's verdict, a tight pair's, and every gap and map stay."""
+    ``step10``: the whole body is one of _PR_STEP10_BODIES, whose comment says what that drops."""
     # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
     # earlier identifier bind must not move a hit off the line main reported it at.
     found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}

@@ -1380,8 +1380,8 @@ _PR_STEP10_MUST_FIRE: list[str] = [
     # The last, unrepaired review round on head 28bcdc34ef: an earlier draft matched step 10's shapes
     # as two case-insensitive regular expressions against one rendered unit, so it dropped bodies not
     # among the six. A cross product of the shapes' alternatives, other case, a heading or another
-    # unit around the shape, a table header, a column mark step 9 removes, and rendering (a quote
-    # marker, an indent, a link, a wrapped line, surrounding whitespace).
+    # unit around the shape, and rendering (a quote marker, an indent, a link, a wrapped line,
+    # surrounding whitespace). Its table-header and step 9 bodies are _STEP10_TABLE_CONTEXT_BODIES.
     "The row isn't failing for 2.5.1 batches.",
     "The row is not passing for 2.5.1 batches.",
     "Since 2.5.1 the row isn't failing.",
@@ -1493,27 +1493,36 @@ def test_step_ten_drops_exactly_the_six_named_bodies(sf) -> None:
     assert len(set(_STEP10_QUIET_BODIES)) == 6
 
 
-@pytest.mark.parametrize("body", _STEP10_QUIET_BODIES)
-def test_step_ten_keeps_mains_hits_on_any_edit_of_a_named_body(sf, sf_frozen_main, body) -> None:
-    """A one-step edit of a named body (case, a lead or trailing character, a quote marker, an
-    indent, a second line) is another body, so it keeps every hit main reports."""
-    edits = {
-        body.lower(),
-        body.upper(),
-        body.swapcase(),
-        f" {body}",
-        f"{body} ",
-        f"{body}\n",
-        f"\n{body}",
-        f"> {body}",
-        f"    {body}",
-        f"{body}\n\nMore.",
-        f"Intro.\n\n{body}",
-    } - {body}
-    for edit in sorted(edits):
-        main_hits = set(sf_frozen_main.scan_pr_body(edit))
-        assert main_hits, edit
-        assert main_hits <= set(sf.scan_pr_body(edit)), edit
+#: One-step edits of each named body: case, a lead or trailing character, a quote marker, an indent,
+#: a second paragraph.
+_STEP10_EDITS = sorted(
+    {
+        edit
+        for body in _STEP10_QUIET_BODIES
+        for edit in (
+            body.lower(),
+            body.upper(),
+            body.swapcase(),
+            f" {body}",
+            f"{body} ",
+            f"{body}\n",
+            f"\n{body}",
+            f"> {body}",
+            f"    {body}",
+            f"{body}\n\nMore.",
+            f"Intro.\n\n{body}",
+        )
+    }
+    - set(_STEP10_QUIET_BODIES)
+)
+
+
+@pytest.mark.parametrize("edit", _STEP10_EDITS)
+def test_step_ten_keeps_mains_hits_on_an_edit_of_a_named_body(sf, sf_frozen_main, edit) -> None:
+    """An edit of a named body is another body, so it keeps every hit main reports."""
+    main_hits = set(sf_frozen_main.scan_pr_body(edit))
+    assert main_hits, edit
+    assert main_hits <= set(sf.scan_pr_body(edit)), edit
 
 
 @pytest.mark.parametrize("body", _STEP10_TABLE_CONTEXT_BODIES)
