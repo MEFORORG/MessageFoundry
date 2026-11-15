@@ -1409,19 +1409,18 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
 
 
 def _unstorable_reply(body: str) -> str | None:
-    """Why no store can hold ``body``, or ``None`` when one can (BACKLOG #5616). Every backend binds
-    text as UTF-8, so a lone surrogate, which no charset decode yields, is the case. The reason names
-    a position and never the character (``safe_exc``), and is built after the handler ends, so the
-    caught error, whose ``.object`` is the body, is on no chain."""
+    """Why ``body`` cannot be written as strict UTF-8, or ``None`` when it can (BACKLOG #5616): it
+    holds a lone surrogate, which no charset decode yields. At least the SQLite store and every
+    keyed store's cipher write text that way, and the re-ingress handoff writes the reply as a
+    child's raw. The reason names a position and never the character (``safe_exc``). The trial
+    encode is a C-speed pass, skipped for an ASCII body, and nothing is raised from the handler."""
     if body.isascii():
         return None
     try:
         body.encode("utf-8")
     except UnicodeEncodeError as exc:
-        reason = safe_exc(exc)
-    else:
-        return None
-    return reason
+        return safe_exc(exc)
+    return None
 
 
 def _guard_loopback_body(ic: InboundConnection, body: str) -> str | None:
@@ -11878,11 +11877,13 @@ class RegistryRunner:
             return _ItemOutcome.PROCESSED, None
         unstorable = _unstorable_reply(body)
         if unstorable is not None:
-            # BACKLOG #5616: a reply holding a lone surrogate. No backend can bind it, so the guards'
-            # head sniff raised on it, and a refused child would hold it as its raw and raise in the
-            # handoff: either way the fault arm re-pended it at the head of this FIFO lane forever.
-            # Dead-letter the token instead, as the undecryptable arm above does; it keeps its
-            # reference for a replay.
+            # BACKLOG #5616: a reply holding a lone surrogate. The guards' head sniff raised on one in
+            # the first characters of a text reply, and a refused child holds the reply (or its
+            # head) as its raw, which the handoff then fails to write. Either fault re-pended the
+            # token at the head of this FIFO lane on every pass. Checked before the size ceiling for
+            # that reason: an oversize refusal stores the head. Dead-letter the token instead, as
+            # the undecryptable arm above does; it keeps its reference for a replay, and the origin
+            # finalizes as that arm leaves it.
             log.warning(
                 "response worker %r: reply body of %s cannot be stored (%s); dead-lettering",
                 name,

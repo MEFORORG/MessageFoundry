@@ -349,6 +349,9 @@ async def test_a_reply_no_store_can_hold_is_dead_lettered_and_the_lane_drains(
     dead = [e for e in await store.events_for(bad) if e["event"] == "dead"]
     assert [e for e in dead if "unstorable re-ingress reply" in str(e["detail"])]
     assert all("\udc80" not in str(e["detail"]) for e in dead)
+    # The origin finalizes ERROR, as the undecryptable-reply arm (#4995) leaves it.
+    origin = await store.get_message(bad)
+    assert origin is not None and origin["status"] == MessageStatus.ERROR.value
     # The lane keeps draining: the next reply re-ingresses as a routed child.
     good_token = await store.claim_next_fifo(LOOP, now=4.0, stage=Stage.RESPONSE.value)
     assert good_token is not None and good_token.message_id == good
@@ -361,8 +364,9 @@ async def test_a_reply_no_store_can_hold_is_dead_lettered_and_the_lane_drains(
 async def test_a_faulting_content_guard_is_recorded_and_the_lane_drains(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5616: a content guard that raises anything but its own refusal is recorded as an
-    ERROR child, with only the fault's type, so the next reply on the loopback lane still
+    """BACKLOG #5616: a content guard that raises a read fault (``PEEK_READ_FAULTS``) instead of its
+    own refusal is recorded as an ERROR child, with only the fault's type, so the next reply on the
+    loopback lane still
     re-ingresses. Before the fix the fault escaped the re-ingress step, and the worker re-pended the
     token at the lane's head on every pass."""
     from messagefoundry.pipeline import wiring_runner

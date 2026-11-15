@@ -1993,7 +1993,11 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
-    ) -> ConnectionMetrics: ...
+    ) -> ConnectionMetrics:
+        """Per-channel inbound and per-(channel_id, destination_name) outbound aggregates for the
+        connections dashboard. A pass-through marker is not a delivery, so it is in no destination's
+        aggregate (BACKLOG #5614)."""
+        ...
 
     async def delivery_latency_histogram(
         self, *, buckets: Sequence[float], now: float | None = None
