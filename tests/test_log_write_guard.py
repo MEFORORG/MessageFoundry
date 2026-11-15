@@ -249,12 +249,16 @@ def _flap(handler: GuardedFileHandler, clock: _FakeClock, *, rolls: int, every: 
 
 
 def _guard_on(
-    clock: _FakeClock, monkeypatch: pytest.MonkeyPatch, *, probe: Callable[[], None] | None = None
+    clock: _FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    probe: Callable[[], None] | None = None,
+    check: Callable[[], None] | None = None,
 ) -> tuple[LogWriteGuard, list[LogSinkEvent]]:
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
-    guard.register("file", probe=probe)
+    guard.register("file", probe=probe, check=check)
     guard.set_escalation(events.append)
     return guard, events
 
@@ -448,14 +452,21 @@ def test_revalidating_a_latched_sink_does_not_reset_the_bound(
 ) -> None:
     # Rolls at 0 to 5 s trip the bound at 5 s. The roll at 62 s is a heal to the bound (its window
     # started at 0 s) and the latch holds the sink. A revalidate at 63 s, as a runner restart or an
-    # operator recovery runs it, probes the sink and the probe lands, which releases the latch. Rolls
+    # operator recovery runs it, checks the sink and the check lands, which releases the latch. Rolls
     # at 64 to 68 s are then the sixth roll of the bound's window that began at 62 s, so the bound
-    # trips at 68 s and asks for the stop, as it does on main, where nothing was latched to probe.
-    # NEGATIVE CONTROL: at 696bd10b2 the revalidate called record_healthy on the latched sink, which
-    # reset the bound's window and streak, and no stop was asked for at 68 s.
+    # trips at 68 s and asks for the stop, as it does on main, where nothing was latched to check.
+    # NEGATIVE CONTROL: on the previous attempt at this item (branch qsm-b264-wa3-guard-actions) the
+    # revalidate called record_healthy on the latched sink, which reset the bound's window and
+    # streak, and no stop was asked for at 68 s.
     clock = _FakeClock()
     probed: list[float] = []
-    guard, events = _guard_on(clock, monkeypatch, probe=lambda: probed.append(clock.now))
+    checked: list[float] = []
+    guard, events = _guard_on(
+        clock,
+        monkeypatch,
+        probe=lambda: probed.append(clock.now),
+        check=lambda: checked.append(clock.now),
+    )
     _roll(guard, clock, 0, 1, 2, 3, 4, 5)
     assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
     _roll(guard, clock, 62)
@@ -463,7 +474,8 @@ def test_revalidating_a_latched_sink_does_not_reset_the_bound(
 
     _at(clock, 63)
     assert guard.revalidate() is True
-    assert probed == [1063.0]
+    # The rolling probe is for a sink whose own state is unwritable; this one gets the check.
+    assert (probed, checked) == ([], [1063.0])
     assert guard.status()[0].state == "rolled"
     paged = len(events)
 
@@ -475,23 +487,96 @@ def test_revalidating_a_latched_sink_does_not_reset_the_bound(
     assert guard.can_log() is False
 
 
-def test_a_latched_sink_whose_probe_fails_stays_unwritable(
+def test_a_latched_sink_whose_check_fails_stays_unwritable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The latch is released only by a record that LANDED. A probe that raises leaves the sink held,
-    # and a sink registered with no probe at all cannot be asked, so it stays held too.
+    # The latch is released only by a record that LANDED. A check that raises leaves the sink held,
+    # and a sink registered with no check cannot be asked, so it stays held too, even beside a probe
+    # that would land: the probe is the rolling one, which this sink must not get.
     def refuse() -> None:
         raise OSError("still broken")
 
-    for probe in (refuse, None):
+    for check in (refuse, None):
         clock = _FakeClock()
-        guard, _events = _guard_on(clock, monkeypatch, probe=probe)
+        guard, _events = _guard_on(clock, monkeypatch, probe=lambda: None, check=check)
         _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
 
         _at(clock, 63)
         assert guard.revalidate() is False
         assert guard.status()[0].state == "unwritable"
         assert guard.can_log() is False
+
+
+def test_a_failed_check_refreshes_the_latch_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A check that fails at 100 s is a failure seen 25 s before the roll at 125 s, so that roll is
+    # not after a quiet minute and the latch holds. NEGATIVE CONTROL: with the clock left at the
+    # 62 s roll, the roll at 125 s is 63 s later and releases the latch.
+    def refuse() -> None:
+        raise OSError("still broken")
+
+    clock = _FakeClock()
+    guard, _events = _guard_on(clock, monkeypatch, check=refuse)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
+    _at(clock, 100)
+    assert guard.revalidate() is False
+    _roll(guard, clock, 125)
+
+    assert guard.status()[0].state == "unwritable"
+
+
+def test_a_check_does_not_release_a_latch_a_newer_roll_moved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The check runs outside the guard's lock. A roll on another thread while it runs is newer
+    # evidence than the check, so the check's answer is dropped and the latch the roll set stands.
+    # NEGATIVE CONTROL: an unconditional release after the check lands reads ``rolled`` here.
+    clock = _FakeClock()
+
+    def check_while_the_sink_rolls_again() -> None:
+        _roll(guard, clock, 64)
+
+    guard, _events = _guard_on(clock, monkeypatch, check=check_while_the_sink_rolls_again)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
+    _at(clock, 63)
+
+    assert guard.revalidate() is False
+    assert guard.status()[0].state == "unwritable"
+
+
+def test_checking_a_latched_sink_never_heals_its_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real handler, so the check is the one GuardedFileHandler registers. Rolls at 0 to 5 s trip
+    # the bound; rolls at 62 to 66 s are the first five of a fresh window, and the latch holds the
+    # sink. Its handle then breaks, a revalidate runs at 66.5 s, and the next record at 67 s meets
+    # the broken handle and rolls: the sixth roll of the window, so the bound trips and asks for the
+    # stop, as on main, where nothing checked the sink. NEGATIVE CONTROL: a revalidate that gave this
+    # sink the rolling probe healed the handle at 66.5 s, so the record at 67 s wrote cleanly, the
+    # bound never counted a sixth roll, and the sink read ``rolled`` with no stop.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+
+    for t in (0, 1, 2, 3, 4, 5, 62, 63, 64, 65, 66):
+        _at(clock, t)
+        _break_the_open_handle(handler)
+        handler.emit(_record("break"))
+    assert guard.status()[0].state == "unwritable"
+    stops = sum(e.stop_requested for e in events)
+
+    _break_the_open_handle(handler)
+    _at(clock, 66.5)
+    assert guard.revalidate() is False
+    _at(clock, 67)
+    handler.emit(_record("break"))
+
+    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    assert sum(e.stop_requested for e in events) == stops + 1
+    assert guard.status()[0].state == "unwritable"
+    assert guard.can_log() is False
 
 
 def test_the_flap_bound_does_not_fire_on_an_ordinary_transient(tmp_path: Path) -> None:
