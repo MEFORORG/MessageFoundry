@@ -944,9 +944,10 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     ``subject`` is ``held`` when the list sends nothing, the one held handle it delivers when the live
     ``MsgSend`` statements deliver exactly one, and empty otherwise. Two held handles are two trees in
     Corepoint, and folding both onto one ``msg`` would put a write meant for one into the other's send.
-    An empty subject means **every**
-    path-bearing statement in the list degrades to a TODO — the honest output, because a
-    cross-message write rendered as ``msg.set`` silently mutates the wrong message. A ``MsgSend`` of
+    An empty subject means :func:`_map_roles` maps no path-bearing statement, so each one it reads
+    degrades to a TODO — the honest output, because a cross-message write rendered as ``msg.set``
+    silently mutates the wrong message. A write that takes the flat reading is not gated by the
+    subject (ADR 0086 §2(b″)). A ``MsgSend`` of
     anything outside ``held`` is refused by :func:`_send_refusal` (BACKLOG #313).
 
     A ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) names no handle, so

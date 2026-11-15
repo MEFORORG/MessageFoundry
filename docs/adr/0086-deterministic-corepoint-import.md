@@ -200,10 +200,7 @@ handler keeps its `sends` list, so the handler neither filters silently nor gain
 `messagefoundry check` reports that outbound as unreferenced until someone finishes the send, which
 is accurate. The summary counts the statement as unmapped.
 
-Field writes map onto `msg` only for the one handle the list delivers. A list that delivers two
-different handles maps no field write at all. That holds for role-parsed writes only. A write that
-takes the flat reading is not gated by handle: `ItemClear %OUT/PID-19`, read flat, still writes
-`msg` (the first gap below).
+For a field write that takes the flat reading, see the second gap below.
 
 At least these gaps remain:
 
@@ -218,6 +215,11 @@ At least these gaps remain:
   semicolon included. There a `MsgSend` is refused like a send of an unknown handle, a field write
   the flat reading would map is left unmapped, and the handle scan counts the send as a delivery of
   no known handle and a `MsgTreeCopy` as holding nothing.
+- A field write that takes the flat reading passes neither the handle gate nor the write gates
+  that a role-parsed write takes. The flat reading keeps only a path's leaf, so the handle it
+  names is dropped: `ItemClear %OUT/PID-19`, read flat, writes `msg`, even in a list that delivers
+  two handles. A flat write to `MSH-2`, or to a field of a repeating segment such as `OBX-5`, also
+  maps onto `msg`; a role-parsed write to either is left unmapped.
 - The handle scan does not see statement order or branches. A send that runs before its clone is
   made, or a clone made on one branch only, still counts as `msg`.
 
