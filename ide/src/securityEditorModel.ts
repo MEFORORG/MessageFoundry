@@ -70,13 +70,18 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  * 2. Workspace-set value (`scope.fromWorkspace` true: the workspace's own settings, which a
  *    repository's `.vscode/settings.json` can set): the path, as spelled, must lie inside the
  *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
- *    refused. Then every existing path below the workspace folder, down to the target, must lstat as
+ *    refused. On Windows, a path whose folder or file name below the workspace folder ends in a dot
+ *    or a space is refused before any file-system call: Node reads such a name as written, while
+ *    the CLI's open strips the dot or space and opens another entry. Then every existing path below
+ *    the workspace folder, down to the target, must lstat as
  *    not a link, a dangling one included; the walk stops at the first that does not exist. The
  *    deepest existing one must then realpath to the folder's own realpath joined with the same
  *    parts, because lstat does not report every reparse point as a link, at least not a junction
  *    onto a volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error,
  *    refuses. An 8.3 short name below the folder is refused too, since realpath spells it in full.
- *    The workspace folder itself may be reached through a link: the repository cannot make it one.
+ *    The workspace folder the operator opened, or trusted, is taken as given and is not checked: it
+ *    may be a link, and a repository's `.code-workspace` file can choose it, since the workspace
+ *    folder used is the first in `folders`.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
  *    is refused. Otherwise it is accepted as written, with no file-system call.
@@ -116,6 +121,14 @@ export function securityConfigTarget(
       };
     }
     return { ok: true, path: target };
+  }
+  if (path.sep === "\\" && rel.split(path.sep).some((part) => part.endsWith(".") || part.endsWith(" "))) {
+    return {
+      ok: false,
+      problem:
+        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that ends in " +
+        "a dot or a space, which Windows reads as a different name. Remove the trailing dot or space",
+    };
   }
   if (!noLinkBelow(root, rel, fsx)) {
     return {

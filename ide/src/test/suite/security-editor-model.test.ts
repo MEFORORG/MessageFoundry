@@ -190,6 +190,26 @@ suite("security editor host checks", () => {
     }
   });
 
+  test("on Windows, a component ending in a dot or a space is refused before any file-system call", function () {
+    // Node reads such a component verbatim and finds nothing, while the CLI's open strips the dot
+    // or space and follows a link the repository holds (round 2 review, finding 1).
+    if (process.platform !== "win32") {
+      this.skip();
+    }
+    const root = path.resolve(path.sep, "mf-secedit-model", "ws");
+    const plain = { [root]: "plain", [path.join(root, "linked")]: "link" };
+    for (const fromWorkspace of [true, false]) {
+      const scope = { fromWorkspace, trusted: true };
+      // THE CONTROL: the same names with nothing trailing pass the spelling check.
+      assert.ok(securityConfigTarget(root, "conf\\messagefoundry.toml", scope, modelFs(plain)).ok);
+      for (const setting of ["linked.\\messagefoundry.toml", "linked \\messagefoundry.toml", "conf\\messagefoundry.toml.", "conf\\messagefoundry.toml "]) {
+        const spy = modelFs(plain);
+        assert.strictEqual(securityConfigTarget(root, setting, scope, spy).ok, false, `${JSON.stringify(setting)} ${fromWorkspace}`);
+        assert.deepStrictEqual(spy.calls, [], `${JSON.stringify(setting)} touched the file system`);
+      }
+    }
+  });
+
   test("rule 2: an lstat error other than not-found refuses, and not-found ends the walk", () => {
     const root = path.resolve(path.sep, "mf-secedit-model", "ws");
     const setting = path.join("conf", "messagefoundry.toml");
@@ -228,9 +248,11 @@ suite("security editor host checks", () => {
     }
   });
 
-  test("the open limit: a user-set alias into the workspace folder is accepted as written", function () {
-    // Rule 3 compares spellings only. This pins the documented limit: an alias outside the folder
-    // that leads into it, and then out through a link the repository holds, is not caught.
+  test("known open limit, recorded and not desired: a user-set alias into the workspace folder is not checked", function () {
+    // This records a KNOWN OPEN LIMIT, not a wanted outcome. Rule 3 compares spellings only, so an
+    // alias outside the folder that leads into it, and then out through a link the repository
+    // holds, is not caught; the securityConfigTarget docblock documents it. A change that closes
+    // the limit should replace this assertion with a refusal, not be reverted to keep it green.
     const alias = path.join(outside, "alias");
     try {
       fs.symlinkSync(ws, alias, "junction");
@@ -239,6 +261,7 @@ suite("security editor host checks", () => {
       this.skip();
     }
     const file = path.join(alias, "linked", "messagefoundry.toml");
+    // The documented behaviour today: returned as written, with no link check.
     assert.deepStrictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, real), { ok: true, path: file });
     // The same path set in workspace settings is still refused, as it is outside the folder as spelled.
     assert.strictEqual(securityConfigTarget(ws, file, { fromWorkspace: true, trusted: true }, real).ok, false);
