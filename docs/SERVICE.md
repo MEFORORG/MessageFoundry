@@ -801,40 +801,67 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the edited file, except for code sets, whose lock file sits in the config directory, above
     `codesets`. The config guard does not check the lock file. When the editor's account is
     LocalService (`S-1-5-19`) or NetworkService (`S-1-5-20`), the guard refuses the folder the
-    editor wrote into and the file it left, because other services share that SID (ADR 0036 Amendment
-    E). Before that amendment, self-trust passed both. The guard checks the config directory
-    ahead of `codesets`, and each folder ahead of the files in it, so a load names the first
-    refused folder: at start, or in the engine log on a `/config/reload`, whose caller gets only
-    `422 invalid configuration`. Where the folder grants the shared account write directly, the
+    editor wrote into and the file it left, because other services share that SID (ADR 0036
+    Amendment E). Before that amendment, self-trust passed both. A config load checks the config
+    directory first and `codesets` with its tables last, and stops at the first path it refuses:
+    at start, or in the engine log on a `/config/reload`, whose caller gets only `422 invalid
+    configuration`. For each path the guard reports the first entry it refuses outright, ahead of
+    the owner, so the messages below appear only where no other entry on that path is refused
+    first. Where another account owns the path and an entry grants the shared account write, the
     message has this shape:
     ```text
     refusing to load config from writable-by-others path D:\hl7\config: the account the engine runs as (S-1-5-19) has write access, but other services share that identity, so it is not trusted as the engine's own; see docs/SERVICE.md for required permissions
     ```
-    - The `connection` editor validates an edit by loading the directory, so it refuses the edit
-      with that message before it replaces `connections.toml`. By then it has already created the
-      lock file, if that was absent.
-    - A `codeset upsert` does not run this check, so it completes. Creating an absent lock file or
-      an absent `codesets` folder needs write on the config directory, and the guard refuses a
-      config directory the shared account can write, so the next load names the config directory
-      first. A `codesets` folder the editor created is owned by its account, so once the config
-      directory is fixed, the load refuses that folder on the owner check (`the owner
-      (S-1-5-19) is the account the engine runs as, but other services share that identity,
-      ...`), not with the message above. With both already in place, the next load refuses the `codesets` folder, then the table.
+    Where the shared account owns the path, its own entry passes and the owner check refuses the
+    path instead, with the reason `the owner (S-1-5-19) is the account the engine runs as, but
+    other services share that identity, so it can rewrite the code this loader executes`.
+    - Where its account can create the lock file and its candidate in the config directory and
+      read `connections.toml`, the `connection` editor validates an edit by loading the directory,
+      so it refuses the edit with the config directory's refusal before it replaces
+      `connections.toml`. By then it has already created the lock file, if that was absent.
+      Otherwise the file system refuses the edit first.
+    - A `codeset upsert` does not run this check. It creates an absent `codesets` folder, then
+      takes its lock, creating an absent lock file. Both are created in the config directory, so
+      where either is absent and the editor's account cannot create it there, the upsert is
+      refused at that step, having written nothing, or only the `codesets` folder when the lock
+      file was the step refused. Otherwise it writes the table where its account can replace a
+      file in `codesets`; where it cannot, it is refused there, leaving any `codesets` folder or
+      lock file it created. The next load refuses the first path it reaches that the shared
+      account can write or owns; of the paths the upsert touched, the config directory comes
+      first, then `codesets`, then the table. Once no folder entry grants the shared account write,
+      the section's `/setowner ... /T /C` gives every path an administrator owner, but a table the
+      editor wrote is still refused: with the message above naming the table where `_secure_file`
+      granted that table to the shared account (below), and otherwise as one whose owner and DACL
+      could not be read.
     - The `alert` and `security` editors write the settings file, which `serve` vets at start
       ahead of its folder. The next start prints a refusal of that file, such as `error: refusing
-      to start from writable-by-others path <settings file>: the owner (S-1-5-19) is the account
-      the engine runs as, but other services share that identity, ...`, and, once that file is
-      fixed, a refusal of its folder.
+      to start from writable-by-others path <settings file>: ` followed by the owner reason above,
+      and, once that file is fixed, a refusal of its folder.
 
     The refusal is deliberate, and it stays (owner ruling 2026-11-15). The remedy is an engine
     account that is its own: the installer's default per-service virtual account, or a dedicated
     local account or gMSA passed with `-ServiceAccount`. *Restrict the service token* above
     records that no run has exercised a named account, and that the installer's read-back refuses
     the `HOST\user` spelling today (BACKLOG #3938). Keep the config folders read-only to that
-    account, as `-LockConfigDir` sets them. That remedy clears this refusal. It does not make an
-    editor run under another account safe to use: `store._secure_file` would leave the edited file
-    granting only the account that ran the editor, so the engine's inherited read would be gone.
-    That gap is not settled here.
+    account, as `-LockConfigDir` sets them. The lockdown removes inherited entries but replaces
+    explicit ones only for SYSTEM, Administrators and the run-as account, so remove an explicit
+    grant to the shared account from each folder too, for example `icacls "D:\hl7\config"
+    /remove:g *S-1-5-19`. Nor does the lockdown replace the protected access list
+    `store._secure_file` gives each file an editor writes, at least a code-set table, the settings
+    file and `connections.toml`. That list grants full control to SYSTEM, Administrators, OWNER
+    RIGHTS and the account `store._current_user` names, which it reads from environment
+    variables, not the process token. Where that last grant fails, `_secure_file` logs a warning
+    and the file keeps the other three, which its folder's grants do not reach either. So the new
+    engine account cannot read a file still under that list: a load refuses such a code-set table
+    or `connections.toml` as one whose owner and DACL could not be read (Win32 error 5), and
+    `serve` cannot open such a settings file and stops with `error:` before its start check. Once
+    an administrator owns such a file, run `icacls "<file>" /reset`, which drops the list and has
+    the file inherit its folder's grants. The lockdown's owner step, run at install time with
+    `/C`, made an administrator the owner of what each folder it locks then held, less any file
+    `/C` skipped. For a file written since, one it skipped, or one in a folder it did not lock,
+    run `icacls "<file>" /setowner "*S-1-5-32-544"` first. The same `_secure_file` step means an
+    editor run under any other account would leave the edited file with no grant to the engine's
+    account, so the engine's inherited read would be gone. That gap is not settled here.
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
