@@ -506,6 +506,9 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   // Only a repository with no commits yet gets a baseline. In one with history, staging the whole
   // tree would sweep the user's work in progress into a commit named "Initial commit".
   if ((await git(bin, ["rev-parse", "--verify", "-q", "HEAD"], ws)).code === 0) {
+    void vscode.window.showInformationMessage(
+      "MessageFoundry: this repository already has commits, so no baseline commit was made. Review and commit .gitignore, .gitattributes and .mefor-hooks/pre-commit yourself.",
+    );
     return;
   }
   const pick = await vscode.window.showInformationMessage(

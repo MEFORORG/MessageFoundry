@@ -291,7 +291,8 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     }
   });
 
-  test("a Cancel at the baseline prompt leaves nothing staged (BACKLOG #5413)", async () => {
+  // Only the tree-wide stage is absent: scaffoldHook stages its own two files before any prompt.
+  test("a Cancel at the baseline prompt stages no tree (BACKLOG #5413)", async () => {
     baselineAnswer = "Cancel";
     await sc.setupSourceControl({} as never);
     const runs = launches();

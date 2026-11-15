@@ -19,6 +19,8 @@ suite("Source-control setup ignores the engine's minted secrets (BACKLOG #5413)"
       "api-generated-key.pem.renewing",
       "api-generated-cert.pem.renewing",
       "bootstrap-admin.txt",
+      "master.key",
+      "handoff.key",
       ".env",
       ".env.*",
     ]) {
@@ -54,15 +56,25 @@ suite("Source-control setup ignores the engine's minted secrets (BACKLOG #5413)"
       this.skip();
     }
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), "mf-gitignore-"));
+    // No global or system config, so a user-level excludes file ignoring `*.pem` cannot pass this.
+    const emptyConfig = path.join(ws, "..", `${path.basename(ws)}.gitconfig`);
+    fs.writeFileSync(emptyConfig, "");
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: emptyConfig,
+      GIT_CONFIG_NOSYSTEM: "1",
+      // core.excludesFile defaults to $XDG_CONFIG_HOME/git/ignore; point it at nothing.
+      XDG_CONFIG_HOME: path.join(ws, ".no-xdg"),
+    };
     try {
-      assert.strictEqual(childProcess.spawnSync("git", ["init", "-q"], { cwd: ws }).status, 0);
+      assert.strictEqual(childProcess.spawnSync("git", ["init", "-q"], { cwd: ws, env }).status, 0);
       fs.writeFileSync(path.join(ws, ".gitignore"), `${GITIGNORE_ENTRIES.join("\n")}\n`);
       fs.writeFileSync(path.join(ws, "api-generated-key.pem"), "not a real key\n");
       fs.writeFileSync(path.join(ws, "feed.py"), "# a config module\n");
       const res = childProcess.spawnSync(
         "git",
         ["ls-files", "--others", "--exclude-standard"],
-        { cwd: ws, encoding: "utf8" },
+        { cwd: ws, env, encoding: "utf8" },
       );
       const untracked = res.stdout.split(/\r?\n/).filter(Boolean);
       // The control: the config module IS stageable, so an empty list cannot pass this test.
@@ -70,6 +82,7 @@ suite("Source-control setup ignores the engine's minted secrets (BACKLOG #5413)"
       assert.ok(!untracked.includes("api-generated-key.pem"), "the minted private key would be staged");
     } finally {
       fs.rmSync(ws, { recursive: true, force: true });
+      fs.rmSync(emptyConfig, { force: true });
     }
   });
 });

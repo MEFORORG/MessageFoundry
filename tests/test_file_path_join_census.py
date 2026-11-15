@@ -1093,10 +1093,10 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
-        3,
+        4,
         GUARDED,
-        "The containment check itself: it resolves a workspace setting to a real path and refuses "
-        "one whose path relative to the workspace's real path climbs out or is absolute.",
+        "The containment check itself: it refuses a workspace setting whose spelling, and then whose "
+        "real path, relative to the workspace climbs out or is absolute.",
         "ide/src/workspaceContainment.ts::path.relative(root, target)",
     ),
 }

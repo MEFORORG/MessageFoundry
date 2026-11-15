@@ -38,6 +38,7 @@ suite("resolveInsideWorkspace keeps a configured folder inside the workspace (BA
     assert.strictEqual(resolveInsideWorkspace(ws, "../outside"), undefined);
     assert.strictEqual(resolveInsideWorkspace(ws, "samples/../../outside"), undefined);
     assert.strictEqual(resolveInsideWorkspace(ws, outside), undefined);
+    assert.strictEqual(resolveInsideWorkspace(ws, "\\\\attacker.invalid\\share\\cfg"), process.platform === "win32" ? undefined : path.join(ws, "\\\\attacker.invalid\\share\\cfg"));
     fs.mkdirSync(`${ws}-sibling`);
     assert.strictEqual(resolveInsideWorkspace(ws, `${ws}-sibling`), undefined);
   });
@@ -220,9 +221,18 @@ wizardSuite("The New Route wizard writes only inside a trusted workspace (BACKLO
     assert.deepStrictEqual(writes, [path.join(ws, "samples", "config", "IB_ACME_ADT.py")]);
   });
 
-  test("an untrusted workspace writes nothing", async () => {
+  test("an untrusted workspace opens no wizard", () => {
     stubTrusted = false;
-    await create();
+    nr.openNewRoute({ subscriptions: [] } as never);
+    assert.strictEqual(handler, undefined, "the wizard opened in an untrusted workspace");
+    assert.ok(messages.some((m) => m.level === "warning" && /trust this workspace/.test(m.text)));
+  });
+
+  test("the write itself refuses when the workspace is not trusted", async () => {
+    nr.openNewRoute({ subscriptions: [] } as never);
+    assert.ok(handler, "the wizard registered no message handler");
+    stubTrusted = false;
+    await handler({ command: "create", payload });
     assert.deepStrictEqual(writes, []);
     assert.ok(messages.some((m) => m.level === "warning" && /trust this workspace/.test(m.text)));
   });

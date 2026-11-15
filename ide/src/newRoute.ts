@@ -20,7 +20,20 @@ interface RoutePayload {
 
 let panel: vscode.WebviewPanel | undefined;
 
+function refuseUntrusted(): boolean {
+  if (vscode.workspace.isTrusted) {
+    return false;
+  }
+  void vscode.window.showWarningMessage(
+    "MessageFoundry: trust this workspace to create a route. The wizard writes a config module that later checks run.",
+  );
+  return true;
+}
+
 export function openNewRoute(context: vscode.ExtensionContext, onCreated?: () => void): void {
+  if (refuseUntrusted()) {
+    return;
+  }
   if (panel) {
     panel.reveal();
     return;
@@ -48,10 +61,8 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
   // The module written here runs on every later `check`, dry-run and engine load, and the folder it
   // lands in comes from a setting a checked-in `.vscode/settings.json` can supply. So the wizard
   // writes only in a trusted workspace, and only inside the workspace folder (BACKLOG #5410).
-  if (!vscode.workspace.isTrusted) {
-    void vscode.window.showWarningMessage(
-      "MessageFoundry: trust this workspace to create a route. The wizard writes a config module that later checks run.",
-    );
+  // openNewRoute refuses first, before any input; this repeats it at the write.
+  if (refuseUntrusted()) {
     return;
   }
   // Server-side guard mirroring the form's validation — never write invalid config.
@@ -90,7 +101,11 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     onCreated?.();
     void vscode.window.showInformationMessage(`MessageFoundry: created route ${p.ib.name.trim()} → ${p.ob.name.trim()}.`);
   } catch (e) {
-    void vscode.window.showErrorMessage(`MessageFoundry: could not create the route — ${String(e)}`);
+    // The error code only: the message names the target path, which carries the setting's spelling.
+    const code = (e as { code?: unknown })?.code;
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not create the route${typeof code === "string" ? ` (${code.replace(/[^A-Za-z0-9_]/g, "")})` : ""}.`,
+    );
   }
 }
 

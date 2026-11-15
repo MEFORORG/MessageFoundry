@@ -55,20 +55,27 @@ function realpathOfNearestExisting(p: string): string | undefined {
 }
 
 /**
- * `dir` (relative to `ws`, or absolute) resolved against `ws`, when its real path is the workspace
- * folder's real path or inside it, else `undefined`. The path returned keeps the workspace's own
+ * `dir` (relative to `ws`, or absolute) resolved against `ws`, when both its spelling and its real
+ * path are the workspace folder or inside it, else `undefined`. The path returned keeps the workspace's own
  * spelling (a junction, a mapped drive), so editors keyed on the workspace path still match it.
  */
 export function resolveInsideWorkspace(ws: string, dir: string): string | undefined {
   const logical = path.resolve(ws, dir);
+  // Spelling first, with no I/O: a path that is outside by its spelling (absolute elsewhere, a UNC
+  // share, a `..` climb) is refused before the filesystem is touched, so a crafted setting cannot
+  // make the extension host open a remote share.
+  if (!isWithin(path.resolve(ws), logical)) {
+    return undefined;
+  }
   const root = realpathOfNearestExisting(path.resolve(ws));
   const target = realpathOfNearestExisting(logical);
   if (root === undefined || target === undefined) {
     return undefined;
   }
+  return isWithin(root, target) ? logical : undefined;
+}
+
+function isWithin(root: string, target: string): boolean {
   const rel = path.relative(root, target);
-  if (path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`)) {
-    return undefined;
-  }
-  return logical;
+  return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
 }
