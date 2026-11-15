@@ -1595,6 +1595,33 @@ def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
     assert not lost, lost[:20]
 
 
+#: Review round-7bf3e998ba: a word ending in "row", or "row" behind markup that joins it to a word,
+#: is not step 10's clause, wherever a window's edge falls. Each shape is slid across every offset
+#: of the 80-character window; main flags each, through "failing: <id>" or "<id> stays partial".
+_STEP10_WORD_EDGE_SHAPES = [
+    "Then narrow is not{pad}failing: 1.2.3 here.",
+    "See `retry_row` is not{pad}failing: 1.2.3 here.",
+    "See x__row is not{pad}failing: 1.2.3 here.",
+    "The nar**row** is not failing:{pad}1.2.3 today.",
+    "The nar`row` is not failing:{pad}1.2.3 today.",
+    "The narrow is not failing: 1.2.3 and then\nwe keep the outbound path under watch while{pad}"
+    "1.2.4 stays partial.",
+]
+
+
+@pytest.mark.parametrize("shape", _STEP10_WORD_EDGE_SHAPES)
+def test_step_ten_reads_no_clause_in_a_word_ending_in_row(sf, sf_frozen_main, shape: str) -> None:
+    lost = {}
+    for size in range(0, 100):
+        body = shape.format(pad=" " * (size + 1))
+        missing = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
+        if missing:
+            lost[size] = sorted(missing)
+    # A positive control: main flags the shape, or the loop compared nothing.
+    assert sf_frozen_main.scan_pr_body(shape.format(pad=" "))
+    assert not lost, lost
+
+
 def test_a_pr_body_hit_is_reported_once_at_mains_line_number(sf) -> None:
     """Review round-23e833d96f: a separator only str.splitlines ends a line at no longer reports one
     finding twice under two numberings, and every reading's hits come back in line order."""

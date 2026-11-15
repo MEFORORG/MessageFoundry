@@ -603,6 +603,8 @@ _PR_CELL_VERDICT_LEAD = re.compile(
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
 #: The characters _PR_MARKUP matches, as a set, for a per-character test.
 _PR_MARKUP_CHARS = frozenset("*`_\"'")
+#: Where step 10's prose clause can start: _PR_PROSE_VERDICT is tried only at these.
+_PR_ROW_WORD = re.compile(r"(?i)row")
 #: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
 #: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
@@ -1215,29 +1217,48 @@ def _pr_scan_unit(
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
+def _pr_joined_to_a_word(text: str, start: int) -> bool:
+    """Whether the word at ``start`` sits behind a run of markup that follows a word character, so
+    GFM renders the two as one word ("nar**row**", "nar`row`")."""
+    at = start
+    while at > 0 and text[at - 1] in _PR_MARKUP_CHARS:
+        at -= 1
+    return at < start and at > 0 and (text[at - 1].isalnum() or text[at - 1] == "_")
+
+
 def _pr_step10_blank(sentence: str, is_row: bool, windows: list[tuple[int, int]]) -> str | None:
     """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays,
     or None where it holds no exempt clause.
 
     In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"),
-    searched only inside the given windows, each read as its own slice as _pr_prose_verdict reads
-    it: the re-check reads nothing outside them, and _PR_PROSE_VERDICT backtracks quadratically on a
-    long markup run, so a search over the whole sentence, which has no length limit, would make the
-    gate far slower than main on such a body. In a row, it is a cell's verdict reading, whole or
+    searched only inside the given windows: the re-check reads nothing outside them, and
+    _PR_PROSE_VERDICT backtracks quadratically on a long markup run, so a search over the whole
+    sentence, which has no length limit, would make the gate far slower than main on such a body.
+    The pattern is tried only where "row" stands in a window, and it reads the sentence itself, not
+    a slice, so the character before a window still counts: "narrow" cut at a window's edge is not
+    "row". Nor is "row" behind markup that joins it to a word ("nar**row**", which GFM renders as
+    one word). In a row, it is a cell's verdict reading, whole or
     leading, with "never" before a CI verb ("never fails", "is never failing; "), unless the cell
     opens with "unchanged" or a record verb. A cell is read trimmed and with its markup deleted, as
     _pr_table_verdict reads it; each reading's clause is mapped back to the characters of the row
     it came from."""
     spans: list[tuple[int, int]] = []
     if not is_row:
+        tried: set[tuple[int, int]] = set()
         for left, right in windows:
-            spans += [
-                (left + hit.start(), left + hit.end())
-                for hit in _PR_PROSE_VERDICT.finditer(sentence[left:right])
-                if hit.group("row") is not None
-                and hit.group("row_negated") is not None
-                and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
-            ]
+            for row in _PR_ROW_WORD.finditer(sentence, left, right):
+                if (row.start(), right) in tried:
+                    continue
+                tried.add((row.start(), right))
+                hit = _PR_PROSE_VERDICT.match(sentence, row.start(), right)
+                if (
+                    hit is not None
+                    and hit.group("row") is not None
+                    and hit.group("row_negated") is not None
+                    and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
+                    and not _pr_joined_to_a_word(sentence, row.start())
+                ):
+                    spans.append((hit.start(), hit.end()))
     else:
         edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
         for left, right in itertools.pairwise(edges):
