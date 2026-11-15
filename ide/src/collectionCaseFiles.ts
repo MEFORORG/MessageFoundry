@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+// The transient files a Test Bench collection run feeds to `dryrun` (BACKLOG #5415, ADR 0121). The case
+// bodies are PHI held in SecretStorage, and `dryrun` reads only files, so a run writes them to disk for
+// as long as the dry-run takes. No `vscode` import, so this is unit-testable in isolation.
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+/** Every run's directory starts with this, which is how a later run finds one a crash left behind. */
+export const CASE_DIR_PREFIX = "mefor-testbench-";
+
+/**
+ * How old a run's directory must be before a later run deletes it as left behind. A run deletes its
+ * own directory when it ends, so only a crash leaves one; the margin keeps a sweep from deleting the
+ * directory of a run still going in another window.
+ */
+export const STALE_CASE_DIR_MS = 60 * 60 * 1000;
+
+/** Case `i`'s file name. Unique within a run, so a dry-run row maps back to its case by basename. */
+export function caseFileName(i: number): string {
+  return `case_${String(i).padStart(4, "0")}.hl7`;
+}
+
+/**
+ * Write each input to its own file in a fresh directory under `base`, and return the directory. The
+ * directory is owner-only (0700) and each file is created exclusively and owner-only (0600), so no
+ * other local account can read a body while the run lasts. On any failure the directory is removed
+ * before the error is rethrown, so no partial set of bodies stays behind.
+ */
+export function materializeCases(inputs: readonly string[], base: string = os.tmpdir()): string {
+  const dir = fs.mkdtempSync(path.join(base, CASE_DIR_PREFIX)); // mkdtemp makes it 0700 on POSIX
+  try {
+    inputs.forEach((input, i) => {
+      fs.writeFileSync(path.join(dir, caseFileName(i)), input, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    });
+  } catch (e) {
+    removeCaseDir(dir);
+    throw e;
+  }
+  return dir;
+}
+
+/** Remove a run's directory. Best effort: a cleanup error must not mask the run's own result. */
+export function removeCaseDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* a later run's sweep retries it (sweepStaleCaseDirs) */
+  }
+}
+
+/**
+ * Delete the run directories under `base` that a crashed run left behind: a real directory (never a
+ * symlink) named with CASE_DIR_PREFIX and last modified more than `maxAgeMs` before `now`. Returns how
+ * many it removed. Best effort: an entry it cannot read or remove is skipped.
+ */
+export function sweepStaleCaseDirs(
+  base: string = os.tmpdir(),
+  now: number = Date.now(),
+  maxAgeMs: number = STALE_CASE_DIR_MS,
+): number {
+  let names: string[];
+  try {
+    names = fs.readdirSync(base);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.startsWith(CASE_DIR_PREFIX)) {
+      continue;
+    }
+    const dir = path.join(base, name);
+    try {
+      const st = fs.lstatSync(dir);
+      if (!st.isDirectory() || now - st.mtimeMs <= maxAgeMs) {
+        continue;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+      removed++;
+    } catch {
+      /* gone already, or not ours to remove */
+    }
+  }
+  return removed;
+}
+
+/**
+ * The `dryrun` arguments for one run: the run's directory, never one path per case, so the command
+ * line stays the same length however many cases the collection holds. `dryrun --messages` reads a
+ * directory's `*.hl7` files in sorted order.
+ */
+export function caseDryRunArgs(config: string, dir: string): string[] {
+  return ["dryrun", "--config", config, "--show-phi", "--messages", dir];
+}

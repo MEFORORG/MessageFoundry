@@ -135,7 +135,12 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 (machine-local, but plaintext in VS Code's per-workspace storage). Mitigated by the synthetic-case
 steer (ADR 0030) and the in-UI notice; workspaceState is not encrypted, so authors must not save real
 PHI. Rerun writes transient PHI to a temp dir — always cleaned in `finally`, but a hard crash mid-run
-could leave a temp file (OS temp reaping bounds the exposure). The volatile policy is a fixed default;
+could leave a temp file. *Amended 2026-11-14 (BACKLOG #5415):* the run's directory is owner-only
+(`0700`) and each case file is created exclusively and owner-only (`0600`) on POSIX; on Windows the
+per-user temp directory's ACL governs. A directory a crash left behind is deleted by the next
+collection run once it is over an hour old, and not before, so a run in another window survives; until
+that next run it stays on disk. The dry-run is handed the directory, not one path per case, so a large
+collection no longer grows the command line (`ide/src/collectionCaseFiles.ts`). The volatile policy is a fixed default;
 a feed with other volatile fields (e.g. a bespoke timestamp segment) may show a false regression until
 a future per-collection override lands.
 
