@@ -135,7 +135,8 @@
 
 .PARAMETER IdleHours
     A merged worktree whose commit date, index or HEAD moved within this many hours is held for a human.
-    Default 72, prune-merged.ps1's default. 0 turns the hold off.
+    Default 72, prune-merged.ps1's default. 0 turns the hold off; a failed read of that activity still
+    holds the tree.
 
 .PARAMETER ConfigRoot
     Claude config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry.
@@ -279,18 +280,18 @@ function ConvertTo-Instant($Value) {
 # file a git command deletes between Test-Path and Get-Item sets Unreadable, which the caller holds
 # the tree on, keeping any reading already taken, rather than ending the report under its 'Stop'
 # preference. For the admin files, caught: ItemNotFoundException, DriveNotFoundException,
-# IOException and UnauthorizedAccessException; anything else still throws. For the .git file, ANY
-# failure of the path or the read sets Unreadable to '.git': that catch-all ends in a hold naming the
-# file, not a silenced error.
+# IOException and UnauthorizedAccessException; anything else still throws. For the .git file and
+# the logs/HEAD read, ANY failure sets Unreadable to that file and Error to the exception's type: that
+# catch-all ends in a hold naming the file and the type, not a silenced error.
 function Get-PrivateGitActivity([string]$Worktree) {
-    $none = [pscustomobject]@{ When = $null; Unreadable = $null }
+    $none = [pscustomobject]@{ When = $null; Unreadable = $null; Error = $null }
     $txt = ''
     try {
         $dot = Join-Path $Worktree '.git'
         if (-not (Test-Path -LiteralPath $dot -PathType Leaf)) { return $none }
         $txt = Get-Content -LiteralPath $dot -Raw -ErrorAction Stop
     }
-    catch { return [pscustomobject]@{ When = $null; Unreadable = '.git' } }
+    catch { return [pscustomobject]@{ When = $null; Unreadable = '.git'; Error = $_.Exception.GetType().Name } }
     if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return $none }
     $gitdir = $Matches[1].Trim()
     if (-not [System.IO.Path]::IsPathRooted($gitdir)) { $gitdir = Join-Path $Worktree $gitdir }
@@ -307,13 +308,14 @@ function Get-PrivateGitActivity([string]$Worktree) {
         $name = 'logs/HEAD'
         $reflog = Join-Path $gitdir 'logs/HEAD'
         if (Test-Path -LiteralPath $reflog -PathType Leaf) {
-            $last = Get-Content -LiteralPath $reflog -Tail 1 -ErrorAction Stop
+            try { $last = Get-Content -LiteralPath $reflog -Tail 1 -ErrorAction Stop }
+            catch { return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $_.Exception.GetType().Name } }
             # `<old> <new> <name> <<email>> <unix-seconds> <tz>\t<message>`
             if ($last -and ([string]$last -match '>\s+(\d{9,})\s+[+-]\d{4}')) {
                 # An epoch past what a date can hold is a reading that failed, not one to drop.
                 $secs = 0L
                 if (-not [int64]::TryParse($Matches[1], [ref]$secs) -or $secs -gt 253402300799) {
-                    return [pscustomobject]@{ When = $newest; Unreadable = $name }
+                    return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $null }
                 }
                 $t = [DateTimeOffset]::FromUnixTimeSeconds($secs)
                 if (-not $newest -or $t -gt $newest) { $newest = $t }
@@ -321,9 +323,9 @@ function Get-PrivateGitActivity([string]$Worktree) {
         }
     }
     catch [System.Management.Automation.ItemNotFoundException], [System.Management.Automation.DriveNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
-        return [pscustomobject]@{ When = $newest; Unreadable = $name }
+        return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $null }
     }
-    return [pscustomobject]@{ When = $newest; Unreadable = $null }
+    return [pscustomobject]@{ When = $newest; Unreadable = $null; Error = $null }
 }
 
 # WHAT `git worktree remove` WOULD TAKE WITH A TREE BEYOND THE FILES git status LISTS, AND WHO MAY
@@ -555,6 +557,7 @@ function Get-CloneReport($R) {
             $gitRead = Get-PrivateGitActivity $e.Path
             if ($gitRead.Unreadable) {
                 $where = if ($gitRead.Unreadable -eq '.git') { 'the .git file' } else { "$($gitRead.Unreadable) in its git dir" }
+                if ($gitRead.Error) { $where += ", $($gitRead.Error)" }
                 $reasons.Add("git activity could not be read ($where): a session may still be working there")
             }
             if ($IdleHours -gt 0) {
@@ -754,7 +757,7 @@ foreach ($c in $report.clones) {
     if ($c.cleanup.remove.Count -eq 0) { $md.Add("No worktree passes every check, so nothing is proposed.") }
     else {
         $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see. None has a file flagged skip-worktree or assume-unchanged, a commit only its HEAD reflog or its own refs hold, an allocation not on origin/main, or a claim.")
-        $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked.**" }))
+        $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked; a failed read of it still holds the tree.**" }))
         $md.Add("``git worktree remove`` also deletes gitignored files: a ``.venv`` and caches, but also any local ``.env`` or store file. Run them from a plain terminal:")
         $md.Add("")
         $md.Add('```powershell')

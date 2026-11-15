@@ -1447,7 +1447,7 @@ def test_hygiene_reports_private_git_read_holds_on_a_dot_git_that_became_a_direc
         "function global:Test-Path { [CmdletBinding()] param([string]$LiteralPath, "
         "[string]$PathType) $true }; "
         "try { $b = Get-PrivateGitActivity $env:T_TREE; "
-        "$r = '{0}/{1}' -f ($null -eq $b.When), $b.Unreadable } "
+        "$r = '{0}/{1}/{2}' -f ($null -eq $b.When), $b.Unreadable, $b.Error } "
         'catch { $r = "threw: $($_.Exception.GetType().Name)" }; '
         "'{0}/{1}|{2}' -f ($null -eq $a.When), $a.Unreadable, $r"
     )
@@ -1464,7 +1464,65 @@ def test_hygiene_reports_private_git_read_holds_on_a_dot_git_that_became_a_direc
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "True/|True/.git", (proc.stdout, proc.stderr)
+    assert proc.stdout.strip() == "True/|True/.git/InvalidOperationException", (
+        proc.stdout,
+        proc.stderr,
+    )
+
+
+def test_hygiene_reports_private_git_read_holds_on_a_reflog_that_became_a_directory(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5603. The same race on logs/HEAD: Test-Path saw a file, and by the read it is a
+    directory, whose InvalidOperationException the named catch let end the report. Any failure of
+    that read now names logs/HEAD and the exception's type, and keeps the admin-file reading taken
+    before it. Test-Path is stood in for on logs/HEAD alone, to answer as it did before the swap."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(
+        repo,
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "seed",
+    )
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "linked", str(linked))
+    log = _gitdir(linked) / "logs" / "HEAD"
+    log.unlink()
+    log.mkdir()
+    command = (
+        f"$ErrorActionPreference = 'Stop'; {_LIFT_PRIVATE_GIT_ACTIVITY}"
+        "function global:Test-Path { [CmdletBinding()] param([string]$LiteralPath, "
+        "[string]$PathType) if ($LiteralPath -match 'logs[\\\\/]HEAD$') { return $true }; "
+        "Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }; "
+        "try { $b = Get-PrivateGitActivity $env:T_TREE; "
+        "'{0}/{1}/{2}' -f ($null -ne $b.When), $b.Unreadable, $b.Error } "
+        'catch { "threw: $($_.Exception.GetType().Name)" }'
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "T_TREE": str(linked),
+            "T_SCRIPT": str(SCRIPT.parent / "hygiene-report.ps1"),
+        },
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True/logs/HEAD/InvalidOperationException", (
+        proc.stdout,
+        proc.stderr,
+    )
 
 
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
