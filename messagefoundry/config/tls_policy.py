@@ -299,8 +299,16 @@ def harden_crl_check(
     *,
     setting: str | None = None,
     record_held_copy: bool = True,
+    chain: bool = False,
 ) -> None:
     """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+
+    With ``chain``, revocation is checked for every certificate in the peer's chain, not only the
+    leaf (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627), so a revoked intermediate CA refuses
+    the clients under it. Every CA in the chain then needs its issuer's CRL in the file, or each
+    client under it is refused with ``unable to get certificate CRL``: that fails closed. A
+    single-tier CA, whose own CRL covers its leaves, behaves as without it. The API listener
+    passes it; every other hop keeps the leaf check.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -460,6 +468,8 @@ def harden_crl_check(
     # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
     _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    if chain:
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 

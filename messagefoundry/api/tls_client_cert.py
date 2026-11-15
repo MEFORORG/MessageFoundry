@@ -31,8 +31,9 @@ state; :func:`messagefoundry.api.security.peer_cert_from_request` reads it back.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 from messagefoundry.credential import OTHERNAMES_INTACT_KEY, VERIFIED_ISSUER_KEY
@@ -42,11 +43,19 @@ log = logging.getLogger(__name__)
 __all__ = [
     "ISSUER_INDEX_ATTR",
     "MF_CLIENT_PEERCERT_STATE_KEY",
+    "TrustedProxy",
     "client_cert_http_protocol_class",
     "enriched_app_state",
     "extract_verified_peercert",
+    "parse_trusted_proxies",
+    "peer_is_trusted_proxy",
     "peercert_from_ssl_object",
 ]
+
+#: One parsed ``[api].trusted_proxies`` entry, as uvicorn matches a socket peer against it.
+TrustedProxy = (
+    ipaddress.IPv4Address | ipaddress.IPv6Address | ipaddress.IPv4Network | ipaddress.IPv6Network
+)
 
 # Private ASGI ``scope['state']`` key under which the shim stashes the verified peer cert. The leading
 # underscore + package prefix keeps it clear of any application state and un-guessable as a spoof target
@@ -123,35 +132,97 @@ def _verified_issuer(ssl_object: Any) -> str:
         leaf_der = ssl_object.getpeercert(binary_form=True)
         if not leaf_der:
             return ""
-        issuer: str = index.issuer_of(leaf_der)
+        # BACKLOG #5628: a leaf with no clientAuth extended key usage maps to nobody. The index
+        # remembers each answer, so a repeat client costs no signature check on the event loop.
+        issuer: str = index.issuer_of(leaf_der, require_client_auth=True)
         return issuer
     except Exception:
         log.warning("could not establish a client certificate's issuer; denying", exc_info=True)
         return ""
 
 
+def parse_trusted_proxies(entries: Sequence[str]) -> tuple[TrustedProxy, ...]:
+    """``[api].trusted_proxies`` as the addresses and networks a socket peer is matched against.
+
+    Read through :func:`~messagefoundry.config.settings.uvicorn_trusted_hosts`, the list ``serve``
+    hands uvicorn, so a peer this shim treats as a proxy is exactly one uvicorn takes
+    ``X-Forwarded-For`` from, in either IPv4 spelling. Every entry must already have loaded."""
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    return tuple(
+        ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
+        for entry in uvicorn_trusted_hosts(entries)
+    )
+
+
+def peer_is_trusted_proxy(
+    transport: asyncio.BaseTransport, proxies: Collection[TrustedProxy]
+) -> bool:
+    """Whether ``transport``'s socket peer is one of ``proxies`` (BACKLOG #5628).
+
+    ``False`` with no proxies declared. With some declared, a peer address that cannot be read
+    counts as a proxy, so a certificate whose sender cannot be placed is never mapped."""
+    if not proxies:
+        return False
+    try:
+        peer = transport.get_extra_info("peername")
+        host = str(peer[0]).partition("%")[0]  # the engine reports a peer without its zone
+        address = ipaddress.ip_address(host)
+    except (TypeError, IndexError, ValueError):
+        return True
+    for proxy in proxies:
+        if isinstance(proxy, ipaddress.IPv4Network | ipaddress.IPv6Network):
+            if address in proxy:
+                return True
+        elif address == proxy:
+            return True
+    return False
+
+
 def enriched_app_state(
-    app_state: Mapping[str, Any], transport: asyncio.BaseTransport
+    app_state: Mapping[str, Any],
+    transport: asyncio.BaseTransport,
+    *,
+    trusted_proxies: Collection[TrustedProxy] = (),
 ) -> Mapping[str, Any]:
     """``app_state`` unchanged, or a **per-connection copy** carrying the verified peer cert.
 
     Pure and side-effect-free: it never mutates ``app_state`` (that dict is the process-wide lifespan
     state shared by every connection), returning a fresh dict only when a client cert is actually
-    present. So a connection with no client cert observes byte-identical state."""
+    present. So a connection with no client cert observes byte-identical state.
+
+    A connection from a peer in ``trusted_proxies`` is left unchanged too (BACKLOG #5628). Such a
+    peer forwards other callers' requests, so its own certificate names the proxy, not the caller;
+    stashed, it would let every caller behind the proxy act as the proxy's mapped principal."""
+    if peer_is_trusted_proxy(transport, trusted_proxies):
+        return app_state
     peercert = extract_verified_peercert(transport)
     if peercert is None:
         return app_state
     return {**app_state, MF_CLIENT_PEERCERT_STATE_KEY: peercert}
 
 
-def client_cert_http_protocol_class(base: type[Any]) -> type[asyncio.Protocol]:
+def client_cert_http_protocol_class(
+    base: type[Any], *, trusted_proxies: Sequence[str] = ()
+) -> type[asyncio.Protocol]:
     """An HTTP-protocol subclass that stashes the verified peer cert into ``app_state`` post-handshake.
 
     ``base`` is required: ``serve`` passes the floored class, which carries the pinned parser
     (``protocol_headers.floored_http_protocol_class``, BACKLOG #1125), and a default here would be a
     second place to pin it. Tests pass a stub base. Pass the result as uvicorn's ``http=`` protocol
     class. The subclass adds nothing but the ``connection_made`` enrichment above — every other
-    behaviour is inherited."""
+    behaviour is inherited.
+
+    ``trusted_proxies`` is ``[api].trusted_proxies``, which ``serve`` passes: a certificate a
+    declared proxy presents is never stashed (:func:`enriched_app_state`, BACKLOG #5628), and that
+    is warned about once here, since a proxy's certificate in the map would then match nothing."""
+    proxies = parse_trusted_proxies(trusted_proxies)
+    if proxies:
+        log.warning(
+            "[api].trusted_proxies is set beside [api].tls_client_cert_identities: a client "
+            "certificate presented by a declared proxy maps to no principal, because the proxy "
+            "forwards other callers' requests"
+        )
 
     # Dynamic base class (a `type[Any]` *value*, which mypy cannot check as a static base) — hence
     # the localized ignore, not a blanket one.
@@ -161,6 +232,8 @@ def client_cert_http_protocol_class(base: type[Any]) -> type[asyncio.Protocol]:
             # self.app_state is uvicorn-internal (not on asyncio.Protocol); go through Any so the read +
             # per-connection replacement stay mypy-strict clean without weakening the module's typing.
             protocol: Any = self
-            protocol.app_state = enriched_app_state(protocol.app_state, transport)
+            protocol.app_state = enriched_app_state(
+                protocol.app_state, transport, trusted_proxies=proxies
+            )
 
     return _ClientCertHTTPProtocol

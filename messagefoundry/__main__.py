@@ -2820,7 +2820,13 @@ def _serve(args: argparse.Namespace) -> int:
     shim_http: type[Any] | None = None
     if _client_cert_shim_wanted(settings):
         shim_http = _floor_or_refusal(
-            "start", functools.partial(_client_cert_shim, floored_http, floored_ws)
+            "start",
+            functools.partial(
+                _client_cert_shim,
+                floored_http,
+                floored_ws,
+                trusted_proxies=settings.api.trusted_proxies,
+            ),
         )
         if shim_http is None:
             return 2
@@ -5186,16 +5192,20 @@ def _client_cert_shim_wanted(settings: ServiceSettings) -> bool:
     return bool(settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities)
 
 
-def _client_cert_shim(floored_http: Any, floored_ws: Any) -> type[Any]:
+def _client_cert_shim(
+    floored_http: Any, floored_ws: Any, *, trusted_proxies: Sequence[str]
+) -> type[Any]:
     """Build the client-certificate shim on the floored HTTP class, and self-test it. Raises
     ``ProtocolFloorUnavailable``.
 
     BACKLOG #1120: when :func:`_client_cert_shim_wanted`, the shim is the class uvicorn serves, so
-    the floor's self-test must drive it and not only the class beneath it."""
+    the floor's self-test must drive it and not only the class beneath it. ``trusted_proxies`` is
+    ``[api].trusted_proxies``: a certificate a declared proxy presents maps to nobody (BACKLOG
+    #5628). Keyword-only and required, so no caller can leave the proxies out by accident."""
     from messagefoundry.api.protocol_floor_selftest import selftest_protocol_floor
     from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
 
-    shim = client_cert_http_protocol_class(base=floored_http)
+    shim = client_cert_http_protocol_class(base=floored_http, trusted_proxies=trusted_proxies)
     selftest_protocol_floor(shim, floored_ws)
     return shim
 
@@ -5326,7 +5336,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # The same again for the client-certificate shim, when the settings ask each shard for one.
     if (
         _client_cert_shim_wanted(settings)
-        and _floor_or_refusal("start the fleet", functools.partial(_client_cert_shim, *floor))
+        and _floor_or_refusal(
+            "start the fleet",
+            functools.partial(
+                _client_cert_shim, *floor, trusted_proxies=settings.api.trusted_proxies
+            ),
+        )
         is None
     ):
         return 2

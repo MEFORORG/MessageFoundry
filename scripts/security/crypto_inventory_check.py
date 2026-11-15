@@ -1332,6 +1332,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.set_ciphersuites()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
+            # Vault BACKLOG #5627: harden_crl_check(chain=True), the API listener's whole-chain CRL.
+            "tls_context:.verify_flags |= VERIFY_CRL_CHECK_CHAIN",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",

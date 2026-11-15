@@ -24,7 +24,12 @@ from typing import TYPE_CHECKING, Literal
 
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.audit_write import write_audit_soft
-from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
+from messagefoundry.auth.trust_anchors import (
+    api_client_anchor_spec,
+    api_client_crl_spec,
+    enforced_anchor,
+    verified_anchor_cadata,
+)
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -127,8 +132,16 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
         # loading it before the CA yields a context with the check flag set and zero CRLs -- which
         # refuses EVERY client rather than skipping the check.
-        if api.tls_client_crl_file:
-            harden_crl_check(ctx, api.tls_client_crl_file, setting="[api].tls_client_crl_file")
+        crl = api_client_crl_spec(api)
+        if crl is not None:
+            # Vault BACKLOG #5627: the CRL decides which client certificates are refused, so it
+            # takes the client CA's owner-only ACL and path preflight. A broadly writable CRL could
+            # be swapped for an older one, signed and unexpired, from before a revocation. A file
+            # that cannot be read is left to harden_crl_check, which names it the same way.
+            if Path(crl.path).is_file():
+                enforced_anchor(crl, enforcing=enforcing)
+            # And the whole chain is checked, so a revoked intermediate refuses its clients too.
+            harden_crl_check(ctx, crl.path, setting=crl.setting, chain=True)
     return ctx
 
 

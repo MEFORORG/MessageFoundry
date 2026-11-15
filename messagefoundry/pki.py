@@ -21,7 +21,8 @@ import logging
 import os
 import ssl
 import string
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -36,7 +37,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.utils import CryptographyDeprecationWarning
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.keywrap import (
     DerTlv,
@@ -1652,6 +1653,13 @@ class _Anchor:
     position: int
 
 
+#: How many leaves one :class:`IssuerIndex` remembers its answer for (BACKLOG #5628). The answer
+#: is a pure function of the leaf and the index, which never changes once built, so a repeat
+#: connection from the same client costs a dict read rather than a signature check on the event
+#: loop. Bounded, least recently used out first, so a stream of distinct leaves cannot grow it.
+ISSUER_CACHE_SIZE = 1024
+
+
 class IssuerIndex:
     """Which loaded client CA directly issued a verified client certificate (BACKLOG #2237).
 
@@ -1687,6 +1695,10 @@ class IssuerIndex:
         # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
         # unmatched_keys does not call it a CA.
         self._pinned_subjects: set[str] = set()
+        # BACKLOG #5628: issuer_of's answers, keyed by the leaf and whether clientAuth was asked
+        # for. A lock, because a listener may ask from a worker thread as well as the loop.
+        self._answers: OrderedDict[tuple[bytes, bool], str] = OrderedDict()
+        self._answers_lock = threading.Lock()
         read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
@@ -1718,15 +1730,39 @@ class IssuerIndex:
                 if not anchor.ca:
                     self._pinned_subjects.add(subject)
 
-    def issuer_of(self, leaf_der: bytes) -> str:
+    def issuer_of(self, leaf_der: bytes, *, require_client_auth: bool = False) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
         ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA, or a
         self-signed certificate pinned as itself, with a DIFFERENT key shares the issuing CA's
         subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate
-        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises."""
+        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises.
+
+        With ``require_client_auth``, also ``""`` for a leaf whose extended key usage does not name
+        ``clientAuth``, or that carries none (BACKLOG #5628). OpenSSL refuses a client certificate
+        whose extended key usage leaves ``clientAuth`` out, but admits one with no such extension
+        at all, so without this a certificate issued for any purpose would map to a principal.
+
+        Each answer is remembered for :data:`ISSUER_CACHE_SIZE` leaves (BACKLOG #5628)."""
+        key = (leaf_der, require_client_auth)
+        with self._answers_lock:
+            answer = self._answers.get(key)
+            if answer is not None:
+                self._answers.move_to_end(key)
+                return answer
+        answer = self._issuer_of(leaf_der, require_client_auth=require_client_auth)
+        with self._answers_lock:
+            self._answers[key] = answer
+            self._answers.move_to_end(key)
+            while len(self._answers) > ISSUER_CACHE_SIZE:
+                self._answers.popitem(last=False)
+        return answer
+
+    def _issuer_of(self, leaf_der: bytes, *, require_client_auth: bool) -> str:
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
+            if require_client_auth and not _names_client_auth(leaf):
+                return ""
             issuers = [
                 anchor
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
@@ -2105,6 +2141,17 @@ def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
             type(exc).__name__,
         )
         return None, False
+
+
+def _names_client_auth(leaf: x509.Certificate) -> bool:
+    """Whether ``leaf``'s extended key usage names ``clientAuth`` (BACKLOG #5628). A leaf with no
+    such extension names nothing, and ``anyExtendedKeyUsage`` does not stand in for it. An
+    extension that does not parse raises, which :meth:`IssuerIndex.issuer_of` reads as no issuer."""
+    try:
+        usage = leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        return False
+    return ExtendedKeyUsageOID.CLIENT_AUTH in usage
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
