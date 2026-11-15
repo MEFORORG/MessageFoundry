@@ -314,6 +314,28 @@ def test_a_heal_of_a_dead_sink_does_not_leave_the_flap_window_stale(
     assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
 
 
+def test_the_latch_never_trips_later_than_the_bound_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812, review round 4. A roll at 0 s, stage 2 at 1 s, a healing roll at 2 s, then eight
+    # rolls in seven seconds from 59 s: the five-in-60 bound alone (main's rule) trips at 66 s.
+    # NEGATIVE CONTROL: at c811a7a5e the window restarted at the 2 s heal, reset at 62.5 s, and the
+    # sink ended ``rolled`` with no stop asked for.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    _at(clock, 0)
+    guard.record_rollover("file", reason="lock", rolled_aside=None)
+    _at(clock, 1)
+    guard.record_unwritable("file", reason="the replacement failed too")
+    for t in (2, 59, 60, 61, 62.5, 63, 64, 65, 66):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+
+    assert guard.status()[0].state == "unwritable"
+    assert guard.can_log() is False
+    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+
+
 def test_continuous_stage2_failure_is_not_a_quiet_window(monkeypatch: pytest.MonkeyPatch) -> None:
     # BACKLOG #5812, review finding 2. A flap-latched sink then fails outright on every record for
     # 90 s; the one roll that succeeds after that is still the same break, not a fresh heal after a
