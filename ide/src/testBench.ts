@@ -112,7 +112,9 @@ export class TestBench {
       this.panel.reveal();
       return;
     }
-    sweepStaleCaseDirs(); // a left-behind run's case files go on the next open, not only the next run
+    // A left-behind run directory more than an hour old has its case files swept on the next open,
+    // not only on the next run.
+    sweepStaleCaseDirs();
     this.panel = vscode.window.createWebviewPanel(
       "messagefoundry.testBench",
       "MessageFoundry Test Bench",
@@ -320,10 +322,12 @@ export class TestBench {
    * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
    * each case's stored input is materialized to a FRESH owner-only per-run temp dir, the dir itself
    * is dry-run (`--show-phi`), and in `finally` its case files are deleted, then the dir if it is
-   * then empty; a dir left behind, at least by a crash, a case file that cannot be unlinked or an
-   * entry not named as a case file, has its case files swept by a later run (collectionCaseFiles.ts,
-   * BACKLOG #5415). Cases align to rows by the unique
-   * temp basename the CLI echoes back in `row.path` (robust to a case that yields no row).
+   * then empty. A dir a crash, or a case file that cannot be unlinked, left behind has its case
+   * files swept, and then the dir if it is empty, by a later open or run once it is over an hour
+   * old, and on POSIX only if this user owns it. A dir left only by an entry not named as a case
+   * file has no case files left to sweep, so it stays until someone removes it
+   * (collectionCaseFiles.ts, BACKLOG #5415). Cases align to rows by the unique temp basename the CLI
+   * echoes back in `row.path` (robust to a case that yields no row).
    */
   private async runCollection(name: string): Promise<void> {
     if (!this.panel) {
