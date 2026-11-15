@@ -924,3 +924,108 @@ def test_the_stub_self_certification_fires_when_a_stub_loses(tmp_path: Path) -> 
         pytest.skip("this Git install ships no mingw64 curl, so the wrapper cannot shadow the stub")
     with pytest.raises(AssertionError, match="did NOT win"):
         _assert_stubs_win(str(wrapper), stub_dir, env)
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5593: disarm on a later push, and arm only on the head this run evaluated
+# --------------------------------------------------------------------------------------------------
+
+
+def test_merge_step_pins_the_evaluated_head() -> None:
+    """The arm call must carry ``--match-head-commit`` bound to the event's head SHA.
+
+    Without it GitHub arms auto-merge on whatever the head is when the call lands, which can be a
+    commit pushed after the guardrails evaluated the earlier one.
+    """
+    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    run = str(merge["run"])
+    assert '--match-head-commit "$HEAD_SHA"' in run, f"the arm call is not head-pinned: {run!r}"
+    assert "${{" not in run, "the merge body interpolates an Actions expression; pass it via env:"
+    assert str((merge.get("env") or {}).get("HEAD_SHA", "")).replace(" ", "") == (
+        "${{github.event.pull_request.head.sha}}"
+    ), "HEAD_SHA must be the head the triggering event carried, the one this run evaluated"
+
+
+def test_disarm_runs_first_on_every_push() -> None:
+    """A ``synchronize`` run must disarm BEFORE any guardrail can decide, and before the arm step."""
+    ids = [s.get("id") for s in _steps()]
+    assert ids[0] == "disarm", f"the disarm step must be the first step, got {ids}"
+    disarm = _step("disarm")
+    assert str(disarm.get("if", "")).replace(" ", "") == "github.event.action=='synchronize'", (
+        f"the disarm step must run on every push to the PR; if: {disarm.get('if')!r}"
+    )
+    assert "continue-on-error" not in disarm, (
+        "a disarm failure must fail the job so no later step re-arms"
+    )
+    body = str(disarm["run"])
+    assert "${{" not in body
+    assert "gh pr merge --disable-auto" in body
+    declared = set((disarm.get("env") or {}).keys())
+    undeclared = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED - declared
+    assert not undeclared, f"disarm reads undeclared env var(s): {sorted(undeclared)}"
+
+
+def _gh_disarm_stub(tmp_path: Path) -> Path:
+    """A ``gh`` that keeps the PR's auto-merge state in ``$GH_STATE`` and logs each call to ``$GH_LOG``.
+
+    ``VIEW_FAIL=1`` makes ``pr view`` behave like an HTTP error (JSON body on stdout, non-zero exit),
+    ``DISARM_FAIL=1`` makes ``pr merge --disable-auto`` exit non-zero, and ``DISARM_NOOP=1`` makes it
+    exit 0 while leaving the state armed.
+    """
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$*" >> "$GH_LOG"\n'
+        'case "$1 $2" in\n'
+        '  "pr view")\n'
+        '    if [ "${VIEW_FAIL:-0}" = 1 ]; then echo \'{"message":"Bad credentials"}\'; exit 1; fi\n'
+        '    cat "$GH_STATE" ;;\n'
+        '  "pr merge")\n'
+        '    if [ "${DISARM_FAIL:-0}" = 1 ]; then echo "gh: refused" >&2; exit 1; fi\n'
+        '    if [ "${DISARM_NOOP:-0}" != 1 ]; then echo false > "$GH_STATE"; fi ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub_dir
+
+
+@pytest.mark.parametrize(
+    ("label", "armed", "extra", "rc", "disarm_called", "end_state"),
+    [
+        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false"),
+        ("not armed: nothing to do", "false", {}, 0, False, "false"),
+        ("state unreadable fails closed", "true", {"VIEW_FAIL": "1"}, 1, False, "true"),
+        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
+        ("a disarm that did not take fails closed", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
+    ],
+)
+def test_disarm_step_behaviour(
+    label: str,
+    armed: str,
+    extra: dict[str, str],
+    rc: int,
+    disarm_called: bool,
+    end_state: str,
+    tmp_path: Path,
+) -> None:
+    """The disarm body EXECUTED. A non-zero exit is the fail-closed outcome: Actions then skips every
+    later step, the arm step included, so nothing re-arms on a head whose state is unknown."""
+    state = tmp_path / "state"
+    state.write_text(f"{armed}\n", encoding="utf-8")
+    log = tmp_path / "gh.log"
+    log.write_text("", encoding="utf-8")
+    env = {
+        "PR_URL": "https://github.com/example/example/pull/1",
+        "GH_TOKEN": "stub",
+        "GH_STATE": state.as_posix(),
+        "GH_LOG": log.as_posix(),
+        **extra,
+    }
+    run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
+    assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
+    called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
+    assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
+    assert state.read_text(encoding="utf-8").strip() == end_state, label

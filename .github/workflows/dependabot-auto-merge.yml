@@ -99,6 +99,45 @@ jobs:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     timeout-minutes: 10
     steps:
+      # BACKLOG #5593. A push to the PR (an A3 lock-resync commit, a rebase, or anyone's commit) changes
+      # what the guardrails below evaluated, but auto-merge armed on the earlier head would stay armed
+      # and merge the new head once CI went green, whatever this run then decides. So every
+      # `synchronize` run DISARMS first, and only the merge step below re-arms, pinned to the head THIS
+      # run evaluated. FAILS CLOSED: an unreadable state, a failed disarm, or a state still armed after
+      # the disarm fails the step, and every later step is then skipped, so nothing re-arms.
+      # What this does not cover: once a PR is already in the merge queue, `--disable-auto` does not
+      # remove the entry (korus docs/TIPS-AND-TRICKS.md); whether a push dequeues it is GitHub's
+      # behaviour and is not measured here.
+      - name: Disarm auto-merge armed on an earlier head
+        id: disarm
+        if: github.event.action == 'synchronize'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # `||` outside the substitution, for the reason the ghsa step gives: `gh` writes an error
+          # body to stdout, and the shape check below must see the sentinel, not that body.
+          armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || armed="ERR"
+          case "$armed" in
+            false)
+              echo "::notice::auto-merge is not armed on this PR — nothing to disarm."
+              exit 0
+              ;;
+            true) ;;
+            *)
+              echo "::error::could not read this PR's auto-merge state — failing closed, nothing re-arms."
+              exit 1
+              ;;
+          esac
+          gh pr merge --disable-auto "$PR_URL"
+          after="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || after="ERR"
+          if [ "$after" != "false" ]; then
+            echo "::error::auto-merge still reads '${after}' after the disarm — failing closed, nothing re-arms."
+            exit 1
+          fi
+          echo "::notice::disarmed auto-merge armed on an earlier head; the guardrails below re-evaluate this head."
+
       - name: Fetch Dependabot metadata
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
@@ -425,7 +464,12 @@ jobs:
           (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
            (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
             steps.meta.outputs.dependency-type == 'direct:development'))
-        run: gh pr merge --auto --squash "$PR_URL"
+        # PINNED to the head this run evaluated (BACKLOG #5593): `--match-head-commit` makes GitHub
+        # refuse to arm when the PR's head is no longer that commit, so a push that lands while this
+        # run is evaluating cannot be armed on the strength of the earlier head's verdict. That push
+        # starts its own run, which the disarm step above serves.
+        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
