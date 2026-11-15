@@ -603,6 +603,121 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             "await agent(1)\nconst s = `${ /[abc",
             1,
         ),
+        # A line that opens with a binary operator continues the one before, a postfix tail
+        # included; a line ending in an operator continues whatever the next line opens with.
+        (
+            "a postfix tail continued by a division",
+            "let n = 0\nconst g = () => n++\n / agent(1)\ng()\ng()\n",
+            2,
+        ),
+        ("a postfix tail continued by a caret", "const g = () => n++\n ^ agent(1)\ng()\ng()\n", 2),
+        ("a postfix tail continued by !=", "const g = () => n++\n != agent(1)\ng()\ng()\n", 2),
+        ("a postfix tail continued by !==", "const g = () => n++\n !== agent(1)\ng()\ng()\n", 2),
+        (
+            "a postfix tail continued by in",
+            "const g = (o) => n++\n in o[agent(1)]\ng(o)\ng(o)\n",
+            2,
+        ),
+        (
+            "a postfix tail continued by instanceof",
+            "const g = (o) => n--\n instanceof o[agent(1)]\ng(o)\ng(o)\n",
+            2,
+        ),
+        ("a value continued by a division", "const g = () => k\n / agent(1)\ng()\ng()\n", 2),
+        ("a value continued by in", "const g = (o) => k\n in o[agent(1)]\ng(o)\ng(o)\n", 2),
+        ("a line opening with a bare !", "const g = () => k\n!agent(1)\ng()\ng()\n", 1),
+        ("a line opening with a word starting in", "const g = () => k\ninner(agent(1))\ng()\n", 1),
+        (
+            "a division ending the line before ++",
+            "const g = () => a /\n++n + agent(1)\ng()\ng()\n",
+            2,
+        ),
+        ("a caret ending the line before ++", "const g = () => a ^\n++n + agent(1)\ng()\ng()\n", 2),
+        (
+            "a division ending the line before --",
+            "const g = () => a /\n--n + agent(1)\ng()\ng()\n",
+            2,
+        ),
+        ("a regex ending the line before ++", "const g = () => /a/\n++n + agent(1)\ng()\ng()\n", 1),
+        (
+            "a comment after a division ending the line",
+            "const g = () => a /* c */ /\n++n + agent(1)\ng()\ng()\n",
+            2,
+        ),
+        ("typeof ending the line", "const g = () => typeof\nagent(1)\ng()\ng()\n", 2),
+        ("a property named in ending the line", "const g = () => o.in\n!agent(1)\ng()\ng()\n", 1),
+        (
+            "a prefix increment after typeof ending the line",
+            "const g = (o) => typeof ++\no[agent(1)]\ng(o)\ng(o)\n",
+            2,
+        ),
+        (
+            "a prefix increment after in ending the line",
+            "const g = (o) => k in ++\no[agent(1)]\ng(o)\ng(o)\n",
+            2,
+        ),
+        (
+            "a long comment in a class heritage clause",
+            "function mixin(B) { agent(1); return B }\nmixin(Object)\n"
+            "class A extends /* a comment long enough to pass any window */ mixin(Object) {\n"
+            "  run() { return 1 }\n}\n",
+            2,
+        ),
+        (
+            "a deeply indented class heritage call",
+            "function mixin(B) { agent(1); return B }\nmixin(Object)\nclass A extends\n"
+            + " " * 48
+            + "mixin(Object) {\n  run() { return 1 }\n}\n",
+            2,
+        ),
+        (
+            "an Allman object method sharing a helper's name",
+            "function review(r) { return agent(r) }\nconst api = {\n  review(r)\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman object method after a comma",
+            "function review(r) { return agent(r) }\nconst api = { a: 1,\n  review(r)\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman class getter sharing a helper's name",
+            "function review(r) { return agent(r) }\nclass A {\n  get review()\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman object method in a conditional's branch",
+            "function review(r) { return agent(r) }\nconst api = c ? 1 : {\n  review(r)\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman class method after a field",
+            "function review(r) { return agent(r) }\nclass A\n{\n  x = 1\n  review(r)\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman class method under a heritage clause",
+            "function review(r) { return agent(r) }\nclass A extends Object {\n  run() {}\n"
+            "  review(r)\n  {\n    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "a call then a bare block in a block",
+            "function review(r) { return agent(r) }\nif (x) {\n  review(1)\n  {\n"
+            "    log(2)\n  }\n}\n",
+            1,
+        ),
+        (
+            "a call then a bare block in a case clause",
+            "function review(r) { return agent(r) }\nswitch (x) {\n  case 1: {\n"
+            "    review(1)\n    {\n      log(2)\n    }\n  }\n}\n",
+            1,
+        ),
     ],
 )
 def test_shapes_the_helper_rules_must_not_misread(

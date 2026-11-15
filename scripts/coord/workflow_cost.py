@@ -173,11 +173,29 @@ def _token_re(helpers: list[str]) -> re.Pattern[str]:
     )
 
 
-# A line ending, or the next line starting, with one of these continues an expression-bodied arrow.
+# Characters that carry an expression on past a value: after an array literal's `]`, the name is
+# bound to something computed from the literal rather than the literal.
 _CONTINUES = "?:.+-*%|&=<>,(["
 _POSTFIX = ("++", "--")
-_SAME_LINE_BRACE_RE = re.compile(r"[ \t]*\{")
-_EXTENDS_BEFORE_RE = re.compile(r"(?<![\w$.])extends\s*$")
+# A line ending in one of these awaits an operand, so the expression goes on to the next line.
+_OPERATOR_TAIL = _CONTINUES + "/^!~"
+# A line opening with a binary operator continues the line before: no `;` is inserted ahead of one.
+# A bare `!` and a `++`/`--` open a new statement instead.
+_LEADS_ON_RE = re.compile("[" + re.escape(_CONTINUES + "/^") + r"]|!==?|(?:in|instanceof)(?![\w$])")
+# A code character after which an operand is expected: what follows it continues the expression.
+_EXPECTS_OPERAND = "(,=:?[&|!+-*/%<>~^"
+# Keywords an operand follows, so a `++`/`--` after one is a prefix operator and not a postfix.
+_OPERAND_WORDS = frozenset(
+    ["in", "instanceof", "typeof", "void", "delete", "new", "await", "yield"]
+    + ["return", "throw", "case", "else", "do"]
+)
+# Of those, the ones a line break may follow: `return`, `throw` and `yield` take a `;` there.
+_LINE_OPERAND_WORDS = _OPERAND_WORDS - {"return", "throw", "yield"}
+# Keywords after which a `{` opens an object literal; any other word before one ends a statement.
+_EXPRESSION_WORDS = (_OPERAND_WORDS - {"else", "do"}) | {"default", "of"}
+# Words that end a walk back through a class head: none of them can sit inside one.
+_HEAD_STOP = _KEYWORDS | _OPERAND_WORDS | {"function", "try", "finally", "default"}
+_MODIFIERS = frozenset(["get", "set", "static", "async"])
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
@@ -313,7 +331,8 @@ def _ends_postfix(text: str, at: int) -> bool:
     """Whether the code character at ``at`` ends a postfix ``++``/``--``.
 
     Only a run of exactly two after a value: ``a+++/x/`` lexes as ``a++ + /x/`` and ``1 + ++`` is a
-    prefix operator, and both still expect an operand.
+    prefix operator, and both still expect an operand. A keyword is not a value: ``typeof ++`` and
+    ``k in ++`` end in a prefix operator too.
     """
     c = text[at] if 0 <= at < len(text) else ""
     if c not in ("+", "-"):
@@ -325,7 +344,19 @@ def _ends_postfix(text: str, at: int) -> bool:
         return False
     while k >= 0 and text[k] in " \t":
         k -= 1
-    return k >= 0 and (text[k].isalnum() or text[k] in "_$)]")
+    if k < 0 or not (text[k].isalnum() or text[k] in "_$)]"):
+        return False
+    word, start = _word_ending_at(text, k)
+    # `o.typeof++` increments a property that happens to share a keyword's name.
+    return word not in _OPERAND_WORDS or text[start - 1 : start] == "."
+
+
+def _word_ending_at(text: str, k: int) -> tuple[str, int]:
+    """The identifier ending at ``k`` and its start, or ``("", k + 1)`` if none ends there."""
+    w = k
+    while w >= 0 and (text[w].isalnum() or text[w] in "_$"):
+        w -= 1
+    return text[w + 1 : k + 1], w + 1
 
 
 @dataclass
@@ -710,20 +741,33 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
         elif depth == 0 and c in ";,":
             return j
         elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
-            # A `++`/`--` starting the next line is a prefix operator after an inserted semicolon.
-            # A postfix result ending this line cannot be called, indexed or dotted, so ASI splits
-            # there unless the next line opens with a binary operator.
-            tail = raw[i:j].rstrip()
             nxt = _NONSPACE_RE.search(raw, j)
-            if nxt is None:
-                return j
-            anew = nxt.group() not in _CONTINUES or raw.startswith(_POSTFIX, nxt.start())
-            if _ends_postfix(raw, i + len(tail) - 1):
-                if anew or nxt.group() in "([.":
-                    return j
-            elif tail[-1] not in _CONTINUES and anew:
+            last = i + len(raw[i:j].rstrip()) - 1
+            if nxt is None or not _line_continues(ctx, last, nxt.start()):
                 return j
     return len(masked)
+
+
+def _line_continues(ctx: _Ctx, last: int, nxt: int) -> bool:
+    """Whether an expression whose line ends at ``last`` goes on at ``nxt``, the next line's code.
+
+    THE ONE CONTINUATION TEST. A line ending in an operator awaits its operand, whatever the next
+    line opens with. Otherwise the next line continues it only by opening with a binary operator: a
+    ``++``/``--`` there is a prefix operator after an inserted ``;``, and a postfix result cannot be
+    called, indexed or dotted, so ASI splits before ``(``, ``[`` and ``.`` after one.
+    """
+    raw = ctx.code
+    leads = not raw.startswith(_POSTFIX, nxt) and _LEADS_ON_RE.match(raw, nxt) is not None
+    if _ends_postfix(raw, last):
+        return leads and raw[nxt] not in "([."
+    # The mask blanks a regex literal, so a `/` it kept is division, not a regex's closing slash.
+    if raw[last] in _OPERATOR_TAIL and ctx.masked[last] == raw[last]:
+        return True
+    # `typeof`/`in` await an operand too.
+    word, start = _word_ending_at(raw, last)
+    if word in _LINE_OPERAND_WORDS and raw[start - 1 : start] != ".":
+        return True
+    return leads
 
 
 def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
@@ -798,7 +842,7 @@ def _is_statement_start(ctx: _Ctx, i: int) -> bool:
         if raw[w + 1 : k + 1] in ("async", "export", "default"):
             k = w
             continue
-        return raw[k] in ";{}" or (newline and raw[k] not in "(,=:?[&|!+-*/%<>~^")
+        return raw[k] in ";{}" or (newline and raw[k] not in _EXPECTS_OPERAND)
 
 
 def _collect_helpers(ctx: _Ctx) -> None:
@@ -1038,15 +1082,131 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
 
 
 def _is_method_head(ctx: _Ctx, name_start: int, open_idx: int) -> bool:
-    """Whether ``name(...)`` at ``open_idx`` is a method head: a ``{`` follows on the same line.
+    """Whether ``name(...)`` at ``open_idx`` defines a method rather than calling a helper.
 
-    Same line only: a call followed by a bare block on the next line must still price the call.
-    ``class A extends mixin(B) {`` calls ``mixin`` even though a brace follows.
+    Decided from what PRECEDES the name: a member position, directly inside a class body or first
+    or after a comma in an object literal, a ``get``/``set``/``static``/``async``/``*`` prefix
+    allowed, with a block after the parameters on any line. Anywhere else a block after the call is
+    a statement of its own, and ``class A extends mixin(B) {`` calls ``mixin`` however much comment
+    or indentation sits between ``extends`` and the name.
     """
-    if _EXTENDS_BEFORE_RE.search(ctx.masked, max(0, name_start - 32), name_start):
-        return False
     close = _match_bracket(ctx.masked, open_idx)
-    return close != -1 and _SAME_LINE_BRACE_RE.match(ctx.code, close + 1) is not None
+    if close == -1 or _block_body(ctx, close + 1) is None:
+        return False
+    brace = _enclosing_open(ctx.masked, name_start)
+    if brace == -1 or ctx.masked[brace] != "{":
+        return False
+    kind = _brace_kind(ctx, brace)
+    if kind == "block":
+        return False
+    code = ctx.code
+    k = _prev_code(code, name_start)
+    while k >= 0:
+        word, start = _word_ending_at(code, k)
+        if code[k] == "*":
+            k = _prev_code(code, k)
+        elif word in _MODIFIERS:
+            k = _prev_code(code, start)
+        else:
+            break
+    if kind == "object":
+        return k >= 0 and code[k] in "{,"
+    return k < 0 or code[k] not in _EXPECTS_OPERAND  # not inside a field's initializer
+
+
+def _prev_code(code: str, i: int) -> int:
+    """Index of the last code character before ``i`` in the comment-blanked text, or -1."""
+    k = i - 1
+    while k >= 0 and code[k].isspace():
+        k -= 1
+    return k
+
+
+def _enclosing_open(masked: str, i: int) -> int:
+    """Index of the innermost bracket still open at ``i``, or -1 at the top level."""
+    depth = 0
+    for k in range(i - 1, -1, -1):
+        c = masked[k]
+        if c in _CLOSERS:
+            depth += 1
+        elif c in _PAIRS:
+            if not depth:
+                return k
+            depth -= 1
+    return -1
+
+
+def _after_conditional(masked: str, colon: int) -> bool:
+    """Whether the ``:`` at ``colon`` closes a conditional's ``?`` branch in the same statement.
+
+    Walks back over balanced brackets to the enclosing bracket or a ``;``. ``?.`` and ``??`` are
+    not a conditional's ``?``.
+    """
+    depth = 0
+    for k in range(colon - 1, -1, -1):
+        c = masked[k]
+        if c in _CLOSERS:
+            depth += 1
+        elif c in _PAIRS:
+            if not depth:
+                return False
+            depth -= 1
+        elif depth == 0 and c == ";":
+            return False
+        elif depth == 0 and c == "?":
+            nxt, before = masked[k + 1 : k + 2], masked[k - 1 : k] if k else ""
+            if nxt not in ("?", ".") and before != "?":
+                return True
+    return False
+
+
+def _brace_kind(ctx: _Ctx, brace: int) -> str:
+    """Whether the ``{`` at ``brace`` opens a ``"class"`` body, an ``"object"`` or a ``"block"``.
+
+    Read from what precedes it. A class head is walked back across lines and over the brackets of
+    its heritage until ``class`` or a word no head can hold. Otherwise a ``{`` after a statement's
+    end, a ``)``, an arrow or ``else``/``do``/``try``/``finally`` opens a block, a ``:`` takes the
+    kind of the braces around it (an object's property, or a label or ``case``), and one after an
+    operator or an expression keyword opens an object.
+    """
+    code, masked = ctx.code, ctx.masked
+    before = k = _prev_code(code, brace)
+    while k >= 0:
+        if code[k] in ")]":
+            k = _match_bracket_back(masked, k, 0)
+            if k == -1:
+                break
+            k = _prev_code(code, k)
+            continue
+        if code[k] == ".":  # `extends ns.Base`
+            k = _prev_code(code, k)
+            continue
+        word, start = _word_ending_at(code, k)
+        if not word:
+            break
+        if word == "class" and code[start - 1 : start] != ".":
+            return "class"
+        if word in _HEAD_STOP:
+            break
+        k = _prev_code(code, start)
+    k = before
+    if k < 0:
+        return "block"
+    c = code[k]
+    if c in ";{})" or code.startswith("=>", k - 1):
+        return "block"
+    if c == ":":
+        outer = _enclosing_open(masked, k)
+        if (outer != -1 and masked[outer] != "{") or _after_conditional(masked, k):
+            return "object"  # a conditional's branch
+        if outer == -1:
+            return "block"  # a label
+        # A property's value inside an object; a label or a `case` inside a block.
+        return "object" if _brace_kind(ctx, outer) == "object" else "block"
+    word, _ = _word_ending_at(code, k)
+    if word:
+        return "object" if word in _EXPRESSION_WORDS else "block"
+    return "object"
 
 
 def _invoked_in_place(ctx: _Ctx, body_end: int) -> bool:
