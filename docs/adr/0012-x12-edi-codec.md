@@ -161,7 +161,8 @@ defining one at `+3`) — must equal the element separator. (Derive these in cod
 not a hand-typed list.) No ISA element's data may hold the element separator or the segment terminator
 (either character of a `CR+LF` one). On a delimiter collision, a sanity-gate failure or such a delimiter
 in ISA element data, the codec's delimiter discovery (`discover_delimiters`, which `X12Peek`,
-`X12Message`, `split` and `check_integrity` run) raises
+`X12Message` and `check_integrity` run; `split` returns such an ISA whole as its own element, per
+the 2026-11-13 amendment below) raises
 **`X12PeekError`** — the Router routes the message to the **error/dead-letter** path (status `ERROR`) rather
 than guessing, honouring the count-and-log invariant (never accept-and-drop). Hardcoding `*~:^` is **wrong** —
 trading partners legitimately vary all four.
@@ -170,8 +171,10 @@ Every codec tokenizer, at least `iter_segments` (which `X12Peek`, `X12Message` a
 read through), `split` and `X12FrameReader`, starts the body past the ISA, so the fixed-width header is
 never read as more than one segment (BACKLOG #5536). `X12FrameReader` counts the ISA in bytes, not
 characters, so that holds for it only while every ISA character is one byte; a multi-byte character in
-ISA element data moves the byte it reads as the terminator. It runs none of the ISA checks above: it
-frames such an ISA whole, and the codec refuses it only where something peeks or parses it. The strict
+ISA element data moves the byte it reads as the terminator. Of the ISA checks above it runs only the
+structural ones, through `isa_separators_line_up` (the 2026-11-13 amendment below), never the
+element-data check: it frames such an ISA whole, and at least the shared ingress guards and anything
+that peeks or parses the frame may refuse it later. The strict
 `validate()` in `parsing/x12/validate.py` runs neither the delimiter discovery nor these tokenizers. It
 hands the raw text to pyx12, which reads its delimiters from the fixed-width ISA but then splits from
 the start of the ISA on the one character at `+105`, so a segment forged in ISA element data can reach
@@ -312,6 +315,63 @@ real failure mode), so it is rejected.
    (documented as not guaranteed byte-identical when cosmetic whitespace was present).
 6. **Sample fixtures. → SYNTHETIC `.edi` SAMPLES.** Create synthetic PHI-free `samples/messages/*.edi` (270
    now, 837P/835 later) plus a `samples/config` X12 inbound example module.
+
+## Amendment (2026-11-13) — framing keeps the data around a bad ISA, in at least the cases below (BACKLOG #5921)
+
+`split` and `X12FrameReader` both run `isa_separators_line_up` (in `parsing/x12/delimiters.py`) on
+each `ISA` to decide whether it opens an interchange. It is the structural part of section 4's checks:
+every fixed element-separator position holds the separator, and the element, component and segment
+delimiters, plus the repetition separator from 00501, are mutually distinct. It never reads element
+data. An `ISA` that fails it, such as a trigram in noise, padded "VISA" text, or a corrupted header, is
+framed through its own `IEA` or up to the next `ISA` that passes, whichever comes first. Such a
+suspect may be held until that next `ISA` arrives. With `max_frame_seconds` set, one still held at
+the frame deadline is dropped with no message row when the listener closes the connection. With it
+disabled, it is held until more bytes arrive or the connection ends, at least through
+`receive_timeout` or a peer close, and dropped with no message row if the connection ends first;
+with both disabled a peer that keeps the socket open quietly keeps it held. The walk of an `ISA`
+that passes ends at its `IEA` or at a later segment that opens with an `ISA` that also passes, the
+whole header present, meaning only the walk's own terminator and whitespace come before it, so an
+interchange with no `IEA` does not swallow the next one. The frame ends at that terminator, the
+whitespace between is discarded, and the `ISA` opens the next frame. A segment that opens with a
+literal `ISA` that fails the check, such as `ISA~`, `ISAX*1~`, `ISA*NOTE*~` or a `<terminator>ISA`
+inside binary segment data, is data in the interchange being walked, so a complete interchange is
+not cut there; the check stops at the first gate position that differs (`ISA~` fails at its +6).
+From that segment on, the walk is also bounded by the next `ISA` that passes, anywhere, as a
+suspect's is, so junk or a cut-off header between an interchange with no `IEA` and the next one
+does not let it swallow that one: a complete interchange reaches its own `IEA` first. While the
+bytes that decide a segment-start `ISA` have not arrived, the reader holds the open frame rather
+than cut it or walk past it, and resumes the check where it stopped on the next read. The costs,
+in at least these cases. An interchange with no `IEA` is framed together with whatever failing run
+follows it, through that run's `IEA` where it has one with the same terminator, or up to the next
+`ISA` that passes, the whitespace before that `ISA` included. Where that run is a corrupted
+interchange, the frame parses under the first interchange's header, carrying the second one's
+groups, and only `check_integrity` reports the mismatch. Where no `ISA` that passes follows, the
+reader holds the whole frame, and a connection that ends drops it with no message row, where the
+earlier rule yielded the interchange with no `IEA` at once. An `ISA` that passes at a segment start
+still cuts the interchange around it; once a failing one has bounded the walk, so does one that
+passes anywhere later, in element data included, and the reader then holds the tail with the real
+`IEA`. Binary data holding a whole interchange can still end or cut the frame around it. While the
+reader holds at a segment-start `ISA` whose header is still arriving, it holds the open frame too,
+so a connection that ends or reaches the frame deadline then drops both. The outbound reply reads
+in `transports/x12.py` use the same reader, so a reply held that way is read as a timeout and the
+send is retried. Another known gap: a complete interchange whose segments from a literal `ISA` to
+the end of what the sender has sent line up at every gate position that has arrived is held in the
+reader until more bytes decide it, as above, where `split` frames it whole.
+Each segment start is checked as the walk reaches it, and the bound's search resumes where the
+last one stopped, so the work stays linear however interchanges are separated. Until a failing segment-start `ISA` bounds the walk, a later `ISA`
+behind anything else, at least a BOM, junk or MLLP envelope bytes, or one in the middle of a
+segment, does not end the walk: an
+interchange with no `IEA` followed that way is still framed together with what follows it, a known
+gap. A second known gap: "ISA", then 101 copies of one character, then CR LF passes the check for
+at least a space or a zero, because its component separator (CR) and terminator (LF) differ from
+that character and from each other, and the version that run spells reads as before 00501, so no
+repetition separator is compared. Such a line is walked as an interchange with an LF terminator. Closing it means reading
+element data, which the check must not do while #5536 frames a delimiter in ISA data whole.
+`X12Peek` and `X12Message` still parse a frame cut there; `check_integrity` reports its missing `SE`,
+`GE` or `IEA`. `split` returns every run other than inter-interchange whitespace/BOM as an element, and an
+`ISA` that passes but that `discover_delimiters` refuses, for a delimiter in its element data (BACKLOG
+#5536), is one such element, framed whole, so the parse of it still refuses it. `split` no longer
+raises for the whole buffer. The reader still discards a run that does not open with `ISA`.
 
 ---
 

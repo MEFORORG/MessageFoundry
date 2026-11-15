@@ -713,7 +713,8 @@ harness locks a live agent's worktree (observed 2026-11-05 with the reason `clau
 long is not seen**, and its tree can be removed under it. Its committed work survives through refs,
 since the branch is never deleted. The ignored cache directories go with the tree, and what is inside
 one is read only for a few data-like names; an ignored entry git lists outside them, such as a `.env`
-or a `*.db` store, refuses it. The header says what else the step does not see.
+or a `*.db` store, refuses it, except the two local files the header names as tolerated. The header
+says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check

@@ -1114,22 +1114,27 @@ class LogForwarderInfo(BaseModel):
     :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
     its own forwarder, and this is the one that answered.
 
-    **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
-    a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
-    seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
+    **A UDP forwarder is never ``healthy``.** Over UDP a send is counted as failed only when it
+    raises an error on this host (BACKLOG #5923), so the engine cannot see a record lost on the
+    wire. ``delivery_confirmed`` is then ``False``, and a forwarder with no fault seen reads
+    ``unconfirmed``. A send that raises a network error, such as ``ENETUNREACH``, sets
+    ``send_failing``. It reaches ``lost`` at least as ``unsent`` with no spool, or as
+    ``spool_dropped`` when the spool refused it; a spool that took the record holds it unsent.
+    A datagram too large to send (``EMSGSIZE``) never sets ``send_failing``: it is dropped as
+    undeliverable, is not kept for a retry, and is counted in ``undeliverable``, so in ``lost``.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 
     state: str  # "healthy" | "unconfirmed" | "degraded" | "not_installed"
     installed: bool
-    delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
+    delivery_confirmed: bool = True  # False over UDP: a datagram lost on the wire is not visible
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
     queued: int = 0  # on the hand-off queue now, both lanes, capped at the smaller lane bound
     queue_dropped: int = 0  # dropped because their lane of the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
-    undeliverable: int = 0  # dropped for a send error that was not a network error
+    undeliverable: int = 0  # dropped: a datagram too large to send, or not a network error
     spool_dropped: int = 0  # the on-disk spool was full or refused the write
     spool_skipped: int = 0  # spooled records found torn, malformed or gone
     spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost

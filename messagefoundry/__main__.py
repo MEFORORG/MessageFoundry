@@ -1070,7 +1070,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     check_privileges.add_argument(
         "--db",
         default=None,
-        help="store path (overrides [store].path; a relative path is read from the current directory)",
+        help="store path (overrides [store].path; a relative path is read under "
+        "[environments].base_dir when one is set, else from the current directory)",
     )
     check_privileges.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -1947,13 +1948,12 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
     each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
     directory can take the name: those are ``engine`` or start ``shard-``."""
-    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.anchor import anchored_store_path, resolve_project_root
 
-    store_path = Path(db_base)
-    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
-    if root is not None and not store_path.is_absolute():
-        store_path = root / store_path
-    return str(_forward_spool_root(settings, str(store_path)) / "supervisor")
+    cwd = Path.cwd()
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+    store_path = anchored_store_path(db_base, root, cwd=cwd)
+    return str(_forward_spool_root(settings, store_path) / "supervisor")
 
 
 def _forwarder_posture_refused(
@@ -2718,7 +2718,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     from messagefoundry.api import create_managed_app
     from messagefoundry.auth.trust_anchors import collect_anchor_specs
-    from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
+    from messagefoundry.config.anchor import (
+        anchor_under_root,
+        anchored_store_path,
+        resolve_project_root,
+    )
     from messagefoundry.config.memory_encryption import (
         READOUT_DISCLAIMER,
         platform_memory_encryption_readout,
@@ -2829,8 +2833,9 @@ def _serve(args: argparse.Namespace) -> int:
     # Anchor a relative [store].path under the root too (whether it came from --db or the settings
     # file): one DB location follows the project root, an absolute path stays put (AC-1/AC-7). Done on
     # the loaded settings so a file-authored relative path is anchored exactly like a relative --db.
-    if effective_root is not None and not Path(settings.store.path).is_absolute():
-        settings.store.path = str(effective_root / settings.store.path)
+    # The rule the offline commands apply too (config/anchor.py), over the root already resolved
+    # above, so it is resolved, and any drive-relative warning given, once.
+    settings.store.path = anchored_store_path(settings.store.path, effective_root, cwd=cwd)
 
     # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind, a
     # declared upstream TLS terminator, or a set [api].trusted_proxies (vault BACKLOG #2251). It is
@@ -5214,17 +5219,16 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
         generated_state_dir,
         record_generated_pair_replacements,
     )
-    from messagefoundry.config.anchor import resolve_project_root
+    from messagefoundry.config.anchor import anchored_store_path, resolve_project_root
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store
 
-    store_path = Path(db_base)
-    root = resolve_project_root(settings.environments.base_dir or None, cwd=Path.cwd())
-    if root is not None and not store_path.is_absolute():
-        store_path = root / store_path
+    cwd = Path.cwd()
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+    store_path = anchored_store_path(db_base, root, cwd=cwd)
 
-    state_dir = generated_state_dir(str(store_path))
+    state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
     ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
     if not replaced:
@@ -5237,7 +5241,7 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
 
     # BACKLOG #1916: the verdict serve's lifespan passes, so the audited opt-out opens the store here
     # as it does there, and a store with no key and no opt-out is refused here as serve would refuse.
-    shard_store = settings.store.model_copy(update={"path": str(store_path)})
+    shard_store = settings.store.model_copy(update={"path": store_path})
 
     async def _audit() -> None:
         store = await open_store(
@@ -6289,6 +6293,11 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         settings, detail = _load_service_settings(args.service_config)
         if settings is None:
             return _cert_fail(f"cannot load --service-config: {detail}", as_json=args.json)
+        # The generated pair sits beside the store serve opens, so anchor its path the way serve
+        # does first, or a site running this away from base_dir is told about a stray pair (#5926).
+        from messagefoundry.config.anchor import anchor_settings_store_path
+
+        anchor_settings_store_path(settings, cwd=Path.cwd())
         # The cert the bind SERVES with, which is no longer the same question as
         # `[api].tls_cert_file`.
         api_plan = plan_api_tls_material(
@@ -6802,6 +6811,7 @@ def _host_gated_store_settings(
     """
     from pathlib import Path
 
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import StoreBackend
 
     cli: dict[str, dict[str, object]] = {}
@@ -6812,6 +6822,8 @@ def _host_gated_store_settings(
     if settings is None:
         _emit_error(detail or "could not load the service settings", as_json=args.json)
         return 2
+    # Before the guard below, so it tests the store serve would open (BACKLOG #5926).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     # The same M-31 guard _audit_verify carries. Before #1780 a SQLite store was CREATED on open, so a
     # typo'd path yielded a fresh empty DB and a false "no such user". open_store now refuses an absent
@@ -6861,39 +6873,110 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
     expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
     ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
+
+    **THE AUDIT ROW COMMITS WITH THE CLEAR, NOT AFTER IT (BACKLOG #5633).** The clear and its row
+    were two writes, and the OS user was named between them, so a failure there left an unlock
+    made and unrecorded. Now the OS user is named before the store opens, and ``clear_lockout``
+    appends the row in the clear's own transaction, as ``admin-reset-totp`` does: both land, or
+    neither does. The pre-check still runs before the write, so the ordinary refusal exits 2.
     """
     import getpass
 
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
+    from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_call_errors,
+        store_connect_errors,
     )
-    from messagefoundry.store.row_seal import RowSealError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.row_seal import (
+        RowSealError,
+        RowSealUnverifiableError,
+        TransitSealUnavailableError,
+    )
+    from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
     posture = _command_hop_posture(settings)
+    # Stripped once, as `admin-reset-totp` and `admin-set-notify-email` strip it, so the argv that
+    # created the account also finds it; every later use reads this value.
+    wanted = args.username.strip()
+    if not wanted:
+        # The shared text, so commands answer a blank name alike (BACKLOG #3391).
+        return _emit_error(f"{BLANK_USERNAME_REFUSAL}; nothing was written", as_json=args.json)
+    try:
+        # Before the store opens: a shell whose OS user cannot be named writes nothing.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({codec_safe_str(exc)}); nothing was "
+            "written",
+            as_json=args.json,
+        )
+    # Could not start, exit 2 (ADR 0171 Amendment C): each is raised before anything is written.
+    # `_UnauditableWrite` is raised by the pre-check, which runs outside the write's catch below.
+    could_not_start: tuple[type[Exception], ...] = (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
+        *_key_unresolved(),
+    )
+    # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
+    # raises when it cannot reach its database (vault BACKLOG #3054, item 10).
+    reach_errors: tuple[type[Exception], ...] = (*store_call_errors(), *store_connect_errors())
+    # Raised by the OPEN: a keyed store opened without its key, or a row the open cannot decrypt.
+    # Could not start, exit 2, as admin-set-notify-email exits on them (BACKLOG #2124).
+    open_errors: tuple[type[Exception], ...] = (StoreKeylessError, CipherError, *reach_errors)
+    # Raised by the read or the write, after the open: the refusals above, plus a cipher or a
+    # Transit row seal that failed. Exit 1: not "could not start". A defect is re-raised first
+    # (AUDIT_WRITE_DEFECTS), so a bug reaches the dispatch floor rather than reading as a refusal.
+    call_errors: tuple[type[Exception], ...] = (
+        CipherError,
+        RowSealUnverifiableError,
+        TransitSealUnavailableError,
+        *reach_errors,
+    )
 
-    async def run() -> tuple[str, dict[str, Any]]:
+    async def run() -> tuple[str, Any]:
+        """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
+        ``open-failed``, ``read-refused`` and ``refused``, else ``None``. Each catch is scoped to
+        its own step, so an error is classed by where it was raised."""
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
         # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
-        store = await _open_store_or_refuse(
-            open_store(
-                settings.store,
-                posture=posture,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            )
-        )
         try:
-            user = await store.get_user_by_username(args.username)
+            store = await _open_store_or_refuse(
+                open_store(
+                    settings.store,
+                    posture=posture,
+                    keyless_chain_refusal=keyless_opt_out_refusal(
+                        settings.store, settings.security
+                    ),
+                )
+            )
+        except (*AUDIT_WRITE_DEFECTS, *could_not_start):
+            raise  # a defect, or a refusal that prints its own text, exit 2, below
+        except open_errors as exc:
+            return ("open-failed", exc)
+        try:
+            try:
+                user = await store.get_user_by_username(wanted)
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except call_errors as exc:
+                return ("read-refused", exc)
             if user is None:
-                return ("no-such-user", {})
+                return ("no-such-user", None)
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
             # what the clear replaced. The engine is stopped for this command (ADR 0171).
@@ -6904,41 +6987,88 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 "second_step_lock_cycles": user.second_step_lock_cycles,
                 "cycles_reset": bool(args.reset_cycles),
             }
-            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             # Read only with users:manage (owner ruling 2026-09-28, BACKLOG #1131): its detail names
             # both locks, which would tell another reader which counter a campaign armed.
-            await store.record_audit(
+            audit = AuditAppend(
                 ADMIN_UNLOCKED_ACTION,
-                actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, **report}),
+                actor=actor,
+                detail=json.dumps({"username": user.username, **report}),
             )
-            return ("unlocked", report)
+            try:
+                cleared = await store.clear_lockout(
+                    user.id, audit=audit, reset_cycles=bool(args.reset_cycles)
+                )
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except call_errors as exc:
+                return ("refused", exc)
+            # False: the row was removed, or changed under the clear's compare-and-set.
+            return ("unlocked", report) if cleared else ("changed", None)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the result: after a commit it would
+            # report a landed unlock as a failure (vault BACKLOG #3054).
+            await _close_store_quietly(store)
 
     try:
-        outcome, report = run_guarded(run())
+        outcome, extra = run_guarded(run())
     # #1916; #1780: a server database with no store (auto mode); #3054: no key; #2532: a store hop
-    # the posture refuses. Could not start.
-    except (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        _UnauditableWrite,
-        _StoreOpenRefused,
-    ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+    # the posture refuses. Could not start. Through `codec_safe_str`: a key source's codec error
+    # quotes a byte of what it decoded (BACKLOG #2532).
+    except could_not_start as exc:
+        # A short server schema says what the open may have changed before it (BACKLOG #5067).
+        left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.", as_json=args.json)
         return 2
     except RowSealError:
         # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
         return _emit_error(
-            _seal_refusal(args.username, "unlock") + ". Nothing was written", as_json=args.json
+            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
         )
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "open-failed":
+        if isinstance(extra, (StoreKeylessError, CipherError)):
+            _emit_error(
+                f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
+            )
+            return 2
+        # #1670: a path that is not a database, or a server the driver could not reach.
+        return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
+    if outcome in ("read-refused", "refused"):
+        # Logged, so the cause can be found: WARNING names the class only, since a driver's
+        # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
+        # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+        log = logging.getLogger(__name__)
+        log.warning(
+            "admin-unlock: the store refused the %s for %r (%s)",
+            "account read" if outcome == "read-refused" else "unlock",
+            wanted,
+            type(extra).__name__,
+        )
+        log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
+    if outcome == "read-refused":
+        return _emit_error(
+            f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
+            "nothing was written. Check the store key and the database, then re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused":
+        return _emit_error(
+            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
+            "its audit row are one transaction, so neither was written, unless a server "
+            "database reported the error after its commit. If the engine is running, stop it "
+            "and re-run; a second unlock is harmless",
+            as_json=args.json,
+        )
+    if outcome == "changed":
+        return _emit_error(
+            f"the account {wanted!r} was removed or changed while this command ran; nothing was "
+            "written. Stop the engine and re-run",
+            as_json=args.json,
+        )
     if outcome == "no-such-user":
-        return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
+        return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
+    report = cast("dict[str, Any]", extra)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, **report}))
+        print(json.dumps({"ok": True, "username": wanted, **report}))
     else:
 
         def _state(label: str, until: float | None) -> str:
@@ -6958,7 +7088,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         kept = "reset to 0" if report["cycles_reset"] else "kept"
         print(
-            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            f"OK: cleared lockout for {wanted!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
         )
     return 0
@@ -7842,6 +7972,7 @@ def _check_privileges(args: argparse.Namespace) -> int:
     and an LDAP over-grant, which do not, and a Vault probe failure that is not a network failure,
     a timeout or a 403, which gates serve's start only where serve's own probe meets it. The exit
     code does not follow it."""
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import hop_posture_from_ai
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.privilege_check import (
@@ -7860,6 +7991,7 @@ def _check_privileges(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    anchor_settings_store_path(settings, cwd=Path.cwd())  # the store serve opens (#5926)
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     others = settings_hops(
@@ -7893,10 +8025,13 @@ def _refuse_an_unauditable_write(store: Store) -> None:
     """Raise :class:`_UnauditableWrite` when ``store`` would refuse this command's audit row.
 
     For a command that writes other rows BEFORE its audit row -- ``provision-admin`` writes the
-    account, ``admin-unlock`` clears the lockout. Without this, a refused audit append lands after
-    those writes, so the change is made and nothing records who made it. The case that reaches it: a
-    keyed chain opened from a shell with no key, under a stale audited opt-out that let the open
-    through.
+    account. Without this, a refused audit append lands after those writes, so the change is made
+    and nothing records who made it. The case that reaches it: a keyed chain opened from a shell
+    with no key, under a stale audited opt-out that let the open through.
+
+    ``admin-unlock`` and ``admin-reset-totp`` append their row in the write's own transaction, so a
+    refused append rolls the write back (BACKLOG #5633, #2226); they call this first so the ordinary
+    refusal exits 2, could not start, before any write is tried.
 
     ``admin-set-notify-email`` writes its audit row first, and calls this anyway: the refusal it
     raises exits 2, could not start, where the append's own refusal could not be told apart from a
@@ -7909,7 +8044,13 @@ def _refuse_an_unauditable_write(store: Store) -> None:
 
 
 def _key_file_access_gate(
-    path: str, *, what: str, remedy: str, enforcing: bool, absent_ok: bool = False
+    path: str,
+    *,
+    what: str,
+    remedy: str,
+    enforcing: bool,
+    absent_ok: bool = False,
+    engine_owned: bool = False,
 ) -> bool:
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
@@ -7918,10 +8059,12 @@ def _key_file_access_gate(
     ``[security].enforcement = enforce`` a problem is an error and the answer is ``False``; under
     ``warn`` it is a warning and the start goes on. ``what`` names the file for the operator and
     ``remedy`` says what to do about it. With ``absent_ok`` a missing file passes, for the loader
-    to fail on."""
+    to fail on. ``engine_owned`` is :func:`key_file_problem`'s, for a file only the engine writes."""
     from messagefoundry.config.key_file_access import key_file_problem
 
-    problem = key_file_problem(path, what=what, remedy=remedy, absent_ok=absent_ok)
+    problem = key_file_problem(
+        path, what=what, remedy=remedy, absent_ok=absent_ok, engine_owned=engine_owned
+    )
     if problem is None:
         return True
     if enforcing:
@@ -7951,7 +8094,8 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
-            "the key again with `messagefoundry protect-key` to a new path"
+            "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
+            "group may delete a file in, with no junction or link on its path that another account can change"
         ),
         enforcing=enforcing,
     )
@@ -7972,13 +8116,16 @@ def _engine_account_name() -> str:
 
 
 def _generated_tls_key_remedy(state_dir: Path) -> str:
-    """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
-    store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
-    #5636), with the path shell-quoted so the command can be pasted as printed."""
+    """What :func:`_generated_tls_key_gate` tells the operator to do. It also covers the store
+    directory the key sits in, which the check judges on every platform (vault BACKLOG #5636,
+    #5657): on POSIX with the commands to fix its mode and owner, the path shell-quoted so they can
+    be pasted as printed, and on Windows in words, since a new pair would land in it again."""
     import shlex
 
     remedy = (
-        "Restrict it to the account the engine runs as, or delete it and its certificate so "
+        "Where the refusal names who owns it, delete it and its certificate so the next start "
+        "mints a pair the engine owns: restricting it does not change its owner. Otherwise "
+        "restrict it to the account the engine runs as, or delete it and its certificate so "
         "the next start mints a new pair. "
     )
     if sys.platform != "win32":
@@ -7988,6 +8135,16 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
+            "Where it names a link on its path, keep the store where no link another account "
+            "can change is above it, since a new pair would be minted in the same place. "
+        )
+    else:
+        remedy += (
+            "Where the refusal names the directory that holds it, that is the store's directory: "
+            "remove a broad group's right to delete files in it or change its access list, and "
+            "give it an owner that is not such a group. Where it names a folder on its path, keep "
+            "the store where no junction or link another account can change is above it. A new pair would be minted in the "
+            "same place again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "
@@ -8011,6 +8168,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
+        engine_owned=True,  # only the engine mints this key, so its owner is vetted
     )
 
 
@@ -9174,6 +9332,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         _is_integrity_refusal,
         provision_notify_email,
     )
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
@@ -9189,6 +9348,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    # This command CREATES the store, so a path left unanchored would mint one beside the working
+    # directory that serve never opens (BACKLOG #5926).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     # AC-15: the argument checks, before the prompt and before any open. The length limits are the
     # web console's (`UserCreateRequest`), and the address limit is the one `admin-set-notify-email`
@@ -10288,11 +10450,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     **It ends every session of the account** in the same transaction, because a session elevated
     with the old seed is what a seed leak buys.
 
-    **THE AUDIT ROW COMMITS WITH THE SWAP, NOT AFTER IT.** ``admin-unlock`` checks the audit refusal
-    before its write and appends its row after it, as a second write
-    (:func:`_refuse_an_unauditable_write`). A failure between the two leaves the change made and
-    unrecorded. For an unlock that is the narrowest change there is, and a re-run repeats it
-    harmlessly. Here the change is a live credential, and the first build of this command hit that
+    **THE AUDIT ROW COMMITS WITH THE SWAP, NOT AFTER IT.** A pre-check before the write and the row
+    appended after it as a second write (:func:`_refuse_an_unauditable_write`) leaves a window: a
+    failure between the two leaves the change made and unrecorded. ``admin-unlock`` shipped that
+    shape until BACKLOG #5633 moved its row into the clear's transaction too. Here the change is a
+    live credential, and the first build of this command hit that
     window: an append refused after the swap left the new seed in force with no audit row and no
     codes shown, reported as a store that could not be opened. So the row joins the swap's
     transaction, the shape ``create_user`` uses for BACKLOG #2100: both land, or neither does. The
@@ -10880,6 +11042,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # which reached the dispatch floor and exited 1 before #2725. Exit 2: could not start.
         _emit_error(detail or "could not load the service settings", as_json=False)
         return 2
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    # Before the refusal below tests the path, so it tests the store serve opens (BACKLOG #5926).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     # A SQLite store was once CREATED (or schema-migrated) on open: a compliance job pointed at a
     # typo'd path, or at the zero-byte file a touch/failed copy leaves behind, got a fresh empty DB
@@ -11110,6 +11276,10 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         # the command could not start, and 1 is a broken chain's code in the audit family.
         _emit_error(detail or "could not load the service settings", as_json=args.json)
         return 2
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    # Before the refusal below tests the path, so it tests the store serve opens (BACKLOG #5927).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     # The SAME guard as _audit_verify, and it matters MORE here: before the read-only open (#1780) a
     # typo'd path or a zero-byte file minted a fresh empty DB and printed `0:` — an anchor OF
@@ -11357,6 +11527,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     """
     from pathlib import Path
 
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
@@ -11372,6 +11543,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
         return 2
+    # Before every check below that tests the path, so each tests the store serve opens (#5927).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
     if settings.store.cipher_provider == "vault_transit":
         # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
         # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
@@ -11753,6 +11926,7 @@ def _backup(args: argparse.Namespace) -> int:
     and prune to keep-N. PHI-safe output (paths/counts/fingerprints only — never a body or key bytes).
     Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
     from messagefoundry import __version__
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
@@ -11772,6 +11946,7 @@ def _backup(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    anchor_settings_store_path(settings, cwd=Path.cwd())  # back up the store serve opens (#5927)
     if not settings.backup.destination.strip():
         return _emit_error(
             "no backup destination — pass --destination or set [backup].destination (a LOCAL/UNC path)",
@@ -11908,6 +12083,7 @@ def _restore_verify(args: argparse.Namespace) -> int:
     + a reason only, never a body)."""
     from pathlib import Path
 
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import run_restore_verify
 
@@ -11920,6 +12096,8 @@ def _restore_verify(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    # The settings a --full check opens the snapshot under name the store serve opens (#5927).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
@@ -12028,6 +12206,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     if settings is None:
         _emit_error(detail or "could not load the service settings", as_json=as_json)
         return 2
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    anchor_settings_store_path(settings, cwd=Path.cwd())  # audit the store serve opens (#5926)
     store = settings.store
     if args.db is not None and store.backend != StoreBackend.SQLITE:
         # --db names a SQLite file. Under a server backend it would be ignored, and the audit would
@@ -12464,6 +12645,11 @@ def _restore(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    # The key custody directory sits beside the store serve opens, so resolve the path the way
+    # serve does before the keys are looked up there (BACKLOG #5927).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     try:
         # `run_restore` carries no `allow_unencrypted` knob at all (unlike `run_restore_verify`): the
@@ -13026,6 +13212,7 @@ def _support_bundle(args: argparse.Namespace) -> int:
     bundle is still produced (support is most wanted when something is already broken)."""
     from pydantic import ValidationError
 
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import load_settings, settings_error_detail
     from messagefoundry.support import build_bundle
 
@@ -13062,6 +13249,9 @@ def _support_bundle(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # The status snapshot reads the store serve opens, not one beside the working directory
+    # (BACKLOG #5927). A no-op when the settings did not load.
+    anchor_settings_store_path(settings, cwd=Path.cwd())
     kwargs: dict[str, Any] = {"config_dir": args.config, "settings": settings}
     if args.log_tail_lines is not None:
         kwargs["log_tail_lines"] = args.log_tail_lines

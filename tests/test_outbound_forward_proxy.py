@@ -535,7 +535,6 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
             timeout=1,
             endpoint="tok",
             connector="c",
-            digest_proxy=True,
         )
     # The peer's algorithm token stays on the cause, off the stored last_error text.
     assert "MD5" not in str(refused_ei.value)
@@ -547,7 +546,6 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
             timeout=1,
             endpoint="tok",
             connector="c",
-            digest_proxy=True,
         )
     assert not isinstance(ei.value, DeliveryError)
 

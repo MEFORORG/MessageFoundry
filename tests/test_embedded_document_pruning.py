@@ -17,10 +17,16 @@ for parity (AC-4): SQLite always; Postgres / SQL Server skipif-gated on ``MEFOR_
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+import sqlite3
+import sys
+import threading
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import pytest
 
@@ -33,7 +39,11 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing import binary
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.retention import RetentionRunner
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, document_strip
+from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.crypto import CipherUnavailableError, IdentityCipher
+from messagefoundry.store.document_strip import StripResult
+from messagefoundry.store.store import OutboxStatus, load_audit_chain
 
 DAY = 86_400.0
 PRUNED_AT = 1_700_000_000.0
@@ -52,9 +62,15 @@ def _hl7_with_ed() -> str:
 
 
 HL7_ED_BODY = _hl7_with_ed()
+_DB_NAME = "embedded_doc_pruning.db"
 
 
 # --- backend fixtures (SQLite always; PG/SQLServer skipif-gated) ---------------
+#
+# The server cases run on the shared live databases of at least the postgres-store,
+# postgres-store-windows and sqlserver-store CI legs (BACKLOG #5651). As in the sibling store suites, a setup failure closes the pool (BACKLOG
+# #1629), and the audit chain is read again from the emptied log, because a keyed chain an earlier
+# file left would make this keyless handle refuse every append.
 
 _PG = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -67,7 +83,7 @@ _MSSQL = pytest.mark.skipif(
 
 
 async def _open_sqlite(tmp_path) -> MessageStore:
-    return await MessageStore.open(tmp_path / "embedded_doc_pruning.db")
+    return await MessageStore.open(tmp_path / _DB_NAME)
 
 
 async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated on
@@ -76,11 +92,16 @@ async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated 
 
     settings = load_settings(environ=os.environ).store
     s = await PostgresStore.open(settings)
-    async with s._pool.acquire() as conn:
-        await conn.execute(
-            "TRUNCATE message_events, audit_log, queue, response, delivered_keys, messages "
-            "RESTART IDENTITY CASCADE"
-        )
+    try:
+        async with s._pool.acquire() as conn:
+            await conn.execute(
+                "TRUNCATE message_events, audit_log, queue, response, delivered_keys, messages "
+                "RESTART IDENTITY CASCADE"
+            )
+        await load_audit_chain(s, read_only=False)
+    except BaseException:
+        await s.close()
+        raise
     return s
 
 
@@ -90,18 +111,27 @@ async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated
 
     settings = load_settings(environ=os.environ).store
     s = await SqlServerStore.open(settings)
-    async with s._pool.acquire() as conn:
-        cur = await conn.cursor()
-        for table in (
-            "message_events",
-            "audit_log",
-            "queue",
-            "response",
-            "delivered_keys",
-            "messages",
-        ):
-            await cur.execute(f"DELETE FROM {table}")
-        await conn.commit()
+    try:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            try:
+                for table in (
+                    "message_events",
+                    "audit_log",
+                    "queue",
+                    "response",
+                    "delivered_keys",
+                    "messages",
+                ):
+                    await cur.execute(f"DELETE FROM {table}")
+                await conn.commit()
+            finally:
+                # Closed before the pool is, so no statement handle outlives its connection.
+                await cur.close()
+        await load_audit_chain(s, read_only=False)
+    except BaseException:
+        await s.close()
+        raise
     return s
 
 
@@ -332,6 +362,667 @@ async def test_unreadable_delimiters_skip_is_logged_once_per_strip_call(
     assert str(readable) not in text
     for piece in ("SEND", "RECV", "MSG0001", "ORU", "^~", DOC.decode()[:20], "C-UNR"):
         assert piece not in text, piece
+
+
+# --- BACKLOG #5651: the write-back is guarded, batched, and off the loop --------
+
+
+def _spy_strip(monkeypatch: pytest.MonkeyPatch, before: Callable[[], None]) -> list[int]:
+    """Wrap ``strip_documents`` so ``before`` runs ahead of each call, on whatever thread the strip
+    runs it on, and return the thread idents the calls ran on."""
+    real = binary.strip_documents
+    threads: list[int] = []
+
+    def spy(*args: Any, **kwargs: Any) -> tuple[str, int, int]:
+        threads.append(threading.get_ident())
+        before()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(document_strip, "strip_documents", spy)
+    return threads
+
+
+_RESEALED = binary.encode(b"RE-SEALED-SYNTHETIC " * 300)
+_PENDING = OutboxStatus.PENDING.value
+
+
+def _change(kind: str, mid: str) -> tuple[str, tuple[Any, ...]]:
+    """Another writer's statement, in ``?`` form, for one kind of concurrent change to ``mid``."""
+    if kind == "body-purged":
+        return "UPDATE messages SET raw=? WHERE id=?", ("", mid)
+    if kind == "body-re-sealed":
+        return "UPDATE messages SET raw=? WHERE id=?", (_RESEALED, mid)
+    return "UPDATE queue SET status=? WHERE message_id=?", (_PENDING, mid)  # re-pended (replay)
+
+
+async def _run_sql_on_server(store: Any, sql: str, params: tuple[Any, ...]) -> None:
+    """Run one other writer's statement on a server backend, committed."""
+    async with store._pool.acquire() as conn:
+        if type(store).__name__ == "PostgresStore":
+            await conn.execute(sql.replace("?", "$1", 1).replace("?", "$2", 1), *params)
+            return
+        cur = await conn.cursor()
+        await cur.execute(sql, params)
+        await conn.commit()
+
+
+def _concurrent_writer(
+    store: Any, tmp_path: Any, sql: str, params: tuple[Any, ...], loop: asyncio.AbstractEventLoop
+) -> Callable[[], None]:
+    """A callable that, the first time it runs, commits ``sql`` as a separate writer: called from
+    inside the strip's transform, it lands between the strip's read of a row and its write-back."""
+    done: list[bool] = []
+    loop_thread = threading.get_ident()
+
+    def write() -> None:
+        if done:
+            return
+        done.append(True)
+        if isinstance(store, MessageStore):
+            with contextlib.closing(sqlite3.connect(tmp_path / _DB_NAME, timeout=30)) as db, db:
+                db.execute(sql, params)
+            return
+        if threading.get_ident() == loop_thread:
+            pytest.fail("the strip ran its transform on the event loop thread")
+        asyncio.run_coroutine_threadsafe(_run_sql_on_server(store, sql, params), loop).result(30)
+
+    return write
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw_after"),
+    [
+        pytest.param("body-purged", "", id="body-purged"),
+        pytest.param("body-re-sealed", _RESEALED, id="body-re-sealed"),
+        pytest.param("re-pended", MFB64_BODY, id="re-pended"),
+    ],
+)
+async def test_a_write_between_the_strips_read_and_write_back_wins(
+    store: MessageStore,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    raw_after: str,
+) -> None:
+    """BACKLOG #5651: a body purge (``raw`` emptied), a key rotation (``raw`` re-sealed) or a replay
+    (a queue row pending again) that commits after the strip read a row and before it writes the
+    row back wins. The strip must not write the stripped copy of the old body over it, must not set
+    the row's ``documents_pruned`` flag, and must not count it. The other writer runs from inside
+    the strip's own transform, so the interleaving is forced rather than left to a scheduler."""
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-RACE")
+    sql, params = _change(kind, mid)
+    _spy_strip(
+        monkeypatch, _concurrent_writer(store, tmp_path, sql, params, asyncio.get_running_loop())
+    )
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult()
+    rec = await _get(store, mid)
+    assert rec["raw"] == raw_after  # the other writer's state stands
+    assert rec["documents_pruned"] is None
+    if kind == "re-pended":
+        # raw is unchanged in this case, so prove the other writer committed rather than failed,
+        # which the strip would have contained as a skipped row with the same end state.
+        [row] = await store.outbox_for(mid)
+        assert row["status"] == _PENDING
+
+
+async def test_the_transform_runs_off_the_event_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: the decrypt, strip and encrypt of a pass run in a worker thread, never on the
+    event loop thread."""
+    await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-THREAD")
+    threads = _spy_strip(monkeypatch, lambda: None)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result.messages_stripped == 1
+    assert threads and threading.get_ident() not in threads
+
+
+async def test_the_scan_reads_candidates_in_bounded_keyset_batches(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: the pass reads at most ``STRIP_BATCH_ROWS`` candidates at a time and walks the
+    whole candidate set by ``(received_at, id)``, ties across a batch boundary included, so every
+    eligible row is still stripped and counted once. An in-flight row and a row on a keep-forever
+    connection, among them, stay as stored."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    batches: list[int] = []
+    real = document_strip.transform_strip_batch
+
+    def spy(cipher: Any, rows: Any, **kwargs: Any) -> Any:
+        batches.append(len(rows))
+        return real(cipher, rows, **kwargs)
+
+    monkeypatch.setattr(document_strip, "transform_strip_batch", spy)
+    eligible = [
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=at, control=f"C-B{i}")
+        for i, at in enumerate((0.0, 0.0, 0.0, 1.0, 2.0))  # three tie on received_at
+    ]
+    in_flight = await store.enqueue_message(
+        channel_id="IB", raw=MFB64_BODY, deliveries=[("OB", "p")], control_id="C-BINF", now=0.0
+    )
+    kept = await _delivered(store, channel_id="IB_KEEP", raw=MFB64_BODY, now=0.0, control="C-BK")
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"),
+        now=PRUNED_AT,
+        connection_cutoffs={"IB": 4 * DAY, "IB_KEEP": float("-inf")},
+    )
+
+    assert (result.messages_stripped, result.documents_stripped) == (5, 5)
+    # Five eligible rows and the keep-forever row pass the loose scan bound; the in-flight row never.
+    assert batches and max(batches) <= 2 and sum(batches) == 6
+    for mid in eligible:
+        assert binary.is_document_tombstone((await _get(store, mid))["raw"])
+    for mid in (in_flight, kept):
+        rec = await _get(store, mid)
+        assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None
+
+
+async def test_a_batch_that_fails_is_passed_over_and_the_scan_goes_on(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5651: a batch whose transform fails is logged and passed over, and the keyset goes
+    on past it, so no row can stall the strip for good. The WARNING names the error's type, never
+    its text or a byte of a body."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    real = document_strip.transform_strip_batch
+    calls: list[int] = []
+
+    def flaky(cipher: Any, rows: Any, **kwargs: Any) -> Any:
+        calls.append(len(rows))
+        if len(calls) == 1:
+            raise RuntimeError("synthetic transform failure SECRET-TEXT")
+        return real(cipher, rows, **kwargs)
+
+    monkeypatch.setattr(document_strip, "transform_strip_batch", flaky)
+    first = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-F1")
+    second = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-F2")
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
+        result = await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, first))["raw"] == MFB64_BODY  # its batch failed
+    assert binary.is_document_tombstone((await _get(store, second))["raw"])  # the scan went on
+    [record] = [r for r in caplog.records if "passed over a batch" in r.getMessage()]
+    text = record.getMessage()
+    assert "RuntimeError" in text and "SECRET-TEXT" not in text and DOC.decode()[:20] not in text
+
+
+async def test_a_write_that_fails_rolls_back_its_batch_and_the_scan_goes_on(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5651: a batch whose write fails is rolled back whole and counts nothing; the
+    keyset moves past it and the next batch is stripped. The WARNING names the error's type, and
+    the traceback goes to DEBUG."""
+    if not isinstance(store, MessageStore) or type(store) is not MessageStore:
+        pytest.skip("drives the SQLite write path")
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    first = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-W1")
+    second = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-W2")
+    real_commit = store._commit
+    commits: list[int] = []
+
+    async def failing_once() -> None:
+        # The first batch's commit fails after its UPDATE ran, so the writer transaction must
+        # roll that UPDATE back.
+        commits.append(1)
+        if len(commits) == 1:
+            raise RuntimeError("synthetic write failure")
+        await real_commit()
+
+    monkeypatch.setattr(store, "_commit", failing_once)
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.document_strip"):
+        result = await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    rec = await _get(store, first)
+    assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None  # rolled back
+    assert binary.is_document_tombstone((await _get(store, second))["raw"])
+    warned = [r for r in caplog.records if "passed over a batch" in r.getMessage()]
+    assert len(warned) == 1 and "RuntimeError" in warned[0].getMessage()
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
+
+
+async def test_one_row_that_fails_to_strip_is_skipped(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a row whose own strip raises is logged and skipped; the rows around it are
+    still stripped."""
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-SB1")
+    good = await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=1.0, control="C-SB2")
+    real = binary.strip_documents
+
+    def one_bad(raw: str, **kwargs: Any) -> tuple[str, int, int]:
+        if raw == MFB64_BODY:
+            raise ValueError("synthetic strip failure")
+        return real(raw, **kwargs)
+
+    monkeypatch.setattr(document_strip, "strip_documents", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, bad))["raw"] == MFB64_BODY
+    assert (await _get(store, good))["raw"] != HL7_ED_BODY
+
+
+async def test_a_batch_with_any_verdict_does_not_end_the_call(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: the call ends early only when every row of a batch got no verdict. A batch
+    where some rows got one (here refused cells) is not an outage: its no-verdict rows are skipped,
+    as on origin/main, and the scan goes on."""
+    ids = [
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-RS{i}")
+        for i in range(5)
+    ]
+    calls: list[str] = []
+
+    def alternate(*_args: Any, message_id: str, channel_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        if ids.index(message_id) % 2:
+            raise CellTagError("messages", "raw", message_id, channel_id)
+        raise CipherUnavailableError("synthetic: no verdict")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", alternate)
+    backend = sys.modules[type(store).__module__]
+
+    async def no_audit(*_args: Any) -> None:
+        return None
+
+    monkeypatch.setattr(backend, "report_cell_tag_failures", no_audit)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult()  # not ended early
+    assert calls == ids
+
+
+async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5651: when auditing the refused cells, the pass's last step, raises after its
+    batches committed, the part-way WARNING still names what was stripped, and the error
+    propagates."""
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-AUD")
+
+    async def broken_report(*_args: Any) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    backend = sys.modules[type(store).__module__]
+    monkeypatch.setattr(backend, "report_cell_tag_failures", broken_report)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"),
+        pytest.raises(RuntimeError, match="synthetic audit"),
+    ):
+        await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert binary.is_document_tombstone((await _get(store, mid))["raw"])
+    [record] = [r for r in caplog.records if "failed part way" in r.getMessage()]
+    assert "1 documents in 1 messages" in record.getMessage()
+
+
+async def test_a_key_service_outage_stops_the_pass(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a batch where at least ``OUTAGE_MIN_ROWS`` rows reached the key service and
+    none got a verdict is an outage: the strip call ends after it, rather than failing, and timing
+    out, once per row of every later batch. The call returns, flagged ``ended_early``, instead of
+    raising."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 3)
+    for i in range(5):
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-O{i}")
+    calls: list[str] = []
+
+    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult(ended_early=True)
+    assert len(calls) == 3  # the first batch only
+
+
+async def test_one_row_the_key_service_gives_no_verdict_on_is_skipped(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: one row that always gets no verdict (an oversized cell, say) is skipped like
+    any unreadable row. It must not end the call, or every later pass would stop at it."""
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-NV1")
+    good = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-NV2")
+    from messagefoundry.store.cell_tag import open_message_cell as real
+
+    def one_bad(cipher: Any, column: str, stored: Any, **kwargs: Any) -> Any:
+        if kwargs["message_id"] == bad:
+            raise CipherUnavailableError("synthetic: no verdict on this one cell")
+        return real(cipher, column, stored, **kwargs)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, bad))["raw"] == MFB64_BODY
+    assert binary.is_document_tombstone((await _get(store, good))["raw"])
+
+
+async def test_a_row_refused_alone_in_its_batch_is_skipped_and_does_not_end_the_call(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a row the key service always gives no verdict on is skipped, as on
+    origin/main, even when it is the only row of its batch to reach the service. Fewer than
+    ``OUTAGE_MIN_ROWS`` such rows are not an outage, so the scan goes on to the rows after it."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-AL1")
+    good = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-AL2")
+    from messagefoundry.store.cell_tag import open_message_cell as real
+
+    def one_bad(cipher: Any, column: str, stored: Any, **kwargs: Any) -> Any:
+        if kwargs["message_id"] == bad:
+            raise CipherUnavailableError("synthetic: no verdict on this one cell")
+        return real(cipher, column, stored, **kwargs)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert binary.is_document_tombstone((await _get(store, good))["raw"])
+
+
+async def test_a_store_wide_cipher_error_from_encrypt_propagates(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a store-wide fail-closed :class:`CipherError` from ``encrypt``, the AES-GCM
+    invocation ceiling here, is not swallowed as one row's failure: it propagates out of the strip,
+    as on origin/main, so its instruction to rotate the store key reaches the operator."""
+    from messagefoundry.store.crypto import CipherError
+
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-CEIL")
+
+    def ceiling(*_args: Any, **_kwargs: Any) -> str:
+        raise CipherError(
+            "AES-GCM invocation ceiling reached for this store's data key; rotate the store "
+            "encryption key (`messagefoundry rotate-key`) and restart before encrypting further"
+        )
+
+    monkeypatch.setattr(store._cipher, "encrypt", ceiling)
+
+    with pytest.raises(CipherError, match="rotate the store encryption key"):
+        await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert (await _get(store, mid))["raw"] == MFB64_BODY
+
+
+async def test_a_failed_batch_read_ends_the_call_and_counts_as_audited_work() -> None:
+    """BACKLOG #5651: a batch read that fails ends the call with ``read_failed`` set. Unlike an
+    outage, a database fault is work for the retention audit row, so a pass whose only event it
+    was still writes that row, recording it."""
+    from messagefoundry.pipeline.retention import RetentionPass
+
+    async def fetch(*_args: Any) -> list[Any]:
+        raise RuntimeError("synthetic read failure")
+
+    async def never(*_args: Any) -> list[Any]:
+        raise AssertionError("no batch to write")
+
+    async def report(_failures: Any) -> None:
+        return None
+
+    result = await document_strip.run_strip_pass(
+        IdentityCipher(),
+        fetch=fetch,
+        write=never,
+        report=report,
+        now=PRUNED_AT,
+        older_than=float("-inf"),
+        connection_cutoffs={"IB": 4 * DAY},
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert (result.ended_early, result.read_failed) == (True, True)
+    quiet: dict[str, Any] = {
+        "messages_purged": 0,
+        "dead_purged": 0,
+        "state_purged": 0,
+        "conn_events_purged": 0,
+        "wal_checkpointed": False,
+        "vacuumed": False,
+        "size_bytes": None,
+        "over_limit": False,
+    }
+    assert RetentionPass(**quiet, documents_strip_read_failed=True).did_work
+    assert not RetentionPass(**quiet, documents_strip_ended_early=True).did_work
+
+
+async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pass(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: an outage in the strip phase does not fail the retention pass: the pass
+    completes and still writes its single ``retention_purge`` audit row, here for a body purge the
+    same pass made."""
+    # Two days old: past their one-day strip window, inside the three-day body window.
+    kept = [
+        await _delivered(
+            store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=3 * DAY, control=f"O1{i}"
+        )
+        for i in range(3)
+    ]
+    # Five days old: its body is purged by the same pass.
+    await _delivered(store, channel_id="IB_KEEP", raw=MFB64_BODY, now=0.0, control="O2")
+    calls: list[str] = []
+
+    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    reg = _registry()
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=3),
+        clock=lambda: 5 * DAY,
+        registry_source=lambda: reg,
+    )
+
+    result = await runner.run_once()
+
+    assert sorted(calls) == sorted(kept)  # the strip phase ran, and ended at the outage
+    assert result.messages_purged == 1 and result.documents_messages_stripped == 0
+    assert result.documents_strip_ended_early
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1  # written for the body purge
+    assert json.loads(audit[0]["detail"])["documents_strip_ended_early"] is True
+
+
+async def test_an_outage_alone_writes_no_retention_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: an early end is not work for the audit row: a pass whose only event is a
+    key-service outage in its strip phase writes no audit row, since that row would go through the
+    failing key service too. The strip logs the early end at WARNING."""
+    for i in range(3):
+        await _delivered(store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=0.0, control=f"OA{i}")
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> str:
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    reg = _registry()
+    no_floor = RetentionSettings(
+        min_free_disk_mb=0, wal_checkpoint_seconds=0, audit_log_warn_rows=0
+    )
+    runner = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: reg)
+
+    result = await runner.run_once()
+
+    assert result.documents_strip_ended_early and not result.did_work
+    assert not [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+
+
+_LOCK_ROW = {"id": "M-LOCK", "channel_id": "IB", "raw": MFB64_BODY, "received_at": 0.0}
+
+
+async def test_the_postgres_write_is_only_guarded_updates_inside_one_transaction() -> None:
+    """BACKLOG #5651: the Postgres write takes no row locks; it is the guarded UPDATEs alone, all in
+    one transaction with no savepoint, so a failure rolls back the whole batch. Each UPDATE carries
+    the compare-and-swap guard. No server runs here, so a recording connection stands in for one."""
+    from messagefoundry.store.postgres import PostgresStore
+
+    calls: list[tuple[str, int]] = []
+    depth = {"n": 0, "max": 0}
+
+    class Txn:
+        async def __aenter__(self) -> None:
+            depth["n"] += 1
+            depth["max"] = max(depth["max"], depth["n"])
+
+        async def __aexit__(self, *_exc: object) -> None:
+            depth["n"] -= 1
+
+    class Conn:
+        def transaction(self) -> Txn:
+            return Txn()
+
+        async def execute(self, sql: str, *_args: Any) -> str:
+            calls.append((sql, depth["n"]))
+            return "UPDATE 1"
+
+    @contextlib.asynccontextmanager
+    async def acquire(**_kwargs: Any) -> AsyncIterator[Conn]:
+        yield Conn()
+
+    pages = [[_LOCK_ROW], []]
+
+    async def fetchall(_sql: str, *_args: Any) -> list[Any]:
+        return pages.pop(0)
+
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = IdentityCipher()
+    store._timed_acquire = acquire
+    store._fetchall = fetchall
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result.messages_stripped == 1
+    [(sql, in_txn)] = calls
+    assert sql.startswith("UPDATE messages") and in_txn == 1 and depth["max"] == 1
+    for part in ("documents_pruned IS NULL", "raw=$4", "NOT EXISTS (SELECT 1 FROM queue"):
+        assert part in sql
+
+
+async def test_the_sqlserver_write_rolls_back_the_whole_batch_on_a_failure() -> None:
+    """BACKLOG #5651: the SQL Server write takes no row locks and catches no per-row error: a
+    failed UPDATE rolls back the whole batch and counts nothing, and the pass goes on. No server
+    runs here, so a recording cursor stands in for one."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    events: list[str] = []
+
+    class Cur:
+        async def execute(self, sql: str, _params: Any = ()) -> None:
+            events.append(sql)
+            raise RuntimeError("synthetic write failure")
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+    @contextlib.asynccontextmanager
+    async def acquire() -> AsyncIterator[object]:
+        yield object()
+
+    @contextlib.asynccontextmanager
+    async def cursor(_conn: object) -> AsyncIterator[Cur]:
+        yield Cur()
+
+    async def commit(_conn: object) -> None:
+        events.append("COMMIT")
+
+    async def rollback(_conn: object, **_kwargs: Any) -> None:
+        events.append("ROLLBACK")
+
+    pages = [[dict(_LOCK_ROW), {**_LOCK_ROW, "id": "M-LOCK-2"}], []]
+
+    async def fetchall(_sql: str, _params: Any = ()) -> list[dict[str, Any]]:
+        return pages.pop(0)
+
+    store: Any = object.__new__(SqlServerStore)
+    store._cipher = IdentityCipher()
+    store._acquire = acquire
+    store._cursor = cursor
+    store._commit = commit
+    store._rollback_or_discard = rollback
+    store._fetchall = fetchall
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult()
+    assert len(events) == 2 and events[0].startswith("UPDATE messages") and events[1] == "ROLLBACK"
+
+
+def test_a_refused_cell_is_returned_with_its_traceback_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a refused cell's error is returned, not raised, so its traceback is cleared;
+    its frames would otherwise keep the batch's bodies alive until the pass ends."""
+
+    def refused(*_args: Any, message_id: str, channel_id: str, **_kwargs: Any) -> str:
+        raise CellTagError("messages", "raw", message_id, channel_id)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", refused)
+    rows = [{"id": "M-1", "channel_id": "IB", "raw": "sealed", "received_at": 0.0}]
+
+    batch = document_strip.transform_strip_batch(
+        IdentityCipher(),
+        rows,
+        now=PRUNED_AT,
+        older_than=1.0,
+        connection_cutoffs=None,
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert (batch.updates, batch.unreadable, batch.outage) == ([], [], False)
+    [failure] = batch.refused
+    assert failure.__traceback__ is None
 
 
 # --- AC-5: one audit row per pass via the runner, recording counts -------------

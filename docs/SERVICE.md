@@ -999,7 +999,9 @@ parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / 
 alert.
 
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
-*and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
+*and* outbounds — from the web console, or by restarting the service. Under the pooled claim mode, a
+router, transform or response lane that is STOPPED when you restart a connection stays STOPPED
+after that restart.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
 re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
 against a still-broken disk leaves the connection halted (and its listener down) and raises another

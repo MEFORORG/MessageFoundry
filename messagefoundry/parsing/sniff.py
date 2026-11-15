@@ -172,23 +172,26 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 
 
 # --- text-only upload gate (ASVS 14.2.8) ------------------------------------------------------------
-# The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.txt/.xml). POST
-# /uploads enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
+# The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.txt/.xml). Its
+# chokepoint enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
 # metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
 # incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses) — or (b) not
-# plausibly plain text (a NUL byte, or a high density of non-printable control bytes in the sampled head).
-# With only plaintext admitted, no embedded-metadata container (EXIF/XMP/docProps) can ever be stored —
-# which is what makes "no metadata stripping" (ASVS 14.2.8) closeable WITHOUT a stripping engine.
+# plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
+# the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
+# stripping engine. What it lets through is stated once, in docs/CONNECTIONS.md, under the
+# uploaded-logs upload policy, "Permitted types".
 
 # Control bytes that are legitimate inside a text diagnostic log: tab, LF, CR, vertical-tab/form-feed, and
 # the MLLP frame bytes (0x0b start-block, 0x1c/0x1d end-block/segment markers) an HL7 capture may carry.
 # Every other C0 control byte (and DEL, 0x7f) counts toward the non-text density.
 _TEXT_ALLOWED_CONTROLS = frozenset(b"\t\n\r\x0b\x0c\x1c\x1d")
-# >30% control bytes in the sampled head => not plausibly text. Loose on purpose: real .hl7/.txt/.xml logs
-# sit far below it (segment/line terminators are the allowed set), while a header-less binary blob sits far
-# above it — the point is to catch binaries the magic table doesn't name, not to police odd-but-textual logs.
+# >30% control bytes in one 8 KiB window => not plausibly text. Loose on purpose: real .hl7/.txt/.xml logs
+# sit far below it (segment/line terminators are the allowed set), and it is not there to police
+# odd-but-textual logs.
 _CONTROL_DENSITY_LIMIT = 0.30
-_TEXT_SAMPLE_BYTES = 8192
+#: The window the density is judged over: consecutive windows from the start, the last one ending at
+#: the body's end. A dense run that straddles two windows is judged as two halves.
+_TEXT_WINDOW_BYTES = 8192
 
 
 def nontext_upload_reason(data: bytes) -> str | None:
@@ -197,26 +200,41 @@ def nontext_upload_reason(data: bytes) -> str | None:
 
     * a leading magic-byte signature of a metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX,
       GIF, TIFF) — these carry embedded metadata (EXIF/XMP/docProps) the text-only feature refuses to store;
-    * a body that is not plausibly plain text — it contains a NUL byte, or the sampled head has a high
-      density of non-printable control bytes.
+    * a body that is not plausibly plain text — it contains a NUL byte anywhere, or one of its
+      consecutive 8 KiB windows has a high density of non-printable control bytes.
 
-    POST /uploads maps a non-``None`` reason to HTTP 415 BEFORE the file is written, so a container can never
-    reach the store. This is a stricter, binary-shaped gate than the 5.2.2 extension/content sniff (which
-    maps a text-but-mismatched body to 400); a container carrying a permitted text extension is caught here
-    first (415), so the 5.2.2 400 path handles the remaining text-vs-extension mismatches."""
+    **The whole body is read (BACKLOG #5551).** What it lets through is stated once, in
+    docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types". The scan is
+    ``bytes`` methods with no per-byte Python loop, but it is linear in the body, so a caller runs it
+    off the event loop.
+
+    ``uploads.validate_upload_content`` runs this first, inside ``UploadStore.save`` and before the
+    file is written, and POST /uploads answers a non-``None`` reason with HTTP 415, so a body that
+    begins with a container's signature never reaches the store. This is a stricter, binary-shaped
+    gate than the 5.2.2 extension/content sniff (which maps a text-but-mismatched body to 400); a container carrying a permitted text extension is
+    caught here first (415), so the 5.2.2 400 path handles the remaining text-vs-extension mismatches."""
     head = _lstrip_bom_ws(data)
     for mime, prefixes in _MAGIC_PREFIXES.items():
         if head.startswith(prefixes):
             return f"body is a {mime} container; the uploaded-logs feature accepts only plain-text logs"
-    sample = data[:_TEXT_SAMPLE_BYTES]
-    if b"\x00" in sample:
+    if b"\x00" in data:
         return "body contains NUL bytes; the uploaded-logs feature accepts only plain-text logs"
-    controls = sum(1 for b in sample if (b < 0x20 or b == 0x7F) and b not in _TEXT_ALLOWED_CONTROLS)
-    if sample and controls / len(sample) > _CONTROL_DENSITY_LIMIT:
-        return (
-            "body has a high density of control characters; the uploaded-logs feature accepts only "
-            "plain-text logs"
-        )
+    # The bytes the density counts, deleted by ``translate`` so the count runs at C speed.
+    counted = bytes(
+        b for b in range(256) if (b < 0x20 or b == 0x7F) and b not in _TEXT_ALLOWED_CONTROLS
+    )
+    size = len(data)
+    for start in range(0, size, _TEXT_WINDOW_BYTES):
+        end = start + _TEXT_WINDOW_BYTES
+        # A last partial window is the body's final whole window instead, overlapping the one before
+        # it, so a few trailing control bytes are never judged on their own.
+        window = data[start:end] if end <= size else data[-_TEXT_WINDOW_BYTES:]
+        controls = len(window) - len(window.translate(None, counted))
+        if controls / len(window) > _CONTROL_DENSITY_LIMIT:
+            return (
+                "body has a high density of control characters; the uploaded-logs feature accepts "
+                "only plain-text logs"
+            )
     return None
 
 

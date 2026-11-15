@@ -366,8 +366,7 @@ async def test_upload_accepts_txt_and_xml(engine: Engine, tmp_path: Path) -> Non
 
 async def test_upload_rejects_binary_container_415(engine: Engine, tmp_path: Path) -> None:
     # ASVS 14.2.8: a metadata-bearing binary container (JPEG/PDF/ZIP incl. DOCX) is refused with HTTP 415
-    # BEFORE anything is written, even under a permitted text extension — so no embedded metadata
-    # (EXIF/XMP/docProps) can be stored (closes "no metadata stripping" without a stripper). The magic
+    # BEFORE anything is written, even under a permitted text extension. The magic
     # bytes are sent as BYTES so they survive multipart encoding; the audit records the shape, never a body.
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
@@ -417,6 +416,29 @@ async def test_upload_rejects_nul_body_415(engine: Engine, tmp_path: Path) -> No
         assert up.status_code == 415, up.text
         assert (await c.get("/uploads", headers=h)).json()["files"] == []
     assert any(a["action"] == "upload.reject" for a in await engine.store.list_audit())
+
+
+async def test_upload_rejects_a_nul_past_the_first_8_kib_415(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #5551: a NUL past the 8 KiB the route used to sample, in an .hl7 whose header
+    passes the sniff, is refused 415 by save()'s whole-body check, and nothing is stored."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    body = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\rPID|1\r" + b"x" * 9000 + b"\x00tail"
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post("/uploads", files={"file": ("late.hl7", body, "text/plain")}, headers=h)
+        assert up.status_code == 415, up.text
+        assert "NUL" in up.json()["detail"]
+        assert "late.hl7" not in up.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+    rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
+    assert len(rej) == 1 and "late" not in str(rej[0]["detail"])
 
 
 async def test_upload_text_formats_pass_text_only_gate(engine: Engine, tmp_path: Path) -> None:

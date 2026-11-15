@@ -50,9 +50,12 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore, WebAuthnCredential, no_audit_row
+from messagefoundry.store.store import AuditAppend, MessageStore, WebAuthnCredential, no_audit_row
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
 from tests._enrolment_code import enrolment_code_for
+
+#: The audit row a test's lockout clear appends: ``clear_lockout`` requires one (BACKLOG #5633).
+_UNLOCK_AUDIT = AuditAppend("auth.admin_unlocked", actor="test")
 
 
 class _FakeNotifier:
@@ -538,7 +541,7 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
         # --- arm 3: parallel COMBINED sign-ins, right password and wrong code ---------------------
         # ADR 0197 routes one factor right to the second-step counter, and the second-step lock
         # refuses a combined sign-in, so this leg is bounded by the same lock as arm 2.
-        await store.clear_lockout(identity.user_id)
+        await store.clear_lockout(identity.user_id, audit=_UNLOCK_AUDIT)
         live = fresh_totp(enroll.secret)
         wrong_code = f"{(int(live[0]) + 1) % 10}{live[1:]}"
         counts["combined"] = 0
@@ -1588,7 +1591,7 @@ async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
         identity, password, steps = await _totp_admin(service, monkeypatch)
         timings: dict[str, list[float]] = {}
         for done in range(1, most_rounds + 1):
-            await store.clear_lockout(identity.user_id)
+            await store.clear_lockout(identity.user_id, audit=_UNLOCK_AUDIT)
             shapes = await _refused_outcomes(service, store, identity, password, steps)
             for label, username, pw, code, setup in shapes:
                 await setup()
@@ -2207,7 +2210,7 @@ async def test_AC10_an_unlock_then_a_new_lock_at_a_high_cycle_count_still_mails(
             await _refuse(service, ADMIN_USERNAME)
             clock.now += 15 * 60 + 1
         assert len(await _lock_notices(service, notifier)) == 1
-        await store.clear_lockout(user_id)
+        await store.clear_lockout(user_id, audit=_UNLOCK_AUDIT)
         clock.now += 86_400 + 1
         await _refuse(service, ADMIN_USERNAME)
         notices = await _lock_notices(service, notifier)

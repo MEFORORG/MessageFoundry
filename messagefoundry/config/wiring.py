@@ -3919,7 +3919,7 @@ def Rest(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4048,7 +4048,7 @@ def FHIR(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4521,7 +4521,7 @@ def DICOMweb(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4534,7 +4534,9 @@ def DICOMweb(
     — it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener, cleartext-credential
     refusal, the retry/dead-letter classification, the ``[egress].allowed_http`` gate) and adds only the
     STOW-RS multipart framing + the ``application/dicom+json`` response classification (a per-instance
-    ``FailedSOPSequence`` → permanent dead-letter; 5xx/408/429/connection errors → retry). This is the
+    ``FailedSOPSequence`` → permanent dead-letter, as are some other 2xx replies that do not confirm
+    the store, though not all; which ones is docs/CONNECTIONS.md *DICOMweb*, *Status classification*;
+    5xx/408/429/connection errors → retry). This is the
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever).
@@ -5003,7 +5005,7 @@ def Soap(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:

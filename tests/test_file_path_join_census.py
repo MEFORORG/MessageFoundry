@@ -463,14 +463,10 @@ SITES: dict[str, Site] = {
     "messagefoundry/__main__.py::_is_console_source_checkout": Site(
         2, REVIEWED, "Package-relative literals, tested for existence."
     ),
-    "messagefoundry/__main__.py::_renew_api_tls_before_spawning": Site(1, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_resolve_offline_anchor": Site(
         1, OPERATOR, "A fixed name under the project root the operator named."
     ),
-    "messagefoundry/__main__.py::_serve": Site(
-        1, OPERATOR, "The operator's [store].path under the project root the operator named."
-    ),
-    "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(2, OPERATOR, _STORE_PATH),
+    "messagefoundry/__main__.py::_supervisor_forward_spool_dir": Site(1, OPERATOR, _STORE_PATH),
     "messagefoundry/__main__.py::_webconsole_provenance_problem": Site(
         1, REVIEWED, "A package-relative literal, compared."
     ),
@@ -1013,8 +1009,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::UploadStore._paths_unfollowed": Site(
         2,
         INTERNAL,
-        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a parent "
-        "check; the reseal instead opens only a regular file, by lstat.",
+        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a check that "
+        "each path resolves to itself, which refuses a symlink but not a hard link; the reseal "
+        "instead opens only a regular file, by lstat.",
     ),
     "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
         1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."

@@ -2727,12 +2727,15 @@ class LogWriteFailurePolicy(str, Enum):  # noqa: UP042
 
 
 class SyslogProtocol(str, Enum):  # noqa: UP042
-    # RFC 5426; fire-and-forget, never blocks the engine (the default).
+    # RFC 5426; fire-and-forget, never blocks the engine (the default). One unframed record per
+    # datagram.
     UDP = "udp"
-    # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
+    # RFC 6587 octet counting (BACKLOG #5924; docs/CONFIGURATION.md forward_protocol states the
+    # framing); connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
     # timeout so a wedged collector can't block the event loop — synchronous send).
     TCP = "tcp"
-    # RFC 5425; syslog over an ssl-wrapped TCP socket (native, no local agent needed — ADR 0080). Same
+    # RFC 5425 octet-counted frames, the same as tcp, over an ssl-wrapped TCP socket (native, no
+    # local agent needed — ADR 0080). Same
     # down-at-startup-skipped + bounded-timeout posture as tcp; the handshake is also bounded so a
     # collector that stalls TLS can't block the event loop. Requires a CA trust anchor unless
     # verification is explicitly disabled (see LoggingSettings.forward_tls_*).

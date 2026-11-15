@@ -208,6 +208,7 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
             proxy=proxy,
             ech_sidecar=ech_sidecar,
             trust_anchor=trust_anchor,
+            connection=connection,
         )
 
     def _fetch_token(self) -> tuple[str, float]:

@@ -312,9 +312,8 @@ The costs, at least these:
 - The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
   refusing web proxy would still fail each message in turn, as before.
 
-The fault is raised only where a Digest handler is on the opener and refuses, or, since
-2026-11-06, in the token hop's `CONNECT` case B.1 states. These unanswered challenges do not
-raise it, at least: a Basic challenge that reaches a handler (read as a plain 401 or 407, on
+The fault is raised only where a Digest handler is on the opener and refuses. These
+unanswered challenges do not raise it, at least: a Basic challenge that reaches a handler (read as a plain 401 or 407, on
 purpose; see B.1), a 407 on a request that went direct rather than through the proxy (read as a
 plain 407, since BACKLOG #2989), and any challenge on a connection with no Digest set up. A Digest challenge
 with no nonce, and one whose `qop` urllib does not support, did not raise it either until B.1. A
@@ -330,7 +329,7 @@ The probe arms and the `FhirLookup` read are not deliveries, so they carry no fa
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
 *Narrowed 2026-10-11: a probe that mints a bearer passes on the token hop's own refusal (B.1),
 which carries the marker; the test-connection route reads it as a `DeliveryError` and shows its
-text.* The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
+text. Since BACKLOG #2989 item 11 no built configuration reaches that refusal.* The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
 
 Tests: `tests/test_digest_refusal_classification.py`, at least
 `test_post_reports_a_refused_challenge_as_a_configuration_fault`,
@@ -374,9 +373,14 @@ for Digest, `smart.request_token` now raises the same fault for the proxy's 407 
 token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognises. Since
 2026-11-13 (BACKLOG #2989 items 14 and 15) its text names the proxy's `CONNECT`, and the match
 reads the status of the proxy's reply and a flag the hop sets when it is built, not
-`http.client`'s message.* The Digest
+`http.client`'s message.*
+*Overtaken 2026-11-14 (BACKLOG #2989 item 11): an OAuth2 or SMART token hop with an `https://` token
+endpoint, whose web proxy resolved for the token host is set up for Digest, is refused when it is
+built, so no built configuration meets this 407 and the send-time match is gone. A token host the
+proxy bypasses builds, and so does a token hop behind an ECH sidecar, whose request goes to the
+loopback sidecar direct.* The Digest
 handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
-error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic is
+error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic was
 read the same way; the engine holds no Basic credential there to answer it with. The remedies
 are a route to the token host that crosses no authenticating proxy, or `proxy_auth_type =
 "basic"`, which urllib sends on the `CONNECT` in recoverable form, where Digest never sends the
@@ -384,7 +388,7 @@ password. A per-host bypass is such a route only where no environment or system 
 carries the request.
 A `CONNECT` 407 on a token hop with no Digest set up, a rejected pre-emptive Basic credential
 among them, still reads as unreachable and retries, which keeps the Basic case above. Any other
-`CONNECT` status retries too. The case needs a loopback `http://` destination, since proxy Digest
+`CONNECT` status retries too. The case needed a loopback `http://` destination, since proxy Digest
 is refused for an `https://` one and a bearer for an off-box `http://` one. For the same reason
 the delivery hops need no change: a delivery hop that sends a `CONNECT` has no Digest set up.
 

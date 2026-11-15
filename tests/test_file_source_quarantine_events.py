@@ -200,11 +200,11 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     source._handler = handler
     moves: list[Path] = []
 
-    def failed_move(path: Path, _dest: Path, *_rest: object) -> bool:
+    def failed_move(path: Path, _dest: Path, *_rest: object) -> tuple[bool, bool]:
         moves.append(path)
-        return False
+        return False, False  # nothing archived (BACKLOG #5717: and not remembered as stuck)
 
-    monkeypatch.setattr(FileSource, "_move", staticmethod(failed_move))
+    monkeypatch.setattr(FileSource, "_archive_to", staticmethod(failed_move))
 
     await _settle(source)
     await source._scan_once()
