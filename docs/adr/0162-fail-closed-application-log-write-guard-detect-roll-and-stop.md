@@ -376,9 +376,8 @@ these moved and not *when*.
 ## Amendment B (2026-11-14) — section 1: a flap latch beside the stage-1 bound (BACKLOG #5812)
 
 **Section 1 above is unedited, and its bound runs as before.** Past 5 rolls in 60 seconds, counted
-from the first roll of the window, the sink is declared unwritable, and every roll past that bound
-pages and, under the `stop` policy, asks for the stop when every sink is unwritable, as before this
-amendment. Amendment A's statement that section 1 describes the shipped module exactly stops being
+from the first roll of the window, the sink is declared unwritable, as before this amendment.
+Amendment A's statement that section 1 describes the shipped module exactly stops being
 true here: section 1 does not describe the latch below.
 
 **What was wrong.** The roll that trips the bound wrote the sink's state as `rolled` and only then
@@ -391,8 +390,7 @@ overlay in its own field, `_flap_latch`, holding a `_FlapLatch` per held sink, a
 bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rule; in short:
 
 - The roll that trips the bound latches the sink, in the same hold of the guard's lock that writes the
-  bound's state, so a reader of `status()` or `can_log()` sees it unwritable before
-  `record_unwritable` runs.
+  bound's state.
 - A later roll keeps the latch while it comes within 60 seconds of the sink's last roll or stage-2
   failure, and the first roll after a longer gap releases it. A stage-2 failure refreshes that clock
   but never starts a latch: a sink stage 2 alone declared dead is not latched.
@@ -411,10 +409,10 @@ bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rul
   read `status()`, so a page that lists the unwritable sinks can name a latched one too.
 
 **What the latch does not change.** The code that computes the bound, its window and streak, the
-state the three `record_*` methods write, every stage-1 and stage-2 page and every stop request is the
+state the three `record_*` methods write, the events the guard fires and every stop request is the
 code on `main` before this amendment, line for line, and it does not read the latch. The latch never
-writes to, rolls or probes a sink. The pages are still one per roll past the bound, not one per
-break: the row's *one page per break* clause is not closed by this amendment.
+writes to, rolls or probes a sink. The row's *one page per break* clause is not closed by this
+amendment.
 
 **Stricter than section 1 between recovery actions, and stated rather than hidden.** A sink the
 latch holds reads unwritable while it may be accepting records, so `can_log()` and `/status` can read
@@ -436,8 +434,8 @@ step and shared, and runner restarts (escalation re-wired, then `revalidate()`),
 sinks, one of them with a probe-less sink and the `continue` policy. Two more drive each module's
 real `handleError` and probe over a fake stream whose write and roll faults are shared by both
 guards, so a write that heals a handle or takes a fault shows up as a later difference. At every
-step it compared the reported state, `can_log()`, the `revalidate()` answer, stage-1 and stage-2
-pages, every event, stop requests, the `/status` fields other than `state`, and the bound's own
+step it compared the reported state, `can_log()`, the `revalidate()` answer, every
+stage-1 and stage-2 event, stop requests, the `/status` fields other than `state`, and the bound's own
 `_sinks` and `_roll_flap`. Over 8 seeds and those 7 configurations it found no step where `main` was
 stricter. It did find such steps on the previous attempt at this item, including a `revalidate()`
 that reset the bound, and, through the real-handler configurations, on a draft of this one that

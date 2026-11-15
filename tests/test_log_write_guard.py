@@ -207,10 +207,11 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
 # alone would not, and never pages, asks for a stop or trips the bound less than the bound alone.
 
 
-def test_every_roll_past_the_bound_pages_and_asks_for_the_stop_as_before(tmp_path: Path) -> None:
-    # The latch never pages less than the bound alone: every roll past the bound pages and asks for
-    # the stop, as on main. Driven by real rolls: a sink that heals on every roll and breaks on every
-    # record, well past the bound. This pins main's paging, which the overlay must leave alone.
+def test_every_roll_past_the_bound_fires_a_stage2_event_as_before(tmp_path: Path) -> None:
+    # The latch never changes the guard's events: every roll past the bound fires a stage-2 event
+    # carrying the stop request, as on main. Driven by real rolls: a sink that heals on every roll
+    # and breaks on every record, well past the bound. This pins main's events, which the overlay
+    # must leave alone.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -308,7 +309,7 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     assert guard.can_log() is True
 
 
-def test_the_roll_that_trips_the_bound_never_reads_writable_before_the_page(
+def test_the_roll_that_trips_the_bound_reads_unwritable_before_record_unwritable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The tripping roll writes the bound's ``rolled`` state and only then calls record_unwritable, so
@@ -608,10 +609,12 @@ def test_revalidate_never_uses_up_a_write_fault_on_a_latched_sink(
         stream.arm()
         handler.emit(_record("break"))
     stops = sum(e.stop_requested for e in events)
+    # Latched: the bound alone reads ``rolled`` after the fresh window's fifth roll.
+    assert guard.status()[0].state == "unwritable"
 
     stream.arm()
     _at(clock, 66.5)
-    guard.revalidate()
+    assert guard.revalidate() is True  # the bound's own answer, with no write to the sink
     _at(clock, 67)
     handler.emit(_record("break"))
 

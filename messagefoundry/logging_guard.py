@@ -21,9 +21,12 @@ module is that second half.
 **And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
 operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
 control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests a dead sink **by
-writing a real record to it**, because ``unwritable`` is only ever set by a failed write and nothing
-clears it on its own: *repaired* and *still broken* are indistinguishable from memory, which is
-exactly the distinction recovery has to make. The engine gates every re-arm path on that answer.
+writing a real record to it**, because ``unwritable``, as a sink's own state, is only ever set by a
+failed write and nothing clears it on its own: *repaired* and *still broken* are indistinguishable
+from memory, which is exactly the distinction recovery has to make. The engine gates every re-arm
+path on that answer. (The state :meth:`LogWriteGuard.status` reports may also include the flap
+latch, see :meth:`LogWriteGuard.record_rollover`; :meth:`LogWriteGuard.revalidate` answers from
+each sink's own state.)
 
 **Scope of the stop is the PROCESS, and the code says so rather than pretending otherwise.** The
 application log is a process-global handler set on the root logger — a write failure is a property of
@@ -254,17 +257,15 @@ class LogWriteGuard:
         is where the rule is stated). The bound's window restarts a minute after its first roll, so a
         sink still rolling every few seconds would otherwise read ``rolled`` again, and
         :meth:`can_log` True with no probe, until the bound trips again. So the roll that trips the
-        bound also latches the sink, in the same hold of the lock that writes the bound's state, so a
-        reader of :meth:`status` or :meth:`can_log` sees it unwritable from that hold on, before
-        :meth:`record_unwritable` has run, until one of the releases below. A later roll keeps the latch while it comes within
-        :data:`_ROLL_FLAP_WINDOW_SECONDS` of the sink's last roll or stage-2 failure, and the first
-        roll after a longer gap releases it. Otherwise only :meth:`revalidate` or
-        :meth:`record_healthy` releases it. **The latch changes nothing above:** it is an overlay in
-        its own field, never touches a sink, and the code that computes the bound, its window and
-        streak, the pages, the stop requests and every field of the recorded status does not read
-        it. It changes what :meth:`status` and :meth:`can_log` answer, and only towards
-        ``unwritable``. It does not make the pages one per break: a roll past the bound pages each
-        time, as the bound always has.
+        bound also latches the sink, in the same hold of the lock that writes the bound's state. A
+        later roll keeps the latch while it comes within :data:`_ROLL_FLAP_WINDOW_SECONDS` of the
+        sink's last roll or stage-2 failure, and the first roll after a longer gap releases it.
+        Otherwise only :meth:`revalidate` or :meth:`record_healthy` releases it. **The latch changes
+        nothing above:** it is an overlay in its own field, never touches a sink, and the code that
+        computes the bound, its window and streak, the events this method and
+        :meth:`record_unwritable` fire, the stop requests and every field of the recorded status
+        does not read it. It changes what :meth:`status` and :meth:`can_log` answer, and only towards
+        ``unwritable``.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -412,13 +413,15 @@ class LogWriteGuard:
             return not all(self._reads_unwritable(s) for s in self._sinks.values())
 
     def revalidate(self) -> bool:
-        """Re-test every unwritable sink BY WRITING TO IT, and report whether the process can log.
+        """Re-test every sink whose own state is unwritable BY WRITING TO IT, and report whether the
+        process can log, from each sink's own state.
 
-        **A cached state cannot answer this, and that is the whole reason this exists.** ``unwritable``
-        is only ever set by a failed write, and nothing clears it on its own — so after an operator
-        fixes the disk the guard still reads "broken", and before they fix it the guard reads "broken"
-        too. The two situations are indistinguishable from memory, which is exactly the distinction the
-        fail-closed recovery path has to make. Each sink's probe writes a real record through the real
+        **A cached state cannot answer this, and that is the whole reason this exists.**
+        ``unwritable``, as a sink's own state, is only ever set by a failed write, and nothing clears
+        it on its own — so after an operator fixes the disk the guard still reads "broken", and
+        before they fix it the guard reads "broken" too. The two situations are indistinguishable
+        from memory, which is exactly the distinction the fail-closed recovery path has to make.
+        Each sink's probe writes a real record through the real
         formatter, rolling the sink first if its live handle is stale (a repaired directory still leaves
         the old handle closed), so "writable" means *a record landed*, not *a stat call succeeded*.
 
@@ -434,7 +437,9 @@ class LogWriteGuard:
         :meth:`_GuardedSinkMixin.handleError`, where the bound counts it; and even one plain write
         can take a one-shot fault the next record would have met. Each of those lets a sink still
         flapping trip the bound later. A sink whose own state IS ``unwritable`` gets the probe below
-        exactly as before, and the latch on it is released only with that state."""
+        exactly as before, and the latch on it is released only with that state. The answer reads
+        the sinks' own states, not the latch, so it is the answer this method gave before the
+        latch existed, even if another thread re-latches a sink while the probes run."""
         with self._lock:
             dead = [name for name, status in self._sinks.items() if status.state == "unwritable"]
             probes = [(name, self._probes.get(name)) for name in dead]
@@ -445,7 +450,10 @@ class LogWriteGuard:
             # guessing on its behalf is how a fail-closed control gets talked out of failing closed.
             if probe is not None and _probe_lands(probe):
                 self.record_healthy(name)
-        return self.can_log()
+        with self._lock:
+            if not self._sinks:
+                return True
+            return not all(s.state == "unwritable" for s in self._sinks.values())
 
     def _fire(self, event: LogSinkEvent) -> None:
         with self._lock:
