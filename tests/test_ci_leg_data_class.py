@@ -13,12 +13,16 @@ This module used to hold the opposite guard: that a serve step which trusts a se
 certificate also sets ``[security].enforcement = warn``, because the escape was honoured only there.
 That pairing came from the ``load test (smoke, sqlserver)`` legs going RED for four nights
 (2026-07-27..30) on ``ValueError: SQL Server TLS is weakened``. It cannot be satisfied any more, so
-the guard now refuses the weakening itself, on every step of every workflow, at PR time, rather
-than on a nightly.
+the guard now refuses the weakening itself, at PR time, rather than on a nightly. It reads every
+workflow's `env:` mappings (workflow, job and step) and every `run:` body, where an `export`, a
+`docker run -e`, a `>> $GITHUB_ENV` line or a PowerShell `$env:` assignment sets the variable.
+It does not read test code, or a value a script computes, so a test that builds its own weakened
+connection string is outside it.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -28,6 +32,11 @@ _ENCRYPT = "MEFOR_STORE_ENCRYPT"
 _RETIRED = "MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA"
 _TRUTHY = {"true", "1", "yes", "on"}
 _FALSY = {"false", "0", "no", "off"}
+#: An assignment in a `run:` body: `export X=v`, `-e X=v`, `X=v >> $GITHUB_ENV`, `$env:X = "v"`.
+_RUN_WEAKENED = re.compile(
+    r"(?i)\b(?:" + _TRUST + r"\s*=\s*['\"]?(?:true|1|yes|on)\b"
+    r"|" + _ENCRYPT + r"\s*=\s*['\"]?(?:false|0|no|off)\b)"
+)
 
 
 def _workflows() -> dict[str, dict[str, Any]]:
@@ -51,7 +60,11 @@ def _weakened(env: dict[str, Any]) -> list[str]:
 
 
 def _offenders(workflows: dict[str, dict[str, Any]]) -> tuple[int, list[str]]:
-    """(env blocks examined, each workflow-level, job-level or step-level env that weakens TLS)."""
+    """(env blocks plus run bodies examined, each one that weakens TLS to the store).
+
+    An env block counts at the workflow, job or step level; a run body counts only where a step has
+    one, so the examined count is not inflated by `uses:` steps.
+    """
     examined = 0
     out: list[str] = []
     for wf_name, wf in workflows.items():
@@ -60,7 +73,13 @@ def _offenders(workflows: dict[str, dict[str, Any]]) -> tuple[int, list[str]]:
             blocks.append((f"{wf_name}:{job_key} (job env)", (job or {}).get("env")))
             for step in (job or {}).get("steps") or []:
                 name = str((step or {}).get("name") or "<unnamed>")
-                blocks.append((f"{wf_name}:{job_key} step {name!r}", (step or {}).get("env")))
+                where = f"{wf_name}:{job_key} step {name!r}"
+                blocks.append((where, (step or {}).get("env")))
+                run = (step or {}).get("run")
+                if not isinstance(run, str):
+                    continue
+                examined += 1
+                out.extend(f"{where} runs {m.group(0)}" for m in _RUN_WEAKENED.finditer(run))
         for where, env in blocks:
             if not isinstance(env, dict):
                 continue
@@ -77,15 +96,37 @@ def test_the_scan_sees_a_weakened_leg() -> None:
             "jobs": {
                 "j": {
                     "env": {_TRUST: "true"},
-                    "steps": [{"name": "s", "env": {_TRUST: True, _ENCRYPT: False}}],
+                    "steps": [
+                        {"name": "s", "env": {_TRUST: True, _ENCRYPT: False}},
+                        {
+                            "name": "r",
+                            "run": (
+                                f"export {_ENCRYPT}=false\n"
+                                f"echo {_TRUST}=true >> $GITHUB_ENV\n"
+                                f"docker run -e {_ENCRYPT}=no img\n"
+                                f'$env:{_TRUST} = "1"\n'
+                            ),
+                        },
+                    ],
                 },
-                "clean": {"steps": [{"name": "ok", "env": {_TRUST: "false", _ENCRYPT: "true"}}]},
+                "clean": {
+                    "steps": [
+                        {"name": "ok", "env": {_TRUST: "false", _ENCRYPT: "true"}},
+                        {"name": "ok-run", "run": f"export {_ENCRYPT}=true {_TRUST}=false"},
+                        {"name": "action", "uses": "actions/checkout@v4"},
+                    ]
+                },
             },
         }
     }
     examined, offenders = _offenders(synthetic)
-    assert examined == 4
+    # 4 env blocks (workflow, job j, step s, step ok) + 2 run bodies (r, ok-run); `uses:` adds none.
+    assert examined == 6
     assert offenders == [
+        f"w.yml:j step 'r' runs {_ENCRYPT}=false",
+        f"w.yml:j step 'r' runs {_TRUST}=true",
+        f"w.yml:j step 'r' runs {_ENCRYPT}=no",
+        f"w.yml:j step 'r' runs {_TRUST} = \"1",
         f"w.yml (workflow env) sets {_ENCRYPT}=false",
         f"w.yml:j (job env) sets {_TRUST}=true",
         f"w.yml:j step 's' sets {_TRUST}=True",
@@ -95,7 +136,7 @@ def test_the_scan_sees_a_weakened_leg() -> None:
 
 def test_no_ci_leg_weakens_tls_to_its_database() -> None:
     examined, offenders = _offenders(_workflows())
-    print(f"[ci-leg-tls] examined {examined} env block(s) across every workflow")
+    print(f"[ci-leg-tls] examined {examined} env block(s) and run body(ies) across every workflow")
     # Liveness: the server-DB legs alone carry dozens of env blocks.
     assert examined > 30, f"expected the workflows' env blocks, found {examined}"
     assert not offenders, (

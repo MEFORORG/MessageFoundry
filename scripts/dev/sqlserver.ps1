@@ -72,7 +72,11 @@ $env:MEFOR_STORE_DATABASE = $Database
 $env:MEFOR_STORE_AUTH = "sql"
 $env:MEFOR_STORE_USERNAME = $Username
 $env:MEFOR_STORE_PASSWORD = $Password
-if ($RootCert) { $env:MEFOR_STORE_SSL_ROOT_CERT = $RootCert }   # verified TLS; nothing permits a weakened store hop
+# Verified TLS: set both keys, so a weakened value left in this shell is not inherited, since
+# nothing permits a weakened store hop. Clear a pin left from an earlier run when -RootCert is empty.
+$env:MEFOR_STORE_ENCRYPT = "true"
+$env:MEFOR_STORE_TRUST_SERVER_CERTIFICATE = "false"
+if ($RootCert) { $env:MEFOR_STORE_SSL_ROOT_CERT = $RootCert } else { Remove-Item Env:MEFOR_STORE_SSL_ROOT_CERT -ErrorAction SilentlyContinue }
 
 Write-Host "Running SQL Server store tests against $Username@${DbServer}:$Port/$Database ..." -ForegroundColor Cyan
 if ($Full) {
