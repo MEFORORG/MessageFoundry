@@ -88,14 +88,15 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    DICOM PS3.5, section 6.2.1 (the PN value representation), puts the alphabetic group first and
-    makes the ideographic and phonetic groups alternate representations of the same name. So the
-    alphabetic group is used whenever any of its family, given or middle components is non-blank.
-    Otherwise the first alternate group, in that order, with a family name is used, and failing
-    that the first alternate group with a given or middle name, so an ideographic-only name is not
-    lost and a group holding only a prefix or suffix is passed over. It returns ``()`` when no
-    group has a family, given or middle name. A blank
-    (spaces-only) component is written empty. A name taken from the ideographic or phonetic group
+    DICOM PS3.5 (the PN value representation) orders the groups alphabetic, ideographic, phonetic,
+    and lets any of them be absent. Which group to use is this project's choice, not the
+    standard's: the alphabetic group is used whenever any of its family, given or middle
+    components is non-blank, because it is the group most likely to stay ASCII under an ``MSH``
+    that declares ASCII. Otherwise the ideographic group, then the phonetic group, is checked for a
+    family name, and failing that the ideographic group, then the phonetic group, for a given or
+    middle name. So an ideographic-only name is not lost, and a group holding only a prefix or
+    suffix is passed over. It returns ``()`` when no group has a family, given or middle name. A
+    blank (spaces-only) component is written empty. A name taken from the ideographic or phonetic group
     carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a receiver that
     reads ``XPN-8`` which group it is. It does not make the text decode. This helper sets no
     character set, and with ``MSH-18`` empty the message declares ASCII. For any non-ASCII name,
@@ -112,8 +113,8 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
         [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
         for group in patient_name.split("=")[:3]
     ]
-    # The alphabetic group if it names anyone; then an alternate with a family name; then an
-    # alternate with a given or middle name. A prefix or suffix alone is no name.
+    # The alphabetic group first, as the one most likely to stay ASCII; a prefix or suffix alone
+    # names nobody, so it never decides the choice.
     alternates = list(enumerate(candidates))[1:]
     group_index: int | None = 0 if any(candidates[0][:3]) else None
     if group_index is None:

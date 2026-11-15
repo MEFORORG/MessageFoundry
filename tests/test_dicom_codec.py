@@ -233,7 +233,7 @@ def test_person_name_components_splits_pn() -> None:
         pytest.param("Doe^Jane^^^Jr", ("Doe", "Jane", "", "Jr"), id="suffix-only"),
         # A sixth component on is malformed, and would land in the coded XPN-6 onward.
         pytest.param("Doe^Jane^Q^Dr^Jr^PhD^L", ("Doe", "Jane", "Q", "Jr", "Dr"), id="too-long"),
-        # A blank alphabetic group falls through to the first populated group, which XPN-8 names.
+        # A blank alphabetic group falls through to an alternate group, which XPN-8 names.
         pytest.param("=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="ideographic-only"),
         pytest.param("^ =Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="blank-alphabetic"),
         pytest.param("^^=^=Yamada", ("Yamada", *[""] * 6, "P"), id="phonetic-only"),
@@ -241,20 +241,29 @@ def test_person_name_components_splits_pn() -> None:
         pytest.param("^^^^^X=Yamada", ("Yamada", *[""] * 6, "I"), id="text-past-fifth"),
         pytest.param("^^^^^X", (), id="only-past-fifth"),
         pytest.param("Doe^ ^Q", ("Doe", "", "Q"), id="blank-middle"),
-        # A group with only a prefix or suffix is no name: the next group is used, or, with none
-        # left, the result is empty.
+        # A group with only a prefix or suffix is no name: the alternates are checked as below, or,
+        # with no name anywhere, the result is empty.
         pytest.param(
             "^^^Dr=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="prefix-only-group"
         ),
         pytest.param("^^^^Jr", (), id="suffix-alone"),
-        # PS3.5: the alphabetic group is primary, so any family, given or middle name in it wins.
+        # Project choice: any family, given or middle name in the alphabetic group wins, since that
+        # group is the most likely to stay ASCII.
         pytest.param("^Testgiven=Yamada^Taro", ("", "Testgiven"), id="alphabetic-given-wins"),
-        pytest.param("^John^Q=^^^^=Smith", ("", "John", "Q"), id="alphabetic-given-middle-wins"),
+        pytest.param(
+            "^Testgiven^Testmiddle=^^^^=Testfamily",
+            ("", "Testgiven", "Testmiddle"),
+            id="alphabetic-given-middle-wins",
+        ),
+        pytest.param("^^Q=Yamada^Taro", ("", "", "Q"), id="alphabetic-middle-wins"),
         pytest.param("^A=^B", ("", "A"), id="alphabetic-before-alternate"),
         pytest.param("^Testgiven=^^^Dr", ("", "Testgiven"), id="given-alone"),
-        # With no name in the alphabetic group: an alternate with a family name, in group order,
-        # then an alternate with a given or middle name.
-        pytest.param("=^A=Smith", ("Smith", *[""] * 6, "P"), id="alternate-family-first"),
+        # With no name in the alphabetic group: the ideographic, then the phonetic group with a
+        # family name, then the ideographic, then the phonetic group with a given or middle name.
+        pytest.param("=Yamada=Yamada2", ("Yamada", *[""] * 6, "I"), id="ideographic-family-first"),
+        pytest.param(
+            "=^Testgiven=Testfamily", ("Testfamily", *[""] * 6, "P"), id="alternate-family-first"
+        ),
         pytest.param("=^A=^B", ("", "A", *[""] * 5, "I"), id="first-alternate-given"),
         pytest.param("^^^Dr=^^Q", ("", "", "Q", *[""] * 4, "I"), id="middle-alone"),
         pytest.param("^^^^", (), id="all-empty"),
