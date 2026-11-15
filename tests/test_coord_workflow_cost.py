@@ -442,6 +442,51 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             3,
         ),
         (
+            "a comment between a helper's head and its body",
+            "const R = [1, 2, 3]\nasync function review(r) /* one row */ { return agent(r) }\n"
+            "await parallel(R.map(r => () => review(r)))\n",
+            3,
+        ),
+        (
+            "a documented helper",
+            "const R = [1, 2, 3]\n/** Review one row. */\nfunction review(r) { return agent(r) }\n"
+            "await parallel(R.map(r => () => review(r)))\n",
+            3,
+        ),
+        (
+            "a multi-line template inside an expression-bodied helper",
+            "const R = [1, 2, 3]\nconst review = r => skip(r) ? `nothing\nto do` : agent(r)\n"
+            "await parallel(R.map(r => () => review(r)))\n",
+            3,
+        ),
+        (
+            "a trailing comment ending in a continuation character",
+            "const fmt = r => `row ${r}` // format one row.\nawait agent('synthesise')\n",
+            1,
+        ),
+        (
+            "a named function expression bound to the same name",
+            "const R = [1, 2, 3]\nconst review = function review(r) { return agent(r) }\n"
+            "await parallel(R.map(r => () => review(r)))\n",
+            3,
+        ),
+        (
+            "an immediately invoked arrow",
+            "await (async () => { const R = [1, 2, 3]; await parallel(R.map(r => () => agent(r))) })()\n",
+            3,
+        ),
+        (
+            "an export default entry point",
+            "export default async function main() {\n  const R = [1, 2, 3]\n"
+            "  await parallel(R.map(r => () => agent(r)))\n}\n",
+            3,
+        ),
+        (
+            "an array length read inside an interpolation",
+            "const R = [1, 2]\nawait parallel(R.map(r => () => agent(`${R.length} rows`)))\n",
+            2,
+        ),
+        (
             "a helper that starts nothing, passed as a value",
             "const fmt = x => x + 1\nconst show = r => fmt(r)\nlog([1].map(show))\nawait agent(1)\n",
             1,
@@ -486,6 +531,27 @@ def test_shapes_the_helper_rules_must_not_misread(
         (
             "an array filled through an alias",
             "const R = []\nconst T = R\nT.push(1)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "a workflow inside an object property",
+            "const h = { sub: () => workflow('other') }\nawait h.sub()\n",
+        ),
+        (
+            "an agent after an object literal inside an interpolation",
+            "const s = `${fmt({ a: 1 }) + await agent(1)}`\n",
+        ),
+        (
+            "an array computed from its literal",
+            "const R = [1].concat(found)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "an array pushed inside an interpolation",
+            "const R = [1, 2]\nlog(`${R.push(3)}`)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "an array spliced under a spread",
+            "const R = [1]\nconst copy = [...R.splice(0, 0, 2, 3)]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
         ),
         (
             "an array handed to a function",

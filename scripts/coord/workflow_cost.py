@@ -111,6 +111,7 @@ _BINDING_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=
 _FUNCTION_EXPR_RE = re.compile(r"(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z_$][\w$]*)?\s*\(")
 _ASYNC_RE = re.compile(r"async\b\s*")
 _NONSPACE_RE = re.compile(r"\S")
+_EXPORT_DEFAULT_RE = re.compile(r"(?<![\w$.])export\s+default\s+(?:async\s+)?$")
 # `for (x of R)`, and `pipeline(R, ...)`, whose first argument is only ever iterated.
 _READ_PREFIX_RE = re.compile(r"(?:(?<![\w$.])(?:of|in)|(?<![\w$.])pipeline\s*\()\s*$")
 _CHANGES_RE = re.compile(r"\s*(?:" + _ASSIGN + r"|\+\+|--)")
@@ -168,7 +169,7 @@ def _token_re(helpers: list[str]) -> re.Pattern[str]:
 
 
 # A line ending, or the next line starting, with one of these continues an expression-bodied arrow.
-_CONTINUES = "?:.+-*/%|&=<>,(["
+_CONTINUES = "?:.+-*%|&=<>,(["
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
@@ -262,6 +263,10 @@ class _Ctx:
     helper_stack: list[str] = field(default_factory=list)
     token_re: re.Pattern[str] = field(default_factory=lambda: _token_re([]))
     interps: list[tuple[int, int]] = field(default_factory=list)
+    held_newlines: set[int] = field(default_factory=set)
+    # The raw text with only COMMENTS blanked: literals intact, so "is there code here" and "what
+    # is the last character of this line" can be read without a comment deciding the answer.
+    code: str = ""
     # Offsets of every `agent` token, and every helper call, the pricer actually attributed to a
     # site. `_residue` reports the rest, so an unrecognised construct cannot contribute zero in
     # silence.
@@ -292,22 +297,36 @@ def _is_regex_position(prev: str) -> bool:
     return prev == "" or not (prev.isalnum() or prev in "_$)]}")
 
 
-def _mask(src: str, interps: list[tuple[int, int]] | None = None) -> str:
+@dataclass
+class _MaskNotes:
+    """What ``_mask`` saw while blanking, for the readers that need more than the masked text."""
+
+    interps: list[tuple[int, int]] = field(default_factory=list)  # each top-level `${...}` inside
+    comments: list[tuple[int, int]] = field(default_factory=list)
+    held_newlines: set[int] = field(default_factory=set)  # newlines inside a blanked span
+
+
+def _mask(src: str, notes: _MaskNotes | None = None) -> str:
     """Blank out comments, strings, template literals and regexes, PRESERVING length and newlines.
 
     Positions and line numbers in the masked text therefore address the original file exactly, so
-    findings can be reported against real line numbers without a second mapping. ``interps``, when
-    given, collects the span of every top-level ``${...}`` so the residue can still look inside.
+    findings can be reported against real line numbers without a second mapping. ``notes``, when
+    given, collects interpolation and comment spans and the newlines a blanked span holds.
     """
     out = list(src)
     n = len(src)
     i = 0
     prev = ""
+    notes = notes if notes is not None else _MaskNotes()
 
-    def blank(start: int, stop: int) -> None:
+    def blank(start: int, stop: int, comment: bool = False) -> None:
+        if comment:
+            notes.comments.append((start, min(stop, n)))
         for k in range(start, min(stop, n)):
             if out[k] != "\n":
                 out[k] = " "
+            else:
+                notes.held_newlines.add(k)
 
     while i < n:
         c = src[i]
@@ -315,14 +334,14 @@ def _mask(src: str, interps: list[tuple[int, int]] | None = None) -> str:
         if c == "/" and i + 1 < n and src[i + 1] == "/":
             end = src.find("\n", i)
             end = n if end == -1 else end
-            blank(i, end)
+            blank(i, end, comment=True)
             i = end
             continue
 
         if c == "/" and i + 1 < n and src[i + 1] == "*":
             end = src.find("*/", i + 2)
             end = n if end == -1 else end + 2
-            blank(i, end)
+            blank(i, end, comment=True)
             i = end
             continue
 
@@ -341,9 +360,9 @@ def _mask(src: str, interps: list[tuple[int, int]] | None = None) -> str:
             continue
 
         if c == "`":
-            # A template literal masks whole, `${...}` interpolations included. A hook call inside
-            # an interpolation would be missed; none has ever been written and the alternative is
-            # re-entering code mode mid-string, which desynchronises far more often than it helps.
+            # A template literal masks whole, `${...}` interpolations included, so no pricer sees
+            # a call inside one; re-entering code mode mid-string desynchronises far more often
+            # than it helps. The residue reads the recorded interpolation spans instead.
             j = i + 1
             depth = 0
             interp_start = 0
@@ -357,10 +376,12 @@ def _mask(src: str, interps: list[tuple[int, int]] | None = None) -> str:
                     depth += 1
                     j += 2
                     continue
-                if src[j] == "}" and depth:
+                if src[j] == "{" and depth:  # an object or block inside the interpolation
+                    depth += 1
+                elif src[j] == "}" and depth:
                     depth -= 1
-                    if not depth and interps is not None:
-                        interps.append((interp_start, j))
+                    if not depth:
+                        notes.interps.append((interp_start, j))
                     j += 1
                     continue
                 if src[j] == "`" and depth == 0:
@@ -456,12 +477,25 @@ def _is_declared_at(ctx: _Ctx, i: int) -> bool:
 
 
 def _word_re(name: str) -> re.Pattern[str]:
-    return re.compile(r"(?<![\w$.])" + re.escape(name) + r"(?![\w$])")
+    """A reference to ``name``: not a member (``x.name``), but a spread (``...name``) counts."""
+    return re.compile(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(name) + r"(?![\w$])")
 
 
 def _declaration_count(ctx: _Ctx, name: str) -> int:
-    """How many times ``name`` is declared with ``const``/``let``/``var``/``function`` anywhere."""
-    return sum(1 for m in _word_re(name).finditer(ctx.masked) if _is_declared_at(ctx, m.start()))
+    """How many times ``name`` is declared with ``const``/``let``/``var``/``function`` anywhere.
+
+    A named function EXPRESSION (``const review = function review(r) {...}``) names its own body
+    rather than declaring a second binding, so ``function NAME`` counts only in statement position.
+    """
+    count = 0
+    for m in _word_re(name).finditer(ctx.masked):
+        lo = max(0, m.start() - 16)
+        kw = _DECLARED_BEFORE_RE.search(ctx.masked, lo, m.start())
+        if kw and not (
+            kw.group().startswith("function") and not _is_statement_start(ctx, kw.start())
+        ):
+            count += 1
+    return count
 
 
 def _first_assignment(ctx: _Ctx, name: str) -> int | None:
@@ -473,12 +507,15 @@ def _first_assignment(ctx: _Ctx, name: str) -> int | None:
     return None
 
 
-def _is_read(ctx: _Ctx, i: int, end: int) -> bool:
-    """Whether the reference to an array name in ``[i, end)`` provably leaves its length alone."""
-    masked = ctx.masked
+def _is_read(masked: str, i: int, end: int) -> bool:
+    """Whether the reference to an array name in ``[i, end)`` provably leaves its length alone.
+
+    ``masked`` is the masked text, or the raw text for a reference inside an interpolation.
+    """
     before = masked[max(0, i - 24) : i]
-    if before.rstrip().endswith("...") or _READ_PREFIX_RE.search(before):
-        return True
+    # `...R`, `of R` and `pipeline(R` iterate the name -- but only when nothing hangs off it, or
+    # `[...R.splice(0, 0, x)]` would pass as a read.
+    bare_read = before.rstrip().endswith("...") or _READ_PREFIX_RE.search(before) is not None
     j = _skip_space(masked, end)
     if masked.startswith("=>", j):  # a parameter of the same name: another binding
         return True
@@ -490,7 +527,7 @@ def _is_read(ctx: _Ctx, i: int, end: int) -> bool:
         close = _match_bracket(masked, j)
         return close != -1 and not _CHANGES_RE.match(masked, close + 1)
     else:
-        return False
+        return bare_read
     method = _IDENT_RE.match(masked, _skip_space(masked, j))
     if method is None:
         return False
@@ -502,10 +539,19 @@ def _is_read(ctx: _Ctx, i: int, end: int) -> bool:
 
 
 def _first_unsafe_use(ctx: _Ctx, name: str) -> int | None:
-    """Offset of the first reference to ``name`` that is not a provable read, or None."""
-    for m in _word_re(name).finditer(ctx.masked):
-        if not _is_declared_at(ctx, m.start()) and not _is_read(ctx, m.start(), m.end()):
+    """Offset of the first reference to ``name`` that is not a provable read, or None.
+
+    A reference inside a template interpolation is invisible in the masked text, so those spans
+    are read in the raw text: ``${R.push(3)}`` changes the length as surely as a statement does.
+    """
+    word = _word_re(name)
+    for m in word.finditer(ctx.masked):
+        if not _is_declared_at(ctx, m.start()) and not _is_read(ctx.masked, m.start(), m.end()):
             return m.start()
+    for lo, hi in ctx.interps:
+        for m in word.finditer(ctx.raw, lo, hi):
+            if not _is_read(ctx.raw, m.start(), m.end()):
+                return m.start()
     return None
 
 
@@ -530,7 +576,10 @@ def _collect_array_widths(ctx: _Ctx) -> tuple[dict[str, int], dict[str, str]]:
             continue
         name = m.group(1)
         parts = _split_top_level(ctx, open_idx + 1, close)
-        if _has_spread(ctx, parts):
+        after = _skip_space(ctx.masked, close + 1)
+        if after < len(ctx.masked) and ctx.masked[after] in _CONTINUES + "!/":
+            unstable[name] = "is computed from its literal, not the literal itself"
+        elif _has_spread(ctx, parts):
             unstable[name] = "is built by spread"
         widths[name] = len(parts)
     for name in widths:
@@ -562,7 +611,7 @@ def _skip_space(text: str, i: int) -> int:
 def _expr_end(ctx: _Ctx, i: int) -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues."""
-    masked, raw = ctx.masked, ctx.raw
+    masked, raw = ctx.masked, ctx.code
     depth = 0
     for j in range(i, len(masked)):
         c = masked[j]
@@ -574,7 +623,7 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
             depth -= 1
         elif depth == 0 and c in ";,":
             return j
-        elif depth == 0 and c == "\n" and raw[i:j].strip():
+        elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             if raw[i:j].rstrip()[-1] not in _CONTINUES and (
                 nxt is None or nxt.group() not in _CONTINUES
@@ -593,7 +642,7 @@ def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
 
 def _block_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
     """The inside of the ``{...}`` block starting at the first code at or after ``i``."""
-    brace = _skip_space(ctx.raw, i)
+    brace = _skip_space(ctx.code, i)
     if brace >= len(ctx.masked) or ctx.masked[brace] != "{":
         return None
     end = _match_bracket(ctx.masked, brace)
@@ -605,14 +654,14 @@ def _arrow_body(ctx: _Ctx, after_arrow: int) -> tuple[int, int]:
     block = _block_body(ctx, after_arrow)
     if block is not None:
         return block
-    body = _skip_space(ctx.raw, after_arrow)
+    body = _skip_space(ctx.code, after_arrow)
     return body, _expr_end(ctx, body)
 
 
 def _bound_function_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
     """The body of the function expression or arrow starting at ``i``, if one starts there."""
     masked = ctx.masked
-    i = _skip_space(ctx.raw, i)
+    i = _skip_space(ctx.code, i)
     fn = _FUNCTION_EXPR_RE.match(masked, i)
     if fn:
         return _function_body(ctx, fn.end() - 1)
@@ -623,12 +672,12 @@ def _bound_function_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
         close = _match_bracket(masked, i)
         if close == -1:
             return None
-        arrow = _skip_space(ctx.raw, close + 1)
+        arrow = _skip_space(ctx.code, close + 1)
     else:
         ident = _IDENT_RE.match(masked, i)
         if not ident:
             return None
-        arrow = _skip_space(ctx.raw, ident.end())
+        arrow = _skip_space(ctx.code, ident.end())
     if not masked.startswith("=>", arrow):
         return None
     return _arrow_body(ctx, arrow + 2)
@@ -640,7 +689,7 @@ def _is_statement_start(ctx: _Ctx, i: int) -> bool:
     ``R.map(function review(r) {...})`` names a function it never calls by name; registering it
     as a helper would skip its body and price the fan at zero.
     """
-    raw = ctx.raw
+    raw = ctx.code
     k = i - 1
     while True:
         newline = False
@@ -669,7 +718,10 @@ def _collect_helpers(ctx: _Ctx) -> None:
     found: dict[str, list[_Helper]] = {}
     bodies: list[tuple[int, int]] = []
     for m in _FUNCTION_DECL_RE.finditer(ctx.masked):
-        span = _function_body(ctx, m.end() - 1) if _is_statement_start(ctx, m.start()) else None
+        # `export default function main` is the entry point the runtime calls, not a helper.
+        entry = _EXPORT_DEFAULT_RE.search(ctx.code, max(0, m.start() - 32), m.start())
+        statement = _is_statement_start(ctx, m.start()) and entry is None
+        span = _function_body(ctx, m.end() - 1) if statement else None
         if span:
             found.setdefault(m.group(1), []).append(_Helper(m.start(1), *span))
     for m in _BINDING_RE.finditer(ctx.masked):
@@ -885,6 +937,15 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
     return total
 
 
+def _invoked_in_place(ctx: _Ctx, body_end: int) -> bool:
+    """Whether the function whose body ends at ``body_end`` is called right there: ``(...)()``."""
+    i = body_end + 1 if ctx.masked[body_end : body_end + 1] == "}" else body_end
+    i = _skip_space(ctx.code, i)
+    if ctx.masked[i : i + 1] != ")":
+        return False
+    return ctx.masked[_skip_space(ctx.code, i + 1) : _skip_space(ctx.code, i + 1) + 1] == "("
+
+
 def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
     """Where the scan resumes past a function value nothing in view invokes (BACKLOG #5602).
 
@@ -895,13 +956,18 @@ def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
     ``invoked`` set, because the construct itself calls it.
     """
     if m.group("arrow"):
-        return _arrow_body(ctx, m.end())[1]
+        end = _arrow_body(ctx, m.end())[1]
+        return m.end() if _invoked_in_place(ctx, end) else end
     if m.group("fn"):
+        if _EXPORT_DEFAULT_RE.search(ctx.code, max(0, m.start() - 32), m.start()):
+            return m.end()  # the module's entry point: the runtime calls it
         fn = _FUNCTION_EXPR_RE.match(ctx.masked, m.start())
         span = _function_body(ctx, fn.end() - 1) if fn else None
-        return span[1] if span else m.end()
-    if m.group("method") in _KEYWORDS:
-        return m.end()
+        if span is None or _invoked_in_place(ctx, span[1]):
+            return m.end()
+        return span[1]
+    if m.group("method") in _KEYWORDS or _is_declared_at(ctx, m.start()):
+        return m.end()  # `function main(` was already judged at its `function` keyword
     close = _match_bracket(ctx.masked, m.end() - 1)
     span = _block_body(ctx, close + 1) if close != -1 else None  # `review(r) { ... }`
     return span[1] if span else m.end()
@@ -1012,6 +1078,7 @@ def _price_hook(ctx: _Ctx, hook: str, name_start: int, open_idx: int, close: int
         return Cost(agents=1, sites=(Site(ctx.line_of(name_start), "agent(...)", 1, 1, 1),))
 
     if hook == "workflow":
+        ctx.attributed.add(name_start)
         # Shares this run's agent counter, but its body is another file. Naming it is the only
         # honest answer; returning zero and staying quiet is the #1400 failure one layer down.
         return Cost(
@@ -1111,7 +1178,7 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
         if not grown:
             break
         reach |= grown
-    words = [_AGENT_WORD_RE] + [_word_re(n) for n in reach - {"agent", "workflow"}]
+    words = [_AGENT_WORD_RE] + [_word_re(n) for n in reach - {"agent"}]
     hits = [m for word in words for m in word.finditer(ctx.masked)]
     # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
     # pricer. Read the raw text there; an `agent` in a string inside one reads as a false hit,
@@ -1119,7 +1186,11 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
     hits += [m for lo, hi in ctx.interps for m in starts.finditer(ctx.raw, lo, hi)]
     out: list[Unknown] = []
     for m in sorted(hits, key=lambda m: m.start()):
-        if m.start() in ctx.attributed or m.start() in ctx.def_names:
+        if (
+            m.start() in ctx.attributed
+            or m.start() in ctx.def_names
+            or _is_declared_at(ctx, m.start())
+        ):
             continue
         line_end = ctx.raw.find("\n", m.start())
         out.append(
@@ -1156,8 +1227,20 @@ def workflow_name(source: str) -> str | None:
 
 def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
-    interps: list[tuple[int, int]] = []
-    ctx = _Ctx(raw=source, masked=_mask(source, interps), interps=interps)
+    notes = _MaskNotes()
+    masked = _mask(source, notes)
+    chars = list(source)
+    for lo, hi in notes.comments:
+        for k in range(lo, hi):
+            if chars[k] != "\n":
+                chars[k] = " "
+    ctx = _Ctx(
+        raw=source,
+        masked=masked,
+        interps=notes.interps,
+        held_newlines=notes.held_newlines,
+        code="".join(chars),
+    )
     ctx.widths, ctx.unstable = _collect_array_widths(ctx)
     _collect_helpers(ctx)
     cost = _price(ctx, 0, len(ctx.masked))
