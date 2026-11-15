@@ -36,12 +36,18 @@ import tokenize
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import FunctionType
 
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
     Reference,
     ReferenceIndex,
+    SourceCache,
     build_reference_index,
+    config_module_files,
+    loaded_names,
+    reached_functions,
+    table_kinds,
 )
 from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
@@ -67,6 +73,9 @@ RENAMEABLE_KINDS = frozenset(
 #: it, and its definition literal is rewritten like any other code-first declaration (see
 #: :data:`_DECLARATION_FACTORIES`).
 _FILE_BACKED_KINDS = frozenset({"code_set"})
+
+#: The registry table kinds, which may share a name with one another (a code set and a reference).
+_TABLE_KINDS = frozenset({"code_set", "reference", "lookup", "fhir_lookup"})
 
 #: Code-first declaration factories whose first positional arg is the object's name literal. These specs
 #: carry no ``source_file``/``source_line`` (unlike inbound/outbound), so their definition statement is
@@ -204,41 +213,63 @@ def plan_rename(
         )
 
     index = build_reference_index(registry)
-    # file -> the line spans within it we may rewrite (definition + referrers).
-    py_spans: dict[str, list[_Span]] = {}
+    # file -> the line spans within it we may rewrite: the definition's, and the referrers' sites.
+    def_spans: dict[str, list[_Span]] = {}
+    ref_spans: dict[str, list[_Span]] = {}
     # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
     toml_targets: set[tuple[str, str]] = set()
 
-    def add_py_span(file: str | None, span: _Span | None) -> None:
+    def add_def_span(file: str | None, span: _Span | None) -> None:
         if file is None or span is None:
             return
         resolved = _under_config_dir(config_dir, file)
         if resolved is not None:
-            py_spans.setdefault(resolved, []).append(span)
+            def_spans.setdefault(resolved, []).append(span)
 
     # The object's own definition (so the name is actually changed, not only its referents).
-    _add_definition_span(registry, config_dir, target_kind, old, add_py_span, toml_targets)
+    _add_definition_span(registry, config_dir, target_kind, old, add_def_span, toml_targets)
 
-    # Every referent edge: rewrite the literal in the referrer's source (or its toml binding). Keep each
-    # py referrer's (resolved-file, span) so a referrer we could not rewrite is surfaced, not dropped.
-    referrer_spans: list[tuple[Reference, str, _Span]] = []
+    # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
+    # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
+    # dropped -- including one whose source could not be located at all (no sites).
+    sources = SourceCache()
+    referrer_sites: list[tuple[Reference, list[tuple[str, _Span]]]] = []
     for ref in index.referrers(target_kind, old):
-        loc = _add_referrer_span(registry, target_kind, ref, add_py_span, toml_targets)
-        if loc is not None:
-            resolved = _under_config_dir(config_dir, loc[0])
-            if resolved is not None:
-                referrer_spans.append((ref, resolved, loc[1]))
+        sites = _referrer_sites(registry, ref, old, sources, toml_targets)
+        if sites is None:
+            continue
+        in_dir = [
+            (resolved, span)
+            for file, span in sites
+            if (resolved := _under_config_dir(config_dir, file)) is not None
+        ]
+        for file, span in in_dir:
+            ref_spans.setdefault(file, []).append(span)
+        referrer_sites.append((ref, in_dir))
 
+    # A table name another table kind also holds (a code set and a reference both called "x"): a
+    # referrer site may read either, so only a literal passed straight to this kind's accessor is ours.
+    shared = len(table_kinds(registry).get(old, [])) > 1 and target_kind in _TABLE_KINDS
     edits: list[LiteralEdit] = []
-    for file, spans in py_spans.items():
+    for file, spans in def_spans.items():
         edits.extend(_py_literal_edits(file, old, new, spans))
+    for file, spans in ref_spans.items():
+        found = _py_literal_edits(file, old, new, spans)
+        if shared:
+            ours = {
+                pos for pos, kind in sources.occurrences(file, old).items() if kind == target_kind
+            }
+            found = [e for e in found if (e.start_line, e.start_col) in ours]
+        edits.extend(found)
     for toml_path, key in toml_targets:
         edits.extend(_toml_value_edits(toml_path, key, old, new))
 
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
     ordered = sorted(unique.values(), key=lambda e: (e.file, e.start_line, e.start_col))
-    unresolved = _unresolved_referrers(referrer_spans, ordered)
+    unresolved = _unresolved_referrers(
+        referrer_sites, ordered, old, sources, target_kind if shared else None
+    )
     return RenamePlan(
         target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
     )
@@ -312,42 +343,85 @@ def _add_definition_span(
         add_py_span(file, span)
 
 
-def _add_referrer_span(
+def _referrer_sites(
     registry: Registry,
-    target_kind: str,
     ref: Reference,
-    add_py_span: object,
+    old: str,
+    sources: SourceCache,
     toml_targets: set[tuple[str, str]],
-) -> tuple[str, _Span] | None:
-    """Scope one referent edge: a router/handler body naming ``old`` (rewrite in its function span), or
-    an inbound's ``router="old"`` binding (its definition statement, or its ``connections.toml`` line).
+) -> list[tuple[str, _Span]] | None:
+    """The ``.py`` sites one referent edge reads ``old`` from, or ``None`` for a ``connections.toml``
+    router binding (recorded in ``toml_targets`` instead).
 
-    Returns the referrer's ``(source_file, span)`` when it maps to a ``.py`` span (so the caller can
-    later check whether an edit actually landed in it), or ``None`` for a TOML binding / an unlocatable
-    referrer."""
-    assert callable(add_py_span)
+    A router/handler's sites are every function it reaches -- its own body, a handler's ``accepts=``
+    predicate, and the config-authored helpers either calls -- plus each module-level statement that
+    binds a global one of them reads and that holds ``old`` (``TARGET = "OB_X"``, ``DIET =
+    code_set("diets")``), in its own module or a config module it reads through (BACKLOG #5620). An
+    inbound's site is its definition statement. An empty list means the referrer could not be located,
+    which the caller reports as unresolved."""
     if ref.referrer_kind in ("router", "handler"):
         table = registry.routers if ref.referrer_kind == "router" else registry.handlers
         fn = table.get(ref.referrer)
-        if fn is not None:
-            file, span = _fn_span(fn)
-            add_py_span(file, span)
-            if file is not None and span is not None:
-                return file, span
-        return None
+        if fn is None:
+            return []
+        roots: list[object] = [fn]
+        if ref.referrer_kind == "handler" and ref.referrer in registry.handler_accepts:
+            roots.append(registry.handler_accepts[ref.referrer])
+        sites: list[tuple[str, _Span]] = []
+        for root in roots:
+            for func in reached_functions(root):
+                file, span = _fn_span(func)
+                if file is not None and span is not None:
+                    sites.append((file, span))
+                sites.extend(_module_binding_sites(func, old, sources))
+        return sites
     if ref.referrer_kind == "inbound":
         conn = registry.inbound.get(ref.referrer)
         if conn is None:
-            return None
+            return []
         if conn.source_line is not None and conn.source_file:
             span = _statement_span(conn.source_file, conn.source_line)
-            add_py_span(conn.source_file, span)
-            if span is not None:
-                return conn.source_file, span
-        elif conn.source_file and _is_connections_toml(conn.source_file):
+            return [(conn.source_file, span)] if span is not None else []
+        if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
             toml_targets.add((conn.source_file, "router"))
+            return None
+        return []
     return None
+
+
+def _module_binding_sites(
+    func: FunctionType, old: str, sources: SourceCache
+) -> list[tuple[str, _Span]]:
+    """The module-level statements that bind a global ``func`` reads and hold ``old``: in ``func``'s own
+    module, and in any config module ``func`` reads an attribute of (``_consts.TARGET``)."""
+    names = loaded_names(func.__code__)
+    sites: list[tuple[str, _Span]] = []
+    for file in sorted(config_module_files(func)):
+        sites.extend((file, span) for span in _binding_spans(sources, file, names, old))
+    return sites
+
+
+def _binding_spans(sources: SourceCache, file: str, names: set[str], old: str) -> list[_Span]:
+    """The line spans of ``file``'s top-level statements that bind one of ``names`` and hold the
+    string value ``old`` anywhere in them."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return []
+    spans: list[_Span] = []
+    for stmt in parsed[0].body:
+        if isinstance(stmt, ast.Assign):
+            targets: list[ast.expr] = list(stmt.targets)
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            targets = [stmt.target]
+        else:
+            continue
+        bound = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        if not bound & names:
+            continue
+        if any(isinstance(n, ast.Constant) and n.value == old for n in ast.walk(stmt)):
+            spans.append(_Span(stmt.lineno, stmt.end_lineno or stmt.lineno))
+    return spans
 
 
 def _fn_span(fn: object) -> tuple[str | None, _Span | None]:
@@ -440,17 +514,33 @@ def _call_name(func: ast.expr) -> str | None:
 
 
 def _unresolved_referrers(
-    referrer_spans: list[tuple[Reference, str, _Span]], edits: list[LiteralEdit]
+    referrer_sites: list[tuple[Reference, list[tuple[str, _Span]]]],
+    edits: list[LiteralEdit],
+    old: str,
+    sources: SourceCache,
+    shared_kind: str | None,
 ) -> tuple[Reference, ...]:
-    """The referrers whose ``.py`` span carries no rewrite — a real referent the tokenizer safely refused
-    to touch (a folded adjacent-string concat / no-interpolation f-string / dynamic name). Reported so a
-    ``--apply`` that renames the definition doesn't silently leave a dangling referent behind."""
+    """The referrers that would still read ``old`` after the edits — a real referent the tokenizer
+    safely refused to touch (a folded adjacent-string concat / no-interpolation f-string), or a name
+    the planner cannot see at any of the referrer's sites (a dynamic name, an imported constant).
+    Reported so a ``--apply`` that renames the definition doesn't silently leave a dangling referent.
+
+    Coverage is per occurrence, not per span: every place a site spells ``old`` must carry an edit
+    (BACKLOG #5620), so one rewritten literal no longer vouches for a second one beside it. With
+    ``shared_kind`` set (the name is a table of another kind too), a literal passed straight to
+    another kind's accessor belongs to that table and is not counted."""
+    edited = {(e.file, e.start_line, e.start_col) for e in edits}
     out: list[Reference] = []
-    for ref, file, span in referrer_spans:
-        covered = any(
-            edit.file == file and span.start <= edit.start_line <= span.end for edit in edits
-        )
-        if not covered:
+    for ref, sites in referrer_sites:
+        occurrences: set[tuple[str, int, int]] = set()
+        for file, span in sites:
+            for (line, col), kind in sources.occurrences(file, old).items():
+                if not span.start <= line <= span.end:
+                    continue
+                if shared_kind is not None and kind is not None and kind != shared_kind:
+                    continue
+                occurrences.add((file, line, col))
+        if not occurrences or not occurrences <= edited:
             out.append(ref)
     return tuple(out)
 
