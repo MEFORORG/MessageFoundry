@@ -3607,6 +3607,7 @@ jobs:
         timeout-minutes: 5
         env:
           MSSQL: ${{ job.services.mssql.id }}
+          LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/mssql-tls"
@@ -3617,9 +3618,13 @@ jobs:
             echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
             exit 1
           fi
+          # SQL Server 2022 on Linux allows TLS 1.0-1.2 by default and refuses a strict (TDS 8.0)
+          # login there with error 17821 (run 43704495127). 1.2 stays for the Encrypt=yes login.
+          protocols=()
+          if [ "$LABEL" = 2022 ]; then protocols=('tlsprotocols = 1.2,1.3'); fi
           printf '%s\n' '[network]' \
             'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
-            > "$dir/mssql.conf"
+            "${protocols[@]}" > "$dir/mssql.conf"
           docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
           docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
           docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
@@ -3656,19 +3661,23 @@ jobs:
       - name: Install project (dev + sqlserver extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
-      # TEMPORARY DIAGNOSTIC, 2022 LEG ONLY (vault BACKLOG #3533 item 2, engine PR 2978). The 2022
-      # server refuses the strict pinned login with error 17821, "A valid TLS certificate is not
-      # configured to accept strict (TDS 8.0 and above) connections", while 2025 takes the same
-      # certificate. This probes which server TLS setting or certificate shape 2022 needs, one
-      # restart each, prints one PROBE line per variant, restores the step above's configuration, and
-      # always exits 0: the check below still decides the leg. It is removed once the fix is known.
+      # TEMPORARY DIAGNOSTIC, 2022 LEG ONLY (vault BACKLOG #3533 item 2, engine PR 2978). Under TLS
+      # 1.0-1.2, the default, the 2022 server refused the strict pinned login with error 17821, "A
+      # valid TLS certificate is not configured to accept strict (TDS 8.0 and above) connections"
+      # (run 43704495127). The step above now also allows TLS 1.3 on 2022. This probes the strict
+      # pinned login and the Encrypt=yes login under a few TLS 1.3 settings and certificate shapes,
+      # one restart each, waiting on the server's own ready line rather than on a TDS 7 login, which
+      # TLS 1.3 alone refuses. It restores the step above's configuration and always exits 0: the
+      # check below still decides the leg. It is removed once the fix is confirmed.
       - name: Probe what the 2022 server needs for a strict login (temporary diagnostic)
         if: matrix.label == '2022'
         timeout-minutes: 15
         env:
           MSSQL: ${{ job.services.mssql.id }}
         run: |
-          set -uo pipefail
+          # No -e: a refused variant must not end the probe. pipefail stays, so no pipe hides a status.
+          set +e
+          set -o pipefail
           tls="$RUNNER_TEMP/mssql-tls"
           dir="$RUNNER_TEMP/mssql-probe"
           mkdir -p "$dir"
@@ -3681,9 +3690,9 @@ jobs:
           openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -days 7 \
             -config "$dir/ku.cnf" -keyout "$dir/ec.key" -out "$dir/ec.pem" 2>/dev/null
           uid="$(docker exec "$MSSQL" id -u)"
-          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
           serve() {  # serve <cert stem> [network lines...]
-            local stem="$1"; shift
+            local stem="$1"
+            shift
             printf '%s\n' '[network]' 'tlscert = /var/opt/mssql/tls/server.pem' \
               'tlskey = /var/opt/mssql/tls/server.key' "$@" > "$dir/mssql.conf"
             docker cp "$dir/$stem.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
@@ -3692,12 +3701,16 @@ jobs:
             docker exec -u 0 "$MSSQL" chown -R "${uid}:0" /var/opt/mssql/tls /var/opt/mssql/mssql.conf
             docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
             docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
+            since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             docker restart "$MSSQL" > /dev/null
             for i in $(seq 1 60); do
-              "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1 && return 0
+              docker logs --since "$since" "$MSSQL" > "$dir/since.log" 2>&1
+              if grep -q 'ready for client connections' "$dir/since.log"; then
+                sleep 2
+                return 0
+              fi
               sleep 2
             done
-            echo "server did not come back"
             return 1
           }
           probe() {  # probe <name> <cert stem> [network lines...]
@@ -3710,31 +3723,34 @@ jobs:
 
           import pyodbc
 
-          dsn = (
+          base = (
               "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=master;"
-              "UID=sa;PWD={Str0ng_P@ssw0rd!};Encrypt=strict;ServerCertificate={" + sys.argv[1] + "};"
+              "UID=sa;PWD={Str0ng_P@ssw0rd!};"
           )
-          try:
-              pyodbc.connect(dsn, timeout=10).close()
-              print(f"PROBE {sys.argv[2]}: CONNECTED")
-          except pyodbc.Error as exc:
-              print(f"PROBE {sys.argv[2]}: REFUSED: {exc.args[-1] if exc.args else exc}")
+          logins = {
+              "strict pinned": base + "Encrypt=strict;ServerCertificate={" + sys.argv[1] + "};",
+              "Encrypt=yes": base + "Encrypt=yes;TrustServerCertificate=no;",
+          }
+          for login, dsn in logins.items():
+              try:
+                  pyodbc.connect(dsn, timeout=10).close()
+                  print(f"PROBE {sys.argv[2]} / {login}: CONNECTED")
+              except pyodbc.Error as exc:
+                  print(f"PROBE {sys.argv[2]} / {login}: REFUSED: {exc.args[-1] if exc.args else exc}")
           PY
             else
-              echo "PROBE $name: SERVER DID NOT START"
+              echo "PROBE $name: SERVER NOT READY IN 120 S"
             fi
-            docker logs --since 90s "$MSSQL" 2>&1 | grep -E 'TLS|17821|strict|loaded for encryption' | cut -c1-260 | tail -8
+            docker logs --tail 40 "$MSSQL" > "$dir/tail.log" 2>&1
+            grep -E 'TLS protocol|17821|strict|loaded for encryption' "$dir/tail.log" | cut -c1-200
             echo "::endgroup::"
           }
-          probe "rsa, tlsprotocols 1.2" base 'tlsprotocols = 1.2'
           probe "rsa, tlsprotocols 1.3" base 'tlsprotocols = 1.3'
           probe "rsa, tlsprotocols 1.2,1.3" base 'tlsprotocols = 1.2,1.3'
-          probe "rsa keyUsage, default protocols" ku
-          probe "rsa keyUsage, tlsprotocols 1.2" ku 'tlsprotocols = 1.2'
-          probe "ecdsa p-256, default protocols" ec
-          probe "rsa, forceencryption 1, tlsprotocols 1.2" base 'forceencryption = 1' 'tlsprotocols = 1.2'
+          probe "rsa keyUsage, tlsprotocols 1.2,1.3" ku 'tlsprotocols = 1.2,1.3'
+          probe "ecdsa p-256, tlsprotocols 1.2,1.3" ec 'tlsprotocols = 1.2,1.3'
           echo "::group::restore the step above's configuration"
-          serve base || echo "::warning::restoring the base configuration did not bring the server back"
+          serve base 'tlsprotocols = 1.2,1.3' || echo "::warning::restoring the configuration did not bring the server back"
           echo "::endgroup::"
           exit 0
 
