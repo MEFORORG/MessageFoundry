@@ -19,12 +19,10 @@ function inside(root: string, target: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-/** The file-system reads the containment check makes, as fs.realpathSync.native, fs.lstatSync and
- *  fs.readlinkSync make them: each throws an error carrying `code` for a path it cannot read. */
+/** The one file-system read the link check makes, as fs.lstatSync makes it: it throws an error
+ *  carrying `code` for a path it cannot read. */
 export interface LinkFs {
-  realpath(p: string): string;
   lstat(p: string): { isSymbolicLink(): boolean };
-  readlink(p: string): string;
 }
 
 /** Whether `e` says only that the path does not exist, the one read error the check passes over. */
@@ -33,115 +31,47 @@ function missing(e: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-/** `target` with every symbolic link in it resolved, or undefined when that cannot be told. The part
- *  that does not exist yet is joined back as written, so each missing component is checked to be
- *  truly absent: a dangling link exists to lstat and is refused, since it could later lead anywhere.
- *  Any error but "does not exist" is refused too. */
-function resolveLinks(target: string, fsx: LinkFs): string | undefined {
-  const tail: string[] = [];
-  let at = target;
-  for (;;) {
+/** Whether no existing path from `root` down to `target`, both ends included, is a link. `target`
+ *  lies inside `root`. Each path is lstat'd, so a dangling link counts. The walk stops at the first
+ *  path that does not exist, since nothing below it can. Any other read error answers false. */
+function noLinkBelow(root: string, target: string, fsx: LinkFs): boolean {
+  let at = root;
+  for (const part of ["", ...path.relative(root, target).split(path.sep)]) {
+    at = path.join(at, part);
     try {
-      return path.join(fsx.realpath(at), ...tail);
+      if (fsx.lstat(at).isSymbolicLink()) {
+        return false;
+      }
     } catch (e) {
-      if (!missing(e)) {
-        return undefined;
-      }
-    }
-    try {
-      fsx.lstat(at);
-      return undefined; // it exists, yet does not resolve: a dangling or looping link
-    } catch (e) {
-      if (!missing(e)) {
-        return undefined;
-      }
-    }
-    const parent = path.dirname(at);
-    if (parent === at) {
-      return undefined;
-    }
-    tail.unshift(path.basename(at));
-    at = parent;
-  }
-}
-
-// The most paths reachesRoot follows, links included, before it gives up and the caller refuses.
-const MAX_HOPS = 40;
-
-/** Whether resolving `target` passes through the folder whose resolved path is `realRoot`. Each
- *  existing prefix is resolved, and each link on the way is also followed one hop at a time, since a
- *  link chain resolves straight to its end: an alias pointing at a link the workspace holds must
- *  count too. That is how an alias outside the folder that realpath resolves to it leads into it; the
- *  aliases this covers are listed under {@link securityConfigTarget}. Undefined when a prefix or
- *  link cannot be read, or there are too many hops, so the caller refuses. */
-function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | undefined {
-  const pending = [target];
-  const seen = new Set<string>();
-  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
-    const whole = next;
-    if (seen.has(whole)) {
-      continue;
-    }
-    if (seen.size >= MAX_HOPS) {
-      return undefined;
-    }
-    seen.add(whole);
-    for (let at = whole; ; at = path.dirname(at)) {
-      try {
-        const real = fsx.realpath(at);
-        if (path.relative(realRoot, real) === "" || inside(realRoot, real)) {
-          return true;
-        }
-      } catch (e) {
-        if (!missing(e)) {
-          return undefined;
-        }
-      }
-      try {
-        if (fsx.lstat(at).isSymbolicLink()) {
-          // A relative target is resolved from the link's real folder, as the OS does: the folder as
-          // spelled may be an alias that is not itself a link, such as a subst drive.
-          const hop = path.resolve(fsx.realpath(path.dirname(at)), fsx.readlink(at));
-          pending.push(path.join(hop, path.relative(at, whole)));
-        }
-      } catch (e) {
-        if (!missing(e)) {
-          return undefined;
-        }
-      }
-      if (path.dirname(at) === at) {
-        break;
-      }
+      return missing(e);
     }
   }
-  return false;
+  return true;
 }
 
 /**
  * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), resolved against
- * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused.
+ * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused. The
+ * value is resolved as text, so a `..` is collapsed before any check, and the path returned is the
+ * one the checks ran on: the CLI is handed exactly that path.
  *
- * `scope.fromWorkspace` says the value in force comes from the workspace's own settings, which a
- * repository's `.vscode/settings.json` can set. Such a value must name a file inside the workspace
- * folder: one that leaves it by `..` or by being absolute elsewhere is refused, as is the folder
- * itself. A value from user settings is the operator's own and may name a file outside the folder,
- * such as the service's TOML in another folder, within the link rules below.
+ * 1. Untrusted workspace (`scope.trusted` false): refused before anything else, so this check makes
+ *    no file-system call there. That bounds this check only; it says nothing of what VS Code itself
+ *    reads in Restricted Mode.
+ * 2. Workspace-set value (`scope.fromWorkspace` true: the workspace's own settings, which a
+ *    repository's `.vscode/settings.json` can set): the path, as spelled, must lie inside the
+ *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
+ *    refused. Then every existing path from the workspace folder down to the target, both included,
+ *    must lstat as not a link (a symbolic link or a junction), a dangling one included. An lstat
+ *    error other than ENOENT or ENOTDIR refuses.
+ * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
+ *    the default `messagefoundry.toml` included, it gets the link check of rule 2, and the folder
+ *    itself is refused. Otherwise it is accepted as written, with no file-system call.
  *
- * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
- * included, must not leave it through a symbolic link the repository holds, a dangling one included.
- * A user-set path that reaches the folder by an alias gets the same rules where realpath resolves the
- * alias to the folder: at least a link, a subst drive onto a local path or an 8.3 short name. An alias
- * that realpath resolves to a different spelling than the folder's own is not caught: at least a
- * `net use` drive or a subst drive onto a UNC target when the folder is local, a UNC loopback or
- * admin-share spelling (a link to one included), a bind mount or a firmlink. A path whose links, or
- * the folder's, cannot be read is refused at either scope. A path that reaches the folder is returned
- * with its links resolved, so the CLI opens the folders that were checked; one that never reaches it
- * is returned as written.
- *
- * `scope.trusted` says the workspace is trusted. An untrusted one is refused before anything else, so
- * this check makes no file-system call there. Otherwise realpath, lstat and readlink would traverse
- * the repository's links, and on Windows traversing a link to a UNC path can contact SMB. That bounds
- * this check only; it says nothing of what VS Code itself reads in Restricted Mode.
+ * Open limit: rule 3 compares spellings only. A user-set path that reaches the workspace folder by
+ * an alias is accepted as written, and no link the repository holds is checked on it. That covers at
+ * least a subst drive, an 8.3 short name, a UNC spelling of the folder, a junction or symbolic link
+ * outside the folder that leads into it, and a mapped network drive.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -152,38 +82,35 @@ export function securityConfigTarget(
   if (!scope.trusted) {
     return { ok: false, problem: "This workspace is not trusted. Trust it to read or write its security settings" };
   }
-  const { fromWorkspace } = scope;
   if (typeof setting !== "string" || setting.trim() === "") {
     return { ok: false, problem: "messagefoundry.serviceConfig is blank or is not text" };
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
   // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
-  const outside = {
-    ok: false,
-    problem: fromWorkspace
-      ? "messagefoundry.serviceConfig names a path that leaves the workspace folder, or whose links cannot be checked. " +
-        "A value in workspace settings must name a file inside the workspace folder, and a path inside it must not leave " +
-        "it through a link; to use a file elsewhere, set it in user settings"
-      : "messagefoundry.serviceConfig, set in user settings, names a path that passes through the workspace folder and " +
-        "then leaves it through a link, or whose links, or the workspace folder's, cannot be checked. Name the file by a " +
-        "path that does not pass through the workspace folder, or one whose links all stay inside it",
-  } as const;
-  const lexicallyInside = inside(root, target);
-  if (!lexicallyInside && fromWorkspace) {
-    return outside;
+  if (path.relative(root, target) === "") {
+    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
   }
-  const realRoot = resolveLinks(root, fsx);
-  const realTarget = resolveLinks(target, fsx);
-  if (realRoot === undefined || realTarget === undefined) {
-    return outside;
+  if (!inside(root, target)) {
+    if (scope.fromWorkspace) {
+      return {
+        ok: false,
+        problem:
+          "messagefoundry.serviceConfig, set in workspace settings, names a path outside the workspace folder. " +
+          "To use a file elsewhere, set it in user settings",
+      };
+    }
+    return { ok: true, path: target };
   }
-  const entersRoot = lexicallyInside || reachesRoot(target, realRoot, fsx);
-  if (entersRoot === undefined || (entersRoot && !inside(realRoot, realTarget))) {
-    return outside;
+  if (!noLinkBelow(root, target, fsx)) {
+    return {
+      ok: false,
+      problem:
+        "messagefoundry.serviceConfig names a path in the workspace folder that passes through a link, " +
+        "or whose folders cannot be read. Name a path whose folders are all plain folders",
+    };
   }
-  // A path that never reaches the folder keeps its spelling, so every editor locks the same folder.
-  return { ok: true, path: entersRoot ? realTarget : target };
+  return { ok: true, path: target };
 }
 
 /** The file one editor panel now shows (BACKLOG #5411). Save writes only to this file, so a setting
