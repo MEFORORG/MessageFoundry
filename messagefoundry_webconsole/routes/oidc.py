@@ -10,7 +10,8 @@ them:
   **nothing** — when the IdP is inside ``[security].organization_domains`` it delegates straight to
   the POST leg instead.
 * ``POST /ui/oidc/start`` mints a server-side flow, drops an opaque flow id in a short-lived
-  ``__Host-`` cookie, and 303s the browser to the IdP.
+  ``__Host-`` cookie, and sends the browser to the IdP with a 200 page that navigates, never a
+  303 (see :func:`pages.idp_handoff`).
 * ``GET /ui/oidc/callback`` re-binds cookie + ``state``, redeems the code, and lands the session.
 
 **Registration is self-gating.** ``register`` returns before declaring any of its routes unless
@@ -249,6 +250,15 @@ def _fail(request: Request, code: str, *, keep_flow: bool = False) -> Response:
     return resp
 
 
+def _idp_hop(request: Request, auth: AuthService, flow_id: str, authorization_url: str) -> Response:
+    """A start leg's answer once its flow is staged: the flow cookie, on a 200 page that navigates
+    to the IdP. Never a 303: both start legs are form POSTs, and the /ui CSP's
+    ``form-action 'self'`` blocks a redirect to the IdP's origin (see :func:`pages.idp_handoff`)."""
+    resp = HTMLResponse(pages.idp_handoff(authorization_url), status_code=200)
+    set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
+    return resp
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """Register the federated-login legs — ONLY when ``[auth].oidc_enabled`` is set.
 
@@ -388,9 +398,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
-        resp = RedirectResponse(authorization_url, status_code=303)
-        set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
-        return resp
+        return _idp_hop(request, auth, flow_id, authorization_url)
 
     @app.post("/ui/reauth/oidc")
     @public_route("the federated re-authentication a step-up gate sends the browser to")
@@ -398,7 +406,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         """The federated step-up leg's START (BACKLOG #296, ADR 0142 Amendment B).
 
         An OIDC session's ``/ui/reauth`` page posts here. This stages a STEP-UP flow bound to the
-        session and 303s the browser to the IdP with ``max_age=0`` and ``prompt=login``. The IdP
+        session and sends the browser to the IdP with ``max_age=0`` and ``prompt=login``, through
+        the same navigating page as the sign-in start, never a 303. The IdP
         returns to the same ``/ui/oidc/callback``, which tells the two kinds of flow apart.
 
         Authenticated, unlike the sign-in legs, so it draws on the per-ACTOR ceremony budget that
@@ -488,9 +497,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # mints one grant.
         if action.unlock:
             hold_claim_for_flow(flow_id, claim)
-        resp = RedirectResponse(authorization_url, status_code=303)
-        set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
-        return resp
+        return _idp_hop(request, auth, flow_id, authorization_url)
 
     @app.get("/ui/oidc/callback")
     @public_route("the federated sign-in return; a session does not exist yet")

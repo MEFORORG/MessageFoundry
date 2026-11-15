@@ -26,6 +26,7 @@ from ._common import _deadline_passed, _deadline_stamp
 
 __all__ = [
     "account_page",
+    "idp_handoff",
     "leaving_site",
     "login",
     "oidc_landing",
@@ -190,19 +191,50 @@ def oidc_landing(target: str = "/ui") -> Markup:
     admin form the step-up unlocked, which the caller has ALREADY validated as a registered /ui
     action. This page never takes a URL from the request.
     """
-    body = el(
+    body = _hop_card("Signed in — continuing to the console…", target)
+    return page("Signing in", body, nav=minimal_nav(), head_extra=_meta_refresh(target))
+
+
+def _hop_card(message: str, target: str) -> Markup:
+    """The body of a navigating hop: its message, and a visible link for a browser with meta
+    refresh disabled."""
+    return el(
         "div",
         el("h1", wordmark(tm=True)),
-        el("p", "Signed in — continuing to the console…"),
+        el("p", message),
         el("p", el("a", "Continue", href=target), class_="muted"),
         class_="card",
     )
-    return page(
-        "Signing in",
-        body,
-        nav=minimal_nav(),
-        head_extra=el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"}),
-    )
+
+
+def _meta_refresh(target: str) -> Markup:
+    """The ``<head>`` element of a navigating hop. ``el`` escapes the attribute, so a ``&`` or a
+    quote in ``target`` cannot end it early."""
+    return el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"})
+
+
+def idp_handoff(authorization_url: str) -> Markup:
+    """The hop from a federated START leg to the IdP: ``POST /ui/oidc/start`` and
+    ``POST /ui/reauth/oidc`` both answer with it.
+
+    Returned as **200 HTML with a meta refresh**, deliberately NOT a 303, for a reason unlike
+    :func:`oidc_landing`'s. Both legs are form POSTs, and the ``/ui`` CSP carries
+    ``form-action 'self'``. Chromium checks ``form-action`` again on each redirect that follows a
+    form submission, so a 303 to the IdP's origin is blocked and the browser never leaves the page
+    (measured in headless Edge 157 against the real ``POST /ui/oidc/start``). A meta refresh is a
+    navigation from this document, not a form submission, so ``form-action`` does not govern it,
+    and the CSP needs no IdP origin.
+
+    **Bare chrome, on purpose.** :func:`.._html.minimal_nav` carries the session watchdog, whose
+    first probe sends a signed-out browser to the login page. On the sign-in leg there is no
+    session yet, so that probe would race this page's own navigation to the IdP. The page lives
+    for no time at all, so it offers no sign-out control.
+
+    ``authorization_url`` comes from the engine's flow state, built from configuration, never from
+    the request.
+    """
+    body = _hop_card("Continuing to your organization's sign-in provider.", authorization_url)
+    return page("Signing in", body, nav=Markup(""), head_extra=_meta_refresh(authorization_url))
 
 
 def leaving_site(

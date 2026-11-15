@@ -51,6 +51,11 @@ _SERVICE_LOGGER = "messagefoundry.auth.service"
 #: The pages/*.py builders allowed to suppress the nav entirely: both are reached WITHOUT a session.
 UNAUTHENTICATED_BARE_BUILDERS = frozenset({"login", "sso_challenge"})
 
+#: The one TRANSIT page allowed to suppress the nav: the federated start legs' hop to the IdP. It
+#: navigates away at once, and ``minimal_nav()`` would bring the session watchdog, whose first probe
+#: sends a browser with no session (the sign-in start) to the login page, racing the hop itself.
+TRANSIT_BARE_BUILDERS = frozenset({"idp_handoff"})
+
 _PAGES_DIR = Path(messagefoundry_webconsole.__file__).parent / "pages"
 
 
@@ -117,6 +122,15 @@ def test_unauthenticated_pages_render_no_sign_out() -> None:
     assert LOGOUT_FORM not in pages.sso_challenge()
 
 
+def test_the_idp_hop_carries_no_session_watchdog() -> None:
+    """The start legs' hop to the IdP navigates at once. With the watchdog's hook on it, a browser
+    with no session yet would be sent to the login page by the first probe, racing the hop."""
+    hop = pages.idp_handoff("https://idp.example/authorize?state=s")
+    assert "data-mf-session-watchdog" not in hop
+    assert LOGOUT_FORM not in hop
+    assert 'http-equiv="refresh"' in hop
+
+
 # --- builder enumeration: a NEW bare authenticated page fails here --------------------------------
 
 
@@ -157,7 +171,11 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
         for owner, call in _page_calls_with_nav(tree):
             seen_builders.add(owner)
             nav = next(kw.value for kw in call.keywords if kw.arg == "nav")
-            if _is_minimal_nav_call(nav) or owner in UNAUTHENTICATED_BARE_BUILDERS:
+            if (
+                _is_minimal_nav_call(nav)
+                or owner in UNAUTHENTICATED_BARE_BUILDERS
+                or owner in TRANSIT_BARE_BUILDERS
+            ):
                 continue
             offenders.append(f"{path.name}:{call.lineno} in {owner}()")
     # The walk must still be finding the known sites — a silently-empty walk would "pass" forever.
@@ -165,6 +183,7 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
         "login",
         "sso_challenge",
         "oidc_landing",
+        "idp_handoff",
         "reauth",
         "reauth_continue",
         "password_page",

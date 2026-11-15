@@ -159,7 +159,8 @@ def page(
 
     ``head_extra`` appends markup to the ``<head>`` and is ``None`` for every existing caller, so the
     rendered document is byte-identical unless a caller opts in. It exists for the federated-login
-    landing hop (ADR 0142), which needs a ``<meta http-equiv="refresh">``: a pragma directive is only
+    hops (ADR 0142), the landing hop and the start legs' hop to the IdP, which each need a
+    ``<meta http-equiv="refresh">``: a pragma directive is only
     conforming inside ``<head>``, and relying on browsers' tolerance of one in ``<body>`` would make a
     security-critical redirect depend on undefined behaviour.
     """

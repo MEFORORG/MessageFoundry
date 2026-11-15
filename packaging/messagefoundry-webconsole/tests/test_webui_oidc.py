@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import HOSTILE_IDP_URL, assert_idp_hop, create_local_user_chosen, idp_url
 from _webui_support import (
     PW,
     _add,
@@ -91,12 +91,12 @@ def _oidc_service(engine: Engine, **over: object) -> AuthService:
 
 
 def _oidc_client(
-    engine: Engine, service: AuthService, *, peer: str = "127.0.0.1"
+    engine: Engine, service: AuthService, *, peer: str = "127.0.0.1", scheme: str = "http"
 ) -> httpx.AsyncClient:
     # public_origin is required: the redirect_uri derives from it, never from the Host header.
     app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
     transport = httpx.ASGITransport(app=app, client=(peer, 123))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+    return httpx.AsyncClient(transport=transport, base_url=f"{scheme}://t")
 
 
 async def _oidc_audits(engine: Engine) -> list[str]:
@@ -124,15 +124,13 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         # leg can still attempt per-request and recover without a restart (AC-8).
         service.mark_oidc_unavailable("boom")
         assert "/ui/oidc/start" not in (await c.get("/ui/login")).text
-        # BOTH outcomes are 303, so the status alone cannot tell AC-8 compliance from the exact
-        # regression this guards. Assert the DESTINATION: the start leg must still reach the IdP
-        # while the advisory flag is set, not bounce to ?e=oidc_unavailable.
+        # Assert the DESTINATION: the start leg must still reach the IdP while the advisory flag
+        # is set, not bounce to ?e=oidc_unavailable.
         # ASVS 3.7.3: flow-minting moved to the POST leg — the GET now renders the "leaving this
         # site" interstitial and stages nothing. AC-8 is a property of the leg that ATTEMPTS, so
         # this targets the POST.
         r = await c.post("/ui/oidc/start", follow_redirects=False)
-        assert r.status_code == 303
-        assert r.headers["location"].startswith("https://idp.example/authorize?")
+        assert idp_url(r).startswith("https://idp.example/authorize?")
 
 
 @pytest.mark.parametrize(
@@ -178,7 +176,7 @@ async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
     service._oidc_opener = _TokenEndpoint()  # type: ignore[assignment]
     async with _oidc_client(engine, service) as c:
         start = await c.post("/ui/oidc/start", follow_redirects=False)
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         r = await c.get(
             "/ui/oidc/callback",
             params={"code": "not-a-code-the-idp-issued", "state": state},
@@ -199,16 +197,16 @@ async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: 
     service = _oidc_service(engine)
     await service.initialize()
     async with _oidc_client(engine, service) as c:
-        # ASVS 3.7.3: the GET renders the interstitial and mints NOTHING; the 303 + PKCE params +
-        # flow cookie this test is about now belong to the POST leg. Asserted here rather than
-        # retargeted silently, because "the start leg 303s to the IdP" stopped being true of the GET.
+        # ASVS 3.7.3: the GET renders the interstitial and mints NOTHING; the IdP hop + PKCE params
+        # + flow cookie this test is about now belong to the POST leg. Asserted here rather than
+        # retargeted silently, because "the start leg sends the browser to the IdP" stopped being
+        # true of the GET. The hop is a 200 page that navigates, not a 303: see idp_url.
         interstitial = await c.get("/ui/oidc/start", follow_redirects=False)
         assert interstitial.status_code == 200
         assert "leaving" in interstitial.text.lower()
         assert "set-cookie" not in {k.lower() for k in interstitial.headers}
         r = await c.post("/ui/oidc/start", follow_redirects=False)
-        assert r.status_code == 303
-        location = r.headers["location"]
+        location = idp_url(r)
         assert location.startswith("https://idp.example/authorize?")
         assert "code_challenge_method=S256" in location
         assert "response_type=code" in location
@@ -219,6 +217,28 @@ async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: 
         # SameSite=Lax, NOT Strict: Lax is what survives the IdP top-level cross-site GET return.
         assert "samesite=lax" in cookie.lower()
         assert "httponly" in cookie.lower()
+
+
+async def test_oidc_start_post_answers_with_a_navigating_page_not_a_303(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``POST /ui/oidc/start`` answers with a 303 to the IdP. The /ui CSP's
+    ``form-action 'self'`` is checked again on a redirect that follows a form POST, so Chromium
+    blocks a 303 to the IdP's origin and federated sign-in never leaves the console (measured in
+    headless Edge 157). The hop must carry the very URL the engine staged, escaped, under an
+    unchanged CSP: the fix is never to widen ``form-action``."""
+    service = _oidc_service(engine)
+    await service.initialize()
+
+    async def staged(**_kw: object) -> tuple[str, str]:
+        return "flow-hop", HOSTILE_IDP_URL
+
+    monkeypatch.setattr(service, "begin_oidc_login", staged)
+    # Effective https, so the response carries the nonce CSP build_ui_csp writes.
+    async with _oidc_client(engine, service, scheme="https") as c:
+        r = await c.post("/ui/oidc/start", follow_redirects=False)
+    assert_idp_hop(r, HOSTILE_IDP_URL)
+    assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:
@@ -279,7 +299,7 @@ async def test_every_other_oidc_route_reject_records_the_client(
             # A real flow, because an error= or malformed callback is audited under its own reason
             # only once its state matches (BACKLOG #3198).
             start = await c.post("/ui/oidc/start", follow_redirects=False)
-            state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+            state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
             query = {
                 "callback_non_navigation_fetch": "?code=abc&state=xyz",
                 "idp_error": "?error=access_denied&state=" + quote(state),
@@ -320,7 +340,7 @@ async def test_a_forged_error_or_malformed_callback_keeps_the_sign_in_in_flight(
     assert service._oidc_flows is not None
     async with _oidc_client(engine, service) as c:
         start = await c.post("/ui/oidc/start", follow_redirects=False)
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         flow_id = c.cookies.get("mf_oidc_flow")
         assert flow_id
 
@@ -349,7 +369,7 @@ async def test_a_forged_state_callback_keeps_the_flow_and_its_cookie(engine: Eng
     await service.initialize()
     async with _oidc_client(engine, service) as c:
         start = await c.post("/ui/oidc/start", follow_redirects=False)
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         flow_id = c.cookies.get("mf_oidc_flow")
         assert flow_id
         r = await c.get(
@@ -485,8 +505,7 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
         assert leaving.status_code == 200
         assert "leaving" in leaving.text.lower()
         start = await c.post("/ui/oidc/start", follow_redirects=False)
-        assert start.status_code == 303
-        params = dict(parse_qsl(urlsplit(start.headers["location"]).query))
+        params = dict(parse_qsl(urlsplit(idp_url(start)).query))
         flow_id = c.cookies.get("mf_oidc_flow")
         assert flow_id
 

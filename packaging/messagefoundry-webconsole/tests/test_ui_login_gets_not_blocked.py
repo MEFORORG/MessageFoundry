@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import HEADERLESS_UI_REQUEST
+from _ui_clients import HEADERLESS_UI_REQUEST, idp_url
 from _ui_clients import SAME_ORIGIN as _SAME
 from test_browser_support_doc import _row_for
 from test_ui_directory_admin_alert import _SUBJECT, _service, _Sink
@@ -110,8 +110,7 @@ async def test_oidc_callback_get_with_neither_header_signs_in(
     monkeypatch.setattr(service, "_exchange_and_validate", _exchange)
     async with _client(engine, service, interstitial=True) as c:
         start = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
-        assert start.status_code == 303, start.text
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         r = await c.get(
             "/ui/oidc/callback",
             params={"code": "authcode", "state": state},
@@ -131,8 +130,7 @@ async def test_oidc_start_get_with_neither_header_redirects_to_the_idp(engine: E
     async with _client(engine, service, interstitial=False) as c:
         r = await c.get("/ui/oidc/start", extensions=_HEADERLESS, follow_redirects=False)
     assert _names_no_provenance(r)
-    assert r.status_code == 303, r.text
-    assert r.headers["location"].startswith("https://idp.example/authorize?")
+    assert idp_url(r).startswith("https://idp.example/authorize?")
     assert "mf_oidc_flow=" in r.headers.get("set-cookie", "")
 
 
@@ -207,8 +205,7 @@ async def test_oidc_start_get_with_an_unknown_site_and_no_foreign_origin_redirec
                 },
                 follow_redirects=False,
             )
-            assert r.status_code == 303, (extra, r.text)
-            assert r.headers["location"].startswith("https://idp.example/authorize?")
+            assert idp_url(r).startswith("https://idp.example/authorize?"), extra
 
 
 async def test_oidc_start_post_with_neither_header_is_still_refused(engine: Engine) -> None:
@@ -221,7 +218,7 @@ async def test_oidc_start_post_with_neither_header_is_still_refused(engine: Engi
         assert "neither Sec-Fetch-Site nor Origin" in refused.text
         assert "set-cookie" not in refused.headers
         named = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
-        assert named.status_code == 303, named.text
+        assert idp_url(named).startswith("https://idp.example/authorize?")
 
 
 def _registered_gets(module: Path) -> set[str]:

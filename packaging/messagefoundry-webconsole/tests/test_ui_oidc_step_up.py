@@ -21,8 +21,8 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from _ui_clients import HOSTILE_IDP_URL, assert_idp_hop, idp_url, issue_continuation
 from _ui_clients import SAME_ORIGIN as _SAME
-from _ui_clients import issue_continuation
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
@@ -151,8 +151,7 @@ async def _federated_sign_in(
 ) -> str:
     _idp_answers(service, monkeypatch)
     start = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
-    assert start.status_code == 303, start.headers
-    r = await _callback(c, start.headers["location"])
+    r = await _callback(c, idp_url(start))
     assert r.status_code == 200, r.headers
     token = c.cookies.get("mf_session")
     assert token and await service.session_steps_up_at_idp(token)
@@ -260,11 +259,10 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)  # what the step-up gate's refusal of the click records
         start = await _start_step_up(c)
-        assert start.status_code == 303
-        query = dict(parse_qsl(urlsplit(start.headers["location"]).query))
+        query = dict(parse_qsl(urlsplit(idp_url(start)).query))
         assert query["max_age"] == "0" and query["prompt"] == "login"
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert f'action="{_NEXT}"' in r.text  # the auto-retry of the action the operator started
@@ -274,6 +272,26 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
         assert await service.identity_for_token(old) is None
         assert await service.has_recent_step_up(new)
         assert await service.session_steps_up_at_idp(new), "rotation lost the mechanism"
+
+
+async def test_the_step_up_start_answers_with_a_navigating_page_not_a_303(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``POST /ui/reauth/oidc`` answers with a 303 to the IdP. The /ui CSP's
+    ``form-action 'self'`` is checked again on a redirect that follows a form POST, so Chromium
+    blocks a 303 to the IdP's origin and every IdP step-up stops at the console. The hop must carry
+    the very URL the engine staged, escaped, under an unchanged CSP."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+
+        async def staged(*_a: object, **_kw: object) -> tuple[str, str]:
+            return "flow-hop", HOSTILE_IDP_URL
+
+        monkeypatch.setattr(service, "begin_oidc_step_up", staged)
+        r = await _start_step_up(c)
+    assert_idp_hop(r, HOSTILE_IDP_URL)
+    assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
 
 
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
@@ -288,9 +306,8 @@ async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
         page = await c.get("/ui/reauth", params={"next": _NEXT}, follow_redirects=False)
         assert page.status_code == 200 and "nothing will run" in page.text
         start = await _start_step_up(c)
-        assert start.status_code == 303
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert "data-autosubmit" not in r.text
@@ -308,7 +325,7 @@ async def test_a_different_idp_account_is_refused_and_changes_nothing(
         start = await _start_step_up(c)
         _idp_answers(service, monkeypatch, subject="S-1-5-21-someone-else")
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 403
         assert "different account" in r.text
@@ -337,7 +354,7 @@ async def test_a_forged_callback_does_not_cancel_the_step_up_in_flight(
         assert forged.status_code == 403
         assert session is not None
         c.cookies.set("mf_session", session)
-        real = await _callback(c, start.headers["location"])
+        real = await _callback(c, idp_url(start))
         assert real.status_code == 200, real.text
         new = c.cookies.get("mf_session")
         assert new and await service.has_recent_step_up(new)
@@ -350,7 +367,7 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
     async with _client(engine, service) as c:
         token = await _federated_sign_in(service, c, monkeypatch)
         start = await _start_step_up(c)
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         c.cookies.delete("mf_session")
         r = await c.get(
             "/ui/oidc/callback",
@@ -407,11 +424,10 @@ async def test_a_spent_sign_in_window_does_not_refuse_an_idp_step_up_return(
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         _drain_sign_in_window(service)
         _forbid_sign_in_charge(service, monkeypatch)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert f'action="{_NEXT}"' in r.text
@@ -439,7 +455,6 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         assert identity is not None
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         flow_id = _flow_id(c)
         return_key = _step_up_return_key(identity.user_id)
         for _ in range(_settings().login_rate_limit_per_ip):
@@ -449,7 +464,7 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         _forbid_sign_in_charge(service, monkeypatch)
         rows_before = await service.store.count_audit(limit=None)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 429, r.text
         assert "Too many attempts" in r.text
@@ -467,7 +482,7 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         clock[0] += _settings().login_rate_limit_window_seconds + 1  # the key refilled
         assert service._reauth_limiter is not None, "the retry must meet the limiter, not skip it"
         assert _ceremony_budget_left(service, return_key)
-        retry = await _callback(c, start.headers["location"])
+        retry = await _callback(c, idp_url(start))
         assert retry.status_code == 200, retry.text
         new = c.cookies.get("mf_session")
         assert new and await service.has_recent_step_up(new)
@@ -555,7 +570,6 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         )
         assert identity is not None
         start = await _start_step_up(c)
-        assert start.status_code == 303
         flow_id = _flow_id(c)
         if spent == "own":
             _drain_own_step_up_return_audit_budget(service, identity.user_id)
@@ -565,7 +579,7 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
             service._step_up_return_audit_paged_at.clear()
         rows_before = await service.store.count_audit(limit=None, action="auth.login_failed")
 
-        r = await _fetch_return(c, start.headers["location"])
+        r = await _fetch_return(c, idp_url(start))
 
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
         rows = await service.store.count_audit(limit=None, action="auth.login_failed")
@@ -577,7 +591,7 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         assert pages == [], pages
         if spent == "others":
             # The second is stopped: no row, the line, and the backstop pages with its action.
-            again = await _fetch_return(c, start.headers["location"])
+            again = await _fetch_return(c, idp_url(start))
             assert again.status_code == 303
             after = await service.store.count_audit(limit=None, action="auth.login_failed")
             assert after == rows
@@ -601,12 +615,11 @@ async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_retu
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         _drain_sign_in_window(service)
         _drain_step_up_return_audit_budget(service)
         _forbid_sign_in_charge(service, monkeypatch)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         new = c.cookies.get("mf_session")
@@ -636,9 +649,8 @@ async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
         session = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         start = await _start_unlock_step_up(c)
-        assert start.status_code == 303
         assert not continuation_issued(session, _UNLOCK)  # held for the flow, not in the table
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         c.cookies.delete("mf_session")
         refused = await c.get(
             "/ui/oidc/callback",
@@ -651,8 +663,7 @@ async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
         assert continuation_issued(session, _UNLOCK)  # given back for the retry
 
         retry = await _start_unlock_step_up(c)
-        assert retry.status_code == 303
-        landed = await _callback(c, retry.headers["location"])
+        landed = await _callback(c, idp_url(retry))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text  # the landing continues to the page
@@ -675,11 +686,10 @@ async def test_a_retry_after_an_abandoned_idp_prompt_still_continues(
         await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         abandoned = await _start_unlock_step_up(c)
-        assert abandoned.status_code == 303
+        assert abandoned.status_code == 200
         retry = await _start_unlock_step_up(c)
-        assert retry.status_code == 303
 
-        landed = await _callback(c, retry.headers["location"])
+        landed = await _callback(c, idp_url(retry))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
@@ -697,15 +707,13 @@ async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
         issue_continuation(c, _UNLOCK)
         session = c.cookies.get("mf_session")
         first = await _start_unlock_step_up(c)
-        assert first.status_code == 303
         second = await _start_unlock_step_up(c)
-        assert second.status_code == 303
 
-        stale = await _callback(c, first.headers["location"])
+        stale = await _callback(c, idp_url(first))
         assert stale.status_code != 200 or _UNLOCK not in stale.text
         assert session is not None
         c.cookies.set("mf_session", session)
-        landed = await _callback(c, second.headers["location"])
+        landed = await _callback(c, idp_url(second))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
@@ -731,7 +739,6 @@ async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minti
         session = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         first = await _start_unlock_step_up(c)
-        assert first.status_code == 303
         budget = [False]
         monkeypatch.setattr(oidc_routes, "allow_reauth_attempt", lambda *_a: budget[0])
         refused = await _start_unlock_step_up(c)
@@ -739,7 +746,7 @@ async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minti
         budget[0] = True
         assert continuation_issued(session, _UNLOCK)  # the issue is back in the table
 
-        landed = await _callback(c, first.headers["location"])
+        landed = await _callback(c, idp_url(first))
 
         assert landed.status_code == 200, landed.text
         new = c.cookies.get("mf_session")
