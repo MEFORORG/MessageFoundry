@@ -66,14 +66,23 @@ def _probe_argv() -> list[str]:
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
 
-    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set; this
-    file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds nothing.
-    Comments are blanked first, so a comment quoting the argv cannot satisfy the pin.
+    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
+    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
+    nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
+    the pin ends at the array's close, so an element added after the flag reds it.
     """
-    src = " ".join(_js_code(_MODEL.read_text(encoding="utf-8")).split())
-    assert (
-        '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`, '
-        "...serviceConfigFlag(opts.serviceConfig)" in src
+    raw = _MODEL.read_text(encoding="utf-8")
+    src = " ".join(_js_code(raw).split())
+    # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
+    assert "Each value is bound with" in raw
+    assert "Each value is bound with" not in src
+    assert re.search(
+        re.escape(
+            '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`, '
+            "...serviceConfigFlag(opts.serviceConfig)"
+        )
+        + r",? \];",
+        src,
     )
     assert (
         "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "
