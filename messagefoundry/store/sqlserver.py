@@ -178,11 +178,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -10080,12 +10080,11 @@ class SqlServerStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(self._cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(self._cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:

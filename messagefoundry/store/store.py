@@ -181,11 +181,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -12389,9 +12389,10 @@ class MessageStore:
         preset's owner; BACKLOG #2593); caller holds ``self._lock``. ``select`` names the tag's
         columns, ``id`` among them, so the decrypt and the encrypt share one tag. All identifiers
         are code constants. A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no read can ever open it,
-        and re-sealing it would make it look genuine. Any other failure, a retired key that was not
-        supplied above all, still stops the rotation. Pages by ``id``, since a skipped row still
+        (:func:`reseal_unless_tag_failure`) is left as it is and counted in a WARNING: no read can ever
+        open it, and re-sealing it would make it look genuine. Any other failure still stops the
+        rotation, at least a retired key that was not supplied, a malformed envelope, and the active
+        key's invocation ceiling on the re-encrypt (BACKLOG #5610). Pages by ``id``, since a skipped row still
         matches the marker filter."""
         total = skipped = 0
         after = ""
@@ -12407,12 +12408,11 @@ class MessageStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(cipher, r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
                 await self._commit()
