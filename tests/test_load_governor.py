@@ -137,6 +137,8 @@ def test_a_zero_rate_stretch_does_not_burst_on_the_way_back_up(
     phase = _VPhase(name="v", kind="ramp", loop="open", duration_s=6.0, rate_start=100.0)
     gov = _run(phase, monkeypatch)
     assert _within(len(gov.emitted), 400), len(gov.emitted)
+    # The integral less _within's one send of slack, stated as a floor the absence check rests on.
+    assert len(gov.emitted) >= 399, len(gov.emitted)
     in_gap = [t for t in gov.emitted if 2.06 <= t < 4.0]
     assert not in_gap, in_gap[:5]
     # No single instant carries more than a tick's worth of sends at 100 msg/s.

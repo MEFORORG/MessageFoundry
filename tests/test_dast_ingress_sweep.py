@@ -490,6 +490,8 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
     sentinel = run_sentinel(int(_policy()["seed"]))
     cases = catalogue(sentinel, _CAP)
     assert {c.plane for c in cases} == {"mllp", "tcp", "x12"}, "a plane dropped out of the census"
+    # 58 cases on 2026-11-15; a shrunken census would make the absence check below hollow.
+    assert len(cases) >= 50, f"the catalogue census shrank to {len(cases)} cases"
     blind = [f"{c.plane}:{c.name}" for c in cases if not carries_sentinel(c, sentinel)]
     assert not blind, f"catalogue cases the log_body detector could not recognise: {blind}"
 
