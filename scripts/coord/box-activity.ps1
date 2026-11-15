@@ -36,9 +36,18 @@
     4. NEVER RE-DERIVE THE VETO STATE LIST. `Test-OccupancyVeto` in occupancy.ps1 owns it. A second
        copy of a safety list is the drift CLAUDE.md section 11 forbids, and the copy nobody tests is
        the one that breaks.
+    5. LOCAL PROBES COUNT ONLY FOR THIS PC'S SEAT (BACKLOG #5596). `.writer-alive` sits on the SHARED
+       root; the transcript, the session registry and the worktree list are this PC's own disk. For a
+       seat on another PC, or one whose host this PC cannot name, what those probes fail to find says
+       nothing, so they are not counted and the heartbeat alone stays below two. What they DO find
+       still vetoes: reading them is always the safe direction.
+    6. AN ABSENT OR UNPARSED REGISTRY IS NOT AN EVALUATED FENCE (BACKLOG #5596). A non-veto answer
+       counts only when a registry exists and every record in it parsed. A record that does not parse
+       may be this session's, half-written at launch; one written inside the fresh window vetoes.
 
     WHAT THIS FILE DOES NOT OWN. The box key is mail-key.ps1's. The liveness fence is
-    session-registry.ps1's. The veto state list is occupancy.ps1's. All three are dot-sourced.
+    session-registry.ps1's. The veto state list is occupancy.ps1's. The host rule is coord-root.ps1's.
+    The last three are dot-sourced here.
 #>
 
 # NO Set-StrictMode AND NO $ErrorActionPreference HERE, deliberately. Both are SCOPE settings, and a
@@ -47,6 +56,27 @@
 # the "defines functions, does nothing" this file's synopsis promises. Caught by breaking a caller.
 . "$PSScriptRoot\session-registry.ps1"
 . "$PSScriptRoot\occupancy.ps1"
+. "$PSScriptRoot\coord-root.ps1"
+
+function Get-BoxRecordHost {
+    <#
+    .SYNOPSIS
+        The host the box's newest seat record names: '' for a legacy record with no host field, $null
+        when there is none or the newest one cannot be read as an object.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$BoxKey, [Parameter(Mandatory)][string]$SeatsDir)
+    $dir = Join-Path $SeatsDir $BoxKey
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    # The NEWEST record only. One that cannot be read, parses to nothing, or is not an object may be
+    # the seat's current record mid-write, so nothing older speaks for it.
+    $f = Get-ChildItem -LiteralPath $dir -Filter *.json -File -Force -EA SilentlyContinue |
+         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if (-not $f) { return $null }
+    try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { return $null }
+    if ($rec -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    return (Get-CoordRecordHost $rec)
+}
 
 function ConvertTo-TranscriptSlug {
     <#
@@ -136,8 +166,11 @@ function Get-BoxActivity {
         Every activity signal for one seat box, with a count of how many could actually be evaluated.
 
     .OUTPUTS
-        BoxKey, WorktreePath, FenceState, FenceVeto, WriterAliveAgeH, TranscriptAgeH, WorktreeExists,
-        Signals, Evaluable, Veto, Why.
+        BoxKey, WorktreePath, RecordHost, HostHere, FenceState, FenceVeto, WriterAliveAgeH,
+        TranscriptAgeH, WorktreeExists, Signals, Evaluable, Veto, Why.
+
+        HostHere is false when the seat's host is another PC or cannot be named; the local probes are
+        then read for a veto but not counted in Signals (rule 5).
 
         Veto = true means DO NOT DISTURB. Veto = false does NOT mean safe -- check Evaluable, which is
         false when fewer than two signals could be read. Three outcomes, not two, and a caller that
@@ -151,6 +184,10 @@ function Get-BoxActivity {
         [string]$SessionId,
         [string[]]$ConfigRoot,
         [string]$RepoHint,
+        # The host the seat runs on, when the caller already holds its record. Unbound, it is read
+        # from the box's newest seat record under $SeatsDir. '' names nobody: a caller holding a
+        # legacy record with no host passes this machine's name, as lane-level.ps1 does.
+        [string]$RecordHost,
         # Hours. A signal newer than this vetoes. Deliberately generous: the cost of waiting a day
         # before retiring a file is nothing, and the cost of moving a live seat's handoff is the harm
         # this whole mechanism exists to avoid.
@@ -161,19 +198,59 @@ function Get-BoxActivity {
     $why = @()
     $signals = 0
 
+    # RULE 5. A legacy record with no host field is this PC's, the reading Test-CoordRecordIsHere
+    # gives; no record at all, an empty -RecordHost, or an unreadable host names nobody, so it is not
+    # here. Not-here stops the local probes COUNTING, never VETOING: a live session they do see is
+    # still a reason to leave the box alone.
+    $recHost = if ($PSBoundParameters.ContainsKey('RecordHost')) {
+                   $h = Get-CoordRecordHost @{ host = $RecordHost }
+                   if ($h) { $h } else { $null }
+               } else { Get-BoxRecordHost -BoxKey $BoxKey -SeatsDir $SeatsDir }
+    $here = ($null -ne $recHost) -and (Test-CoordRecordIsHere @{ host = $recHost })
+
     $fenceState = ''
     $fenceVeto = $false
     if ($SessionId) {
         try {
-            $l = Get-SessionLiveness -SessionId $SessionId -ConfigRoot $ConfigRoot
-            $fenceState = [string]$l.State
-            # UNKNOWN counts as EVALUATED and as NOT a veto: the fence looked and found no record.
-            # It is still not permission -- see the Signals contract. Measured 2026-08-22: 18 registry
-            # records against 265 seat records, so UNKNOWN is the normal case for a historical seat,
-            # not an edge one.
-            $signals++
-            $fenceVeto = Test-OccupancyVeto -State $fenceState
-            if ($fenceVeto) { $why += "fence=$fenceState" }
+            # An explicit -ConfigRoot is returned whether or not it holds sessions/, so test for it here.
+            $registries = @(Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot |
+                            Where-Object { Test-Path -LiteralPath (Join-Path $_ 'sessions') -PathType Container })
+            if ($registries.Count -eq 0) {
+                # RULE 6. No root holds a registry, so the fence had nowhere to look.
+                $fenceState = 'NO-REGISTRY'
+            } else {
+                # RULE 6. The unparsed records are listed BEFORE the fence reads, so a record still
+                # half-written when the fence skipped it is caught here rather than finishing between
+                # two reads and slipping past both.
+                $unparsed = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable |
+                              Where-Object { $_.Unreadable })
+                $l = Get-SessionLiveness -SessionId $SessionId -ConfigRoot $ConfigRoot
+                $fenceState = [string]$l.State
+                $fenceVeto = Test-OccupancyVeto -State $fenceState
+                if ($fenceVeto) {
+                    $why += "fence=$fenceState"
+                    if ($here) { $signals++ }
+                } elseif ($unparsed.Count -gt 0) {
+                    # Not counted: the record the fence missed, or a newer one for a relaunch of a
+                    # DEAD or STALE session, may be one of these. A fresh one is the shape of a session
+                    # launching right now, so it vetoes too; a vanished one counts as fresh.
+                    $fenceState = 'UNPARSED-REGISTRY'
+                    $fresh = @($unparsed | Where-Object {
+                        $it = Get-Item -LiteralPath $_.File -Force -EA SilentlyContinue
+                        (-not $it) -or (($Now - $it.LastWriteTimeUtc).TotalHours -lt $FreshHours)
+                    })
+                    if ($fresh.Count -gt 0) {
+                        $fenceVeto = $true
+                        $why += "fence=UNPARSED-REGISTRY ($($fresh.Count) registry record(s) written in the last ${FreshHours}h could not be parsed; one may be this session mid-launch)"
+                    }
+                } elseif ($here) {
+                    # UNKNOWN counts as EVALUATED and as NOT a veto: the fence looked in a readable
+                    # registry and found no record. It is still not permission -- see the Signals
+                    # contract. Measured 2026-08-22: 18 registry records against 265 seat records, so
+                    # UNKNOWN is the normal case for a historical seat, not an edge one.
+                    $signals++
+                }
+            }
         } catch {
             $fenceState = 'UNREADABLE'
             $fenceVeto = $true
@@ -189,14 +266,15 @@ function Get-BoxActivity {
 
     $transcriptH = Get-TranscriptAgeHours -WorktreePath $WorktreePath -ConfigRoot $ConfigRoot -Now $Now
     if ($null -ne $transcriptH) {
-        $signals++
+        if ($here) { $signals++ }
         # RULE 1. Stated as its own branch rather than folded in with the heartbeat, because the whole
         # reason this signal was added is that it must win when the two disagree.
         if ($transcriptH -lt $FreshHours) { $why += "transcript ${transcriptH}h (independent of seat.ps1)" }
     }
 
-    $exists = $false
-    if ($WorktreePath) {
+    # $null when not looked for: for a seat that is not here, absence on this disk says nothing.
+    $exists = if ($here) { $false } else { $null }
+    if ($WorktreePath -and $here) {
         $norm = ConvertTo-Norm $WorktreePath
         $wts = @(Get-RepoWorktrees -RepoHint $RepoHint)
         if ($wts.Count -gt 0) {
@@ -218,6 +296,8 @@ function Get-BoxActivity {
     return [pscustomobject]@{
         BoxKey          = $BoxKey
         WorktreePath    = $WorktreePath
+        RecordHost      = $recHost
+        HostHere        = $here
         FenceState      = $fenceState
         FenceVeto       = $fenceVeto
         WriterAliveAgeH = $writerH
