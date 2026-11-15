@@ -31,13 +31,15 @@ full control until the rename, so no step of the edit depends on what the privat
 grants. The file's ownership is given back where Windows lets this account do that. That needs the
 restore privilege enabled, which an elevated administrator holds but does not enable, and nothing
 here enables it. Otherwise the file stays owned by the account that created the candidate: the
-editing account, or on Windows Server Administrators. Read only then does not bind the editor, since
-an owner may rewrite a file's access list, and a later edit by an administrator reads the file as
-its own and makes the owner-only rewrite, which drops the owner's grant. Where the editor is not the
-owner, its later edit, code-set rename or remove of that file replaces or deletes a file it may not
-delete, so it succeeds only where the folder lets it delete files in it, as Administrators' full
-control of a folder does; elsewhere it is refused and the file is left as it was. An edit by the file's own account, or by an elevated administrator of
-a file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
+editing account, or on Windows Server Administrators. Where the editing account still owns it, it
+keeps full control: read only would bind it to nothing, since an owner may rewrite a file's access
+list, and would take only the right to delete the file that its next edit needs. A later edit by
+an administrator then reads the file as its own and makes the owner-only rewrite, which drops the
+owner's grant. Where the editor neither owns the file nor keeps full control, its later edit,
+code-set rename or remove of that file replaces or deletes a file it may not delete, so it succeeds
+only where the folder lets it delete files in it, as Administrators' full control of a folder does;
+elsewhere it is refused and the file is left as it was. An edit by the file's own account, or by an
+elevated administrator of a file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
 the editing account, not SYSTEM, Administrators or another reader. That holds only when this
 process's account can be read from its token and the list can be written. When the token cannot be
 read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
@@ -551,6 +553,16 @@ def _canonical_sid(sid: str) -> str | None:
         kernel32.LocalFree(pointer)
 
 
+def _owner_of(path: Path) -> str | None:
+    """The SID that owns ``path``, in ``S-1-...`` form, or ``None`` when it cannot be read.
+    Windows only."""
+    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl
+
+    sddl = _read_dacl_sddl(path, owner=True)
+    match = _SDDL_OWNER.search(sddl) if sddl is not None else None
+    return _canonical_sid(match.group(1)) if match is not None else None
+
+
 def _foreign_windows_owner(path: Path) -> str | None:
     """The SID of the account that owns ``path`` when that is not this process's account, else
     ``None``. ``None`` too when the owner, the token or the token's groups cannot be read, and for
@@ -568,11 +580,9 @@ def _foreign_windows_owner(path: Path) -> str | None:
         _is_package_sid,
         administrators_enabled,
     )
-    from messagefoundry.store.store import _SDDL_OWNER, _current_user_sid, _read_dacl_sddl
+    from messagefoundry.store.store import _current_user_sid
 
-    sddl = _read_dacl_sddl(path, owner=True)
-    match = _SDDL_OWNER.search(sddl) if sddl is not None else None
-    owner = _canonical_sid(match.group(1)) if match is not None else None
+    owner = _owner_of(path)
     editor = _current_user_sid()
     if owner is None or editor is None or owner == editor:
         return None
@@ -679,6 +689,20 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
             result.dacl_status,
         )
         return False
+    if result.owner_status != 0 and editor is not None and _owner_of(path) == editor:
+        # The hand-back was refused and the editor still owns the file. Read only would bind it to
+        # nothing, since an owner may rewrite the list, and the loader trusts the owner's own entry;
+        # it would only take the DELETE a later edit by this editor needs. Where another account
+        # owns it instead, such as Administrators on Windows Server, the editor stays at read only.
+        kept = _set_security_from_sddl(
+            path, _owner_and_editor_list(owner, editor, editor_writes=True), protected=True
+        )
+        if kept.failure is not None or kept.dacl_status != 0:
+            _log.warning(
+                "%s is left read only for this account, which owns it: %s",
+                scrub_log_argument(str(path)),
+                kept.failure or f"Win32 status {kept.dacl_status}",
+            )
     return True
 
 

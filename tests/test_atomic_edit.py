@@ -494,6 +494,64 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
     assert _verdict() == f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access"
 
 
+#: A service account no real account here is: the live file's foreign owner where this process
+#: plays the editing administrator, so naming it as the owner is refused (no restore privilege).
+_SERVICE_SID = "S-1-5-21-1000000001-1000000002-1000000003-7777"
+
+
+def _config_verdict(path: Path, engine_sid: str) -> str | None:
+    """What the config loader, running as ``engine_sid``, says of ``path``: ``None`` to accept."""
+    from messagefoundry.config.wiring import _evaluate_config_dacl, _win32_config_source_probes
+
+    probes = _win32_config_source_probes()
+    security = probes.read_path(path)
+    assert security.status == 0 and security.owner_sid is not None
+    assert security.aces is not None
+    return _evaluate_config_dacl(
+        security.owner_sid, security.aces, engine_sid, probes.owner_in_admins
+    )
+
+
+@windows_only
+@pytest.mark.parametrize("hand_back", ["succeeds", "refused"])
+def test_a_foreign_owners_file_can_be_edited_again_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hand_back: str
+) -> None:
+    """A second edit after a foreign-owner edit, with the config loader's check after each.
+
+    ``succeeds``: this process plays the file's owner, the service account, and the token seam
+    reports another account as the editor, so the ownership hand-back is to this process itself.
+    ``refused``: this process plays the editing administrator, and the owner is a service account
+    no real account is, so Windows refuses to name it as the owner and this process keeps the file.
+    Its folder grants this process Modify, which holds no right to delete another file in it, so
+    the second edit can replace the file only through the file's own entry."""
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+
+    me = store_mod._current_user_sid()
+    assert me is not None
+    folder = tmp_path / "config"
+    folder.mkdir()
+    written = store_mod._set_security_from_sddl(
+        folder, f"D:P(A;OICI;0x1301bf;;;{me})", protected=True
+    )
+    assert written.failure is None and written.dacl_status == 0, written
+    path = folder / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+    if hand_back == "succeeds":
+        engine = _real_owner(path)
+        monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
+    else:
+        engine = _SERVICE_SID
+        monkeypatch.setattr(atomic_edit, "_foreign_windows_owner", lambda _path: _SERVICE_SID)
+
+    for text in (b"x = 1\n", b"x = 2\n"):
+        atomic_edit.replace_validated(path, text, _noop)
+        assert path.read_bytes() == text
+        assert _config_verdict(path, engine) is None
+
+
 @windows_only
 def test_a_failed_owner_and_editor_list_write_keeps_the_foreign_owners_grant_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
