@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -27,7 +27,8 @@ from harness.acceptance.probes import run_probe
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: pytest's own "some tests failed" exit code; any other non-zero code means the run itself broke.
+#: pytest's own "some tests failed" exit code (``pytest.ExitCode.TESTS_FAILED``, copied so the
+#: harness need not import pytest); any other non-zero code means the run itself broke.
 _PYTEST_TESTS_FAILED = 1
 
 
@@ -40,7 +41,7 @@ class PytestRun:
     a timeout. Every ``PYTEST`` row is then ``ERROR`` (or ``FAIL``), never ``PASS``.
     """
 
-    by_file: dict[str, Status]
+    by_file: dict[str, Status] = field(default_factory=dict)
     run_error: str = ""
 
 
@@ -128,7 +129,7 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
     failure the map cannot carry becomes ``run_error`` rather than a silent ``PASS``.
     """
     if not node_ids:
-        return PytestRun({})
+        return PytestRun()
     env = dict(os.environ)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")  # console suites need a headless Qt platform
     with tempfile.TemporaryDirectory(prefix="mefor_accept_") as td:
@@ -159,12 +160,21 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
         return PytestRun(by_file, _judge_run(node_ids, proc.returncode, by_file, unattributed))
 
 
-def _aggregate(statuses: Iterable[Status]) -> Status | None:
-    """Combine a row's per-file statuses. Precedence: FAIL > ERROR > PASS > SKIP. ``None`` if empty."""
+_ONCE_ORDER = (Status.FAIL, Status.ERROR, Status.PASS, Status.SKIP)
+_PER_DB_ORDER = (Status.FAIL, Status.ERROR, Status.SKIP, Status.PASS)
+
+
+def _aggregate(statuses: Iterable[Status], *, per_db: bool = False) -> Status | None:
+    """Combine a row's per-file statuses. ``None`` if empty.
+
+    Precedence: FAIL > ERROR > PASS > SKIP, so a row passes once any of its suites ran. A ``per_db``
+    row instead ranks SKIP above PASS: it certifies every backend, and its server-DB suites skip
+    whole off-server, so SQLite passing alone must not read as PASS for the row.
+    """
     seen = list(statuses)
     if not seen:
         return None
-    for level in (Status.FAIL, Status.ERROR, Status.PASS, Status.SKIP):
+    for level in _PER_DB_ORDER if per_db else _ONCE_ORDER:
         if level in seen:
             return level
     return None
@@ -180,12 +190,11 @@ def _pytest_row_result(row: MatrixRow, run: PytestRun) -> RowResult:
             status = Status.ERROR  # requested but not collected (missing file / collection error)
         statuses.append(status)
         parts.append(f"{Path(key).name}={status.value}")
-    agg = _aggregate(statuses) or Status.ERROR
     if run.run_error:
         # The run broke somewhere the per-file map cannot show, so no row of it may PASS or SKIP.
-        if agg is not Status.FAIL:
-            agg = Status.ERROR
+        statuses.append(Status.ERROR)
         parts.append(f"run error: {run.run_error}")
+    agg = _aggregate(statuses, per_db=row.is_per_db) or Status.ERROR
     return RowResult(row, agg, ", ".join(parts), evidence=row.notes)
 
 
@@ -205,7 +214,7 @@ def run_matrix(
     selected = [r for r in rows if include_sections is None or r.section in set(include_sections)]
 
     pytest_files = [ref for r in selected if r.coverage is Coverage.PYTEST for ref in r.refs]
-    pytest_run = PytestRun({})
+    pytest_run = PytestRun()
     if run_pytest and pytest_files:
         # de-dup preserving order
         ordered = list(dict.fromkeys(pytest_files))
