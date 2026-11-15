@@ -119,6 +119,24 @@ MUST_HIT = [
         "-AllowOrphanedAllocations",
         id="allow-orphaned",
     ),
+    # BACKLOG #5587: an escaped quote closed the span, so the real close opened another and the act
+    # after it read as quoted text.
+    pytest.param(
+        'echo "say \\"hi" ; git push --force origin b ; echo "end"',
+        "git push --force",
+        id="bash-escaped-double-quote",
+    ),
+    pytest.param(
+        'Write-Output "say `"hi" ; git push --force origin b ; Write-Output "end"',
+        "git push --force",
+        id="pwsh-backtick-escaped-quote",
+    ),
+    pytest.param(
+        "echo $'it\\'s' ; git reset --hard ; echo 'x'",
+        "git reset --hard",
+        id="bash-ansi-c-escaped-quote",
+    ),
+    pytest.param("git push \\--force origin b", "git push --force", id="bash-escaped-flag"),
 ]
 
 MUST_PASS = [
@@ -147,6 +165,10 @@ MUST_PASS = [
         id="kill-switch-read",
     ),
     pytest.param("gh api repos/MEFORORG/MessageFoundry/pulls/1 -X PATCH -f x=y", id="other-gh"),
+    # The controls for #5587: an escaped quote inside a message keeps the mention a mention.
+    pytest.param('git commit -m "say \\"git push --force\\" ok"', id="bash-escaped-mention"),
+    pytest.param('git commit -m "say `"git push --force`" ok"', id="pwsh-escaped-mention"),
+    pytest.param("echo 'it''s git push --force'", id="pwsh-doubled-single-quote"),
 ]
 
 
