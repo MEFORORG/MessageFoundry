@@ -372,3 +372,60 @@ restored rather than superseded.
 change at the graft boundary rather than at its commit. The instrument here was a content comparison
 between `46b3a4437b7d64053851a0787911f861e3127fdb` and `main` at `1aa2d6a1b`, which establishes *that*
 these moved and not *when*.
+
+## Amendment B (2026-11-14) — section 1: a flap latch beside the stage-1 bound (BACKLOG #5812)
+
+**Section 1 above is unedited, and its bound runs as before.** Past 5 rolls in 60 seconds, counted
+from the first roll of the window, the sink is declared unwritable, and every roll past that bound
+pages and, under the `stop` policy, asks for the stop when every sink is unwritable, as before this
+amendment. Amendment A's statement that section 1 describes the shipped module exactly stops being
+true here: section 1 does not describe the latch below.
+
+**What was wrong.** The roll that trips the bound wrote the sink's state as `rolled` and only then
+escalated, so for that interval another thread read the sink as writable. And the bound's window
+restarts a minute after its first roll, so a sink still rolling every few seconds read `rolled`
+again, and `can_log()` read True with no probe, until the bound tripped again.
+
+**The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).** It is an
+overlay in its own field, `_flap_latch`, holding a `_FlapLatch` per held sink, and never in the
+bound's `_roll_flap`.
+
+- The roll that trips the bound latches the sink, in the same hold of the guard's lock that writes the
+  bound's state, so the sink reads unwritable before `record_unwritable` runs.
+- A later roll keeps the latch while it comes within 60 seconds of the sink's last roll or stage-2
+  failure. The first roll after a longer gap releases it. A stage-2 failure refreshes that clock but
+  never starts a latch: a sink stage 2 alone declared dead is not latched.
+- A latched sink that stops rolling stays held until `revalidate()` writes a record to it.
+  `revalidate()` probes a sink the latch alone holds as well as each sink whose own state is
+  `unwritable`, so section 4's "re-validate its dead sinks" now covers these too. When the probe of a
+  latch-only sink lands, only the latch is released: `record_healthy` is not called for it, so the
+  bound's window and streak are not reset. A probe that raises, or a sink registered with no probe,
+  leaves the latch held.
+- `status()`, `can_log()` and `revalidate()` read a sink unwritable when its own state or the latch
+  says so. On `GET /status` the latch changes only the `state` field; the cause, the rolled-aside path
+  and the roll count are the newest event's, as without it.
+
+**What the latch does not change.** The bound, its window and streak, the state the three `record_*`
+methods write, every stage-1 and stage-2 page and every stop request are the code on `main` before
+this amendment, line for line; the latch's code only reads them. The pages are still one per roll past
+the bound, not one per break: the row's *one page per break* clause is not closed by this amendment.
+
+**Stricter than section 1, and stated rather than hidden.** A sink the latch holds reads unwritable
+while it may be accepting records. So `can_log()` can read False where section 1 alone would read
+True. `revalidate()` can too, when the probe of a latch-only sink raises or the sink has no probe; a
+re-arm gated on it, a runner start included, is then refused or comes up halted where section 1
+alone would have let it through. The latch requests no stop of its own: a running process whose sinks all
+read unwritable only because of the latch keeps running until a stop event or a re-arm asks.
+
+**How far "never weaker than section 1" was checked, and no further.** A side-by-side fuzz ran this
+guard beside `main`'s `logging_guard.py` (checked byte-identical to `origin/main` at the run) under a
+fake clock, over random sequences of rolls, stage-2 failures, `record_healthy` calls where `main`
+would probe, `revalidate()` calls with shared probe outcomes, and runner restarts (escalation
+re-wired, then `revalidate()`), on one sink and on two sinks, one configuration with a probe-less
+sink and the `continue` policy. At every step it compared the reported state, `can_log()`, the
+`revalidate()` answer, stage-1 and stage-2 pages, every event, stop requests, the `/status` fields
+other than `state`, and the bound's own `_sinks` and `_roll_flap`. Over 8 seeds and 5 configurations
+it found no step where `main` was stricter, and it found such steps on the previous attempt at this
+item, including a `revalidate()` that reset the bound. That is a sampled search, not a proof.
+[`tests/test_log_write_guard.py`](../../tests/test_log_write_guard.py) pins the cases by name, among
+them a revalidate between two flaps that must still stop at the moment `main` stops.
