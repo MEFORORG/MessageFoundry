@@ -1383,6 +1383,14 @@ def _context_checks(dispatcher: Path, g: dict[str, Path]) -> list[str]:
     if not hso(threw).get("additionalContext", "").startswith("context A"):
         failed.append(f"a failed guard cost another guard its context: {threw}")
 
+    asked = run("ask", "throws")
+    if (
+        asked.returncode != 0
+        or hso(asked).get("permissionDecision") != "ask"
+        or _FAILED_NOTICE not in str(hso(asked).get("additionalContext"))
+    ):
+        failed.append(f"a kept decision hid a failed guard: {asked}")
+
     silent_fail = run("silent", "throws")
     if (silent_fail.returncode, silent_fail.stdout) != (1, ""):
         failed.append(f"a failed guard beside a silent allow did not exit 1: {silent_fail}")

@@ -626,6 +626,14 @@ QUOTED_SUBSTITUTION_DENY = [
     pytest.param(r"echo \$'\'; find /proc", id="escaped-dollar-before-plain-single-quotes"),
     # `$$` is the PID, so the quote after it is a plain one, not a `$'...'`.
     pytest.param(r"echo $$'\'; find /proc", id="pid-before-plain-single-quotes"),
+    # A quote inside a heredoc body is data, in the commit-message form and at the top level.
+    pytest.param(
+        "git commit -m \"$(cat <<'EOF'\nFix: don't break it\nEOF\n)\" && grep -r foo /proc",
+        id="apostrophe-in-a-heredoc-inside-a-quoted-substitution",
+    ),
+    pytest.param("cat <<EOF\ndon't\nEOF\nfind /proc", id="apostrophe-in-a-top-level-heredoc"),
+    # Arithmetic is not a heredoc opener.
+    pytest.param('echo "$((1 << n))"\nfind /proc', id="shift-inside-quoted-arithmetic"),
 ]
 
 
@@ -661,6 +669,11 @@ POWERSHELL_QUOTE_DENY = [
 ]
 
 
+def test_a_payload_without_a_tool_name_is_still_screened() -> None:
+    """Strict mode throws on a missing property, and the guard's catch allows."""
+    assert_denied(run_guard('{"tool_input": {"command": "find /proc"}}'))
+
+
 @pytest.mark.parametrize("command", POWERSHELL_QUOTE_DENY)
 def test_a_powershell_string_does_not_hide_the_walk_after_it(command: str) -> None:
     assert_denied(run_guard(bash(command, tool="PowerShell")))
@@ -690,7 +703,7 @@ EXPECTED_ROW_COUNTS = {
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
     "FOLDING_ALLOW": 20,
-    "QUOTED_SUBSTITUTION_DENY": 10,
+    "QUOTED_SUBSTITUTION_DENY": 13,
     "QUOTED_PROSE_ALLOW": 6,
     "POWERSHELL_QUOTE_DENY": 2,
 }

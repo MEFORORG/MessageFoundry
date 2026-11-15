@@ -1634,6 +1634,20 @@ def _git(repo: Path, *args: str, stdin: str = "") -> str:
     return proc.stdout.strip()
 
 
+def test_the_digest_folds_a_seat_alias_as_the_gate_does(sb: Sandbox) -> None:
+    """Decisions logged as `mgr` are the manager's in both digest tables, as the gate charges them."""
+    _with_roster(sb)
+    mine = [rec(at=ago(days=20), seat="mgr", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    out = proc.stdout
+    assert "| manager | B |" in out, out
+    assert "| manager | 2 of 2 in the trailing 24 hours; CLOSED" in out, out
+    assert "| mgr |" not in out, out
+
+
 def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(
     sb: Sandbox,
 ) -> None:

@@ -90,7 +90,14 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 #
 # BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
 # backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
-# quote and blank the command after them. -Plain keeps the toggle that read both correctly.
+# quote and blank the command after them. -Plain keeps the toggle this guard had before, which
+# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote.
+#
+# A HEREDOC BODY IS DATA, and it is blanked here too, line for line. Hide-HeredocBodies runs on the
+# output of this function, so a quote in a body (`don't`) would otherwise open a span here that
+# blanks the terminator and the walk after it -- most often inside "$(cat <<'EOF' ... EOF)", the
+# commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
+# as a heredoc opener.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -116,12 +123,41 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     $depths = [System.Collections.Generic.List[int]]::new()
     $kinds.Add('top'); $depths.Add(0)
     $prevDollar = $false
+    # The delimiter of a heredoc opened on this line, then of the body being blanked.
+    $pending = $null
+    $bodyTerm = $null
     $n = 0
     while ($n -lt $Text.Length) {
+        if ($null -ne $bodyTerm) {
+            # At the start of a body line: blank it whole, or keep the terminator line as it is.
+            $end = $Text.IndexOf("`n", $n)
+            if ($end -lt 0) { $end = $Text.Length }
+            $line = $Text.Substring($n, $end - $n)
+            if ($line.Trim() -ceq $bodyTerm) { [void]$sb.Append($line); $bodyTerm = $null }
+            else { [void]$sb.Append(' ' * $line.Length) }
+            if ($end -lt $Text.Length) { [void]$sb.Append("`n") }
+            $n = $end + 1
+            continue
+        }
         $ch = $Text[$n]
         $top = $kinds.Count - 1
         $kind = $kinds[$top]
         $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
+        if ($kind -ceq 'arith') {
+            if ($ch -ceq '(') { $depths[$top]++; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ')' -and $depths[$top] -gt 0) { $depths[$top]--; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ')' -and $next -ceq ')') {
+                $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append('))'); $n += 2; continue
+            }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(' -and
+            $kind -cne 'sq' -and $kind -cne 'ansi') {
+            $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
+            $n += 3; continue
+        }
         if ($kind -ceq 'sq' -or $kind -ceq 'ansi') {
             if ($kind -ceq 'ansi' -and $ch -ceq '\' -and $null -ne $next) {
                 [void]$sb.Append(' ')
@@ -148,7 +184,24 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
             else { [void]$sb.Append(' ') }
             $n++; continue
         }
-        # Unquoted: top, sub or bt. An unquoted backslash escapes the next character, whatever it is.
+        # Unquoted: top, sub or bt. A newline ends the line a heredoc was opened on, so its body
+        # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
+        # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
+        if ($ch -ceq "`n" -and $null -ne $pending) {
+            [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false
+            $n++; continue
+        }
+        if ($ch -ceq '<' -and $next -ceq '<' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])) -and
+            -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<')) {
+            $d = [regex]::Match($Text.Substring($n + 2), '^-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+            if ($d.Success) {
+                $pending = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                    Where-Object { $_ } | Select-Object -First 1
+            }
+            [void]$sb.Append('<<'); $prevDollar = $false
+            $n += 2; continue
+        }
+        # An unquoted backslash escapes the next character, whatever it is.
         if ($ch -ceq '\') {
             [void]$sb.Append($ch)
             if ($null -ne $next) { [void]$sb.Append($next) }
@@ -274,7 +327,9 @@ try {
 
     # The blanked view says where a command starts and what program it is; the raw view, at the
     # same offsets, gives its operands. Quotes are masked before heredocs, for the reason above.
-    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain:([string]$j.tool_name -cne 'Bash'))
+    # Read safely: under strict mode a missing tool_name would throw, and the catch would allow.
+    $tool = if ($j.PSObject.Properties['tool_name']) { [string]$j.tool_name } else { '' }
+    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain:($tool -ceq 'PowerShell'))
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.
