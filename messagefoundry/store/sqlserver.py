@@ -286,6 +286,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -16707,8 +16708,16 @@ class SqlServerStore:
         stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
         await self._write_session_txn(token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
+        written = await self._write_session_txn(token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

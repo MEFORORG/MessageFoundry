@@ -116,6 +116,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
@@ -3375,8 +3376,10 @@ class AuthStore(Protocol):
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
         :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
-        that report what they changed: every other one is deliberately blind (a write against a dead
-        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        that report what they changed, with one narrower exception:
+        :meth:`mark_session_mfa_verified` answers only whether it landed AND applied a pending-factor
+        anchor, so its False does not tell a dead hash from a stamp that applied none. Every other
+        one is deliberately blind (a write against a dead hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
@@ -3409,8 +3412,31 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_mfa_verified(
-        self, token_hash: str, *, now: float | None = None
-    ) -> None: ...
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp the session's second factor as met (``mfa_verified_at``), always.
+
+        ``anchor`` (vault BACKLOG #2964 item 14) is applied only when the row this write reads has
+        not met its factor. The decision is made inside the write's own transaction, on the row the
+        write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
+        SQLite's writer lock orders this process's writers, so a factor another request met first
+        leaves this a plain factor stamp. On SQLite a commit by another process between the read
+        and the write makes the write raise rather than replace anything, which the passkey leg
+        answers by ending the session (fail closed). When
+        applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
+        and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
+        ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
+        default ``None`` applies no anchor, which is the behaviour every other caller has.
+
+        Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
+        its new-address bookkeeping only for a session an anchor was applied to (with
+        ``anchor.client`` ``None`` that is True with the address unchanged); ``False`` for a write
+        that applied none, a session gone or revoked, or a write that lost its seal compare."""
+        ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 

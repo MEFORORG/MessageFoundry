@@ -1007,8 +1007,12 @@ count is above `0` (vault BACKLOG #2613).
 > ([ADR 0077](adr/0077-action-bound-step-up.md)).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
-  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
-  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  With the switch off, those routes accept the session-wide step-up window instead. At least a
+  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  completes a pending factor with the user-verification flag, on any session but an `oidc` one,
+  can open that window; that flag is
+  the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
   or export bodies in bulk with no fresh proof.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
