@@ -162,8 +162,9 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui. The
   check FAILS CLOSED on a write that carries neither header (BACKLOG #1116, #1124).
 * **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
-  :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
-  has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
+  :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; which
+  browsers apply its ``"cache"`` value, and which only in part, is the version table in
+  ``docs/BROWSER-SUPPORT.md``. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
   the cookie is explicitly deleted, every /ui HTML response carries ``Cache-Control: no-store``, and
   the 14.3.1 watchdog blanks the rendered document synchronously before navigating away.
 * **``Cache-Control: no-store``** on /ui HTML and PHI JSON (engine middleware) — DEGRADES SILENTLY: a
@@ -380,8 +381,9 @@ class UiFetchMetadataMiddleware:
     **EVERY REQUIREMENT BELOW IS CONDITIONAL ON THE BROWSER HAVING ALREADY PROVED IT SPEAKS FETCH
     METADATA (BACKLOG #1122).** None of them is reached until ``Sec-Fetch-Site`` arrived and said
     cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
-    what lets them ship with no supported-browser matrix in the tree -- ``docs/SYSTEM-REQUIREMENTS.md``
-    says only "A modern browser" -- and it is exactly what an ABSENCE rule could not claim. Measured
+    what lets them ship without assuming any browser sends fetch metadata -- the version table in
+    ``docs/BROWSER-SUPPORT.md`` documents a floor, and nothing enforces it -- and it is exactly what
+    an ABSENCE rule could not claim. Measured
     2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
     reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
     browser-support decision, not a code change, and it is not taken here.
