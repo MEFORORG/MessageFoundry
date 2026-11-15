@@ -33,6 +33,7 @@ true, so the day someone widens it, a test has to be edited deliberately.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import functools
 import itertools
@@ -82,8 +83,14 @@ _ENV_REF = re.compile(r"\$\{?([A-Z][A-Z0-9_]*)\}?")
 _RUNNER_PROVIDED = frozenset({"GITHUB_OUTPUT"})
 
 
-def _load() -> dict:
+@functools.cache
+def _parsed() -> dict:
     return yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def _load() -> dict:
+    # Parsed once; each caller gets its own copy, so no test can change what another reads.
+    return copy.deepcopy(_parsed())
 
 
 def _steps() -> list[dict]:
@@ -541,10 +548,71 @@ def _merge_contexts() -> list[dict[str, str]]:
 
 _GH_PR_MERGE = re.compile(r"gh pr merge[^;\n]*")
 
+# The two bodies that run `gh pr merge`, pinned WHOLE (BACKLOG #5593, #5605). A check on the
+# gh calls alone sees only the spellings it knows, so any edit to either body has to edit this
+# text deliberately, as the one-line pin of the arm body this replaced did.
+_ARM_BODY = (
+    "set -u\n"
+    'if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"; then\n'
+    "  exit 0\n"
+    "fi\n"
+    'now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || '
+    'now="ERR"\n'
+    'case "$now" in *[!0-9a-f]*) now_ok=false ;; *) now_ok=true ;; esac\n'
+    '[ "${#now}" -eq 40 ] || now_ok=false\n'
+    'if [ "$now_ok" != true ]; then\n'
+    '  echo "::error::arming failed and the PR head could not be read (got '
+    "'${now}').\"\n"
+    "  exit 1\n"
+    "fi\n"
+    'if [ "$now" != "$HEAD_SHA" ]; then\n'
+    '  echo "::notice::the head moved from $HEAD_SHA to $now while this run '
+    'evaluated; the run for the new head decides."\n'
+    "  exit 0\n"
+    "fi\n"
+    'echo "::error::arming failed on the head this run evaluated."\n'
+    "exit 1\n"
+)
+
+_DISARM_BODY = (
+    "set -u\n"
+    "# `||` outside the substitution, for the reason the ghsa step gives: `gh` "
+    "writes an error\n"
+    "# body to stdout, and the shape check below must see the sentinel, not that "
+    "body.\n"
+    'armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq \'.autoMergeRequest '
+    '!= null\' 2>/dev/null)" || armed="ERR"\n'
+    'case "$armed" in\n'
+    "  false)\n"
+    '    echo "::notice::no auto-merge request is armed on this PR (a merge-queue '
+    'entry is not read here)."\n'
+    "    exit 0\n"
+    "    ;;\n"
+    "  true) ;;\n"
+    "  *)\n"
+    '    # Unknown is not "not armed": an arm on an earlier head may still be live, '
+    "so disarm\n"
+    "    # anyway. The read-back below decides whether the job passes.\n"
+    "    echo \"::warning::could not read this PR's auto-merge state \u2014 disarming "
+    'anyway."\n'
+    "    ;;\n"
+    "esac\n"
+    'gh pr merge --disable-auto "$PR_URL"\n'
+    'after="$(gh pr view "$PR_URL" --json autoMergeRequest --jq \'.autoMergeRequest '
+    '!= null\' 2>/dev/null)" || after="ERR"\n'
+    'if [ "$after" != "false" ]; then\n'
+    "  echo \"::error::auto-merge still reads '${after}' after the disarm \u2014 failing "
+    'closed, nothing re-arms."\n'
+    "  exit 1\n"
+    "fi\n"
+    'echo "::warning::disarmed auto-merge armed on an earlier head; it re-arms only '
+    'if the guardrails admit this head."\n'
+)
+
 
 def _merge_step() -> dict:
-    """The one step that ARMS auto-merge."""
-    arms = [s for s in _steps() if "gh pr merge --auto" in str(s.get("run", ""))]
+    """The one step that ARMS auto-merge, found with its whitespace collapsed."""
+    arms = [s for s in _steps() if "gh pr merge --auto" in " ".join(str(s.get("run", "")).split())]
     assert len(arms) == 1, f"expected exactly one arming gh pr merge step, found {len(arms)}"
     return arms[0]
 
@@ -554,32 +622,19 @@ def test_one_step_arms_in_the_arming_job_and_the_disarm_step_only_disarms() -> N
     ``disarm`` job's step (BACKLOG #5593), whose every ``gh pr merge`` call may only DISARM. A third
     ``gh pr merge`` step, or an arm call inside the disarm step, fails here, so neither role can
     hide behind the other."""
-    merges = [s for s in _steps() if "gh pr merge" in str(s.get("run", ""))]
-    assert [s.get("id") for s in merges if s.get("id") == "disarm"] == ["disarm"], merges
+    merges = [s for s in _steps() if "gh pr merge" in " ".join(str(s.get("run", "")).split())]
     assert len(merges) == 2, f"expected exactly two gh pr merge steps, found {len(merges)}"
-    body = str(_step("disarm")["run"])
-    calls = _GH_PR_MERGE.findall(body)
-    assert calls == ['gh pr merge --disable-auto "$PR_URL"'], f"the disarm step arms: {calls!r}"
-    _assert_only_gh_on_the_pr(body)
+    disarm = _step("disarm")
+    assert disarm in merges, "the disarm step no longer runs gh pr merge"
+    assert disarm["run"] == _DISARM_BODY, "the disarm body changed; re-read it and edit the pin"
+    assert _GH_PR_MERGE.findall(_DISARM_BODY) == ['gh pr merge --disable-auto "$PR_URL"']
     assert _merge_step() in _load()["jobs"]["auto-merge"]["steps"], "the arm step left the job"
-
-
-def _assert_only_gh_on_the_pr(body: str) -> None:
-    """A ``gh pr merge`` regex sees only one spelling of an arm. So the disarm and arm bodies may
-    reach GitHub only through ``gh pr view`` or ``gh pr merge`` on ``"$PR_URL"``: no ``gh api`` (a
-    GraphQL ``enablePullRequestAutoMerge`` arms too), no other client, and no read of the token,
-    which ``gh`` takes from the env and nothing else in the body needs."""
-    calls = re.findall(r"\bgh [^;\n)]*", body)
-    assert calls, "no gh call in the body"
-    for call in calls:
-        assert re.match(r"gh pr (view|merge) ", call) and '"$PR_URL"' in call, call
-    for word in ("curl", "wget", "graphql", "TOKEN", "command ", "which ", "python", "node "):
-        assert word not in body, f"the body names {word!r}"
 
 
 def test_the_arming_job_runs_only_its_known_steps() -> None:
     """The job holding ``contents: write`` runs these steps and no others, and the one action it
-    uses is fetch-metadata, so an unconditioned third-party arm step cannot be added unread."""
+    uses is fetch-metadata, so a NEW step, an unconditioned third-party arm action for one, cannot
+    be added unread. What an existing step's body calls is not limited here."""
     steps = _load()["jobs"]["auto-merge"]["steps"]
     assert [s.get("id") for s in steps] == ["meta", "allowset", "ghsa", "age", "authors", None]
     uses = [str(s["uses"]) for s in steps if "uses" in s]
@@ -635,14 +690,13 @@ def test_the_job_runs_only_for_dependabot_authored_prs() -> None:
 
 
 def test_the_merge_step_squashes_the_triggering_pr_and_nothing_else() -> None:
-    """One arm call, a head-pinned squash of the triggering PR; every other ``gh`` call in the body
-    reads that same PR. The env holds only the PR, the evaluated head and the token."""
+    """The arm body is the pinned text and nothing else: its one arm call is a head-pinned squash
+    of the triggering PR. The env holds only the PR, the evaluated head and the token."""
     merge = _merge_step()
-    run = str(merge["run"])
-    assert _GH_PR_MERGE.findall(run) == [
+    assert merge["run"] == _ARM_BODY, "the arm body changed; re-read it and edit the pin"
+    assert _GH_PR_MERGE.findall(_ARM_BODY) == [
         'gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"'
-    ], run
-    _assert_only_gh_on_the_pr(run)
+    ]
     env = merge.get("env") or {}
     assert env == {
         "PR_URL": "${{ github.event.pull_request.html_url }}",

@@ -1135,13 +1135,12 @@ def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> No
 
 
 def test_a_breach_under_a_name_that_drops_below_60_still_closes_its_alias(sb: Sandbox) -> None:
-    """The manager's 60 ratings end in 4 disagreements, but its oldest decision has left the 60-day
-    window, so it holds 59 there and its own history is no longer a breach. Read with `mgr`'s 60
-    clean ratings before them, the seat's pooled history still is, so `mgr` stays closed."""
-    gone = rec(at=ago(days=61), seat="manager", item="calib")
-    gone_rating = rec("rating", at=ago(days=19), seat="owner", ref=gone["id"], rating="agree")
+    """The manager's ratings end in 4 disagreements, but it holds 59 rated decisions in the 60-day
+    window, which is what a name holds once its 60th has aged out (the gate reads no decision
+    logged before the window), so its own history is no breach. Read with `mgr`'s 60 clean ratings
+    before them, the seat's pooled history still is, so `mgr` stays closed."""
     manager = _rated("manager", 19, disagree=(55, 56, 57, 58), count=59)
-    seed_vault(sb, calibrated("builder") + _rated("mgr", 20) + [gone, gone_rating] + manager)
+    seed_vault(sb, calibrated("builder") + _rated("mgr", 20) + manager)
     code, doc = gate(sb, seat="mgr")
     msg = why(doc)
     assert code == REVIEW, msg

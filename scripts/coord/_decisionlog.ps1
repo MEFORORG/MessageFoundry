@@ -635,9 +635,9 @@ function Get-DecisionCalibration {
         all its names' read together -- applies to every name of it. All its names together is the
         seat-pooled reading this ruling replaced, so every breach that reading catches closes every
         name: option c is at least as strict as it, never looser. A history is in breach as its own
-        row would read it, so a name with fewer than 60 ratings in the window, one whose oldest have
-        aged out included, is no breach alone and counts only within all the names together. A
-        name's own breach heals only on 60 ratings of its own.
+        row would read it, so a name with fewer than 60 rated decisions logged in the window, one
+        whose oldest have aged out included, is no breach alone and counts only within all the
+        names together. A name's own breach heals only on 60 ratings of its own.
       - REVERSALS are charged across the names: another name's reversed decisions in -RecentDays
         count in this name's rate, while its unreversed ones never dilute it. The rate itself is
         this name's, so a rate breach under another name reaches this one only through the
