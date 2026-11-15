@@ -376,18 +376,25 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
     """The stranding arm one band's ``_reconcile`` judged, as the band published it.
 
     ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
-    say (BACKLOG #5574): a missing field must not clear the arm. The verdict is read, never worked
-    out again here, because only the band knows the budget argument it passed (connscale-remote
-    computes it with the same ``_excusal`` call ``_reconcile`` makes).
+    say, or says something its own numbers contradict (BACKLOG #5574): a missing or malformed field
+    must not clear the arm. The verdict is read, never worked out again here, because only the band
+    knows the budget argument it passed (connscale-remote computes it with the same ``_excusal`` call
+    ``_reconcile`` makes); the check here is only that ``over_budget`` is ``unconfirmed > budget``,
+    the comparison ``_excusal`` makes.
     """
     stranding = report.get("no_loss", {}).get("stranding")
-    if not isinstance(stranding, Mapping) or not isinstance(stranding.get("over_budget"), bool):
+    if not isinstance(stranding, Mapping):
         return None, ""
-    if not stranding["over_budget"]:
+    over, unconfirmed, budget = (stranding.get(k) for k in ("over_budget", "unconfirmed", "budget"))
+    if (
+        not isinstance(over, bool)
+        or not all(isinstance(v, int) and not isinstance(v, bool) for v in (unconfirmed, budget))
+        or over != (unconfirmed > budget)
+    ):
+        return None, ""
+    if not over:
         return False, ""
     band = escape_for_terminal(str(report.get("engine_index_base", "?")), single_line=True)
-    unconfirmed = escape_for_terminal(str(stranding.get("unconfirmed", "?")), single_line=True)
-    budget = escape_for_terminal(str(stranding.get("budget", "?")), single_line=True)
     return True, (
         f"band at engine index {band}: {unconfirmed} unconfirmed sends exceed its stranding budget "
         f"({budget}) — systemic no-ACK fault, judged on that band's client counters alone"
@@ -507,10 +514,6 @@ def aggregate_cell_record(
     stranding_unjudged = 0
     for r in proc_reports:
         over_budget, why = _band_stranding(r)
-        if over_budget is None:
-            stranding_unjudged += 1
-        elif over_budget:
-            stranding.append(why)
         nl = r.get("no_loss", {})
         engine_unjudged = False
         if "counter_reset" not in nl:
@@ -523,7 +526,8 @@ def aggregate_cell_record(
         if int(nl.get("backlog", 0) or 0) < 0:
             blind += 1
             engine_unjudged = True
-        # A band already counted over the stranding budget is not counted twice.
+        # A band already counted over the stranding budget is not counted twice, and one whose
+        # client-only loss is kept needs no stranding arm to clear it, so it is not called unjudged.
         if (
             engine_unjudged
             and not over_budget
@@ -531,6 +535,10 @@ def aggregate_cell_record(
             and nl.get("inconclusive") is False
         ):
             client_lost += 1
+        elif over_budget is None:
+            stranding_unjudged += 1
+        elif over_budget:
+            stranding.append(why)
     # Every band reads the SAME engine, so one band's readings are the engine totals and a proven
     # loss needs only the bands that read it cleanly (BACKLOG #5574): one band's reset or blindness
     # must not suppress a loss the others still prove. The two arms differ in what a reset does.

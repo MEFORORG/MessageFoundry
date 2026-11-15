@@ -196,7 +196,7 @@ class ComparisonRow:
             return False
         # A baseline trial that cleared nothing is no breach and no measurement, so it fails the
         # row whatever the other trials proved (BACKLOG #5574): it cannot make a resilience win, and
-        # the throughput delta, read off the clean trials only, says nothing for it.
+        # the row makes no throughput comparison.
         if self.baseline.inconclusive_trials:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
@@ -454,7 +454,12 @@ def build_comparison(
         # Sound when the pooled arm held zero-loss and at least one per_lane trial did: compare against
         # the clean per_lane trials only (BACKLOG #5429), not the all-trials mean a drowning trial
         # zeroes, and not "no comparison" because one trial of several drowned.
-        throughput_comparable = cand.no_loss_ok and base.clean_read_per_s is not None
+        # A baseline trial that could not clear zero-loss is no measurement, so a row carrying one
+        # makes no throughput comparison either (BACKLOG #5574): it fails, and the summary's
+        # throughput verdict does not rest on it.
+        throughput_comparable = (
+            cand.no_loss_ok and base.clean_read_per_s is not None and not base.inconclusive_trials
+        )
         thr_ok, thr_delta = _throughput_verdict(
             base.clean_read_per_s if base.clean_read_per_s is not None else 0.0,
             cand.achieved_read_per_s,
@@ -1411,16 +1416,16 @@ def _fuse_verdict(
 def _undrained_reason(cand: _FuseArm) -> str:
     """Why a B1 arm with no drain time did not drain, told by what each undrained trial carries.
 
-    A trial whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries the same
-    None drain as a timed-out one, with a placeholder ``sent`` of 0 whatever the fleet drove, so
-    whether it stranded rows is unknown and no stall is asserted for it. A trial that recorded
-    traffic and no drain time is a real ``await_drain`` timeout and keeps its specific reason
-    (BACKLOG #5574).
+    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout and keeps
+    its specific reason (BACKLOG #5574). One that recorded none is not asserted to have stalled:
+    a batch cell whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries a
+    placeholder ``sent`` of 0 whatever its fleet drove, and a step that sent nothing may still have
+    timed out on rows it did not send; its reconcile detail says which.
     """
     unread = (
-        f"{cand.drainless_unsent} B1 trial(s) recorded no traffic and no drain time (the cell's "
-        f"drive or aggregation failed, so whether it stranded rows is unknown; the reconcile "
-        f"detail says why)"
+        f"{cand.drainless_unsent} B1 trial(s) recorded no traffic and no drain time (a failed "
+        f"cell's placeholder, or a step that sent nothing; whether rows were stranded is not "
+        f"asserted, and the reconcile detail says why)"
     )
     if cand.drain_timeouts:
         also = f"; {unread}" if cand.drainless_unsent else ""

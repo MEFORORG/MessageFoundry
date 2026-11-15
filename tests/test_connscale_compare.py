@@ -425,6 +425,8 @@ def test_a_baseline_inconclusive_trial_fails_the_row_whatever_the_other_trials_p
         assert cmp is not None and len(cmp.rows) == 1
         (row,) = cmp.rows
         assert row.baseline.trials == 2 and row.baseline.inconclusive_trials == 1
+        # No throughput comparison rests on it either, so the summary does not fold it in.
+        assert not row.throughput_comparable and cmp.throughput_non_regression is None
         assert not row.resilience_win and not row.ok and not cmp.ok, first.no_loss.detail
         assert _loss_label(row).startswith("BASELINE INCONCLUSIVE -- 1 of 2 per_lane trial(s)")
         assert cmp.baseline_inconclusive == 1

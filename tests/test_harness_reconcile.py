@@ -1589,12 +1589,18 @@ def test_batchbox_aggregate_one_blind_band_does_not_hide_an_intake_loss_another_
 
 def test_batchbox_aggregate_keeps_a_band_loss_proven_on_client_counters_alone() -> None:
     # The band saw a reset, so its reconcile judged only its client-counter arms, and those proved a
-    # loss (a stranding flood). The cell used to demote it to INCONCLUSIVE. The control is the same
-    # reset with an INCONCLUSIVE band verdict, which proves nothing.
+    # loss. The cell used to demote it to INCONCLUSIVE. The band publishes no stranding arm (a
+    # producer other than connscale-remote, whose client-only loss is that arm), so the band's own
+    # verdict is what the cell keeps, and its loss needs no unjudged stranding arm named beside it.
+    # The control is the same reset with an INCONCLUSIVE band verdict, which proves nothing.
     flood = _pair(counter_reset=_RESET, ok=False, inconclusive=False)
+    flood_no_loss = flood["no_loss"]
+    assert isinstance(flood_no_loss, dict)
+    del flood_no_loss["stranding"]
     rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
     assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
     assert "proved a loss on client counters alone" in rec.no_loss.detail
+    assert "do not say whether their sends broke" not in rec.no_loss.detail
     unsure = _pair(counter_reset=_RESET, ok=False, inconclusive=True)
     control = bb.aggregate_cell_record(_cell(), [unsure, _pair()])
     assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
@@ -1674,8 +1680,16 @@ def test_batchbox_aggregate_keeps_a_stranding_loss_whether_or_not_the_band_read_
 
 def test_batchbox_aggregate_does_not_clear_a_stranding_arm_a_band_does_not_publish() -> None:
     # A band report that does not say whether it broke the stranding budget cannot clear the arm,
-    # whether the field is absent or not a boolean. The control is the same band saying False.
-    for stranding in (None, {"unconfirmed": 0, "budget": 8}, {"over_budget": "false"}):
+    # whether the field is absent, not a boolean, or without the numbers it rests on. The control is
+    # the same band saying False with numbers that agree.
+    # A verdict its own numbers contradict is malformed too: 9 > 7 is over budget, whatever it says.
+    for stranding in (
+        None,
+        {"unconfirmed": 0, "budget": 8},
+        {"unconfirmed": 0, "budget": 8, "over_budget": "false"},
+        {"over_budget": False},
+        {"unconfirmed": 9, "budget": 7, "over_budget": False},
+    ):
         band = _pair()
         no_loss = band["no_loss"]
         assert isinstance(no_loss, dict)

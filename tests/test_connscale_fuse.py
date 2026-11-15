@@ -325,7 +325,7 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
     assert "did not fully drain" in cmp.rows[0].reason
     assert "3 B1 trial(s) recorded no traffic and no drain time" in cmp.rows[0].reason
-    assert "whether it stranded rows is unknown" in cmp.rows[0].reason
+    assert "whether rows were stranded is not asserted" in cmp.rows[0].reason
     assert "rows stranded" not in cmp.rows[0].reason
     assert "await_drain timed out" not in cmp.rows[0].reason
     # Both at once: the timeout's reason stands, and the failed trial is named beside it.
