@@ -828,8 +828,8 @@ def _unread_markup(data: str, roles: tuple[RoleToken, ...]) -> bool:
     """Whether :func:`parse_roles` read no span in ``data`` and :func:`strip_markup` changes it.
 
     The render emits no live write or send for such a statement. THE one test, asked by the
-    render's write and send arms and by the handle scan alike, so the three cannot disagree on it. ADR 0086 §2(b″), first gap, states the rule and what follows from it
-    (BACKLOG #5556)."""
+    render's write and send arms and by the handle scan alike, so the three cannot disagree on it.
+    ADR 0086 §2(b″), first gap, states the rule and what follows from it (BACKLOG #5556)."""
     return not roles and strip_markup(data) != data.strip()
 
 
