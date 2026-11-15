@@ -10889,6 +10889,11 @@ def _file_and_folder(
         try:
             present = _stat_is(path, folder=folder)
             chain, end = _link_chain(path)
+            if present and end is not None and not os.path.samefile(path, end):
+                # The kernel's own answer, against the walk's. On Windows a relative link reached
+                # through a junction resolves its ``..`` against the path through the junction,
+                # not the folder the walk reached (measured), so the walk vetted another file.
+                raise OSError(errno.EINVAL, "the open reaches another object than the walk")
         except (OSError, ValueError) as exc:
             # ValueError: a link target holding a NUL, which lstat refuses.
             refusal = safe_exc(exc)

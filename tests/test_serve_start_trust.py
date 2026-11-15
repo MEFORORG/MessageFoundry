@@ -578,6 +578,31 @@ def test_a_junction_in_the_path_vets_the_folder_holding_it(tmp_path: Path) -> No
     assert {_norm(cfg), _norm(junction), _norm(store), _norm(store / "dev.toml")} <= vetted
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows link")
+def test_a_relative_link_behind_a_junction_that_opens_another_file_refuses(tmp_path: Path) -> None:
+    """Measured: a relative link reached through a junction resolves its ``..`` against the path
+    through the junction, so the open reads ``a\\x\\g.toml`` while the walk vetted ``real\\x``
+    and the file its link leads to (round-e90390621c finding 1)."""
+    import _winapi
+
+    winapi: Any = _winapi  # typeshed declares CreateJunction for win32 only
+    real_c = tmp_path / "real" / "c"
+    real_c.mkdir(parents=True)
+    real_x = tmp_path / "real" / "x"
+    real_x.mkdir()
+    final = tmp_path / "final" / "values.toml"
+    final.parent.mkdir()
+    final.write_text("", encoding="utf-8")
+    decoy = tmp_path / "a" / "x"
+    decoy.mkdir(parents=True)
+    (decoy / "g.toml").write_text("", encoding="utf-8")
+    winapi.CreateJunction(str(real_c), str(tmp_path / "a" / "b"))
+    _link(real_c / "f.toml", Path("..") / "x" / "g.toml")
+    _link(real_x / "g.toml", final)
+    with pytest.raises(WiringError, match="another object than the walk"):
+        _file_and_folder([tmp_path / "a" / "b" / "f.toml"])
+
+
 def test_a_link_into_a_file_where_a_folder_belongs_vets_that_file_s_folder(tmp_path: Path) -> None:
     """A link whose target runs through a regular file reads nothing (ENOTDIR), but whoever can
     write the folder holding that file can replace it with a folder holding the target."""
