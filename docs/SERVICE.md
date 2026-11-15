@@ -790,24 +790,28 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
   - **An engine run as LocalService or NetworkService earns no self-trust**
     ([ADR 0036](adr/0036-windows-config-source-trust.md) Amendment E). Other services share
-    LocalService (`S-1-5-19`) and NetworkService (`S-1-5-20`), so the guard does not treat either
-    as the engine's own account. On a site that ran the engine as one of them, the guard would
-    refuse, at load or at `serve` start, a path it checks where an entry grants the shared account
-    write, or where the shared account owns it and is not a direct member of the local
-    Administrators group. That includes a file a config editor writes as that account. A load
-    stops at the first path it refuses. The refusal is the guard's own message. Under this rule it
-    names the shared account as a write grantee or as the owner, though another entry the guard
-    refuses on the same path can be reported first. The refusal is deliberate and stays: the owner
-    ruled on 2026-11-15 to keep it fail-closed. The remedy:
+    LocalService (`S-1-5-19`) and NetworkService (`S-1-5-20`), which is why the grantee and owner
+    rules above never count either as the account the engine runs as. On a site that ran the
+    engine as one of them, a path the guard checks that the shared account owns or can write would
+    be refused at load or at `serve` start, as it would be for any other account that is not an
+    administrator. That covers a config editor run as that account: the folder it writes into, the
+    file it leaves, and its own validation load where it runs one. The refusal is the guard's own
+    message; a `/config/reload` caller gets only a 422, and the reason is in the engine log. The
+    refusal is deliberate and stays: the owner ruled on 2026-11-15 to keep it fail-closed. The
+    remedy takes all three of these:
     - **Run the engine under an account that is its own:** the installer's default per-service
       virtual account, or a dedicated local account or gMSA passed with `-ServiceAccount`, with the
       caveat [Restrict the service token](#restrict-the-service-token) records for a named account.
-    - **Do not run the config editors as the engine's shared account,** whether from the CLI or
+    - **Do not run the config editors as LocalService or NetworkService,** whether from the CLI or
       through the VS Code extension: at least `connection`, `codeset`, `alert` and `security`.
-    - **Keep the config folders read-only to the engine account,** as `-LockConfigDir` sets them.
+    - **Leave every config folder and file readable by the engine account, writable only by SYSTEM
+      and administrators, and with no entry for LocalService or NetworkService.** `-LockConfigDir`
+      sets the folders it locks read-only to the engine account, but it replaces only the entries
+      for SYSTEM, Administrators and the run-as account and leaves any other explicit entry.
 
     An editor run under any other account has an open problem of its own: its rewrite can replace
-    the edited file's access list (BACKLOG #5619, which engine PR 2977 addresses).
+    the edited file's access list, so the engine account can lose its read of that file (vault
+    BACKLOG #5619).
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
