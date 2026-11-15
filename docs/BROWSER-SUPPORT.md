@@ -158,8 +158,9 @@ two passkey options.
 | Firefox | 138 | `Clear-Site-Data` with `"cache"`. | Session cookie `Secure` (not verified). |
 | Safari | 17 | `Clear-Site-Data` with `"cache"`. | Passkey option `residentKey: "required"` (note 6). Passkey extension `credProps` (note 6). Session cookie `Secure` (not verified). `Sec-Fetch-User`. |
 
-At these floors Chrome, Edge and Safari would, by a dataset record not measured in a browser,
-refuse the redirect after the console's federated sign-in and step-up forms: see
+At these floors and in every later version the dataset records, Chrome, Edge and Safari would, by
+a record not measured in a browser, refuse the redirect after the console's federated sign-in and
+step-up forms, so upgrading the browser would not help: see
 [A recorded sign-in risk](#a-recorded-sign-in-risk-form-action-and-redirects).
 
 So a floor is the first version that has every counted feature the browser's current releases
