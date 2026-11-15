@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
-from harness.load.connscale.runner import ConnScaleError, _reconcile
+from harness.load.connscale.runner import ConnScaleError, _Excusal, _excusal, _reconcile
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
     SIGN_IN_ERRORS,
@@ -96,6 +96,11 @@ class ConnScaleRemoteReport:
     #: reads to know the engine counters reset mid-cell (BACKLOG #5574). Required, so a band report
     #: can never omit it by default; the aggregate refuses to clear a cell whose band names none.
     counter_reset: str | None
+    #: The stranding budget this band's ``_reconcile`` judged its sends by, computed from the same
+    #: counters and budget argument (BACKLOG #5574). The batch aggregate reads it rather than work
+    #: the budget out again from report fields: only this producer knows what it passed. Required,
+    #: so a band report can never omit it; the aggregate refuses to clear a cell without it.
+    stranding: _Excusal
     notes: list[str] = field(default_factory=list)
     # False when a hold-bracket ``/stats`` sample failed, so the rates above are a placeholder 0.0 and
     # not a hold-bracket reading; the JSON then names no rate window (BACKLOG #5431).
@@ -127,7 +132,8 @@ class ConnScaleRemoteReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive and counter_reset (BACKLOG #5574)
+            # 1 -> 2: no_loss.inconclusive, counter_reset and stranding (BACKLOG #5574)
+            "schema_version": 2,
             "kind": "connscale_remote",
             "result": "PASS" if self.result_ok else "FAIL",
             "exit_code": self.exit_code,
@@ -169,6 +175,13 @@ class ConnScaleRemoteReport:
                 "detail": self.no_loss.detail,
                 "inconclusive": self.no_loss.inconclusive,
                 "counter_reset": self.counter_reset,
+                # The band's own stranding arm, which reads only its client counters, so the batch
+                # aggregate keeps it whatever the band's engine arms did (BACKLOG #5574).
+                "stranding": {
+                    "unconfirmed": self.stranding.unconfirmed,
+                    "budget": self.stranding.budget,
+                    "over_budget": self.stranding.over_budget,
+                },
             },
             "notes": self.notes,
         }
@@ -393,11 +406,15 @@ async def run_connscale_remote(
         c = metrics.counters.snapshot()
         base_sample, final_sample = poller.baseline, poller.final
         counter_reset = _counter_reset(poller)
+        # One budget argument for both, so the published stranding arm is the one `_reconcile`
+        # judged. No reload probe runs here, so nothing is excused as reload stranding.
+        unconfirmed_budget = n * count
+        stranding = _excusal(c, unconfirmed_budget=unconfirmed_budget)
         no_loss = _reconcile(
             c,
             base_sample,
             final_sample,
-            unconfirmed_budget=n * count,
+            unconfirmed_budget=unconfirmed_budget,
             drain_seconds=drain_seconds,
             counter_reset=counter_reset,
         )
@@ -431,6 +448,7 @@ async def run_connscale_remote(
             in_pipeline_peak=in_pipeline_peak,
             drain_seconds=drain_seconds,
             counter_reset=counter_reset,
+            stranding=stranding,
             notes=notes,
             rates_measured=rates_measured,
         )

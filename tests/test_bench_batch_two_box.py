@@ -26,8 +26,9 @@ import pytest
 import harness.load.connscale.batchbox as bb
 from harness.load.connscale.compare import FUSE_GO
 from harness.load.connscale.profile import load_connscale_profile_text
-from harness.load.connscale.runner import ConnScaleError
+from harness.load.connscale.runner import ConnScaleError, _excusal
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
+from harness.load.metrics import Counters
 
 _MINIMAL_BATCH = """
 [connscale]
@@ -340,6 +341,7 @@ def _fake_proc(sent: int, sink: int, read: float, arm_b1: bool) -> dict[str, Any
             "backlog": 0,
             "detail": "",
             "counter_reset": None,  # what connscale-remote writes (BACKLOG #5574)
+            "stranding": {"unconfirmed": 0, "budget": sent, "over_budget": False},
         },
         "throughput": {
             "rate_window": "hold_bracket",  # what connscale-remote writes (BACKLOG #2012)
@@ -381,6 +383,7 @@ def test_aggregate_cell_record_flags_loss() -> None:
             "backlog": 0,
             "detail": "",
             "counter_reset": None,
+            "stranding": {"unconfirmed": 0, "budget": 8, "over_budget": False},
         },
         "throughput": {
             "achieved_aggregate_rate": 5.0,
@@ -1068,6 +1071,7 @@ def test_the_remote_report_json_names_its_rate_window() -> None:
         in_pipeline_peak=0,
         drain_seconds=0.5,
         counter_reset=None,
+        stranding=_excusal(Counters(sent=8), unconfirmed_budget=4),
     )
     throughput = remote.to_json_dict()["throughput"]
     assert isinstance(throughput, dict)

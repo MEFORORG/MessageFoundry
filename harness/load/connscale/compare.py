@@ -194,9 +194,9 @@ class ComparisonRow:
         # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
         if self.candidate is not None and not self.candidate.drain_completed:
             return False
-        # A baseline trial that cleared nothing is no breach and no measurement: the row cannot pass
-        # on the resilience basis, nor on a throughput delta it never made sound, whatever the other
-        # trials proved (BACKLOG #5574).
+        # A baseline trial that cleared nothing is no breach and no measurement, so it fails the
+        # row whatever the other trials proved (BACKLOG #5574): it cannot make a resilience win, and
+        # the throughput delta, read off the clean trials only, says nothing for it.
         if self.baseline.inconclusive_trials:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
@@ -646,10 +646,17 @@ def _loss_label(row: ComparisonRow) -> str:
     if row.candidate is not None and not row.candidate.drain_completed:
         return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
     if row.baseline.inconclusive_trials:
+        # Beside a trial that proved a breach, say so: the summary counts that breach, and the
+        # label must not read as if per_lane lost nothing.
+        breached = (
+            "; another per_lane trial proved a breach, which cannot pass the row beside it"
+            if not row.baseline.no_loss_inconclusive
+            else ""
+        )
         return (
             f"BASELINE INCONCLUSIVE -- {row.baseline.inconclusive_trials} of "
             f"{row.baseline.trials} per_lane trial(s) could not clear zero-loss and proved no "
-            f"loss, so the row has no sound basis ({row.baseline.no_loss_detail})"
+            f"loss{breached}, so the row has no sound basis ({row.baseline.no_loss_detail})"
         )
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
@@ -791,9 +798,9 @@ class _FuseArm:
     # final ``no_loss.backlog`` is one reading after the drain wait; drain completion is the signal that
     # the whole pipeline emptied within the timeout, so it is the gate.) ---
     drain_seconds_worst: float | None
-    #: Of the trials with no drain time, how many sent traffic (``await_drain`` timed out over a real
-    #: run) and how many sent nothing (a cell that never ran or whose drive failed carries the same
-    #: None drain). The drain guard's reason names which (BACKLOG #5574); the gate reads only
+    #: Of the trials with no drain time, how many recorded traffic (``await_drain`` timed out over a
+    #: real run) and how many recorded none (a failed cell's placeholder, see `_undrained_reason`).
+    #: The drain guard's reason names which (BACKLOG #5574); the gate reads only
     #: ``drain_seconds_worst``.
     drain_timeouts: int
     drainless_unsent: int
@@ -1355,24 +1362,8 @@ def _fuse_verdict(
     if candidate_lost and not cand.zero_loss_inconclusive:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
-        # A failed or never-run cell carries the same None drain as a timed-out one. What it sent
-        # tells them apart: a trial that sent nothing stranded nothing, so no stall is asserted for
-        # it, and a timed-out drain over real traffic keeps its specific reason (BACKLOG #5574).
-        unsent = (
-            f"{cand.drainless_unsent} B1 trial(s) sent nothing and have no drain time (the cell "
-            f"never ran or its drive failed; the reconcile detail says which)"
-        )
-        if not cand.drain_completed and cand.drain_timeouts:
-            also = f"; {unsent}" if cand.drainless_unsent else ""
-            return FUSE_NO_GO, (
-                "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
-                "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
-                f"rides a backlog, not a real ceiling lift{also}"
-            )
         if not cand.drain_completed:
-            return FUSE_NO_GO, (
-                f"B1 pipeline did not fully drain: {unsent} -- no ceiling lift is measured"
-            )
+            return FUSE_NO_GO, _undrained_reason(cand)
         return FUSE_NO_GO, (
             f"B1 drain time grew (B1 {_fmt(cand.drain_seconds_worst)}s > B0 "
             f"{_fmt(base.drain_seconds_worst)}s) -- the higher intake rode a larger backlog, not a real "
@@ -1415,6 +1406,30 @@ def _fuse_verdict(
         f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% and > {sigma_multiple:.0f}sigma, in_pipeline "
         f"flat-or-lower, delivered/offered >= {min_delivered_offered:.2f}, zero-loss held"
     )
+
+
+def _undrained_reason(cand: _FuseArm) -> str:
+    """Why a B1 arm with no drain time did not drain, told by what each undrained trial carries.
+
+    A trial whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries the same
+    None drain as a timed-out one, with a placeholder ``sent`` of 0 whatever the fleet drove, so
+    whether it stranded rows is unknown and no stall is asserted for it. A trial that recorded
+    traffic and no drain time is a real ``await_drain`` timeout and keeps its specific reason
+    (BACKLOG #5574).
+    """
+    unread = (
+        f"{cand.drainless_unsent} B1 trial(s) recorded no traffic and no drain time (the cell's "
+        f"drive or aggregation failed, so whether it stranded rows is unknown; the reconcile "
+        f"detail says why)"
+    )
+    if cand.drain_timeouts:
+        also = f"; {unread}" if cand.drainless_unsent else ""
+        return (
+            "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
+            "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
+            f"rides a backlog, not a real ceiling lift{also}"
+        )
+    return f"B1 pipeline did not fully drain: {unread} -- no ceiling lift is measured"
 
 
 def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:

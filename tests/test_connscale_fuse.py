@@ -312,28 +312,29 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     # specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
     assert "await_drain timed out" in cmp.rows[0].reason
     assert "rows stranded" in cmp.rows[0].reason and "never ran" not in cmp.rows[0].reason
-    # A trial that sent nothing (a cell that never ran) carries the same None drain, and no stall
-    # is asserted for it: it stranded nothing.
-    never_ran = [
+    # A failed cell (batchbox `_failed_cell_record`: a placeholder sent of 0) carries the same None
+    # drain, and no stall is asserted for it: whether it stranded rows is unknown.
+    failed_cells = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))
         for r in _trials(
             True, [0.0, 0.0, 0.0], sent=0, sink_received=0, no_loss_ok=False, drain_seconds=None
         )
     ]
-    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + never_ran, (False, True))
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + failed_cells, (False, True))
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
     assert "did not fully drain" in cmp.rows[0].reason
-    assert "3 B1 trial(s) sent nothing" in cmp.rows[0].reason
+    assert "3 B1 trial(s) recorded no traffic and no drain time" in cmp.rows[0].reason
+    assert "whether it stranded rows is unknown" in cmp.rows[0].reason
     assert "rows stranded" not in cmp.rows[0].reason
     assert "await_drain timed out" not in cmp.rows[0].reason
-    # Both at once: the timeout's reason stands, and the trial that never ran is named beside it.
+    # Both at once: the timeout's reason stands, and the failed trial is named beside it.
     cmp = build_fuse_comparison(
-        _trials(False, [100.0, 101.0, 99.0]) + undrained[:2] + never_ran[:1], (False, True)
+        _trials(False, [100.0, 101.0, 99.0]) + undrained[:2] + failed_cells[:1], (False, True)
     )
     assert cmp is not None
     assert "rows stranded" in cmp.rows[0].reason
-    assert "1 B1 trial(s) sent nothing" in cmp.rows[0].reason
+    assert "1 B1 trial(s) recorded no traffic" in cmp.rows[0].reason
     # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
     flat = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))

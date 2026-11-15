@@ -60,13 +60,11 @@ from harness.load.connscale.runner import (
     ConnScaleError,
     _await_node_healthy,
     _evaluate_slos,
-    _excusal,
     _node_env,
     _reset_server_store,
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
-from harness.load.metrics import Counters
 from messagefoundry.terminal_text import escape_for_terminal
 
 _HEALTH_TIMEOUT = 30.0
@@ -374,42 +372,25 @@ def build_remote_argv(
 # --- the driver-side per-cell aggregation (pure) -----------------------------
 
 
-def _report_count(value: object) -> int | None:
-    """A non-negative integer count read off a band report, or None for anything else."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
-
-
 def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
-    """Whether one band's own sends broke the stranding budget its ``_reconcile`` judged them by.
+    """The stranding arm one band's ``_reconcile`` judged, as the band published it.
 
     ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
-    carry what the budget reads (BACKLOG #5574): a missing field must not clear the arm. The budget's
-    connection term is a FLOOR (``max(connections, three quarters of the sends)``), so a report
-    without its connection count still decides every band whose timeouts sit within the three
-    quarters; only one past it needs the count it lacks.
+    say (BACKLOG #5574): a missing field must not clear the arm. The verdict is read, never worked
+    out again here, because only the band knows the budget argument it passed (connscale-remote
+    computes it with the same ``_excusal`` call ``_reconcile`` makes).
     """
-    traffic = report.get("traffic", {})
-    sent = _report_count(traffic.get("sent"))
-    timeouts = _report_count(traffic.get("timeouts"))
-    if sent is None or timeouts is None:
+    stranding = report.get("no_loss", {}).get("stranding")
+    if not isinstance(stranding, Mapping) or not isinstance(stranding.get("over_budget"), bool):
         return None, ""
-    bands = _report_count(report.get("engine_bands"))
-    per_band = _report_count(report.get("count_per_band"))
-    connections = None if bands is None or per_band is None else bands * per_band
-    ex = _excusal(
-        Counters(sent=sent, timeouts=timeouts),
-        unconfirmed_budget=0 if connections is None else connections,
-    )
-    if not ex.over_budget:
+    if not stranding["over_budget"]:
         return False, ""
-    if connections is None:
-        return None, ""
+    band = escape_for_terminal(str(report.get("engine_index_base", "?")), single_line=True)
+    unconfirmed = escape_for_terminal(str(stranding.get("unconfirmed", "?")), single_line=True)
+    budget = escape_for_terminal(str(stranding.get("budget", "?")), single_line=True)
     return True, (
-        f"a band's {ex.unconfirmed} unconfirmed sends exceed its stranding budget ({ex.budget} = "
-        f"max({connections} connections, three quarters of its {sent} sends)) — systemic no-ACK "
-        f"fault, judged on that band's client counters alone"
+        f"band at engine index {band}: {unconfirmed} unconfirmed sends exceed its stranding budget "
+        f"({budget}) — systemic no-ACK fault, judged on that band's client counters alone"
     )
 
 
@@ -517,13 +498,11 @@ def aggregate_cell_record(
     # verdict rather than demote it to INCONCLUSIVE (BACKLOG #5574). A band that judged its engine
     # arms is not counted: its delivery arm compares one band's sink with the engine-wide written.
     client_lost = 0
-    # The stranding budget, judged again here on EVERY band's own client counters, whatever its
-    # engine arms did (BACKLOG #5574). It reads only that band's sends and timeouts, so no other band
-    # can correct it, and a band over budget is a loss the cell keeps. Taking it off the band's
-    # verdict alone would keep it only where the engine arms went unjudged: the same flood beside a
-    # clean engine read would pass the cell, and beside a reset would fail it. `_excusal` is the one
-    # definition the band's `_reconcile` used, with the budget it was given (engine_bands x
-    # count_per_band; a remote band runs no reload probe, so nothing is excused as reload stranding).
+    # The stranding arm, read off EVERY band's published `no_loss.stranding`, whatever its engine
+    # arms did (BACKLOG #5574). It reads only that band's sends and timeouts, so no other band can
+    # correct it, and a band over budget is a loss the cell keeps. Taking it off the band's overall
+    # verdict would keep it only where the engine arms went unjudged: the same flood beside a clean
+    # engine read would pass the cell, and beside a reset would fail it.
     stranding: list[str] = []
     stranding_unjudged = 0
     for r in proc_reports:
@@ -601,9 +580,8 @@ def aggregate_cell_record(
         unproven.append(f"{blind} band(s) could not read the engine metrics — {unjudged}")
     if stranding_unjudged:
         unproven.append(
-            f"{stranding_unjudged} band report(s) do not carry what the stranding budget reads "
-            f"(traffic sent and timeouts, engine_bands, count_per_band) — their stranding arm was "
-            f"not judged"
+            f"{stranding_unjudged} band report(s) do not say whether their sends broke the "
+            f"stranding budget (no_loss.stranding.over_budget) — their stranding arm was not judged"
         )
     no_loss_ok = not lost and drained and not unproven
     parts: list[str] = []

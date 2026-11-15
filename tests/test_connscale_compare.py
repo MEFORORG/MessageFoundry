@@ -430,9 +430,13 @@ def test_a_baseline_inconclusive_trial_fails_the_row_whatever_the_other_trials_p
         assert cmp.baseline_inconclusive == 1
         loss = cmp.to_json_dict()["rows"][0]["loss"]  # type: ignore[index]
         assert loss["per_lane_inconclusive_trials"] == 1
-    # A proven breach still counts as one beside the INCONCLUSIVE trial; it just cannot pass.
+    # A proven breach still counts as one beside the INCONCLUSIVE trial, and the label names it so
+    # it does not read as if per_lane lost nothing; it just cannot pass the row.
     cmp = build_comparison([breached, unsure, *pooled], ("per_lane", "pooled"))
     assert cmp is not None and cmp.baseline_zero_loss_breaches == 1
+    assert "another per_lane trial proved a breach" in _loss_label(cmp.rows[0])
+    cmp = build_comparison([clean, unsure, *pooled], ("per_lane", "pooled"))
+    assert cmp is not None and "another per_lane trial" not in _loss_label(cmp.rows[0])
     drowned = _replace(breached, trial=1)
     cmp = build_comparison([breached, drowned, *pooled], ("per_lane", "pooled"))
     assert cmp is not None and len(cmp.rows) == 1

@@ -18,7 +18,8 @@ from typing import Any
 import pytest
 
 from harness.load.connscale import remote as rr
-from harness.load.connscale.runner import ConnScaleError
+from harness.load.connscale.runner import ConnScaleError, _excusal
+from harness.load.metrics import Counters
 from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 
@@ -246,6 +247,7 @@ def _remote_report(**over: Any) -> rr.ConnScaleRemoteReport:
         "in_pipeline_peak": 0,
         "drain_seconds": 0.5,
         "counter_reset": None,
+        "stranding": _excusal(Counters(sent=8), unconfirmed_budget=4),
     }
     fields.update(over)
     return rr.ConnScaleRemoteReport(**fields)
