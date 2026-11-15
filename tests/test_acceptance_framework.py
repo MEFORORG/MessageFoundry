@@ -102,15 +102,23 @@ def test_run_matrix_maps_pytest_rows() -> None:
     assert results["B6"].status is Status.PASS
 
 
-def _fake_pytest(monkeypatch: pytest.MonkeyPatch, junit_text: str, code: pytest.ExitCode) -> None:
-    """Stand in for the pytest subprocess: write ``junit_text`` where ``--junitxml`` points."""
+def _fake_pytest(
+    monkeypatch: pytest.MonkeyPatch, junit_text: str, code: pytest.ExitCode
+) -> dict[str, Any]:
+    """Stand in for the pytest subprocess: write ``junit_text`` where ``--junitxml`` points.
 
-    def fake_run(cmd: list[str], **_: Any) -> Any:
+    Returns a dict that receives the keyword arguments the runner passed to ``subprocess.run``.
+    """
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        seen.update(kwargs)
         target = next(a for a in cmd if a.startswith("--junitxml=")).split("=", 1)[1]
         Path(target).write_text(junit_text, encoding="utf-8")
         return subprocess.CompletedProcess(cmd, int(code))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
 
 
 _PASSING = """<?xml version="1.0" encoding="utf-8"?>
@@ -197,20 +205,15 @@ def test_default_runner_clean_exit_has_no_run_error(monkeypatch: pytest.MonkeyPa
 def test_default_runner_drops_pytest_addopts_from_the_child_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # An inherited ``-k`` or ``-p no:...`` would deselect a failing test, and its row would read PASS.
-    seen: dict[str, str] = {}
-
-    def fake_run(cmd: list[str], *, env: dict[str, str], **_: Any) -> Any:
-        seen.update(env)
-        target = next(a for a in cmd if a.startswith("--junitxml=")).split("=", 1)[1]
-        Path(target).write_text(_PASSING, encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, int(pytest.ExitCode.OK))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setenv("PYTEST_ADDOPTS", "-k nothing_matches")
+    # An inherited partial deselect (``-k``/``-m``) would drop a failing test and keep its passing
+    # siblings, so the row would read PASS.
+    seen = _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.OK)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k 'not test_failing'")
+    monkeypatch.setenv("MEFOR_TEST_SENTINEL", "kept")  # the scrub must not drop the rest of the env
     default_pytest_runner(["tests/test_a.py"])
-    assert seen, "the runner never called subprocess.run"
-    assert "PYTEST_ADDOPTS" not in seen
+    env = seen["env"]
+    assert "PYTEST_ADDOPTS" not in env
+    assert env["MEFOR_TEST_SENTINEL"] == "kept"
 
 
 def test_default_runner_reports_truncated_junit_instead_of_crashing(
@@ -260,7 +263,9 @@ def test_default_runner_flags_a_report_that_attributes_nothing(
 
 
 def test_default_runner_attributes_a_real_pytest_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)  # an outer -k or -m would empty the child
+    # The runner must shield the child from this: inherited, it would deselect everything, the child
+    # would exit 5, and run_error would be set.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k nothing_matches")
     # One real child run: the hand-written JUnit above carries ``file=``, which pytest's default
     # JUnit family omits, so only a real run proves the argv lets results reach their rows.
     ref = "tests/test_win2025_acceptance.py"
