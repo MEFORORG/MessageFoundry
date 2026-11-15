@@ -374,10 +374,7 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     """The merge step's ``if`` must require the allow-set guard AND the two security-track guards,
     while still invoking ``gh pr merge --auto`` for the eligible path."""
     steps = _steps()
-    merge = next((s for s in steps if "gh pr merge --auto" in str(s.get("run", ""))), None)
-    assert merge is not None, (
-        "the gh pr merge --auto step was removed (auto-merge must be preserved)"
-    )
+    merge = _merge_step()
     cond = str(merge.get("if", ""))
     assert "steps.allowset.outputs.eligible == 'true'" in cond, (
         "merge not gated on the allow-set guard"
@@ -557,14 +554,36 @@ def test_one_step_arms_in_the_arming_job_and_the_disarm_step_only_disarms() -> N
     ``disarm`` job's step (BACKLOG #5593), whose every ``gh pr merge`` call may only DISARM. A third
     ``gh pr merge`` step, or an arm call inside the disarm step, fails here, so neither role can
     hide behind the other."""
-    doc = _load()
-    steps = [s for job in doc["jobs"].values() for s in job["steps"]]
-    merges = [s for s in steps if "gh pr merge" in str(s.get("run", ""))]
+    merges = [s for s in _steps() if "gh pr merge" in str(s.get("run", ""))]
     assert [s.get("id") for s in merges if s.get("id") == "disarm"] == ["disarm"], merges
     assert len(merges) == 2, f"expected exactly two gh pr merge steps, found {len(merges)}"
-    calls = _GH_PR_MERGE.findall(str(_step("disarm")["run"]))
+    body = str(_step("disarm")["run"])
+    calls = _GH_PR_MERGE.findall(body)
     assert calls == ['gh pr merge --disable-auto "$PR_URL"'], f"the disarm step arms: {calls!r}"
-    assert _merge_step() in doc["jobs"]["auto-merge"]["steps"], "the arm step left the arming job"
+    _assert_only_gh_on_the_pr(body)
+    assert _merge_step() in _load()["jobs"]["auto-merge"]["steps"], "the arm step left the job"
+
+
+def _assert_only_gh_on_the_pr(body: str) -> None:
+    """A ``gh pr merge`` regex sees only one spelling of an arm. So the disarm and arm bodies may
+    reach GitHub only through ``gh pr view`` or ``gh pr merge`` on ``"$PR_URL"``: no ``gh api`` (a
+    GraphQL ``enablePullRequestAutoMerge`` arms too), no other client, and no read of the token,
+    which ``gh`` takes from the env and nothing else in the body needs."""
+    calls = re.findall(r"\bgh [^;\n)]*", body)
+    assert calls, "no gh call in the body"
+    for call in calls:
+        assert re.match(r"gh pr (view|merge) ", call) and '"$PR_URL"' in call, call
+    for word in ("curl", "wget", "graphql", "TOKEN", "command ", "which ", "python", "node "):
+        assert word not in body, f"the body names {word!r}"
+
+
+def test_the_arming_job_runs_only_its_known_steps() -> None:
+    """The job holding ``contents: write`` runs these steps and no others, and the one action it
+    uses is fetch-metadata, so an unconditioned third-party arm step cannot be added unread."""
+    steps = _load()["jobs"]["auto-merge"]["steps"]
+    assert [s.get("id") for s in steps] == ["meta", "allowset", "ghsa", "age", "authors", None]
+    uses = [str(s["uses"]) for s in steps if "uses" in s]
+    assert len(uses) == 1 and uses[0].startswith("dependabot/fetch-metadata@"), uses
 
 
 def test_the_merge_condition_evaluates_to_the_policy_over_every_input() -> None:
@@ -623,8 +642,7 @@ def test_the_merge_step_squashes_the_triggering_pr_and_nothing_else() -> None:
     assert _GH_PR_MERGE.findall(run) == [
         'gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"'
     ], run
-    gh_calls = re.findall(r"\bgh [^;\n)]*", run)
-    assert gh_calls and all('"$PR_URL"' in call for call in gh_calls), gh_calls
+    _assert_only_gh_on_the_pr(run)
     env = merge.get("env") or {}
     assert env == {
         "PR_URL": "${{ github.event.pull_request.html_url }}",

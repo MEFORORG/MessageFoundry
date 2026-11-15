@@ -92,8 +92,10 @@ def _rated(
     stride: int = 1,
 ) -> list[dict[str, Any]]:
     """``count`` Class B decisions by ``seat``, ``days`` old, each rated, the ``disagree`` indexes
-    (oldest first) rated disagree and the rest agree. Rating ``i`` falls in minute slot
-    ``start + stride * i``, so two calls with stride 2 and starts 0 and 1 interleave their ratings."""
+    rated disagree and the rest agree. Index ``i`` takes minute slot ``start + stride * i``: its
+    RATING falls that many minutes plus one after the ``days`` mark, so ratings run oldest first and
+    two calls with stride 2 and starts 0 and 1 interleave; its DECISION falls that many minutes
+    before it, so decisions run newest first. Calibration orders by the rating."""
     slots = [start + stride * i for i in range(count)]
     decided = [rec(at=ago(days=days, minutes=m), seat=seat, item="calib") for m in slots]
     rated = [
@@ -1124,11 +1126,12 @@ def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> No
 
 
 # THE BAR FOR OPTION C IS MAIN'S POOLED READING (BACKLOG #5604): every history the seat-pooled
-# calibration this ruling replaced answers REVIEW for must still be REVIEW. Each REVIEW history below
-# was run through origin/main's decision.ps1 and _decisionlog.ps1 at 73d9236f3b as well, which
-# answered REVIEW for it, and each NO-REVIEW control likewise answered NO-REVIEW there: option c may
-# be stricter than that reading, never looser, and it does not lock a seat on one name's short
-# history that the pooled reading passes.
+# calibration this ruling replaced answers REVIEW for must still be REVIEW. When these tests were
+# written, each history below was also run once, by hand, through origin/main's decision.ps1 and
+# _decisionlog.ps1 at 73d9236f3b, which answered as each test expects. The suite runs only this
+# branch's copy, so it pins these verdicts, not the parity itself: option c may be stricter than the
+# pooled reading, never looser, and it does not lock a seat on one name's short history that the
+# pooled reading passes.
 
 
 def test_a_breach_under_a_name_that_drops_below_60_still_closes_its_alias(sb: Sandbox) -> None:
