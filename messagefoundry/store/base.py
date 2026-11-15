@@ -987,9 +987,11 @@ class QueueStore(StoreLifecycle, Protocol):
         more deaths than ``cap`` before a dead-letter lands.
 
         "Every time" therefore means across passes that each claimed the row anew: after a restart,
-        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
-        flight, so it is not re-claimed in the same process unless a lease sweep re-pends it
-        (#4607 steps 1, 2 and 5 are not built). A resolved row is not counted, and the empty
+        or a Postgres lease reclaim, or, on a lane a per_lane worker drains, a respawn: the runner
+        re-pends the rows the dead worker held before its replacement claims, so the row is
+        re-claimed in the same process. A pooled serializer is not respawned, so on a pooled lane
+        the row is re-claimed only after a restart or a lease sweep. A resolved row is not counted,
+        and the empty
         :class:`WorkerDeathOutcome` comes back."""
         ...
 

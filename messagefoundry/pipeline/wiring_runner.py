@@ -1571,8 +1571,10 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
     before the exception goes on (vault BACKLOG #4607 step 6). Both claim modes reach these bodies,
     the per_lane loops directly and the pooled dispatcher through its ``_dispatch_*`` adapters. The
     concurrent transform run counts where a death leaves its loop, since it does not come through
-    :meth:`RegistryRunner._process_routed_item`. The exception is always re-raised: respawning a
-    dead worker and recovering its other held rows is #4607 steps 1, 2 and 5."""
+    :meth:`RegistryRunner._process_routed_item`. The exception is always re-raised. A per-lane
+    worker's supervisor then re-pends exactly the rows the dead task held and respawns it
+    (:class:`_HeldRows`, :meth:`RegistryRunner._recover_then_run`). A pooled serializer is still not
+    respawned; that half of #4607 stays held."""
 
     def wrap(body: _ItemBody) -> _ItemBody:
         @functools.wraps(body)
@@ -1589,6 +1591,22 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
         return guarded
 
     return wrap
+
+
+@dataclass(eq=False)
+class _HeldRows:
+    """The rows one per-lane worker task holds in flight, and the lease it claimed them under
+    (vault BACKLOG #1611 step 2, #4607 steps 1, 2 and 5, per-lane half). The worker loop mutates
+    ``ids`` IN PLACE on each claim and each resolution, so its done-callback can read what the task
+    held when it died: a coroutine-local list dies with the coroutine.
+
+    ``ids`` may name rows the task already resolved, since a batch is cleared only once the whole
+    pass resolves. That is harmless: ``reschedule_claimed`` touches only rows still ``inflight``,
+    and every row named here is on the task's own lane, which has no other consumer (ADR 0059), so
+    an ``inflight`` row on it is this task's."""
+
+    ids: list[str]
+    fence: RependFence | None = None
 
 
 # Which direction's operator hold a STOPPED lane on each pooled stage belongs to. A RESPONSE lane is
@@ -2044,6 +2062,11 @@ class RegistryRunner:
         # One delivery worker per outbound connection, addressable by name so a reload can
         # gracefully stop/swap a single connection's worker without touching its siblings.
         self._workers: dict[str, asyncio.Task[None]] = {}
+        # #1611 step 2 / #4607 (per-lane half): what each per-lane worker task holds in flight, so a
+        # task that dies can have exactly those rows re-pended before its replacement claims. Keyed
+        # by task, not lane, so a replacement never reads a live sibling's rows. An entry leaves at
+        # the task's done-callback, or when a spawn that replaces the dead task takes it.
+        self._held_rows_by_task: dict[asyncio.Task[Any], _HeldRows] = {}
         # --- outbound operator PAUSE (connection controls) ---------------------------------------
         # Operator-paused outbounds: delivery halted, queued rows RETAINED PENDING (never dropped/
         # reordered). The RELOAD-SURVIVING source of truth — outbound_running() reads it, a reload
@@ -7605,8 +7628,13 @@ class RegistryRunner:
                 self.registry.shard_id,
             )
             return
+        dead = self._take_dead_rows(self._workers.get(name))
         task = asyncio.create_task(
-            self._after_start(functools.partial(self._delivery_worker, name))
+            self._after_start(
+                functools.partial(
+                    self._recover_then_run, "delivery", name, dead, self._delivery_worker
+                )
+            )
         )
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
@@ -7620,18 +7648,107 @@ class RegistryRunner:
     def _on_worker_done(self, name: str, task: asyncio.Task[None]) -> None:
         """A delivery worker should only finish on shutdown — its loop swallows + backs off on
         errors. If one somehow dies while the engine is running, log and respawn so the destination
-        keeps draining rather than silently stalling (review H-1)."""
-        if self._stop.is_set() or not self._running or task.cancelled():
-            return  # expected shutdown / cancellation
-        if task.exception() is None:
-            return
-        if self._workers.get(name) is task:  # still the registered worker (not mid-reconcile/stop)
-            log.error(
-                "delivery worker %r exited unexpectedly; respawning",
+        keeps draining rather than silently stalling (review H-1). The respawn first re-pends the
+        rows the dead task held (:meth:`_recover_then_run`); a task that is not respawned here drops
+        its held-rows entry, and its rows stay in flight for the next start, as before."""
+        try:
+            if self._stop.is_set() or not self._running or task.cancelled():
+                return  # expected shutdown / cancellation
+            if task.exception() is None:
+                return
+            if self._workers.get(name) is task:  # still the registered worker (not mid-reconcile)
+                log.error(
+                    "delivery worker %r exited unexpectedly; respawning",
+                    name,
+                    exc_info=task.exception(),
+                )
+                self._spawn_worker(name)
+        finally:
+            self._held_rows_by_task.pop(task, None)
+
+    def _held_rows(self) -> _HeldRows:
+        """The current per-lane worker task's :class:`_HeldRows`, created on first use. A worker
+        loop binds its ``claimed`` list to ``ids`` once and mutates it in place from then on."""
+        task = asyncio.current_task()
+        if task is None:  # not reachable from a worker loop, which always runs as a task
+            return _HeldRows([])
+        held = self._held_rows_by_task.get(task)
+        if held is None:
+            held = self._held_rows_by_task[task] = _HeldRows([])
+        return held
+
+    def _take_dead_rows(self, old: asyncio.Task[None] | None) -> _HeldRows | None:
+        """Take the held rows of ``old``, the worker a spawn is about to replace, when it died by an
+        exception, for the replacement to re-pend before it claims. Every spawn door takes them, not
+        only the done-callback, so a start or reload that replaces a dead worker before its
+        callback runs cannot let the replacement claim past them. A worker that returned or was
+        cancelled gives none: a return has resolved or released its rows, or left them for
+        :meth:`_recover_stopped_worker_residue`, and only teardown cancels."""
+        if old is None or not old.done() or old.cancelled() or old.exception() is None:
+            return None
+        return self._held_rows_by_task.pop(old, None)
+
+    async def _recover_then_run(
+        self,
+        worker: str,
+        name: str,
+        dead: _HeldRows | None,
+        work: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Re-pend exactly the rows the dead worker task held in flight, then run the replacement
+        worker loop ``work`` (vault BACKLOG #1611 step 2, #4607 steps 1, 2 and 5, per-lane half;
+        owner ruling 2026-11-15, holder-exact per-lane recovery).
+
+        A worker killed by an exception its loop does not catch (a ``BaseException`` that
+        :func:`_kills_the_worker` counts, or an ``Exception`` raised outside its ``try``) never
+        reaches its fault arm's :meth:`_repend_claimed_on_fault`, so its claimed rows stayed in
+        flight until the next start while the respawn claimed their successors: a per-lane FIFO
+        break. This runs as the replacement task itself, so the lane's worker slot is taken while
+        the re-pend runs and no other spawn can put a second claimer on the lane, and it runs only
+        after the dead task is done, so the dead task can write nothing more.
+
+        The ids come from the dead task alone, never a lane-wide or age-based read, so a live
+        worker's rows are never touched, and under engine shards (ADR 0073) the re-pend names only
+        rows this shard's worker claimed on a lane it owns. The re-pend is the fault arm's own
+        hold-and-retry: a store fault is retried while this task holds the lane, so nothing claims
+        past the rows and none is dropped. Its fence is the lease the dead task claimed under.
+        Only ``STOPPED`` returns without running the loop, leaving the rows for the next start's
+        reset; on every other end the loop runs, as the fault arm's caller goes on. The fault arm's
+        backoff follows a landed re-pend, since ``reschedule_claimed`` dates the rows that far ahead.
+
+        It composes with the worker-death cap: a dying ingress, routed or response row is counted
+        in ``worker_deaths``, which ``reschedule_claimed`` does not touch, and dead-lettered at
+        :data:`_WORKER_DEATH_LIMIT`, after which the guarded re-pend skips it. A dying outbound row
+        on a per-lane lane is already re-pended by :meth:`_record_worker_death` as a failed send,
+        so its ``attempts`` count survives and the lane's own cap applies."""
+        if dead is not None and dead.ids:
+            # Taken over by this task first, so a death during the re-pend hands the same rows on.
+            held = self._held_rows()
+            held.ids[:] = dead.ids
+            held.fence = dead.fence
+            log.warning(
+                "%s worker %r: re-pending %d row(s) the dead worker held in flight before the "
+                "replacement claims",
+                worker,
                 name,
-                exc_info=task.exception(),
+                len(held.ids),
             )
-            self._spawn_worker(name)
+            ended = await self._repend_claimed_on_fault(
+                worker,
+                name,
+                held.ids,
+                fence=dead.fence,
+                abandon=(lambda: not self._lane_may_deliver(name))
+                if worker == "delivery"
+                else None,
+            )
+            if ended is HoldResult.STOPPED:
+                return  # stopped while holding them: they stay INFLIGHT for the next start
+            if ended is HoldResult.LANDED:
+                held.ids.clear()
+            if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
+                return
+        await work(name)
 
     async def _after_start(self, work: Callable[[], Awaitable[None]]) -> None:
         """Run a per-lane worker once start() has committed to running, or not at all if a stop
@@ -7717,10 +7834,16 @@ class RegistryRunner:
             self._release_operator_hold(name, "inbound")
 
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
-        """Start the ``kind`` (router/transform) worker for one inbound connection."""
+        """Start the ``kind`` (router/transform) worker for one inbound connection. A worker it
+        replaces that died has its held rows re-pended first (:meth:`_recover_then_run`)."""
         workers = self._inbound_worker_dict(kind)
+        dead = self._take_dead_rows(workers.get(name))
         task = asyncio.create_task(
-            self._after_start(functools.partial(self._inbound_worker_coro(kind), name))
+            self._after_start(
+                functools.partial(
+                    self._recover_then_run, kind, name, dead, self._inbound_worker_coro(kind)
+                )
+            )
         )
         task.add_done_callback(functools.partial(self._on_inbound_worker_done, kind, name))
         workers[name] = task
@@ -7729,19 +7852,23 @@ class RegistryRunner:
         """A router/transform worker should only finish on shutdown or a STOP-policy halt. If it dies
         on an unexpected error while running, respawn it so the inbound keeps processing (mirrors the
         delivery worker's supervisor). A STOP-policy halt returns normally (no exception) and is left
-        down until a reload re-arms it."""
-        if self._stop.is_set() or not self._running or task.cancelled():
-            return  # expected shutdown / cancellation
-        if task.exception() is None:
-            return  # normal return (e.g. STOP policy halted the lane) — not respawned
-        if self._inbound_worker_dict(kind).get(name) is task:
-            log.error(
-                "%s worker %r exited unexpectedly; respawning",
-                kind,
-                name,
-                exc_info=task.exception(),
-            )
-            self._spawn_inbound_worker(kind, name)
+        down until a reload re-arms it. The respawn first re-pends the rows the dead task held
+        (:meth:`_recover_then_run`), as :meth:`_on_worker_done` says."""
+        try:
+            if self._stop.is_set() or not self._running or task.cancelled():
+                return  # expected shutdown / cancellation
+            if task.exception() is None:
+                return  # normal return (e.g. STOP policy halted the lane) — not respawned
+            if self._inbound_worker_dict(kind).get(name) is task:
+                log.error(
+                    "%s worker %r exited unexpectedly; respawning",
+                    kind,
+                    name,
+                    exc_info=task.exception(),
+                )
+                self._spawn_inbound_worker(kind, name)
+        finally:
+            self._held_rows_by_task.pop(task, None)
 
     # --- pooled-mode dispatcher management (ADR 0066) ------------------------
 
@@ -10207,10 +10334,11 @@ class RegistryRunner:
         # coalesces further rows inside _process_delivery_batch; on a fault it appends their ids
         # here, so the arm re-pends head and extras in one write (#1579, #1844). Only a raising
         # pass appends, so the STOPPED tail slice below never sees them.
-        claimed: list[str] = []
+        holding = self._held_rows()  # #1611/#4607: what a respawn re-pends if this task dies
+        claimed = holding.ids
         faults = _WorkerFaultLog("delivery", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            fence = holding.fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0189) THE CLAIM GATE, per_lane half: the application log is unwritable and this
             # process has fail-closed, so this lane must not deliver no matter which door started it.
             # Return BEFORE the claim so no row is left INFLIGHT. A door that finds the log working
@@ -10276,7 +10404,7 @@ class RegistryRunner:
                         limit=self.claim_limit, destination_name=name
                     )
                 # #1611: taken before anything else can raise, so the except arm re-pends THESE rows.
-                claimed = [it.id for it in items]
+                claimed[:] = [it.id for it in items]
                 if self._delivery_phase_timing:
                     # One lane per claim in per_lane mode (this worker owns exactly `name`). Recorded
                     # synchronously; counts only, never the lane name (destination_name = PHI-adjacent).
@@ -10333,7 +10461,7 @@ class RegistryRunner:
                     if outcome[0] is _ItemOutcome.STOPPED:
                         await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
-                claimed = []  # #1844: resolved, before anything else in the pass can raise
+                claimed.clear()  # #1844: resolved, before anything else in the pass can raise
                 faults.healthy()
             except asyncio.CancelledError:
                 raise
@@ -10354,7 +10482,7 @@ class RegistryRunner:
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
-                claimed = []
+                claimed.clear()
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -11371,10 +11499,11 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
         )
-        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
+        holding = self._held_rows()  # #1611/#4607: what a respawn re-pends if this task dies
+        claimed = holding.ids  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("router", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            fence = holding.fence = self._repend_fence()  # #1611: the lease this pass claims under
             # #122 (ADR 0162) THE CLAIM GATE: the application log is unwritable and this process has
             # fail-closed. Checked BEFORE the claim so no row is left INFLIGHT. The worker WAITS here
             # rather than returning (BACKLOG #5704), so the gate stays apart from the worker's life:
@@ -11397,7 +11526,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.INGRESS.value, limit=self._fifo_batch
                     )
-                claimed = [it.id for it in items]  # #1611
+                claimed[:] = [it.id for it in items]  # #1611
                 if not items:
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
@@ -11410,7 +11539,7 @@ class RegistryRunner:
                         return
                 # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
                 # its fault does not re-pend rows this pass already handed off.
-                claimed = []
+                claimed.clear()
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.
                 now = time.time()
@@ -11433,7 +11562,7 @@ class RegistryRunner:
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
-                claimed = []
+                claimed.clear()
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -11755,16 +11884,17 @@ class RegistryRunner:
         wait_ev = (
             self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
         )
-        claimed: list[str] = []  # #1611: the row this loop claimed, for the except arm's re-pend
+        holding = self._held_rows()  # #1611/#4607: what a respawn re-pends if this task dies
+        claimed = holding.ids  # #1611: the row this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("response", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            fence = holding.fence = self._repend_fence()  # #1611: the lease this pass claims under
             if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 woken = await self._wait_for_work(wait_ev)
                 continue
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
-                claimed = [] if item is None else [item.id]  # #1611
+                claimed[:] = [] if item is None else [item.id]  # #1611
                 if item is None:
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
@@ -11773,7 +11903,7 @@ class RegistryRunner:
                 outcome = await self._process_response_item(name, item)
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
-                claimed = []  # #1844: resolved, before anything else in the pass can raise
+                claimed.clear()  # #1844: resolved, before anything else in the pass can raise
                 faults.healthy()
             except asyncio.CancelledError:
                 raise
@@ -11787,7 +11917,7 @@ class RegistryRunner:
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
-                claimed = []
+                claimed.clear()
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -11897,10 +12027,11 @@ class RegistryRunner:
         # B12 (ADR 0061): wait on THIS inbound's ROUTED lane Event when per-lane wake is on; else the
         # shared singleton (byte-identical). Resolved once.
         wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
-        claimed: list[str] = []  # #1611: rows this loop claimed, for the except arm's re-pend
+        holding = self._held_rows()  # #1611/#4607: what a respawn re-pends if this task dies
+        claimed = holding.ids  # #1611: rows this loop claimed, for the except arm's re-pend
         faults = _WorkerFaultLog("transform", name)  # #1844: backs off the except arm's traceback
         while not self._stop.is_set():
-            fence = self._repend_fence()  # #1611: the lease this pass claims under
+            fence = holding.fence = self._repend_fence()  # #1611: the lease this pass claims under
             if self._inbound_log_halted(name):  # #122 (ADR 0162) — see _router_worker's gate
                 woken = await self._wait_for_work(wait_ev)
                 continue
@@ -11916,7 +12047,7 @@ class RegistryRunner:
                     items = await self.store.claim_next_fifo_batch(
                         name, stage=Stage.ROUTED.value, limit=self._fifo_batch
                     )
-                claimed = [it.id for it in items]  # #1611
+                claimed[:] = [it.id for it in items]  # #1611
                 if not items:
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
@@ -11947,13 +12078,13 @@ class RegistryRunner:
                         # STOP ran, and found this worker alive, so it spawned none. Keep draining,
                         # as the worker it would have spawned does. Only with the tail released:
                         # otherwise the next claim would pass rows still in flight.
-                        claimed = []
+                        claimed.clear()
                         woken = False  # the next claim follows no wait (B11 accounting)
                         continue
                     return
                 # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
                 # its fault does not re-pend rows this pass already handed off.
-                claimed = []
+                claimed.clear()
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # routed (transform) backlog is building behind a slow/hung handler — reported separately
                 # from the ingress lane.
@@ -11978,7 +12109,7 @@ class RegistryRunner:
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
-                claimed = []
+                claimed.clear()
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
@@ -13424,26 +13555,29 @@ class RegistryRunner:
         and reads back the count its own increment left. No claim raises it, so a batch tail
         claimed beside the dying row is never counted, and a crash, a stop or a STOP-policy re-pend
         never adds to it. At :data:`_WORKER_DEATH_LIMIT` the same transaction dead-letters the row,
-        its message ``ERROR``. Below it nothing else is written, as on ``main``: a row still in
-        flight stays there, the in-flight watch pages it, and ``reset_stale_inflight`` brings it
-        back at the next start with its count kept.
-        "Repeatedly" therefore means across passes that each claimed the row anew, after a restart
-        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
-        flight, so this process does not re-claim it unless a lease sweep re-pends it; recovering a
-        dead worker's held rows in-process is #4607 steps 1, 2 and 5.
+        its message ``ERROR``. Below it nothing else is written here: a row still in flight stays
+        there until something re-pends it. On a per-lane lane that is the respawned worker, which
+        re-pends exactly the rows the dead task held before it claims (:meth:`_recover_then_run`),
+        so the row is re-claimed and counted again in-process, without a restart and without a
+        later row overtaking it. On a pooled lane it is ``reset_stale_inflight`` at the next start,
+        with the count kept, and the in-flight watch pages the row meanwhile.
 
         **An outbound row** counts the death as a failed send under the lane's own retry policy
         (owner ruling 2026-11-11). Its count is the ``attempts`` the claim raised, which also holds
         its failed sends, and which a FIFO batch claim raises on every row it takes, so a batch tail
         carries the count too. At the lane's ``max_attempts`` the row goes through ``mark_failed``,
-        whose DEAD branch leaves a row already DONE, DEAD or CANCELLED as it is; below it nothing is
-        written. Where the store counted fewer attempts than the claim, ``mark_failed`` takes its
-        retry branch instead, and :meth:`_arm_retry` arms its retry wake on a lane a per-lane
-        worker drains while ``_per_lane_wake`` is on. A lane that retries forever
+        whose DEAD branch leaves a row already DONE, DEAD or CANCELLED as it is. Below the cap, on a
+        lane a per-lane worker drains, it goes through ``mark_failed`` as well, whose retry branch
+        re-pends it with the lane's backoff and keeps ``attempts``; the respawn's guarded re-pend
+        then skips it, so its count is not undone. Below the cap on a dispatcher-drained lane
+        nothing is written. Where the store counted fewer attempts than the claim, ``mark_failed``
+        takes its retry branch at the cap too, and :meth:`_arm_retry` arms its retry wake on a lane
+        a per-lane worker drains while ``_per_lane_wake`` is on. A lane that retries forever
         (``max_attempts = None``) never dead-letters on a death.
 
-        **A pooled lane's serializer is not respawned** (#4607 step 2), so its lane claims nothing
-        until a restart, and every death there fires ``connection_stopped``.
+        **A pooled lane's serializer is not respawned**: that half of #4607 (its step 2) stays held
+        for the owner, so its lane claims nothing until a restart, and every death there fires
+        ``connection_stopped``.
 
         Never raises: the caller re-raises the death, and a store or alert fault here must not
         replace it. Logs names, ids and the exception's type, never its text, which can carry the
@@ -13465,7 +13599,10 @@ class RegistryRunner:
         try:
             if outbound:
                 cap = retry.max_attempts
-                if cap is None or item.attempts < cap:
+                below = cap is None or item.attempts < cap
+                if below and self._drained_by_dispatcher(stage, name):
+                    # The pooled serializer is not respawned (that half of #4607 is held), so the
+                    # row is left as it was for the next start.
                     log.error(
                         "%s worker %r: row %s (message %s) killed the worker with %s on attempt %d "
                         "of %s; nothing written, so a row still in flight comes back at the next "
@@ -13479,9 +13616,11 @@ class RegistryRunner:
                         "unlimited" if cap is None else cap,
                     )
                     return
-                # Through _mark_failed_and_arm, so a re-pend (the store's attempts lower than the
-                # claim's copy) arms the lane's retry wake where _arm_retry arms one (a
-                # per-lane-drained lane, per-lane wake on).
+                # Through _mark_failed_and_arm, so a re-pend arms the lane's retry wake where
+                # _arm_retry arms one (a per-lane-drained lane, per-lane wake on). On a per-lane
+                # lane below the cap this IS the failed send: it re-pends the row with the lane's
+                # backoff and keeps the claim's attempts, which the respawn's reschedule_claimed
+                # would undo, so the lane's cap is reached in-process (#1611 step 2).
                 failed = await self._mark_failed_and_arm(name, item.id, error, retry)
                 if failed.retry_at is not None:
                     # mark_failed took its retry branch. Its retry_at comes back even when the
@@ -13490,14 +13629,19 @@ class RegistryRunner:
                     # finds this row resolved and claims only the lane's other due rows, as for
                     # the other _mark_failed_and_arm callers.
                     log.error(
-                        "%s worker %r: row %s (message %s) killed the worker with %s; the store "
-                        "counted fewer attempts than the claim, so mark_failed took its retry "
-                        "branch, which re-pends the row unless it was already resolved",
+                        "%s worker %r: row %s (message %s) killed the worker with %s on attempt "
+                        "%d of %s; %s, so mark_failed took its retry branch, which re-pends the "
+                        "row under the lane's retry policy unless it was already resolved",
                         worker,
                         name,
                         item.id,
                         item.message_id,
                         kind,
+                        item.attempts,
+                        "unlimited" if cap is None else cap,
+                        "counted as a failed send"
+                        if below
+                        else "the store counted fewer attempts than the claim",
                     )
                     return
                 dead = failed.dead > 0
@@ -13545,8 +13689,9 @@ class RegistryRunner:
             item.id,
             item.message_id,
             kind,
-            f"death {deaths} of {_WORKER_DEATH_LIMIT}, so nothing else is written: a row still in "
-            "flight stays there until the next start"
+            f"death {deaths} of {_WORKER_DEATH_LIMIT}, so nothing else is written here: a row "
+            "still in flight is re-pended by the respawned per-lane worker, or on a pooled lane "
+            "at the next start"
             if deaths
             else "nothing written: the row was already resolved or gone, or the store's leader "
             "fence refused the write",
