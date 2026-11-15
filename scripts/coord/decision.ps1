@@ -36,7 +36,8 @@
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     NO-REVIEW needs all of: the kill switch reads exactly OFF (afk-kill.ps1 -Status); the seat's
-    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration);
+    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration,
+    under which a roster alias earns its own 60 samples; owner ruling 2026-11-15, option c);
     no decision on the item was reversed in the 60 days read; the reversal budget is open (plan 4.5:
     3 reversals fleet-wide or 2 of the seat's own decisions inside 24 hours close it for 24 hours);
     the chain is no deeper than two (plan 4.6, below); and the cost rung is not hit (plan 4.7).
@@ -381,11 +382,10 @@ function Invoke-DecisionGate {
         $closed = $false
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
-        # One seat by its roster name, never by raw string: an alias or a padded spelling is the same
-        # seat's history (BACKLOG #5597).
-        $canon = ConvertTo-DecisionSeat $Seat
-        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
-                $_.kind -eq 'decision' -and (ConvertTo-DecisionSeat ([string]$_.seat)) -eq $canon -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+        # Every seat's Class B pool and -Seat as asked; Get-DecisionCalibration applies the alias
+        # ruling (owner ruling 2026-11-15, option c) and says how.
+        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Seat $Seat -Decisions @($all | Where-Object {
+                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
             })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")

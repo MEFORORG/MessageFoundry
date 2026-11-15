@@ -596,6 +596,27 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
     return [string]$Record.outcome
 }
 
+function Get-DecisionBlindState($Decisions, [hashtable]$Ratings) {
+    # One history's owner-rating state, verdicts oldest first. A breach is any trailing 60 holding
+    # more than 3 disagreements; after the latest one, 60 newer ratings must pass before it heals.
+    $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
+            Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
+    $n = $verdicts.Count
+    $lastBreach = -1
+    # A running count of the disagreements in the trailing 60 ending at $i.
+    $dis = 0
+    for ($i = 0; $i -lt $n; $i++) {
+        if ($verdicts[$i]) { $dis++ }
+        if ($i -ge 60 -and $verdicts[$i - 60]) { $dis-- }
+        if ($i -ge 59 -and $dis -gt 3) { $lastBreach = $i }
+    }
+    $since = $n - 1 - $lastBreach
+    return [pscustomobject]@{
+        N = $n; Rated = [Math]::Min($n, 60); Disagree = $dis; Since = $since
+        Breached = ($lastBreach -ge 0 -and $since -lt 60)
+    }
+}
+
 function Get-DecisionCalibration {
     <#
       One seat and class's calibration, plan section 4.2: the owner's disagreement on the trailing 60
@@ -603,25 +624,69 @@ function Get-DecisionCalibration {
       pass), and the reversal rate over the decisions logged on -RecentDays (a breach above 5
       percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
       reads Calibrated.
+
+      -Decisions is one class's pool for every seat. -Seat is mandatory, so no caller can pool every
+      seat by leaving it out. A roster alias and its seat (docs/roles/seats.json) are one seat, read
+      under owner ruling 2026-11-15, option c (BACKLOG #5604, #5597):
+      - The SAMPLES are the name's own: the decisions logged under -Seat's spelling, trimmed and
+        lower-cased, and never under another name of its seat. Borrowing them would let a name with
+        no record of its own inherit its seat's calibration.
+      - A live owner-rating BREACH in any history of the seat -- its roster name's, any alias's, or
+        all its names' read together -- applies to every name of it. All its names together is the
+        seat-pooled reading this ruling replaced, so every breach that reading catches closes every
+        name: option c is at least as strict as it, never looser. A history is in breach as its own
+        row would read it, so a name with fewer than 60 rated decisions logged in the window, one
+        whose oldest have aged out included, is no breach alone and counts only within all the
+        names together. A name's own breach heals only on 60 ratings of its own.
+      - REVERSALS are charged across the names: another name's reversed decisions in -RecentDays
+        count in this name's rate, while its unreversed ones never dilute it. The rate itself is
+        this name's, so a rate breach under another name reaches this one only through the
+        reversals it charges here.
+      The gate and the digest both call this, so they apply the ruling alike.
     #>
-    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays)
-    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
-    # the latest one, 60 newer ratings must pass before the class is calibrated again.
-    $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
-            Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
-    $n = $verdicts.Count
-    $lastBreach = -1
-    for ($i = 59; $i -lt $n; $i++) {
-        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
+    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Seat)
+    $label = ConvertTo-DecisionSeatLabel $Seat
+    $canon = ConvertTo-DecisionSeat $Seat
+    $family = @($Decisions | Where-Object { (ConvertTo-DecisionSeat ([string]$_.seat)) -eq $canon })
+    $own = @()
+    $otherNames = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in @($family | Group-Object { ConvertTo-DecisionSeatLabel ([string]$_.seat) } | Sort-Object Name)) {
+        if ($g.Name -eq $label) { $own = @($g.Group) } else { $otherNames.Add($g) }
     }
-    $rated = [Math]::Min($n, 60)
-    $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
-    $since = $n - 1 - $lastBreach
+    $others = @($otherNames | ForEach-Object { $_.Group })
+    $st = Get-DecisionBlindState $own $Ratings
     $blindOk = $false
-    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
-    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    $blind = if ($st.N -lt 60) { "review path, $($st.N)/60 samples" }
+    elseif ($st.Breached) { "BREACH: review path, $($st.Since)/60 fresh samples" }
     else { $blindOk = $true; 'calibrated' }
-    $recent = @($Decisions | Where-Object { $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
+    # The seat's other histories: each other name alone, then, when no single history is in breach
+    # and two or more names hold ratings, every name together, which catches disagreements split
+    # across names so that no one name holds more than 3.
+    $breachedIn = [System.Collections.Generic.List[string]]::new()
+    $ratedNames = [int]($st.N -gt 0)
+    foreach ($g in $otherNames) {
+        $o = Get-DecisionBlindState $g.Group $Ratings
+        if ($o.N) { $ratedNames++ }
+        if ($o.Breached) { $breachedIn.Add($g.Name) }
+    }
+    if (-not $st.Breached -and -not $breachedIn.Count -and $ratedNames -ge 2 -and (Get-DecisionBlindState $family $Ratings).Breached) {
+        $breachedIn.Add("all of $canon's names together")
+    }
+    if ($breachedIn.Count) {
+        $seatBreach = "BREACH in seat $canon's history ($($breachedIn -join ', ')): review path"
+        $blind = if ($blindOk) { $seatBreach } else { "$blind; $seatBreach" }
+        $blindOk = $false
+    }
+    # A decision the gate answered HALT for was deferred, not acted on, so it does not dilute the
+    # rate -- unless it was reversed anyway, which is still a reversal. BACKLOG #5604.
+    $recent = @($own | Where-Object {
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and
+            ([string]$_.gate -ne 'HALT' -or (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed')
+        })
+    $recent += @($others | Where-Object {
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed'
+        })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
     $revRate = if ($recent.Count) { $revd / $recent.Count } else { 0 }
     $breach = $revRate -gt 0.05
@@ -629,7 +694,7 @@ function Get-DecisionCalibration {
     $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
     $rateText = if ($recent.Count) { $pct + $(if ($breach) { ' BREACH' } else { '' }) } else { 'n/a' }
     return [pscustomobject]@{
-        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $recent.Count; Reversed = $revd
+        Rated = $st.Rated; Disagree = $st.Disagree; Blind = $blind; Recent = $recent.Count; Reversed = $revd
         RateText = $rateText; Calibrated = ($blindOk -and -not $breach)
     }
 }
@@ -774,7 +839,7 @@ function Get-DecisionSeatAliases {
         $doc = Read-CoordText $roster | ConvertFrom-Json -ErrorAction Stop
         $aliases = Get-DecisionJsonValue $doc 'aliases'
         if ($aliases -isnot [System.Management.Automation.PSCustomObject]) { throw "$roster holds no aliases map" }
-        foreach ($p in $aliases.PSObject.Properties) { $map[$p.Name.Trim().ToLowerInvariant()] = ([string]$p.Value).Trim().ToLowerInvariant() }
+        foreach ($p in $aliases.PSObject.Properties) { $map[(ConvertTo-DecisionSeatLabel $p.Name)] = ConvertTo-DecisionSeatLabel ([string]$p.Value) }
     } catch {
         $script:DecisionSeatAliases = $false
         return $null
@@ -783,12 +848,21 @@ function Get-DecisionSeatAliases {
     return $map
 }
 
+function ConvertTo-DecisionSeatLabel([string]$Seat) {
+    # One spelling's name, trimmed and lower-cased with no alias collapsed: the name a calibration
+    # sample pool is kept under (owner ruling 2026-11-15, option c), so padding or case starts no
+    # fresh pool, while `mgr` and `manager` stay two pools.
+    if (-not $Seat) { return '' }
+    return $Seat.Trim().ToLowerInvariant()
+}
+
 function ConvertTo-DecisionSeat([string]$Seat) {
     # One seat's one name: trimmed, lower-cased, and an alias collapsed onto the seat it spells
     # (docs/roles/seats.json). Every seat comparison here goes through this, so a padded or aliased
-    # spelling cannot escape a seat's reversal budget or calibration history (BACKLOG #5597).
-    if (-not $Seat) { return '' }
-    $s = $Seat.Trim().ToLowerInvariant()
+    # spelling cannot escape a seat's reversal budget or calibration breach (BACKLOG #5597). Only the
+    # calibration SAMPLES are kept per name, by ConvertTo-DecisionSeatLabel.
+    $s = ConvertTo-DecisionSeatLabel $Seat
+    if (-not $s) { return '' }
     $map = Get-DecisionSeatAliases
     if ($map -and $map.ContainsKey($s)) { return [string]$map[$s] }
     return $s

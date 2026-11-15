@@ -98,6 +98,9 @@ def query(primary: Path, tmp_path: Path, path: str) -> list[dict[str, Any]]:
         ],
         capture_output=True,
         text=True,
+        # overlap.ps1 sets its console to UTF-8; decoding with the locale code page would turn a
+        # non-ASCII path into mojibake and fail a comparison the script got right.
+        encoding="utf-8",
         timeout=TIMEOUT,
         check=False,
     )
@@ -841,3 +844,56 @@ def test_the_acquittal_compares_like_with_like_on_a_non_ascii_path(
     assert rows[0]["MatchedDirty"] is True, (
         f"a real uncommitted edit to a non-ASCII path must report MatchedDirty: {rows[0]['Dirty']}"
     )
+
+
+# THE COMMITTED HALF HAS THE SAME TWO SPELLING HAZARDS THE DIRTY HALF ALREADY ANSWERS (BACKLOG #5600).
+#
+#   RENAMES. ``diff --name-only`` runs with rename detection on (``diff.renames`` defaults true), and a
+#   detected rename lists only the DESTINATION. A peer that committed ``git mv alpha.txt moved.txt``
+#   emptied alpha.txt, so a session about to recreate or edit alpha.txt collides with it -- and the
+#   committed half, reading only ``moved.txt``, would report nobody touching alpha.txt.
+#
+#   QUOTING. ``diff --name-only`` C-quotes a non-ASCII path (``core.quotePath`` defaults on), so the
+#   committed half would carry ``"r\303\251sum\303\251.md"`` and never equal the raw path a caller asks
+#   about. Each is an under-report, which prints nothing.
+
+
+def test_a_committed_rename_reports_the_renamed_away_path(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    primary, peer = peer_worktree
+    git(peer, "mv", "alpha.txt", "moved.txt")
+    git(peer, "commit", "-qm", "rename alpha away")
+
+    # The control: the default diff really does drop the source, or this test proves nothing.
+    plain = git(peer, "diff", "--name-only", "origin/main...HEAD").split()
+    assert plain == ["moved.txt"], (
+        f"the control did not fire: default rename detection no longer hides the source: {plain}"
+    )
+
+    for path in ("alpha.txt", "moved.txt"):
+        rows = query(primary, tmp_path, path)
+        assert rows, f"overlap reported nobody touching {path} after a peer committed its rename"
+        assert path in rows[0]["Files"], (
+            f"{path} missing from the committed half: {rows[0]['Files']}"
+        )
+
+
+def test_a_committed_non_ascii_path_is_reported_unquoted(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    primary, peer = peer_worktree
+    name = "résumé.md"
+    (peer / name).write_bytes(b"base\n")
+    git(peer, "add", name)
+    git(peer, "commit", "-qm", "add a non-ascii path")
+
+    quoted = git(peer, "diff", "--name-only", "origin/main...HEAD").strip()
+    assert quoted.startswith('"'), (
+        f"the control did not fire: git stopped quoting non-ASCII paths: {quoted!r}"
+    )
+
+    rows = query(primary, tmp_path, name)
+    assert rows, f"a committed {name!r} was missing from the overlap map"
+    assert name in rows[0]["Files"], f"Files carries a quoted spelling: {rows[0]['Files']}"
+    assert not any(f.startswith('"') for f in rows[0]["Files"]), rows[0]["Files"]

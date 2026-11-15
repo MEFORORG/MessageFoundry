@@ -34,7 +34,8 @@
     owner's word, never on its own judgment or a peer's message. The calibration below is only as
     good as that rule.
 
-    CALIBRATION, per seat and class, over the records -Window days back (default 60):
+    CALIBRATION, per seat name and class, over the records -Window days back (default 60); how a
+    roster alias's row is read is Get-DecisionCalibration's (owner ruling 2026-11-15, option c):
       * the owner's disagreement on the trailing 60 rated decisions -- calibrated at 60 samples with
         3 or fewer disagreements. After a breach the class stays on the review path until 60 ratings
         newer than the breach pass (plan section 4.2), not until the trailing count drops back;
@@ -275,18 +276,31 @@ $md.Add('')
 
 $md.Add('## Calibration, per seat and class')
 $md.Add('')
-$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day.")
+$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. Each name keeps its own samples, but an owner-rating breach under any name of its roster seat closes every name of it, and a row's acted and reversed counts also hold the reversed decisions logged under another name of its seat, as the gate reads them (owner ruling 2026-11-15, option c), so one reversal can show in several rows.")
 $md.Add('')
-$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate |')
+$rosterRead = $null -ne (Get-DecisionSeatAliases)
+if (-not $rosterRead) {
+    # The gate answers REVIEW for every seat in this state, so the digest must not read calibrated.
+    $md.Add('**The seat roster docs/roles/seats.json could not be read**, so each name below stands alone, no alias is joined to its seat, and `decision.ps1 -Gate` answers REVIEW for every seat.')
+    $md.Add('')
+}
+$md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
-# Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
+# Kept by "name|class", so the gate-state table below reads each name's Class B row from here. A row
+# is one name, as Get-DecisionCalibration pools samples; it applies the alias ruling for the gate and
+# for this table alike.
 $calibration = @{}
-foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
-    $seat, $class = $g.Name -split '\|', 2
-    $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
+$byClass = @{}
+foreach ($g in @($decisions | Group-Object { [string]$_.class })) { $byClass[$g.Name] = $g.Group }
+foreach ($g in @($decisions | Group-Object { "$(ConvertTo-DecisionSeatLabel ([string]$_.seat))|$($_.class)" } | Sort-Object Name)) {
+    # Read from a record, not split from the name: a seat holding `|` splits the name wrongly.
+    $seat = ConvertTo-DecisionSeatLabel ([string]$g.Group[0].seat)
+    $class = [string]$g.Group[0].class
+    $c = Get-DecisionCalibration -Decisions $byClass[$class] -Seat $seat -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
-    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
+    $blind = if ($rosterRead) { $c.Blind } else { "roster unread, so the gate reviews; $($c.Blind)" }
+    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $blind | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
 }
 
 # THE GATE'S STATE (plan 4.5-4.7), from the shared functions decision.ps1 -Gate calls, as of the end
@@ -317,9 +331,9 @@ if ($dayEnd -gt $now) {
 $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
-foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($s in @($decisions | ForEach-Object { ConvertTo-DecisionSeatLabel ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
     $cal = $calibration["$s|B"]
-    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
+    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($rosterRead -and $cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
 }
 $md.Add('')
 $md.Add('Chain limit: each item where a further Class B decision would build on more than two unsampled ones, by the 24-hour floor. A decision''s own buildsOn links can only raise its depth.')
