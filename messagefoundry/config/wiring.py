@@ -10737,19 +10737,24 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
     in a link target holds a colon or ends in a space or a dot, a link leads to a device path, a
     drive with no separator after it or a path rooted with no drive, the name is a reparse point
     other than a symbolic link or a junction, or a relative link target holding ``..`` is met
-    after a junction. Each of those would leave a folder the open passes through unread, or have
+    after a junction. Each of those could leave a folder the open passes through unread, or have
     the walk vet another object than the open reaches: Win32 strips a trailing dot or space where
     a link's target, opened as written, keeps it, a joined name holding a colon restarts the path
-    at a drive (``anchor_path.windows_chain`` refuses both), and a relative link reached through a
-    junction resolves its ``..`` against the path through the junction (measured)."""
+    at a drive (``anchor_path.windows_chain`` refuses both), and the open can resolve the ``..``
+    of a relative link reached through a junction against the path through the junction
+    (measured). That last refusal holds for the rest of the walk, so it also refuses some layouts
+    the open would land on safely, such as one with an absolute link between the junction and the
+    relative link: it fails closed."""
     from messagefoundry.auth.anchor_path import _IO_REPARSE_TAG_MOUNT_POINT, _NAME_SURROGATE_BIT
 
     windows = os.name == "nt"
     found: list[Path] = []
     hops = 0
-    # Measured on Windows: a relative link reached through a junction resolves its ``..`` against
-    # the path through the junction, not the real folder this walk reaches, so the open can take
-    # a route this walk never vets. Once a junction is crossed, such a target is refused.
+    # Measured on Windows: the open can resolve the ``..`` of a relative link reached through a
+    # junction against the path through the junction, not the real folder this walk reaches, so
+    # it can take a route this walk never vets. Once a junction is crossed, such a target is
+    # refused for the rest of the walk, which fails closed on some layouts the open lands on
+    # safely, such as an absolute link between the two.
     junction_crossed = False
     pending = os.fspath(path.absolute())
     while True:

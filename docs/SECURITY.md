@@ -2839,10 +2839,12 @@ link leads to a file that is not there, the last folder the walk reaches on the 
 vetted. A start vets
 the file and the links it follows the same way when the engine is built, before its first load
 reads the directory; where the value file is not there and no link leads to it, that check does
-not vet its folder. On Windows a relative link reached through a junction resolves its `..`
-against the path through the junction, not the real folder the walk reached (measured), so a
-relative link target holding `..` met after the walk crossed a junction is refused, whether or
-not a file is there. The check also stats the value file through the open's own resolution and
+not vet its folder. On Windows the open can resolve the `..` of a relative link reached through
+a junction against the path through the junction, not the real folder the walk reached
+(measured), so a relative link target holding `..` met after the walk crossed a junction is
+refused, whether or not a file is there. The refusal holds for the rest of the walk, so it also
+refuses some layouts the open would land on safely, such as one with an absolute link between
+the junction and the relative link: it fails closed. The check also stats the value file through the open's own resolution and
 refuses it where that and the walk disagree: one reaches something and the other reaches
 nothing, or `os.path.samefile` says they reach two different ones. That refuses at least a
 value file whose final link names a file with a trailing separator, which the open cannot read
