@@ -3708,9 +3708,15 @@ if ($tool -in @("Bash", "PowerShell")) {
         $viaConfig = $via -match '^config\b'
         # A WRITE MODE BETWEEN `config` AND THE KEY (BACKLOG #5588). `git config --unset <key>` names no
         # value and still removes the key, so neither read exemption below may excuse it. The flags and
-        # the subcommand words are git's own write modes; a mode missing here only leaves a shape the
-        # exemptions excuse, which is where this rule stood before. $viaRead is "a read exemption may apply".
-        $viaWrite = $via -match '\s--(?:unset(?:-all)?|remove-section|rename-section|replace-all|add)(?=[\s=])|^config\s+(?:set|unset|remove-section|rename-section)\s'
+        # the subcommand words are git's own write modes. git accepts ANY unique prefix of a long
+        # option (measured: `--unset-a <key>` removes the key), so a `--<name>` counts when <name> is a
+        # prefix of a write mode; an ambiguous prefix git would refuse only costs a deny.
+        # $viaRead is "a read exemption may apply".
+        $writeModes = 'unset-all', 'remove-section', 'rename-section', 'replace-all', 'add'
+        $viaWrite = ($via -match '^config\s+(?:set|unset|remove-section|rename-section)\s') -or
+            [bool]@([regex]::Matches($via, '\s--(?<o>[A-Za-z][\w-]*)') | Where-Object {
+                $o = $_.Groups['o'].Value.ToLowerInvariant()
+                @($writeModes | Where-Object { $_.StartsWith($o) }).Count -gt 0 })
         $viaRead = $viaConfig -and -not $viaWrite
         # THE EXPLICIT READ FLAGS ARE TESTED BELOW, AGAINST THE DISARMING INVOCATION'S OWN WINDOW, and
         # they used to be tested here against the WHOLE SEGMENT. See the block after $ownCmdWin.
@@ -3814,25 +3820,32 @@ if ($tool -in @("Bash", "PowerShell")) {
         # exactly as before -- the flag is inside its own window -- and so is `git --no-pager config
         # --get <key>`, while the neighbouring read no longer reaches across the separator.
         #
-        # THE FLAG IS READ OFF $via ALONE NOW, AND ONLY FOR THE `config` FORM (BACKLOG #5589). Three
-        # defects had one cause, the window this test read:
+        # REPLACED (BACKLOG #5589), because the window it read was wrong three ways:
         #   * `-c` and `--config-env` override the key for WHATEVER subcommand follows, so a read flag
-        #     anywhere after them excused `git -c core.hooksPath=/x commit -m x --list`. Only `config`
-        #     reads, so only the `config` form is exempt.
+        #     anywhere after them excused `git -c core.hooksPath=/x commit -m x --list`.
         #   * git config stops parsing options at the key, so a `--list` AFTER it is the value. Measured:
-        #     `git config core.hooksPath --list` stores `--list`. $rest therefore never holds a read flag.
+        #     `git config core.hooksPath --list` stores `--list`. $rest never holds a read flag.
         #   * $ownCmdWin ends where $via starts, at the `config` word, so the flag in `git config --get
-        #     <key> <pattern>` was in neither half and that read was refused. $via is where it sits.
-        # Measured on real git, every flag here placed before the key stores nothing however many
-        # arguments follow (tests/test_worktree_gate.py). A write mode in $via outranks a read flag.
+        #     <key> <pattern>` was in neither half and that read was refused.
         #
-        # $via MUST BE ONE INVOCATION'S TEXT for its flag to be that invocation's. Its `[^|;&]` run does
-        # not stop at a substitution, so in `git config --list x $(git config <key> v)` the flag is the
-        # outer read's and the key the inner write's. A parenthesis, a backtick, a brace or a second git
-        # word in $via withholds the exemption; that costs a deny on an odd read, never an allow.
+        # THE EXEMPTION IS NOW AN ALLOWLIST OVER $via, NOT A SEARCH FOR A FLAG IN IT. A search was tried
+        # and review measured it excusing real writes: `--comment --get <key> v` (the `--get` is the
+        # comment's VALUE, and git stores v), `--show-origin --no-show-origin <key> v`, and a write in a
+        # substitution after the key, `git config --get alias.x y $(git config <key> v)`. So:
+        #   * every token between `config` and the key must be an exact, valueless option from the list
+        #     below, and one of them must be a `--get` mode; no value-taking option, no abbreviation, no
+        #     negation of a get mode can appear;
+        #   * $rest, the pattern arguments, must hold nothing a shell could run or redirect: no
+        #     parenthesis, backtick, brace, `$`, `<` or `>`.
+        # A double quote is refused too: the scan blanks a quoted span, so `"$(...)"` reaches $rest as
+        # blanks and only the quote is left to show it.
+        # A read outside that shape -- `--file <f> --get`, an abbreviated flag, a double-quoted pattern
+        # -- still denies. That is the false deny #5589 names, closed only for the plain shape; widening
+        # it needs git's option table, not a regex. The bare read (empty $rest) is excused above.
         # ===============================================================================================
-        if ($viaRead -and $via -notmatch '[()`{}]|\bgit\b' -and
-            $via -match '\s--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        $readOpt = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope)|-z'
+        if ($viaRead -and $via -cmatch "^config(?:\s+(?:$readOpt))+\s+$" -and
+            $via -cmatch '\s--get(?:-all|-regexp)?\s' -and $rest -notmatch '[()`{}$<>"]') { continue }
 
         # ===============================================================================================
         # AND WHAT DID AN EARLIER STATEMENT OR LINE PUT IN THE ENVIRONMENT? (BACKLOG #1379 class two)
@@ -4028,7 +4041,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
         if (-not $whereRaw) {
             Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
-BLOCKED: this sets '$badKey', and the gate cannot tell WHICH repository it would set it in.
+BLOCKED: this $(if ($viaWrite) { 'changes' } else { 'sets' }) '$badKey', and the gate cannot tell WHICH repository it would change it in.
 
 The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an absolute path from this
 session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
@@ -4160,7 +4173,8 @@ What to do instead:
             "checkout's hooks. Which case applies is not knowable from the command alone, so it is refused."
         }
         else {
-            "BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
+            # A write mode may REMOVE the key (BACKLOG #5588), so "setting" would misdescribe it.
+            "BLOCKED: $(if ($viaWrite) { 'changing' } else { 'setting' }) '$badKey' would change the SHARED git configuration of $($govCfg.Display)."
         }
         # The mechanism paragraph is scope-aware for the same reason the opening is: the shared-.git
         # sentence is TRUE of a repository-scope write and FALSE of --global/--system.

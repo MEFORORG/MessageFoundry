@@ -2443,8 +2443,9 @@ def test_a_document_on_the_shared_root_is_still_allowed(
 
 # --- rule 3c: spellings the disarm pattern and its read exemptions misjudged (BACKLOG #5588, #5589) --
 #
-# Every row is judged in the same real governed repository as DISARM_WRITE, which each test asks
-# first as its positive control, so a fixture that stopped discriminating goes red rather than green.
+# Every row is judged in a real governed repository. The allow test asks DISARM_WRITE first as its
+# positive control, so a fixture that stopped discriminating goes red there rather than green; a
+# deny row needs no control, since an inert fixture allows and fails it.
 
 
 def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None, check: bool = True) -> str:
@@ -2476,6 +2477,12 @@ def test_real_git_honours_the_spellings_these_rows_close(git_primary: Path) -> N
     # Option parsing stops at the key, so a `--list` after it is the VALUE, and real git stores it.
     _git_out(git_primary, "config", "core.hooksPath", "--list")
     assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "--list"
+    # An abbreviated write mode removes the key.
+    _git_out(git_primary, "config", "--unset-a", "core.hooksPath")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath", check=False) == ""
+    # A read flag that is another option's value is no read: git stores the value.
+    _git_out(git_primary, "config", "--comment", "--get", "core.hooksPath", "/y")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "/y"
     _git_out(git_primary, "config", "--unset", "core.hooksPath")
 
 
@@ -2483,8 +2490,9 @@ def test_real_git_honours_the_spellings_these_rows_close(git_primary: Path) -> N
 def test_real_git_stores_nothing_for_a_read_flag_before_the_key(
     git_primary: Path, flag: str
 ) -> None:
-    """The ground truth under the multi-argument read exemption: a read flag between `config` and
-    the key makes the trailing arguments a pattern, or an error, and never a stored value."""
+    """The ground truth under the multi-argument read exemption: a read flag DIRECTLY after `config`
+    makes the trailing arguments a pattern, or an error, and never a stored value. Only directly:
+    after a value-taking option it is that option's value (the honours test measures one)."""
     _git_out(git_primary, "config", flag, "core.hooksPath", "/nope", check=False)
     _git_out(git_primary, "config", "--local", flag, "alias.zz", "status", check=False)
     # `--get` of an unset key exits 1, which is the answer asked for here.
@@ -2520,6 +2528,18 @@ def test_real_git_stores_nothing_for_a_read_flag_before_the_key(
         "git config --list x `git config core.hooksPath /dev/null`",
         "git config --get x <(git config core.hooksPath /dev/null)",
         "git config --list x && git config core.hooksPath /dev/null",
+        # #5588: git takes any unique prefix of a long option.
+        "git config --unset-a core.hooksPath",
+        "git config --unset- core.hooksPath",
+        "git config --uns include.path",
+        # Review round 1: a read flag in $via that is not the action, and a write in $rest.
+        "git config --comment --get core.hooksPath /dev/null",
+        "git config --show-origin --no-show-origin core.hooksPath /dev/null",
+        "git config --comm --get core.hooksPath /dev/null",
+        "git config --get alias.x y $(git config core.hooksPath /dev/null)",
+        "git config --get alias.x y `git config core.hooksPath /dev/null`",
+        "git config --get-all core.hooksPath x >(git config core.hooksPath /dev/null)",
+        'git config --get-all core.hooksPath "$(git config core.hooksPath /dev/null)"',
     ],
 )
 def test_rule_3c_denies_the_spellings_it_used_to_miss(
@@ -2537,6 +2557,7 @@ def test_rule_3c_denies_the_spellings_it_used_to_miss(
         "git config --get-all alias.st status",
         "git config --get-regexp alias.co .",
         "git config --local --get core.hooksPath x",
+        "git config --show-origin --get-all core.hooksPath x",
     ],
 )
 def test_rule_3c_allows_multi_argument_reads(
