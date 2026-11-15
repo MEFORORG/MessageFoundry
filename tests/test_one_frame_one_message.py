@@ -708,6 +708,26 @@ def test_frame_reply_refuses_a_delimiter_the_charset_cannot_hold() -> None:
     assert wire == MLLP_CODEC.frame(reply.replace("\u4e2d", "?").encode("latin-1"))
 
 
+@pytest.mark.parametrize("head", ["MSH", "MSH\r\n"], ids=["bare-msh", "msh-then-lf"])
+def test_frame_reply_reads_no_delimiters_from_a_header_too_short_to_declare_them(head: str) -> None:
+    """Round-three review of #5799: a first line of ``MSH`` alone raised IndexError out of the
+    delimiter read. It declares no delimiters, so the reply is replaced and answered. Mutation:
+    measure the whole reply rather than its first line. Red: IndexError."""
+    reply = head + "\r" + "MSA|AA|CTRL1|\u4e2d" + CR
+    wire = frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_SHORT_MSH")
+    assert wire == MLLP_CODEC.frame(reply.replace("\u4e2d", "?").encode("ascii"))
+
+
+@pytest.mark.parametrize("lead", ["\ufeff", " \ufeff\r\n"], ids=["bom", "whitespace-and-bom"])
+def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
+    """Round-three review of #5799: a leading BOM hid the header, so a reply declaring ``?`` was
+    sent with ``?`` written into its data. The BOM and whitespace are skipped as the engine's
+    tolerated leading noise is. Mutation: drop the lstrip. Red: the call returns a reply."""
+    reply = lead + "MSH|?~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|\u4e2d" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM")
+
+
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])
 def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
     """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE

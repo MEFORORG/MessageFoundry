@@ -29,6 +29,7 @@ from messagefoundry.framing import (
     codec_for,
 )
 from messagefoundry.parsing._builtin_hl7 import _extract_separators
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
@@ -245,7 +246,13 @@ def _encodes(delimiter: str, encoding: str) -> bool:
 
 def _reply_delimiters(reply: str) -> frozenset[str]:
     """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
-    segment terminator; empty for any other reply. Read only: nothing here changes the reply."""
-    if not reply.startswith("MSH") or len(reply) < 4:
+    segment terminator; empty for any other reply. Read only: nothing here changes the reply.
+
+    Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
+    leading noise (``sniff._LEADING_WS_STR``) skips them. The first line is measured, not the whole
+    reply, so a first line of ``MSH`` alone has no field separator to read and declares nothing,
+    rather than indexing past its end."""
+    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
+    if not line.startswith("MSH") or len(line) < 4:
         return frozenset()
-    return frozenset((*_extract_separators(reply.partition("\r")[0]), "\r"))
+    return frozenset((*_extract_separators(line), "\r"))

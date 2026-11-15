@@ -430,6 +430,46 @@ async def test_an_oauth2_only_401_with_a_ws_security_fault_still_retries(
     assert provider.invalidations == 1
 
 
+_EXPIRED_401 = b"<soap:Fault><faultcode>wsse:MessageExpired</faultcode></soap:Fault>"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{}, {"soap_version": "1.2", "ws_security": True}],
+    ids=["no-ws-security", "timestamp-only"],
+)
+async def test_an_oauth2_401_message_expired_stays_permanent_without_a_username_token(
+    over: dict[str, object],
+) -> None:
+    """Round-three review: MessageExpired names the envelope's Timestamp, which a fresh bearer
+    cannot fix, so it stays permanent as before #5798 even with no UsernameToken sent. The bearer
+    is still dropped. Mutation: drop the MessageExpired test from the carve-out. Red: DeliveryError,
+    and the message retries for the whole budget."""
+    dest, provider = _oauth2_dest(**over)
+    dest._opener = _Opener(exc=_http_error(401, _EXPIRED_401))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
+    assert provider.invalidations == 1
+
+
+@pytest.mark.parametrize("body", [b"", _SENDER_11.encode()], ids=["no-fault", "sender-fault"])
+async def test_a_username_token_connection_still_retries_a_non_ws_security_401(
+    body: bytes,
+) -> None:
+    """Round-three review: the carve-out keys on the fault code, not on the connection alone, so a
+    401 with no WS-Security fault retries with a fresh bearer even where a UsernameToken is sent.
+    Mutation: test only the UsernameToken condition in the carve-out. Red: NegativeAckError."""
+    dest, provider = _oauth2_dest(
+        soap_version="1.2", ws_security=True, ws_username="svc", ws_password="pw-synthetic"
+    )
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+    assert provider.invalidations == 1
+
+
 async def test_control_an_oauth2_403_stays_permanent_and_keeps_the_token() -> None:
     dest, provider = _oauth2_dest()
     dest._opener = _Opener(exc=_http_error(403, b""))  # type: ignore[assignment]

@@ -27,15 +27,17 @@ per-connection opener (server verification stays on); incompatible with ``verify
 **Fault mapping.** A response is inspected for a SOAP ``Fault`` (faults can arrive as HTTP 500 *or* an
 HTTP 200 body). A WS-Security fault (FailedAuthentication / InvalidSecurityToken / MessageExpired) →
 :class:`NegativeAckError` (``permanent=True``) → dead-letter (a credential/expiry reject won't fix on a
-retry). A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server** fault →
+retry), with the one OAuth2 exception at the end of this paragraph. A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server** fault →
 :class:`DeliveryError` (retry). The code is read first from the Fault's first child, its faultcode or
 Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
 error retries. With OAuth2 client credentials configured, an HTTP 401 drops the cached bearer and
-retries, as the REST and FHIR connectors do, unless the connection also sends a WS-Security
-UsernameToken and the body is a WS-Security fault, which stays permanent (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
-fault role + HTTP status are.
+retries, as the REST and FHIR connectors do, unless its body is a WS-Security fault a fresh bearer
+cannot fix, which stays permanent: any such fault on a connection that sends a UsernameToken, and a
+MessageExpired fault on any connection. So on a connection sending no UsernameToken, a 401
+FailedAuthentication or InvalidSecurityToken retries (BACKLOG #5798). Fault bodies are **not**
+echoed into errors/logs (they may carry PHI) — only the SOAP fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
 in WS-\* mode — correct WS-\* retry semantics). The service operation **must be idempotent** and its
@@ -152,6 +154,8 @@ _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
 _WSSE_FAULT_RE = re.compile(
     r"FailedAuthentication|InvalidSecurityToken|MessageExpired", re.IGNORECASE
 )
+# The one of those codes that names the envelope's Timestamp rather than a credential (BACKLOG #5798).
+_WSSE_EXPIRED_RE = re.compile(r"MessageExpired", re.IGNORECASE)
 # SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>. Only the start tag's
 # NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
@@ -411,12 +415,21 @@ def _searched_code(body: str, start: int, end: int) -> str:
     return ""
 
 
+def _names_expired_timestamp(body: str) -> bool:
+    """Whether ``body`` holds a Fault whose WS-Security code, searched as :func:`_classify_soap`
+    searches it, includes ``MessageExpired``."""
+    fault, start = _find_fault(body)
+    return bool(fault) and _WSSE_EXPIRED_RE.search(body, start) is not None
+
+
 def _classify_soap(status: int, body: str) -> DeliveryError | None:
     """``None`` if delivered, else the classified failure. A WS-Security fault (auth/expiry) →
     permanent; a SOAP fault is classified by its code (Sender/Client → permanent; Receiver/Server →
     transient; unrecognized → permanent so a rejected request can't loop the lane); a fault-less
     response falls back to the HTTP status. The Fault and the WS-Security code are searched for from
-    where :func:`_find_fault` starts."""
+    where :func:`_find_fault` starts. This is the classification of the reply alone: on an HTTP 401
+    with OAuth2 configured, ``_post`` retries some WS-Security faults instead (BACKLOG #5798, the
+    module docstring's fault mapping says which)."""
     fault, start = _find_fault(body)
     if fault:
         code = _fault_code(body, fault)
@@ -1320,17 +1333,20 @@ class SoapDestination(DestinationConnector):
                 # revoked or expired between mint and use. Drop it and retry with a fresh one
                 # (transient); classifying the 401 permanent dead-lettered the message and left the
                 # bad token cached for every later send. A 403 stays permanent below, as there.
-                # A WS-Security fault on a connection that sends a UsernameToken may name that
-                # envelope credential, which a fresh bearer cannot fix, so there it stays the
-                # permanent failure it was: retrying would resend a wrong password for the whole
-                # retry budget. With no UsernameToken sent, the bearer is the only credential the
-                # fault can name, so it retries like any other 401. Secret-safe: the redacted URL only.
+                # A WS-Security fault stays the permanent failure it was where a fresh bearer cannot
+                # fix it: on a connection that sends a UsernameToken, which the fault may name
+                # (retrying would resend a wrong password for the whole budget), and wherever it is
+                # MessageExpired, which names the envelope's Timestamp. Otherwise, with no
+                # UsernameToken sent, FailedAuthentication or InvalidSecurityToken can only name the
+                # bearer, so it retries like any other 401. Secret-safe: the redacted URL only.
                 self._token_provider.invalidate()
-                sends_username_token = self.ws_security and bool(self.ws_username)
                 if not (
-                    sends_username_token
-                    and isinstance(failure, NegativeAckError)
+                    isinstance(failure, NegativeAckError)
                     and failure.code == "wssecurity"
+                    and (
+                        (self.ws_security and bool(self.ws_username))
+                        or _names_expired_timestamp(body)
+                    )
                 ):
                     raise DeliveryError(
                         f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
