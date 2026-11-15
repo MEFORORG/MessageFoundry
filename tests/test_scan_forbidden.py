@@ -1846,8 +1846,8 @@ _PROSE = "This paragraph explains the change in plain words and names no require
 @pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
 @pytest.mark.parametrize("layout", ["one-line", "wrapped"])
 def test_a_main_caught_shape_past_the_cap_is_still_caught(sf, body: str, layout: str) -> None:
-    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. Only an
-    adversarial run is cut now, so ordinary prose before the shape keeps main's reading of it."""
+    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. Past the
+    cap the baseline reads with linear-time equals of main's patterns, so it reads the whole body."""
     filler = _PROSE * 30
     if layout == "wrapped":
         filler = "\n".join(_PROSE.strip() for _ in range(30)) + "\n"
@@ -1858,15 +1858,71 @@ def test_a_main_caught_shape_past_the_cap_is_still_caught(sf, body: str, layout:
     assert set(main_hits) <= set(sf.scan_pr_body(long_body)), layout
 
 
-def test_the_baseline_cut_falls_only_on_an_adversarial_run_and_never_mid_word(sf) -> None:
-    prose = _PROSE * 300
-    assert sf._pr_base_bounded(prose, sf._pr_base_split_cost) == prose
-    adversarial = "a" + " " * 30_000 + "ASVS 16.9.97 is metadata-driven"
-    cut = sf._pr_base_bounded(adversarial, sf._pr_base_split_cost)
-    assert len(cut) <= sf._PR_BASE_CAP
-    brackets = ("word " * 500) + "[" * 20_000
-    cut = sf._pr_base_bounded(brackets, sf._pr_base_link_cost)
-    assert len(cut) <= sf._PR_BASE_CAP and cut.endswith("word"), cut[-10:]
+_LONG_BODIES_MAIN_READS_FAST = [
+    pytest.param(
+        "## Changes\n\n```\n"
+        + "".join(f" pkg/{'x' * 80}{i:03}.py {' ' * 10}| 2 +-\n" for i in range(131))
+        + "```\nNext steps -> 16.9.97 has a residual gap",
+        id="diffstat",
+    ),
+    pytest.param(
+        "the loop runs while i<n and j<m " * 120 + "\nNext steps -> 16.9.97 has a residual gap",
+        id="comparisons",
+    ),
+    pytest.param("[a " * 800 + "](x) ASVS 16.9.97 is met</b> over time", id="nested-brackets"),
+    pytest.param(_PROSE * 40 + "ASVS 16.9.97 is met</b> over time " + _PROSE * 40, id="mid-shape"),
+]
+
+
+@pytest.mark.parametrize("body", _LONG_BODIES_MAIN_READS_FAST)
+def test_a_long_body_keeps_main_s_reading_whole(sf, body: str) -> None:
+    """Round 6: a cost-model cut lost main's hit on bodies like these, which main reads in
+    milliseconds. The baseline cuts nothing now."""
+    main_hits = _main_scan_pr_body(sf, body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(body))
+
+
+def _fuzz_strings(alphabet: str, count: int, longest: int) -> list[str]:
+    rng = random.Random(len(alphabet) * 7919 + longest)
+    return ["".join(rng.choices(alphabet, k=rng.randint(0, longest))) for _ in range(count)]
+
+
+def test_the_linear_link_sub_equals_main_s_pattern(sf) -> None:
+    """The baseline reads a long line with this in place of main's link pattern, so they must agree."""
+    changed = 0
+    for text in _fuzz_strings("[]()[]()[]()aa \t \x1c\n", 4000, 40):
+        expected = _MAIN_MD_LINK.sub(r"\1", text)
+        changed += expected != text
+        assert sf._pr_base_link_sub(text) == expected, repr(text)
+    assert changed > 100, "control: the corpus must hold links, or the equality is vacuous"
+
+
+def test_the_linear_split_equals_main_s_pattern(sf) -> None:
+    """The baseline splits a long paragraph with this in place of main's split pattern."""
+    split = 0
+    for text in _fuzz_strings("<>/bB. !?\t \x1cA*`[(\"'#-", 4000, 40):
+        expected = [(m.start(), m.end()) for m in _MAIN_SENTENCE_SPLIT.finditer(text)]
+        split += bool(expected)
+        assert sf._pr_base_split_spans(text) == expected, repr(text)
+    assert split > 100, "control: the corpus must hold splits, or the equality is vacuous"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[" * 1600 + "a](" + "x" * 63_900,
+        "[" * 65_000,
+        "a" + " " * 65_000 + "b",
+        "<a " * 21_000,
+        ("[" * 1999 + "\n") * 32,
+    ],
+    ids=["shared-target", "brackets", "space-run", "open-tags", "bracket-lines"],
+)
+def test_the_baseline_stays_linear_at_the_body_limit(sf, body: str) -> None:
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 2
 
 
 def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:

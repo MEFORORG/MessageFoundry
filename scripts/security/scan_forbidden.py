@@ -718,23 +718,13 @@ _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 _PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 _PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
-#: The baseline's link and split patterns backtrack: each `[` scans to the next `]`, each `](` to the
-#: next `)` or space, each tag opening to the next `>`, and a whitespace run costs its length squared.
-#: :func:`_pr_base_cost` adds those up in linear time, and only a line or paragraph whose cost passes
-#: this budget is cut to ``_PR_BASE_CAP`` characters for the baseline. Ordinary prose, HTML release
-#: notes and long unwrapped lines cost about their length, so they are read whole; the cut falls only
-#: on an adversarial run, where main's reading would take seconds. The newer readings read every byte.
+#: The longest line, and paragraph, the baseline reads with the patterns above. Their link and split
+#: backtrack on a long run (`[` with no `]`, whitespace with no tag after it, `<x` with no `>`), so past
+#: this the baseline runs :func:`_pr_base_link_sub` and :func:`_pr_base_split_spans` instead, which give
+#: the same output in linear time (a test checks them against the patterns). Nothing is cut.
 _PR_BASE_CAP = 2000
-_PR_BASE_BUDGET_PER_CHAR = 20
-_PR_BASE_BUDGET_FLOOR = 100_000
-_PR_BASE_TAG_OPEN = re.compile(r"</?[A-Za-z]")
-_PR_BASE_TAG_CLOSE = re.compile(r">")
-_PR_BASE_LINK_OPEN = re.compile(r"\[")
-_PR_BASE_LINK_TEXT_END = re.compile(r"\]")
-_PR_BASE_TARGET_OPEN = re.compile(r"\]\(")
-_PR_BASE_TARGET_END = re.compile(r"[)\s]")
-#: A whitespace run, found from its head only, so a long run is read once.
-_PR_BASE_SPACE_RUN = re.compile(r"(?<!\s)\s+")
+#: The lookahead class of the full-stop split, as ``_PR_BASE_SENTENCE_SPLIT`` spells it.
+_PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
@@ -801,42 +791,96 @@ def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, in
     return units
 
 
-def _pr_scan_cost(text: str, opens: re.Pattern[str], ends: re.Pattern[str]) -> int:
-    """How far a pattern that starts at each ``opens`` match and runs to the next ``ends`` match scans,
-    added up: the backtracking cost of the baseline's link and tag patterns, found in linear time."""
-    stops = [m.start() for m in ends.finditer(text)]
-    total = 0
-    for m in opens.finditer(text):
-        i = bisect.bisect_left(stops, m.end())
-        total += (stops[i] if i < len(stops) else len(text)) - m.start()
-    return total
+def _pr_next(stops: list[int], at: int, end: int) -> int:
+    """The first stop at or after ``at``, or ``end``."""
+    i = bisect.bisect_left(stops, at)
+    return stops[i] if i < len(stops) else end
 
 
-def _pr_base_link_cost(line: str) -> int:
-    return _pr_scan_cost(line, _PR_BASE_LINK_OPEN, _PR_BASE_LINK_TEXT_END) + _pr_scan_cost(
-        line, _PR_BASE_TARGET_OPEN, _PR_BASE_TARGET_END
-    )
+def _pr_base_link_sub(line: str) -> str:
+    r"""``_PR_BASE_MD_LINK.sub(r"\1", line)``, in linear time. Each part of the pattern stops at the first
+    character it cannot take, and backtracking cannot make a shorter run end on the character the next
+    part needs, so a match is found by lookups: the next `]` or newline, then `(`, then the next `)` or
+    whitespace, which must be `)`."""
+    n = len(line)
+    text_ends = [i for i, c in enumerate(line) if c in "]\n"]
+    target_ends = [i for i, c in enumerate(line) if c == ")" or c.isspace()]
+    out: list[str] = []
+    pos = i = 0
+    while (i := line.find("[", i)) != -1:
+        j = _pr_next(text_ends, i + 1, n)
+        if j + 1 < n and line[j] == "]" and line[j + 1] == "(":
+            k = _pr_next(target_ends, j + 2, n)
+            if k < n and line[k] == ")":
+                out += [line[pos:i], line[i + 1 : j]]
+                pos = i = k + 1
+                continue
+        i += 1
+    out.append(line[pos:])
+    return "".join(out)
 
 
-def _pr_base_split_cost(unit: str) -> int:
-    runs = sum(len(m.group(0)) ** 2 for m in _PR_BASE_SPACE_RUN.finditer(unit))
-    return runs + _pr_scan_cost(unit, _PR_BASE_TAG_OPEN, _PR_BASE_TAG_CLOSE)
+def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
+    """The (start, end) of every ``_PR_BASE_SENTENCE_SPLIT`` match in ``unit``, in linear time. Each
+    alternative's whitespace run ends where the run does, since a shorter run leaves whitespace where
+    the lookahead or the `<` must be; the tag runs to the next `>`."""
+    n = len(unit)
+    run_end = list(range(n + 1))
+    for p in range(n - 1, -1, -1):
+        if unit[p].isspace():
+            run_end[p] = run_end[p + 1]
+    closes = [i for i, c in enumerate(unit) if c == ">"]
+
+    def letter(at: int) -> bool:
+        return at < n and unit[at].isascii() and unit[at].isalpha()
+
+    spans: list[tuple[int, int]] = []
+    p = 0
+    while p < n:
+        e = run_end[p]
+        if (
+            e > p
+            and e < n
+            and p > 0
+            and unit[p - 1] in ".!?"
+            and unit[e] in _PR_BASE_SPLIT_LOOKAHEAD
+        ):
+            spans.append((p, e))
+            p = e
+            continue
+        if e < n and unit[e] == "<":
+            name = e + 2 if e + 1 < n and unit[e + 1] == "/" else e + 1
+            if letter(name):
+                g = _pr_next(closes, name + 1, n)
+                if g < n:
+                    spans.append((p, run_end[g + 1]))
+                    p = run_end[g + 1]
+                    continue
+        p += 1
+    return spans
 
 
-def _pr_base_bounded(text: str, cost: Callable[[str], int]) -> str:
-    """``text`` whole, unless the baseline's patterns would cost more than the budget on it: then its
-    first ``_PR_BASE_CAP`` characters, cut back to a space so no word is cut into a verdict."""
-    if cost(text) <= _PR_BASE_BUDGET_PER_CHAR * len(text) + _PR_BASE_BUDGET_FLOOR:
-        return text
-    head = text[:_PR_BASE_CAP]
-    space = max(head.rfind(" "), head.rfind("\t"))
-    return head[:space] if len(text) > _PR_BASE_CAP and space > 0 else head
+def _pr_base_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+    """:func:`_pr_sentences` with origin/main's split: the pattern itself up to ``_PR_BASE_CAP``, and
+    its linear-time equal past it."""
+    if is_row:
+        return [(0, unit)]
+    if len(unit) <= _PR_BASE_CAP:
+        spans = [(m.start(), m.end()) for m in _PR_BASE_SENTENCE_SPLIT.finditer(unit)]
+    else:
+        spans = _pr_base_split_spans(unit)
+    sentences, start = [], 0
+    for begin, end in spans:
+        sentences.append((start, unit[start:begin]))
+        start = end
+    sentences.append((start, unit[start:]))
+    return sentences
 
 
 def _pr_base_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
     """:func:`_pr_units` as origin/main had it, the baseline reading: links read as their text, the
     first `>` of a line taken out wherever it sits, and every HTML tag left for the split to end a
-    sentence at. A line or paragraph its patterns would backtrack across is cut first (see
+    sentence at. Nothing is cut: a long line takes the link pattern's linear-time equal (see
     ``_PR_BASE_CAP``)."""
     units: list[tuple[list[tuple[int, int]], str, bool]] = []
     marks: list[tuple[int, int]] = []
@@ -844,21 +888,21 @@ def _pr_base_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
 
     def flush() -> None:
         if parts:
-            unit = _pr_base_bounded(" ".join(parts), _pr_base_split_cost)
-            units.append((list(marks), unit, False))
+            units.append((list(marks), " ".join(parts), False))
             marks.clear()
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        stripped = _pr_base_bounded(raw.strip(), _pr_base_link_cost)
-        line = _PR_BASE_MD_LINK.sub(r"\1", _PR_BASE_QUOTE.sub("", stripped, count=1).strip())
+        unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
+        if len(unquoted) <= _PR_BASE_CAP:
+            line = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
+        else:
+            line = _pr_base_link_sub(unquoted)
         if not line:
             flush()
             continue
         if line.startswith("|") or _PR_HEADING.match(line):
             flush()
-            if not line.startswith("|"):
-                line = _pr_base_bounded(line, _pr_base_split_cost)
             units.append(([(0, lineno)], line, line.startswith("|")))
             continue
         if _PR_LIST_ITEM.match(line):
@@ -1009,11 +1053,11 @@ def _pr_asvs_columns(header: str) -> set[int]:
     }
 
 
-def _pr_sentences(unit: str, is_row: bool, splitter: re.Pattern[str]) -> list[tuple[int, str]]:
+def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
     if is_row:
         return [(0, unit)]
     sentences, start = [], 0
-    for split in splitter.finditer(unit):
+    for split in _PR_SENTENCE_SPLIT.finditer(unit):
         sentences.append((start, unit[start : split.start()]))
         start = split.end()
     sentences.append((start, unit[start:]))
@@ -1028,24 +1072,23 @@ def scan_pr_body(body: str) -> list[str]:
 
     Read three times, and the hits are the union (BACKLOG #5582). The baseline is origin/main's reading
     (:func:`_pr_base_units`, ``_PR_BASE_SENTENCE_SPLIT``), so no rewrite of the readings below it can
-    report less than it did, except where ``_PR_BASE_CAP`` cuts an adversarial line or paragraph. The
-    second reads each link as its text and each inline tag as no edge, and the third keeps each link's
+    report less than it did. The second reads each link as its text and each inline tag as no edge, and the third keeps each link's
     target beside it, so a code path only a target names is seen. Every reading keeps each line where
     it was, so the hits merge by (line, kind), sorted by line and then in ``PR_BODY_REASONS`` order.
     """
     base = _pr_base_units(body)
-    hits = _pr_unit_hits(base, _PR_BASE_SENTENCE_SPLIT)
+    hits = _pr_unit_hits(base, _pr_base_sentences)
     as_text = _pr_units(body)
     # With no `<` the two splits are the same full-stop rule, so equal units would only repeat the
     # baseline's hits.
     if "<" in body or as_text != base:
-        hits += _pr_unit_hits(as_text, _PR_SENTENCE_SPLIT)
+        hits += _pr_unit_hits(as_text, _pr_sentences)
     # No link and no tag means no target, so the third reading would only repeat the second.
     with_targets = _pr_units(body, targets=True) if "](" in body or "<" in body else as_text
     if with_targets != as_text:
         # Only a map: the third reading exists so a target's code path counts, and a target's words
         # are a URL's, not the body's own verdict or gap.
-        extra = _pr_unit_hits(with_targets, _PR_SENTENCE_SPLIT)
+        extra = _pr_unit_hits(with_targets, _pr_sentences)
         hits += [h for h in extra if h.endswith(PR_BODY_REASONS["map"])]
     return sorted(
         dict.fromkeys(hits),
@@ -1054,7 +1097,8 @@ def scan_pr_body(body: str) -> list[str]:
 
 
 def _pr_unit_hits(
-    units: list[tuple[list[tuple[int, int]], str, bool]], splitter: re.Pattern[str]
+    units: list[tuple[list[tuple[int, int]], str, bool]],
+    sentences: Callable[[str, bool], list[tuple[int, str]]],
 ) -> list[str]:
     hits: list[str] = []
     asvs_columns: set[int] = set()
@@ -1067,7 +1111,7 @@ def _pr_unit_hits(
             and _pr_is_delimiter(units[index + 1][1])
         ):
             asvs_columns = _pr_asvs_columns(unit)
-        for start, sentence in _pr_sentences(unit, is_row, splitter):
+        for start, sentence in sentences(unit, is_row):
             found: dict[str, int] = {}
             # The tree scan's tight pair, before the version filter can set its identifier aside: what
             # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
