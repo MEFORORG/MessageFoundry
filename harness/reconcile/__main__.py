@@ -12,7 +12,8 @@ Two subcommands:
 
 * ``compare`` — offline: pair MEFOR's capture against Corepoint's export for one connection (by a
   configurable match key) and diff each pair, normalizing engine-non-deterministic fields. Exits non-zero
-  if anything differs, so it can gate a per-connection sign-off.
+  if anything differs, if nothing was compared, or if a key repeats, so it can gate a per-connection
+  sign-off.
 
       python -m harness.reconcile compare --connection IB_ACME_ADT \
         --mefor captures/IB_ACME_ADT.jsonl --corepoint exports/IB_ACME_ADT.hl7 \
@@ -112,10 +113,17 @@ def _run_compare(args: argparse.Namespace) -> int:
     )
     print(render_text(result))
     if args.report_json:
-        Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.report_json).write_text(
-            json.dumps(render_json(result), indent=2), encoding="utf-8"
-        )
+        try:
+            Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.report_json).write_text(
+                json.dumps(render_json(result), indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            # 2, never the traceback's 1, which reads as "the outputs differ" on a clean pair.
+            print(
+                f"compare: the report could not be written ({type(exc).__name__})", file=sys.stderr
+            )
+            return 2
     return 0 if result.clean else 1
 
 

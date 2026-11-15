@@ -122,7 +122,26 @@ def test_difference_describe_is_readable() -> None:
 def test_normalize_blanks_in_place_returns_canonical() -> None:
     canon = normalize(BASE)
     msh = canon[0]
-    # MSH-7 (split idx 6) and MSH-10 (split idx 9) blanked by default.
-    assert msh[6] == "" and msh[9] == ""
-    # MSH-9 (type, split idx 8) preserved.
-    assert msh[8] == "ADT^A01"
+    # MSH-7 and MSH-10 blanked by default; the row holds MSH-1, so each sits at its field number.
+    assert msh[7] == "" and msh[10] == ""
+    # MSH-9 (type) preserved.
+    assert msh[9] == "ADT^A01"
+
+
+def test_a_different_declared_field_separator_is_a_difference() -> None:
+    """BACKLOG #5425: MSH-1 is the field separator itself, so splitting each side on its own separator
+    lost it, and two messages that differed only there normalized to equal rows. It is a real output
+    difference: a receiver that hardcodes ``|`` reads the other side's message as one field."""
+    alt = BASE.replace("|", "#")
+    [d] = diff(BASE, alt)
+    assert (d.segment, d.occurrence, d.field_no, d.left, d.right, d.kind) == (
+        "MSH",
+        1,
+        1,
+        "|",
+        "#",
+        "field",
+    )
+    assert normalize(BASE) != normalize(alt)
+    # The rows now index every segment by its HL7 field number, MSH included.
+    assert normalize(BASE)[0][1:3] == ["|", "^~\\&"]

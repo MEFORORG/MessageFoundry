@@ -110,8 +110,11 @@ def _capture_stderr(out: Path) -> bytes:
 
 
 def _compare_args(tmp_path: Path, *extra: str) -> list[str]:
+    # One synthetic message a side: with nothing compared the result cannot read clean (BACKLOG #5424).
+    msg = "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101000000||ADT^A01|K1|P|2.5.1\rPID|1||MRN1\r"
     for side in ("mefor", "corepoint"):
         (tmp_path / side).mkdir()
+        (tmp_path / side / "1.hl7").write_text(msg, encoding="latin-1")
     return [
         "compare",
         "--mefor",

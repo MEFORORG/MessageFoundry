@@ -21,6 +21,7 @@ harness.reconcile compare --max-file-bytes`` changes the cap.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import re
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from harness.reconcile.normalize import (
     NormalizeRules,
     ReconcileError,
     Separators,
+    _segments,
     diff,
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -46,17 +48,13 @@ DEFAULT_KEY: tuple[str, int] = ("MSH", 10)
 
 def field_value(raw: str, key: tuple[str, int]) -> str | None:
     """Read ``(segment_id, field_no)`` from a raw HL7 message on its own declared separators (read-only;
-    never slices to mutate). Returns ``None`` if the segment/field is absent. ``MSH-1`` is the field
-    separator, so an ``MSH`` field ``N`` is at split index ``N-1``; every other segment's is at ``N``."""
+    never slices to mutate). Returns ``None`` if the segment/field is absent. The rows are the diff's
+    own, indexed by HL7 field number for every segment, ``MSH-1`` (the separator) included."""
     seg_id, field_no = key
     sep = Separators.from_message(raw)  # raises ReconcileError if there's no MSH header
-    for line in _normalize_line_endings(raw).split("\r"):
-        if not line.strip():
-            continue
-        fields = line.split(sep.field)
-        if fields and fields[0] == seg_id:
-            idx = field_no - 1 if seg_id == "MSH" else field_no
-            return fields[idx] if 0 <= idx < len(fields) else None
+    for fields in _segments(raw, sep):
+        if fields[0] == seg_id:
+            return fields[field_no] if 0 < field_no < len(fields) else None
     return None
 
 
@@ -108,10 +106,34 @@ def _record(path: Path, number: int, line: str) -> str:
     return raw
 
 
+#: Byte-order marks of encodings latin-1 cannot read: decoded byte by byte, the text interleaves NULs
+#: and no line begins with ``MSH``. UTF-32 LE begins with UTF-16 LE's mark, so it is covered.
+_WIDE_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)
+
+
+def _hl7_text(path: Path, data: bytes) -> str:
+    """One HL7 file's text: latin-1, which reads any byte, unless a byte-order mark names the
+    encoding. A UTF-8 mark is dropped and the rest read as UTF-8; kept, it hid the first ``MSH``."""
+    if data.startswith(codecs.BOM_UTF8):
+        try:
+            return data.decode("utf-8-sig")  # drops the mark without copying the bytes first
+        except UnicodeDecodeError:
+            pass  # refused below, outside the handler, so no decode error (holding the bytes) chains
+        raise LoadError(
+            f"{path}: starts with a UTF-8 byte-order mark but is not UTF-8", over_cap=False
+        )
+    return data.decode("latin-1")
+
+
 def _parse(path: Path, data: bytes) -> list[str]:
     """The messages in one file's bytes: a JSONL capture by its ``.jsonl`` name, else HL7."""
+    if data.startswith(_WIDE_BOMS):  # either shape: neither decode reads this as text
+        raise LoadError(
+            f"{path}: starts with a UTF-16 or UTF-32 byte-order mark; save it as UTF-8 or single-byte",
+            over_cap=False,
+        )
     if path.suffix != ".jsonl":
-        return _split_batch(data.decode("latin-1"))
+        return _split_batch(_hl7_text(path, data))
     # utf-8-sig drops a byte-order mark, which some Windows tools write before UTF-8 text.
     text = data.decode("utf-8-sig")
     msgs: list[str] = []
@@ -175,10 +197,15 @@ def load_messages(
 
 def _split_batch(text: str) -> list[str]:
     """Split concatenated HL7 into messages: each ``MSH`` line starts a new one (MLLP wrappers, if any,
-    are tolerated since we key off the ``MSH`` prefix of a stripped line)."""
+    are tolerated since we key off the ``MSH`` prefix of a stripped line).
+
+    Content before the first ``MSH`` line, which is all of a file that has none, is kept as one more
+    entry rather than dropped: it has no header, so the pairing counts it as unkeyed, and the result
+    cannot read clean with it."""
     norm = _normalize_line_endings(text)
     msgs: list[str] = []
     current: list[str] = []
+    preamble: list[str] = []
     for line in norm.split("\r"):
         if line.lstrip("\x0b").startswith("MSH"):
             if current:
@@ -188,8 +215,12 @@ def _split_batch(text: str) -> list[str]:
             stripped = line.rstrip("\x1c\x0d")
             if stripped:
                 current.append(stripped)
+        elif line.strip("\x0b\x1c \t\n"):
+            preamble.append(line)
     if current:
         msgs.append("\r".join(current))
+    if preamble:
+        msgs.insert(0, "\r".join(preamble))
     return msgs
 
 
@@ -225,9 +256,13 @@ class ReconcileResult:
 
     @property
     def clean(self) -> bool:
-        """True iff every matched pair is identical and nothing is unmatched on either side."""
+        """True iff at least one pair was compared, every matched pair is identical, nothing is
+        unmatched or unkeyed on either side, and no key repeats. With no pair the gate checked
+        nothing; a repeated key had its earlier copies discarded unread, and is a doubled output."""
         return (
-            not self.mismatched
+            bool(self.pairs)
+            and not self.duplicate_keys
+            and not self.mismatched
             and not self.mefor_only
             and not self.corepoint_only
             and not self.unkeyed_mefor
