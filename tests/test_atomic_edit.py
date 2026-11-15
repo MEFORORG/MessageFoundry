@@ -452,6 +452,37 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
 
 
 @windows_only
+def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The owner keeps its grant so that it can load the file again (vault BACKLOG #5619), and the
+    # loader refuses a config file a non-owner, non-admin account can write. So the editing account
+    # may read the replaced file, never write it. Here this process is the owner, the account the
+    # engine runs as, and the token seam reports another account as the editor.
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+    from messagefoundry.config.wiring import _evaluate_config_dacl, _win32_config_source_probes
+
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    probes = _win32_config_source_probes()
+    security = probes.read_path(path)
+    assert security.status == 0 and security.owner_sid is not None and security.aces is not None
+    verdict = _evaluate_config_dacl(
+        security.owner_sid, security.aces, owner, probes.owner_in_admins
+    )
+    assert verdict is None, verdict
+    assert path.read_bytes() == b"x = 1\n"
+    assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FR", _EDITOR_SID)]
+
+
+@windows_only
 def test_a_failed_owner_and_editor_list_write_keeps_the_foreign_owners_grant_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -482,7 +513,7 @@ def test_a_failed_owner_and_editor_list_write_keeps_the_foreign_owners_grant_on_
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     assert secured == []
-    assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FA", _EDITOR_SID)]
+    assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FR", _EDITOR_SID)]
     assert path.read_bytes() == b"x = 1\n"
 
 
@@ -509,6 +540,38 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
     assert_owner_only(path, owner)
     assert path.read_bytes() == b"x = 1\n"
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "dacl",
+    [
+        "D:(A;;FA;;;{me})",  # inheritance not blocked
+        "D:P(A;;FA;;;{me})(A;;FR;;;S-1-5-32-545)",  # a second entry
+        "D:P(A;;FR;;;{me})",  # the right account, at read only
+        "D:P(A;;FA;;;S-1-5-18)",  # full control, for another account
+    ],
+    ids=["unprotected", "extra-entry", "read-only", "other-account"],
+)
+def test_the_owner_only_check_fails_on_anything_else(tmp_path: Path, dacl: str) -> None:
+    """The positive control for :func:`assert_owner_only`: each list here differs from the owner-only
+    one in one way, and the check must refuse it. The last write is the owner-only list itself,
+    which it must accept, so the check is not refusing everything."""
+    import messagefoundry.store.store as store_mod
+
+    me = store_mod._current_user_sid()
+    assert me is not None
+    path = folder_granting(tmp_path / "folder", me) / "probe"
+    path.write_bytes(b"x")
+    result = store_mod._set_security_from_sddl(
+        path, dacl.format(me=me), protected=dacl.startswith("D:P")
+    )
+    assert result.failure is None and result.dacl_status == 0, result
+    with pytest.raises(AssertionError):
+        assert_owner_only(path, me)
+    result = store_mod._set_security_from_sddl(path, f"D:P(A;;FA;;;{me})", protected=True)
+    assert result.failure is None and result.dacl_status == 0, result
+    assert_owner_only(path, me)
 
 
 def _an_own_file_in_a_folder_without_staging_entries(

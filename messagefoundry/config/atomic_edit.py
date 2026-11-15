@@ -13,8 +13,8 @@ inside a private directory created beside it (unique, and on POSIX owner-only fr
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
 On Windows those modes do not restrict the file, so the candidate is given a protected access list
 granting the editing account, and the live file's owner when that is another account, before its
-first byte is written. The replaced file is then given the editing account's list alone, or the
-list the next paragraph describes. ``_restrict_to_editor`` says why that is one whole-list write
+first byte is written. An own-account replaced file is then given the editing account's list
+alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor`` says why that is one whole-list write
 and not ``store._secure_file``, which is only the fallback when the write fails. The caller's
 ``validate`` runs against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
@@ -25,8 +25,11 @@ edit run as another account, such as root or an elevated administrator editing a
 account owns, would otherwise have left it owned by and restricted to the editing account, so the
 account that reads it could no longer. On POSIX, root gives the candidate the live file's owner and
 group before the rename, and the mode is still 0600. On Windows, a live file another account owns
-is restricted to that account and the editing one rather than to the editing account alone, and
-its ownership is given back where Windows lets this account do that (it needs the restore privilege
+is restricted to that account at full control and the editing one at read only, rather than to
+the editing account alone. The editor may not write it, because the config loader refuses a file a
+non-owner, non-admin account can write (``wiring._evaluate_config_dacl``). The candidate grants
+the editor full control until the rename, since this account writes, renames and removes it. The
+file's ownership is given back where Windows lets this account do that (it needs the restore privilege
 enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
 a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
 file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
@@ -401,7 +404,7 @@ def replace_validated(
                 if sys.platform == "win32":
                     # Before the first byte, so the candidate never carries its directory's list.
                     # A failure is logged, and the replaced file is restricted again below.
-                    _restrict_to_editor(candidate, owner=live.windows_owner)
+                    _restrict_to_editor(candidate, owner=live.windows_owner, editor_writes=True)
                 handle.write(data)
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
@@ -426,8 +429,9 @@ def replace_validated(
     _fsync_dir(path.parent)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
         return
-    # When the owner-and-editor list write fails, the fallback still grants the live owner, as the
-    # candidate's list did. A refused ownership hand-back whose list was written never gets here.
+    # When the owner-and-editor list write fails, the fallback writes the same list again: the live
+    # owner at full control, the editor at read only. A refused ownership hand-back whose list was
+    # written never gets here.
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
     _secure_file(path)
@@ -580,18 +584,32 @@ def _foreign_windows_owner(path: Path) -> str | None:
     return owner
 
 
-def _full_control_for(*sids: str | None) -> str:
-    """A protected SDDL access list granting each of ``sids`` but ``None`` full control, once each,
-    in order."""
-    from messagefoundry.restricted_file import _FULL_ACCESS, _protected_sddl
+def _owner_and_editor_list(owner: str | None, editor: str | None, *, editor_writes: bool) -> str:
+    """A protected SDDL access list: ``owner`` at full control when given, then ``editor`` at full
+    control when ``editor_writes`` or when there is no other owner, else at read only. ``None`` is
+    left out, and an editor that is the owner keeps the owner's entry.
 
-    return _protected_sddl(dict.fromkeys(filter(None, sids), _FULL_ACCESS))
+    Read only for the editor beside another owner, because the config loader refuses a file a
+    non-owner, non-admin account can write (``wiring._evaluate_config_dacl``), and the owner must be
+    able to load the file it was given back."""
+    from messagefoundry.restricted_file import _FULL_ACCESS, _READ_ACCESS, _protected_sddl
+
+    access: dict[str, int] = {}
+    if owner is not None:
+        access[owner] = _FULL_ACCESS
+    if editor is not None:
+        access.setdefault(editor, _FULL_ACCESS if editor_writes or owner is None else _READ_ACCESS)
+    return _protected_sddl(access)
 
 
-def _restrict_to_editor(path: Path, *, owner: str | None = None) -> bool:
-    """Replace the access list of ``path`` with a protected one granting the editing account full
-    control, and ``owner`` too when one is given; ``False``, logged, when the token or the write
-    failed. Windows only.
+def _restrict_to_editor(
+    path: Path, *, owner: str | None = None, editor_writes: bool = False
+) -> bool:
+    """Replace the access list of ``path`` with a protected one granting ``owner`` full control
+    when one is given, and the editing account full control, or read only beside another owner
+    unless ``editor_writes`` (:func:`_owner_and_editor_list`); ``False``, logged, when the token or
+    the write failed. Windows only. The candidate takes ``editor_writes``, since this account must
+    still write, rename and remove it.
 
     The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
     private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
@@ -609,7 +627,8 @@ def _restrict_to_editor(path: Path, *, owner: str | None = None) -> bool:
             scrub_log_argument(str(path)),
         )
         return False
-    result = _set_security_from_sddl(path, _full_control_for(owner, editor), protected=True)
+    sddl = _owner_and_editor_list(owner, editor, editor_writes=editor_writes)
+    result = _set_security_from_sddl(path, sddl, protected=True)
     if result.failure is not None or result.dacl_status != 0:
         _log.warning(
             "could not restrict %s to this account: %s",
@@ -626,14 +645,14 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
 
     The owner-only rewrite would grant the editing account alone, so an elevated administrator's
     edit of a file the service account owns would leave the service unable to read it (vault
-    BACKLOG #5619). The editor keeps its entry because it already held write access to the file.
-    Naming another account as the owner needs the restore privilege, which an elevated
+    BACKLOG #5619). The editor keeps read only, because the config loader refuses a file a
+    non-owner, non-admin account can write (:func:`_owner_and_editor_list`). Naming another account as the owner needs the restore privilege, which an elevated
     administrator holds but does not enable; when that is refused the access list alone is written
     and the refusal is logged, since the access list is what lets the owner read it."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()
-    sddl = f"O:{owner}" + _full_control_for(owner, editor)
+    sddl = f"O:{owner}" + _owner_and_editor_list(owner, editor, editor_writes=False)
     result = _set_security_from_sddl(path, sddl, protected=True)
     if result.failure is not None:
         _log.warning("could not restrict %s to its owner after the edit: %s", path, result.failure)
