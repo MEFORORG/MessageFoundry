@@ -588,7 +588,7 @@ def test_date_diff_field_years_counts_each_stamps_own_date() -> None:
     ("start", "end"),
     [
         ("202603010800", "202603011400+0000"),  # a time of day beside an offset
-        ("20260301", "202603010200-0500"),  # a date beside a time with an offset
+        ("202603010800+0000", "202603011400"),  # the other way round
     ],
 )
 def test_date_diff_field_one_offset_raises_for_a_clock_unit(start: str, end: str) -> None:
@@ -609,6 +609,18 @@ def test_date_diff_field_a_date_only_stamp_beside_an_offset_is_an_age() -> None:
     m = _two_stamps("19800615", "202606150200-0500")
     date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
     assert m["ZTS-3"] == "46"
+
+
+@pytest.mark.parametrize(("unit", "expected"), [("days", "4"), ("hours", "108")])
+def test_date_diff_field_a_date_only_stamp_beside_an_offset_keeps_mains_count(
+    unit: Literal["days", "hours"], expected: str
+) -> None:
+    # BACKLOG #5822, review finding 3. Age in days or hours from a date-only date of birth to an
+    # event time with an offset is the calendar count main wrote, exempted the way "years" is.
+    # NEGATIVE CONTROL: at 8de4d951d this raised "only one ... carries an offset".
+    m = _two_stamps("20260101", "202601051200-0500")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
+    assert m["ZTS-3"] == expected
 
 
 def test_date_diff_field_two_dates_are_a_calendar_difference_whatever_their_offsets() -> None:
@@ -644,11 +656,14 @@ def test_date_diff_field_reads_a_composite_ts_by_its_first_component() -> None:
     assert m["ZTS-3"] == "84"
 
 
-@pytest.mark.parametrize("start", ["^D", "^", "~"])
-def test_date_diff_field_a_ts_field_with_no_time_is_empty(start: str) -> None:
-    # A precision with no time, or empty components, hold no timestamp: a no-op, as an empty field is.
+@pytest.mark.parametrize("start", ["^D", "^20260101", "~20270101"])
+def test_date_diff_field_a_ts_field_with_an_empty_first_value_raises(start: str) -> None:
+    # BACKLOG #5822, review finding 4. A field whose first component or repetition is empty but which
+    # holds something else is unparseable, as on main, rather than a silent no-op. NEGATIVE CONTROL:
+    # at 8de4d951d each of these wrote nothing and raised nothing.
     m = _two_stamps(start, "20260104")
-    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    with pytest.raises(ValueError):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] is None
 
 
