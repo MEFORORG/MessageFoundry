@@ -532,8 +532,13 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   boolean settings, such as on for `verify_tls`. It stops the load on a composer's `enabled`
   flag, where SMART and OAuth2 had read it as off and signing had already refused it, and on
   `Ftp(tls=...)`, where it used to mean plain FTP. The hop-policy flags, `tls_hop_attested`,
-  `cleartext_accepted` and `tls_revocation_attested`, refuse it too, as they refused any value
-  but `True` or `False` before. The flags `inbound()` and `outbound()` take themselves, such as
+  `cleartext_accepted` and `tls_revocation_attested`, refuse it too wherever a declaration takes
+  them as an argument, as they refused any value but `True` or `False` before. A `None` written
+  straight into a lookup's or reference source's settings, past its factory, reads as off, so it
+  attests and accepts nothing. A non-bool literal there is refused with advice to write `True` or
+  `False`, since these flags take no `env()` reference. A raw `tls_hop_attested` in a
+  connection's transport settings is refused as not a transport setting, whatever its value. The
+  flags `inbound()` and `outbound()` take themselves, such as
   `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
   `False` as well. Any other value there, such as a string or a number, stops the load when the
   connection is declared, before any check reads the flag. An `env()` reference stops it too,

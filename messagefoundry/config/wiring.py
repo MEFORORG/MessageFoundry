@@ -1550,6 +1550,17 @@ _COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool | None]] = MappingProxyType(
     {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}
 )
 
+#: The composer that writes each :data:`_COMPOSER_BOOL_SETTINGS` key, so a refusal names the call
+#: the author wrote and not only the key it stored. ``tests/test_env_uncast_bool_setting.py`` pins
+#: it against what each composer writes.
+_COMPOSER_OF_BOOL_SETTING: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "smart_enabled": "with_smart_backend",
+        "oauth2_enabled": "with_oauth2_client_credentials",
+        "sign_enabled": "with_signing",
+    }
+)
+
 
 class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
@@ -1654,10 +1665,9 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     try:
         require_flag(value, f"setting {key!r}")
     except ValueError as exc:  # names the key and the type, never the value
-        composer = (
-            " (the enabled= flag of a with_* composer)" if key in _COMPOSER_BOOL_SETTINGS else ""
-        )
-        return f"{exc}{composer}{_bool_remedy(value)}"
+        composer = _COMPOSER_OF_BOOL_SETTING.get(key)
+        named = f" (the enabled= flag of {composer})" if composer is not None else ""
+        return f"{exc}{named}{_bool_remedy(key, value)}"
     return None
 
 
@@ -1669,19 +1679,42 @@ def _quoted_false_hint(value: object) -> str:
     return ""
 
 
-def _bool_remedy(value: object) -> str:
-    """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`."""
+def _bool_remedy(key: str, value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`.
+    A hop-policy flag refuses ``env()`` (:func:`refuse_unresolved_hop_flags`), so it gets that
+    flag's own remedy, :func:`_flag_hint`, rather than advice to write a reference."""
+    if key in HOP_POLICY_FLAGS:
+        return f"{_quoted_false_hint(value)}{_flag_hint(value)}"
     return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
 
 
-def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
-    """Refuse the first non-bool literal on a boolean setting, before a connection's own checks
-    or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted false
-    would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
-    ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it."""
+def _bool_literal_problems_in(settings: Mapping[str, Any]) -> Iterator[str]:
+    """:func:`_bool_literal_problem` for every setting in ``settings``, in order. The one loop
+    behind :func:`_refuse_bool_literals`, :func:`_refuse_factory_bool_literals` and
+    :meth:`Registry.bool_literal_problems`."""
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
-            raise WiringError(f"{where}: {bad}")
+            yield bad
+
+
+def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse every non-bool literal on a boolean setting, in one error, before a connection's own
+    checks or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted
+    false would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
+    ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it.
+    Raising stops the config module, so a later declaration in it is not reached, as with every
+    other refusal a declaration raises."""
+    if problems := list(_bool_literal_problems_in(settings)):
+        raise WiringError(f"{where}: " + "; ".join(problems))
+
+
+def _refuse_factory_bool_literals(factory: str, **values: object) -> None:
+    """:func:`_refuse_bool_literals` for a factory's own arguments, for a check inside the factory
+    that reads one of them before ``inbound()`` or ``outbound()`` can refuse it. Without it, such
+    a check judges the flag by truthiness and refuses with an error about the flag's effect
+    (``DICOMweb(verify_tls=0, tls_ca_file=...)`` read as verification off). Named by the factory,
+    which runs before the declaration has a name."""
+    _refuse_bool_literals(values, factory)
 
 
 def _refuse_non_bool_flags(
@@ -2815,6 +2848,8 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
+    # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
+    _refuse_factory_bool_literals("MLLP", tls=tls)
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
@@ -4578,6 +4613,8 @@ def DICOMweb(
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("DICOMweb", headers)
+    # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification off.
+    _refuse_factory_bool_literals("DICOMweb", verify_tls=verify_tls)
     _check_tls_ca_file(
         "DICOMweb",
         tls_ca_file,
@@ -5293,7 +5330,7 @@ def Ftp(
     # require_flag's wording, raised outside any handler (tests/test_from_none_is_not_redaction.py).
     if not isinstance(tls, (bool, EnvRef)):
         raise WiringError(
-            f"Ftp: setting 'tls' must be true or false, not {type(tls).__name__}{_bool_remedy(tls)}"
+            f"Ftp: setting 'tls' must be true or false, not {type(tls).__name__}{_bool_remedy('tls', tls)}"
         )
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
@@ -6592,9 +6629,9 @@ class Registry:
         problems: list[str] = []
         try:
             for kind, name, settings, _deployed in self.settings_carriers():
-                for key, value in settings.items():
-                    if (bad := _bool_literal_problem(key, value)) is not None:
-                        problems.append(f"{kind} {name!r}: {bad}")
+                problems.extend(
+                    f"{kind} {name!r}: {bad}" for bad in _bool_literal_problems_in(settings)
+                )
         except WiringError as exc:  # a factory whose annotations do not resolve; report, not raise
             return [str(exc)]
         return problems
@@ -8333,6 +8370,10 @@ def build_inbound_connection(
     the caller is responsible for ``add_inbound``. ``content_type`` accepts a :class:`ContentType`
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
+    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
+    # because the settings dict stays mutable after the declaration returns. Before the bool-literal
+    # refusal, which would otherwise give a raw non-bool tls_hop_attested the generic remedy.
+    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
     _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
     # Before any check below reads one: the content_type check read strict="false" as strict on.
     _refuse_non_bool_flags(
@@ -8520,9 +8561,6 @@ def build_inbound_connection(
     _hop_attestation_entries(
         f"inbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
     )
-    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
-    # because the settings dict stays mutable after the declaration returns.
-    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
     # ADR 0173: the revocation-attestation pair is coherence-checked at this shared choke point, so a
     # flag with no reason fails at `messagefoundry check` / dry-run on either authoring surface.
     try:
@@ -8740,6 +8778,9 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    # Before the bool-literal refusal, which would otherwise give a raw non-bool tls_hop_attested
+    # the generic remedy instead of naming the declaration that carries it.
+    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
     _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
     _refuse_non_bool_flags(
         f"outbound connection {name!r}",
@@ -8761,7 +8802,6 @@ def build_outbound_connection(
     _refuse_attested_and_accepted(
         f"outbound connection {name!r}", tls_hop_attested, cleartext_accepted
     )
-    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
     if dead_letter_days is not None and dead_letter_days < 0:
         # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
         # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
