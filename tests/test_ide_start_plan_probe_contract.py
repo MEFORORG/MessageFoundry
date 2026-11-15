@@ -62,9 +62,17 @@ def _probe_argv() -> list[str]:
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """If the TypeScript stops building this argv, the two tests below stop describing the IDE."""
-    src = _MODEL.read_text(encoding="utf-8")
-    assert '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`' in src
+    """If the TypeScript stops building this argv, the two tests below stop describing the IDE.
+
+    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set; this
+    file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds nothing.
+    """
+    src = " ".join(_MODEL.read_text(encoding="utf-8").split())
+    assert (
+        '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`, '
+        "...serviceConfigFlag(opts.serviceConfig)" in src
+    )
+    assert "serviceConfig === undefined ? [] :" in src
     assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
