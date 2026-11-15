@@ -1690,6 +1690,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         self._invocations = 0
         self._warned_gcm_soft = False
         self._bound_enabled = False
+        # True once a grant has carried the key's persisted total in (BACKLOG #5608). Until then an
+        # enabled bound knows only this process's spend, so `_count_invocation` refuses to encrypt.
+        self._bound_hydrated = False
         self._bound_total = 0
         self._reserve_remaining = 0
         # The counter is mutated from MORE THAN the event-loop thread: the ADR 0134 uploaded-logs store
@@ -1909,6 +1912,15 @@ class AesGcmCipher(_UnmarkedPolicy):
     def invocation_bound_enabled(self) -> bool:
         return self._bound_enabled
 
+    @property
+    def invocation_bound_hydrated(self) -> bool:
+        """Whether a grant has handed this cipher the key's persisted total (BACKLOG #5608).
+
+        An enabled bound that is not hydrated has never read the key's lifetime count, so the
+        ceiling cannot be enforced against it and :meth:`encrypt` refuses until a store's
+        checkpoint hydrates it. A cipher no store bounds is never refused for this."""
+        return self._bound_hydrated
+
     def set_refill_hook(self, hook: Callable[[], None] | None) -> None:
         """Register the callback fired when the reserve crosses the refill watermark (``None`` clears it).
 
@@ -2006,6 +2018,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         key's persisted total AFTER the atomic add that reserved them. A NEGATIVE ``count`` is a
         settlement refund of an unspent reserve (see :meth:`invocation_settlement`)."""
         with self._count_lock:
+            self._bound_hydrated = True
             self._reserve_remaining += count
             # A refund LOWERS the key's persisted total, so the authoritative post-add figure replaces
             # ours; a reservation can only raise it, and `max` there guards a stale/racy read.
@@ -2031,6 +2044,14 @@ class AesGcmCipher(_UnmarkedPolicy):
         uploaded-logs store); the refill hook, the WARNING and the raise all happen OUTSIDE it, so a slow
         hook or log handler never serializes concurrent encrypts."""
         with self._count_lock:
+            if self._bound_enabled and not self._bound_hydrated:
+                # BACKLOG #5608: the bound is on but has never read the key's persisted total, so a
+                # key already at the ceiling would pass. Nothing is counted, since nothing is sealed.
+                raise CipherError(
+                    "the AES-GCM invocation bound has not read this data key's persisted total yet "
+                    f"(store key {self._active_id!r}); nothing is encrypted under it until a store "
+                    "checkpoint reads it"
+                )
             self._invocations += 1
             write = self._write  # read under the lock bind_store_salt swaps it under
             want_refill = False

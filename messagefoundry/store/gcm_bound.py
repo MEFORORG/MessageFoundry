@@ -69,13 +69,16 @@ amendment traces the path by symbol (BACKLOG #2187; a seat decision under owner 
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 
 from messagefoundry.store.crypto import (
     _GCM_RESERVE_BLOCK,
     AesGcmCipher,
     Cipher,
+    CipherError,
     new_store_salt,
     parse_store_salt,
 )
@@ -123,6 +126,84 @@ def counts_under_dek(cipher: Cipher | None) -> bool:
     return bound is not None and bound.store_salt is None
 
 
+#: One ``asyncio.Lock`` per bounded cipher, with the loop it was made on (BACKLOG #5608). Every
+#: accounting pass on one cipher reads its state, awaits the persisted add, and applies the grant.
+#: Two passes interleaved there would compute their counts from the same state and could apply the
+#: grants out of the database's order. A settlement refund replaces the cipher's total with the one
+#: its add returned, so a refund granted after a later refill would leave the cipher's figure below
+#: the persisted one by a whole block: an under-count, the one direction this bound may never drift.
+#: Weak on the cipher, so the map never keeps a closed store's key material alive; remade when the
+#: running loop changes, because an ``asyncio.Lock`` is bound to the loop it first waits on.
+_PASS_LOCKS: weakref.WeakKeyDictionary[
+    AesGcmCipher, tuple[asyncio.AbstractEventLoop, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _pass_lock(bound: AesGcmCipher) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    held = _PASS_LOCKS.get(bound)
+    if held is None or held[0] is not loop:
+        held = (loop, asyncio.Lock())
+        _PASS_LOCKS[bound] = held
+    return held[1]
+
+
+async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -> None:
+    """Run the persisted add and the in-memory grant as one unit a cancellation cannot split.
+
+    The add runs in its own task, shielded, so a cancellation of the caller cannot abandon a write
+    the database may still commit (an aiosqlite statement runs on a worker thread whatever happens to
+    the awaiting coroutine). A cancellation that lands mid-add is held until the add finishes and its
+    grant is applied, then re-raised. Without that, a committed REFUND with no grant would leave the
+    cipher spending a reserve the store no longer holds. Holding the cancellation also keeps the
+    caller's locks, this pass's and a SQLite store's writer lock, held until the add is done with
+    the connection."""
+    task = asyncio.ensure_future(add(bound.invocation_key_id, need))
+    cancelled = False
+    while True:
+        try:
+            total = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                raise  # the add itself was cancelled, so it returned no total to grant
+            cancelled = True
+            continue
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+        break
+    bound.grant_invocations(need, total)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _account(bound: AesGcmCipher, add: AddInvocations, need: int, what: str) -> None:
+    """Charge ``need`` to the key's persisted total and grant it to the cipher.
+
+    Fail-closed on the FIRST hydration (BACKLOG #5608). Until one add has returned the key's persisted
+    total, the cipher's figure is only this process's own spend, so a key another process or an
+    earlier run had already taken to the ceiling would keep encrypting. That failure raises
+    :class:`CipherError` instead of being logged, and the cipher refuses to encrypt until a later pass
+    hydrates it. Once hydrated, a failed add is logged and retried: the cipher's figure then carries
+    the key's lifetime total, so the ceiling still holds against it."""
+    try:
+        await _add_then_grant(bound, add, need)
+    except Exception as exc:
+        if not bound.invocation_bound_hydrated:
+            raise CipherError(
+                f"could not read the AES-GCM invocation bound's persisted total while {what}; this "
+                "data key's lifetime count is unknown, so nothing is encrypted under it until a "
+                "later pass reads it"
+            ) from exc
+        log.warning(
+            "could not reach the AES-GCM invocation bound for the active key while %s; the "
+            "in-process ceiling still applies and the next pass retries",
+            what,
+            exc_info=True,
+        )
+
+
 async def checkpoint_invocations(
     cipher: Cipher | None, add: AddInvocations, *, settle: bool = False
 ) -> int | None:
@@ -137,32 +218,26 @@ async def checkpoint_invocations(
     cadence, while a short-lived CLI process that encrypted a handful of values does not permanently burn
     a whole 2**16 block of the key's budget. Idempotent: a second settle finds nothing to correct.
 
-    Returns ``None`` when the store's cipher carries no bound (identity / ``vault_transit``). Never
-    raises: a checkpoint that cannot reach the DB is logged and retried next pass — the in-process
-    ceiling still holds meanwhile, so a transient DB blip must not take the engine down."""
+    Returns ``None`` when the store's cipher carries no bound (identity / ``vault_transit``). Passes on
+    one cipher run one at a time, and a cancellation never splits an add from its grant (BACKLOG #5608).
+    Once the cipher is hydrated this never raises: a checkpoint that cannot reach the DB is logged and
+    retried next pass, since the in-process ceiling still holds meanwhile and a transient DB blip must
+    not take the engine down. Before that, a failed add raises :class:`CipherError` (:func:`_account`)."""
     bound = bounded_cipher(cipher)
     if bound is None:
         return None
-    if not bound.invocation_bound_enabled:
-        # First contact: switch the cipher onto the persisted bound so the very first block is
-        # reserved before it is spent.
-        bound.enable_invocation_bound()
-    need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
-    if need:
-        try:
-            total = await add(bound.invocation_key_id, need)
-        except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
-            log.warning(
-                "could not checkpoint the AES-GCM invocation bound for the active key; the "
-                "in-process ceiling still applies and the next pass retries",
-                exc_info=True,
-            )
-            return bound.cumulative_invocations()
-        # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle is a
-        # no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a refill grant
-        # hands over a fresh block.
-        bound.grant_invocations(need, total)
-    return bound.cumulative_invocations()
+    async with _pass_lock(bound):
+        if not bound.invocation_bound_enabled:
+            # First contact: switch the cipher onto the persisted bound so the very first block is
+            # reserved before it is spent.
+            bound.enable_invocation_bound()
+        need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
+        # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle
+        # is a no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a
+        # refill grant hands over a fresh block.
+        if need:
+            await _account(bound, add, need, "settling" if settle else "checkpointing")
+        return bound.cumulative_invocations()
 
 
 async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, count: int) -> None:
@@ -176,26 +251,18 @@ async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, 
     persisted total leads every encrypt, so an unclean exit can only OVER-count. A crash mid-surface
     forfeits the reservation for encrypts the rollback discarded, which is that same conservative bias.
 
-    Same failure contract as :func:`checkpoint_invocations`: a reservation that cannot reach the DB is
-    logged and the burst proceeds under the in-process ceiling, which still applies."""
+    Same failure contract as :func:`checkpoint_invocations`: once the cipher is hydrated, a
+    reservation that cannot reach the DB is logged and the burst proceeds under the in-process
+    ceiling, which still applies; before that, it raises."""
     bound = bounded_cipher(cipher)
     if bound is None or count <= 0:
         return
-    if not bound.invocation_bound_enabled:
-        bound.enable_invocation_bound()
-    need = bound.invocation_reserve_shortfall(ahead=count)
-    if not need:
-        return
-    try:
-        total = await add(bound.invocation_key_id, need)
-    except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
-        log.warning(
-            "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
-            "in-process ceiling still applies",
-            exc_info=True,
-        )
-        return
-    bound.grant_invocations(need, total)
+    async with _pass_lock(bound):
+        if not bound.invocation_bound_enabled:
+            bound.enable_invocation_bound()
+        need = bound.invocation_reserve_shortfall(ahead=count)
+        if need:
+            await _account(bound, add, need, "reserving ahead of an at-rest seal")
 
 
 async def bind_store_salt(cipher: Cipher | None, ensure: EnsureSalt) -> None:

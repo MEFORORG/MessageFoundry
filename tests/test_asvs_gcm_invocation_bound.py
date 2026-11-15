@@ -602,17 +602,26 @@ async def test_runner_is_a_noop_on_a_keyless_store(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_checkpoint_never_raises_when_the_store_write_fails() -> None:
-    # A transient DB blip must not take the engine down; the in-process ceiling still applies.
+async def test_checkpoint_never_raises_when_the_store_write_fails_once_hydrated() -> None:
+    # A transient DB blip must not take the engine down; the in-process ceiling still applies. That
+    # holds only once a pass has read the key's persisted total: a failed FIRST read fails closed
+    # (BACKLOG #5608, tests/test_gcm_bound_accounting_races.py).
     cipher = _cipher()
+    persisted = 0
+
+    async def _ok(_key_id: str, count: int) -> int:
+        nonlocal persisted
+        persisted += count
+        return persisted
 
     async def _boom(_key_id: str, _count: int) -> int:
         raise RuntimeError("db is down")
 
-    total = await checkpoint_invocations(cipher, _boom)
-    assert total == 0
+    with pytest.raises(CipherError, match="persisted total"):
+        await checkpoint_invocations(cipher, _boom)
+    assert await checkpoint_invocations(cipher, _ok) == 0
     cipher.encrypt("x")
-    assert await checkpoint_invocations(cipher, _boom) == 1
+    assert await checkpoint_invocations(cipher, _boom, settle=True) == 1
 
 
 # --- the OTHER writer under the same DEK: uploaded logs (ADR 0134) -----------

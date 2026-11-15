@@ -18832,10 +18832,24 @@ class MessageStore:
         return int(row["n"]) if row is not None else 0
 
     async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
-        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
-        return await checkpoint_invocations(
-            self._cipher, self.add_cipher_invocations, settle=settle
-        )
+        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`.
+
+        Takes the writer lock BEFORE the bound's own per-cipher pass lock (BACKLOG #5608). The
+        rotation and at-rest seal bursts charge the bound with the writer lock already held, so they
+        take the two in that order; a checkpoint taking the pass lock first and then waiting on the
+        writer lock inside its add would deadlock against them. A failed add is rolled back inside
+        the guard, so the bound's own contract (log and retry once hydrated) still decides."""
+        if bounded_cipher(self._cipher) is None:
+            return None  # nothing to account, so no reason to take the writer lock
+
+        async def add(key_id: str, count: int) -> int:
+            try:
+                return await self._add_cipher_invocations_locked(key_id, count)
+            except BaseException as exc:
+                await _unwind_and_raise(self._db, exc, role="writer")
+
+        async with _writer_guard(self._db, self._lock):
+            return await checkpoint_invocations(self._cipher, add, settle=settle)
 
     async def reserve_upload_quota(
         self,
