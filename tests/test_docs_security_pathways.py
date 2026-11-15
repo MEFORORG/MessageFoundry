@@ -1010,14 +1010,18 @@ def _anchor_is_none_on_oidc(leg: ast.AST) -> bool:
     )
 
 
-#: Calls that read a session's factor state, at least the ones the console MFA routes can reach,
-#: directly or through the must-change confinement helpers (vault BACKLOG #2964 item 14).
+#: Named calls that read a session's or account's factor state, called directly in a route body.
+#: A fixed list: a new helper that reads factor state passes unseen until it is added here
+#: (vault BACKLOG #2964 item 14).
 _FACTOR_STATE_READERS = (
     "mfa_satisfied",
     "mfa_status",
     "rotation_comes_first",
     "confined_before_its_factor",
     "must_change_target",
+    "must_enrol_first",
+    "_enrols_first",
+    "must_enrol_before_rotating",
     "password_change_owes_factor",
     "_owes_known_factor",
 )
@@ -1033,8 +1037,10 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
        interstitial and charges nothing, unless ``_interstitial_needed()`` is false, when it runs the
        POST leg itself: limiter, flow and all.
     2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
-       ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
-       met its factor, so a TOTP or recovery code opens a fresh window at any time. Since vault
+       ``verify_mfa`` stamps ``reauth_at`` and does not ask whether the session already met its
+       factor, so a TOTP or recovery code opens a fresh window at any time. ``POST /ui/mfa`` asks
+       around it: before the code (``rotation_comes_first``, a must-change session's redirect) and
+       after a refused one (``mfa_satisfied``, a satisfied session's redirect to ``/ui``). Since vault
        BACKLOG #2964 item 14 a passkey assertion with the UV flag that completes a pending factor
        stamps one too.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
