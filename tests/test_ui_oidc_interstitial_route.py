@@ -26,7 +26,8 @@ from messagefoundry_webconsole.routes import oidc as oidc_routes
 
 
 class _FakeAuth:
-    """The narrow slice of AuthService the start legs touch before they would reach the IdP."""
+    """The narrow slice of AuthService the start legs touch, for a request that carries no session
+    cookie, before they would reach the IdP."""
 
     oidc_enabled = True
     oidc_flow_ttl_seconds = 300
@@ -80,19 +81,27 @@ def test_an_external_idp_gets_the_interstitial_not_a_redirect() -> None:
     assert "<code>idp.example.com</code>" in body
     assert 'method="post"' in body  # Continue is a form, not a link
     assert "Cancel" in body
+    # Positive control for _is_interstitial, which the skip tests below use only negatively.
+    assert _is_interstitial(r)
+
+
+def _is_interstitial(r: Any) -> bool:
+    """The "leaving this site" page, told apart by its Continue form, which posts to the start leg.
+
+    Not by status or wording: when the interstitial is skipped the start leg runs, and it has
+    several legitimate outcomes, among them a 303 to the login page and a 200 page that navigates
+    to the IdP. Pinning one would make these tests about flow plumbing instead of about 3.7.3.
+    """
+    return r.status_code == 200 and 'action="/ui/oidc/start"' in r.text
 
 
 def test_an_internal_idp_is_not_interstitialed() -> None:
-    """An operator's own AD FS is a different host and still inside their control.
-
-    Asserted as "not the interstitial" rather than "is a 303": the start leg has several legitimate
-    303 outcomes and pinning one would make this test about flow plumbing instead of about 3.7.3.
-    """
+    """An operator's own AD FS is a different host and still inside their control."""
     r = _client(
         organization_domains=("hospital.example",),
         oidc_authorization_host="adfs.hospital.example",
     ).get("/ui/oidc/start")
-    assert r.status_code != 200 or "leaving" not in r.text.lower()
+    assert not _is_interstitial(r)
 
 
 def test_with_no_org_domains_even_a_plausible_idp_is_interstitialed() -> None:
@@ -111,7 +120,7 @@ def test_the_allowlist_escape_suppresses_the_interstitial() -> None:
         external_link_allowlist=("idp.example.com",),
         oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
-    assert r.status_code != 200 or "leaving" not in r.text.lower()
+    assert not _is_interstitial(r)
 
 
 @pytest.mark.parametrize(
@@ -156,7 +165,7 @@ def test_turning_the_interstitial_off_suppresses_it() -> None:
         external_link_interstitial=False,
         oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
-    assert r.status_code != 200 or "leaving" not in r.text.lower()
+    assert not _is_interstitial(r)
 
 
 def test_an_unconfigured_idp_host_still_gets_the_interstitial() -> None:

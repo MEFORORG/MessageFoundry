@@ -245,6 +245,20 @@ def session_token(conn: Request | WebSocket) -> str | None:
     return conn.cookies.get(session_cookie_name(conn))
 
 
+async def has_live_session(request: Request, auth: AuthService | None) -> bool:
+    """Whether this request carries a session that still authenticates, for a page that may be
+    served either way to decide whether it carries the session watchdog (``minimal_nav(session=)``).
+
+    Asked through ``AuthService.session_shows_signed_in``, whose docstring says which refused
+    sessions it ends. A cookie that no longer authenticates is no session: the probe would 303 on
+    it and the watchdog would send the browser to the login page.
+    """
+    token = session_token(request)
+    if not token or auth is None:
+        return False
+    return await auth.session_shows_signed_in(token)
+
+
 # Strict, self-only CSP for the /ui surface — no 'unsafe-eval'/'unsafe-inline' (ADR 0065 §5). The only
 # script is the first-party /ui/static/app.js (no inline script, no on* handlers), so 'self' suffices.
 # Everything (script/style/font/img) is served from /ui/static, same origin.
@@ -270,14 +284,16 @@ _KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
-#: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
-#: There are exactly THREE emitters, and between them they cover every shape a termination takes:
-#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password change
-#: that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response` (every
-#: SERVER-driven expiry, revoke or disable redirect), and the login RENDER in :mod:`.routes.core`
-#: (a post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
-#: session cookie that no longer authenticates). Deletion and this header are deliberately fused in
-#: one helper rather than left as two lines a new route must remember to write together.
+#: ASVS 14.3.1 — the header that ends a session's browser-visible life, sent by the emitters below.
+#: Not every landing after a termination carries it. There are at least four emitters:
+#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password
+#: change that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response`
+#: (every SERVER-driven expiry, revoke or disable redirect), the login RENDER in
+#: :mod:`.routes.core` (a post-termination landing reached by bookmark or Back, recognised by its
+#: outcome code or by a session cookie that no longer authenticates), and the OIDC "leaving this
+#: site" interstitial in :mod:`.routes.oidc` (a session cookie that no longer authenticates). In
+#: :func:`clear_session_cookie`, cookie deletion and this header are fused in one helper; the login
+#: render and the interstitial send the header without deleting the cookie.
 #: ``"cache"`` ONLY: ``"cookies"`` is already covered by the explicit cookie deletion (and would clear
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
 #: ``mfcols:v2`` column preferences (14.3.3), which are not session state. Defense-in-depth against

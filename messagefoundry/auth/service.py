@@ -12824,6 +12824,31 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
+    async def session_shows_signed_in(self, token: str | None) -> bool:
+        """Whether a page that may be served with or without a session shows this browser as
+        signed in: Sign-out and the session watchdog. A DISPLAY decision, never an authorization.
+
+        It refuses, ends and reports a session as :meth:`identity_for_token` does, with one
+        exception: a session whose owner's temporary credential has lapsed reads ``False`` and is
+        left as it is, so the sign-in callback's supersession ends it and records the lapse
+        (BACKLOG #3749). Unlike that method, this one never refreshes a session's idle clock.
+        """
+        if not token:
+            return False
+        session = await self._load_session(hash_token(token))
+        if session is None:
+            return False
+        now = time.time()
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
+            await self._store.revoke_session(session.token_hash, now=now)
+            return False
+        user = await self._load_user(session.user_id)
+        if user is not None and (refusal := self._gate_refusal(session, user, now)) is not None:
+            if refusal != "credential":
+                await self._session_seal_failed(session.token_hash)
+            return False
+        return user is not None and not user.disabled
+
     async def _load_session(self, token_hash: str) -> SessionRecord | None:
         """The session ``token_hash`` names, or ``None`` (BACKLOG #2592). The ONLY reader of
         ``AuthStore.get_session`` in this service; ``tests/test_session_seal.py`` holds that.

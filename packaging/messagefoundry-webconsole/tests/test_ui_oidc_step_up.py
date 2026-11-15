@@ -15,21 +15,33 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 import httpx
 import pytest
+from _ui_clients import (
+    HOSTILE_IDP_URL,
+    assert_idp_hop,
+    create_local_user_chosen,
+    idp_url,
+    issue_continuation,
+)
 from _ui_clients import SAME_ORIGIN as _SAME
-from _ui_clients import issue_continuation
+from _webui_support import PW
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
+from messagefoundry.auth.tokens import hash_token
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole._auth import continuation_issued
 from messagefoundry_webconsole.routes.oidc import _step_up_return_key
 
@@ -68,8 +80,9 @@ class _FakeLdap:
         return _PRINCIPAL if username == "jdoe" else None
 
 
-def _settings(*, require_mfa: bool = False) -> AuthSettings:
-    return AuthSettings(
+def _settings(*, require_mfa: bool = False, **over: object) -> AuthSettings:
+    return AuthSettings(  # type: ignore[arg-type]
+        **over,
         oidc_callback_min_elapsed_seconds=0,
         require_mfa=require_mfa,
         ad_enabled=True,
@@ -89,9 +102,11 @@ def _settings(*, require_mfa: bool = False) -> AuthSettings:
     )
 
 
-async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False) -> AuthService:
+async def _service(
+    engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False, **over: object
+) -> AuthService:
     service = AuthService(  # type: ignore[arg-type]
-        engine.store, _settings(require_mfa=require_mfa), ldap=ldap
+        engine.store, _settings(require_mfa=require_mfa, **over), ldap=ldap
     )
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
@@ -151,8 +166,7 @@ async def _federated_sign_in(
 ) -> str:
     _idp_answers(service, monkeypatch)
     start = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
-    assert start.status_code == 303, start.headers
-    r = await _callback(c, start.headers["location"])
+    r = await _callback(c, idp_url(start))
     assert r.status_code == 200, r.headers
     token = c.cookies.get("mf_session")
     assert token and await service.session_steps_up_at_idp(token)
@@ -260,11 +274,10 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)  # what the step-up gate's refusal of the click records
         start = await _start_step_up(c)
-        assert start.status_code == 303
-        query = dict(parse_qsl(urlsplit(start.headers["location"]).query))
+        query = dict(parse_qsl(urlsplit(idp_url(start)).query))
         assert query["max_age"] == "0" and query["prompt"] == "login"
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert f'action="{_NEXT}"' in r.text  # the auto-retry of the action the operator started
@@ -274,6 +287,316 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
         assert await service.identity_for_token(old) is None
         assert await service.has_recent_step_up(new)
         assert await service.session_steps_up_at_idp(new), "rotation lost the mechanism"
+
+
+async def test_the_step_up_start_answers_with_a_navigating_page_not_a_303(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``POST /ui/reauth/oidc`` answers with a 303 to the IdP. The /ui CSP's
+    ``form-action 'self'`` is checked again on a redirect that follows a form POST, so Chromium
+    blocks a 303 to the IdP's origin and every IdP step-up stops at the console. The hop must carry
+    the very URL the engine staged, escaped, under an unchanged CSP."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+
+        async def staged(*_a: object, **_kw: object) -> tuple[str, str]:
+            return "flow-hop", HOSTILE_IDP_URL
+
+        monkeypatch.setattr(service, "begin_oidc_step_up", staged)
+        r = await _start_step_up(c)
+    assert_idp_hop(r, HOSTILE_IDP_URL)
+    assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
+    assert 'action="/ui/logout"' in r.text  # a live session, so its sign-out stays (ASVS 7.4.4)
+
+
+async def test_a_signed_in_browser_keeps_sign_out_on_the_sign_in_pages(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the no-session interstitial test in test_webui_oidc.py, and RED when: a
+    browser that holds a live session starts a federated sign-in (it hands that session over,
+    ASVS 7.2.4) and the IdP hop drops its Sign-out. Both the "leaving this site" page and the hop
+    are reached with a session here, so both carry Sign-out and the watchdog (ASVS 7.4.4, 14.3.1)."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert idp_url(hop)
+    # A live session is not a terminated one, so its cache is kept (ASVS 14.3.1).
+    assert "clear-site-data" not in leaving.headers
+    for page in (leaving, hop):
+        assert 'action="/ui/logout"' in page.text
+        assert "data-mf-session-watchdog" in page.text
+
+
+_EXPIRY_HOURS = 72
+
+
+async def _lapsed_local_sessions(service: AuthService, engine: Engine) -> tuple[str, str]:
+    """Two sessions of a local account whose admin-issued temporary credential lapsed, its
+    deadline backdated to a minute before now: the one a test presents, and one for its control."""
+    user_id = await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(2):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    await engine.store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (time.time() - _EXPIRY_HOURS * 3600 - 60, user_id),
+    )
+    await engine.store._db.commit()
+    return tokens[0], tokens[1]
+
+
+async def _ended(engine: Engine, token: str) -> bool:
+    row = await engine.store.get_session(hash_token(token))
+    assert row is not None
+    return row.revoked_at is not None
+
+
+async def _lapse_rows(engine: Engine) -> list[tuple[object, object, dict[str, object]]]:
+    """Each ``auth.temp_password_expired`` row as its actor, client and detail, newest first."""
+    import json
+
+    return [
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")))
+        for row in await engine.store.list_audit(action="auth.temp_password_expired")
+    ]
+
+
+async def _assert_a_gate_ends_the_control(
+    service: AuthService, engine: Engine, control: str
+) -> None:
+    """Positive control: the session really is one a gate ends, with an ``at=session`` row."""
+    assert await service.identity_for_token(control, activity=False) is None
+    assert await _ended(engine, control)
+    assert [d["at"] for _, _, d in await _lapse_rows(engine)][0] == "session"
+
+
+async def test_cancelling_at_the_interstitial_ends_no_lapsed_session(
+    engine: Engine,
+) -> None:
+    """RED when: showing the "leaving this site" page ends the session the browser presents. A
+    browser whose temporary credential lapsed and that cancels there has ended nothing, and a
+    display decision must not end it either (BACKLOG #3749 records what each end writes)."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    # A lapsed session is shown as no session: no watchdog, whose probe would end it.
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert not await _ended(engine, presented)
+    assert await _lapse_rows(engine) == []
+    await _assert_a_gate_ends_the_control(service, engine, control)
+
+
+async def test_a_sign_in_start_leaves_a_lapsed_prior_session_for_the_callback(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /ui/oidc/start`` ends the lapsed session it hands over (ASVS 7.2.4). That
+    session is the callback's to end, with the client and ``at=superseded``; ended here, the row
+    says ``at=session`` with no client, and an abandoned IdP trip ends it too."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert idp_url(hop)
+    assert 'action="/ui/logout"' not in hop.text
+    assert not await _ended(engine, presented)
+    assert await _lapse_rows(engine) == []
+    await _assert_a_gate_ends_the_control(service, engine, control)
+
+
+async def test_the_callback_records_a_lapsed_prior_session_as_superseded(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a federated sign-in from a browser holding a lapsed session loses the row the
+    supersession writes for it: ``auth.temp_password_expired`` with ``at=superseded``, the
+    client and the session reference (BACKLOG #3749). The control is the session itself, live
+    until the callback ends it."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, _control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        assert (await c.get("/ui/oidc/start", follow_redirects=False)).status_code == 200
+        assert not await _ended(engine, presented)  # control: still live after the interstitial
+        await _federated_sign_in(service, c, monkeypatch)
+    assert await _ended(engine, presented)
+    assert await _lapse_rows(engine) == [
+        (
+            "ivan",
+            "127.0.0.1",
+            {
+                "provider": "local",
+                "expiry_hours": _EXPIRY_HOURS,
+                "at": "superseded",
+                "session": hash_token(presented)[:12],
+            },
+        )
+    ]
+
+
+@pytest.fixture
+async def keyed_engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    """An engine on a keyed store, so each session row carries an integrity seal."""
+    store = await MessageStore.open(
+        tmp_path / "oidc_session_seal.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    engine = Engine(
+        store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        yield engine
+    finally:
+        await engine.stop()
+
+
+async def _seal_failures(engine: Engine, token: str) -> int:
+    """The ``AUTHORITY_SEAL_FAILED_ACTION`` rows that name ``token``'s session."""
+    ref = hash_token(token)[:12]
+    rows = await engine.store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=10_000)
+    return sum(1 for row in rows if f'"session": "{ref}"' in str(row["detail"]))
+
+
+async def test_both_start_legs_end_and_report_a_session_row_that_fails_its_seal(
+    keyed_engine: Engine,
+) -> None:
+    """RED when: the start legs' display read leaves a session row that fails its integrity seal
+    unended and unreported. Before the start legs read the session themselves, the interstitial
+    carried the session watchdog, whose probe ended and reported such a row through
+    ``identity_for_token``; the read that replaced the probe must not do less. The control is an
+    intact session of the same account, which neither leg ends. A lapsed temporary credential, by
+    contrast, is left for the callback: see the lapsed-session tests above (BACKLOG #3749)."""
+    engine = keyed_engine
+    service = await _service(engine, _FakeLdap())
+    await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(3):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    at_get, at_post, intact = tokens
+    for token in (at_get, at_post):
+        # A sealed field altered outside the store, so the row's seal no longer verifies.
+        await engine.store._db.execute(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.8", hash_token(token))
+        )
+    await engine.store._db.commit()
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", at_get)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+        c.cookies.set("mf_session", at_post)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert "clear-site-data" in leaving.headers
+    assert idp_url(hop)
+    assert 'action="/ui/logout"' not in hop.text
+    for token in (at_get, at_post):
+        assert await _ended(engine, token)
+        assert await _seal_failures(engine, token) == 1
+    assert not await _ended(engine, intact)
+    assert await _seal_failures(engine, intact) == 0
+    assert await service.identity_for_token(intact, activity=False) is not None
+
+
+async def _local_sessions(service: AuthService, count: int) -> list[str]:
+    """``count`` sessions of one local account, ``ivan``."""
+    await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(count):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    return tokens
+
+
+async def _at_the_interstitial(engine: Engine, service: AuthService, token: str) -> httpx.Response:
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", token)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert "clear-site-data" in leaving.headers
+    return leaving
+
+
+async def test_the_interstitial_ends_and_reports_a_session_a_revoke_staled(
+    engine: Engine,
+) -> None:
+    """RED when: the interstitial's display read leaves a session whose account epoch moved past
+    it unended or unreported. ``identity_for_token`` ends and reports such a row as one that fails
+    its seal (BACKLOG #2592), and so did the watchdog's probe the read replaced. The control is a
+    second session of the same account, sealed after the epoch moved, which the read leaves live."""
+    service = await _service(engine, _FakeLdap())
+    (presented,) = await _local_sessions(service, 1)
+    await engine.store._db.execute(
+        "UPDATE users SET session_epoch=session_epoch+1 WHERE username=?", ("ivan",)
+    )
+    await engine.store._db.commit()
+    outcome = await service.login("ivan", PW, client="127.0.0.1")
+    assert outcome.ok and outcome.token
+    control = outcome.token
+    await _at_the_interstitial(engine, service, presented)
+    assert await _ended(engine, presented)
+    assert await _seal_failures(engine, presented) == 1
+    assert not await _ended(engine, control)
+    assert await service.session_shows_signed_in(control)
+    assert await _seal_failures(engine, control) == 0
+
+
+@pytest.mark.parametrize("column", ["expires_at", "last_used_at"])
+async def test_the_interstitial_ends_a_session_past_its_expiry_or_idle_window(
+    engine: Engine, column: str
+) -> None:
+    """RED when: the interstitial's display read leaves a session past its absolute expiry or its
+    idle window unended. ``identity_for_token`` revokes it, and so did the watchdog's probe the
+    read replaced. It is no integrity failure, so nothing is reported. The control is a second
+    session of the same account, still inside both, which the read leaves live."""
+    service = await _service(engine, _FakeLdap())
+    presented, control = await _local_sessions(service, 2)
+    past = time.time() - service.session_idle_seconds - 60
+    statement = {
+        "expires_at": "UPDATE sessions SET expires_at=? WHERE token_hash=?",
+        "last_used_at": "UPDATE sessions SET last_used_at=? WHERE token_hash=?",
+    }[column]
+    await engine.store._db.execute(statement, (past, hash_token(presented)))
+    await engine.store._db.commit()
+    await _at_the_interstitial(engine, service, presented)
+    assert await _ended(engine, presented)
+    assert await _seal_failures(engine, presented) == 0
+    assert not await _ended(engine, control)
+    assert await service.session_shows_signed_in(control)
 
 
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
@@ -288,9 +611,8 @@ async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
         page = await c.get("/ui/reauth", params={"next": _NEXT}, follow_redirects=False)
         assert page.status_code == 200 and "nothing will run" in page.text
         start = await _start_step_up(c)
-        assert start.status_code == 303
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert "data-autosubmit" not in r.text
@@ -308,7 +630,7 @@ async def test_a_different_idp_account_is_refused_and_changes_nothing(
         start = await _start_step_up(c)
         _idp_answers(service, monkeypatch, subject="S-1-5-21-someone-else")
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 403
         assert "different account" in r.text
@@ -337,7 +659,7 @@ async def test_a_forged_callback_does_not_cancel_the_step_up_in_flight(
         assert forged.status_code == 403
         assert session is not None
         c.cookies.set("mf_session", session)
-        real = await _callback(c, start.headers["location"])
+        real = await _callback(c, idp_url(start))
         assert real.status_code == 200, real.text
         new = c.cookies.get("mf_session")
         assert new and await service.has_recent_step_up(new)
@@ -350,7 +672,7 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
     async with _client(engine, service) as c:
         token = await _federated_sign_in(service, c, monkeypatch)
         start = await _start_step_up(c)
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         c.cookies.delete("mf_session")
         r = await c.get(
             "/ui/oidc/callback",
@@ -407,11 +729,10 @@ async def test_a_spent_sign_in_window_does_not_refuse_an_idp_step_up_return(
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         _drain_sign_in_window(service)
         _forbid_sign_in_charge(service, monkeypatch)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         assert f'action="{_NEXT}"' in r.text
@@ -439,7 +760,6 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         assert identity is not None
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         flow_id = _flow_id(c)
         return_key = _step_up_return_key(identity.user_id)
         for _ in range(_settings().login_rate_limit_per_ip):
@@ -449,7 +769,7 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         _forbid_sign_in_charge(service, monkeypatch)
         rows_before = await service.store.count_audit(limit=None)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 429, r.text
         assert "Too many attempts" in r.text
@@ -467,7 +787,7 @@ async def test_an_idp_step_up_return_is_still_rate_limited_per_actor(
         clock[0] += _settings().login_rate_limit_window_seconds + 1  # the key refilled
         assert service._reauth_limiter is not None, "the retry must meet the limiter, not skip it"
         assert _ceremony_budget_left(service, return_key)
-        retry = await _callback(c, start.headers["location"])
+        retry = await _callback(c, idp_url(start))
         assert retry.status_code == 200, retry.text
         new = c.cookies.get("mf_session")
         assert new and await service.has_recent_step_up(new)
@@ -555,7 +875,6 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         )
         assert identity is not None
         start = await _start_step_up(c)
-        assert start.status_code == 303
         flow_id = _flow_id(c)
         if spent == "own":
             _drain_own_step_up_return_audit_budget(service, identity.user_id)
@@ -565,7 +884,7 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
             service._step_up_return_audit_paged_at.clear()
         rows_before = await service.store.count_audit(limit=None, action="auth.login_failed")
 
-        r = await _fetch_return(c, start.headers["location"])
+        r = await _fetch_return(c, idp_url(start))
 
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=oidc_failed"
         rows = await service.store.count_audit(limit=None, action="auth.login_failed")
@@ -577,7 +896,7 @@ async def test_a_non_navigation_step_up_return_writes_its_row_within_the_audit_b
         assert pages == [], pages
         if spent == "others":
             # The second is stopped: no row, the line, and the backstop pages with its action.
-            again = await _fetch_return(c, start.headers["location"])
+            again = await _fetch_return(c, idp_url(start))
             assert again.status_code == 303
             after = await service.store.count_audit(limit=None, action="auth.login_failed")
             assert after == rows
@@ -601,12 +920,11 @@ async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_retu
         old = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _NEXT)
         start = await _start_step_up(c)
-        assert start.status_code == 303
         _drain_sign_in_window(service)
         _drain_step_up_return_audit_budget(service)
         _forbid_sign_in_charge(service, monkeypatch)
 
-        r = await _callback(c, start.headers["location"])
+        r = await _callback(c, idp_url(start))
 
         assert r.status_code == 200, r.text
         new = c.cookies.get("mf_session")
@@ -636,9 +954,8 @@ async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
         session = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         start = await _start_unlock_step_up(c)
-        assert start.status_code == 303
         assert not continuation_issued(session, _UNLOCK)  # held for the flow, not in the table
-        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
         c.cookies.delete("mf_session")
         refused = await c.get(
             "/ui/oidc/callback",
@@ -651,8 +968,7 @@ async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
         assert continuation_issued(session, _UNLOCK)  # given back for the retry
 
         retry = await _start_unlock_step_up(c)
-        assert retry.status_code == 303
-        landed = await _callback(c, retry.headers["location"])
+        landed = await _callback(c, idp_url(retry))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text  # the landing continues to the page
@@ -675,11 +991,10 @@ async def test_a_retry_after_an_abandoned_idp_prompt_still_continues(
         await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         abandoned = await _start_unlock_step_up(c)
-        assert abandoned.status_code == 303
+        assert idp_url(abandoned)  # a flow was staged, not a refusal page
         retry = await _start_unlock_step_up(c)
-        assert retry.status_code == 303
 
-        landed = await _callback(c, retry.headers["location"])
+        landed = await _callback(c, idp_url(retry))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
@@ -697,15 +1012,13 @@ async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
         issue_continuation(c, _UNLOCK)
         session = c.cookies.get("mf_session")
         first = await _start_unlock_step_up(c)
-        assert first.status_code == 303
         second = await _start_unlock_step_up(c)
-        assert second.status_code == 303
 
-        stale = await _callback(c, first.headers["location"])
+        stale = await _callback(c, idp_url(first))
         assert stale.status_code != 200 or _UNLOCK not in stale.text
         assert session is not None
         c.cookies.set("mf_session", session)
-        landed = await _callback(c, second.headers["location"])
+        landed = await _callback(c, idp_url(second))
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
@@ -731,7 +1044,6 @@ async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minti
         session = await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         first = await _start_unlock_step_up(c)
-        assert first.status_code == 303
         budget = [False]
         monkeypatch.setattr(oidc_routes, "allow_reauth_attempt", lambda *_a: budget[0])
         refused = await _start_unlock_step_up(c)
@@ -739,7 +1051,7 @@ async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minti
         budget[0] = True
         assert continuation_issued(session, _UNLOCK)  # the issue is back in the table
 
-        landed = await _callback(c, first.headers["location"])
+        landed = await _callback(c, idp_url(first))
 
         assert landed.status_code == 200, landed.text
         new = c.cookies.get("mf_session")
