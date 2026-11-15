@@ -3358,8 +3358,10 @@ class AuthStore(Protocol):
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
         :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
-        that report what they changed: every other one is deliberately blind (a write against a dead
-        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        that report what they changed, with one narrower exception:
+        :meth:`mark_session_mfa_verified` answers only whether it landed AND applied a pending-factor
+        anchor, so its False does not tell a dead hash from a stamp that applied none. Every other
+        one is deliberately blind (a write against a dead hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG

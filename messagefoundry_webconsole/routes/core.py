@@ -2181,7 +2181,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # is untouched) that verifies an assertion, marks the session's factor and, when that
     # completes a pending factor, re-anchors it as a TOTP code does, stamping the window only
     # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). The pages stage an
-    # assertion only for a session that has not met its factor, so an ordinary /ui/reauth step-up
+    # assertion only after reading that the session has not met its factor, so an ordinary
+    # /ui/reauth step-up
     # of a satisfied session gets no passkey and steps up with the password. An assertion can
     # still arrive for a session that met its factor after the ceremony was staged (two tabs
     # share the challenge, which moves with the session's re-key); it marks the factor and

@@ -779,7 +779,7 @@ session weaker than a TOTP code (`verify_mfa`, unchanged here) completing the sa
 `tests/test_webauthn.py::test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_factor`
 runs both from one state: a pending session at address A that minted an ADR 0077 grant by a
 password step-up there, whose factor is then completed from address B. Both paths move the anchor
-to B, so the new-address signal that every new-address refusal asks (`flag_new_client_ip`: the
+to B, so the new-address signal the new-address refusals ask (`flag_new_client_ip`: at least the
 step-up gates, `require_phi_read`, `require_paced`, the reveal path and the console's
 `_refuse_from_new_address`) no longer fires from B, and both leave the earlier grant spendable from
 B. The code opens the window; the non-UV passkey shuts it. So the non-UV passkey matches the code

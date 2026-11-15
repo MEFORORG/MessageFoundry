@@ -570,7 +570,7 @@
   });
 
   // Passkey assertion: run the get() ceremony against the staged options and POST the assertion
-  // to the passkey leg. The server stages one only for a session that has not met its factor, so
+  // to the passkey leg. The server stages one only after reading that the session has not met its factor, so
   // on success that factor is met (and the window stamped only with the UV flag). On the reauth
   // page the operator still enters the password below, which completes the step-up; a session
   // that already met its factor is offered no passkey there and steps up with the password.

@@ -11885,9 +11885,10 @@ class AuthService:
 
         **Ordering is the whole control** (see each call site): every store stamp for this elevation
         must already have been written against the OLD hash before this runs, because the re-key
-        carries those columns forward, and every session stamp UPDATE is rowcount-blind (which
-        session writes report what they changed is :meth:`AuthStore.rotate_session`'s docstring to
-        say) — a stamp issued *after* the rotation silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+        carries those columns forward, and a session stamp UPDATE against a dead hash raises
+        nothing (which session writes report what they changed is
+        :meth:`AuthStore.rotate_session`'s docstring to say) — a stamp issued *after* the rotation
+        silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
 
         A rotation the store refused is ``None`` here too (BACKLOG #3023); see
         :meth:`_rotate_session_hash`.
