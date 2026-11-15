@@ -164,11 +164,10 @@ def _refuse_a_loaded_ca_without_its_own_crl(
     #5627). With the whole chain checked, OpenSSL needs that CRL for every certificate the CA
     issued, a leaf or an intermediate a client sends, and refuses each client with ``unable to
     get certificate CRL`` when it is missing: a context that builds and then refuses every client
-    under that CA, which this says at start instead. A CRL counts for the CA whose key signed it,
-    whatever issuer name it carries (:func:`messagefoundry.pki.cas_without_own_crl`), so each CA
-    is named with its serial number: two CAs in a key rollover can share a name. An intermediate only
-    the client sends is not loaded, so its own CRL cannot be checked here. Raises ``ValueError``
-    naming ``setting``."""
+    under that CA, which this says at start instead. Which CRL is a CA's own is
+    :func:`messagefoundry.pki.cas_without_own_crl`'s to say; each CA is named with its serial
+    number, since two CAs can share a name. An intermediate only the client sends is not loaded,
+    so its own CRL cannot be checked here. Raises ``ValueError`` naming ``setting``."""
     from messagefoundry.pki import cas_without_own_crl
 
     try:
@@ -184,7 +183,8 @@ def _refuse_a_loaded_ca_without_its_own_crl(
     if missing:
         named = ", ".join(f"{subject!r} (serial number {serial:#x})" for subject, serial in missing)
         raise ValueError(
-            f"{setting} holds no CRL signed by the loaded client CA(s) {named}. The whole client "
+            f"{setting} holds no CRL signed by the loaded client CA(s) {named}, under that CA's "
+            "own name and key. The whole client "
             "chain is checked against this file, so every client under such a CA would be "
             "refused. Add each one's CRL to the file"
         )

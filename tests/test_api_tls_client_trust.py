@@ -122,18 +122,26 @@ def _cert(
 
 
 def _crl(
-    issuer: str, signer: ec.EllipticCurvePrivateKey, revoked: x509.Certificate | None
+    issuer: str,
+    signer: ec.EllipticCurvePrivateKey,
+    revoked: x509.Certificate | None,
+    *,
+    akid: bool = True,
+    age: datetime.timedelta = _DAY,
 ) -> bytes:
+    """``akid=False`` leaves out the Authority Key Identifier, so the CRL names no key; ``age`` is
+    how long before now its lastUpdate falls."""
     builder = (
         x509.CertificateRevocationListBuilder()
         .issuer_name(_name(issuer))
-        .last_update(_NOW - _DAY)
+        .last_update(_NOW - age)
         .next_update(_NOW + 30 * _DAY)
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
-        )
         .add_extension(x509.CRLNumber(1), False)
     )
+    if akid:
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), False
+        )
     if revoked is not None:
         builder = builder.add_revoked_certificate(
             x509.RevokedCertificateBuilder()
@@ -417,15 +425,69 @@ def rollover(tmp_path: Path) -> _Rollover:
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
+@pytest.mark.parametrize("akid", [True, False], ids=["names-key", "names-no-key"])
 def test_a_crl_whose_issuer_differs_from_its_ca_only_in_spacing_builds_and_admits(
-    rollover: _Rollover,
+    rollover: _Rollover, akid: bool
 ) -> None:
-    """Red before the fix: the check matched the CRL to its CA by issuer name, compared with white
-    space exact, so a CRL from ``CN=Client Root `` refused the start, while OpenSSL drops that
-    space, takes the CRL as the CA's own, and admits the client. The CRL is the CA's by its key."""
-    crl = rollover.crl("spaced.pem", _crl("Client Root ", rollover.new_key, None))
+    """Red before the fix: the check compared the CRL's issuer name with the CA's subject with
+    white space exact, so a CRL from ``CN=Client Root `` refused the start, while OpenSSL drops
+    that space, takes the CRL as the CA's own, and admits the client. With no authority key
+    identifier, the CA's key verifying the CRL is what makes it the CA's."""
+    crl = rollover.crl("spaced.pem", _crl("Client Root ", rollover.new_key, None, akid=akid))
     ctx = build_api_ssl_context(rollover.settings([rollover.new_root], crl))
     _handshake(rollover.client(), ctx)
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_crl_the_cas_key_signed_under_another_name_refuses_the_build(
+    rollover: _Rollover,
+) -> None:
+    """OpenSSL finds a CRL by name, so a CRL the CA's key signed under ``CN=Renamed Root`` is no
+    CRL for ``CN=Client Root``: the start refuses, and by hand the handshake does too."""
+    crl = rollover.crl("renamed.pem", _crl("Renamed Root", rollover.new_key, None))
+    settings = rollover.settings([rollover.new_root], crl)
+    with pytest.raises(
+        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+    ):
+        build_api_ssl_context(settings)
+    by_hand = _crl_checked_server(
+        rollover.server_cert,
+        rollover.server_key,
+        Path(str(settings.tls_client_ca_file)),
+        crl,
+        chain=True,
+    )
+    with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
+        _handshake(rollover.client(), by_hand)
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_same_name_rollover_whose_crls_name_no_key_refuses_the_build(
+    rollover: _Rollover,
+) -> None:
+    """Each key signed a CRL, but neither CRL names its key, so OpenSSL tells them apart by date
+    alone: with the old key's CRL the newer one, the new key's client fails with ``CRL signature
+    failure``. The start refuses both CAs instead. The control is the earlier rollover test, whose
+    CRLs name their keys and admit the client."""
+    crl = rollover.crl(
+        "no-akid.pem",
+        _crl("Client Root", rollover.old_key, None, akid=False, age=_DAY / 4),
+        _crl("Client Root", rollover.new_key, None, akid=False),
+    )
+    settings = rollover.settings([rollover.old_root, rollover.new_root], crl)
+    with pytest.raises(
+        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+    ):
+        build_api_ssl_context(settings)
+    by_hand = _crl_checked_server(
+        rollover.server_cert,
+        rollover.server_key,
+        Path(str(settings.tls_client_ca_file)),
+        crl,
+        chain=True,
+    )
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(rollover.client(), by_hand)
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
