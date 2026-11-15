@@ -3807,12 +3807,9 @@ Without this, an account disabled in the directory would keep renewing its windo
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag would not stop
 it sooner: the pass never writes that flag, which an administrator's edit of the account sets. The
 pass ends the account's live sessions instead, and writes its roles only from an answer that reads
-the account present, when its groups map to a different set. It runs every
-`[auth].ad_session_recheck_seconds` (300 s by default), and revokes after
-`[auth].ad_session_recheck_strikes` answers (2 by default) that read the account absent, disabled or
-undetermined, with no present answer between them.
+the account present, when its groups map to a different set.
 [Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
-has the full rule, including the per-pass probe budget and when a pass revokes nothing. An id-less row
+says how often it runs, when it revokes, and when a pass revokes nothing. An id-less row
 with no binding used to be looked up by name here, as the reconciler did until BACKLOG #2434. Since the
 rest of BACKLOG #2027 this check refuses it, as the Windows SSO sign-in and the password step-up do.
 

@@ -183,9 +183,10 @@ never probed, and its row's `disabled` flag and roles were never refreshed. A di
 or group removal never reached the certificate path at all.
 
 *Corrected 2026-11-14: the reconciler never writes the `disabled` flag, for a probed account or any
-other. For a probed directory account it ends the live sessions after repeated absent, disabled or
-undetermined answers, and writes the roles only from an answer that reads the account present. A
-certificate-only account got neither, which is the gap above.*
+other. For a probed directory account it ends the live sessions, under the rule
+[SECURITY.md](../SECURITY.md) states in *Directory session reconciliation*, and writes the roles
+only from an answer that reads the account present. A certificate-only account got neither, which
+is the gap above.*
 
 **Decision.**
 
