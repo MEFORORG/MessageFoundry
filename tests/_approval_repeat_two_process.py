@@ -60,19 +60,11 @@ from uuid import uuid4
 async def _open(target):
     if target == "sqlserver":
         from messagefoundry.config.settings import load_settings
-        from messagefoundry.config.tls_policy import HopPosture
         from messagefoundry.store.sqlserver import SqlServerStore
 
-        # The parent's warn posture is a contextvar (tests/conftest.py,
-        # _warn_posture_for_the_server_db_legs), which a child does not inherit. Without it the
-        # CI container's self-signed certificate is refused as weakened TLS, so state it here, as
-        # the applock child in test_sqlserver_store.py does. It is not inert on its own: since vault
-        # BACKLOG #2223 it also turns a broadly writable [store].ssl_root_cert pin from a refusal
-        # into a warning. The weakened-TLS cross the container needs still requires the
-        # MEFOR_ALLOW_INSECURE_TLS escape as well.
-        return await SqlServerStore.open(
-            load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
-        )
+        # No posture: the CI container's certificate is pinned (MEFOR_STORE_SSL_ROOT_CERT), so the
+        # store opens at the enforcing default, as the parent does (vault BACKLOG #3533 item 2).
+        return await SqlServerStore.open(load_settings(environ=os.environ).store)
     from messagefoundry.store.store import MessageStore
 
     return await MessageStore.open(Path(target))

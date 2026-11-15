@@ -6078,7 +6078,6 @@ import time
 from pathlib import Path
 
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import PostgresStore
 
 
@@ -6102,7 +6101,7 @@ def rendezvous(latch_dir, tag, peers, timeout=60.0):
 async def main() -> None:
     tag, rows, latch_dir, peers = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
     store = await PostgresStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     try:
         rendezvous(latch_dir, tag, peers)

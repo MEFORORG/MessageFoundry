@@ -24,9 +24,10 @@
     CI-verified against a real SQL Server (2022 and 2025) by the gated service-container
     job - on par with the Postgres suite.
 
-    Loopback DEV convenience: sets trust_server_certificate=true + MEFOR_ALLOW_INSECURE_TLS=1
-    so the store's weakened-TLS guard permits the local self-signed connection. Do NOT
-    use these settings against a real/remote server.
+    The store refuses trust_server_certificate=true and encrypt=false at every posture, and
+    MEFOR_ALLOW_INSECURE_TLS does not lift that (owner ruling 2026-11-14, vault BACKLOG #3533
+    item 2). Pass -RootCert with the server's own certificate to pin it (Encrypt=strict, SQL
+    Server 2022 or later), or trust the server's certificate machine-wide.
 
 .EXAMPLE
     scripts\dev\sqlserver.ps1 -Password 'Your_sa_password'
@@ -45,6 +46,7 @@ param(
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Dev/test helper only: the local SQL Server sa password fed into MEFOR_STORE_PASSWORD for the gated suite. A real secret comes from env in production; SecureString here would just defeat the convenience.')]
     [string]$Password = $env:MEFOR_STORE_PASSWORD,
+    [string]$RootCert = "",  # [store].ssl_root_cert: the server's own certificate, pinned
     [switch]$Full  # run the entire pytest suite, not only tests/test_sqlserver_store.py
 )
 
@@ -70,8 +72,7 @@ $env:MEFOR_STORE_DATABASE = $Database
 $env:MEFOR_STORE_AUTH = "sql"
 $env:MEFOR_STORE_USERNAME = $Username
 $env:MEFOR_STORE_PASSWORD = $Password
-$env:MEFOR_STORE_TRUST_SERVER_CERTIFICATE = "true"   # local self-signed cert...
-$env:MEFOR_ALLOW_INSECURE_TLS = "1"                  # ...so the weakened-TLS guard permits it (dev/test only)
+if ($RootCert) { $env:MEFOR_STORE_SSL_ROOT_CERT = $RootCert }   # verified TLS; nothing permits a weakened store hop
 
 Write-Host "Running SQL Server store tests against $Username@${DbServer}:$Port/$Database ..." -ForegroundColor Cyan
 if ($Full) {

@@ -1,71 +1,116 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A CI leg that weakens TLS must also stop enforcing — the two are mutually exclusive.
+"""No CI leg weakens TLS to its database, and no serve step sets the retired data-class key.
 
-THE DEFECT THIS EXISTS FOR. The ``load test (smoke, sqlserver)`` legs were RED for four consecutive
-nights (2026-07-27..30) on::
+THE RULE, AND WHAT CHANGED IT. Owner ruling 2026-11-14 (vault BACKLOG #3533 item 2): a store login
+over ``trust_server_certificate=true`` or ``encrypt=false`` is refused, and so is a SQL Server
+DATABASE connection login over the same, whatever ``MEFOR_ALLOW_INSECURE_TLS`` or
+``[security].enforcement`` says. So a CI leg that still sets ``MEFOR_STORE_TRUST_SERVER_CERTIFICATE``
+true or ``MEFOR_STORE_ENCRYPT`` false cannot open its store on any posture. The server-DB legs serve
+a certificate generated in a step (``scripts/ci/db-tls-cert.sh``) and pin it or trust it instead.
 
-    ValueError: SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false)
-
-The job *did* set ``MEFOR_ALLOW_INSECURE_TLS=1``, and had since the history reset. What changed is that
-ADR 0148 (GIVEN 1) remapped the built-in ``dev`` env from SYNTHETIC to **PHI** — and under an enforcing
-PHI posture that escape is clamped **inert** by design (#200 / ADR 0092 decision 2,
-``weakened_tls_escape_permitted``).
-
-So the combination the job asked for is impossible on purpose::
-
-    trust_server_certificate=true  +  enforcement=enforce   ->  REFUSED, always
-
-Nothing caught it, because a nightly is not a PR context and the ``CI gate`` roll-up correctly treats
-those PR-skipped legs as a pass. This test makes the incompatibility fail LOUDLY at PR time instead.
-
-THE RULE, AND WHAT RE-KEYED IT. If a serve-based CI job sets
-``MEFOR_STORE_TRUST_SERVER_CERTIFICATE=true`` (a self-signed service container — the only practical
-option for a ``services:`` block, which starts before any step runs and so cannot be handed a cert
-generated in a step), then it MUST also set ``MEFOR_SECURITY_ENFORCEMENT=warn``.
-
-**That used to be ``MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA=false``, and BACKLOG #1279 retired it.**
-The clamp reads ``enforcing`` alone now: every instance carries patient data, so declaring one
-synthetic is neither possible nor, if it were, the narrow thing to do here. The replacement is
-*strictly narrower* — the retired declaration silenced nineteen start-up gates, and ``warn`` downgrades
-them to warnings and silences none. The clamp itself is unchanged and so is the failure it produces.
-
-The alternative — keeping ``enforce`` — requires a REAL certificate, which means moving the job off
-``services:`` onto a ``docker run`` with a generated cert mounted and trusted. Worth doing
-deliberately; not as a side effect of unbreaking a nightly.
+This module used to hold the opposite guard: that a serve step which trusts a self-signed server
+certificate also sets ``[security].enforcement = warn``, because the escape was honoured only there.
+That pairing came from the ``load test (smoke, sqlserver)`` legs going RED for four nights
+(2026-07-27..30) on ``ValueError: SQL Server TLS is weakened``. It cannot be satisfied any more, so
+the guard now refuses the weakening itself, on every step of every workflow, at PR time, rather
+than on a nightly.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 _TRUST = "MEFOR_STORE_TRUST_SERVER_CERTIFICATE"
-_ENFORCEMENT = "MEFOR_SECURITY_ENFORCEMENT"
+_ENCRYPT = "MEFOR_STORE_ENCRYPT"
 _RETIRED = "MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA"
 _TRUTHY = {"true", "1", "yes", "on"}
+_FALSY = {"false", "0", "no", "off"}
 
 
-def _serve_steps_with_env(workflow: str) -> list[tuple[str, str, dict]]:
-    """(job key, step name, env) for every step that actually STARTS THE ENGINE.
-
-    Scoped to ``messagefoundry serve`` deliberately, and this scoping is the whole correctness of the
-    module. The posture clamp only exists when the engine builds one: ``api/app.py``'s lifespan threads
-    ``hop_posture_from_ai(...)`` into ``open_store``, so a served instance gets a real ``HopPosture``.
-    A **pytest** step calls ``open_store`` directly with ``posture=None``. Since vault BACKLOG #2354
-    that fails closed, so those steps get their warn posture from ``tests/conftest.py``
-    (``_warn_posture_for_the_server_db_legs``), not from the engine. CORRECTED: this read that
-    ``posture=None`` was *the unclamped fallback*.
-
-    Without this narrowing the first draft of this test flagged six `sqlserver-store` steps that set
-    ``MEFOR_STORE_TRUST_SERVER_CERTIFICATE=true`` and are perfectly green — they run the pytest suites,
-    never `serve`. Demanding a relaxation there would have been a false positive that "fixing" makes
-    the repo *less* honest: those legs genuinely exercise the PHI-shaped store path.
-    """
+def _workflows() -> dict[str, dict[str, Any]]:
     yaml = pytest.importorskip("yaml")
     from tests._workflow_contexts import WORKFLOWS
 
-    doc = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8"))
-    out: list[tuple[str, str, dict]] = []
+    return {
+        path.name: yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
+    }
+
+
+def _weakened(env: dict[str, Any]) -> list[str]:
+    """The weakened-TLS store settings ``env`` names, as ``NAME=value``."""
+    found = []
+    if str(env.get(_TRUST, "")).strip().lower() in _TRUTHY:
+        found.append(f"{_TRUST}={env[_TRUST]}")
+    if str(env.get(_ENCRYPT, "")).strip().lower() in _FALSY:
+        found.append(f"{_ENCRYPT}={env[_ENCRYPT]}")
+    return found
+
+
+def _offenders(workflows: dict[str, dict[str, Any]]) -> tuple[int, list[str]]:
+    """(env blocks examined, each workflow-level, job-level or step-level env that weakens TLS)."""
+    examined = 0
+    out: list[str] = []
+    for wf_name, wf in workflows.items():
+        blocks: list[tuple[str, Any]] = [(f"{wf_name} (workflow env)", wf.get("env"))]
+        for job_key, job in (wf.get("jobs") or {}).items():
+            blocks.append((f"{wf_name}:{job_key} (job env)", (job or {}).get("env")))
+            for step in (job or {}).get("steps") or []:
+                name = str((step or {}).get("name") or "<unnamed>")
+                blocks.append((f"{wf_name}:{job_key} step {name!r}", (step or {}).get("env")))
+        for where, env in blocks:
+            if not isinstance(env, dict):
+                continue
+            examined += 1
+            out.extend(f"{where} sets {hit}" for hit in _weakened(env))
+    return examined, out
+
+
+def test_the_scan_sees_a_weakened_leg() -> None:
+    """Positive control: the scanner fires on each weakening, at each level it reads."""
+    synthetic = {
+        "w.yml": {
+            "env": {_ENCRYPT: "false"},
+            "jobs": {
+                "j": {
+                    "env": {_TRUST: "true"},
+                    "steps": [{"name": "s", "env": {_TRUST: True, _ENCRYPT: False}}],
+                },
+                "clean": {"steps": [{"name": "ok", "env": {_TRUST: "false", _ENCRYPT: "true"}}]},
+            },
+        }
+    }
+    examined, offenders = _offenders(synthetic)
+    assert examined == 4
+    assert offenders == [
+        f"w.yml (workflow env) sets {_ENCRYPT}=false",
+        f"w.yml:j (job env) sets {_TRUST}=true",
+        f"w.yml:j step 's' sets {_TRUST}=True",
+        f"w.yml:j step 's' sets {_ENCRYPT}=False",
+    ]
+
+
+def test_no_ci_leg_weakens_tls_to_its_database() -> None:
+    examined, offenders = _offenders(_workflows())
+    print(f"[ci-leg-tls] examined {examined} env block(s) across every workflow")
+    # Liveness: the server-DB legs alone carry dozens of env blocks.
+    assert examined > 30, f"expected the workflows' env blocks, found {examined}"
+    assert not offenders, (
+        "a CI leg weakens TLS to its database, which the engine refuses at every posture whatever "
+        "MEFOR_ALLOW_INSECURE_TLS says (owner ruling 2026-11-14, vault BACKLOG #3533 item 2):\n  "
+        + "\n  ".join(offenders)
+        + "\nServe a certificate the leg can verify instead: scripts/ci/db-tls-cert.sh makes one; "
+        "pin it with MEFOR_STORE_SSL_ROOT_CERT or add it to the runner's trust store."
+    )
+
+
+def _serve_steps_with_env(workflow: str) -> list[tuple[str, str, dict[str, Any]]]:
+    """(job key, step name, env) for every step that STARTS THE ENGINE with an ``env:`` block."""
+    doc = _workflows()[workflow]
+    out: list[tuple[str, str, dict[str, Any]]] = []
     for key, job in (doc.get("jobs") or {}).items():
         for step in (job or {}).get("steps") or []:
             env = (step or {}).get("env")
@@ -75,74 +120,12 @@ def _serve_steps_with_env(workflow: str) -> list[tuple[str, str, dict]]:
     return out
 
 
-def test_a_weakened_tls_leg_stops_enforcing() -> None:
-    """The incompatibility, made mechanical.
-
-    While enforcing, the ``MEFOR_ALLOW_INSECURE_TLS`` escape is inert, so a leg that trusts a
-    self-signed server certificate can never start. Requiring ``enforcement=warn`` alongside it turns a
-    four-night silent breakage into a PR-time failure.
-    """
-    offenders: list[str] = []
-    checked = 0
-    for job, step, env in _serve_steps_with_env("ci.yml"):
-        if str(env.get(_TRUST, "")).strip().lower() not in _TRUTHY:
-            continue
-        checked += 1
-        declared = str(env.get(_ENFORCEMENT, "")).strip().lower()
-        if declared != "warn":
-            offenders.append(
-                f"ci.yml:{job} — step {step!r} sets {_TRUST}=true but "
-                f"{_ENFORCEMENT}={declared or '<unset>'}"
-            )
-
-    # Liveness: if no leg trusts a self-signed cert any more, say so rather than pass on an empty scan.
-    print(
-        f"[ci-leg-tls-posture] examined {checked} serve step(s) that trust a self-signed server certificate"
-    )
-    assert checked > 0, (
-        f"no `messagefoundry serve` step in ci.yml sets {_TRUST}=true any more. If those legs were reworked onto a real "
-        "certificate that is a genuine improvement — delete this guard deliberately rather than "
-        "letting it pass by finding nothing."
-    )
-    assert not offenders, (
-        "a CI leg trusts a self-signed server certificate while still enforcing:\n  "
-        + "\n  ".join(offenders)
-        + "\nWhile enforcing, the MEFOR_ALLOW_INSECURE_TLS escape is INERT by design (ADR 0092 "
-        "decision 2), so that leg cannot start at all — it fails with 'SQL Server TLS is weakened'. "
-        f"Either set {_ENFORCEMENT}=warn, or give the leg a real certificate, which means moving it "
-        "off a `services:` container."
-    )
-
-
-def test_the_escape_alone_is_not_mistaken_for_a_fix() -> None:
-    """``MEFOR_ALLOW_INSECURE_TLS`` present without the dial turned down is the exact trap.
-
-    It reads like the fix — it is even what the error message names first — and it is what the job had
-    set, unchanged, for the entire four nights it was failing. The variable is necessary but NOT
-    sufficient while the instance enforces.
-    """
-    for job, step, env in _serve_steps_with_env("ci.yml"):
-        if "MEFOR_ALLOW_INSECURE_TLS" not in env:
-            continue
-        if str(env.get(_TRUST, "")).strip().lower() not in _TRUTHY:
-            continue
-        declared = str(env.get(_ENFORCEMENT, "")).strip().lower()
-        assert declared == "warn", (
-            f"ci.yml:{job} — step {step!r} sets MEFOR_ALLOW_INSECURE_TLS with {_TRUST}=true but does "
-            f"not set {_ENFORCEMENT}=warn. The escape is clamped inert while enforcing, so on its own "
-            "it does nothing here — this is the configuration that failed silently for four nights "
-            "while looking correct."
-        )
-
-
 def test_no_leg_still_sets_the_retired_declaration() -> None:
     """The retired key is refused at LOAD, so a leg that still sets it fails at start, not at review.
 
-    This is the migration's own tripwire and it is deliberately wider than the two tests above: it
-    covers every serve step, not only the TLS-weakened ones, because ``handles_real_patient_data`` was
-    a convenience anywhere a CI box wanted a quiet start. A leg that kept it would die on
-    ``[security].handles_real_patient_data was REMOVED``, which is a clear message but arrives a
-    nightly too late (BACKLOG #1279).
+    It covers every serve step, because ``handles_real_patient_data`` was a convenience anywhere a CI
+    box wanted a quiet start. A leg that kept it would die on ``[security].handles_real_patient_data
+    was REMOVED``, which is a clear message but arrives a nightly too late (BACKLOG #1279).
     """
     steps = _serve_steps_with_env("ci.yml")
     assert steps, "no `messagefoundry serve` step found in ci.yml — this guard would scan nothing"

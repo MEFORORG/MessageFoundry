@@ -229,7 +229,6 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
 
 RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
@@ -267,7 +266,7 @@ def check(ok, message):
 
 async def main() -> None:
     store = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     quarantined = []
     real_release_dirty = store._release_dirty

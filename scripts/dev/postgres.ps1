@@ -9,9 +9,11 @@
     skips unless MEFOR_TEST_POSTGRES is set) and runs them through the project venv.
 
     Assumes a PostgreSQL is reachable at the given host/port with the given database already
-    created (see the install checklist / docs). This is a loopback, no-TLS DEV convenience: it
-    sets MEFOR_ALLOW_INSECURE_TLS=1 so the store's weakened-TLS guard permits the plaintext
-    local connection. Do NOT use these settings against a real/remote server.
+    created (see the install checklist / docs). The PostgreSQL must serve TLS: the store refuses
+    encrypt=false at every posture, and MEFOR_ALLOW_INSECURE_TLS does not lift that (owner ruling
+    2026-11-14, vault BACKLOG #3533 item 2). Pass -RootCert with the CA (or self-signed
+    certificate) the server's certificate chains to, or trust it machine-wide.
+    scripts\ci\db-tls-cert.sh makes a throwaway localhost certificate.
 
 .EXAMPLE
     scripts\dev\postgres.ps1
@@ -30,6 +32,7 @@ param(
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Dev/test helper only: a non-secret loopback Postgres dev password fed into MEFOR_STORE_PASSWORD for the gated suite. A real secret comes from env in production; SecureString here would just defeat the convenience.')]
     [string]$Password = "mefor",
+    [string]$RootCert = "",  # [store].ssl_root_cert: a CA bundle the server's certificate chains to
     [switch]$Full  # run the entire pytest suite, not only tests/test_postgres_store.py
 )
 
@@ -50,8 +53,7 @@ $env:MEFOR_STORE_PORT = "$Port"
 $env:MEFOR_STORE_DATABASE = $Database
 $env:MEFOR_STORE_USERNAME = $Username
 $env:MEFOR_STORE_PASSWORD = $Password
-$env:MEFOR_STORE_ENCRYPT = "false"        # local loopback: no TLS...
-$env:MEFOR_ALLOW_INSECURE_TLS = "1"       # ...so the weakened-TLS guard permits it (dev/test only)
+if ($RootCert) { $env:MEFOR_STORE_SSL_ROOT_CERT = $RootCert }   # verified TLS; nothing permits a weakened store hop
 
 Write-Host "Running Postgres store tests against $Username@${DbServer}:$Port/$Database ..." -ForegroundColor Cyan
 if ($Full) {
