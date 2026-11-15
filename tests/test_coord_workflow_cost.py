@@ -289,6 +289,175 @@ def test_an_unbalanced_call_stops_the_scan_loudly(mod: ModuleType) -> None:
     assert "unreadable" in {u.kind for u in cost.unknowns}
 
 
+# ------------------------------------------------------------------------------------------------
+# BACKLOG #5601: a literal's length is a width only while nothing else can change it
+# ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "script"),
+    [
+        (
+            "spread",
+            "const A = [1, 2]\nconst R = [...A, ...found]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "push after an empty declaration",
+            "const R = []\nfor (const x of found) R.push(x)\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "reassigned",
+            "let R = [1]\nR = found\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "declared twice",
+            "function f() { const R = [1, 2, 3, 4, 5] }\nconst R = [1]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "index-assigned",
+            "const R = [1]\nR[found] = 2\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "length-assigned",
+            "const R = [1, 2]\nR.length = n\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "inline spread",
+            "await parallel([...found, 1].map(r => () => agent(r)))\n",
+        ),
+        (
+            "for-of over a pushed array",
+            "const R = []\nR.unshift(x)\nfor (const r of R) { await agent(r) }\n",
+        ),
+    ],
+)
+def test_a_literal_whose_length_can_change_is_not_an_exact_width(
+    mod: ModuleType, label: str, script: str
+) -> None:
+    """Regression (BACKLOG #5601): each of these shapes recorded the literal's own length.
+
+    ``const R = []`` filled by ``push`` priced at ZERO and said exact, so ``--strict`` passed the
+    very dynamic-width fan it exists to flag. A width is only a count while no other line in the
+    file can change it.
+    """
+    cost = mod.price_script(script)
+    assert not cost.exact, f"{label}: priced {cost.agents} and called it exact"
+    # A for...of whose width is unknown falls back to the loop term, which says the same thing.
+    assert {"dynamic-width", "loop"} & {u.kind for u in cost.unknowns}, label
+
+
+def test_a_literal_nothing_changes_keeps_its_exact_width(mod: ModuleType) -> None:
+    """The negative control for #5601: reads, comparisons and arrows over the name stay exact."""
+    script = (
+        "const R = [1, 2, 3]\n"
+        "if (R.length == 3 && R !== other) { log(R[0]) }\n"
+        "const f = R => R\n"
+        "await parallel(R.map(r => () => agent(r)))\n"
+    )
+    cost = mod.price_script(script)
+    assert cost.agents == 3
+    assert cost.exact
+
+
+# ------------------------------------------------------------------------------------------------
+# BACKLOG #5602: an agent inside a named helper costs what its callers multiply it by
+# ------------------------------------------------------------------------------------------------
+
+
+def test_a_helper_called_from_a_fan_is_multiplied_by_the_fan(mod: ModuleType) -> None:
+    """Regression (BACKLOG #5602): the helper's one ``agent()`` priced at 1 and reported exact.
+
+    The linear scan attributed the call inside the body and never saw ``review(r)`` as a cost,
+    so a six-wide fan over the helper priced at one agent with an empty residue.
+    """
+    script = (
+        "const R = [1, 2, 3, 4, 5, 6]\n"
+        "async function review(r) {\n  return agent(r)\n}\n"
+        "await parallel(R.map(r => () => review(r)))\n"
+    )
+    cost = mod.price_script(script)
+    assert cost.agents == 6
+    assert cost.exact
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "function review(r) { return agent(r) }",
+        "const review = async (r) => { return agent(r) }",
+        "const review = r => agent(r)",
+        "let review = async function (r) { return agent(r) }",
+    ],
+)
+def test_every_helper_binding_form_is_resolved_at_its_call_sites(
+    mod: ModuleType, definition: str
+) -> None:
+    script = (
+        f"{definition}\n"
+        "const R = [1, 2, 3]\n"
+        "await parallel(R.map(r => () => review(r)))\n"
+        "await review('one more')\n"
+    )
+    cost = mod.price_script(script)
+    assert cost.agents == 4, definition
+    assert cost.exact, definition
+
+
+def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
+    script = (
+        "const LENSES = ['a', 'b']\n"
+        "const one = l => agent(l)\n"
+        "async function panel() { return parallel(LENSES.map(l => () => one(l))) }\n"
+        "const R = [1, 2, 3]\n"
+        "await parallel(R.map(r => () => panel()))\n"
+    )
+    cost = mod.price_script(script)
+    assert cost.agents == 6
+    assert cost.exact
+
+
+def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:
+    """An agent in a body nobody calls by name may still run, passed as a value: say so."""
+    script = "function review(r) { return agent(r) }\n"
+    cost = mod.price_script(script)
+    assert cost.agents == 0
+    assert not cost.exact
+    assert [u.kind for u in cost.unknowns] == ["unattributed"]
+
+
+def test_a_helper_passed_as_a_value_is_reported(mod: ModuleType) -> None:
+    """``R.map(review)`` calls the helper six times without ever writing ``review(``."""
+    script = (
+        "const R = [1, 2, 3, 4, 5, 6]\n"
+        "function review(r) { return agent(r) }\n"
+        "await Promise.all(R.map(review))\n"
+    )
+    cost = mod.price_script(script)
+    assert not cost.exact
+    assert "unattributed" in {u.kind for u in cost.unknowns}
+
+
+def test_a_helper_defined_twice_is_not_resolved(mod: ModuleType) -> None:
+    script = (
+        "function review(r) { return agent(r) }\n"
+        "function review(r) { return parallel([() => agent(r), () => agent(r)]) }\n"
+        "await review(1)\n"
+    )
+    cost = mod.price_script(script)
+    assert not cost.exact
+    assert "helper" in {u.kind for u in cost.unknowns}
+
+
+def test_a_recursive_helper_is_reported_rather_than_looping(mod: ModuleType) -> None:
+    script = "async function go(n) { await agent(n); if (n) await go(n - 1) }\nawait go(3)\n"
+    cost = mod.price_script(script)
+    assert not cost.exact
+    assert "recursion" in {u.kind for u in cost.unknowns}
+
+
 def test_every_priced_agent_is_attributed_so_the_residue_stays_quiet(mod: ModuleType) -> None:
     """The catch-all's negative control: it must not fire on scripts the pricer fully understood.
 
@@ -415,6 +584,32 @@ def test_disabling_the_residue_check_is_caught(mod: ModuleType) -> None:
     assert not mod.price_script(script).exact
 
 
+def test_dropping_the_unstable_width_check_is_caught(mod: ModuleType) -> None:
+    """BACKLOG #5601's guard, mutation-proved: without it a pushed array prices at exact zero."""
+    mutant = _mutate(
+        r"return \{k: v for k, v in widths\.items\(\) if k not in unstable\}, unstable",
+        "return widths, {}",
+        "cwc_mutant4",
+    )
+    script = "const R = []\nR.push(x)\nawait parallel(R.map(r => () => agent(r)))\n"
+    priced = mutant.price_script(script)
+    assert (priced.agents, priced.exact) == (0, True), "the mutant must reproduce the defect"
+    assert not mod.price_script(script).exact
+
+
+def test_dropping_helper_resolution_is_caught(mod: ModuleType) -> None:
+    """BACKLOG #5602's guard, mutation-proved: without it a six-wide helper fan prices at one."""
+    mutant = _mutate(r"    _collect_helpers\(ctx\)\n", "", "cwc_mutant5")
+    script = (
+        "const R = [1, 2, 3, 4, 5, 6]\n"
+        "function review(r) { return agent(r) }\n"
+        "await parallel(R.map(r => () => review(r)))\n"
+    )
+    priced = mutant.price_script(script)
+    assert (priced.agents, priced.exact) == (1, True), "the mutant must reproduce the defect"
+    assert mod.price_script(script).agents == 6
+
+
 # ------------------------------------------------------------------------------------------------
 # The tool as a process -- what a launcher actually runs
 # ------------------------------------------------------------------------------------------------
@@ -452,6 +647,18 @@ def test_strict_exits_non_zero_only_when_a_term_is_unpriced(
     assert mod.main([str(exact), "--strict"]) == 0
     assert mod.main([str(fuzzy)]) == 0, "a report is not a gate -- an unpriced term must not fail"
     assert mod.main([str(fuzzy), "--strict"]) == 1
+
+    # BACKLOG #5601 and #5602: both shapes used to exit 0 under --strict with an exact label.
+    pushed = tmp_path / "pushed.js"
+    pushed.write_text(
+        "const R = []\nR.push(x)\nawait parallel(R.map(r => () => agent(r)))\n", "utf-8"
+    )
+    helper = tmp_path / "helper.js"
+    helper.write_text(
+        "function review(r) { return agent(r) }\nawait Promise.all(found.map(review))\n", "utf-8"
+    )
+    assert mod.main([str(pushed), "--strict"]) == 1
+    assert mod.main([str(helper), "--strict"]) == 1
     capsys.readouterr()
 
 
