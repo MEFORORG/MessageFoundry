@@ -248,7 +248,9 @@ this line.**
   session watchdog only when the request carries a live session: before, the watchdog on the
   interstitial sent a browser with no session to the login page before Continue could be clicked.
   The interstitial sends `Clear-Site-Data: "cache"` to a browser whose session cookie no longer
-  authenticates; the hop does not. No seam change.
+  authenticates; the hop does not. Both pages decide through `AuthService.session_shows_signed_in`,
+  which ends no session, so a session a sign-in start presents is still there for the callback to
+  supersede and record. Needs the engine seam that carries `AuthService.session_shows_signed_in`.
 - **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
   breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
   changed its terminators. The editor now carries the original's style in a hidden `eol` field

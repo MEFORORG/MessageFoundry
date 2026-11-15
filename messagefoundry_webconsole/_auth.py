@@ -249,14 +249,15 @@ async def has_live_session(request: Request, auth: AuthService | None) -> bool:
     """Whether this request carries a session that still authenticates, for a page that may be
     served either way to decide whether it carries the session watchdog (``minimal_nav(session=)``).
 
-    Asked as the watchdog's own probe would find it: ``identity_for_token`` with ``activity=False``,
-    so asking does not slide the idle clock. A cookie that no longer authenticates is no session:
-    the probe would 303 on it and the watchdog would send the browser to the login page.
+    Asked through ``AuthService.session_shows_signed_in``, which ends, revokes, touches and audits
+    no session, so a session a sign-in start presents is left for the callback's supersession to
+    end and record. A cookie that no longer authenticates is no session: the probe would 303 on it
+    and the watchdog would send the browser to the login page.
     """
     token = session_token(request)
     if not token or auth is None:
         return False
-    return await auth.identity_for_token(token, activity=False) is not None
+    return await auth.session_shows_signed_in(token)
 
 
 # Strict, self-only CSP for the /ui surface — no 'unsafe-eval'/'unsafe-inline' (ADR 0065 §5). The only

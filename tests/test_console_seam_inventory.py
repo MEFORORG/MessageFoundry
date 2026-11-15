@@ -576,6 +576,7 @@ _AUTH_SERVICE: dict[str, AuthUse] = {
     "reauth": _C,
     "revoke_other_sessions": AuthUse("read", ("DELETE /me/sessions",)),
     "revoke_own_session": AuthUse("read", ("DELETE /me/sessions/{session_id}",)),
+    "session_shows_signed_in": _C,
     "session_steps_up_at_idp": _C,
     "sessions_ended_by_ad_map_save": _G,
     "sessions_ended_by_custom_role_save": _G,

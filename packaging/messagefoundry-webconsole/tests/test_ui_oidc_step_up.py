@@ -21,13 +21,21 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import HOSTILE_IDP_URL, assert_idp_hop, idp_url, issue_continuation
+from _ui_clients import (
+    HOSTILE_IDP_URL,
+    assert_idp_hop,
+    create_local_user_chosen,
+    idp_url,
+    issue_continuation,
+)
 from _ui_clients import SAME_ORIGIN as _SAME
+from _webui_support import PW
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._auth import continuation_issued
@@ -68,8 +76,9 @@ class _FakeLdap:
         return _PRINCIPAL if username == "jdoe" else None
 
 
-def _settings(*, require_mfa: bool = False) -> AuthSettings:
-    return AuthSettings(
+def _settings(*, require_mfa: bool = False, **over: object) -> AuthSettings:
+    return AuthSettings(  # type: ignore[arg-type]
+        **over,
         oidc_callback_min_elapsed_seconds=0,
         require_mfa=require_mfa,
         ad_enabled=True,
@@ -89,9 +98,11 @@ def _settings(*, require_mfa: bool = False) -> AuthSettings:
     )
 
 
-async def _service(engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False) -> AuthService:
+async def _service(
+    engine: Engine, ldap: _FakeLdap, *, require_mfa: bool = False, **over: object
+) -> AuthService:
     service = AuthService(  # type: ignore[arg-type]
-        engine.store, _settings(require_mfa=require_mfa), ldap=ldap
+        engine.store, _settings(require_mfa=require_mfa, **over), ldap=ldap
     )
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
@@ -314,6 +325,125 @@ async def test_a_signed_in_browser_keeps_sign_out_on_the_sign_in_pages(
     for page in (leaving, hop):
         assert 'action="/ui/logout"' in page.text
         assert "data-mf-session-watchdog" in page.text
+
+
+_EXPIRY_HOURS = 72
+
+
+async def _lapsed_local_sessions(service: AuthService, engine: Engine) -> tuple[str, str]:
+    """Two sessions of a local account whose admin-issued temporary credential lapsed a minute
+    after both were opened: the one a test presents, and one for its control."""
+    user_id = await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(2):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    await engine.store._db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (time.time() - _EXPIRY_HOURS * 3600 - 60, user_id),
+    )
+    await engine.store._db.commit()
+    return tokens[0], tokens[1]
+
+
+async def _ended(engine: Engine, token: str) -> bool:
+    row = await engine.store.get_session(hash_token(token))
+    assert row is not None
+    return row.revoked_at is not None
+
+
+async def _lapse_rows(engine: Engine) -> list[tuple[object, object, dict[str, object]]]:
+    """Each ``auth.temp_password_expired`` row as its actor, client and detail, newest first."""
+    import json
+
+    return [
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")))
+        for row in await engine.store.list_audit(action="auth.temp_password_expired")
+    ]
+
+
+async def _assert_a_gate_ends_the_control(
+    service: AuthService, engine: Engine, control: str
+) -> None:
+    """Positive control: the session really is one a gate ends, with an ``at=session`` row."""
+    assert await service.identity_for_token(control, activity=False) is None
+    assert await _ended(engine, control)
+    assert [d["at"] for _, _, d in await _lapse_rows(engine)][0] == "session"
+
+
+async def test_cancelling_at_the_interstitial_ends_no_lapsed_session(
+    engine: Engine,
+) -> None:
+    """RED when: showing the "leaving this site" page ends the session the browser presents. A
+    browser whose temporary credential lapsed and that cancels there has ended nothing, and a
+    display decision must not end it either (BACKLOG #3749 records what each end writes)."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    # A lapsed session is shown as no session: no watchdog, whose probe would end it.
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert not await _ended(engine, presented)
+    assert await _lapse_rows(engine) == []
+    await _assert_a_gate_ends_the_control(service, engine, control)
+
+
+async def test_a_sign_in_start_leaves_a_lapsed_prior_session_for_the_callback(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /ui/oidc/start`` ends the lapsed session it hands over (ASVS 7.2.4). That
+    session is the callback's to end, with the client and ``at=superseded``; ended here, the row
+    says ``at=session`` with no client, and an abandoned IdP trip ends it too."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert idp_url(hop)
+    assert 'action="/ui/logout"' not in hop.text
+    assert not await _ended(engine, presented)
+    assert await _lapse_rows(engine) == []
+    await _assert_a_gate_ends_the_control(service, engine, control)
+
+
+async def test_the_callback_records_a_lapsed_prior_session_as_superseded(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a federated sign-in from a browser holding a lapsed session loses the row the
+    supersession writes for it: ``auth.temp_password_expired`` with ``at=superseded``, the
+    client and the session reference (BACKLOG #3749). The control is the session itself, live
+    until the callback ends it."""
+    service = await _service(engine, _FakeLdap(), initial_password_expiry_hours=_EXPIRY_HOURS)
+    presented, _control = await _lapsed_local_sessions(service, engine)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", presented)
+        assert (await c.get("/ui/oidc/start", follow_redirects=False)).status_code == 200
+        assert not await _ended(engine, presented)  # control: still live after the interstitial
+        await _federated_sign_in(service, c, monkeypatch)
+    assert await _ended(engine, presented)
+    assert await _lapse_rows(engine) == [
+        (
+            "ivan",
+            "127.0.0.1",
+            {
+                "provider": "local",
+                "expiry_hours": _EXPIRY_HOURS,
+                "at": "superseded",
+                "session": hash_token(presented)[:12],
+            },
+        )
+    ]
 
 
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(

@@ -267,7 +267,7 @@ async def test_a_store_fault_on_the_liveness_read_stages_no_flow(
         c.cookies.set("mf_session", "not-a-live-session")
         assert idp_url(await c.post("/ui/oidc/start", follow_redirects=False))
         assert len(flows._entries) == 1  # positive control: a working read stages one flow
-        monkeypatch.setattr(service, "identity_for_token", faulting)
+        monkeypatch.setattr(service.store, "get_session", faulting)
         with pytest.raises(_StoreFault):
             await c.post("/ui/oidc/start", follow_redirects=False)
     assert len(flows._entries) == 1, "the failed start left a flow staged"

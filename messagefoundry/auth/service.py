@@ -12598,20 +12598,50 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def _load_session(self, token_hash: str) -> SessionRecord | None:
+    async def session_shows_signed_in(self, token: str | None) -> bool:
+        """Whether a page that may be served with or without a session shows this browser as
+        signed in: Sign-out and the session watchdog. A DISPLAY decision, never an authorization.
+
+        Unlike :meth:`identity_for_token` it ends, revokes, touches and audits no session. A row
+        that fails its seal or its clock, or whose owner's temporary credential lapsed or whose
+        epoch is stale, reads ``False`` and is left as it is. So a session a sign-in start
+        presents is still there for the callback's supersession to end and record (BACKLOG #3749).
+        An account record that fails its own seal is reported, as every read of it is.
+        """
+        if not token:
+            return False
+        session = await self._load_session(hash_token(token), end_failed=False)
+        if session is None:
+            return False
+        now = time.time()
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
+            return False
+        user = await self._load_user(session.user_id)
+        if user is None or user.disabled:
+            return False
+        return self._gate_refusal(session, user, now) is None
+
+    async def _load_session(
+        self, token_hash: str, *, end_failed: bool = True
+    ) -> SessionRecord | None:
         """The session ``token_hash`` names, or ``None`` (BACKLOG #2592). The ONLY reader of
         ``AuthStore.get_session`` in this service; ``tests/test_session_seal.py`` holds that.
 
         ``None`` for no row, for a revoked row, and for an unrevoked row whose integrity seal does not
         verify. A revoked row grants nothing and its seal is blank by design, so it is refused
         quietly. An unrevoked row that fails is treated as no session and handed to
-        :meth:`_session_seal_failed`, which ends it. On a keyless store there is no seal to check.
+        :meth:`_session_seal_failed`, which ends it, unless ``end_failed`` is false: then it is
+        only treated as no session, for :meth:`session_shows_signed_in`, which ends nothing. On a
+        keyless store there is no seal to check.
 
         The account's session epoch is checked where the account is read, in
         :meth:`identity_for_token` and :meth:`list_sessions`, so this costs no extra statement."""
         session = await self._store.get_session(token_hash)
         if session is None or session.revoked_at is not None:
             return None
+        if not end_failed:
+            sealed = await session_seal_ok_async(self._store.row_sealer(), session)
+            return session if sealed else None
         if not await self._session_row_holds(session, self._store.row_sealer()):
             return None
         return session
