@@ -747,9 +747,10 @@ jobs:
     #
     # A REAL INSTALL, not `--dry-run`, so a wheel that downloads and hashes clean but will not install
     # is caught too. Each lock goes into a freshly cleared venv, so one lock cannot satisfy another's
-    # pin. Measured 2026-11-14 on Windows 11 with CPython 3.14: all four locks resolve under these
-    # flags, and zeroing sspilib's hashes in a copy of the core lock fails the install with a hash
-    # mismatch.
+    # pin. Measured 2026-11-14 on Windows 11 with CPython 3.14, as a `--dry-run` under these flags:
+    # all five locks resolve, and zeroing sspilib's hashes in a copy of the core lock fails with a
+    # hash mismatch. release.yml installs release-tools.lock without `--only-binary`, so a red on
+    # that line here is stricter than the release, not a prediction of it.
     #
     # It hard-fails and reports on every pull request and merge-group run. Whether it gates a merge is
     # `.github/required-contexts.txt`'s answer, not this comment's; tests/test_security_posture.py

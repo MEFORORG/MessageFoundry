@@ -1007,6 +1007,8 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         ("a disarm that did not take fails closed", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
         # A re-run of an older run: the newer run's arm is left alone.
         ("a stale run leaves the arm alone", "true", {"GH_HEAD": "b" * 40}, 0, False, "true"),
+        # An unreadable head is not stale: disarm, then fail so nothing re-arms.
+        ("an unreadable head disarms and fails", "true", {"GH_HEAD": ""}, 1, True, "false"),
     ],
 )
 def test_disarm_step_behaviour(
@@ -1034,9 +1036,9 @@ def test_disarm_step_behaviour(
         **extra,
     }
     run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
-    assert (run.outputs.get("stale") == "true") is (extra.get("GH_HEAD", "a" * 40) != "a" * 40), (
-        f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
-    )
+    assert (run.outputs.get("stale") == "true") is (
+        extra.get("GH_HEAD", "a" * 40) not in ("a" * 40, "")
+    ), f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
     assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
     called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
     assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
@@ -1058,40 +1060,39 @@ def _gh_rows_stub(tmp_path: Path, rows: str | None) -> Path:
     return stub_dir
 
 
+_BOT = "dependabot[bot]"
+
+
 @pytest.mark.parametrize(
-    ("label", "rows", "expected"),
+    ("label", "sender", "rows", "expected"),
     [
-        (
-            "only verified Dependabot commits",
-            "dependabot[bot]\tdependabot[bot]\ttrue\ndependabot[bot]\tdependabot[bot]\ttrue\n",
-            "true",
-        ),
-        (
-            "a commit by someone else",
-            "dependabot[bot]\tdependabot[bot]\ttrue\nsomeone\tsomeone\ttrue\n",
-            "false",
-        ),
-        # The spoof: anyone can WRITE dependabot[bot] as author and sign as themselves, and GitHub
-        # then reports verified=true, because it checks the committer's key.
-        ("a spoofed author, signed by its committer", "dependabot[bot]\tsomeone\ttrue\n", "false"),
-        ("an unverified Dependabot commit", "dependabot[bot]\tdependabot[bot]\tfalse\n", "false"),
-        ("an author with no GitHub login", "\tdependabot[bot]\ttrue\n", "false"),
-        ("an empty commit list", "", "false"),
-        ("the API errors", None, "false"),
+        # The discriminating PASS: a Dependabot push of one Dependabot commit re-arms.
+        ("Dependabot pushed one Dependabot commit", _BOT, "login=dependabot[bot]\n", "true"),
+        # A human or the Lander pushed: the sender is that person, whatever the commits say.
+        ("a human sender", "someone", "login=dependabot[bot]\n", "false"),
+        ("two commits", _BOT, "login=dependabot[bot]\nlogin=dependabot[bot]\n", "false"),
+        ("a Dependabot sender, human-authored commit", _BOT, "login=someone\n", "false"),
+        # An empty login is its own visible field, so it fails the author test, not a shifted one.
+        ("an author with no GitHub login", _BOT, "login=\n", "false"),
+        ("no commits", _BOT, "", "false"),
+        ("the API errors", _BOT, None, "false"),
     ],
 )
-def test_authors_step_holds_any_commit_not_dependabots_own(
-    label: str, rows: str | None, expected: str, tmp_path: Path
+def test_authors_step_rearms_only_a_dependabot_push_of_one_dependabot_commit(
+    label: str, sender: str, rows: str | None, expected: str, tmp_path: Path
 ) -> None:
-    """fetch-metadata reads only the first commit, so an appended commit must hold the PR."""
+    """fetch-metadata reads only the first commit, so re-arming needs the sender, the commit count
+    and the single commit's author to all be Dependabot's."""
     run = _run_step_body(
         "authors",
-        {"REPO": "example/example", "PR_NUMBER": "1", "GH_TOKEN": "stub"},
+        {"SENDER": sender, "REPO": "example/example", "PR_NUMBER": "1", "GH_TOKEN": "stub"},
         tmp_path,
         path_prepend=_gh_rows_stub(tmp_path, rows),
     )
     assert run.rc == 0, f"{label}: rc={run.rc}{_diagnostic(run)}"
     assert run.outputs.get("sole_author") == expected, f"{label}{_diagnostic(run)}"
+    if label == "an author with no GitHub login":
+        assert "authored by ''" in run.stdout, f"failed for the wrong reason{_diagnostic(run)}"
 
 
 def _gh_arm_stub(tmp_path: Path, arm_ok: bool, head: str | None) -> Path:

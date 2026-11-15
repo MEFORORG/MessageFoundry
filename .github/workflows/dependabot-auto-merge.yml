@@ -125,10 +125,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
+          head_unknown=false
           now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || now="ERR"
           case "$now" in
             ""|ERR|*[!0-9a-f]*)
-              echo "::warning::could not read this PR's head — disarming anyway."
+              # NOT treated as stale: a stale run would leave the arm alone, and an unknown head must
+              # not take that path. Disarm, then fail the step below so nothing re-arms.
+              echo "::warning::could not read this PR's head — disarming anyway; nothing re-arms."
+              head_unknown=true
               ;;
             *)
               if [ "$now" != "$HEAD_SHA" ]; then
@@ -144,6 +148,10 @@ jobs:
           case "$armed" in
             false)
               echo "::notice::no auto-merge request is armed on this PR (a merge-queue entry is not read here)."
+              if [ "$head_unknown" = true ]; then
+                echo "::error::the PR head could not be read — failing closed, nothing re-arms."
+                exit 1
+              fi
               exit 0
               ;;
             true) ;;
@@ -157,6 +165,10 @@ jobs:
           after="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || after="ERR"
           if [ "$after" != "false" ]; then
             echo "::error::auto-merge still reads '${after}' after the disarm — failing closed, nothing re-arms."
+            exit 1
+          fi
+          if [ "$head_unknown" = true ]; then
+            echo "::error::disarmed, but the PR head could not be read — failing closed, nothing re-arms."
             exit 1
           fi
           echo "::warning::disarmed auto-merge armed on an earlier head; it re-arms only if the guardrails below admit this head."
@@ -475,38 +487,51 @@ jobs:
 
       # BACKLOG #5593. fetch-metadata derives every output above from the PR's FIRST commit, its body
       # and its branch name, never from the head, so a commit appended by anyone else would inherit
-      # the first commit's verdict. Re-arming is therefore allowed only when EVERY commit on the PR has
-      # dependabot[bot] as BOTH author and committer and a signature GitHub verified. The committer is
-      # the half that matters: anyone can write an author, but GitHub verifies a signature against the
-      # COMMITTER's account, so a pusher who names dependabot[bot] as committer cannot sign it valid.
-      # The A3 lock-resync commits name dependabot[bot] as author and are unsigned, so they hold; they
-      # land only on uv PRs, whose allow row is empty, so that costs nothing today. FAILS CLOSED: an
-      # API error, an empty list, any other identity or an unverified commit all emit false. Gated on
-      # the allow-set so a held PR makes no API call.
-      - name: Require every commit on the PR to be Dependabot's own
+      # the first commit's verdict. Re-arming is therefore allowed only when ALL of these hold: the
+      # event's SENDER (the pusher, not a commit author) is dependabot[bot]; the PR has exactly ONE
+      # commit; and that commit's author is dependabot[bot]. The sender is the half no pusher can
+      # write: a human's or the Lander's push, and a web-flow commit a human makes through the API,
+      # all carry that human as sender. The committer is not checked, because GitHub's web-flow
+      # commits Dependabot's own work. An A3 lock-resync push adds a second commit, so it holds; it
+      # lands only on uv PRs, whose allow row is empty, so that costs nothing today. FAILS CLOSED: an
+      # API error, any other sender, any commit count but one, or any other author emits false.
+      # Gated on the allow-set so a held PR makes no API call.
+      - name: Require a Dependabot push of a single Dependabot commit
         id: authors
         if: steps.allowset.outputs.eligible == 'true'
         env:
+          SENDER: ${{ github.event.sender.login }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | [(.author.login // ""), (.committer.login // ""), (.commit.verification.verified | tostring)] | @tsv' 2>/dev/null)" || rows="ERR"
-          if [ "$rows" = "ERR" ] || [ -z "$rows" ]; then
+          if [ "$SENDER" != "dependabot[bot]" ]; then
+            echo "::notice::this event was sent by '${SENDER:-<none>}', not dependabot[bot] — routing to manual review."
+            echo "sole_author=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # One `login=<author>` line per commit, so an empty login is a visible field, never a
+          # collapsed one (a whitespace IFS would shift the fields of a row with an empty value).
+          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | "login=" + (.author.login // "")' 2>/dev/null)" || rows="ERR"
+          if [ "$rows" = "ERR" ]; then
             echo "::warning::could not list this PR's commits — failing closed (manual review)."
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          sole_author=true
-          while IFS="$(printf '\t')" read -r author committer verified; do
-            if [ "$author" != "dependabot[bot]" ] || [ "$committer" != "dependabot[bot]" ] || [ "$verified" != "true" ]; then
-              echo "::notice::the PR carries a commit by '${author:-<unknown>}' committed by '${committer:-<unknown>}' (verified=${verified:-<none>}) — routing to manual review."
-              sole_author=false
-              break
-            fi
-          done <<< "$rows"
-          echo "sole_author=$sole_author" >> "$GITHUB_OUTPUT"
+          commits=()
+          if [ -n "$rows" ]; then mapfile -t commits <<< "$rows"; fi
+          if [ "${#commits[@]}" -ne 1 ]; then
+            echo "::notice::the PR has ${#commits[@]} commit(s), not exactly one — routing to manual review."
+            echo "sole_author=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${commits[0]}" != "login=dependabot[bot]" ]; then
+            echo "::notice::the PR's commit is authored by '${commits[0]#login=}', not dependabot[bot] — routing to manual review."
+            echo "sole_author=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sole_author=true" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge for in-scope updates
         # Auto-merge only when: (a) EVERY dependency is on its ecosystem's allow row (#3), AND (b)
