@@ -186,10 +186,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         control.value = displayValue(f.value);
       } else {
         control = document.createElement('input');
-        // A number box only while the recorded value is a number: the browser blanks any other
-        // value a number box is given, and the save would then drop the key.
-        const numeric = f.value === undefined || f.value === null || typeof f.value === 'number';
-        control.type = f.control === 'number' && !useEnv && numeric ? 'number' : 'text';
+        // Never a number box, only a numeric keyboard hint: a number box reads text it cannot parse
+        // as "", so a typo was saved as an emptied box and the recorded key was dropped. A text box
+        // posts what was typed; typedValue converts a number and the engine refuses anything else.
+        control.type = 'text';
+        if (f.control === 'number' && !useEnv) control.setAttribute('inputmode', 'decimal');
         control.placeholder = useEnv ? secretHint(f) : (f.placeholder || '');
         control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
       }

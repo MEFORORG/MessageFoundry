@@ -296,6 +296,25 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.deepStrictEqual(settings.headers, { "X-Feed": "orm" });
   });
 
+  test("edit: text typed into a number field that is not a number is posted, never read as a removal", () => {
+    // A number input sanitizes text it cannot parse to "", which the save read as an emptied box,
+    // so the recorded key was silently dropped instead of the typed text reaching the engine's
+    // validator.
+    const p = load({ groups });
+    const port = p.window.document.querySelector('#settings [data-key="port"]');
+    port.value = "66x2";
+    assert.strictEqual(saved(p, false).port, "66x2", "the typed text must be posted for the engine to refuse");
+    // A number still reads back as a number.
+    const q = load({ groups });
+    q.window.document.querySelector('#settings [data-key="port"]').value = " 6663 ";
+    assert.strictEqual(saved(q, false).port, 6663);
+    // The explicit Remove still removes.
+    const r = load({ groups });
+    r.window.document.querySelector('#settings [data-key="port"]').value = "66x2";
+    r.window.document.querySelector('#settings [data-remove-key="port"]').click();
+    assert.ok(!("port" in saved(r, false)), "Remove must still remove");
+  });
+
   test("edit: a transport round trip never sends a held credential, and the save keeps every one", () => {
     const p = load({ groups });
     const transport = p.window.document.getElementById("transport");
