@@ -396,7 +396,9 @@ try {
         elseif ([Console]::IsInputRedirected) { try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' } }
     }
     $moved = $false
-    if ($hasHelper -and $raw) {
+    # Resolved even with no input: an empty read that timed out or threw is a Reason, and skipping it
+    # announced the session as sitting where the hook started, the primary under the desktop app.
+    if ($hasHelper) {
         # -SelfTest is a diagnostic, so it reads the session pin and never writes one.
         $session = Enter-CcxHookSession -Text $raw -ReadOnly:$SelfTest
         $cwdFault = $session.Reason

@@ -442,6 +442,35 @@ def test_a_cwd_that_does_not_exist_reads_no_note_and_says_so_once(
     assert run_hook_with_cwd(repo, gone) is None, "the same fault was said twice in its cooldown"
 
 
+@pytest.mark.parametrize("stdin", ["{not json at all", "[1, 2]", '{"cwd": ""}'])
+def test_input_it_cannot_use_reads_no_note_and_says_so(
+    primary_and_worktree: tuple[Path, Path], stdin: str
+) -> None:
+    """BACKLOG #5586. The resolver answered these with no root and no Reason, so the hook fell back
+    to CLAUDE_PROJECT_DIR and read, removed and injected the PRIMARY session's note. The arm above
+    with no `cwd` is the control that reads it."""
+    repo, _ = primary_and_worktree
+    env = os.environ.copy()
+    env["CLAUDE_PROJECT_DIR"] = str(repo)
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+        cwd=str(repo),
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.strip()
+    ctx = str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
+    assert "PRIMARY-NOTE" not in ctx, "another session's note was read"
+    assert (repo / ".claude" / "steer.txt").exists(), "another session's note was removed"
+    # Keyed on this fixture's project directory, so the throttle cannot hide it on a first run.
+    assert ctx.startswith("[steer] Could not read this session's worktree"), ctx
+
+
 def test_the_sender_writes_to_the_worktree_it_stands_in(
     primary_and_worktree: tuple[Path, Path],
 ) -> None:

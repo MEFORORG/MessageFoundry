@@ -89,7 +89,9 @@ try {
         elseif (-not [Console]::IsInputRedirected) { $raw = '' }
         else { $raw = [Console]::In.ReadToEnd() }
     } catch { $raw = '' }
-    if ($helper -and $raw) { $cwdFault = (Enter-CcxHookSession -Text $raw).Reason }
+    # Resolved even with no input: an empty read that timed out or threw is a Reason, and skipping it
+    # stamped the record for where the hook started.
+    if ($helper) { $cwdFault = (Enter-CcxHookSession -Text $raw).Reason }
     # NOTHING IS STAMPED WITHOUT THE SESSION'S WORKTREE. The only record left to stamp is the one for
     # where this hook started, the primary under the desktop app, and a record there says this session
     # sits in the primary. The prompt itself is still printed below.

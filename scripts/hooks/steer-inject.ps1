@@ -95,7 +95,11 @@ try {
         if ($s.Root) { $project = $s.Root }
         elseif ($s.Reason) {
             $fault = $s.Reason
-            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId } else { 'cwd:' + [string]$s.Payload.cwd }
+            # Input that names neither (unparsed, or a blank cwd) is keyed on the project and the fault,
+            # or one such fault anywhere on the machine would silence every other for the cooldown.
+            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId }
+                        elseif ($s.Payload -and [string]$s.Payload.cwd) { 'cwd:' + [string]$s.Payload.cwd }
+                        else { 'input:' + [string]$env:CLAUDE_PROJECT_DIR + '|' + $s.Reason }
         }
     } catch {
         $fault = "the hook could not read its input ($($_.Exception.Message))"

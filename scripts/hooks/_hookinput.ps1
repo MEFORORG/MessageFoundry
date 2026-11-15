@@ -51,11 +51,15 @@
     worktree. Temp files older than ten minutes and pins older than thirty days are pruned at each
     pin write.
 
-    NO CWD IS NOT A FAULT. A payload with no `cwd` (an older harness, a hand-run test) answers for
-    the session's pin, or with none leaves the hook where it started. Stdin still open at the
-    read's bound IS one, because nothing says it would have named no `cwd`. A refused `cwd` is a
-    fault too, and both entry points return the Reason so the caller can say it aloud. Falling back
-    in silence is the defect this file exists to fix.
+    NO CWD IS NOT A FAULT. A JSON object with no `cwd` field (an older harness, a hand-run test)
+    answers for the session's pin, or with none leaves the hook where it started. Every other input
+    the hook cannot use IS one, because nothing says it would have named no `cwd`: stdin still open
+    at the read's bound, a stdin read that threw, input that is not a JSON object, a `cwd` field
+    that is blank, a refused `cwd`, and a `cwd` named to a hook that started inside no checkout and
+    so cannot check it. Each sets a non-empty Reason, which both entry points return so the caller
+    can say it aloud and act on no checkout. Falling back in silence is the defect this file exists
+    to fix: a caller that reads no Reason takes the start checkout, the PRIMARY under the desktop
+    app.
 
     A hook reads its input with Read-CcxHookInput and then does ONE of two things:
 
@@ -86,10 +90,12 @@ function Read-CcxHookInput {
         (announce-session.ps1 measured it), and a caller that leaves stdin open would hang an
         unbounded read. The harness writes its JSON and closes the pipe, so it never meets the bound.
         A read that does meet it says so on stderr and sets $script:CcxHookInputTimedOut, and
-        Resolve-CcxHookSession then reports a fault rather than "no cwd".
+        Resolve-CcxHookSession then reports a fault rather than "no cwd". A read that throws does the
+        same. Either way $script:CcxHookInputFault holds the Reason Resolve-CcxHookSession returns.
     #>
     param([int] $TimeoutMs = 2000)
     $script:CcxHookInputTimedOut = $false
+    $script:CcxHookInputFault = ''
     try {
         if (-not [Console]::IsInputRedirected) { return '' }
         $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
@@ -97,9 +103,16 @@ function Read-CcxHookInput {
         if ($read.Wait($TimeoutMs)) { return $read.Result }
         [Console]::Error.WriteLine("[hook-input] stdin was still open after $TimeoutMs ms, so the hook read no input.")
         $script:CcxHookInputTimedOut = $true
+        $script:CcxHookInputFault = 'the hook input was still open when the hook stopped waiting for it, so it names no cwd'
         return ''
     }
-    catch { return '' }
+    catch {
+        $why = [string]$_.Exception.Message
+        if (-not $why) { $why = 'an unnamed error' }
+        $script:CcxHookInputFault = "the hook input could not be read ($why), so it names no cwd"
+        try { [Console]::Error.WriteLine("[hook-input] the hook input could not be read ($why).") } catch { }
+        return ''
+    }
 }
 
 function Get-CcxHookPayloadCwd {
@@ -108,8 +121,10 @@ function Get-CcxHookPayloadCwd {
         What the hook input says about its directory: Named, Cwd and Reason.
 
       .DESCRIPTION
-        Named is $false when the input names no cwd at all, which is not a fault. Cwd is the resolved
-        directory when it exists. Reason says why a named cwd could not be used.
+        Named is $false when the input is a JSON object with no cwd field, or there is no input at
+        all, which is not a fault. Cwd is the resolved directory when it exists. Reason says why the
+        input or its cwd could not be used: input that is not a JSON object, or a blank cwd field,
+        sets Named and a Reason, because nothing says that input would have named no cwd.
 
         -Payload takes input already parsed, so a caller holding one does not parse it twice.
     #>
@@ -118,12 +133,25 @@ function Get-CcxHookPayloadCwd {
     $payload = $Payload
     if ($null -eq $payload) {
         if ([string]::IsNullOrWhiteSpace($Text)) { return $out }
-        try { $payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { return $out }
+        try { $payload = $Text | ConvertFrom-Json -ErrorAction Stop }
+        catch {
+            $out.Named = $true
+            $out.Reason = 'the hook input is not readable JSON, so it names no cwd this hook can use'
+            return $out
+        }
     }
-    if ($null -eq $payload -or $payload -isnot [pscustomobject] -or -not $payload.PSObject.Properties['cwd']) { return $out }
-    $dir = [string]$payload.cwd
-    if ([string]::IsNullOrWhiteSpace($dir)) { return $out }
+    if ($payload -isnot [System.Management.Automation.PSCustomObject]) {
+        $out.Named = $true
+        $out.Reason = 'the hook input is not a JSON object, so it names no cwd this hook can use'
+        return $out
+    }
+    if (-not $payload.PSObject.Properties['cwd']) { return $out }
     $out.Named = $true
+    $dir = [string]$payload.cwd
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        $out.Reason = 'the hook input names a blank cwd'
+        return $out
+    }
     try {
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
             $out.Reason = "the hook input names cwd $dir, which does not exist"
@@ -343,8 +371,9 @@ function Resolve-CcxHookSession {
           Named, SessionId, Event, Payload  what the input said.
 
         A hook started outside every checkout has no repository to check a `cwd` against and nowhere
-        to pin. It stays where it started, in silence, unless the `cwd` does not exist (a Reason) or
-        -AllowOutside takes a `cwd` that sits in no checkout.
+        to pin. It stays where it started: in silence when the input names no `cwd`, and with a
+        Reason for any `cwd` it does not take. Only -AllowOutside takes one, and only one that sits
+        in no checkout.
     #>
     param(
         [string] $Text,
@@ -362,20 +391,29 @@ function Resolve-CcxHookSession {
     }
     $startRoot = Get-CcxWorktreeRoot $StartDir
     $startCommon = Get-CcxGitCommonDir $startRoot
-    $timedOut = [bool](Get-Variable -Name CcxHookInputTimedOut -Scope Script -ValueOnly -ErrorAction Ignore)
-    # Outside every checkout a hook stays silent (below), and an open stdin does not change that,
-    # except for an -AllowOutside caller, which does act outside a checkout and must say why not.
-    if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut -and ($startCommon -or $AllowOutside)) {
+    $readFault = [string](Get-Variable -Name CcxHookInputFault -Scope Script -ValueOnly -ErrorAction Ignore)
+    # A fault inside a checkout or out of one. With no Reason a caller falls back to where it started,
+    # and steer-inject, say, then reads CLAUDE_PROJECT_DIR: the primary under the desktop app.
+    if ([string]::IsNullOrWhiteSpace($Text) -and $readFault) {
         $out.Named = $true
-        $out.Reason = 'the hook input was still open when the hook stopped waiting for it, so it names no cwd'
+        $out.Reason = $readFault
         return $out
     }
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         try { $out.Payload = $Text | ConvertFrom-Json -ErrorAction Stop } catch { $out.Payload = $null }
+        # Not an object is a fault, not "no cwd": the same text through Get-CcxHookPayloadCwd -Text
+        # gives the same Reason, so hand it over rather than restate it.
+        if ($out.Payload -isnot [System.Management.Automation.PSCustomObject]) {
+            $p = Get-CcxHookPayloadCwd -Text $Text
+            $out.Named = $true
+            $out.Reason = $p.Reason
+            $out.Payload = $null
+            return $out
+        }
     }
     # Through PSObject.Properties, because a caller under Set-StrictMode throws on a missing member.
     $source = ''
-    if ($out.Payload -is [pscustomobject]) {
+    if ($out.Payload) {
         $props = $out.Payload.PSObject.Properties
         if ($props['session_id']) { $out.SessionId = [string]$props['session_id'].Value }
         if ($props['hook_event_name']) { $out.Event = [string]$props['hook_event_name'].Value }
@@ -386,11 +424,14 @@ function Resolve-CcxHookSession {
 
     if (-not $startCommon) {
         # No repository to check against and nowhere to pin. A `cwd` in some checkout is not this
-        # session's own (it launched in none), so the hook stays put, in silence, as it did before
-        # it read any `cwd`. A missing `cwd` is still a fault, and -AllowOutside still takes one
-        # that sits in no checkout.
+        # session's own (it launched in none), so the hook stays put. -AllowOutside still takes a
+        # `cwd` that sits in no checkout. Any other named `cwd` is a fault: staying put in silence
+        # let a caller read CLAUDE_PROJECT_DIR instead.
         if ($p.Reason) { $out.Reason = $p.Reason }
         elseif ($p.Cwd -and $AllowOutside -and -not (Get-CcxWorktreeRoot $p.Cwd)) { $out.Dir = $p.Cwd; $out.Source = 'cwd' }
+        elseif ($p.Named) {
+            $out.Reason = "the hook started in $StartDir, which is inside no checkout, so it cannot check the hook input's cwd $($p.Cwd) against a repository"
+        }
         return $out
     }
 
