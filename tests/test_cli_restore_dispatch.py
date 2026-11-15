@@ -1743,7 +1743,8 @@ def test_a_later_sweep_never_touches_a_staged_store_an_earlier_restore_spared(
     # the re-marked leftover handed the name to the fail-safe: on a volume that reports one link
     # it truncated the restored store through it ("still-held"), or it removed the name its own
     # run had refused to ("released"). The decision is now a marker beside the file, and every
-    # later teardown reads it.
+    # later teardown reads it. With the marker both ids take the one path, which never reaches
+    # `_remove_tree`; each id pins the way the in-memory design failed.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     with pytest.MonkeyPatch.context() as mp:
@@ -1842,6 +1843,79 @@ def test_a_failed_rollback_leaves_its_spared_staged_store_reported_and_unswept(
     assert staged.stat().st_size == size and marker.exists()
     found = [m for m in errors.messages if "a second name for the placed store" in m]
     assert any(leftover.name in m for m in found), errors.messages
+    shutil.rmtree(leftover)
+
+
+def test_a_rollback_that_removes_the_store_only_after_the_teardown_reports_the_lone_copy(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The placed store refuses only the failed restore's first unlink, so the teardown spares the
+    # staged name as a name for it, and the rollback's second attempt then removes the store. The
+    # staged name is now the only decrypted copy: its marker says so, it is logged at ERROR, and it
+    # is never emptied, rather than left labelled as a second name for a store that is gone.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    store_refusals: list[Path] = []
+
+    def held(path: Path) -> bool:
+        if (path.name, path.parent.name) == ("msg.db", "restored") and not store_refusals:
+            store_refusals.append(path)
+            return True
+        return _is_staged_store(path)
+
+    errors = _ErrorRecords()
+    with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
+        _restore_staging_that_cannot_be_removed(mp)
+        _hold(mp, held)
+        mp.setattr(dr_backup, "_truncate_unfollowed", _truncate_ignoring_links)
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        rc = main(_restore_argv(archive, toml, dest, tmp_path / "bundle"))
+    assert rc == 1 and "member-count cap" in _refusal(capsys)
+    assert len(store_refusals) == 1 and not dest.exists()
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    staged = leftover / "extracted_store.db"
+    assert staged.stat().st_size > 0
+    assert (leftover / "extracted_store.db.mefor-spared").read_bytes() == b"rolled-back"
+    assert any("only decrypted copy" in m and str(staged) in m for m in errors.messages), (
+        errors.messages
+    )
+    shutil.rmtree(leftover)
+
+
+def test_a_spare_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
+    tmp_path, key_b64, capsys
+) -> None:
+    # Where the marker cannot be written, the spare holds for that run alone, so the directory
+    # loses the mark a sweep needs before the run lets go of its lock, and no later sweep touches
+    # the staged name, even on a volume that reports one link.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    real_release = dr_backup._Staging.release
+    marked_at_release: list[bool] = []
+
+    def release(self, **kwargs):
+        # Read while the run still holds the lock: a sweep could act the moment it lets go.
+        marked_at_release.append((self.path / ".lock-held").exists())
+        return real_release(self, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        _hold(mp, _is_staged_store)
+        mp.setattr(dr_backup, "_write_spare_marker", lambda item, reason: False)
+        mp.setattr(dr_backup._Staging, "release", release)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    capsys.readouterr()
+    assert marked_at_release and not any(marked_at_release), marked_at_release
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    staged = leftover / "extracted_store.db"
+    size = staged.stat().st_size
+    assert not (leftover / ".lock-held").exists()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_truncate_unfollowed", _truncate_ignoring_links)
+        owner = dr_backup._owner_of(leftover)
+        assert dr_backup._sweep_abandoned_staging(dest.parent, owner=owner, own=dest) == 0
+    assert staged.stat().st_size == size
+    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
     shutil.rmtree(leftover)
 
 
