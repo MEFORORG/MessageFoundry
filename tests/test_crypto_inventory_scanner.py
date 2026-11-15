@@ -1470,9 +1470,14 @@ def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
     )
     gate = _gate()
     assert gate.discover_non_python(root, repo=tmp_path) == {"ide/b.ts": frozenset({"Math.random"})}
-    # And the text APIs drop the BOM themselves, not only the file read: without that, the per-line
-    # view reads a BOM-led one-line doc comment as code.
-    assert gate.randomness_tokens_in("\ufeff/** Math.random() is weak */\nconst k = 1;\n") == set()
+    # The BOM is dropped for the lexer only. A BOM-led /*-led first line whose code the lexer
+    # misreads (a TypeScript ``!`` before a division) is still scanned by the per-line view, as
+    # origin/main scans it; dropping the BOM there too hid this draw.
+    text = (
+        '\ufeff/* hdr */ const r = m.get(k)! / total; const s = "a/b"; '
+        'const u = "http://y"; const n = Math.random();\n'
+    )
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
 
 
 def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:

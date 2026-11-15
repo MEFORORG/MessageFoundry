@@ -2399,9 +2399,8 @@ def _js_code(text: str) -> list[str]:
 
     The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
     says how) and blank real code; the per-line view still scans every line it scanned before. So
-    the gate scans at least what it scanned before #5578, except one deliberate narrowing: a leading
-    BOM is dropped first, so a BOM-led ``/** ... */`` or ``//`` first line is a comment in both
-    views, where before it was scanned. The cost is false positives from both views: the per-line
+    the gate scans at least what it scanned before #5578: the per-line view is unchanged, and only
+    the lexer's input drops a leading BOM. The cost is false positives from both views: the per-line
     view's old ones (a prose line inside a block comment that does not start with ``*``), and the
     lexer's (a comment-shaped line inside a template literal, or a real comment line kept after a
     literal misread).
@@ -2409,8 +2408,9 @@ def _js_code(text: str) -> list[str]:
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
     is unusable."""
-    text = text.removeprefix("\ufeff")
-    folded = text
+    # The BOM is dropped for the lexer only, so a BOM-led ``/**`` opens its comment there; the
+    # per-line view reads the text exactly as it did before #5578.
+    folded = text.removeprefix("\ufeff")
     for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
         folded = folded.replace(terminator, "\n")
     lexed = js_lexer.blank_js_comments(folded).split("\n")
@@ -2444,8 +2444,7 @@ def discover_non_python(root: Path, *, repo: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative path -> randomness tokens, for the files that draw randomness at all."""
     out: dict[str, frozenset[str]] = {}
     for path in non_python_sources(root):
-        # utf-8-sig, like the operation arms, so the file read drops a BOM before _js_code does.
-        tokens = randomness_tokens_in(path.read_text(encoding="utf-8-sig"))
+        tokens = randomness_tokens_in(path.read_text(encoding="utf-8"))
         if tokens:
             out[path.relative_to(repo).as_posix()] = frozenset(tokens)
     return out
