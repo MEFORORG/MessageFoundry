@@ -646,18 +646,21 @@ _PR_BARE_HOLD = re.compile(
     rf"(?i){_PR_NB}{_PR_HOLD_VERB}(?:{_PR_SEP}(?:it|them|both|each))?{_PR_SEP}(?:at{_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
 )
-#: Step 10's false-positive shapes, each read against a WHOLE unit (paragraph or table row), and no
-#: wider than the bodies engine PR 2893's review named: CI prose about HL7 v2.5.1 ("The row is not
-#: failing for 2.5.1 batches.", "The row isn't passing for 2.5.1 batches.", "Since 2.5.1 the row is not
-#: failing.") and a component row about it ("| 2.5.1 | parser | never fails |", with "is never
-#: failing." or "has never been failing" in the last cell). Any other number, word, sentence, cell,
-#: label, markup or lead in the unit fails the match, so main's hit stays.
-_PR_STEP10_PROSE = re.compile(
-    r"(?i)the row (?:is not|isn't) (?:failing|passing) for 2\.5\.1 batches\."
-    r"|since 2\.5\.1 the row (?:is not|isn't) failing\."
-)
-_PR_STEP10_ROW = re.compile(
-    r"(?i)\| 2\.5\.1 \| parser \| (?:never fails|is never failing\.|has never been failing) \|"
+#: Step 10's false positives: the six bodies engine PR 2893's review named, CI prose and a component
+#: row about HL7 v2.5.1. scan_pr_body compares each, case-sensitively and byte for byte, with the
+#: WHOLE pull request body as given, surrounding whitespace included. Only a body equal to one of them
+#: drops a verdict, and only one an unmarked identifier or an unmarked row binds. Any other body,
+#: however close (another case, a heading, a table header, a quote marker, an indent, a link, a
+#: trailing newline, a second line), keeps every verdict.
+_PR_STEP10_BODIES = frozenset(
+    {
+        "The row is not failing for 2.5.1 batches.",
+        "The row isn't passing for 2.5.1 batches.",
+        "Since 2.5.1 the row is not failing.",
+        "| 2.5.1 | parser | never fails |",
+        "| 2.5.1 | parser | is never failing. |",
+        "| 2.5.1 | parser | has never been failing |",
+    }
 )
 _PR_GAP = re.compile(
     rf"(?i){_PR_EB}(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
@@ -1169,8 +1172,10 @@ def scan_pr_body(body: str) -> list[str]:
     starts = _pr_table_starts(units, blanks, quote_blanks, quoted)
     asvs = _pr_table_columns(units, starts)
     loose = _pr_loose_columns(units, starts)
+    # The raw body as given, not a unit or a rendered reading of it: see _PR_STEP10_BODIES.
+    step10 = body in _PR_STEP10_BODIES
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
-        _pr_scan_unit(unit, unit_asvs, unit_loose, found)
+        _pr_scan_unit(unit, unit_asvs, unit_loose, step10, found)
     # Where the body holds an invisible character, it is read again with each one deleted. A unit
     # whose text and columns that leaves unchanged reads the same, so only the others are scanned.
     if _PR_INVISIBLE.search(body) is not None:
@@ -1185,7 +1190,7 @@ def scan_pr_body(body: str) -> list[str]:
             strict=True,
         ):
             if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
-                _pr_scan_unit(unit, unit_asvs, unit_loose, found)
+                _pr_scan_unit(unit, unit_asvs, unit_loose, step10, found)
     # One hit per kind per line, in line order, however many readings found it.
     kinds = list(PR_BODY_REASONS)
     return [f"pr-body:{line}: {PR_BODY_REASONS[kinds[kind]]}" for line, kind in sorted(found)]
@@ -1195,21 +1200,16 @@ def _pr_scan_unit(
     unit: tuple[list[tuple[int, int]], str, bool],
     asvs_columns: set[int],
     loose_columns: set[int],
+    step10: bool,
     hits: set[tuple[int, int]],
 ) -> None:
-    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
+    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind).
+    ``step10`` says the whole body is one of _PR_STEP10_BODIES."""
     marks, unit_text, is_row = unit
-    step10 = _pr_step10_false_positive(unit_text, is_row)
     for start, sentence in _pr_sentences(unit_text, is_row):
         found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns, step10)
         for kind_index, kind in enumerate(PR_BODY_REASONS):
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
-
-
-def _pr_step10_false_positive(unit: str, is_row: bool) -> bool:
-    """Whether a whole unit is one of step 10's false-positive shapes (_PR_STEP10_PROSE,
-    _PR_STEP10_ROW)."""
-    return (_PR_STEP10_ROW if is_row else _PR_STEP10_PROSE).fullmatch(unit.strip()) is not None
 
 
 def _pr_sentence_found(
@@ -1217,10 +1217,9 @@ def _pr_sentence_found(
 ) -> dict[str, list[int]]:
     """Every binding in one sentence of a unit, by kind, as offsets into it.
 
-    ``step10`` says the whole unit is one of step 10's false-positive shapes
-    (_pr_step10_false_positive). Only then is a verdict dropped, and only one that an identifier the
-    text does not mark binds, or that an unmarked row binds; a marked identifier's verdict, a tight
-    pair's, and every gap and map stay."""
+    ``step10`` says the whole pull request body is one of _PR_STEP10_BODIES. Only then is a verdict
+    dropped, and only one that an identifier the text does not mark binds, or that an unmarked row
+    binds; a marked identifier's verdict, a tight pair's, and every gap and map stay."""
     # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
     # earlier identifier bind must not move a hit off the line main reported it at.
     found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}

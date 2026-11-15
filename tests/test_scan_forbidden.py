@@ -1267,8 +1267,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
         )
         for code in (0x0C, 0x85, 0x2028)
     ),
-    # Step 10 drops only a whole unit of its false-positive shape: a cell that goes on past "never
-    # failing" keeps the row bound.
+    # Step 10 drops only its six named whole bodies: a cell that goes on past "never failing" keeps
+    # the row bound.
     ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; stays failing |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; re-scored as failing |"),
@@ -1294,12 +1294,12 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
 ]
 #: Bodies main flags through a "row is not failing" or "never fails" clause, or beside one, that are
-#: not step 10's false-positive shape, so step 10 must not drop them. Each must fire on main and on
+#: not one of step 10's six named bodies, so step 10 must not drop them. Each must fire on main and on
 #: head, at main's lines. The first ten are the Lander's hold on engine PR 2980 (blocking points 1 to
 #: 3); the next nineteen are the bodies review rounds 4f580a28dd and b628ef8690 listed, which an
 #: earlier draft of step 10 dropped by name and the hold's point 4 kept flagged (the first two of
-#: them say "tests pass" or "will fail" after the clause); the rest are review rounds cc2be34b's and
-#: df2d868b's.
+#: them say "tests pass" or "will fail" after the clause); then review rounds cc2be34b's and
+#: df2d868b's; the last are the final round's on head 28bcdc34ef.
 _PR_STEP10_MUST_FIRE: list[str] = [
     f"The row is not failing: {_REQ} here.",
     f"| never fails: {_REQ} |",
@@ -1377,22 +1377,68 @@ _PR_STEP10_MUST_FIRE: list[str] = [
     "| 2.5.1 | parser | is never passing |",
     "The row is not failing for 2.5.1.",
     "The row is not failing for 2.5.1 batches either.",
+    # The last, unrepaired review round on head 28bcdc34ef: an earlier draft matched step 10's shapes
+    # as two case-insensitive regular expressions against one rendered unit, so it dropped bodies not
+    # among the six. A cross product of the shapes' alternatives, other case, a heading or another
+    # unit around the shape, a table header, a column mark step 9 removes, and rendering (a quote
+    # marker, an indent, a link, a wrapped line, surrounding whitespace).
+    "The row isn't failing for 2.5.1 batches.",
+    "The row is not passing for 2.5.1 batches.",
+    "Since 2.5.1 the row isn't failing.",
+    "the row is not failing for 2.5.1 batches.",
+    "THE ROW IS NOT FAILING FOR 2.5.1 BATCHES.",
+    "since 2.5.1 the row is not failing.",
+    "| 2.5.1 | Parser | never fails |",
+    "| 2.5.1 | PARSER | NEVER FAILS |",
+    "## ASVS 2.5.1\n\nThe row is not failing for 2.5.1 batches.",
+    "ASVS 2.5.1\n\n| 2.5.1 | parser | never fails |",
+    "> The row is not failing for 2.5.1 batches.",
+    "    The row is not failing for 2.5.1 batches.",
+    "> | 2.5.1 | parser | never fails |",
+    "  | 2.5.1 | parser | never fails |",
+    "| [2.5.1](https://example.com/asvs#2.5.1) | parser | never fails |",
+    "The row is not failing\nfor 2.5.1 batches.",
+    "The row is not failing for 2.5.1 batches.\n",
+    " The row is not failing for 2.5.1 batches.",
+]
+#: Step 9's deliberate drop: a blank line ends an ASVS-headed table, so a headerless pipe block after
+#: it is unmarked.
+_STEP9_QUIET_BODY = f"{_HEAD}| a | b | c |\n\n{_ROW}"
+#: Step 10's deliberate drops: the six whole bodies engine PR 2893's review named, two of the three
+#: newly flagged lines it listed and their kin (the third, "<id>, which is na", is the comma spelling
+#: of a sentence that already flagged without one). Each is a whole body; the scanner's own copy is
+#: _PR_STEP10_BODIES, pinned equal to this one below.
+_STEP10_QUIET_BODIES = (
+    "| 2.5.1 | parser | never fails |",
+    "The row is not failing for 2.5.1 batches.",
+    "The row isn't passing for 2.5.1 batches.",
+    "| 2.5.1 | parser | is never failing. |",
+    "| 2.5.1 | parser | has never been failing |",
+    "Since 2.5.1 the row is not failing.",
+)
+#: Tables whose last row is one of step 10's bodies, under a header that marks it or with a column
+#: mark step 9 removes. The body is not one of the six, so step 10 keeps every hit main reports.
+_STEP10_TABLE_CONTEXT_BODIES = [
+    *(
+        f"{header}\n|---|---|---|\n| 2.5.1 | parser | never fails |"
+        for header in (
+            "| Requirement | Component | Result |",
+            "| Cell | Component | Result |",
+            "| Version | Component | ASVS |",
+            "| ASVS | Component | Result |",
+        )
+    ),
+    # Step 9 ends the table at the blank line, so the last row reads unmarked, as the bare body does.
+    f"{_HEAD}| a | b | c |\n\n| 2.5.1 | parser | never fails |",
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
     ("5", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n| - | - | - |\n{_ROW}"),
     # Step 6: the same rules after a table whose header does not name the column ASVS.
     ("6", f"| Version | Note | Result |\n|---|---|---|\n{_ROW}\n---"),
-    # Step 9: a blank line ends the ASVS-headed table, so a headerless pipe block after it is unmarked.
-    ("9", f"{_HEAD}| a | b | c |\n\n{_ROW}"),
+    ("9", _STEP9_QUIET_BODY),
     ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
-    # Step 10: two of the three newly flagged lines engine PR 2893 listed, and their kin. The third,
-    # "<id>, which is na", is the comma spelling of a sentence that already flagged without one.
-    ("10", "| 2.5.1 | parser | never fails |"),
-    ("10", "The row is not failing for 2.5.1 batches."),
-    ("10", "The row isn't passing for 2.5.1 batches."),
-    ("10", "| 2.5.1 | parser | is never failing. |"),
-    ("10", "| 2.5.1 | parser | has never been failing |"),
+    *(("10", body) for body in _STEP10_QUIET_BODIES),
     # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
     ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
     # Step 11: a header naming a requirement but not ASVS, or disclaiming ASVS, marks no column.
@@ -1402,8 +1448,6 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 11: a snake_case join is not emphasis, so these words stay inside their names.
     ("11", "The `retry_gap` setting is read for 2.5.1 batches."),
     ("11", "The example_row_is_failing flag is set for 2.5.1 batches."),
-    # Step 10's word order with the version first: a plain space before "the row" marks nothing.
-    ("10", "Since 2.5.1 the row is not failing."),
     # Step 11: zero-width characters around a cell beside an unmarked HL7 version.
     ("11", f"| 2.5.1 | ADT^A01 |\u200b{_PASS.title()} (12 messages)\u200b|"),
     # Review round-23e833d96f's false positives against main, quiet on main: an emphasis underscore
@@ -1436,8 +1480,48 @@ def test_a_pr_body_shape_engine_pr_2893_review_found_is_flagged(
 def test_step_ten_keeps_every_hit_main_reports_beside_a_verdict_or_a_label(
     sf, sf_frozen_main, body: str
 ) -> None:
-    """Step 10 drops only its false-positive shape, so each body fires on main and on head, and head
+    """Step 10 drops only its six named bodies, so each body fires on main and on head, and head
     reports every hit main reports, at main's line."""
+    main_hits = set(sf_frozen_main.scan_pr_body(body))
+    assert main_hits, body
+    assert main_hits <= set(sf.scan_pr_body(body)), body
+
+
+def test_step_ten_drops_exactly_the_six_named_bodies(sf) -> None:
+    """The scanner's set is the six bodies this file lists as step 10's deliberate drops, no more."""
+    assert frozenset(_STEP10_QUIET_BODIES) == sf._PR_STEP10_BODIES
+    assert len(set(_STEP10_QUIET_BODIES)) == 6
+
+
+@pytest.mark.parametrize("body", _STEP10_QUIET_BODIES)
+def test_step_ten_keeps_mains_hits_on_any_edit_of_a_named_body(sf, sf_frozen_main, body) -> None:
+    """A one-step edit of a named body (case, a lead or trailing character, a quote marker, an
+    indent, a second line) is another body, so it keeps every hit main reports."""
+    edits = {
+        body.lower(),
+        body.upper(),
+        body.swapcase(),
+        f" {body}",
+        f"{body} ",
+        f"{body}\n",
+        f"\n{body}",
+        f"> {body}",
+        f"    {body}",
+        f"{body}\n\nMore.",
+        f"Intro.\n\n{body}",
+    } - {body}
+    for edit in sorted(edits):
+        main_hits = set(sf_frozen_main.scan_pr_body(edit))
+        assert main_hits, edit
+        assert main_hits <= set(sf.scan_pr_body(edit)), edit
+
+
+@pytest.mark.parametrize("body", _STEP10_TABLE_CONTEXT_BODIES)
+def test_step_ten_keeps_mains_hits_on_a_named_row_inside_a_table(sf, sf_frozen_main, body) -> None:
+    """A table header (a Requirement or Cell header, ASVS in another column) or a column mark step 9
+    removes never reaches step 10, which reads the whole body: the same row alone is dropped."""
+    assert body.rsplit("\n", 1)[1] in sf._PR_STEP10_BODIES
+    assert sf.scan_pr_body(body.rsplit("\n", 1)[1]) == []
     main_hits = set(sf_frozen_main.scan_pr_body(body))
     assert main_hits, body
     assert main_hits <= set(sf.scan_pr_body(body)), body
@@ -1466,20 +1550,13 @@ _FROZEN_MAIN_BLOB = "0c6e61278ae36990232a06cf6d88dd2561ec65a0"
 #: The separators str.splitlines ends a line at and GFM does not. GFM's own ("\r" twice is a blank
 #: line) are step 9's to end a table at.
 _SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
-#: The bodies main flags that the repairs quiet ON PURPOSE, by name, each with its ruled step. Every
-#: other hit main reports in the constructed set and the tracked corpus, head must report too, at the
-#: same line.
+#: The bodies main flags that the repairs quiet ON PURPOSE, keyed by the body itself, each with its
+#: ruled step. Every other hit main reports in the constructed set and the tracked corpus, head must
+#: report too, at the same line.
 _SUPERSET_EXCEPTIONS = {
-    # Step 9: a blank line ends an ASVS-headed table, so pipe rows after it are unmarked.
-    "stay-quiet-2-step9": "9",
-    # Step 10: only these six bodies, the whole unit an exact shape (_PR_STEP10_PROSE,
-    # _PR_STEP10_ROW) about HL7 v2.5.1.
-    "stay-quiet-4-step10": "10",
-    "stay-quiet-5-step10": "10",
-    "stay-quiet-6-step10": "10",
-    "stay-quiet-7-step10": "10",
-    "stay-quiet-8-step10": "10",
-    "stay-quiet-15-step10": "10",
+    _STEP9_QUIET_BODY: "9",
+    # Step 10: the six whole bodies, compared byte for byte (_PR_STEP10_BODIES).
+    **dict.fromkeys(_STEP10_QUIET_BODIES, "10"),
 }
 
 
@@ -1527,6 +1604,9 @@ def _superset_bodies() -> dict[str, str]:
     )
     bodies.update({f"header-table-{name}": body for name, body in _PR_HEADER_TABLE_BODIES.items()})
     bodies.update({f"step10-fire-{i}": body for i, body in enumerate(_PR_STEP10_MUST_FIRE)})
+    bodies.update(
+        {f"step10-table-{i}": body for i, body in enumerate(_STEP10_TABLE_CONTEXT_BODIES)}
+    )
     bodies.update(
         {f"must-fire-{i}-step{s}": body for i, (s, _, body) in enumerate(_PR_FINDINGS_MUST_FIRE)}
     )
@@ -1596,11 +1676,12 @@ def test_every_superset_exception_names_a_body_main_flags_and_head_drops(
 ) -> None:
     """An exception that names no body, a body main does not flag, or a body where head now reports
     every hit main reports, excuses nothing and is stale."""
-    for name in _SUPERSET_EXCEPTIONS:
-        body = _SUPERSET_BODIES[name]
+    listed = set(_SUPERSET_BODIES.values())
+    for body in _SUPERSET_EXCEPTIONS:
+        assert body in listed, body
         main_hits = set(sf_frozen_main.scan_pr_body(body))
-        assert main_hits, name
-        assert main_hits - set(sf.scan_pr_body(body)), name
+        assert main_hits, body
+        assert main_hits - set(sf.scan_pr_body(body)), body
 
 
 @pytest.mark.parametrize("name", sorted(_SUPERSET_BODIES))
@@ -1610,9 +1691,9 @@ def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
     """BACKLOG #3364: on each constructed body, head reports every hit main reports, at main's line
     number, except the deliberate step 9 and step 10 drops named in _SUPERSET_EXCEPTIONS. A finite
     set: it pins these bodies, and a loss on a body outside it is not caught here."""
-    if name in _SUPERSET_EXCEPTIONS:
-        pytest.skip(f"step {_SUPERSET_EXCEPTIONS[name]} drops this body's hits on purpose")
     body = _SUPERSET_BODIES[name]
+    if body in _SUPERSET_EXCEPTIONS:
+        pytest.skip(f"step {_SUPERSET_EXCEPTIONS[body]} drops this body's hits on purpose")
     lost = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
     assert not lost, (name, sorted(lost))
 
