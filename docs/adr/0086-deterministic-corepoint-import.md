@@ -201,8 +201,9 @@ handler keeps its `sends` list, so the handler neither filters silently nor gain
 is accurate. The summary counts the statement as unmapped.
 
 Field writes map onto `msg` only for the one handle the list delivers. A list that delivers two
-different handles maps no field write at all. That holds for role-parsed writes: a write that takes
-the flat reading names no handle (the first gap below).
+different handles maps no field write at all. That holds for role-parsed writes only. A write that
+takes the flat reading is not gated by handle: `ItemClear %OUT/PID-19`, read flat, still writes
+`msg` (the first gap below).
 
 At least these gaps remain:
 
