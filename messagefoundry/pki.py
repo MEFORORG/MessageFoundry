@@ -16,6 +16,7 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
+import functools
 import ipaddress
 import logging
 import os
@@ -36,7 +37,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.utils import CryptographyDeprecationWarning
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.keywrap import (
     DerTlv,
@@ -601,7 +602,8 @@ _UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWa
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
 #: :class:`IssuerIndex` also refuses a file holding a CA that raises one, and its ``issuer_of``
 #: names no issuer for a client LEAF that raises one, so narrowing this tuple reaches both (BACKLOG
-#: #4948).
+#: #4948). So does :func:`_signed_by`, which reads a CA whose authority key identifier match
+#: raises one as not having signed that CRL, failing closed (vault BACKLOG #5627).
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
@@ -1079,29 +1081,38 @@ def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
     When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
     identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no
     AKID or no key identifier fits, and so does a CA with no Subject Key Identifier, but none of
-    those names the key."""
+    those names the key.
+
+    **A CA whose extensions do not read, where the AKID needs them, raises** ``ValueError``, or
+    another of :data:`_UNREADABLE_CA`, rather than reading as ruled out: OpenSSL skips the key
+    identifier check where it reads no identifier, so the CRL may still be one it judges that
+    CA's peers by. The serial number and the issuer name are matched first, so a CRL they rule
+    the CA out of never reads its extensions. :func:`_signature_state` reads such a CA as not
+    fitting that CRL, as it read ``None`` before, and :func:`_signed_by` as not having signed it
+    (vault BACKLOG #5627)."""
     if akid is None:
         return False
     ca = listed.cert
+    if akid.serial is not None and akid.serial != listed.serial:
+        return None
+    # By the name test the issuer match uses, since OpenSSL compares this name by the same
+    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
+    # as it did before vault BACKLOG #3543.
+    if akid.issuers and _issuer_name_key(ca.issuer) not in akid.issuers:
+        return None
     names_key = False
     if akid.key_identifier is not None:
         try:
             ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
         except x509.ExtensionNotFound:
             ski = None
-        except (x509.DuplicateExtension, ValueError):
-            return None
+        except x509.DuplicateExtension as exc:
+            raise ValueError(f"the CA's extensions do not read: {exc}") from exc
         if ski is not None:
             if ski != akid.key_identifier:
                 return None
             names_key = True
-    if akid.serial is not None and akid.serial != listed.serial:
-        return None
-    # By the name test the issuer match uses, since OpenSSL compares this name by the same
-    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
-    # as it did before vault BACKLOG #3543.
-    fits = not akid.issuers or _issuer_name_key(ca.issuer) in akid.issuers
-    return names_key if fits else None
+    return names_key
 
 
 def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
@@ -1212,6 +1223,100 @@ def crl_pem_blocks(pem: bytes) -> list[bytes]:
     says which). For a caller that must find or compare the CRLs inside a file that also holds
     certificates, such as a CA bundle (vault BACKLOG #2319)."""
     return list(_crl_blocks(pem))
+
+
+def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[str, int]]:
+    """Each CA in ``ca_ders`` that ``crl_pem`` gives no CRL of its own, as its subject in RFC 4514
+    form and its certificate's serial number (vault BACKLOG #5627). Under a whole-chain CRL check
+    OpenSSL needs a loaded CA's own CRL for every certificate it issued, a leaf or an intermediate
+    a client sends, so without it every client under that CA is refused.
+
+    **A CA's candidates are the CRLs OpenSSL may judge its clients by**: those that carry its
+    name and that its authority key identifier does not rule out (:func:`_akid_fit`). OpenSSL
+    finds a CRL by name, so a CRL the CA's key signed under another name is no candidate. The
+    name is compared by :func:`_openssl_name_key`, the engine's model of OpenSSL's comparison,
+    white space folded, so a CRL whose issuer differs only in white space is a candidate, though
+    :func:`_signature_state` reads it ``unlisted``. **A CA has a CRL of its own when it has at
+    least one candidate and signed every one** (:func:`_signed_by`). Every one, since OpenSSL
+    picks among them by its own score and by date: in a rollover that keeps the name under a new
+    key, a CRL that names no key is a candidate for both CAs and one of them did not sign it.
+    That is stricter than OpenSSL where the CA's own CRL would win the pick. Raises
+    ``ValueError`` naming which file did not parse."""
+    try:
+        crls = [
+            (crl, _openssl_name_key(crl.issuer), _crl_extensions(crl).akid)
+            for crl in map(x509.load_pem_x509_crl, _crl_blocks(crl_pem))
+        ]
+    except _UNREADABLE_CA as exc:
+        raise ValueError(f"a CRL block does not parse: {exc}") from exc
+    missing: list[tuple[str, int]] = []
+    for der in ca_ders:
+        try:
+            ca = _listed_ca(der)
+            name = _openssl_name_key(ca.cert.subject)
+        except _UNREADABLE_CA as exc:
+            raise ValueError(f"a loaded client CA does not parse: {exc}") from exc
+        verdicts = [
+            verdict
+            for crl, crl_name, akid in crls
+            if crl_name == name and (verdict := _signed_by(crl, akid, ca)) is not None
+        ]
+        if not verdicts or not all(verdicts):
+            missing.append((ca.cert.subject.rfc4514_string(), ca.serial))
+    return missing
+
+
+def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
+    """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
+    after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
+    named with its serial number, since two CAs can share a name, in one order whatever order the
+    caller read them in."""
+    named = ", ".join(
+        f"{quoted_issuer(subject)} (serial number {serial:#x})"
+        for subject, serial in sorted(missing)
+    )
+    return (
+        f"the loaded client CA(s) {named} have no CRL of their own in it. Each needs a CRL that "
+        "carries its name and that its key signed, and every other CRL under its name that it "
+        "fits must be signed by it too, since OpenSSL may judge its clients by any of them. The "
+        "whole client chain is checked against this file, so every client under such a CA would "
+        "be refused. Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
+        "authority key identifier that rules the other CA out: one naming the signing CA's key "
+        "separates two CAs that each carry a subject key identifier, and one naming the signing "
+        "CA's issuer and serial number separates two CAs unless they share both. A CA with no "
+        "subject key identifier fits every CRL whose authority key identifier names a key alone, "
+        "so beside another CA of its name it stays refused until that CA's CRLs also name their "
+        "signer's issuer and serial number, or it is reissued with a subject key identifier. A "
+        "CRL under a CA's name also counts as not its own where the engine cannot read the CA's "
+        "certificate well enough to match that CRL's authority key identifier against it: "
+        "reissue such a CA"
+    )
+
+
+def _signed_by(
+    crl: x509.CertificateRevocationList, akid: _CrlAkid | None, ca: _ListedCa
+) -> bool | None:
+    """Whether ``ca``, which carries ``crl``'s issuer name, signed it: ``None`` when the CRL's
+    Authority Key Identifier ``akid`` rules the CA out (:func:`_akid_fit`), so the CRL is no
+    candidate for it.
+
+    **A CA whose AKID fit raises one of** :data:`_UNREADABLE_CA` **is False, fail closed**, as
+    :func:`_signature_state` credits such a CA with no CRL. The engine cannot rule the CRL out as
+    a candidate OpenSSL may judge the CA's clients by, nor show it is the CA's own, so whatever the
+    CA's key says, the CA has no CRL of its own.
+
+    Otherwise True when the CA's key verifies the CRL, or when the engine cannot check the
+    signature and the CRL names the CA's key by key identifier, which a start loads with a warning
+    (``uncheckable``). A signature that cannot be checked proves nothing where no key is named,
+    since a key of another kind than the signature cannot check it either, so that is False."""
+    try:
+        names_key = _akid_fit(akid, ca)
+    except _UNREADABLE_CA:
+        return False
+    if names_key is None:
+        return None
+    verified = _verifies(crl, ca.cert)
+    return verified is True or (verified is None and names_key)
 
 
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
@@ -1652,6 +1757,13 @@ class _Anchor:
     position: int
 
 
+#: How many leaves one :class:`IssuerIndex` remembers its answer for (BACKLOG #5628). The answer
+#: is a pure function of the leaf and the index, which never changes once built, so a repeat
+#: connection from the same client costs a dict read rather than a signature check on the event
+#: loop. Bounded, least recently used out first, so a stream of distinct leaves cannot grow it.
+ISSUER_CACHE_SIZE = 1024
+
+
 class IssuerIndex:
     """Which loaded client CA directly issued a verified client certificate (BACKLOG #2237).
 
@@ -1687,6 +1799,9 @@ class IssuerIndex:
         # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
         # unmatched_keys does not call it a CA.
         self._pinned_subjects: set[str] = set()
+        # BACKLOG #5628: issuer_of's answers, keyed by the leaf and whether clientAuth was asked
+        # for. lru_cache is bounded and safe to call from a worker thread as well as the loop.
+        self._answers = functools.lru_cache(maxsize=ISSUER_CACHE_SIZE)(self._issuer_of)
         read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
@@ -1718,21 +1833,35 @@ class IssuerIndex:
                 if not anchor.ca:
                     self._pinned_subjects.add(subject)
 
-    def issuer_of(self, leaf_der: bytes) -> str:
+    def issuer_of(self, leaf_der: bytes, *, require_client_auth: bool = False) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
         ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA, or a
         self-signed certificate pinned as itself, with a DIFFERENT key shares the issuing CA's
         subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate
-        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises."""
+        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises.
+
+        With ``require_client_auth``, also ``""`` for a leaf whose extended key usage does not name
+        ``clientAuth``, or that carries none (BACKLOG #5628). OpenSSL refuses a client certificate
+        whose extended key usage leaves ``clientAuth`` out, but admits one with no such extension
+        at all, so without this a certificate issued for any purpose would map to a principal.
+
+        Each answer is remembered for :data:`ISSUER_CACHE_SIZE` leaves (BACKLOG #5628)."""
+        answer: str = self._answers(leaf_der, require_client_auth)
+        return answer
+
+    def _issuer_of(self, leaf_der: bytes, require_client_auth: bool) -> str:
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
+            if require_client_auth and not _names_client_auth(leaf):
+                return ""
             issuers = [
                 anchor
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
                 if (anchor.ca or anchor.der == leaf_der) and _directly_issued(leaf, anchor.cert)
             ]
-        except _UNREADABLE_CA:
+        except (*_UNREADABLE_CA, x509.DuplicateExtension):
+            # DuplicateExtension: a leaf listing one extension twice, read by _names_client_auth.
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:
@@ -2105,6 +2234,17 @@ def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
             type(exc).__name__,
         )
         return None, False
+
+
+def _names_client_auth(leaf: x509.Certificate) -> bool:
+    """Whether ``leaf``'s extended key usage names ``clientAuth`` (BACKLOG #5628). A leaf with no
+    such extension names nothing, and ``anyExtendedKeyUsage`` does not stand in for it. An
+    extension that does not parse raises, which :meth:`IssuerIndex.issuer_of` reads as no issuer."""
+    try:
+        usage = leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        return False
+    return ExtendedKeyUsageOID.CLIENT_AUTH in usage
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:

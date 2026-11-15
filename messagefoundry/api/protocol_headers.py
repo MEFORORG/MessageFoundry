@@ -636,7 +636,7 @@ def floored_http_protocol_class(base: type[Any] | None = None) -> type[asyncio.P
     """uvicorn's HTTP protocol with the headers on its ``400`` and on each cycle's ``500``.
 
     ``base`` defaults to :func:`pinned_http_protocol_base`, never to uvicorn's ``AutoHTTPProtocol``.
-    Compose, never replace: ``client_cert_http_protocol_class(base=<this>)`` stacks the mTLS shim on
+    Compose, never replace: ``client_cert_http_protocol_class(base=<this>, trusted_proxies=...)`` stacks the mTLS shim on
     top, since the two override different methods.
 
     Raises :class:`ProtocolFloorUnavailable` when ``base`` lacks a hook, or when the pinned base
