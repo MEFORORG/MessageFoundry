@@ -17,8 +17,12 @@ process is structural; ADR 0068 records the store-backed table as the multi-node
 Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attestation certificates are
 requested or stored, and this module configures no attestation trust anchor; the engine's
 operator-supplied anchors are :mod:`messagefoundry.auth.trust_anchors`),
-``user_verification=PREFERRED`` (the knowledge factor is the password that accompanies every
-step-up; ``REQUIRED`` would brick PIN-less U2F keys for no factor gain), the credential algorithm
+``user_verification=PREFERRED`` (``REQUIRED`` would brick PIN-less U2F keys; a passkey-only assertion
+without the UV flag meets the factor but opens no step-up window, and when it completes a pending
+factor it clears one already open, vault BACKLOG #2964 item 14; the
+flag is the authenticator's own report in its signed authenticator data, and with no attestation
+the engine does not verify which authenticator made it, so it is not a factor the engine checked),
+the credential algorithm
 set (:data:`SUPPORTED_COSE_ALGS`), and the key type and curve each algorithm must arrive in
 (:data:`_COSE_KEY_SHAPE_FOR_ALG`), checked at registration and again at every sign-in.
 """
@@ -626,6 +630,16 @@ def assertion_options(
     return options_to_json(options)
 
 
+@dataclass(frozen=True)
+class AssertionResult:
+    """What a verified assertion proved: the authenticator's new sign count, and whether the
+    signed authenticator data carried the user-verified (UV) flag. Both come from the authenticator
+    data the signature covers, never from client-supplied fields."""
+
+    new_sign_count: int
+    user_verified: bool
+
+
 def verify_assertion(
     *,
     response_json: str | dict[str, Any],
@@ -634,8 +648,8 @@ def verify_assertion(
     origin: str,
     public_key: bytes,
     current_sign_count: int,
-) -> int:
-    """Verify an assertion; return the authenticator's new sign count.
+) -> AssertionResult:
+    """Verify an assertion; return the authenticator's new sign count and its UV flag.
 
     py_webauthn enforces counter increment only when both counts are >0 (synced-passkey 0/0 is
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
@@ -678,7 +692,7 @@ def verify_assertion(
         # service's clone-signal classification. The raw types stay caught although the stored
         # key was screened above: the response itself is attacker input too.
         raise _refusal(exc, ceremony="assertion") from exc
-    return verified.new_sign_count
+    return AssertionResult(verified.new_sign_count, bool(verified.user_verified))
 
 
 def parse_response(response_json: str) -> dict[str, Any]:

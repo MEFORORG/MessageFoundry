@@ -109,6 +109,12 @@ export function engineUrl(): string {
   return config().get<string>("engineUrl", "https://127.0.0.1:8765");
 }
 
+/** Whether the operator configured the engine target: `messagefoundry.engineUrl` set rather than
+ *  left at its default, or any named `environments` (BACKLOG #5564; see pickOfflinePolicy). */
+export function engineTargetIsSet(): boolean {
+  return settingIsSet(config().inspect("engineUrl")) || environments().length > 0;
+}
+
 /** One addressable engine instance within an environment (e.g. a horizontal shard / replica). */
 export interface Shard {
   name: string;

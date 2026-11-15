@@ -12,8 +12,10 @@ Design rules (CLAUDE.md §8): separators are read from the message's own ``MSH``
 mutate via string slicing). Pure + stdlib + the read-only ``messagefoundry.parsing`` library only.
 
 Field indexing follows HL7: ``MSH-1`` is the field separator itself and ``MSH-2`` the encoding
-characters, so an ``MSH`` field number ``N`` lands at split index ``N-1``; every other segment's field
-``N`` is at split index ``N`` (index 0 being the segment id). :func:`_field_index` hides this quirk.
+characters, so splitting an ``MSH`` line lands field ``N`` at index ``N-1`` and loses ``MSH-1``.
+:func:`_segments` puts the separator back at index 1 of each ``MSH`` row, so in every canonical row,
+``MSH`` included, field ``N`` is at index ``N`` (index 0 being the segment id), and two messages that
+differ only in their declared separator do not compare equal.
 """
 
 from __future__ import annotations
@@ -109,18 +111,17 @@ class Difference:
         return f"{self.kind} @ {loc}: left={self.left!r} right={self.right!r}"
 
 
-def _field_index(segment_id: str, field_no: int) -> int:
-    """Map an HL7 field number to its split index (MSH-1 = the separator → MSH is off by one)."""
-    return field_no - 1 if segment_id == "MSH" else field_no
-
-
 def _segments(message: str, sep: Separators) -> list[list[str]]:
-    """Split a message into segments, each a list of fields, on the message's own separators."""
+    """Split a message into segments, each a list of fields indexed by HL7 field number, on the
+    message's own separators. Splitting an ``MSH`` line consumes ``MSH-1``, so it is put back."""
     norm = _normalize_line_endings(message)
     out: list[list[str]] = []
     for line in norm.split("\r"):
         if line.strip():
-            out.append(line.split(sep.field))
+            fields = line.split(sep.field)
+            if fields[0] == "MSH":
+                fields.insert(1, sep.field)
+            out.append(fields)
     return out
 
 
@@ -144,16 +145,12 @@ def normalize(message: str, rules: NormalizeRules | None = None) -> list[list[st
             continue
         row = list(fields)
         for f_seg, f_no in rules.blank_fields:
-            if f_seg == seg_id:
-                idx = _field_index(seg_id, f_no)
-                if 0 <= idx < len(row):
-                    row[idx] = ""
+            if f_seg == seg_id and 0 < f_no < len(row):
+                row[f_no] = ""
         for r_seg, r_no in rules.sort_repetition_fields:
-            if r_seg == seg_id:
-                idx = _field_index(seg_id, r_no)
-                if 0 <= idx < len(row):
-                    reps = row[idx].split(sep.repetition)
-                    row[idx] = sep.repetition.join(sorted(reps))
+            if r_seg == seg_id and 0 < r_no < len(row):
+                reps = row[r_no].split(sep.repetition)
+                row[r_no] = sep.repetition.join(sorted(reps))
         canon.append(row)
 
     if rules.any_position_segments:
@@ -352,13 +349,15 @@ def _diff_fields(seg_id: str, occ: int, left: list[str], right: list[str]) -> li
         rv = right[idx] if idx < len(right) else None
         if lv == rv:
             continue
-        # Report by HL7 field number (inverse of _field_index): MSH split idx N → field N+1; else N.
-        field_no = idx + 1 if seg_id == "MSH" else idx
+        # A canonical row is indexed by HL7 field number, MSH included (see _segments).
         kind = "field" if (lv is not None and rv is not None) else "field-count"
-        out.append(Difference(seg_id, occ, field_no, lv, rv, kind))
+        out.append(Difference(seg_id, occ, idx, lv, rv, kind))
     return out
 
 
 def sep_join(fields: list[str]) -> str:
-    """A readable single-line rendering of a segment's fields (for diff messages, not re-encoding)."""
+    """A readable single-line rendering of a segment's fields (for diff messages, not re-encoding).
+    An ``MSH`` row's index 1 is its own separator, written once after the id rather than joined."""
+    if fields[:1] == ["MSH"] and len(fields) > 1:
+        return "MSH" + fields[1] + "|".join(fields[2:])
     return "|".join(fields)

@@ -92,10 +92,27 @@ class ConnScaleRemoteReport:
     in_pipeline_peak: int
     drain_seconds: float | None
     notes: list[str] = field(default_factory=list)
+    # False when a hold-bracket ``/stats`` sample failed, so the rates above are a placeholder 0.0 and
+    # not a hold-bracket reading; the JSON then names no rate window (BACKLOG #5431).
+    rates_measured: bool = True
+
+    @property
+    def failures(self) -> list[str]:
+        """Why the run FAILS, empty on a PASS. PASS needs the reconcile AND traffic AND a completed
+        drain (BACKLOG #5431): a run that sent nothing reconciles vacuously, and a timed-out drain left
+        rows stranded in some stage, which the outbound-only backlog in the reconcile can miss."""
+        out: list[str] = []
+        if not self.no_loss.ok:
+            out.append(f"loss: {self.no_loss.detail}")
+        if self.sent <= 0:
+            out.append("nothing was sent")
+        if self.drain_seconds is None:
+            out.append("the drain timed out")
+        return out
 
     @property
     def result_ok(self) -> bool:
-        return self.no_loss.ok
+        return not self.failures
 
     @property
     def exit_code(self) -> int:
@@ -107,6 +124,7 @@ class ConnScaleRemoteReport:
             "kind": "connscale_remote",
             "result": "PASS" if self.result_ok else "FAIL",
             "exit_code": self.exit_code,
+            "failures": self.failures,
             "engine_bands": self.engine_bands,
             "count_per_band": self.count_per_band,
             "per_conn_rate": round(self.per_conn_rate, 4),
@@ -119,7 +137,9 @@ class ConnScaleRemoteReport:
             },
             "throughput": {
                 # Engine reads at the hold's start and end, over its length (BACKLOG #2012).
-                "rate_window": HOLD_BRACKET_RATE_WINDOW,
+                "rate_window": HOLD_BRACKET_RATE_WINDOW if self.rates_measured else None,
+                # False: a bracket sample failed and the two rates below are a placeholder 0.0.
+                "rates_measured": self.rates_measured,
                 "achieved_aggregate_rate": round(self.achieved_aggregate_rate, 2),
                 "delivered_aggregate_rate": round(self.delivered_aggregate_rate, 2),
                 "in_pipeline_peak": self.in_pipeline_peak,
@@ -146,7 +166,7 @@ class ConnScaleRemoteReport:
 
     def render_console(self) -> str:
         loss = "OK" if self.no_loss.ok else f"LOSS ({self.no_loss.detail})"
-        drain = "n/a" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
+        drain = "TIMED-OUT" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
         return "\n".join(
             [
                 f"connscale-remote (driver-only) -- {self.engine_bands} engine band(s), "
@@ -154,11 +174,16 @@ class ConnScaleRemoteReport:
                 f"  sink: {self.sink_host} ports={list(self.sink_ports)} "
                 f"({len(self.sink_ports)} local listener process-band)",
                 f"  offered={self.offered_aggregate_rate:.0f}/s "
-                f"achieved={self.achieved_aggregate_rate:.0f}/s "
-                f"delivered={self.delivered_aggregate_rate:.0f}/s",
+                + (
+                    f"achieved={self.achieved_aggregate_rate:.0f}/s "
+                    f"delivered={self.delivered_aggregate_rate:.0f}/s"
+                    if self.rates_measured
+                    else "achieved=n/a delivered=n/a (a hold-bracket /stats sample failed)"
+                ),
                 f"  zero_loss={loss} in_pipeline_peak={self.in_pipeline_peak} drain={drain} "
                 f"deferred={self.deferred} timeouts={self.timeouts}",
                 f"  window=[{self.hold_start_iso} .. {self.drain_complete_iso}]",
+                *(f"  FAIL: {reason}" for reason in self.failures),
                 f"RESULT: {'PASS' if self.result_ok else 'FAIL'} -> exit {self.exit_code}",
             ]
         )
@@ -354,7 +379,9 @@ async def run_connscale_remote(
         base_sample, final_sample = poller.baseline, poller.final
         no_loss = _reconcile(c, base_sample, final_sample, unconfirmed_budget=n * count)
         in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
+        rates_measured = False
         if hold_begin is not None and hold_end is not None and hold_elapsed_s > 0:
+            rates_measured = True
             achieved = max(0.0, (hold_end.read - hold_begin.read) / hold_elapsed_s)
             delivered = max(0.0, (hold_end.written - hold_begin.written) / hold_elapsed_s)
         else:
@@ -381,6 +408,7 @@ async def run_connscale_remote(
             in_pipeline_peak=in_pipeline_peak,
             drain_seconds=drain_seconds,
             notes=notes,
+            rates_measured=rates_measured,
         )
     finally:
         for driver in drivers:

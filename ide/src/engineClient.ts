@@ -7,7 +7,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import type * as tls from "node:tls";
 
-import { serveCommandLine } from "./engineControlModel";
+import { serveCommandHint } from "./engineControlModel";
 import {
   CAFILE_REFUSED_CODE,
   CAFILE_UNREAD_CODE,
@@ -429,7 +429,7 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
   }
   if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
     return new NetworkError(
-      `engine not reachable at ${baseUrl} — if it runs on this machine, start it (the status pill, or \`${serveCommandLine("<configDir>")}\`).`,
+      `engine not reachable at ${baseUrl} — if it runs on this machine, start it (the status pill, or ${serveCommandHint()}).`,
       err.code,
     );
   }

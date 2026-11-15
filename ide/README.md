@@ -196,14 +196,19 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
-  user or workspace settings (a folder value is ignored), every connection edit passes it as
-  `--service-config`, whether or not the file exists, so a missing file fails the edit with
+  user or workspace settings (a folder value is ignored), every connection edit passes it, unless
+  it is blank, as `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
-  setting is passed too, and `connection` refuses it as blank. Setting it to the default name, in
+  setting leaves the flag off for connection edits, as it does for Start and Restart. A blank
+  workspace value still hides a user value, so the default file applies, not the user's. Setting it to the default name, in
   user settings too, counts as set, so a workspace without that file cannot save a connection edit
   until the file exists or the setting is cleared. The flag is left off at least when
-  the setting is unset; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
-  one, the file this setting's default names, and no file if not.
+  the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
+  one, the file this setting's default names, and no file if not. The status bar's Start and
+  Restart pass the same value as `--service-config`, and refuse one that names no existing file
+  before they start or stop anything. A relative value is read from the workspace folder. A value set to the default name counts too, so in
+  a workspace without that file they refuse rather than offer to create a new engine; clear the
+  setting to get that offer back.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
   cannot retarget a promote, and with it your credentials, at another host). https by default
