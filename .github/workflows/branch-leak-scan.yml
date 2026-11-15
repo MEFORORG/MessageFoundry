@@ -131,6 +131,8 @@ jobs:
             case "$sha" in
               *[!0-9a-f]*|"") echo "::error::push SHA '$sha' is not a hex object id." >&2; exit 2 ;;
             esac
+            # Exactly 40: a short hex value would resolve as an abbreviated id.
+            if [ "${#sha}" -ne 40 ]; then echo "::error::push SHA '$sha' is not 40 hex characters." >&2; exit 2; fi
           done
           if [ "$PUSH_AFTER" = "$zero" ]; then
             echo "branch deleted: no pushed commits to scan; scanning the checked-out tree only."

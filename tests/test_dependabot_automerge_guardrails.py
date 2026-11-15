@@ -86,7 +86,8 @@ def _load() -> dict:
 
 def _steps() -> list[dict]:
     doc = _load()
-    return doc["jobs"]["auto-merge"]["steps"]
+    # Every job's steps, the disarm job's first: step ids are unique across the workflow.
+    return [s for job in doc["jobs"].values() for s in job["steps"]]
 
 
 def _step(step_id: str) -> dict:
@@ -356,9 +357,11 @@ def test_no_step_overrides_the_default_shell() -> None:
     """
     doc = _load()
     assert "defaults" not in doc, "a workflow-level defaults: block can change the shell"
-    job = doc["jobs"]["auto-merge"]
-    assert "defaults" not in job, "a job-level defaults: block can change the shell"
-    for step in job["steps"]:
+    jobs = doc["jobs"].values()
+    assert all("defaults" not in job for job in jobs), (
+        "a job-level defaults: block can change the shell"
+    )
+    for step in [s for job in jobs for s in job["steps"]]:
         assert "shell" not in step, (
             f"step {step.get('id') or step.get('name')!r} declares an explicit shell:, so the "
             f"behavioural tests no longer mirror what CI runs — update _run_step_body with it"
@@ -385,7 +388,6 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     assert "steps.authors.outputs.sole_author == 'true'" in cond, (
         "merge not gated on a Dependabot push of one Dependabot commit (BACKLOG #5593)"
     )
-    assert "steps.disarm.outputs.stale != 'true'" in cond, "merge not gated on a stale run"
     # The sender gate is only as good as its binding: the behavioural rows supply SENDER directly.
     env = _step("authors").get("env") or {}
     assert str(env.get("SENDER", "")).replace(" ", "") == "${{github.event.sender.login}}", env
@@ -957,23 +959,44 @@ def test_merge_step_pins_the_evaluated_head() -> None:
     ), "HEAD_SHA must be the head the triggering event carried, the one this run evaluated"
 
 
-def test_disarm_runs_first_on_every_push() -> None:
-    """A ``synchronize`` run must disarm BEFORE any guardrail can decide, and before the arm step."""
-    ids = [s.get("id") for s in _steps()]
-    assert ids[0] == "disarm", f"the disarm step must be the first step, got {ids}"
-    disarm = _step("disarm")
-    assert str(disarm.get("if", "")).replace(" ", "") == (
-        "github.event.action=='synchronize'||github.event.action=='reopened'"
-    ), f"the disarm step must run on every push to the PR, and on reopen; if: {disarm.get('if')!r}"
-    assert "continue-on-error" not in disarm, (
-        "a disarm failure must fail the job so no later step re-arms"
+def test_every_run_disarms_in_its_own_ungrouped_job_before_any_arm() -> None:
+    """The disarm is its own job, in NO concurrency group, on every event the workflow takes, and the
+    arming job needs it. GitHub keeps one pending entry per group and cancels the older pending one,
+    so a disarm inside the group could be cancelled by a later run (a re-run of an `opened` run, say)
+    and an arm on an earlier head would survive. Outside the group every run's disarm runs."""
+    doc = _load()
+    jobs = doc["jobs"]
+    assert "concurrency" not in doc, "a workflow-level group would put the disarm job in it too"
+    disarm_job = jobs.get("disarm")
+    assert disarm_job is not None, "no `disarm` job"
+    assert "concurrency" not in disarm_job, "the disarm job must not be in a cancellable group"
+    # Only the author gate: no event-action filter, so opened, synchronize and reopened all disarm.
+    assert str(disarm_job.get("if", "")).replace(" ", "") == (
+        "github.event.pull_request.user.login=='dependabot[bot]'"
+    ), disarm_job.get("if")
+    assert [s.get("id") for s in disarm_job["steps"]] == ["disarm"]
+    arm_job = jobs["auto-merge"]
+    needs = arm_job.get("needs")
+    assert needs == "disarm" or needs == ["disarm"], (
+        f"the arming job must need the disarm job: {needs!r}"
     )
+    assert "group" in (arm_job.get("concurrency") or {}), "the arming job lost its per-PR group"
+    assert not any(s.get("id") == "disarm" for s in arm_job["steps"]), (
+        "a second disarm in the arm job"
+    )
+    disarm = _step("disarm")
+    assert "if" not in disarm, f"the disarm step must not be skippable: {disarm.get('if')!r}"
+    for owner in (disarm, disarm_job):
+        assert "continue-on-error" not in owner, "a disarm failure must stop the arming job"
     body = str(disarm["run"])
     assert "${{" not in body
     assert "gh pr merge --disable-auto" in body
     declared = set((disarm.get("env") or {}).keys())
     undeclared = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED - declared
     assert not undeclared, f"disarm reads undeclared env var(s): {sorted(undeclared)}"
+    assert "stale" not in _WORKFLOW.read_text(encoding="utf-8").split("jobs:", 1)[1], (
+        "a stale guard is back; the ungrouped disarm job replaced it"
+    )
 
 
 def _gh_disarm_stub(tmp_path: Path) -> Path:
@@ -981,7 +1004,7 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
 
     ``VIEW_FAIL=1`` makes ``pr view`` behave like an HTTP error (JSON body on stdout, non-zero exit),
     ``DISARM_FAIL=1`` makes ``pr merge --disable-auto`` exit non-zero, and ``DISARM_NOOP=1`` makes it
-    exit 0 while leaving the state armed. ``GH_HEAD`` is the PR's current head.
+    exit 0 while leaving the state armed.
     """
     stub_dir = tmp_path / "ghstub"
     stub_dir.mkdir()
@@ -992,7 +1015,6 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         'case "$1 $2" in\n'
         '  "pr view")\n'
         '    if [ "${VIEW_FAIL:-0}" = 1 ]; then echo \'{"message":"Bad credentials"}\'; exit 1; fi\n'
-        '    case "$*" in *headRefOid*) [ "${HEAD_FAIL:-0}" = 1 ] && exit 1; echo "$GH_HEAD"; exit 0 ;; esac\n'
         '    cat "$GH_STATE" ;;\n'
         '  "pr merge")\n'
         '    if [ "${DISARM_FAIL:-0}" = 1 ]; then echo "gh: refused" >&2; exit 1; fi\n'
@@ -1005,41 +1027,19 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("label", "armed", "extra", "rc", "disarm_called", "end_state", "stale"),
+    ("label", "armed", "extra", "rc", "disarm_called", "end_state"),
     [
-        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false", False),
-        ("not armed: nothing to do", "false", {}, 0, False, "false", False),
-        # Unknown is not "not armed": it disarms anyway, then cannot confirm, so the step is red.
-        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false", False),
-        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true", False),
-        ("a disarm that did not take", "true", {"DISARM_NOOP": "1"}, 1, True, "true", False),
-        # THE RACE: an arm placed on the older head, a human pushed a newer one, and this run's
-        # event head is the older one (a re-run, or the newer run was cancelled). It must disarm.
-        (
-            "stale run after an arm on the older head",
-            "true",
-            {"GH_HEAD": "b" * 40},
-            1,
-            True,
-            "false",
-            True,
-        ),
-        ("stale run, nothing armed", "false", {"GH_HEAD": "b" * 40}, 1, False, "false", True),
-        # A head read that is not exactly 40 lowercase hex characters: disarm and fail, never stale.
-        ("an empty head read", "true", {"GH_HEAD": ""}, 1, True, "false", False),
-        ("a short head read", "true", {"GH_HEAD": "abc"}, 1, True, "false", False),
-        ("an uppercase head read", "true", {"GH_HEAD": "A" * 40}, 1, True, "false", False),
-        ("a 41-character head read", "true", {"GH_HEAD": "b" * 41}, 1, True, "false", False),
-        ("a garbled head read", "true", {"GH_HEAD": "g" * 40}, 1, True, "false", False),
-        (
-            "a failed head read, nothing armed",
-            "false",
-            {"HEAD_FAIL": "1"},
-            1,
-            False,
-            "false",
-            False,
-        ),
+        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false"),
+        ("not armed: nothing to do", "false", {}, 0, False, "false"),
+        # The body reads no event or head, so these two races reduce to the same row: whatever run
+        # executes it (a re-run of `opened` after an arm on the older head, or a run whose arming job
+        # the group then cancels) leaves the PR disarmed.
+        ("re-run of opened after an arm on the older head", "true", {}, 0, True, "false"),
+        ("a run whose arming job is later cancelled", "true", {}, 0, True, "false"),
+        # Unknown is not "not armed": it disarms anyway, and the read-back decides.
+        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false"),
+        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
+        ("a disarm that did not take", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
     ],
 )
 def test_disarm_step_behaviour(
@@ -1049,7 +1049,6 @@ def test_disarm_step_behaviour(
     rc: int,
     disarm_called: bool,
     end_state: str,
-    stale: bool,
     tmp_path: Path,
 ) -> None:
     """The disarm body EXECUTED. A non-zero exit is the fail-closed outcome: Actions then skips every
@@ -1063,14 +1062,9 @@ def test_disarm_step_behaviour(
         "GH_TOKEN": "stub",
         "GH_STATE": state.as_posix(),
         "GH_LOG": log.as_posix(),
-        "HEAD_SHA": "a" * 40,
-        "GH_HEAD": "a" * 40,
         **extra,
     }
     run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
-    assert (run.outputs.get("stale") == "true") is stale, (
-        f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
-    )
     assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
     called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
     assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
@@ -1190,6 +1184,9 @@ _EVALUATED = "a" * 40
         ("refused and the head is unreadable", False, None, 1),
         # A short hex read is not proof the head moved, so it must not pass green.
         ("refused and the head read is short", False, "abc", 1),
+        ("refused and the head read is uppercase", False, "B" * 40, 1),
+        ("refused and the head read is 41 characters", False, "b" * 41, 1),
+        ("refused and the head read is garbled", False, "g" * 40, 1),
     ],
 )
 def test_merge_step_passes_only_a_head_moved_refusal(
