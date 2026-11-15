@@ -703,10 +703,11 @@ async def test_a_lock_set_during_the_lookup_is_refused_as_locked_whatever_else_l
     """BACKLOG #3780 item 2. A lock that lands during the lookup, in the probe or in the role test
     that follows it, writes its ``auth.mfa_failed`` locked row whatever else landed in the same
     window, as the re-read the item dropped did. With a self-service TOTP disable it answers
-    ``locked``. With a temporary credential that lapsed, the lapse is still asked and ends the
-    session with its ``auth.temp_password_expired`` row, the stronger end state, so both rows are
+    ``locked``, as main did. With a temporary credential that lapsed, main answered ``locked`` and
+    left the session live, never asking about the lapse; now the lapse is asked too and ends the
+    session with its ``auth.temp_password_expired`` row, a stronger end state, so both rows are
     written. RED when: the TOTP disable answers first, with no row and no ``locked``, or a lapse
-    goes unasked, or either row is missing."""
+    goes unasked, or either row is missing. The lapse cases fail on main by design."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_roles_lost = e.service._directory_roles_lost
@@ -765,8 +766,8 @@ async def test_a_lock_and_a_lapse_during_the_wait_end_the_session_and_keep_both_
     """BACKLOG #3780 item 2. A lock and a lapse that land while the attempt waits in the queue: the
     lapse ends the session and writes ``auth.temp_password_expired``, answering ``session_lost``,
     as on main, where the lapse was asked ahead of the lock. The lock's ``auth.mfa_failed`` row is
-    written too. RED when: the lock answers alone and the lapsed session is left live, or the lock
-    row is missing."""
+    now written too; main wrote none, so the last assertion fails on main by design. RED when: the
+    lock answers alone and the lapsed session is left live, or the lock row is missing."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_lock = e.service._account_credential_lock
     real_lapsed = e.service._credential_lapsed
@@ -793,6 +794,45 @@ async def test_a_lock_and_a_lapse_during_the_wait_end_the_session_and_keep_both_
     assert len(await store.list_audit(action="auth.temp_password_expired")) == 1
     assert not await _live_session(store, e.token), "the lapsed session was not ended"
     assert await _audited_mfa_failures(store) == [{"reason": "locked"}]
+
+
+@pytest.mark.parametrize("leg", ["verify_mfa", "helper-reread"])
+async def test_a_directory_answer_of_an_unknown_type_refuses(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """BACKLOG #3780 item 2. ``_directory_vouches_for_factor`` carries on only with the vouched
+    account row. An answer that is neither a known refusal reason nor that row, here an ``int``,
+    refuses as unconfirmed, on ``verify_mfa`` (``reread=False``) and on the re-reading path the
+    passkey and enrolment legs take. RED when: a non-``str`` answer is taken for a vouch, so the
+    code is checked or the helper hands back an account."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    checks = 0
+    real_verify = e.service._verify_second_factor
+
+    async def _unknown_answer(user: Any) -> object:
+        return 7
+
+    async def _counted(*args: Any, **kwargs: Any) -> bool:
+        nonlocal checks
+        checks += 1
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_directory_step_up_refusal", _unknown_answer)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _counted)
+
+    if leg == "verify_mfa":
+        answer: object = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+    else:
+        user = await e.service._load_user(e.user_id)
+        assert user is not None
+        answer = await e.service._directory_vouches_for_factor(
+            e.token, user, event="auth.mfa_failed", client=None, report_lock=True
+        )
+
+    assert isinstance(answer, service_module.Elevation) and answer.ok is False
+    assert answer.directory_refusal is not None
+    assert checks == 0
+    assert {"reason": "directory_unconfirmed", "outcome": "7"} in await _audited_mfa_failures(store)
 
 
 async def test_a_lost_session_after_a_rename_during_the_lookup_names_the_new_name(

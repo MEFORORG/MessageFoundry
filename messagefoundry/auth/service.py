@@ -16579,8 +16579,9 @@ class AuthService:
         # after the lookup, so the queue is keyed by the account's name as it was then, as the
         # dropped re-read keyed it. A session lost during the lookup is named by the in-queue
         # read, with the account's current name while its row is still there (#2291 class); the
-        # dropped re-read named it with the name read before the lookup. The lock is asked in the queue right after the session
-        # read, before the ``totp_enabled`` and lapse checks (see below).
+        # dropped re-read named it with the name read before the lookup. The lock is asked in the
+        # queue right after the session read, before the ``totp_enabled`` and lapse checks (see
+        # below).
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
@@ -17110,15 +17111,18 @@ class AuthService:
         a second-step-locked account."""
         if not _is_directory_account(user):
             return user
-        refusal = await self._directory_step_up_refusal(user)
-        if isinstance(refusal, str):
-            detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}
+        answer = await self._directory_step_up_refusal(user)
+        # A positive test: only the vouched row carries on, so an answer of any other type, a
+        # refusal shape this does not know included, refuses (fails closed).
+        if not isinstance(answer, VerifiedUser):
+            outcome = str(answer)
+            detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome}
             if phase is not None:
                 detail["phase"] = phase
             await self._audit(event, actor=user.username, detail=_json(detail), client=client)
-            return Elevation(directory_refusal=_directory_refusal(refusal))
+            return Elevation(directory_refusal=_directory_refusal(outcome))
         if not reread:
-            return refusal
+            return answer
         return await self._factor_holder_current(
             token,
             actor=user.username,
@@ -17145,7 +17149,7 @@ class AuthService:
         revocation, a disable or a lock could have landed (BACKLOG #3068).
         :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, for every caller
         but :meth:`verify_mfa`, whose in-queue read takes its place (BACKLOG #3780 item 2). Both
-        second-factor legs run it again right before ``mark_session_mfa_verified``. And
+        second-factor legs run it right before ``mark_session_mfa_verified``. And
         :meth:`verify_mfa` runs it on a matched code whose spend failed, before it decides the
         charge. A session
         revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
