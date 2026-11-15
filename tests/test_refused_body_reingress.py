@@ -193,3 +193,41 @@ def test_a_held_text_head_keeps_a_lone_surrogate() -> None:
         "IB_LOOP", body, ContentType.JSON.value, "e", cipher=_KEYLESS
     )
     assert body.startswith(bounded.raw) and len(bounded.raw) == 256 - 2
+
+
+async def test_a_reply_holding_a_nul_is_refused_on_reingress(store: MessageStore) -> None:
+    """BACKLOG #5616: a NUL inside a captured HL7 reply is refused, as a listener refuses one. Here and
+    not in the shared contract, because a keyless server store cannot capture a NUL to begin with."""
+    from messagefoundry.pipeline.ingress_guards import NUL_REJECTED_REASON
+    from tests._reingress_refused_body_contract import REPLY, _assert_refused_by_a_guard
+
+    body = REPLY.replace("MSA|AA|RB1", "MSA|AA|RB\x001")
+    await _assert_refused_by_a_guard(store, ContentType.HL7V2, body, NUL_REJECTED_REASON, now=900.0)
+
+
+def _loopback(content_type: ContentType) -> Any:
+    from messagefoundry.config.wiring import Loopback, build_inbound_connection
+
+    return build_inbound_connection("IB_LOOP_G", Loopback(), router="r", content_type=content_type)
+
+
+def test_reingress_body_error_reads_the_listener_guards() -> None:
+    """BACKLOG #5616: what ``reingress_body_error`` admits and refuses, beside the contract cases."""
+    from messagefoundry.pipeline.ingress_guards import reingress_body_error
+
+    hl7 = _loopback(ContentType.HL7V2)
+    reply = "MSH|^~\\&|P|||||20260101||ACK^A01|R1|P|2.5.1\rMSA|AA|X1\r"
+    assert reingress_body_error(hl7, reply) is None
+    # A whole MLLP frame around the reply is tolerated, as the listener tolerates it (ADR 0205).
+    assert reingress_body_error(hl7, "\x0b" + reply + "\x1c\r") is None
+    dicom = _loopback(ContentType.DICOM)
+    not_dicom = RawMessage.from_bytes(b"%PDF-1.7 synthetic" * 20, ContentType.DICOM.value).raw
+    refused = reingress_body_error(dicom, not_dicom)
+    assert refused is not None and "'dicom'" in refused
+    part10 = b"\x00" * 128 + b"DICM" + b"\x02\x00" * 8
+    assert (
+        reingress_body_error(dicom, RawMessage.from_bytes(part10, ContentType.DICOM.value).raw)
+        is None
+    )
+    # A carriage that does not decode is left to the codec, as the size rule leaves it.
+    assert reingress_body_error(dicom, "mfb64:v1:@@@not-base64@@@") is None

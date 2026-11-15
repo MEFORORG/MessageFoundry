@@ -189,6 +189,7 @@ from messagefoundry.pipeline.ingress_guards import (
     doc_ref_marker_refusal,
     ingress_encoding,
     peek_max_bytes,
+    reingress_body_error,
     reingress_size_error,
     streaming_over_threshold,
     strict_validate_timeout,
@@ -11838,8 +11839,11 @@ class RegistryRunner:
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.
-        oversize = reingress_size_error(ic, body)
-        if oversize is None:
+        # BACKLOG #5616: then the listener's content guards (NUL, MLLP frame byte, a second MSH, the
+        # declared-type sniff), which a loopback never ran. A refusal takes the peek_failed path below,
+        # so the reply is still recorded as an ERROR child, never dropped and never routed.
+        refusal = reingress_size_error(ic, body) or reingress_body_error(ic, body)
+        if refusal is None:
             control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body)
         else:
             control_id, message_type, summary, peek_failed = None, ic.content_type.value, None, True
@@ -11857,7 +11861,7 @@ class RegistryRunner:
                 name,
                 body,
                 ic.content_type.value,
-                oversize or REINGRESS_PEEK_FAILED,
+                refusal or REINGRESS_PEEK_FAILED,
                 cipher=self.store.cipher(),
             )
         produced = await self.store.ingress_handoff(

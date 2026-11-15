@@ -4513,7 +4513,13 @@ class PostgresStore:
         return True
 
     async def _insert_passthrough_marker_pg(
-        self, conn: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        conn: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
@@ -4535,7 +4541,7 @@ class PostgresStore:
             marker_id,
             parent_id,
             Stage.OUTBOUND.value,
-            pt_name,
+            channel_id,
             pt_name,
             PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
             self._cipher.encrypt(
@@ -4544,7 +4550,7 @@ class PostgresStore:
                     row_id=marker_id,
                     message_id=parent_id,
                     stage=Stage.OUTBOUND.value,
-                    channel_id=pt_name,
+                    channel_id=channel_id,
                     destination_name=pt_name,
                     handler_name=PASSTHROUGH_MARKER_HANDLER,
                     body_ref=None,
@@ -4935,7 +4941,7 @@ class PostgresStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_pg(
-                            conn, message_id, pt_name, produced, now
+                            conn, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(conn, message_id, inherits)

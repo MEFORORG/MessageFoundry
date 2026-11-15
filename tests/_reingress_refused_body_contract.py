@@ -3,7 +3,7 @@
 """Cross-backend contract: a refused loopback re-ingress is bounded by the refused-body allowance
 (vault BACKLOG #4796).
 
-A captured reply that fails its peek or size check on re-ingress is recorded as an ``ERROR`` child of
+A captured reply that fails its peek, size or content check on re-ingress is recorded as an ``ERROR`` child of
 its origin. Before #4796 every backend's ``ingress_handoff`` stored that child's body whole, outside
 the per-inbound allowance a listener's refusal is charged to, so a partner answering with refused
 replies could grow the store unmetered on a first deployment. These cases drive the real re-ingress
@@ -28,6 +28,10 @@ import pytest
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
+from messagefoundry.pipeline.ingress_guards import (
+    FRAME_BYTE_REJECTED_REASON,
+    MULTIPLE_MESSAGES_REJECTED_REASON,
+)
 from messagefoundry.pipeline.refused_body import (
     METADATA_KEY,
     RefusedBodyAllowance,
@@ -60,12 +64,14 @@ def _allowance(allowance_bytes: int) -> RefusedBodyAllowance:
     )
 
 
-def _runner(store: Any, allowance: RefusedBodyAllowance) -> RegistryRunner:
+def _runner(
+    store: Any,
+    allowance: RefusedBodyAllowance,
+    content_type: ContentType = ContentType.HL7V2,
+) -> RegistryRunner:
     reg = Registry()
     reg.add_inbound(
-        build_inbound_connection(
-            LOOP, Loopback(), router="route_loop", content_type=ContentType.HL7V2
-        )
+        build_inbound_connection(LOOP, Loopback(), router="route_loop", content_type=content_type)
     )
     reg.add_router("route_loop", lambda msg: [])
     return RegistryRunner(
@@ -168,9 +174,64 @@ async def assert_an_admitted_reply_is_never_bounded(store: Any) -> None:
     assert METADATA_KEY not in child["meta"]
 
 
+async def _assert_refused_by_a_guard(
+    store: Any, content_type: ContentType, body: str, reason: str, now: float
+) -> None:
+    """``body`` is refused on re-ingress with ``reason``: one ERROR child holding the body whole, its
+    record beside it, and no ingress work on the loopback (BACKLOG #5616)."""
+    runner = _runner(store, _allowance(10 * BODY_BYTES), content_type)
+    child = await _reingress(store, runner, body, now=now)
+    assert child["status"] == MessageStatus.ERROR.value
+    assert child["error"] == reason
+    assert child["raw"] == body
+    assert child["meta"][METADATA_KEY]["stored"] == "whole"
+    assert await store.claim_next_fifo(LOOP, now=now + 50, stage=Stage.INGRESS.value) is None
+
+
+async def assert_a_reply_holding_a_frame_byte_is_refused(store: Any) -> None:
+    """An MLLP end byte inside an HL7 reply, which a listener refuses (ADR 0205 rule 4)."""
+    body = REPLY.replace("MSA|AA|RB1", "MSA|AA|RB1\x1c\rNTE|1||SYNTH")
+    await _assert_refused_by_a_guard(
+        store, ContentType.HL7V2, body, FRAME_BYTE_REJECTED_REASON, now=500.0
+    )
+
+
+async def assert_a_reply_holding_two_messages_is_refused(store: Any) -> None:
+    """A second MSH in one HL7 reply, which a listener refuses (ADR 0206 rule 5)."""
+    body = REPLY + REPLY.replace("RSP1", "RSP2")
+    await _assert_refused_by_a_guard(
+        store, ContentType.HL7V2, body, MULTIPLE_MESSAGES_REJECTED_REASON, now=600.0
+    )
+
+
+async def assert_a_reply_of_the_wrong_type_is_refused(store: Any) -> None:
+    """An XML reply on a JSON loopback fails the declared-type sniff a listener runs (ASVS 5.2.2)."""
+    await _assert_refused_by_a_guard(
+        store,
+        ContentType.JSON,
+        "<ack>synthetic</ack>",
+        "ingress body does not match its declared content type 'json' (no matching magic bytes)",
+        now=700.0,
+    )
+
+
+async def assert_a_reply_of_the_declared_type_is_admitted(store: Any) -> None:
+    """The control for the sniff: a JSON reply on a JSON loopback is routed, not refused."""
+    runner = _runner(store, _allowance(0), ContentType.JSON)
+    body = '{"ack": "synthetic"}'
+    child = await _reingress(store, runner, body, now=800.0)
+    assert child["status"] == MessageStatus.RECEIVED.value
+    assert child["raw"] == body
+    assert METADATA_KEY not in child["meta"]
+
+
 #: Every case, for ``pytest.mark.parametrize``. Each takes ``(store,)``.
 CASES = [
     pytest.param(assert_a_refused_reply_flood_stores_heads_past_the_allowance, id="flood"),
     pytest.param(assert_a_refused_reply_inside_the_allowance_is_stored_whole, id="whole"),
     pytest.param(assert_an_admitted_reply_is_never_bounded, id="admitted"),
+    pytest.param(assert_a_reply_holding_a_frame_byte_is_refused, id="frame-byte"),
+    pytest.param(assert_a_reply_holding_two_messages_is_refused, id="two-messages"),
+    pytest.param(assert_a_reply_of_the_wrong_type_is_refused, id="wrong-type"),
+    pytest.param(assert_a_reply_of_the_declared_type_is_admitted, id="declared-type"),
 ]

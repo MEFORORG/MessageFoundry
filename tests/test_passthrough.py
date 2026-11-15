@@ -43,6 +43,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
 )
 from messagefoundry.transports.passthrough import PassThroughSource
+from tests._passthrough_marker_scope_contract import CASES as PT_MARKER_SCOPE_CASES
 from tests._store_audit import no_operator_audit
 
 
@@ -929,3 +930,11 @@ async def test_reload_non_pt_graph_unaffected_on_non_sqlite(
     finally:
         await engine.stop()
         await s.close()
+
+
+@pytest.mark.parametrize("case", PT_MARKER_SCOPE_CASES)
+async def test_passthrough_marker_scope_contract(pt_store: MessageStore, case: Any) -> None:
+    """BACKLOG #5614: a pass-through marker is scoped to its parent's channel, keyless and keyed (the
+    keyed store binds the marker payload's tag to the channel it carries). The Postgres and SQL
+    Server suites run the same contract."""
+    await case(pt_store)

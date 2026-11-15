@@ -1221,17 +1221,24 @@ def _insert_queue_ingress_params(
 
 
 def _insert_marker_params(
-    row_id: str, parent_id: str, pt_name: str, enc_body: str, status: str, now: float
+    row_id: str,
+    parent_id: str,
+    channel_id: str,
+    pt_name: str,
+    enc_body: str,
+    status: str,
+    now: float,
 ) -> tuple[Any, ...]:
     # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (lane = the PT inbound name),
-    # never claimed. Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
+    # never claimed. ``channel_id`` is the parent's inbound, as on every outbound row the handoff
+    # writes, so a dead marker is scoped to the parent's channel in the dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
     # ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
     # produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
         parent_id,
         Stage.OUTBOUND.value,
-        pt_name,
+        channel_id,
         pt_name,
         PASSTHROUGH_MARKER_HANDLER,
         enc_body,
@@ -7192,7 +7199,13 @@ class SqlServerStore:
         return True
 
     async def _insert_passthrough_marker_mssql(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
@@ -7209,6 +7222,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7216,7 +7230,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7232,7 +7246,13 @@ class SqlServerStore:
             await self._event(cur, parent_id, "dead", pt_name, "passthrough depth cap", now)
 
     def _insert_passthrough_marker_mssql_sync(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Synchronous twin of :meth:`_insert_passthrough_marker_mssql` (ADR 0071 B5)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
@@ -7242,6 +7262,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7249,7 +7270,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7765,7 +7786,7 @@ class SqlServerStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_mssql(
-                            cur, message_id, pt_name, produced, now
+                            cur, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(cur, message_id, inherits)
@@ -7976,7 +7997,7 @@ class SqlServerStore:
                         inherits,
                     )
                     self._insert_passthrough_marker_mssql_sync(
-                        cur, message_id, pt_name, produced, now
+                        cur, message_id, channel_id, pt_name, produced, now
                     )
                 # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                 self._inherit_attachments_sync(cur, message_id, inherits)

@@ -123,6 +123,7 @@ __all__ = [
     "ingress_size_error",
     "peek_max_bytes",
     "raise_if_strictly_invalid",
+    "reingress_body_error",
     "reingress_size_error",
     "store_safe_raw",
     "streaming_over_threshold",
@@ -288,6 +289,34 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
         if carried is not None:
             return ingress_size_error(carried)
     return ingress_size_error(len(body))
+
+
+def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
+    """The refusal text for a loopback re-ingress ``body`` the listener's content guards would refuse
+    (BACKLOG #5616), or ``None`` when they admit it. Run after :func:`reingress_size_error` passes.
+
+    A loopback has no listener, so a captured reply never met them: the NUL, MLLP frame-byte and
+    second-``MSH`` rules of :func:`check_decoded` for a text loopback, and the declared-type sniff of
+    :func:`check_declared_type` for a non-HL7 one, whose HL7 type check stays ``Peek.parse``. A binary
+    loopback is sniffed on the bytes a canonical ``mfb64:v1:`` carriage holds; a body that is not
+    carriage, or whose carriage does not decode, is left to the codec, as the size rule leaves it.
+
+    The reason is the guard's own, which carries no byte of the body."""
+    try:
+        if ic.content_type.is_binary:
+            if is_marked(body):
+                try:
+                    data = decode_carriage(body)
+                except BinaryCarriageError:
+                    return None
+                check_declared_type(ic, data)
+            return None
+        check_decoded(body, ic)
+        if ic.content_type is not ContentType.HL7V2:
+            check_declared_type(ic, text_sniff_head(body))
+    except IngressGuardError as exc:
+        return exc.reason
+    return None
 
 
 class IngressTooLarge(IngressGuardError):

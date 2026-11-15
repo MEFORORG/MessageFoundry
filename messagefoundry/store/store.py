@@ -14178,7 +14178,9 @@ class MessageStore:
                     # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
                     # claims take PENDING rows only), so it is inert; it exists solely so the
                     # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
-                    await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+                    await self._insert_passthrough_marker(
+                        message_id, channel_id, pt_name, produced, now
+                    )
                 # Every child's documents in one pass, after the children exist (BACKLOG #5099).
                 await self._inherit_attachments(message_id, inherits)
             # JSON-encode + apply each declared state write in the SAME transaction as the outbound
@@ -15352,7 +15354,7 @@ class MessageStore:
         return True
 
     async def _insert_passthrough_marker(
-        self, parent_id: str, pt_name: str, produced: bool, now: float
+        self, parent_id: str, channel_id: str, pt_name: str, produced: bool, now: float
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
@@ -15366,7 +15368,11 @@ class MessageStore:
         ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline.
 
         ``handler_name`` carries :data:`PASSTHROUGH_MARKER_HANDLER`, which is how replay, dead-letter
-        replay, resend and the attachment clean-up tell this row from real outbound work (#1580)."""
+        replay, resend and the attachment clean-up tell this row from real outbound work (#1580).
+
+        ``channel_id`` is the parent's inbound, as on every outbound row the handoff writes, and only
+        ``destination_name`` names the PT inbound. So a dead marker is listed and counted in the
+        dead-letter view under the parent's channel scope, never the PT channel's (BACKLOG #5614)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
@@ -15381,7 +15387,7 @@ class MessageStore:
                 marker_id,
                 parent_id,
                 Stage.OUTBOUND.value,
-                pt_name,
+                channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
                 self._cipher.encrypt(
@@ -15390,7 +15396,7 @@ class MessageStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
