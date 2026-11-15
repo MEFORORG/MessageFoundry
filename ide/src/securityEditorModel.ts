@@ -19,15 +19,18 @@ function inside(root: string, target: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-/** The file-system reads the containment check makes, as fs.realpathSync.native and fs.lstatSync
- *  make them: each throws an error carrying `code` for a path it cannot read. */
+/** The file-system reads the containment check makes, as fs.realpathSync.native, fs.lstatSync and
+ *  fs.readlinkSync make them: each throws an error carrying `code` for a path it cannot read. */
 export interface LinkFs {
   realpath(p: string): string;
-  lstat(p: string): unknown;
+  lstat(p: string): { isSymbolicLink(): boolean };
+  readlink(p: string): string;
 }
 
-function errCode(e: unknown): unknown {
-  return typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined;
+/** Whether `e` says only that the path does not exist, the one read error the check passes over. */
+function missing(e: unknown): boolean {
+  const code = typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /** `target` with every symbolic link in it resolved, or undefined when that cannot be told. The part
@@ -41,8 +44,7 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
     try {
       return path.join(fsx.realpath(at), ...tail);
     } catch (e) {
-      const code = errCode(e);
-      if (code !== "ENOENT" && code !== "ENOTDIR") {
+      if (!missing(e)) {
         return undefined;
       }
     }
@@ -50,8 +52,7 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
       fsx.lstat(at);
       return undefined; // it exists, yet does not resolve: a dangling or looping link
     } catch (e) {
-      const code = errCode(e);
-      if (code !== "ENOENT" && code !== "ENOTDIR") {
+      if (!missing(e)) {
         return undefined;
       }
     }
@@ -64,30 +65,54 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
   }
 }
 
-/** Whether `target`, followed component by component, reaches the folder whose resolved path is
- *  `realRoot`: some existing prefix of it resolves to that folder or into it. That is how an alias
- *  outside the folder, such as a link, a mapped drive or an 8.3 short name, leads into it. Undefined
- *  when a prefix cannot be read, so the caller refuses. */
+// The most paths reachesRoot follows, links included, before it gives up and the caller refuses.
+const MAX_HOPS = 40;
+
+/** Whether resolving `target` passes through the folder whose resolved path is `realRoot`. Each
+ *  existing prefix is resolved, and each link on the way is also followed one hop at a time, since a
+ *  link chain resolves straight to its end: an alias pointing at a link the workspace holds must
+ *  count too. That is how an alias outside the folder, such as a link, a mapped drive or an 8.3 short
+ *  name that realpath resolves, leads into it. Undefined when a prefix or link cannot be read, or
+ *  there are too many hops, so the caller refuses. */
 function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | undefined {
-  let at = target;
-  for (;;) {
-    try {
-      const real = fsx.realpath(at);
-      if (path.relative(realRoot, real) === "" || inside(realRoot, real)) {
-        return true;
+  const pending = [target];
+  const seen = new Set<string>();
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const whole = next;
+    if (seen.has(whole)) {
+      continue;
+    }
+    if (seen.size >= MAX_HOPS) {
+      return undefined;
+    }
+    seen.add(whole);
+    for (let at = whole; ; at = path.dirname(at)) {
+      try {
+        const real = fsx.realpath(at);
+        if (path.relative(realRoot, real) === "" || inside(realRoot, real)) {
+          return true;
+        }
+      } catch (e) {
+        if (!missing(e)) {
+          return undefined;
+        }
       }
-    } catch (e) {
-      const code = errCode(e);
-      if (code !== "ENOENT" && code !== "ENOTDIR") {
-        return undefined;
+      try {
+        if (fsx.lstat(at).isSymbolicLink()) {
+          const hop = path.resolve(path.dirname(at), fsx.readlink(at));
+          pending.push(path.join(hop, path.relative(at, whole)));
+        }
+      } catch (e) {
+        if (!missing(e)) {
+          return undefined;
+        }
+      }
+      if (path.dirname(at) === at) {
+        break;
       }
     }
-    const parent = path.dirname(at);
-    if (parent === at) {
-      return false;
-    }
-    at = parent;
   }
+  return false;
 }
 
 /**
@@ -97,14 +122,16 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
  * `fromWorkspace` says the value in force comes from the workspace's own settings, which a
  * repository's `.vscode/settings.json` can set. Such a value must name a file inside the workspace
  * folder: one that leaves it by `..` or by being absolute elsewhere is refused, as is the folder
- * itself. A value from user settings is the operator's own and may name a file anywhere, such as the
- * service's TOML in another folder.
+ * itself. A value from user settings is the operator's own and may name a file outside the folder,
+ * such as the service's TOML in another folder, within the link rules below.
  *
  * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
  * included, must not leave it through a symbolic link the repository holds, a dangling one included.
- * Inside is decided on resolved paths as well as lexically: a user-set path that reaches the folder
- * by an alias, such as a link, a mapped drive or an 8.3 short name, gets the same link rules. The
- * path returned has its links resolved, so the CLI opens the folders that were checked.
+ * A user-set path that reaches the folder by an alias gets the same rules: at least a link, and a
+ * mapped drive or an 8.3 short name where realpath resolves it to the folder. A path whose links, or
+ * the folder's, cannot be read is refused at either scope. A path that reaches the folder is returned
+ * with its links resolved, so the CLI opens the folders that were checked; one that never reaches it
+ * is returned as written.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -120,10 +147,13 @@ export function securityConfigTarget(
   // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
   const outside = {
     ok: false,
-    problem:
-      "messagefoundry.serviceConfig names a path that leaves the workspace folder, or whose links cannot be checked. " +
-      "A value in workspace settings must name a file inside the workspace folder, and a path inside it must not leave " +
-      "it through a link; to use a file elsewhere, set it in user settings",
+    problem: fromWorkspace
+      ? "messagefoundry.serviceConfig names a path that leaves the workspace folder, or whose links cannot be checked. " +
+        "A value in workspace settings must name a file inside the workspace folder, and a path inside it must not leave " +
+        "it through a link; to use a file elsewhere, set it in user settings"
+      : "messagefoundry.serviceConfig, set in user settings, names a path that passes through the workspace folder and " +
+        "then leaves it through a link, or whose links, or the workspace folder's, cannot be checked. Name the file by a " +
+        "path that does not pass through the workspace folder, or one whose links all stay inside it",
   } as const;
   const lexicallyInside = inside(root, target);
   if (!lexicallyInside && fromWorkspace) {
@@ -138,7 +168,8 @@ export function securityConfigTarget(
   if (entersRoot === undefined || (entersRoot && !inside(realRoot, realTarget))) {
     return outside;
   }
-  return { ok: true, path: realTarget };
+  // A path that never reaches the folder keeps its spelling, so every editor locks the same folder.
+  return { ok: true, path: entersRoot ? realTarget : target };
 }
 
 /** The file one editor panel now shows (BACKLOG #5411). Save writes only to this file, so a setting

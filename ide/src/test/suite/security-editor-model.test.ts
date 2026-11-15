@@ -19,7 +19,7 @@ import { FIELDS } from "../../securityEditorWebview";
 // the workspace, each argv value is bound to its flag with `=`, and a save message is checked for
 // shape before anything is written.
 
-const real = { realpath: fs.realpathSync.native, lstat: fs.lstatSync };
+const real = { realpath: fs.realpathSync.native, lstat: fs.lstatSync, readlink: fs.readlinkSync };
 
 suite("security editor host checks", () => {
   let ws: string;
@@ -66,11 +66,8 @@ suite("security editor host checks", () => {
 
   test("a value from user settings may name a file outside the workspace, but never a blank one", () => {
     const file = path.join(outside, "messagefoundry.toml");
-    // Links resolved, as for a path inside, since containment is decided on the resolved path.
-    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real), {
-      ok: true,
-      path: path.join(fs.realpathSync.native(outside), "messagefoundry.toml"),
-    });
+    // A path that never reaches the workspace keeps its spelling, so every editor locks one folder.
+    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real), { ok: true, path: file });
     for (const setting of ["", "  ", undefined, 5]) {
       assert.strictEqual(securityConfigTarget(ws, setting, false, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
@@ -86,7 +83,8 @@ suite("security editor host checks", () => {
       realpath: (): string => {
         throw Object.assign(new Error("denied"), { code: "EACCES" });
       },
-      lstat: (): unknown => undefined,
+      lstat: () => ({ isSymbolicLink: () => false }),
+      readlink: (): string => "",
     };
     assert.strictEqual(securityConfigTarget(ws, "messagefoundry.toml", true, denied).ok, false);
   });
@@ -135,17 +133,44 @@ suite("security editor host checks", () => {
         path: path.join(fs.realpathSync.native(ws), "messagefoundry.toml"),
       });
       // Through the alias and then out by a link the repository holds: refused, as it is lexically.
-      assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", false, real).ok, false, "lexically inside");
       assert.strictEqual(
         securityConfigTarget(ws, path.join(alias, "linked", "messagefoundry.toml"), false, real).ok,
         false,
         "through the alias",
       );
+      // An alias pointing straight at that link: realpath resolves the chain to its end, outside the
+      // workspace, so only following each hop sees that it passes through.
+      const chained = path.join(outside, "chained");
+      fs.symlinkSync(path.join(ws, "linked"), chained, "junction");
+      const t = securityConfigTarget(ws, path.join(chained, "messagefoundry.toml"), false, real);
+      assert.strictEqual(t.ok, false, "an alias to a repository link");
+      assert.ok(!t.ok && t.problem.includes("set in user settings"), "the refusal names the user scope");
       // The alias naming the workspace folder itself is refused, as the folder is.
       assert.strictEqual(securityConfigTarget(ws, alias, false, real).ok, false, "the folder by its alias");
     } finally {
       fs.rmSync(away, { recursive: true, force: true });
     }
+  });
+
+  test("a user-set path whose links or whose workspace cannot be read is refused", () => {
+    const file = path.join(outside, "messagefoundry.toml");
+    const failing = (bad: (p: string) => boolean) => ({
+      realpath: (p: string): string => {
+        if (bad(p)) {
+          throw Object.assign(new Error("denied"), { code: "EACCES" });
+        }
+        return real.realpath(p);
+      },
+      lstat: real.lstat,
+      readlink: real.readlink,
+    });
+    // THE CONTROL: the same path, with every read succeeding, is accepted.
+    assert.ok(securityConfigTarget(ws, file, false, failing(() => false)).ok);
+    // The workspace folder cannot be resolved.
+    assert.strictEqual(securityConfigTarget(ws, file, false, failing((p) => p === path.resolve(ws))).ok, false, "the root");
+    // An ancestor of the target cannot be read while walking it for an alias.
+    const parent = path.dirname(outside);
+    assert.strictEqual(securityConfigTarget(ws, file, false, failing((p) => p === parent)).ok, false, "an ancestor");
   });
 
   test("the file a panel shows is its own, and a disposed panel neither sets it nor saves through it", () => {

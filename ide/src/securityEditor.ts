@@ -87,6 +87,7 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
   const target = securityConfigTarget(ws, serviceConfig(), fromWorkspace, {
     realpath: fs.realpathSync.native,
     lstat: fs.lstatSync,
+    readlink: fs.readlinkSync,
   });
   if (!target.ok) {
     postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
