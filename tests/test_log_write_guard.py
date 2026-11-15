@@ -256,9 +256,9 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     # BACKLOG #5812, across windows. A sink rolling every 10 seconds for five minutes is one break.
     # The bound's window restarts a minute after its first roll, and on main the sink then flipped
     # back to ``rolled`` (can_log() True with no probe) until the bound tripped again. The latch keeps
-    # it ``unwritable`` throughout, with no ``rolled`` event, while still paging on every roll past
-    # the bound as main did (two per 70 s window here, eight in all). NEGATIVE CONTROL: on main the
-    # state reads ``rolled`` at the first roll of each new window.
+    # it ``unwritable`` throughout, while paging exactly as main did: one event per roll, stage 2 on
+    # every roll past the bound (two per 70 s window here, eight in all), stage 1 on the rest.
+    # NEGATIVE CONTROL: on main the state reads ``rolled`` at the first roll of each new window.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
@@ -272,8 +272,8 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
         assert guard.status()[0].state == "unwritable"
         assert guard.can_log() is False
 
-    stages = [e.stage for e in events]
-    assert stages == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 8
+    assert len(events) == 30
+    assert [e.stage for e in events].count("unwritable") == 8
     assert all(e.stop_requested for e in events if e.stage == "unwritable")
 
     # The operator path still recovers it, by writing a real record.
@@ -341,6 +341,30 @@ def test_the_latch_never_trips_later_than_the_bound_alone(
     assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
 
 
+def test_a_roll_the_latch_alone_holds_still_pages_stage1_with_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812, never fewer pages than main. A roll at 62 s is a heal to the bound alone, which
+    # sends its stage-1 ``rolled`` page and shows that roll's cause on /status. The latch changes only
+    # the state. NEGATIVE CONTROL: at f02089441 the held roll fired nothing and /status kept the
+    # first verdict.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+    paged = len(events)
+
+    _at(clock, 62)
+    guard.record_rollover("file", reason="no space left", rolled_aside="/x/app.log.broken-7")
+
+    status = guard.status()[0]
+    assert status.state == "unwritable"
+    assert [(e.stage, e.reason) for e in events[paged:]] == [("rolled", "no space left")]
+    assert status.last_event == "no space left"
+    assert status.rolled_aside == "/x/app.log.broken-7"
+
+
 def test_a_stage2_failure_on_a_sink_the_latch_alone_holds_still_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -389,7 +413,8 @@ def test_continuous_stage2_failure_is_not_a_quiet_window(monkeypatch: pytest.Mon
 
     assert guard.status()[0].state == "unwritable"
     assert guard.can_log() is False
-    assert len(events) == paged
+    # No stage-2 page for the latched failures; the roll's own stage-1 page, as main sends it.
+    assert [e.stage for e in events[paged:]] == ["rolled"]
 
 
 def test_a_latched_roll_with_no_file_to_move_keeps_the_last_broken_file(

@@ -228,15 +228,16 @@ class LogWriteGuard:
         **A flapping sink stays ``unwritable``** (BACKLOG #5812). The bound above is unchanged, and
         every roll past it pages, with the stop request, exactly as before. On top of it, a sink
         the bound declared ``unwritable`` is LATCHED: a later roll the bound alone would call a heal
-        keeps it ``unwritable``, with no page, while that roll comes within
-        :data:`_ROLL_FLAP_WINDOW_SECONDS` of the sink's last roll or stage-2 failure. The roll is
-        counted and its rolled-aside path recorded, and the stage-2 cause stays on ``/status``. A
-        stage-2 failure on a sink the latch alone holds pages, as it would have on the ``rolled``
-        sink the bound alone left. The first roll after a full window with neither moves it to
-        ``rolled`` and pages, as above; a latched sink that heals and never rolls again stays
-        ``unwritable`` until :meth:`revalidate`. A sink stage 2 declared dead is not latched by
-        this: its healing roll moves it to ``rolled`` unless the bound itself says it is flapping.
-        So the latch never pages less, and never reads writable more, than the bound alone.
+        keeps it ``unwritable`` while that roll comes within :data:`_ROLL_FLAP_WINDOW_SECONDS` of the
+        sink's last roll or stage-2 failure. Only the state differs from the bound alone: that roll
+        still fires its stage-1 ``rolled`` page, and its cause is still the newest on ``/status``
+        (its rolled-aside path too, unless it moved nothing aside). A stage-2 failure on a sink the
+        latch alone holds pages, as it would have on the ``rolled`` sink the bound alone left. The
+        first roll after a full window with neither moves it to ``rolled``, as above; a latched
+        sink that heals and never rolls again stays ``unwritable`` until :meth:`revalidate`. A sink
+        stage 2 declared dead is not latched by this: its healing roll moves it to ``rolled``
+        unless the bound itself says it is flapping. So the latch never pages less, and never reads
+        writable more, than the bound alone.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -245,9 +246,9 @@ class LogWriteGuard:
         pass costs — the value published here would then disagree with the notice already written on
         the sink. A scrub that damages correct input is not a safety net."""
         # THE PRIOR STATE AND THE STREAK ARE READ, AND THE VERDICT WRITTEN, IN ONE LOCK HOLD (BACKLOG
-        # #5812). Writing ``rolled`` first and escalating through record_unwritable after made its
-        # latch read the state this method had just overwritten, so a flapping sink paged and asked
-        # for a stop on every roll past the bound.
+        # #5812). Writing ``rolled`` first and escalating through record_unwritable after left a
+        # window in which another thread read the sink as writable. The page on every roll past the
+        # bound is kept deliberately: the latch must never page less than the bound alone.
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -275,28 +276,25 @@ class LogWriteGuard:
                 if past_bound
                 else reason
             )
+            shown_aside = rolled_aside
             if flapping and already_down and previous is not None:
                 # Still down: keep the last broken file when this roll had none to move aside.
-                rolled_aside = rolled_aside or previous.rolled_aside
-            if held and previous is not None:
-                # Latched: keep the stage-2 cause the operator was paged with on ``/status``.
-                last_event, last_event_at = previous.last_event, previous.last_event_at
-            else:
-                last_event, last_event_at = verdict, _utc_now()
+                shown_aside = rolled_aside or previous.rolled_aside
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
                 state="unwritable" if flapping else "rolled",
                 rollovers=rollovers,
-                last_event=last_event,
-                last_event_at=last_event_at,
-                rolled_aside=rolled_aside,
+                last_event=verdict,
+                last_event_at=_utc_now(),
+                rolled_aside=shown_aside,
             )
             all_down = past_bound and all(s.state == "unwritable" for s in self._sinks.values())
-        if not flapping:
+        if not past_bound:
+            # A heal, or a roll the latch alone holds: the bound alone pages it as stage 1 either way.
             self._fire(
                 LogSinkEvent(sink=sink, stage="rolled", reason=reason, rolled_aside=rolled_aside)
             )
-        elif past_bound:
+        else:
             self._announce_unwritable(sink, reason=verdict, all_down=all_down)
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
