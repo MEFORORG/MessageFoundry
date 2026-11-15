@@ -2653,8 +2653,9 @@ count is above `0` (vault BACKLOG #2613).
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
   the first reading an app built without them takes.
-- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
-  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+- **How to clear them:** remove each variable the entry names or counts from the registry value
+  it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
+  environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   a variable named by a `[secrets].provider = "env"` reference, whose name only your config

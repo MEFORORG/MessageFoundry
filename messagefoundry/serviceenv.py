@@ -161,11 +161,9 @@ class ServiceEnvPosture:
     def listed_value_names(self) -> tuple[str, ...]:
         """The ``MEFOR_VALUE_*`` names the service's environment lists set. Unlike the two
         properties above, these come from the registry, so a refusal counts them and never prints
-        one: an operator may have typed a value where the name goes. The bare prefix names no
-        ``env()`` key, so it is not one."""
-        return tuple(
-            name for name in self.listed if name.startswith(_VALUE_PREFIX) and name != _VALUE_PREFIX
-        )
+        one: an operator may have typed a value where the name goes. The bare prefix is one too:
+        it names no ``env()`` key, but a value set under it is as readable as any other."""
+        return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
 
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it."""
@@ -289,9 +287,9 @@ class _WindowsProbe:
 
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     """The upper-cased names of the variables that ``NAME=value`` entries set to a secret. The
-    value is dropped here and never kept. An empty value sets nothing, so its name is not kept,
-    except a ``MEFOR_VALUE_*`` name, whose empty value the engine still overlays on the value
-    file. A path in a name that takes either a key or its path is not a secret, so that name is
+    value is dropped here and never kept. An empty value carries no secret, so its name is not
+    kept, except a ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and
+    whose empty value the engine still overlays on the value file. A path in a name that takes either a key or its path is not a secret, so that name is
     not kept either. Windows compares
     environment names without case, so this does too. Each name is returned with the first
     registry value that sets it."""

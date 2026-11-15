@@ -697,8 +697,8 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
 
 
 def test_env_values_are_counted_per_registry_value() -> None:
-    """Two values in one list and one in another are counted per value, and the bare prefix,
-    which names no ``env()`` key, is not one of them."""
+    """Two values in one list and one in another are counted per value. The bare prefix names no
+    ``env()`` key, but a value under it is as readable as any other, so it is counted too."""
 
     class _AlsoInEnvironment(_Probe):
         def environment_entries(self, service_name: str) -> list[tuple[str, str]]:
@@ -710,14 +710,20 @@ def test_env_values_are_counted_per_registry_value() -> None:
         entries=["MEFOR_VALUE_A=x", "MEFOR_VALUE_B=y", "MEFOR_VALUE_=z"],
     )
     posture = read_service_env_posture(probe=probe, environ={})
-    assert posture.listed_value_names == ("MEFOR_VALUE_A", "MEFOR_VALUE_B", "MEFOR_VALUE_C")
+    assert posture.listed_value_names == (
+        "MEFOR_VALUE_A",
+        "MEFOR_VALUE_B",
+        "MEFOR_VALUE_",
+        "MEFOR_VALUE_C",
+    )
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert refusal.startswith(
-        "2 MEFOR_VALUE_* variable(s) (in Parameters\\AppEnvironmentExtra), "
+        "3 MEFOR_VALUE_* variable(s) (in Parameters\\AppEnvironmentExtra), "
         "1 MEFOR_VALUE_* variable(s) (in Environment) is set in"
     )
-    assert service_env_refusal(_service(["MEFOR_VALUE_=z"])) is None
+    bare = service_env_refusal(_service(["MEFOR_VALUE_=z"]))
+    assert bare is not None and "rename that env() key first" in bare
     assert "counted once, without regard to case, under the first registry value" in refusal
     assert "remove it from every value that sets it" in refusal
     # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
