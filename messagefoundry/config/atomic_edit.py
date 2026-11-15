@@ -12,11 +12,11 @@ restriction (vault BACKLOG #2782). One copy here replaces the four.
 inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
 On Windows those modes do not restrict the file, so the candidate is given a protected access list
-granting the editing account alone before its first byte is written, and the replaced file is given
-it again, or the list the next paragraph describes. ``_restrict_to_editor`` says why that is one
-whole-list write and not ``store._secure_file``, which is only the fallback when the write fails.
-The caller's ``validate`` runs
-against that candidate. Only a candidate
+granting the editing account, and the live file's owner when that is another account, before its
+first byte is written. The replaced file is then given the editing account's list alone, or the
+list the next paragraph describes. ``_restrict_to_editor`` says why that is one whole-list write
+and not ``store._secure_file``, which is only the fallback when the write fails. The caller's
+``validate`` runs against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
 
@@ -29,7 +29,8 @@ is restricted to that account and the editing one rather than to the editing acc
 its ownership is given back where Windows lets this account do that (it needs the restore privilege
 enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
 a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
-file Administrators owns, is the owner-only rewrite it always was.
+file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
+the editing account, not SYSTEM, Administrators or another reader.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -397,7 +398,7 @@ def replace_validated(
                 if sys.platform == "win32":
                     # Before the first byte, so the candidate never carries its directory's list.
                     # A failure is logged, and the replaced file is restricted again below.
-                    _restrict_to_editor(candidate)
+                    _restrict_to_editor(candidate, owner=live.windows_owner)
                 handle.write(data)
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
@@ -539,8 +540,8 @@ def _canonical_sid(sid: str) -> str | None:
 def _foreign_windows_owner(path: Path) -> str | None:
     """The SID of the account that owns ``path`` when that is not this process's account, else
     ``None``. ``None`` too when the owner, the token or the token's groups cannot be read, and for
-    an owner many accounts hold, such as Users; the edit then makes the owner-only rewrite it always
-    made.
+    an owner many accounts hold, such as Users; the edit then makes the owner-only rewrite, which
+    grants the editing account alone.
 
     Administrators as the owner is this account's own when its token holds Administrators enabled:
     that is the default owner of an elevated administrator's files on Windows Server, and such a
@@ -581,16 +582,18 @@ def _full_control_for(*sids: str | None) -> str:
     return _protected_sddl(dict.fromkeys(filter(None, sids), _FULL_ACCESS))
 
 
-def _restrict_to_editor(path: Path) -> bool:
-    """Replace the access list of ``path`` with a protected one granting the editing account alone
-    full control; ``False``, logged, when the token or the write failed. Windows only.
+def _restrict_to_editor(path: Path, *, owner: str | None = None) -> bool:
+    """Replace the access list of ``path`` with a protected one granting the editing account full
+    control, and ``owner`` too when one is given; ``False``, logged, when the token or the write
+    failed. Windows only.
 
     The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
     private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
     RIGHTS, and an own-account edit whose replaced file went through that icacls rewrite was
     measured granting all four rather than its owner alone; that rewrite does not remove every
     entry a file carries. :func:`replace_validated` calls this on the candidate before its first
-    byte, and again on the replaced file."""
+    byte, with the live file's owner when that is another account so it can still read the file
+    once it is renamed into place, and again on an own-account replaced file."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()
@@ -600,7 +603,7 @@ def _restrict_to_editor(path: Path) -> bool:
             scrub_log_argument(str(path)),
         )
         return False
-    result = _set_security_from_sddl(path, _full_control_for(editor), protected=True)
+    result = _set_security_from_sddl(path, _full_control_for(owner, editor), protected=True)
     if result.failure is not None or result.dacl_status != 0:
         _log.warning(
             "could not restrict %s to this account: %s",

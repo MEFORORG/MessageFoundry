@@ -444,19 +444,9 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
     # On Windows Server the owner is Administrators; it must still count as another account here.
     monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
-    # The candidate's restriction to the editor alone is recorded, not written: the editor here is a
-    # seam, and a list naming only it would lock this process, the real account, out of the rename.
-    restricted: list[Path] = []
-
-    def _record(target: Path) -> bool:
-        restricted.append(target)
-        return True
-
-    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", _record)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
-    assert [p.name for p in restricted] == [path.name] and restricted[0] != path
     assert _owner_and_grants(path) == (owner, [owner, _EDITOR_SID])
     assert path.read_bytes() == b"x = 1\n"
 
@@ -509,22 +499,29 @@ def test_the_candidate_is_restricted_before_its_first_byte_on_windows(
 ) -> None:
     import messagefoundry.store.store as store_mod
 
-    path, _ = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)
+    path, owner = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)
     real_write = store_mod._set_security_from_sddl
     writes: list[tuple[Path, int]] = []
 
     def _recording(target: Path, sddl: str, *, protected: bool) -> Any:
         writes.append((target, target.stat().st_size))
-        return real_write(target, sddl, protected=protected)
+        result = real_write(target, sddl, protected=protected)
+        if target != path:
+            # The candidate's own list, read back before any byte reaches it.
+            assert_owner_only(target, owner)
+        return result
 
     monkeypatch.setattr(store_mod, "_set_security_from_sddl", _recording)
+    # Larger than the write buffer, so a restriction moved after the write sees the bytes on disk.
+    data = b"x = 1\n" + b"#" * (1 << 17) + b"\n"
 
-    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+    atomic_edit.replace_validated(path, data, _noop)
 
     (candidate, size), (final, _) = writes
     assert atomic_edit.is_candidate_dir_name(candidate.parent.name, of=path.name)
     assert size == 0, "the candidate held bytes before its access list was written"
     assert final == path
+    assert path.read_bytes() == data
 
 
 @windows_only
