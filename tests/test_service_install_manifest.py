@@ -1686,8 +1686,7 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     """A file link whose own DACL hides its link type passes ``$isLink``, so the walk fails closed on
     any file reparse point whose type reads empty: it skips the item and names it. A named problem
     withholds the installer's "Config : locked" line. Creating a symbolic link needs the privilege
-    an unelevated account has only in Developer Mode, so the test skips without it. Unelevated, no
-    owner can be set with /L or without, so only an elevated run (CI) witnesses the owner arm."""
+    an unelevated account has only in Developer Mode, so the test skips without it."""
     probe = tmp_path / "symlink-probe"
     try:
         probe.symlink_to(tmp_path)
