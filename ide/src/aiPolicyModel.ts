@@ -213,17 +213,24 @@ export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
  * is unreachable and has never answered finds no cache. The local CLI is not that engine and must
  * not answer for it, or retargeting would bypass a deny; such a target fails closed. The CLI stays
  * the fallback only for the default target, where the local file is the policy's nearest source.
+ *
+ * `answeredBefore` ({@link heldAuthoritativeAnswer}): once the IDE has held any engine's answer, the
+ * CLI does not answer for the default target either. Before the per-engine cache, the one cache held
+ * that answer there, so an expired permit or a disabling mode such as `managed_claude` disabled
+ * assistance; with the CLI answering, clearing a configured target or upgrading would let a local
+ * file outrank an expired engine answer, against the rule above.
  */
 export function pickOfflinePolicy(
   cached: CachedAiPolicy | null,
   cli: AiPolicy | null,
   nowMs: number = Date.now(),
   targetConfigured: boolean = false,
+  answeredBefore: boolean = false,
 ): AiPolicy {
   if (cached) {
     return cachedPolicyOffline(cached, nowMs);
   }
-  if (cli && !targetConfigured) {
+  if (cli && !targetConfigured && !answeredBefore) {
     return cli;
   }
   return UNVERIFIED_POLICY;
@@ -280,6 +287,29 @@ export type CarriedDenies = Record<string, AiPolicy>;
 export interface PolicyStore {
   get<T>(key: string): T | undefined;
   update(key: string, value: unknown): PromiseLike<void>;
+  keys(): readonly string[];
+}
+
+/**
+ * Written before {@link LEGACY_AI_POLICY_KEY} is deleted, so the IDE still knows it once held an
+ * engine's answer after the old key is gone ({@link heldAuthoritativeAnswer}).
+ */
+export const AI_POLICY_ANSWERED_KEY = "messagefoundry.aiPolicyAnswered";
+
+/**
+ * Whether the IDE has ever held an authoritative engine answer: any per-engine cache key, the old
+ * unscoped key, or the marker written when that key is deleted. While it has, the local CLI does not
+ * answer for an unreachable target ({@link pickOfflinePolicy}). A store whose keys cannot be read
+ * counts as having held one, which fails closed.
+ */
+export function heldAuthoritativeAnswer(store: PolicyStore): boolean {
+  try {
+    return store
+      .keys()
+      .some((k) => k.startsWith(AI_POLICY_CACHE_PREFIX) || k === LEGACY_AI_POLICY_KEY || k === AI_POLICY_ANSWERED_KEY);
+  } catch {
+    return true;
+  }
 }
 
 /** A central "off" or an `ai:assist` deny: the two answers the carrier records. */
@@ -348,8 +378,11 @@ function withCarrier<T>(
     }
     // The old key goes only once the carrier holding its deny is written: deleted first, a failed
     // write would lose the deny, which fails open. Kept, it is migrated again next time.
+    // The marker goes first, so a deleted old key still bars the CLI; a failed marker write keeps
+    // the old key, which bars it too.
     if (legacy !== undefined && persisted) {
       try {
+        await store.update(AI_POLICY_ANSWERED_KEY, true);
         await store.update(LEGACY_AI_POLICY_KEY, undefined);
       } catch {
         // Kept, it is migrated again on the next resolve, which retries the delete. The result
@@ -405,11 +438,12 @@ export function carryDeniesOnline(
  * The carrier's step when the target is unreachable. `offline` is what {@link pickOfflinePolicy}
  * chose. Any carried deny applies, whichever engine issued it: an unreachable target has no
  * authoritative answer of its own, and neither a cached permit nor the local CLI may outrank a deny
- * an engine gave. A choice that already disables assistance is returned as it is.
+ * an engine gave. A choice that already disables assistance is returned as it is, except the
+ * unverified one, which a carried deny replaces so the gate names the engine's reason.
  */
 export function carryDeniesOffline(store: PolicyStore, offline: AiPolicy): Promise<AiPolicy> {
   return withCarrier(store, (carried) => {
-    if (!assistantState(offline).enabled) {
+    if (!assistantState(offline).enabled && offline.mode !== UNVERIFIED_POLICY.mode) {
       return { next: carried, result: offline };
     }
     const deny = Object.values(carried).find(isPolicyDeny);

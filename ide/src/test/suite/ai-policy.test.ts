@@ -101,6 +101,7 @@ function fakeCtx(seed?: AiPolicy): {
   const ctx = {
     globalState: {
       get: (key: string): unknown => store.get(key),
+      keys: (): readonly string[] => [...store.keys()],
       update: async (key: string, v: unknown): Promise<void> => {
         store.set(key, v);
         if (key === LOOPBACK_KEY) {
@@ -321,6 +322,7 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     return {
       globalState: {
         get: (key: string): unknown => store.get(key),
+      keys: (): readonly string[] => [...store.keys()],
         update: async (key: string, v: unknown): Promise<void> => {
           store.set(key, v);
         },
@@ -396,6 +398,15 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     const p = await resolveAiPolicy(keyedCtx(), io);
     assert.strictEqual(p.mode, "byo");
     assert.strictEqual(io.cliAsked(), true);
+  });
+
+  test("T22b: once any engine has answered, the default target with no cache does not fall to the CLI", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const io = offlineWithCli(false);
+    const p = await resolveAiPolicy(ctx, io);
+    assert.strictEqual(p.mode, "unverified", "the local CLI answered after an engine had");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted once an engine has answered");
   });
 
   test("T23: a central off survives clearing the engine setting back to the default target", async () => {

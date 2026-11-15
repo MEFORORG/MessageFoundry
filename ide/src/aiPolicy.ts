@@ -20,6 +20,7 @@ import {
   carryDeniesOffline,
   carryDeniesOnline,
   evaluatedPermission,
+  heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
   pickOfflinePolicy,
 } from "./aiPolicyModel";
@@ -126,8 +127,9 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
  * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
  * identity-dependent `assist_permitted`; cached on success, per engine]; (b) when the engine is
  * unreachable, that engine's last cached authoritative policy; (c) the local CLI [reads
- * messagefoundry.toml], only when no engine target is configured; (d) a fail-closed "unverified"
- * policy (assistance disabled) so a central "off" can't be bypassed by going offline or retargeting.
+ * messagefoundry.toml], only when no engine target is configured and no engine has ever answered;
+ * (d) a fail-closed "unverified" policy (assistance disabled) so a central "off" can't be bypassed
+ * by going offline or retargeting.
  * Every result passes through the deny carrier, so a deny any engine issued reaches a target that
  * has no authoritative answer of its own.
  *
@@ -184,10 +186,14 @@ export async function resolveAiPolicy(
   } catch {
     // Keep the fail-closed reading.
   }
+  // Once any engine has answered, the local CLI does not answer for this target either: it must not
+  // outrank an engine's answer that has expired or that disables (pickOfflinePolicy). Read before
+  // the carrier runs, which may delete the old key.
+  const answeredBefore = heldAuthoritativeAnswer(ctx.globalState);
   let cli: AiPolicy | null = null;
-  // pickOfflinePolicy never reads the CLI's answer while a cache exists, or for a configured
-  // target, so do not spawn it then.
-  if (cached === null && !targetConfigured) {
+  // pickOfflinePolicy never reads the CLI's answer while a cache exists, for a configured target,
+  // or once an engine has answered, so do not spawn it then.
+  if (cached === null && !targetConfigured && !answeredBefore) {
     try {
       cli = fromWire(await io.getCliPolicy());
     } catch {
@@ -197,7 +203,7 @@ export async function resolveAiPolicy(
   // Unreachable, so no answer of its own: any deny an engine issued applies (carryDeniesOffline).
   return carryDeniesOffline(
     ctx.globalState,
-    pickOfflinePolicy(cached, cli, now(), targetConfigured),
+    pickOfflinePolicy(cached, cli, now(), targetConfigured, answeredBefore),
   );
 }
 

@@ -188,9 +188,10 @@ that function's docstring carries the argument, and `tests/test_cli_ai_policy.py
 ## IDE gating behavior
 
 The IDE assistant ([ide/src/chat.ts](../ide/src/chat.ts)) resolves the policy **before** every
-request: it first calls `GET /ai/policy` (authoritative, and cached on success); on any error it falls
-back to that cached authoritative policy, then to the local `messagefoundry ai-policy` CLI; if none of
-those can positively confirm a policy it uses a fail-closed built-in default (`mode: unverified`),
+request: it first calls `GET /ai/policy` (authoritative, and cached per engine on success); on any
+error it falls back to that engine's cached authoritative policy, then to the local
+`messagefoundry ai-policy` CLI, but only for the default engine target and only while the IDE has
+never held any engine's answer; if none of those can positively confirm a policy it uses a fail-closed built-in default (`mode: unverified`),
 which **disables** assistance rather than re-enabling BYO — a central *off* must not be bypassable by
 taking the engine offline (SEC-022).
 

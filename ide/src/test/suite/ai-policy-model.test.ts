@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import {
+  AI_POLICY_ANSWERED_KEY,
   AI_POLICY_CACHE_PREFIX,
   AI_POLICY_DENY_KEY,
   CACHED_PERMIT_MAX_AGE_MS,
@@ -14,6 +15,7 @@ import {
   cachedPolicyOffline,
   carryDeniesOffline,
   carryDeniesOnline,
+  heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
   pickOfflinePolicy,
   type AiPolicy,
@@ -264,6 +266,7 @@ function memStore(seed: Record<string, unknown> = {}): PolicyStore & { map: Map<
   return {
     map,
     get: <T>(key: string): T | undefined => map.get(key) as T | undefined,
+    keys: (): readonly string[] => [...map.keys()],
     update: async (key: string, value: unknown): Promise<void> => {
       await new Promise((resolve) => setTimeout(resolve, 1));
       if (value === undefined) {
@@ -287,7 +290,8 @@ async function answered(store: PolicyStore, url: string, fresh: AiPolicy): Promi
 
 async function unreachable(store: PolicyStore, url: string, cli: AiPolicy | null, configured: boolean): Promise<AiPolicy> {
   const cached = store.get<AiPolicy & { cachedAt?: number }>(aiPolicyCacheKey(url)) ?? null;
-  return carryDeniesOffline(store, pickOfflinePolicy(cached, cli, 0, configured));
+  const answeredBefore = heldAuthoritativeAnswer(store);
+  return carryDeniesOffline(store, pickOfflinePolicy(cached, cli, 0, configured, answeredBefore));
 }
 
 suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
@@ -330,14 +334,16 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     // Another engine's evaluated grant is its own answer, so it enables there...
     const other = await answered(store, OTHER, policy({ assistPermitted: true }));
     assert.strictEqual(assistantState(other).enabled, true, "an evaluated grant is that engine's own answer");
-    // ...but it does not clear the central deny for a target with no answer of its own.
-    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, false);
+    // ...but it does not clear the central deny, which reaches even OTHER once it is unreachable,
+    // though OTHER's own cache permits.
+    assert.strictEqual(assistantState(await unreachable(store, OTHER, cliByo, true)).enabled, false);
     // A tokenless read from the issuer does not clear it either.
     await answered(store, CENTRAL, policy({ assistPermitted: null }));
-    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, false);
-    // The issuer's evaluated grant does.
+    assert.strictEqual(assistantState(await unreachable(store, OTHER, cliByo, true)).enabled, false);
+    // The issuer's evaluated grant does, for a target whose own cache answers. (The default target
+    // has no cache, and once an engine has answered the CLI does not answer for it: D7.)
     await answered(store, CENTRAL, policy({ assistPermitted: true }));
-    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, true);
+    assert.strictEqual(assistantState(await unreachable(store, CENTRAL, cliByo, true)).enabled, true);
   });
 
   test("D3b: a central off is cleared only when that engine stops answering off", async () => {
@@ -346,7 +352,7 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     await answered(store, OTHER, policy({ mode: "byo" }));
     assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
     await answered(store, CENTRAL, policy({ mode: "byo" }));
-    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "byo");
+    assert.strictEqual((await unreachable(store, CENTRAL, cliByo, true)).mode, "byo");
   });
 
   test("D4: the old unscoped key's deny is migrated once, with an unknown issuer, then deleted", async () => {
@@ -357,15 +363,17 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     assert.ok(store.map.has(AI_POLICY_DENY_KEY), "the deny is carried");
     // Any engine's authoritative permit clears an unknown issuer's deny, as origin/main's key did.
     await answered(store, OTHER, policy({ mode: "byo" }));
-    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "byo");
+    assert.strictEqual((await unreachable(store, OTHER, cliByo, true)).mode, "byo");
   });
 
   test("D4b: an old ai:assist deny is migrated too, and an old permit is deleted without carrying", async () => {
     const deny = memStore({ [LEGACY_AI_POLICY_KEY]: policy({ assistPermitted: false }) });
     assert.strictEqual(assistantState(await unreachable(deny, LOCAL, cliByo, false)).enabled, false);
     const permit = memStore({ [LEGACY_AI_POLICY_KEY]: policy({ assistPermitted: true }) });
-    assert.strictEqual(assistantState(await unreachable(permit, LOCAL, cliByo, false)).enabled, true);
+    // It is still an engine's answer, so the CLI does not answer in its place (D7b).
+    assert.strictEqual(assistantState(await unreachable(permit, LOCAL, cliByo, false)).enabled, false);
     assert.strictEqual(permit.map.has(LEGACY_AI_POLICY_KEY), false);
+    assert.strictEqual(permit.map.get(AI_POLICY_ANSWERED_KEY), true, "the marker outlives the old key");
     assert.strictEqual(permit.map.has(AI_POLICY_DENY_KEY), false, "a permit is not a deny to carry");
   });
 
@@ -433,12 +441,16 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     for (const legacy of [{ mode: 7, assistPermitted: false }, { mode: "bogus", assistPermitted: false }]) {
       for (const deleteFails of [false, true]) {
         const label = `${JSON.stringify(legacy)} deleteFails=${deleteFails}`;
-        const store = memStore({ [LEGACY_AI_POLICY_KEY]: legacy });
+        // CENTRAL's own cache permits, so only the migrated deny can disable it.
+        const store = memStore({
+          [LEGACY_AI_POLICY_KEY]: legacy,
+          [aiPolicyCacheKey(CENTRAL)]: { ...policy({ assistPermitted: true }), cachedAt: 0 },
+        });
         if (deleteFails) {
           failWrites(store, LEGACY_AI_POLICY_KEY);
         }
         for (let i = 0; i < 2; i++) {
-          const p = await unreachable(store, LOCAL, cliByo, false);
+          const p = await unreachable(store, CENTRAL, cliByo, true);
           assert.strictEqual(assistantState(p).enabled, false, `resolve ${i + 1}: ${label}`);
         }
       }
@@ -476,8 +488,39 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
       assert.strictEqual(assistantState(await unreachable(mixed, LOCAL, cliByo, false)).enabled, false, label);
       // The way out: the issuer's authoritative permit clears it.
       await answered(store, CENTRAL, policy({ assistPermitted: true }));
-      assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, true, `not cleared: ${label}`);
+      assert.strictEqual(assistantState(await unreachable(store, CENTRAL, cliByo, true)).enabled, true, `not cleared: ${label}`);
     }
+  });
+
+  test("D7: once any engine has answered, an unreachable default target does not fall to the CLI", async () => {
+    // A configured target answered a permit, which is now expired; the target was then cleared back
+    // to the default, which has no cache of its own. The local file must not outrank an engine.
+    const store = memStore();
+    await answered(store, OTHER, policy({ assistPermitted: true }));
+    const p = await unreachable(store, LOCAL, cliByo, false);
+    assert.strictEqual(p.mode, "unverified", "the CLI answered for a target after an engine had");
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("D7b: an old unscoped value that is not a deny still bars the CLI, on every later resolve", async () => {
+    for (const legacy of [
+      { ...policy({ mode: "managed_claude" }), cachedAt: 0 },
+      { ...policy({ mode: "managed_claude_baa" }), cachedAt: 0 },
+      // An expired permit from whichever engine wrote the old key.
+      { ...policy({ assistPermitted: true }), cachedAt: 0 },
+    ]) {
+      const store = memStore({ [LEGACY_AI_POLICY_KEY]: legacy });
+      for (let i = 0; i < 2; i++) {
+        const p = await unreachable(store, LOCAL, cliByo, false);
+        assert.strictEqual(assistantState(p).enabled, false, `resolve ${i + 1}: ${legacy.mode}`);
+      }
+    }
+  });
+
+  test("D7c: a fresh install with no key at all still lets the CLI answer for the default target", async () => {
+    const p = await unreachable(memStore(), LOCAL, cliByo, false);
+    assert.strictEqual(p.mode, "byo");
+    assert.strictEqual(assistantState(p).enabled, true);
   });
 
   test("D5: two overlapping resolves cannot drop each other's deny", async () => {
@@ -560,7 +603,7 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
       "an engine's answer must pass through the carrier before it gates assistance",
     );
     assert.ok(
-      /return carryDeniesOffline\(\s*ctx\.globalState,\s*pickOfflinePolicy\(cached, cli, now\(\), targetConfigured\),?\s*\);/.test(
+      /return carryDeniesOffline\(\s*ctx\.globalState,\s*pickOfflinePolicy\(cached, cli, now\(\), targetConfigured, answeredBefore\),?\s*\);/.test(
         code,
       ),
       "the offline choice must pass through the carrier",
@@ -571,11 +614,15 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     assert.strictEqual((body[0].match(/\breturn\b/g) ?? []).length, 2, "a return that skips the carrier");
   });
 
-  test("T4: the offline path falls to the CLI only for an unconfigured target", () => {
+  test("T4: the offline path falls to the CLI only for an unconfigured target no engine has answered", () => {
     assert.ok(
-      /pickOfflinePolicy\(cached, cli, now\(\), targetConfigured\)/.test(code),
-      "resolveAiPolicy must tell pickOfflinePolicy whether the target is configured",
+      /pickOfflinePolicy\(cached, cli, now\(\), targetConfigured, answeredBefore\)/.test(code),
+      "resolveAiPolicy must tell pickOfflinePolicy whether the target is configured and an engine answered",
     );
+    // Read from the store before the carrier, which may delete the old key.
+    const read = code.search(/const answeredBefore = heldAuthoritativeAnswer\(ctx\.globalState\);/);
+    assert.ok(read >= 0, "resolveAiPolicy must read whether an engine has answered from globalState");
+    assert.ok(read < code.search(/return carryDeniesOffline\(/), "it must be read before the carrier runs");
     assert.ok(/targetConfigured: engineTargetIsSet,/.test(code), "the production io must read the settings");
   });
 });
