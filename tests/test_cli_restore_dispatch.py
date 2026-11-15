@@ -1541,6 +1541,7 @@ def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monk
         return real_read(tar_path)
 
     monkeypatch.setattr(dr_backup, "_read_manifest_from_tar", hold)
+    monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
     try:
         assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
     finally:

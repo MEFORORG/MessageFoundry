@@ -4911,7 +4911,8 @@ def _restore_blocking(
             if leftover is not None:
                 if isinstance(refusal, BackupError):
                     refusal = BackupError(
-                        refusal.kind, f"{str(refusal).rstrip('.')}. Separately, {leftover}"
+                        refusal.kind,
+                        join_before_checks(str(refusal).rstrip("."), ". Separately, ", leftover),
                     )
                 else:
                     exc.add_note(leftover)
@@ -4919,8 +4920,10 @@ def _restore_blocking(
                 raise
             raise refusal from exc
         finally:
-            # On the exception path `release` already ran above and this returns None, so only a
-            # restore that completed reaches the refusal below. The store and bundle are intact;
+            # A `finally` rather than an `else`, because the config-only route returns from inside
+            # the `try`. On the exception path `release` already ran above and this returns None,
+            # so only a restore that completed reaches the refusal below. The store and bundle are
+            # intact;
             # what is left is the staging directory, which its own remover could not delete. A
             # BackupError, so the CLI prints a refusal line rather than a traceback, and a kind of
             # its own, so the line does not read as the restore having failed. The outer `finally`
@@ -4934,8 +4937,12 @@ def _restore_blocking(
                     intact.append(f"the config bundle at {config_dest}")
                 raise BackupError(
                     "cleanup",
-                    f"the restore completed, but {leftover}. Intact: {', and '.join(intact)}. "
-                    "Do not re-run the restore; the destination is now in use.",
+                    join_before_checks(
+                        f"the restore completed, but {leftover}",
+                        ". ",
+                        f"Intact: {', and '.join(intact)}. Do not re-run the restore; the "
+                        "destination is now in use.",
+                    ),
                 )
     finally:
         if published and not completed:
