@@ -151,7 +151,7 @@ def _pass_lock(bound: AesGcmCipher) -> asyncio.Lock:
 async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -> None:
     """Run the persisted add and the in-memory grant as one unit a cancellation cannot split.
 
-    The add runs in its own task, shielded, so a cancellation of the caller cannot abandon a write
+    The add runs in its own task, which nothing here cancels, so a cancellation of the caller cannot abandon a write
     the database may still commit (an aiosqlite statement runs on a worker thread whatever happens to
     the awaiting coroutine). A cancellation that lands mid-add is held until the add finishes and its
     grant is applied, then re-raised. Without that, a committed REFUND with no grant would leave the
@@ -160,19 +160,21 @@ async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -
     the connection."""
     task = asyncio.ensure_future(add(bound.invocation_key_id, need))
     cancelled = False
-    while True:
+    while not task.done():
         try:
-            total = await asyncio.shield(task)
+            # `wait`, not `shield`: it never cancels the task, and a failure the task raises after
+            # this caller was cancelled is still read below rather than logged by the loop (BACKLOG #2087).
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
-            if task.done():
-                raise  # the add itself was cancelled, so it returned no total to grant
             cancelled = True
-            continue
-        except Exception:
-            if cancelled:
-                raise asyncio.CancelledError from None
-            raise
-        break
+    if task.cancelled():
+        raise asyncio.CancelledError  # the add itself was cancelled, so it returned no total
+    try:
+        total = task.result()
+    except Exception:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
     bound.grant_invocations(need, total)
     if cancelled:
         raise asyncio.CancelledError

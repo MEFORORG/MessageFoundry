@@ -18839,8 +18839,16 @@ class MessageStore:
         take the two in that order; a checkpoint taking the pass lock first and then waiting on the
         writer lock inside its add would deadlock against them. A failed add is rolled back inside
         the guard, so the bound's own contract (log and retry once hydrated) still decides."""
-        if bounded_cipher(self._cipher) is None:
+        bound = bounded_cipher(self._cipher)
+        if bound is None:
             return None  # nothing to account, so no reason to take the writer lock
+        if bound.invocation_bound_hydrated:
+            # The usual pass has nothing to add. Read without either lock, so an idle checkpoint
+            # never queues behind (or blocks) a writer; a stale read only defers work to the next
+            # pass, and the refill hook wakes the runner again when the reserve runs low.
+            idle = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
+            if idle == 0:
+                return bound.cumulative_invocations()
 
         async def add(key_id: str, count: int) -> int:
             try:
