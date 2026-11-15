@@ -203,12 +203,15 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     The ``replace`` handler writes ``?`` on encode. An ``MSH``-led reply declares its own
     delimiters in MSH-1 and MSH-2, and HL7 lets a sender pick ``?`` as one, so where it is a
     delimiter or the segment terminator a replaced data character would become structure (ADR
-    0206). That reply is refused with the same fixed error instead. A reply not led by ``MSH`` has
-    no declared delimiters to collide with."""
-    if _REPLACEMENT in _reply_delimiters(reply):
+    0206). That reply is refused with the same fixed error instead. So is one with a delimiter the
+    charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
+    and both would read as one delimiter. A reply not led by ``MSH`` has no declared delimiters to
+    collide with."""
+    delimiters = _reply_delimiters(reply)
+    if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
         raise UnicodeError(
-            "the reply holds characters its charset cannot encode, and the replacement is one of "
-            "its own delimiters"
+            "the reply holds characters its charset cannot encode, and the replacement would "
+            "collide with one of its own delimiters"
         )
     body: bytes | None
     try:
@@ -229,6 +232,15 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
 
 #: What Python's ``replace`` error handler writes in place of a character on encode.
 _REPLACEMENT = "?"
+
+
+def _encodes(delimiter: str, encoding: str) -> bool:
+    """Whether one delimiter character survives a strict encode, so ``replace`` leaves it alone."""
+    try:
+        delimiter.encode(encoding)
+    except (LookupError, UnicodeError):
+        return False
+    return True
 
 
 def _reply_delimiters(reply: str) -> frozenset[str]:

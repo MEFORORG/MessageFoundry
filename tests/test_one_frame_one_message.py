@@ -681,18 +681,31 @@ def test_frame_reply_refuses_a_replacement_that_is_one_of_the_replys_delimiters(
     Such a reply is refused with the fixed error, chaining nothing. Mutation: drop the delimiter
     check in _encode_replacing. Red: the call returns a reply with an extra delimiter."""
     reply = f"MSH|{msh2}|R|RF|S|F|20260101||ACK|CTRL1|P|2.5" + CR + "MSA|AA|CTRL1|中" + CR
-    with pytest.raises(UnicodeError, match="one of its own delimiters") as ei:
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
         frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
     assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
 def test_control_a_field_separator_of_question_mark_is_refused_too() -> None:
     reply = "MSH?^~" + BS + "&?R?RF" + CR + "MSA?AA?CTRL1?中" + CR
-    with pytest.raises(UnicodeError, match="one of its own delimiters"):
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
         frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
     # And a reply needing no replacement is untouched by the check, delimiters and all.
     clean = "MSH?^~" + BS + "&?R?RF" + CR
     assert frame_reply(MLLP_CODEC, clean, "ascii") == MLLP_CODEC.frame(clean.encode("ascii"))
+
+
+def test_frame_reply_refuses_a_delimiter_the_charset_cannot_hold() -> None:
+    """Round-three review of #5799: an unencodable MSH-1 would itself become ``?`` beside a replaced
+    data character, and the two would read as one delimiter. Mutation: drop the encodability test
+    from the delimiter check. Red: the call returns a reply whose fields have shifted."""
+    reply = "MSH\u00a6^~" + BS + "&\u00a6R\u00a6RF" + CR + "MSA\u00a6AA\u00a6CTRL1\u00a6\u4e2d" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_UNENCODABLE_DELIM")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    # Control: latin-1 holds the delimiter, so only the data character is replaced and it answers.
+    wire = frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_UNENCODABLE_DELIM")
+    assert wire == MLLP_CODEC.frame(reply.replace("\u4e2d", "?").encode("latin-1"))
 
 
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])
