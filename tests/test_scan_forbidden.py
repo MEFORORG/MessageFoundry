@@ -1345,6 +1345,7 @@ def test_a_binary_file_does_not_count_as_scanned(
     root.mkdir()
     (root / "blob.bin").write_bytes(b"\x00\x01\x02 ACME 203.0.113.9")
     assert sf_main.main(["--path", str(root)]) == 2
+    capsys.readouterr()
     (root / "ok.md").write_text("fine\n", encoding="utf-8")
     assert sf_main.main(["--path", str(root)]) == 0
     err = capsys.readouterr().err
@@ -1383,3 +1384,68 @@ def test_a_mid_line_angle_bracket_is_not_read_as_a_quote(sf) -> None:
     """The quote marker was unanchored, so it deleted a line's first ``>`` wherever it sat."""
     assert sf._pr_units("a -> b")[0][1] == "a -> b"
     assert sf._pr_units("> quoted")[0][1] == "quoted"
+
+
+def test_an_unreadable_file_fails_the_run_as_an_instrument(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2, not 1: an unread file wants its permissions fixed, not content removed."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.md"
+    locked.write_text("fine\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert sf_main.main(["--path", str(root)]) == 2
+
+
+def test_a_staged_file_named_show_context_is_not_dropped(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5585. ``--show-context`` from anywhere in argv dropped a staged file of that name."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main([str(dirty / "leak.md"), "--show-context"]) == 2
+    assert "unknown option" in capsys.readouterr().err
+    assert sf_main.main(["--show-context", str(dirty / "leak.md")]) == 1
+
+
+def test_a_file_named_like_a_build_directory_is_walked(sf_main, tmp_path: Path) -> None:
+    """Only directory parts are skipped: a file named ``build`` is not a build directory."""
+    root = tmp_path / "tree"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "build").write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"ASVS {_REQ} is enforced in <https://github.com/example/repo/blob/main/pkg/example_guard.py>.",
+        f"Retries cap at n<max; ASVS {_REQ} is enforced in pkg/example_guard.py -> done.",
+    ],
+)
+def test_a_bracket_that_is_not_a_tag_does_not_swallow_the_code_path(sf, line: str) -> None:
+    """The split's tag ran to the next ``>`` anywhere, so an autolink or a ``<`` and a later ``->``
+    took the code path with them once the quote marker stopped eating the line's first ``>``."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+def test_the_target_reading_adds_maps_only_and_hits_stay_in_line_order(sf) -> None:
+    """A link target's words are a URL's, so the second reading adds a code map and nothing else."""
+    assert sf.scan_pr_body(f"See [the notes](docs/gaps.md) about {_REQ_B}.") == []
+    body = "\n\n".join(
+        [
+            f"ASVS {_REQ} stays {_PARTIAL}.",
+            f"ASVS {_REQ} is enforced in [the guard](pkg/example_guard.py).",
+            f"ASVS {_REQ} is enforced by `pkg/example_guard.py`.",
+        ]
+    )
+    lines = [int(h.split(":")[1]) for h in sf.scan_pr_body(body)]
+    assert lines == sorted(lines) and len(lines) == 3, lines

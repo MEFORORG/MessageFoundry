@@ -133,8 +133,8 @@ def _ipv4_allow_list() -> re.Pattern[str] | None:
 
 
 def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
-    """Forbidden-token **reasons** in ``text`` (no matched text) — vendored twin of
-    ``scan_forbidden.scan_text``. The site code is checked field-anchored by :func:`leak_check`, not
+    """Forbidden-token **reasons** in ``text`` (no matched text), from
+    ``scan_forbidden.scan_text`` itself. The site code is checked field-anchored by :func:`leak_check`, not
     here (see the engine docstring). With the guard loaded this IS the guard's scan, so the two cannot
     drift (BACKLOG #5584); without it the name and estate tables are empty and only the IP check runs."""
     if _GUARD is not None:

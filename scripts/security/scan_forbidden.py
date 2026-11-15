@@ -85,7 +85,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -665,7 +665,11 @@ _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
 #: HTML, and a tag is a block edge there however the text runs on.
-_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+#: The tag is a real tag name with attributes holding no `<` or `>`: `[^>]*` swallowed an autolink, or
+#: everything from `n<max` to the `>` of a later `->`, as one tag and took its code path with it.
+_PR_SENTENCE_SPLIT = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>\s*"
+)
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
 #: Anchored: unanchored, it deleted the first `>` anywhere in a line, the close of the line's first tag.
@@ -904,7 +908,11 @@ def scan_pr_body(body: str) -> list[str]:
     hits = _pr_unit_hits(as_text)
     with_targets = _pr_units(body, targets=True)
     if with_targets != as_text:
-        hits = list(dict.fromkeys(hits + _pr_unit_hits(with_targets)))
+        # Only a map: the second reading exists so a target's code path counts, and a target's words
+        # are a URL's, not the body's own verdict or gap.
+        extra = [h for h in _pr_unit_hits(with_targets) if h.endswith(PR_BODY_REASONS["map"])]
+        hits = list(dict.fromkeys(hits + extra))
+        hits.sort(key=lambda h: int(h.split(":", 2)[1]))
     return hits
 
 
@@ -1656,8 +1664,9 @@ def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
     return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
 
 
-#: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. A stdlib-only twin
-#: of the table in messagefoundry/security/audit_all_platforms.py: this file loads standalone by path.
+#: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
+#: the table in messagefoundry/security/audit_all_platforms.py, copied because this file loads
+#: standalone by path; UTF-8 needs no entry here, since a NUL-free file decodes as UTF-8 anyway.
 _BOMS = (
     (codecs.BOM_UTF32_LE, "utf-32"),
     (codecs.BOM_UTF32_BE, "utf-32"),
@@ -1708,21 +1717,27 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     return _scan_file(path, rel_posix, show_context=show_context)[0]
 
 
+#: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
+#: under a forbidden path), or fail to read it at all.
+_FileState = Literal["read", "unread", "unreadable"]
+
+
 def _scan_file(
     path: Path, rel_posix: str | None = None, *, show_context: bool = False
-) -> tuple[list[str], bool]:
-    """``scan_file``'s hits, and whether the file's content was read as text. A binary file is judged by
-    its name and location only, and the run must not count it as scanned (BACKLOG #5583)."""
+) -> tuple[list[str], _FileState]:
+    """``scan_file``'s hits, and what became of the file's content. A binary file is judged by its name
+    and location only, so the run must not count it as scanned, and an unreadable one is an instrument
+    failure, not a clean file (BACKLOG #5583)."""
     posix = rel_posix if rel_posix is not None else path.as_posix()
     if _is_skipped(posix):
-        return [], False
+        return [], "unread"
     # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
     # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
     if reason := forbidden_path_reason(posix):
-        return [f"{path}:0: {reason}"], False
+        return [f"{path}:0: {reason}"], "unread"
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
     # filename, and a module need not repeat its own name in its text. Placed before the binary
@@ -1744,9 +1759,9 @@ def _scan_file(
         # The errno name only: the message can carry the path's absolute form, a user-home path.
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
         hits.append(f"{posix}:0: unreadable ({why}), so its content was not scanned (fail closed)")
-        return hits, False
+        return hits, "unreadable"
     if text is None:
-        return hits, False
+        return hits, "unread"
     ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
     site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -1809,7 +1824,7 @@ def _scan_file(
                 if estate_pat.search(line):
                     hits.append(f"{posix}:{lineno}: estate token{ctx}")
                     break
-    return hits, True
+    return hits, "read"
 
 
 def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
@@ -2334,8 +2349,12 @@ def main(argv: list[str]) -> int:
         # cannot see. They call for different actions and must not share an exit code.
         return 2 if failures else 0
 
-    show_context = "--show-context" in argv
-    rest = [a for a in argv if a != "--show-context"]
+    # First only, for the reason the terminal modes above are whole-line only: taken from anywhere, a
+    # staged file named ``--show-context`` was dropped unscanned and switched on value echoing.
+    # Anywhere else ``_parse_require_flag`` refuses it. A staged file named ``--path`` still switches
+    # the run to path mode; that needs a ``--`` separator from pre-commit (BACKLOG #5585, remainder).
+    show_context = bool(argv) and argv[0] == "--show-context"
+    rest = argv[1:] if show_context else list(argv)
     try:
         flag_require, minimum, rest = _parse_require_flag(rest)
     except ValueError as exc:
@@ -2390,24 +2409,30 @@ def main(argv: list[str]) -> int:
     path_mode = bool(rest) and rest[0] == "--path"
     hits: list[str] = []
     # Only a file whose content was read as text counts as scanned. A binary file is judged by its name
-    # and location only, and an unreadable one is a hit; counting either as scanned let a run whose
-    # files were all unread report coverage it did not have (BACKLOG #5583).
+    # and location only, and an unreadable one fails the run with exit 2; counting either as scanned let
+    # a run whose files were all unread report coverage it did not have (BACKLOG #5583).
     scanned = 0
     unread = 0
+    unreadable = 0
     for abs_path, rel in _candidate_files(rest):
         # SKIP_DIRS is evaluated on the RELATIVE parts, so a scan-root path component that happens to be
         # named build/venv/dist/… can no longer short-circuit the scan of every file. It applies to the
-        # --path walk only: a tracked or staged file is scanned wherever it sits (BACKLOG #5585).
+        # --path walk only, so the tracked and staged scans read such a file; the CI --path scans still
+        # skip it, because the walk cannot tell tracked from untracked (BACKLOG #5585, remainder). Only
+        # the DIRECTORY parts count: a file named ``build`` is not a build directory. A ``.git`` FILE is
+        # a worktree's pointer to its git directory, and is skipped as that directory is.
         if not abs_path.is_file() or _is_skipped(rel):
             continue
-        if path_mode and set(Path(rel).parts) & SKIP_DIRS:
+        posix_rel = Path(rel)
+        if path_mode and (set(posix_rel.parent.parts) & SKIP_DIRS or posix_rel.name == ".git"):
             continue
-        file_hits, read = _scan_file(abs_path, rel, show_context=show_context)
+        file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
         hits.extend(file_hits)
-        if read:
+        if state == "read":
             scanned += 1
         else:
             unread += 1
+            unreadable += state == "unreadable"
 
     # PRINT WHAT WAS SCANNED, not just what was loaded. Exit 0 plus a token-count line cannot tell a
     # caller whether the files they named were examined -- and when --path silently dropped trailing
@@ -2429,6 +2454,16 @@ def main(argv: list[str]) -> int:
             "scan_forbidden: --path examined ZERO files (all skipped or unread, or empty tree) — refusing "
             "(fail closed). Check the scan path for a SKIP_DIRS component (build/venv/dist/…).",
             file=sys.stderr,
+        )
+        return 2
+
+    # 2, not 1: an unread file is an instrument that could not see, which wants its permissions or lock
+    # fixed, not content removed. The same split as --self-test's.
+    if unreadable:
+        _report_hits(
+            "UNREADABLE FILES -- their content was not scanned (fail closed):",
+            hits,
+            "Fix the file's permissions or lock, then scan again. Any content hit above still applies.",
         )
         return 2
 
