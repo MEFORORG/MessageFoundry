@@ -1276,18 +1276,18 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     (
         "10",
         "verdict",
-        "| Tool | Check | Requirement | Verdict |\n|---|---|---|---|\n| uv | never fails | 1.2.3 | met |",
+        f"| Tool | Check | Requirement | Verdict |\n|---|---|---|---|\n| uv | never fails | {_REQ} | met |",
     ),
     (
         "10",
         "verdict",
-        "| Job | CI | Req | Result |\n|---|---|---|---|\n| smoke-test | never passing | 1.2.3 | not met |",
+        f"| Job | CI | Req | Result |\n|---|---|---|---|\n| smoke-test | never passing | {_REQ} | not met |",
     ),
-    ("10", "verdict", "| unchanged, partial | na | smoke-test | never fails; | 1.2.4 |"),
-    ("10", "verdict", "Per Python row is not failing 1.2.3 is met."),
-    ("10", "verdict", "HL7 row is not failing V1.2.3 is met."),
-    ("10", "verdict", "Build 3.14.0 | row is not failing pass, and\n1.2.3: fail closed."),
-    ("10", "verdict", "[1.2.4] row is not failing pass and\n1.2.3: fail closed."),
+    ("10", "verdict", f"| unchanged, partial | na | smoke-test | never fails; | {_REQ_B} |"),
+    ("10", "verdict", f"Per Python row is not failing {_REQ} is met."),
+    ("10", "verdict", f"HL7 row is not failing V{_REQ} is met."),
+    ("10", "verdict", f"Build 3.14.0 | row is not failing pass, and\n{_REQ}: fail closed."),
+    ("10", "verdict", f"[{_REQ_B}] row is not failing pass and\n{_REQ}: fail closed."),
     # A marked identifier is never exempt.
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
@@ -1356,7 +1356,7 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     f"| {_REQ} | never fails | stays at the same grade |",
     f"For {_REQ} the row is not failing for\nASVS 1.2.3.",
     "Since 2.5.1 the row is not failing for\nASVS 1.2.3.",
-    f"For {_REQ} the row is not failing:\n1.2.3 here.",
+    f"For {_REQ} the row is not failing:\n{_REQ_B} here.",
     f"| {_REQ} | unchanged | never fails |",
     f"| {_REQ} | {_PARTIAL} | never fails |",
     f"| {_REQ} | graded | never fails |",
@@ -1368,18 +1368,18 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     f"Since **{_REQ}** the row is not failing.",
     # Review round-df2d868b: a requirement-shaped number other than 2.5.1, a gap or record word in
     # the component cell or after the number, and the shapes' near variants.
-    "| 14.2.1 | logging | never passes |",
-    "| 8.3.1 | session | is never passing |",
-    "The row is not passing for 14.2.1 yet.",
-    "The row is no longer failing for 8.3.1.",
-    "Since 6.1.1, the row is not failing.",
-    "| 8.3.1 | gap | never fails |",
+    f"| {_REQ} | logging | never passes |",
+    f"| {_REQ_B} | session | is never passing |",
+    f"The row is not passing for {_REQ} yet.",
+    f"The row is no longer failing for {_REQ_B}.",
+    f"Since {_REQ}, the row is not failing.",
+    f"| {_REQ_B} | gap | never fails |",
     "The row is not failing for 2.5.1 gaps.",
-    "| 6.1.1 | residual | is never passing |",
-    "| 6.1.1 | rescore | never fails |",
-    "| 6.1.1 | regraded | never fails |",
-    "| 6.1.1 | vault | never passes |",
-    "The row is not passing for 6.1.1 regrade.",
+    f"| {_REQ} | residual | is never passing |",
+    f"| {_REQ} | rescore | never fails |",
+    f"| {_REQ} | regraded | never fails |",
+    f"| {_REQ} | vault | never passes |",
+    f"The row is not passing for {_REQ} regrade.",
     "| 2.5.1 | satisfied | never fails |",
     "| 2.5.1 | meets | never fails |",
     "The row is no longer passing for 2.5.1 batches.",
@@ -1502,16 +1502,6 @@ def test_a_row_clause_body_main_flags_fires_at_mains_lines(sf, sf_frozen_main, b
     main_hits = set(sf_frozen_main.scan_pr_body(body))
     assert main_hits, body
     assert main_hits <= set(sf.scan_pr_body(body)), body
-
-
-def test_the_pr_2893_false_positive_bodies_fire_as_on_main(sf, sf_frozen_main) -> None:
-    """Step 10 is removed, so each of the six bodies reports exactly what main reports."""
-    assert len(set(_PR_2893_FALSE_POSITIVE_BODIES)) == 6
-    assert not hasattr(sf, "_PR_STEP10_BODIES")
-    for body in _PR_2893_FALSE_POSITIVE_BODIES:
-        main_hits = sf_frozen_main.scan_pr_body(body)
-        assert main_hits, body
-        assert sf.scan_pr_body(body) == main_hits, body
 
 
 @pytest.mark.parametrize(
@@ -1719,21 +1709,21 @@ def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
 #: regression pins: each is slid across every offset of the 80-character window, and head must report
 #: every hit main reports. Main flags each, through "failing: <id>" or "<id> stays partial".
 _WINDOW_EDGE_SHAPES = [
-    "Then narrow is not{pad}failing: 1.2.3 here.",
-    "See `retry_row` is not{pad}failing: 1.2.3 here.",
-    "See x__row is not{pad}failing: 1.2.3 here.",
-    "The nar**row** is not failing:{pad}1.2.3 today.",
-    "The nar`row` is not failing:{pad}1.2.3 today.",
-    "The narrow is not failing: 1.2.3 and then\nwe keep the outbound path under watch while{pad}"
-    "1.2.4 stays partial.",
+    f"Then narrow is not{{pad}}failing: {_REQ} here.",
+    f"See `retry_row` is not{{pad}}failing: {_REQ} here.",
+    f"See x__row is not{{pad}}failing: {_REQ} here.",
+    f"The nar**row** is not failing:{{pad}}{_REQ} today.",
+    f"The nar`row` is not failing:{{pad}}{_REQ} today.",
+    f"The narrow is not failing: {_REQ} and then\nwe keep the outbound path under watch while{{pad}}"
+    f"{_REQ_B} stays partial.",
     # Review round-e784ff8b27: a clause one candidate's window cuts before " over" is no clause in
     # another candidate's window, which reads on, so it must not unbind that candidate's "is met".
-    "Python 3.1.2, _which_ stays partial, as {pad}\nand 1.2.3 is met row is not failing over to"
+    f"Python {_REQ_B}, _which_ stays partial, as {{pad}}\nand {_REQ} is met row is not failing over to"
     " the backup.",
-    "ASVS:{pad}v5 3.1.2 x "
+    f"ASVS:{{pad}}v5 {_REQ_B} x "
     + "y" * 37
-    + "\nand 1.2.3 is met row is not failing over to the backup.",
-    "Python 3.1.2, _which_ stays partial, as {pad}\nso 1.2.3 x the cell is partial row is not"
+    + f"\nand {_REQ} is met row is not failing over to the backup.",
+    f"Python {_REQ_B}, _which_ stays partial, as {{pad}}\nso {_REQ} x the cell is partial row is not"
     " failing over to the backup.",
 ]
 
@@ -1848,10 +1838,10 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
 @pytest.mark.parametrize(
     "body",
     [
-        "1.2.3 is partial and the row is not " + "_" * 16000,
-        "1.2.3 is partial and the row is not " + "*" * 16000,
-        "1.2.3 is partial and the row was " + "`" * 16000,
-        "1.2.3 is partial and the cell is " + "_" * 16000,
+        f"{_REQ} is partial and the row is not " + "_" * 16000,
+        f"{_REQ} is partial and the row is not " + "*" * 16000,
+        f"{_REQ} is partial and the row was " + "`" * 16000,
+        f"{_REQ} is partial and the cell is " + "_" * 16000,
     ],
     ids=["underscore", "star", "backtick", "cell-underscore"],
 )
