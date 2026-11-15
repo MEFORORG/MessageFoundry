@@ -308,6 +308,18 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO
     assert "did not fully drain" in cmp.rows[0].reason
+    # A None drain on an INCONCLUSIVE arm may be a cell that never ran, so no stall is asserted.
+    assert "never ran" in cmp.rows[0].reason and "rows stranded" not in cmp.rows[0].reason
+    # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
+    flat = [
+        replace(r, no_loss=replace(r.no_loss, inconclusive=True))
+        for r in _trials(True, [102.0, 103.0, 101.0], no_loss_ok=False)
+    ]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + flat, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "banked no worthwhile margin" in cmp.rows[0].reason
+    assert not cmp.ok
 
 
 def test_no_go_when_drain_time_grows() -> None:

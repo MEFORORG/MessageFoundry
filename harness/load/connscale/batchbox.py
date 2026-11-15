@@ -478,18 +478,18 @@ def aggregate_cell_record(
     client_lost = 0
     for r in proc_reports:
         nl = r.get("no_loss", {})
-        unjudged = False
+        engine_unjudged = False
         if "counter_reset" not in nl:
             resets.append("a band report does not say whether the engine counters reset")
         elif nl["counter_reset"] is not None:
             resets.append(escape_for_terminal(str(nl["counter_reset"]), single_line=True))
-            unjudged = True
+            engine_unjudged = True
         elif int(nl.get("backlog", 0) or 0) >= 0:
             trusted.append(r)
         if int(nl.get("backlog", 0) or 0) < 0:
             blind += 1
-            unjudged = True
-        if unjudged and nl.get("ok") is False and nl.get("inconclusive") is False:
+            engine_unjudged = True
+        if engine_unjudged and nl.get("ok") is False and nl.get("inconclusive") is False:
             client_lost += 1
     # Every band reads the SAME engine, so one band's readings are the engine totals and a proven
     # loss needs only the bands that read it cleanly (BACKLOG #5574): one band's reset or blindness

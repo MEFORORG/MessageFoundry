@@ -392,6 +392,12 @@ def test_an_inconclusive_baseline_is_no_resilience_win_and_fails_the_row() -> No
     loss = cmp.to_json_dict()["rows"][0]["loss"]  # type: ignore[index]
     assert loss["per_lane_zero_loss_inconclusive"] is True
     assert loss["pooled_zero_loss_inconclusive"] is False
+    # The summary counts the row it fails, beside the breaches it does not count.
+    summary = cmp.to_json_dict()["summary"]
+    assert isinstance(summary, dict)
+    assert summary["baseline_inconclusive"] == 1
+    assert summary["baseline_zero_loss_breaches"] == 0
+    assert "baseline_inconclusive=1" in cmp.render_table()
 
 
 def test_an_inconclusive_arm_is_labelled_inconclusive_not_a_breach() -> None:

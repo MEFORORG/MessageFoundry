@@ -242,6 +242,12 @@ class ClaimModeComparison:
         )
 
     @property
+    def baseline_inconclusive(self) -> int:
+        """Counts whose per_lane arm could not clear zero-loss and proved no loss (BACKLOG #5574).
+        Each fails its row, so the summary names them beside the breaches it does not count."""
+        return sum(1 for row in self.rows if row.baseline.no_loss_inconclusive)
+
+    @property
     def resilience_wins(self) -> int:
         """Counts where per_lane breached zero-loss but pooled held it."""
         return sum(1 for row in self.rows if row.resilience_win)
@@ -286,6 +292,7 @@ class ClaimModeComparison:
                 "candidate_zero_loss_ok": self.candidate_zero_loss_ok,
                 "throughput_non_regression": self.throughput_non_regression,
                 "baseline_zero_loss_breaches": self.baseline_zero_loss_breaches,
+                "baseline_inconclusive": self.baseline_inconclusive,
                 "resilience_wins": self.resilience_wins,
                 "worst_collapse": self.worst_collapse,
                 "missing_arms": self.missing_arms,
@@ -313,8 +320,9 @@ class ClaimModeComparison:
         lines.append(
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
             f"throughput_non_regression={_tnr_label(self.throughput_non_regression)}, "
-            f"resilience_wins={self.resilience_wins}, worst_collapse={self.worst_collapse}, "
-            f"missing_arms={self.missing_arms}, "
+            f"resilience_wins={self.resilience_wins}, "
+            f"baseline_inconclusive={self.baseline_inconclusive}, "
+            f"worst_collapse={self.worst_collapse}, missing_arms={self.missing_arms}, "
             f"orphan_candidate_cells={len(self.orphan_candidate_cells)})"
         )
         if self.orphan_candidate_cells:
@@ -1324,6 +1332,14 @@ def _fuse_verdict(
     if candidate_lost and not cand.zero_loss_inconclusive:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
+        if not cand.drain_completed and candidate_lost and cand.zero_loss_inconclusive:
+            # A failed or never-run cell carries the same None drain as a timed-out one, and its
+            # INCONCLUSIVE reconcile cannot say which; stalled rows are not asserted (BACKLOG #5574).
+            return FUSE_NO_GO, (
+                "B1 pipeline did not fully drain: a B1 trial's drain timed out or the trial never "
+                "ran (its reconcile was INCONCLUSIVE; its detail says which) -- no ceiling lift is "
+                "measured"
+            )
         if not cand.drain_completed:
             return FUSE_NO_GO, (
                 "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
@@ -1340,21 +1356,22 @@ def _fuse_verdict(
         return FUSE_NO_GO, (
             f"delivered/offered {shown} < {min_delivered_offered:.2f} -- B1 is not keeping up end-to-end"
         )
+    if lift_pct is not None and lift_pct < min_lift_pct:
+        return FUSE_NO_GO, (
+            f"lift {lift_pct:+.1f}% < {min_lift_pct:.0f}% -- fusion banked no worthwhile margin "
+            "(null/negative → ADR 0071 escalates to free-threading)"
+        )
     if candidate_lost:
-        # INCONCLUSIVE, after the drain and keeping-up guards so a definite NO-GO there still reads
-        # as one. Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a
-        # message dropped, so it is not called a breach (BACKLOG #5574).
+        # INCONCLUSIVE, after every guard that can return a definite NO-GO (drain, keeping-up, a
+        # lift under the bar), so that NO-GO still reads as one. Still a hard fail (the row's `ok`
+        # reads `candidate_lost`), but nothing proved a message dropped, so it is not called a
+        # breach (BACKLOG #5574).
         return FUSE_INCONCLUSIVE, (
             "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
             "the run fails closed until a clean measurement clears it"
         )
     if lift_pct is None:
         return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
-    if lift_pct < min_lift_pct:
-        return FUSE_NO_GO, (
-            f"lift {lift_pct:+.1f}% < {min_lift_pct:.0f}% -- fusion banked no worthwhile margin "
-            "(null/negative → ADR 0071 escalates to free-threading)"
-        )
     if not significant:
         if base.trials < 2 or cand.trials < 2:
             return FUSE_INCONCLUSIVE, (
