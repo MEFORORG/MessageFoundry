@@ -214,6 +214,14 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
             "the reply holds characters its charset cannot encode, and the replacement would "
             "collide with one of its own delimiters"
         )
+    # Leading noise the charset cannot hold, such as a BOM, would be replaced too, and a reply led by
+    # "?MSH" is no reply any parser reads. Refused like the collisions above. Read only.
+    lead = reply[: len(reply) - len(reply.lstrip(_LEADING_WS_STR))]
+    if not _encodes(lead, encoding):
+        raise UnicodeError(
+            "the reply holds characters its charset cannot encode, including in the noise before "
+            "its first segment"
+        )
     body: bytes | None
     try:
         body = reply.encode(encoding, errors="replace")

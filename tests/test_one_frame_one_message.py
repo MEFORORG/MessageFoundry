@@ -728,6 +728,20 @@ def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
         frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM")
 
 
+def test_frame_reply_refuses_leading_noise_the_charset_cannot_hold() -> None:
+    """Round-four review of #5799: with ordinary delimiters, a BOM-led reply was replaced into
+    "?MSH|...", which no parser reads as an ACK. Mutation: drop the leading-noise check in
+    _encode_replacing. Red: the call returns that reply."""
+    reply = "﻿MSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|中" + CR
+    with pytest.raises(UnicodeError, match="noise before its first segment") as ei:
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM_LEAD")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    # Control: encodable leading whitespace stays, and only the data character is replaced.
+    spaced = " MSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|中" + CR
+    wire = frame_reply(MLLP_CODEC, spaced, "latin-1", connection="IB_BOM_LEAD")
+    assert wire == MLLP_CODEC.frame(spaced.replace("中", "?").encode("latin-1"))
+
+
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])
 def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
     """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE
