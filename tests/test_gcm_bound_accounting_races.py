@@ -20,6 +20,8 @@ only when its result comes back.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +34,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.store import MessageStore
 
 
 def _cipher() -> AesGcmCipher:
@@ -116,11 +119,11 @@ async def test_a_failed_first_hydration_fails_closed() -> None:
         raise RuntimeError("db is down")
 
     cipher = _cipher()
-    with pytest.raises(CipherError, match="persisted total"):
+    with pytest.raises(RuntimeError, match="db is down"):
         await checkpoint_invocations(cipher, _down)
     with pytest.raises(CipherError, match="persisted"):
         cipher.encrypt("x")  # the key's lifetime count is unknown, so it seals nothing
-    with pytest.raises(CipherError, match="persisted total"):
+    with pytest.raises(RuntimeError, match="db is down"):
         await reserve_invocations_ahead(cipher, _down, 5)
 
     # A later pass that reads the row hydrates it; a key the row shows exhausted then refuses.
@@ -153,7 +156,7 @@ async def test_a_strict_pass_fails_closed_even_on_a_hydrated_cipher() -> None:
     async def _down(_key_id: str, _count: int) -> int:
         raise RuntimeError("db is down")
 
-    with pytest.raises(CipherError, match="persisted total"):
+    with pytest.raises(RuntimeError, match="db is down"):
         await checkpoint_invocations(cipher, _down, strict=True)
     # A strict pass reads the row even when the cipher's own reserve is healthy.
     exhausted = _Row(total=_GCM_MAX_INVOCATIONS)
@@ -175,6 +178,89 @@ async def test_a_strict_pass_against_a_row_another_handle_never_charged_never_lo
     assert before == 3
     await checkpoint_invocations(cipher, _Row().add, strict=True)
     assert cipher.cumulative_invocations() >= before
+
+
+def _locked() -> sqlite3.OperationalError:
+    return sqlite3.OperationalError("database is locked")
+
+
+async def test_a_locked_store_on_a_strict_pass_raises_the_store_error_not_a_key_refusal() -> None:
+    """A busy database is not a key refusal. The store open's strict pass still fails closed, but as
+    the store's own error, so an operator is sent to the lock rather than to the key."""
+    cipher = _cipher()
+    await checkpoint_invocations(cipher, _Row().add)
+    error = _locked()
+
+    async def _busy(_key_id: str, _count: int) -> int:
+        raise error
+
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        await checkpoint_invocations(cipher, _busy, strict=True)
+    assert caught.value is error
+
+
+async def test_a_locked_store_on_a_first_hydration_raises_the_store_error_and_fails_closed() -> (
+    None
+):
+    cipher = _cipher()
+
+    async def _busy(_key_id: str, _count: int) -> int:
+        raise _locked()
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await checkpoint_invocations(cipher, _busy)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await reserve_invocations_ahead(cipher, _busy, 5)
+    # Still fail-closed: nothing is sealed under a key whose lifetime count is unknown.
+    with pytest.raises(CipherError, match="persisted"):
+        cipher.encrypt("x")
+
+
+async def test_a_key_failure_on_a_strict_pass_is_still_a_key_refusal() -> None:
+    """The control for the tests above: a failure that IS the cipher's stays a :class:`CipherError`."""
+    cipher = _cipher()
+    refusal = CipherError("no configured key decrypts this value")
+
+    async def _refused(_key_id: str, _count: int) -> int:
+        raise refusal
+
+    with pytest.raises(CipherError) as caught:
+        await checkpoint_invocations(cipher, _refused, strict=True)
+    assert caught.value is refusal
+
+
+async def test_a_locked_store_at_open_is_not_reported_as_a_key_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open's strict first pass, through the real SQLite store, meets a busy database."""
+
+    async def _busy(_self: MessageStore, _key_id: str, _count: int) -> int:
+        raise _locked()
+
+    monkeypatch.setattr(MessageStore, "_add_cipher_invocations_locked", _busy)
+    with pytest.raises(sqlite3.OperationalError, match="locked") as caught:
+        await MessageStore.open(tmp_path / "busy.db", cipher=make_cipher(generate_key()))
+    assert not isinstance(caught.value, CipherError)
+
+
+async def test_a_wrong_key_is_still_refused_as_a_key_error(tmp_path: Path) -> None:
+    """The control for the open above, end to end: a real wrong key still ends in a key refusal.
+
+    The accounting pass never sees the key's correctness (a wrong key derives its own sub-key and
+    charges its own row), so the refusal arrives at the first decrypt. This pins that letting a store
+    error through the pass did not also let a wrong key through the store."""
+    db = tmp_path / "keyed.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        mid = await store.enqueue_message(channel_id="ch", raw="MSH|^~\\&|A\r", deliveries=[])
+    finally:
+        await store.close()
+    wrong = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        with pytest.raises(CipherError, match="no configured key"):
+            await wrong.get_message(mid)
+    finally:
+        await wrong.close()
 
 
 async def test_a_settle_before_any_pass_leaves_the_cipher_able_to_encrypt() -> None:

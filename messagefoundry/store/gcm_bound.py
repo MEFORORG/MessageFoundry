@@ -79,7 +79,6 @@ from messagefoundry.store.crypto import (
     _GCM_RESERVE_BLOCK,
     AesGcmCipher,
     Cipher,
-    CipherError,
     new_store_salt,
     parse_store_salt,
 )
@@ -240,21 +239,25 @@ async def _account(
 
     Fail-closed on the FIRST hydration (BACKLOG #5608). Until one add has returned the key's persisted
     total, the cipher's figure is only this process's own spend, so a key another process or an
-    earlier run had already taken to the ceiling would keep encrypting. That failure raises
-    :class:`CipherError` instead of being logged, and the cipher refuses to encrypt until a later pass
-    hydrates it. ``strict`` raises the same way on a cipher hydrated before: a store open passes it,
-    because the cipher's figure may come from another store handle and only this store's row is the
-    key's total here. Otherwise a failed add on a hydrated cipher is logged and retried: its figure
-    then carries the key's lifetime total, so the ceiling still holds against it."""
+    earlier run had already taken to the ceiling would keep encrypting. That failure is re-raised
+    instead of being logged, and the cipher refuses to encrypt until a later pass hydrates it.
+    ``strict`` raises the same way on a cipher hydrated before: a store open passes it, because the
+    cipher's figure may come from another store handle and only this store's row is the key's total
+    here. Otherwise a failed add on a hydrated cipher is logged and retried: its figure then carries
+    the key's lifetime total, so the ceiling still holds against it.
+
+    The failure is re-raised AS ITSELF. A store that is locked, busy or unreachable raises its
+    driver's error, and a caller that reads :class:`~messagefoundry.store.crypto.CipherError` as a
+    key refusal must not send an operator to the key for it; a ``CipherError`` stays one."""
     try:
         await _add_then_grant(bound, add, need, floor=floor)
     except Exception as exc:
         if strict or not bound.invocation_bound_hydrated:
-            raise CipherError(
-                f"could not read the AES-GCM invocation bound's persisted total while {what}; this "
-                "data key's lifetime count is unknown, so nothing is encrypted under it until a "
-                "pass reads it"
-            ) from exc
+            exc.add_note(
+                f"the AES-GCM invocation bound could not read its persisted total while {what}; "
+                "nothing is encrypted under this data key until a pass reads it"
+            )
+            raise
         log.warning(
             "could not reach the AES-GCM invocation bound for the active key while %s; the "
             "in-process ceiling still applies and the next pass retries",
@@ -285,7 +288,7 @@ async def checkpoint_invocations(
     (BACKLOG #5608). Once the cipher is hydrated, and unless ``strict``, this never raises: a
     checkpoint that cannot reach the DB is logged and retried next pass, since the in-process ceiling
     still holds meanwhile and a transient DB blip must not take the engine down. Before that, a failed
-    add raises :class:`CipherError`."""
+    add raises its own error (:func:`_account`)."""
     bound = bounded_cipher(cipher)
     if bound is None:
         return None

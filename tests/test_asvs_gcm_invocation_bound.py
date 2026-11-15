@@ -617,7 +617,7 @@ async def test_checkpoint_never_raises_when_the_store_write_fails_once_hydrated(
     async def _boom(_key_id: str, _count: int) -> int:
         raise RuntimeError("db is down")
 
-    with pytest.raises(CipherError, match="persisted total"):
+    with pytest.raises(RuntimeError, match="db is down"):  # the store's error, not a key refusal
         await checkpoint_invocations(cipher, _boom)
     assert await checkpoint_invocations(cipher, _ok) == 0
     cipher.encrypt("x")
