@@ -118,7 +118,9 @@ inert.
   a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
-- The VS Code extension's new-route command writes a new module into your config directory.
+- The VS Code extension's new-route command writes a new module into your config directory. It
+  writes only in a trusted workspace, and refuses a `messagefoundry.configDir` that resolves
+  outside the workspace folder, through a link included.
 
 Each writes code that runs with the engine's rights on its next start. Review what they wrote
 before you point the engine at it.
