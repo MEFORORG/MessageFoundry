@@ -230,11 +230,14 @@ def test_person_name_components_splits_pn() -> None:
         pytest.param("Doe^Jane^Q^Dr^Jr", ("Doe", "Jane", "Q", "Jr", "Dr"), id="prefix-and-suffix"),
         pytest.param("Doe^Jane^^Dr", ("Doe", "Jane", "", "", "Dr"), id="prefix-only"),
         pytest.param("Doe^Jane^^^Jr", ("Doe", "Jane", "", "Jr"), id="suffix-only"),
-        # An empty alphabetic group falls through to the first populated group.
-        pytest.param("=Yamada^Taro", ("Yamada", "Taro"), id="ideographic-only"),
-        pytest.param("^^=^=Yamada", ("Yamada",), id="phonetic-only"),
+        # A sixth component on is malformed, and would land in the coded XPN-6 onward.
+        pytest.param("Doe^Jane^Q^Dr^Jr^PhD^L", ("Doe", "Jane", "Q", "Jr", "Dr"), id="too-long"),
+        # A blank alphabetic group falls through to the first populated group, which XPN-8 names.
+        pytest.param("=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="ideographic-only"),
+        pytest.param("^ =Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="blank-alphabetic"),
+        pytest.param("^^=^=Yamada", ("Yamada", *[""] * 6, "P"), id="phonetic-only"),
         pytest.param("^^^^", (), id="all-empty"),
-        pytest.param("==", (), id="empty-groups"),
+        pytest.param("== ", (), id="blank-groups"),
     ],
 )
 def test_person_name_components_maps_pn_onto_xpn(pn: str, xpn: tuple[str, ...]) -> None:
@@ -251,6 +254,7 @@ def test_pid_from_dataset_writes_an_ideographic_only_name() -> None:
     msg.add_segment(hl7_map.pid_from_dataset(ds))
     assert msg.field("PID-5.1") == "Yamada"
     assert msg.field("PID-5.2") == "Taro"
+    assert msg.field("PID-5.8") == "I"  # name representation code: ideographic
 
 
 def test_obx_builder_strips_crlf_injection() -> None:

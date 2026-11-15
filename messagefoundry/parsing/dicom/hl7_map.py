@@ -88,22 +88,25 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    Uses the first group with a populated component, so an ideographic-only name is not lost, and
-    ``()`` for an absent or all-empty name. ``XPN`` puts the suffix before the prefix
-    (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places; trailing
-    empty components are dropped (BACKLOG #5804)."""
+    Uses the first group with a component that is not blank, so an ideographic-only name is not
+    lost, and ``()`` for an absent or all-blank name. A name taken from the ideographic or phonetic
+    group carries ``I`` or ``P`` in ``XPN-8`` (name representation code), so a receiver does not
+    read it as the alphabetic name. ``XPN`` puts the suffix before the prefix
+    (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places. A PN has
+    five components; anything past the fifth is malformed and dropped rather than written into
+    ``XPN-6`` onward, which are coded fields. Trailing blank components are dropped too
+    (BACKLOG #5804)."""
     if not patient_name:
         return ()
-    for group in patient_name.split("="):
-        parts = group.split("^")
-        if any(parts):
-            break
-    else:
+    groups = patient_name.split("=")[:3]  # alphabetic, ideographic, phonetic
+    group_index = next((i for i, g in enumerate(groups) if g.replace("^", "").strip()), None)
+    if group_index is None:
         return ()
-    if len(parts) >= 4:
-        parts += [""] * (5 - len(parts))
-        parts[3], parts[4] = parts[4], parts[3]
-    while not parts[-1]:
+    parts = (groups[group_index].split("^") + [""] * 5)[:5]
+    parts[3], parts[4] = parts[4], parts[3]
+    if group_index:
+        parts += ["", "", "IP"[group_index - 1]]  # XPN-6 and XPN-7 empty, then XPN-8
+    while not parts[-1].strip():
         parts.pop()
     return tuple(parts)
 
