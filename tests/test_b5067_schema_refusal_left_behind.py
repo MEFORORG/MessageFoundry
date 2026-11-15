@@ -32,6 +32,8 @@ from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F40
 
 _RCSI = "READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options"
 _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
+_BOUND_NO_ROW = "No account or audit row was written"
+_BOUND_MAY_HAVE = "may already have changed the database"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
 
 #: ``(backend, schema_management)`` -> whether the refusal names the database setting.
@@ -217,24 +219,102 @@ def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
     assert "Traceback" not in out, out
 
 
-def test_provision_admin_invocation_bound_store_error_at_the_write_open_names_the_entry(
-    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The open's strict invocation-bound pass re-raises a store error as itself (BACKLOG #5608),
-    where it once arrived as a ``CipherError``. It carries the bound's note, so it takes the same
-    exit 2 and keeps the advice about the shown key's entry (#5067), not the floor's exit 1.
-
-    Mutation: drop the ``_InvocationBoundOpenRefused`` raise; the exit is then 1."""
+def _bound_refusal() -> TimeoutError:
+    """A store error the open's strict invocation-bound pass re-raised as itself (BACKLOG #5608),
+    carrying the bound's note, where it once arrived as a ``CipherError``."""
     from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
 
     refusal = TimeoutError("lock request on synthetic_table timed out")
     refusal.add_note(INVOCATION_BOUND_NOTE)
-    _refused_at_the_write(monkeypatch, "sqlserver", refusal)
-    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    return refusal
+
+
+def _assert_bound_left_behind(out: str, *, names_the_setting: bool) -> None:
+    """The pass runs after the open's schema step and salt bind, so the text never says nothing
+    was written: it says which rows were not, and what the open may already have changed."""
     assert "synthetic_table" in out, out
-    assert "nothing was written" in out, out
-    assert _UNUSED_ENTRY in out, out
+    assert _BOUND_NO_ROW in out, out
+    assert _BOUND_MAY_HAVE in out, out
+    assert "nothing was written" not in out.lower(), out
+    assert (_RCSI in out) is names_the_setting, out
     assert "Traceback" not in out, out
+
+
+@pytest.mark.parametrize(("backend", "management"), _STORES)
+def test_provision_admin_invocation_bound_store_error_at_the_pre_check_is_could_not_start(
+    backend: str,
+    management: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The pre-check open, before the prompt, runs the same strict pass on an existing store, so
+    its store error takes the write open's exit 2, not the floor's exit 1.
+
+    Mutation: drop the pre-check's ``_InvocationBoundOpenRefused`` raise; the exit is then 1."""
+    from messagefoundry.store import base
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise _bound_refusal()
+
+    monkeypatch.setattr(base, "open_store", refusing)
+    out = _run(_provision(_settings(shell, backend, management)), capsys)
+    assert "Refusing to provision" in out, out
+    _assert_bound_left_behind(out, names_the_setting=_STORES[backend, management])
+    assert _UNUSED_ENTRY not in out, "no key was shown before the pre-check"
+
+
+def test_provision_admin_invocation_bound_store_error_at_the_write_open_names_the_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """At the write's open the same error keeps the advice about the shown key's entry (#5067).
+
+    Mutation: drop the write's ``_InvocationBoundOpenRefused`` raise; the exit is then 1."""
+    _refused_at_the_write(monkeypatch, "sqlserver", _bound_refusal())
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    _assert_bound_left_behind(out, names_the_setting=True)
+    assert _UNUSED_ENTRY in out, out
+
+
+def test_a_server_driver_error_at_the_bound_shows_its_class_and_sqlstate_not_its_text(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server's text can quote a stored value, so the driver error renders as its class and
+    SQLSTATE, as every other store-open error does (``_store_error_text``).
+
+    Mutation: render the failure through ``codec_safe_str`` again; the quoted value is printed."""
+    from messagefoundry.store import base
+    from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
+
+    driver_error = type("PostgresError", (Exception,), {})
+    asyncpg = types.ModuleType("asyncpg")
+    for name in ("PostgresError", "InterfaceError", "InternalClientError"):
+        setattr(asyncpg, name, driver_error)
+    monkeypatch.setitem(sys.modules, "asyncpg", asyncpg)
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        exc = driver_error("lock timeout on a row quoting synthetic-value-9")
+        exc.sqlstate = "55P03"
+        exc.add_note(INVOCATION_BOUND_NOTE)
+        raise exc
+
+    monkeypatch.setattr(base, "open_store", refusing)
+    out = _run(_provision(_settings(shell, "postgres", "auto")), capsys)
+    assert "PostgresError [SQLSTATE 55P03]" in out, out
+    assert "synthetic-value-9" not in out, out
+
+
+def test_the_invocation_bound_carrier_keeps_its_failure_through_str_and_pickle() -> None:
+    """Built with the failure as its one argument, as ``StoreCreateBatchFailedBeforeKeyUse`` is,
+    so a copy or an unpickle rebuilds it whole."""
+    import pickle
+
+    from messagefoundry.__main__ import _InvocationBoundOpenRefused
+
+    carrier = _InvocationBoundOpenRefused(OSError("synthetic"))
+    assert "synthetic" in str(carrier)
+    copy = pickle.loads(pickle.dumps(carrier))
+    assert isinstance(copy.failure, OSError) and str(copy.failure) == "synthetic"
 
 
 def test_provision_admin_names_no_entry_once_the_write_has_started(

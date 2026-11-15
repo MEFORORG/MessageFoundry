@@ -725,11 +725,14 @@ def _fake_drivers(monkeypatch: pytest.MonkeyPatch) -> dict[str, type[Exception]]
     from types import ModuleType
 
     asyncpg, pyodbc = ModuleType("asyncpg"), ModuleType("pyodbc")
+    # pyodbc's root too, which `store_connect_errors` names, with DatabaseError beneath it as in
+    # the real module. Not in `classes`: it is no driver base `store_driver_errors` names.
+    pyodbc.Error = type("Error", (Exception,), {})  # type: ignore[attr-defined]
     classes: dict[str, type[Exception]] = {
         "asyncpg.PostgresError": type("PostgresError", (Exception,), {}),
         "asyncpg.InterfaceError": type("InterfaceError", (Exception,), {}),
         "asyncpg.InternalClientError": type("InternalClientError", (Exception,), {}),
-        "pyodbc.DatabaseError": type("DatabaseError", (Exception,), {}),
+        "pyodbc.DatabaseError": type("DatabaseError", (pyodbc.Error,), {}),
     }
     for dotted, cls in classes.items():
         module, name = dotted.split(".")
@@ -824,7 +827,11 @@ def test_a_server_store_error_from_the_invocation_bound_at_open_is_could_not_sta
 ) -> None:
     """The open's strict accounting pass re-raises a store error as itself (BACKLOG #5608), where it
     once arrived as a ``CipherError``. It carries the bound's note, and the open arm routes it to
-    the same exit 2 "could not start" a key refusal gets, not to the floor's exit 1."""
+    the same exit 2 "could not start" a key refusal gets, not to the floor's exit 1.
+
+    The pass runs after the open's schema step and salt bind, so the text says which rows were not
+    written, never that nothing was. A server's text can quote a stored value, so the error shows
+    as its class and SQLSTATE, as every store-open error does, under the store it names."""
     from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
 
     monkeypatch.chdir(tmp_path)
@@ -834,13 +841,18 @@ def test_a_server_store_error_from_the_invocation_bound_at_open_is_could_not_sta
 
     async def bound_refused(*_a: object, **_k: object) -> _DriverStore:
         exc = postgres_error("canceling statement due to lock timeout")
+        exc.sqlstate = "55P03"  # type: ignore[attr-defined]
         exc.add_note(INVOCATION_BOUND_NOTE)
         raise exc
 
     monkeypatch.setattr("messagefoundry.store.base.open_store", bound_refused)
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
-    assert "lock timeout" in error and error.endswith("Nothing was written")
+    assert "PostgresError [SQLSTATE 55P03]" in error, error
+    assert "lock timeout" not in error, error
+    assert f"cannot open the store at {db}" in error, error
+    assert "No account or audit row was written" in error, error
+    assert "nothing was written" not in error.lower(), error
 
 
 def test_a_locked_sqlite_store_at_the_invocation_bound_pass_is_could_not_start(
@@ -859,7 +871,10 @@ def test_a_locked_sqlite_store_at_the_invocation_bound_pass_is_could_not_start(
     monkeypatch.setattr(MessageStore, "_add_cipher_invocations_locked", locked)
     assert main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 2
     error = _error(capsys)
-    assert "database is locked" in error and error.endswith("Nothing was written")
+    assert "database is locked" in error, error
+    assert f"cannot open the store at {db}" in error, error
+    assert "No account or audit row was written" in error, error
+    assert "nothing was written" not in error.lower(), error
     assert _audit_rows(db) == []
 
 

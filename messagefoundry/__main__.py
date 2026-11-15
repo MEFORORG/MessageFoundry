@@ -9144,7 +9144,6 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     switch them back. So for that refusal it says the batch was rolled back and, there, that those
     options may already have changed: sentences, the last with no full stop, so a caller can end
     it."""
-    from messagefoundry.config.settings import SchemaManagement, StoreBackend
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     if not any(isinstance(e, ServerSchemaMismatchError) for e in (exc, exc.__cause__)):
@@ -9153,16 +9152,34 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
         "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
         "no row"
     )
-    if (
-        store.backend is StoreBackend.SQLSERVER
-        and store.resolved_schema_management() is SchemaManagement.AUTO
-    ):
+    if _open_switches_snapshot_options(store):
         left += (
             ". Under [store].schema_management = auto the open may already have switched the "
             "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
             "that batch; the refusal does not switch them back"
         )
     return left
+
+
+def _open_switches_snapshot_options(store: StoreSettings) -> bool:
+    """Whether a writable open of ``store`` switches the database's READ_COMMITTED_SNAPSHOT and
+    ALLOW_SNAPSHOT_ISOLATION options on (``SqlServerStore._ensure_database_options``): SQL Server
+    under ``[store].schema_management = auto``. Nothing switches them back."""
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+
+    return (
+        store.backend is StoreBackend.SQLSERVER
+        and store.resolved_schema_management() is SchemaManagement.AUTO
+    )
+
+
+def _kept_key_sentence(kept: Path) -> str:
+    """``provision-admin``'s words for the store key a failed create kept (PR 2804 fourteenth
+    hold), with no full stop."""
+    return (
+        "No Administrator was provisioned, and the store key minted for it is kept at "
+        f"{kept} (see the warning on stderr)"
+    )
 
 
 def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
@@ -9176,13 +9193,71 @@ def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
     return INVOCATION_BOUND_NOTE in getattr(exc, "__notes__", ())
 
 
+def _invocation_bound_open_errors() -> tuple[type[Exception], ...]:
+    """What a store error the invocation bound's pass re-raised at the open can be, at least: the
+    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`), the
+    engine's own ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed
+    connection. Built on each call, as ``store_driver_errors`` is, never cached. An open arm catches
+    this set, by where it arose, and passes on all but the bound's (BACKLOG #5608)."""
+    from messagefoundry.store.base import store_open_errors
+
+    return (RuntimeError, ValueError, *store_open_errors())
+
+
+def _invocation_bound_left_behind(store: StoreSettings) -> str:
+    """What an open the invocation bound's pass failed left behind (BACKLOG #5608): sentences, the
+    last with no full stop, as :func:`_open_refusal_left_behind` returns them.
+
+    The strict pass runs late in a writable open: after the schema step, the store pin's read and
+    the salt bind, which commits a salt row on a store that had none, and on SQL Server under
+    ``[store].schema_management = auto`` after the open switched the database's snapshot options
+    on. It runs before the open appends its audit genesis row, and the command writes nothing
+    until its open returns. So the text says no account or audit row was written, and never that
+    nothing was."""
+    left = (
+        "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
+        "account or audit row was written, but the steps the open runs before that read may "
+        "already have changed the database: at least the schema step, which creates or migrates "
+        "the schema, and the store's salt record"
+    )
+    if _open_switches_snapshot_options(store):
+        left += (
+            ", and under [store].schema_management = auto the database's READ_COMMITTED_SNAPSHOT "
+            "and ALLOW_SNAPSHOT_ISOLATION options, which the open switches on and does not switch "
+            "back"
+        )
+    return left
+
+
 class _InvocationBoundOpenRefused(Exception):
-    """``provision-admin``'s carrier for an open refused by the invocation bound's pass, so one
-    outer arm can report it as the ``CipherError`` arm does. ``failure`` is the store's error."""
+    """The carrier for an open refused by the invocation bound's pass, so one outer arm can report
+    it as could not start. ``failure`` is the store's error, also its one argument, so a copy or an
+    unpickle rebuilds it whole, as for ``StoreCreateBatchFailedBeforeKeyUse``."""
 
     def __init__(self, failure: Exception) -> None:
-        super().__init__()
+        super().__init__(failure)
         self.failure = failure
+
+
+def _invocation_bound_refusal(
+    failure: Exception, store: StoreSettings, *, refusing: str = ""
+) -> str:
+    """The text for an open the invocation bound's pass failed (BACKLOG #5608): the store's error
+    as :func:`_store_error_text` renders it, so a server's text, which can quote a stored value,
+    shows as its class and SQLSTATE, then ``refusing``, then what the open left behind
+    (:func:`_invocation_bound_left_behind`), with no full stop."""
+    return (
+        f"{_sentence(_store_error_text(failure))} {refusing}{_invocation_bound_left_behind(store)}"
+    )
+
+
+def _invocation_bound_provision_refusal(
+    failure: Exception, store: StoreSettings, *, kept: Path | None = None
+) -> str:
+    """``provision-admin``'s :func:`_invocation_bound_refusal`. ``kept`` is the store key a failed
+    create kept, as for :func:`_provision_open_refusal`."""
+    text = _invocation_bound_refusal(failure, store, refusing="Refusing to provision. ")
+    return text if kept is None else f"{text}. {_kept_key_sentence(kept)}"
 
 
 def _provision_open_refusal(
@@ -9197,10 +9272,7 @@ def _provision_open_refusal(
 
     left = _open_refusal_left_behind(exc, store)
     if kept is not None:
-        held = (
-            "No Administrator was provisioned, and the store key minted for it is kept at "
-            f"{kept} (see the warning on stderr)"
-        )
+        held = _kept_key_sentence(kept)
         tail = (
             f"Refusing to provision. {held}"
             if left is None
@@ -9479,6 +9551,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except StoreNotFoundError:
             return True, None
+        except _invocation_bound_open_errors() as exc:
+            # An existing store's open runs the bound's strict pass too (BACKLOG #5608): could
+            # not start, as at the write's open below. Any other error propagates as before.
+            if not _raised_by_the_invocation_bound(exc):
+                raise
+            raise _InvocationBoundOpenRefused(exc) from exc
         store_slot.current = store
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
@@ -9703,6 +9781,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # ruling).
         # Through codec_safe_str, as every open refusal this command prints (#2532, #5067).
         _emit_error(f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json)
+        return 2
+    except _InvocationBoundOpenRefused as refused:
+        # The pre-check's open failed at the invocation bound's strict pass (BACKLOG #5608),
+        # before the prompt, so no key was shown: could not start, as at the write's open.
+        _emit_error(
+            _invocation_bound_provision_refusal(refused.failure, settings.store),
+            as_json=args.json,
+        )
         return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
@@ -10059,11 +10145,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except _InvocationBoundOpenRefused as refused:
         # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
         # arrived as the `CipherError` above: raised at the open, before the write, so the same
-        # exit 2 and the same advice about the shown key's entry (#5067).
+        # exit 2 and the same advice about the shown key's entry (#5067). The open had already
+        # run steps that may write, so the text says what it left rather than "nothing".
         failure = refused.failure
         text = after_the_key(
-            codec_safe_str(failure),
-            _provision_open_refusal(failure, settings.store, kept=kept_key),
+            _store_error_text(failure),
+            _invocation_bound_provision_refusal(failure, settings.store, kept=kept_key),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -10312,14 +10399,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             from messagefoundry.redaction import codec_safe_str
 
             return ("open-refused", wanted, codec_safe_str(exc))
-        except Exception as exc:
+        except _invocation_bound_open_errors() as exc:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
-            # arrived as the `CipherError` above: the same "could not start". Any other propagates.
+            # arrived as the `CipherError` above: could not start, reported below. Any other
+            # error propagates as before.
             if not _raised_by_the_invocation_bound(exc):
                 raise
-            from messagefoundry.redaction import codec_safe_str
-
-            return ("open-refused", wanted, codec_safe_str(exc))
+            raise _InvocationBoundOpenRefused(exc) from exc
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -10385,6 +10471,17 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
+    except _InvocationBoundOpenRefused as bound:
+        # Could not start, exit 2, under the store's name, as a SQLite error from this open was
+        # reported before BACKLOG #5608 tagged it. The open had already run steps that may write,
+        # so the text says what it left rather than "nothing was written".
+        failure = bound.failure
+        return _emit_store_open_error(
+            failure,
+            _store_label(settings.store),
+            as_json=args.json,
+            text=_invocation_bound_refusal(failure, settings.store),
+        )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "open-refused":
