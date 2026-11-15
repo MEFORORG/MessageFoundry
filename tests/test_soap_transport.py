@@ -391,6 +391,19 @@ async def test_an_oauth2_401_invalidates_the_token_and_retries(body: bytes) -> N
     assert str(ei.value) == f"SOAP {URL} returned HTTP 401; refreshing OAuth2 token"
 
 
+async def test_an_oauth2_401_carrying_a_ws_security_fault_stays_permanent() -> None:
+    """Round-one review: the fault names the envelope's UsernameToken, which a fresh bearer cannot
+    fix, so retrying would resend a wrong password for the whole budget. The bearer is still
+    dropped. Mutation: raise the transient in the 401 arm whatever the body. Red: DeliveryError."""
+    dest, provider = _oauth2_dest()
+    body = b"<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode></soap:Fault>"
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<env/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
+    assert provider.invalidations == 1
+
+
 async def test_control_an_oauth2_403_stays_permanent_and_keeps_the_token() -> None:
     dest, provider = _oauth2_dest()
     dest._opener = _Opener(exc=_http_error(403, b""))  # type: ignore[assignment]

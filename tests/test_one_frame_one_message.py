@@ -636,8 +636,11 @@ def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
 def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() -> None:
     """``idna`` is a usable codec that raises for one reply. That is the reply's fault, so it is not
     sent in utf-8 under an "unusable charset" warning, as ``decode_body`` decides it by the name."""
-    with pytest.raises(UnicodeError):
+    with pytest.raises(UnicodeError) as ei:
         frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
+    # Round-one review of #5799: the strict encode's error holds the whole reply as `object`, so the
+    # refusal is raised outside the handler and chains nothing.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
 
 
 @pytest.mark.parametrize("encoding", ["ascii", "latin-1", "cp1252"])
@@ -649,12 +652,16 @@ def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
     charset with each character it cannot hold replaced, and is sent. Mutation: re-raise the
     UnicodeEncodeError in frame_reply. Red: the call raises."""
     reply = MSH + CR + "MSA|AA|CTRL1|中文" + CR
+    connection = f"IB_NARROW_{encoding.upper()}"
     with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
-        wire = frame_reply(MLLP_CODEC, reply, encoding, connection="IB_NARROW_ADT")
+        wire = frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
+        # A narrow charset meets the same characters on every message, so a second reply adds no
+        # line, as the utf-8 fallback's warning does not.
+        frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
     assert _frames(MLLP_CODEC, wire) == [(MSH + CR + "MSA|AA|CTRL1|??" + CR).encode(encoding)]
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
-    assert "IB_NARROW_ADT" in warnings[0] and "replaced" in warnings[0]
+    assert connection in warnings[0] and "replaced" in warnings[0]
     # Neither the reply nor the setting reaches the log, and this is not the utf-8 fallback.
     assert "CTRL1" not in warnings[0] and encoding not in warnings[0]
     assert "utf-8" not in warnings[0]

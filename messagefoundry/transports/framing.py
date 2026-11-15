@@ -65,6 +65,10 @@ FRAMING_CODE = "framing"
 #: Bounded by the configured inbounds, since the key is a connection name.
 _reply_fallback_logged: set[str] = set()
 
+#: The listeners whose reply-character replacement has been logged, once per connection for the
+#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message.
+_reply_replacement_logged: set[str] = set()
+
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
     """Frame one outbound ``payload`` for the wire, or refuse it permanently (ADR 0205 rule 1).
@@ -154,15 +158,19 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     the codec's replacement character, for the same reason a frame byte becomes a space (BACKLOG
     #5799). Before, that reply raised to the listener's last-resort arm, which closed the connection
     unanswered, so the sender resent a message already stored. A codec that cannot replace, such as
-    ``idna``, still raises its own error. Usable is decided by probing the NAME, as ``decode_body``
+    ``idna``, still raises, with a fixed ``UnicodeError`` that chains nothing, since the strict
+    encode's error holds the whole reply. Usable is decided by probing the NAME, as ``decode_body``
     decides it: a usable codec can also raise a bare ``UnicodeError`` for one reply, which still
-    raises here. ``connection`` names the listener in the warning each fallback logs: the utf-8 one
-    once per connection, the replacement one per reply. The charset setting and the reply are never
-    logged: the setting is configuration that may hold anything, and the reply echoes the message."""
+    raises here. ``connection`` names the listener in the warning each fallback logs, once per
+    connection for each, since a narrow charset meets the same characters message after message.
+    The charset setting and the reply are never logged: the setting is configuration that may hold
+    anything, and the reply echoes the message."""
+    unencodable = False
     try:
         body = reply.encode(encoding)
     except UnicodeEncodeError:
-        body = _encode_replacing(reply, encoding, connection)
+        # Decided here and encoded below, so nothing raised later chains this error's `object`.
+        unencodable = True
     except (LookupError, UnicodeError):
         if _is_text_codec(encoding):
             raise
@@ -174,6 +182,8 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
                 connection,
             )
         body = reply.encode("utf-8")
+    if unencodable:
+        body = _encode_replacing(reply, encoding, connection)
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"
@@ -184,12 +194,21 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
 
 def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     """``reply`` in ``encoding`` with each character the charset cannot hold replaced, for
-    :func:`frame_reply`. A codec that refuses the ``replace`` handler raises its own error, as the
-    strict encode did. The warning names the connection, never the reply or the setting."""
-    body = reply.encode(encoding, errors="replace")
-    logger.warning(
-        "inbound %r: the reply held characters its charset cannot encode; each was replaced "
-        "before framing",
-        connection,
-    )
+    :func:`frame_reply`. A codec that refuses the ``replace`` handler raises a fixed
+    ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
+    The warning names the connection, never the reply or the setting."""
+    body: bytes | None
+    try:
+        body = reply.encode(encoding, errors="replace")
+    except (LookupError, UnicodeError):
+        body = None
+    if body is None:
+        raise UnicodeError("the reply holds characters its charset can neither encode nor replace")
+    if connection not in _reply_replacement_logged:
+        _reply_replacement_logged.add(connection)
+        logger.warning(
+            "inbound %r: a reply held characters its charset cannot encode; each was replaced "
+            "before framing (logged once per connection)",
+            connection,
+        )
     return body

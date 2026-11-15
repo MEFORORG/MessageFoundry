@@ -597,7 +597,8 @@ async def test_a_codec_fault_in_the_listener_still_drops_as_framing_error() -> N
     # The last-resort arm (ASVS 16.5.4) still covers the listener's own path: a reply the
     # listener's encoding can neither carry nor replace characters in is not a handler fault, and
     # it still drops the connection. BACKLOG #5799: a narrow charset that can replace now answers
-    # (the next test), so this uses idna, which refuses a label over 63 characters either way.
+    # (the next test), so this uses idna: its strict encode refuses a label over 63 characters,
+    # and it supports no `replace` error handler at all.
     cap = _Capture()
     source = _mllp(encoding="idna")
     source.on_connection_event = cap

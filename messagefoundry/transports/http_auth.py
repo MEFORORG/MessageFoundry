@@ -50,6 +50,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     hop_name_prefix,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.transports.base import float_setting
 from messagefoundry.transports.rest import (
     HttpAuthError,
@@ -195,7 +196,8 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         # BACKLOG #5800: each grant field is encoded strictly as UTF-8 at every mint, so a value
         # holding a lone surrogate raised UnicodeEncodeError out of send or test_connection, and that
         # exception's `object` is the whole value, the client_secret included. Refused here instead,
-        # by setting name only, and raised outside the handler so nothing chains the value.
+        # by setting name only. Strict UTF-8 fails on exactly the surrogate code points, so the
+        # shared predicate decides it with no encode, and nothing raised can chain the value.
         unencodable = next(
             (
                 name
@@ -205,7 +207,7 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
                     ("oauth2_scope", scope),
                     ("oauth2_audience", audience),
                 )
-                if value and not _utf8_encodable(value)
+                if value and has_lone_surrogate(value)
             ),
             None,
         )
@@ -240,7 +242,9 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         try:
             enforce_outbound_length_limits(self.token_url, headers)
         except ValueError as exc:
-            raise HttpAuthError(f"OAuth2 token request: {exc}") from exc
+            raise HttpAuthError(
+                f"OAuth2 token request (oauth2_token_url and the grant headers): {exc}"
+            ) from exc
 
     def _grant(self) -> tuple[bytes, dict[str, str]]:
         """The ``client_credentials`` grant's form body and headers, built from the configured
@@ -269,15 +273,6 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         (which carries the bearer). The grant's encode and length were checked at construction."""
         data, headers = self._grant()
         return self._post_token(data, headers)
-
-
-def _utf8_encodable(value: str) -> bool:
-    """Whether ``value`` encodes as strict UTF-8, which the grant's form and Basic header need."""
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def oauth2_cc_provider_from_settings(
@@ -585,7 +580,7 @@ def with_oauth2_client_credentials(
     stronger option is therefore a choice you make, named in the paragraph above.
 
     That is a statement about WHICH style is the default. It is not a claim that the header this
-    provider builds follows that section's encoding rule. ``_fetch_token`` base64-encodes the client
+    provider builds follows that section's encoding rule. ``_grant`` base64-encodes the client
     id and secret as written. The section also asks for each to be form-encoded first, and that step
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")

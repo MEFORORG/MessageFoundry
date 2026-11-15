@@ -149,9 +149,10 @@ _SURROGATE_SECRET = "s3cr3t-\ud800-synthetic"  # noqa: S105 -- a synthetic test 
 def test_oauth2_cc_refuses_an_unencodable_grant_value_at_construction(
     setting: str, over: dict[str, str], auth_style: str
 ) -> None:
-    """Mutation: drop the encodability check in ``__init__``. Red: the provider builds, and the
-    first mint raises a UnicodeEncodeError whose ``object`` is the whole value, the secret
-    included, out of send or test_connection."""
+    """Mutation: drop the surrogate check in ``__init__``. Red: the length check's ``_grant`` call
+    then raises a UnicodeEncodeError at construction, whose ``object`` is the whole value, the
+    secret included. With that call gone too, as before the fix, the provider builds and the first
+    mint raises it out of send or test_connection."""
     with pytest.raises(
         HttpAuthError, match=f"{setting} holds a character UTF-8 cannot encode"
     ) as ei:
@@ -169,7 +170,10 @@ def test_oauth2_cc_refuses_an_unencodable_grant_value_at_construction(
 def test_oauth2_cc_refuses_an_over_length_grant_at_construction(over: dict[str, str]) -> None:
     """Mutation: move the length check back into ``_fetch_token``. Red: the provider builds, and
     the first mint raises a bare ValueError out of send or test_connection."""
-    with pytest.raises(HttpAuthError, match="OAuth2 token request: .*over the") as ei:
+    with pytest.raises(
+        HttpAuthError,
+        match=r"OAuth2 token request \(oauth2_token_url and the grant headers\): .*over the",
+    ) as ei:
         _oauth_provider(**over)
     assert "x" * 64 not in str(ei.value) and "q" * 64 not in str(ei.value)
 
