@@ -2602,10 +2602,15 @@ count is above `0` (vault BACKLOG #2613).
   ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
   `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
   a password, since the engine cannot tell which `env()` value is a secret (owner ruling
-  2026-11-14, vault BACKLOG #8212). The refusal counts them per registry value and never spells
-  one, since the name was read from the registry and may hold a value typed in the wrong place. It
-  sends each to the secrets directory, or a value that is not a secret and is the same for every
-  instance to the active environment's value file. They also
+  2026-11-14, vault BACKLOG #8212). The refusal never spells one, since the name was read from
+  the registry and may hold a value typed in the wrong place. It counts them: the names are
+  de-duplicated without regard to case, and each is counted once, under the first registry value
+  that sets it, so a name a later value also sets is not counted there. It sends each to the
+  secrets directory, or a value that is not a secret and is the same for every instance to the
+  active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
+  reference names is refused too, and the secrets directory does not supply it, since that
+  provider reads the environment only; the refusal sends that secret to
+  `[secrets].provider = "vault"`. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
@@ -2653,9 +2658,11 @@ count is above `0` (vault BACKLOG #2613).
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   a variable named by a `[secrets].provider = "env"` reference, whose name only your config
-  knows, and a `MEFOR_VALUE_*` variable or a secret other than a store key that reaches the engine
-  from the machine-wide environment, which is neither refused nor named. A `MEFOR_VALUE_*`
-  variable in the service's own lists is covered, as *What is refused* says.
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
+  other than a store key that reaches the engine from the machine-wide environment, which is
+  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
+  reference.
 
 ---
 

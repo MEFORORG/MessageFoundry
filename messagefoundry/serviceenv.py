@@ -41,7 +41,8 @@ by something else, such as a shell, even when that shell itself runs under some 
 **What it does not cover**, at least: a service host other than NSSM, an ``nssm.exe`` renamed to
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or
 the ``messagefoundry`` launcher, and a variable an operator names as a ``[secrets].provider =
-"env"`` reference, whose name the engine does not read here; and any secret or ``MEFOR_VALUE_*``
+"env"`` reference, whose name the engine does not read here, unless that name starts with
+``MEFOR_VALUE_``, which is refused as every such name is; and any secret or ``MEFOR_VALUE_*``
 variable, other than a store key, that reaches the engine from the machine-wide environment. An
 ``env()`` value's ``MEFOR_VALUE_*`` name in the service's own lists is covered.
 
@@ -172,7 +173,9 @@ class ServiceEnvPosture:
         return ", ".join(f"{name} (in {where[name]})" if name in where else name for name in names)
 
     def counted_with_source(self, names: Sequence[str]) -> str:
-        """How many of ``names`` each registry value sets, with no name printed."""
+        """How many of ``names`` each registry value sets, with no name printed. The names were
+        de-duplicated without regard to case as they were read, each credited to the first
+        registry value that sets it, so a name a later value also sets is counted there only."""
         where = dict(self.sources)
         counts: dict[str, int] = {}
         for name in names:
@@ -477,7 +480,21 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             step += (
                 ". A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
-                "default, keyed by the name after MEFOR_VALUE_ in lower case"
+                "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
+                "name is counted once, without regard to case, under the first registry value "
+                "that sets it, so remove it from every value that sets it"
+            )
+            if any(not _setting_names.is_value_name(name) for name in values):
+                step += (
+                    ". At least one of them is not MEFOR_VALUE_ followed by letters, digits and "
+                    "underscores, a file name the secrets directory refuses, so rename that env() "
+                    "key first"
+                )
+            step += (
+                '. A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
+                "read from the environment only, never from the secrets directory, so move that "
+                'secret to [secrets].provider = "vault" instead. Renaming it outside MEFOR_VALUE_* '
+                "ends this refusal but leaves it in the registry key"
             )
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
@@ -492,14 +509,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "entries, before any re-run of the installer, which refuses an existing directory "
                 "the service does not name. `nssm set` replaces that whole list, so read it first "
                 "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-                "back every entry but the names refused above: see docs/SERVICE.md, "
+                "back every entry but those refused above: see docs/SERVICE.md, "
                 '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
                 'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
                 'rest", says how the directory is created'
             )
     return (
-        f"{found}. Any local user may be able to read that key, and with it each value named. "
-        f"Remove each name from the service's lists. {'. '.join(steps)}"
+        f"{found}. Any local user may be able to read that key, and with it each value refused "
+        f"here. Remove each refused variable from the service's lists. {'. '.join(steps)}"
     )
 
 

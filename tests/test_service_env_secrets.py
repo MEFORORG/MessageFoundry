@@ -417,7 +417,7 @@ def test_the_missing_directory_hint_gives_each_route_with_its_condition() -> Non
     assert "MEFOR_SECRETS_DIRECTORY naming that existing path" in existing
     assert "AppEnvironmentExtra" in existing
     assert "read it first with `nssm get`" in existing
-    assert "every entry but the names refused above" in existing
+    assert "every entry but those refused above" in existing
     assert '"Start / stop / status"' in existing
     assert absent.startswith("none exists yet, ")
     assert '"The other secrets: a secrets directory"' in absent
@@ -718,6 +718,39 @@ def test_env_values_are_counted_per_registry_value() -> None:
         "1 MEFOR_VALUE_* variable(s) (in Environment) is set in"
     )
     assert service_env_refusal(_service(["MEFOR_VALUE_=z"])) is None
+    assert "counted once, without regard to case, under the first registry value" in refusal
+    assert "remove it from every value that sets it" in refusal
+    # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
+    assert "Remove each refused variable from the service's lists" in refusal
+    assert "each value named" not in refusal and "Remove each name" not in refusal
+
+
+def test_an_env_value_name_the_secrets_directory_refuses_gets_the_rename_hint() -> None:
+    """The remedy sends each MEFOR_VALUE_* to the secrets directory, whose file names are letters,
+    digits and underscores. A listed name outside that rule is told to rename first; the name
+    itself stays unprinted."""
+    odd = service_env_refusal(_service(["MEFOR_VALUE_ACME-HOST=synthetic-value"]))
+    assert odd is not None
+    assert "a file name the secrets directory refuses, so rename that env() key first" in odd
+    assert "ACME-HOST" not in odd and "synthetic-value" not in odd
+    plain = service_env_refusal(_service(["MEFOR_VALUE_ACME_HOST=x"]))
+    assert plain is not None and "rename that env() key first" not in plain
+
+
+def test_an_env_provider_reference_named_as_a_value_gets_a_route_that_reads_it() -> None:
+    """A ``[secrets].provider = "env"`` reference may name a MEFOR_VALUE_* variable. It is refused
+    like any other, and since EnvSecretProvider reads only the environment, the refusal must not
+    leave the secrets directory as its only way in."""
+    from messagefoundry.config.secretprovider import EnvSecretProvider
+
+    refusal = service_env_refusal(_service(["MEFOR_VALUE_PARTNER_PW=synthetic-value"]))
+    assert refusal is not None
+    assert '[secrets].provider = "env" reference names is read from the environment only' in (
+        refusal
+    )
+    assert 'move that secret to [secrets].provider = "vault" instead' in refusal
+    # The premise the remedy rests on: the env provider does not read the secrets directory.
+    assert "secrets_directory" not in inspect.getsource(EnvSecretProvider)
 
 
 def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None:
