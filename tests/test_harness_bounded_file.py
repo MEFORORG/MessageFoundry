@@ -169,19 +169,26 @@ def test_the_file_sink_reports_a_symlink_unread_with_where_it_resolves(tmp_path:
 @pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows reparse point")
 def test_the_file_sink_reports_a_junction_as_a_link_not_a_directory(tmp_path: Path) -> None:
     """``S_ISLNK`` does not report a junction, so the sink reads the reparse tag as well: a junction
-    out of the directory is recorded as a link that resolves outside, not walked past as a folder."""
+    out of the directory is recorded as a link that resolves outside, and never walked through, so
+    nothing beyond it is listed or read. One to a folder inside is the control: it reads inside."""
     import _winapi  # type: ignore[import-not-found,unused-ignore]
 
+    junction = _winapi.CreateJunction  # type: ignore[attr-defined,unused-ignore]
     outside = tmp_path / "elsewhere"
     outside.mkdir()
+    (outside / "secret.hl7").write_bytes(_BODY)
     out = tmp_path / "out"
-    out.mkdir()
+    (out / "sub").mkdir(parents=True)
     with FileSink(out) as sink:
-        _winapi.CreateJunction(str(outside), str(out / "j.hl7"))  # type: ignore[attr-defined,unused-ignore]
+        junction(str(outside), str(out / "j.hl7"))
+        junction(str(out / "sub"), str(out / "jin.hl7"))
+        junction(str(out), str(out / "loop"))
         records = sink.records()
-    by_name = {r.meta["name"]: r.meta for r in records}
-    assert by_name["j.hl7"]["symlink"] == "true"
-    assert by_name["j.hl7"]["inside"] == "false"
+    by_name = {r.meta["name"]: r for r in records}
+    assert set(by_name) == {"j.hl7", "jin.hl7", "loop"}  # nothing read through any of them
+    assert all(r.meta["symlink"] == "true" and r.payload == b"" for r in records)
+    assert by_name["j.hl7"].meta["inside"] == "false"
+    assert by_name["jin.hl7"].meta["inside"] == "true"
 
 
 def test_the_file_sink_reports_a_symlink_loop_as_not_inside(tmp_path: Path) -> None:
@@ -197,19 +204,59 @@ def test_the_file_sink_reports_a_path_it_cannot_resolve_as_not_inside(
     """A resolve that fails mid-scan neither ends the scan nor passes for inside: the file is still
     recorded, judged not inside, and the files after it are still read."""
     with FileSink(tmp_path) as sink:
-        (tmp_path / "a.hl7").write_bytes(_BODY)
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.hl7").write_bytes(_BODY)
         (tmp_path / "b.hl7").write_bytes(_BODY)
         real = Path.resolve
 
         def resolve(self: Path, strict: bool = False) -> Path:
-            if self.name == "a.hl7":
+            if self.name == "sub":
                 raise OSError(errno.ENOENT, "gone mid-scan")
             return real(self, strict)
 
         monkeypatch.setattr(Path, "resolve", resolve)
         records = sink.records()
-    inside = {r.meta["name"]: r.meta["inside"] for r in records}
-    assert inside == {"a.hl7": "false", "b.hl7": "true"}
+    inside = {r.meta["relpath"]: r.meta["inside"] for r in records}
+    assert inside == {"sub/a.hl7": "false", "b.hl7": "true"}
+
+
+def test_the_file_sink_records_a_file_changed_while_read_once_it_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file replaced between the scan's lstat and its read is not recorded under the stale
+    signature, which would record the new bytes a second time on the next scan."""
+    import harness.sinks.file as file_sink
+
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(b"MSH|first\r")
+        real = read_capped
+
+        def swap_then_read(
+            path: Path, cap: int, *, follow_symlinks: bool = True
+        ) -> tuple[bytes, str]:
+            monkeypatch.setattr(file_sink, "read_capped", real)
+            target.write_bytes(_BODY)  # a different size: the signature moves
+            return real(path, cap, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(file_sink, "read_capped", swap_then_read)
+        assert sink.records() == []  # changed while read: not recorded yet
+        settled = sink.records()
+        assert sink.records() == settled
+    assert [r.payload for r in settled] == [_BODY]
+
+
+def test_the_file_sink_does_not_record_a_chmod_as_a_write(tmp_path: Path) -> None:
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+        first = sink.records()
+        target.chmod(0o444)
+        try:
+            assert sink.records() == first
+        finally:
+            target.chmod(0o644)
+    assert len(first) == 1
 
 
 def test_the_file_sink_records_a_file_overwritten_in_place(tmp_path: Path) -> None:

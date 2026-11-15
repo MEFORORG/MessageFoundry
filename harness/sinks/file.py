@@ -5,12 +5,14 @@
 Files present when the sink starts are ignored while they stay unchanged, so a long-lived output
 directory cannot satisfy a scenario with an earlier run's output; a file written again in place,
 whether present at start or already recorded, is recorded again. "Unchanged" is the ``lstat``
-identity, size and modification time. The scan walks the whole tree under the directory and
-records each file's path relative to it (``meta["relpath"]``) and whether its resolved path,
-symlinks followed, stays inside it (``meta["inside"]``). A path that cannot be resolved strictly (a
-link loop, a dangling link, a mid-scan race) is recorded as not inside, never as inside. A file
-written OUTSIDE the directory is by construction not seen here; a scenario that tests for an escape
-must look where it would land.
+identity, file type, size and modification time, and a file that changes while it is read is
+recorded once it settles, not twice. The scan walks the plain directories under the directory,
+never through a link or a junction, and records each file's path relative to it
+(``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
+(``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
+recorded as not inside, never as inside. A file written OUTSIDE the directory is by construction not
+seen here; a scenario that tests for an escape must look where it would land, and a link the sink
+records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
 Reading is bounded the way the GUI's folder watcher is, through the same reader
 (:func:`harness.bounded_file.read_capped`): regular files only, symlinks not followed, each capped
@@ -25,7 +27,6 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 
 from harness.bounded_file import NOT_REGULAR, read_capped
@@ -39,9 +40,10 @@ KIND = "file"
 #: renames it; a scan that lands mid-write must not record the temp as a delivery.
 _ENGINE_TEMP_SUFFIXES = frozenset({".part", ".probe"})
 
-#: What the sink remembers of a path it has seen: a change to any of these is a new write.
+#: What the sink remembers of a path it has seen: its identity, file type, size and modification
+#: time. A change to any of them is taken as a new write; permission bits are left out, so a chmod
+#: is not. A same-size rewrite within one mtime tick, on the same inode, is not seen.
 _Signature = tuple[int, int, int, int, int]
-
 
 #: The reparse-tag bit Windows sets on a tag that names another path: a symlink, and a junction,
 #: which ``S_ISLNK`` does not report. ``transports/file.py`` defines the same bit; a client may not
@@ -50,7 +52,7 @@ _NAME_SURROGATE = 0x20000000
 
 
 def _signature(st: os.stat_result) -> _Signature:
-    return (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns)
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns)
 
 
 def _is_link(st: os.stat_result) -> bool:
@@ -70,29 +72,59 @@ class FileSink(Sink):
 
     def start(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._seen = {path: _signature(st) for path, st, _ in self._entries()}
+        self._seen = {path: _signature(st) for path, st in self._entries()}
 
-    def _entries(self) -> Iterator[tuple[Path, os.stat_result, bool]]:
-        """``(path, lstat, is a link)`` for each candidate but a plain directory, which the walk
-        descends into; a link to a directory, a junction included, is not skipped. A path gone
-        before its ``lstat`` is left out: nothing is there to record or to ignore."""
-        for path in sorted(self.directory.rglob(self.pattern)):
-            if path.name.startswith(".") or path.suffix in _ENGINE_TEMP_SUFFIXES:
-                continue
+    def _entries(self) -> list[tuple[Path, os.stat_result]]:
+        """``(path, lstat)`` for each candidate under the directory, sorted by path.
+
+        The walk descends into plain directories only. A link, a junction included, is a candidate
+        itself and is never walked through, so nothing outside the directory is listed or read by
+        way of one. A path gone before its ``lstat``, or a folder gone before it is listed, is left
+        out: nothing is there to record or to ignore."""
+        found: list[tuple[Path, os.stat_result]] = []
+        pending = [self.directory]
+        while pending:
+            folder = pending.pop()
             try:
-                st = path.lstat()
+                with os.scandir(folder) as listing:
+                    names = [entry.name for entry in listing]
             except OSError:
                 continue
-            link = _is_link(st)
-            if link or not stat.S_ISDIR(st.st_mode):
-                yield path, st, link
+            for name in names:
+                path = folder / name
+                try:
+                    st = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode) and not _is_link(st):
+                    pending.append(path)
+                elif (
+                    path.match(self.pattern)
+                    and not name.startswith(".")
+                    and path.suffix not in _ENGINE_TEMP_SUFFIXES
+                ):
+                    found.append((path, st))
+        return sorted(found, key=lambda item: item[0])
+
+    def _inside(self, path: Path, link: bool, root: Path) -> bool:
+        """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
+        resolved strictly, so a loop or a dangling link is not inside. A file is judged by its folder,
+        which the walk reached through plain directories only, so a file that vanishes after its read
+        is not mistaken for an escape."""
+        try:
+            if link:
+                return path.resolve(strict=True).is_relative_to(root)
+            return (path.parent.resolve(strict=True) / path.name).is_relative_to(root)
+        except OSError:
+            return False
 
     def records(self) -> list[Record]:
         root = self.directory.resolve()
-        for path, st, link in self._entries():
+        for path, st in self._entries():
             signature = _signature(st)
             if self._seen.get(path) == signature:
                 continue
+            link = _is_link(st)
             if link:
                 data, refused = b"", NOT_REGULAR  # never read through a link
             else:
@@ -101,10 +133,13 @@ class FileSink(Sink):
                     data, refused = read_capped(path, self.max_file_bytes, follow_symlinks=False)
                 except OSError:
                     continue  # vanished or locked mid-write: the next scan retries it
+            inside = self._inside(path, link, root)
             try:
-                inside = path.resolve(strict=True).is_relative_to(root)
-            except (OSError, RuntimeError):
-                inside = False  # a link loop, a dangling link, a race: not shown to stay inside
+                settled = _signature(path.lstat()) == signature
+            except OSError:
+                settled = False
+            if not settled:
+                continue  # changed while read: the next scan records what it settled to, once
             self._seen[path] = signature
             meta = {
                 "path": str(path),
