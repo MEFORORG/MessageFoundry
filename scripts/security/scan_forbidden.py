@@ -1215,24 +1215,29 @@ def _pr_scan_unit(
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
-def _pr_step10_blank(sentence: str, is_row: bool) -> str | None:
+def _pr_step10_blank(sentence: str, is_row: bool, windows: list[tuple[int, int]]) -> str | None:
     """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays,
     or None where it holds no exempt clause.
 
-    In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"). In a
-    row, it is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
-    fails", "is never failing; "), unless the cell opens with "unchanged" or a record verb. A cell is
-    read trimmed and with its markup deleted, as _pr_table_verdict reads it; each reading's clause is
-    mapped back to the characters of the row it came from."""
+    In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"),
+    searched only inside the given windows, each read as its own slice as _pr_prose_verdict reads
+    it: the re-check reads nothing outside them, and _PR_PROSE_VERDICT backtracks quadratically on a
+    long markup run, so a search over the whole sentence, which has no length limit, would make the
+    gate far slower than main on such a body. In a row, it is a cell's verdict reading, whole or
+    leading, with "never" before a CI verb ("never fails", "is never failing; "), unless the cell
+    opens with "unchanged" or a record verb. A cell is read trimmed and with its markup deleted, as
+    _pr_table_verdict reads it; each reading's clause is mapped back to the characters of the row
+    it came from."""
     spans: list[tuple[int, int]] = []
     if not is_row:
-        spans = [
-            (hit.start(), hit.end())
-            for hit in _PR_PROSE_VERDICT.finditer(sentence)
-            if hit.group("row") is not None
-            and hit.group("row_negated") is not None
-            and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
-        ]
+        for left, right in windows:
+            spans += [
+                (left + hit.start(), left + hit.end())
+                for hit in _PR_PROSE_VERDICT.finditer(sentence[left:right])
+                if hit.group("row") is not None
+                and hit.group("row_negated") is not None
+                and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
+            ]
     else:
         edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
         for left, right in itertools.pairwise(edges):
@@ -1335,7 +1340,12 @@ def _pr_sentence_found(
         found["verdict"].append(0)
     if not exemptable and not (row_verdict and not row_marked):
         return found
-    blanked = _pr_step10_blank(sentence, is_row)
+    # Each candidate's prose window, which holds every character its re-check reads (the binding
+    # reads 60 before the identifier and 80 after it).
+    windows = [
+        (max(0, m.start() - _PR_WINDOW), m.end() + _PR_WINDOW) for m, _ in exemptable if not is_row
+    ]
+    blanked = _pr_step10_blank(sentence, is_row, windows)
     for m, version in exemptable:
         if blanked is None or _pr_verdict_bound(blanked, m, version, False):
             found["verdict"].append(m.start())

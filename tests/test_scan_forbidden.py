@@ -1686,6 +1686,27 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     assert time.perf_counter() - began < 10
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "1.2.3 is partial and the row is not " + "_" * 16000,
+        "1.2.3 is partial and the row is not " + "*" * 16000,
+        "1.2.3 is partial and the row was " + "`" * 16000,
+        "1.2.3 is partial and the cell is " + "_" * 16000,
+    ],
+    ids=["underscore", "star", "backtick", "cell-underscore"],
+)
+def test_step_ten_reads_a_long_markup_run_as_fast_as_main(sf, body: str) -> None:
+    """Step 10's overlay searches for an exempt clause only inside each candidate identifier's
+    window, as main reads a window, never over the whole sentence, where _PR_PROSE_VERDICT
+    backtracks quadratically on a markup run. Each body scans in about 3 ms here, against about 2 ms
+    on main and 12 to 23 seconds when the search ran over the whole sentence. The bound is 1 second,
+    loose for a slow runner."""
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 1
+
+
 def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(sf) -> None:
     """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
     reported at its own line, so finding that line must not scan every mark once per identifier.
