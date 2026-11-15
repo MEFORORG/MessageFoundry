@@ -174,11 +174,15 @@ def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
     path = tmp_path / "real.db"
     path.write_bytes(b"x")
     store_mod._secure_file(path)
+    from messagefoundry.config.atomic_edit import _canonical_sid
+
     sddl = store_mod._read_dacl_sddl(path)
     sid = store_mod._current_user_sid()
     assert sddl is not None and sid is not None
-    assert sddl.startswith("D:P"), sddl
-    assert sddl.count("(") == 1 and sddl.endswith(f";;;{sid})"), sddl
+    parsed = store_mod._parse_sddl_dacl(sddl)
+    assert parsed is not None and parsed.protected, sddl
+    # SDDL spells a well-known account (SYSTEM, NETWORK SERVICE) by its alias.
+    assert [_canonical_sid(ace[3]) for ace in parsed.aces] == [sid], sddl
 
 
 @_windows_only

@@ -22,7 +22,9 @@ edit run as another account, such as root or an elevated administrator editing a
 account owns, would otherwise have left it owned by and restricted to the editing account, so the
 account that reads it could no longer. On POSIX, root gives the candidate the live file's owner and
 group before the rename, and the mode is still 0600. On Windows, a live file another account owns
-gets its own access list and owner copied onto the replaced file instead of the owner-only rewrite.
+is restricted to that account and the editing one, and its ownership is given back, rather than to
+the editing account alone. An edit by the file's own account, or by an elevated administrator of a
+file Administrators owns, is the owner-only rewrite it always was.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -296,6 +298,7 @@ def edit_lock(
         raise busy_error(
             f"{lock_path} is a link; an edit of {path} will not lock through it -- remove it"
         ) from exc
+    _give_root_lock_to_folder_owner(fd, path.parent)
     try:
         locked = _acquire(fd, lock_path, path, busy_error, timeout)
         held.add(key)
@@ -310,6 +313,24 @@ def edit_lock(
         # editor waits on its open handle would let a third editor lock a new file beside it.
         with contextlib.suppress(OSError):
             os.close(fd)
+
+
+def _give_root_lock_to_folder_owner(fd: int, folder: Path) -> None:
+    """Hand a lock file root holds to the owner of its folder. Best-effort and POSIX only.
+
+    A root edit gives the edited file back to its owner (:func:`replace_validated`), so a lock file
+    left owned by root at 0600 would refuse every later edit by that owner, who could otherwise
+    edit the file (vault BACKLOG #5619). The folder's owner stands for the file's: one lock guards
+    every file in the folder."""
+    if sys.platform == "win32" or os.geteuid() != 0:
+        return
+    try:
+        lock = os.fstat(fd)
+        owner = os.stat(folder)
+        if lock.st_uid == 0 and owner.st_uid != 0:
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+    except OSError as exc:
+        _log.warning("could not give the edit lock in %s to its folder's owner: %s", folder, exc)
 
 
 def replace_validated(
@@ -374,19 +395,19 @@ def replace_validated(
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
-    if live.windows_sddl is None or not _apply_windows_security(path, live.windows_sddl):
+    if live.windows_owner is None or not _restrict_to_owner_and_editor(path, live.windows_owner):
         _secure_file(path)
 
 
 @dataclass(frozen=True)
 class _LiveSecurity:
-    """What the replaced file must keep from the live one. ``posix_owner`` is the live file's
-    ``(uid, gid)`` when root is editing a file it does not own as root; ``windows_sddl`` is the live
-    file's owner and access list when another account owns it. Each is ``None`` when the owner-only
-    restriction for the editing account is already right."""
+    """Whose the replaced file must stay. ``posix_owner`` is the live file's ``(uid, gid)`` when
+    root is editing a file it does not own as root; ``windows_owner`` is the live file's owner SID
+    when that is another account. Each is ``None`` when the owner-only restriction for the editing
+    account is already right, as for a file the edit creates."""
 
     posix_owner: tuple[int, int] | None = None
-    windows_sddl: str | None = None
+    windows_owner: str | None = None
 
 
 def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None) -> None:
@@ -406,8 +427,7 @@ def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None)
 
 
 def _live_security(path: Path) -> _LiveSecurity:
-    """The live file's owner, and on Windows its access list, where the edit must keep them; see
-    :class:`_LiveSecurity`. Nothing for a file the edit creates."""
+    """Whose the live file is, where the edit must keep it so; see :class:`_LiveSecurity`."""
     try:
         st = os.stat(path, follow_symlinks=False)
     except OSError:
@@ -415,64 +435,84 @@ def _live_security(path: Path) -> _LiveSecurity:
     if not stat.S_ISREG(st.st_mode):
         return _LiveSecurity()
     if sys.platform == "win32":
-        return _LiveSecurity(windows_sddl=_foreign_windows_security(path))
+        return _LiveSecurity(windows_owner=_foreign_windows_owner(path))
     euid = os.geteuid()
     if euid == 0 and (st.st_uid, st.st_gid) != (euid, os.getegid()):
         return _LiveSecurity(posix_owner=(st.st_uid, st.st_gid))
     return _LiveSecurity()
 
 
-def _foreign_windows_security(path: Path) -> str | None:
-    """The owner and access list of ``path`` as SDDL when an account other than this process's
-    owns it, else ``None``. ``None`` too when they cannot be read, which the read logs, and the
-    edit then makes the owner-only rewrite it always made."""
-    from messagefoundry.store.store import _current_user_sid, _parse_sddl_dacl, _read_dacl_sddl
+def _canonical_sid(sid: str) -> str | None:
+    """``sid`` as Windows renders it in ``S-1-...`` form, an SDDL alias such as ``LS`` or ``BA``
+    included, or ``None`` when it does not convert. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return None
+    import ctypes
+
+    from messagefoundry.restricted_file import _render_sid, _sid_libraries
+
+    advapi32, kernel32 = _sid_libraries()
+    pointer = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
+        return None
+    try:
+        return _render_sid(pointer)
+    finally:
+        kernel32.LocalFree(pointer)
+
+
+def _foreign_windows_owner(path: Path) -> str | None:
+    """The SID of the account that owns ``path`` when that is not this process's account, else
+    ``None``. ``None`` too when the owner cannot be read, which the read logs, and the edit then
+    makes the owner-only rewrite it always made.
+
+    Administrators as the owner is this account's own when its token holds Administrators enabled:
+    that is the default owner of an elevated administrator's files on Windows Server, and such a
+    file is the administrator's own."""
+    from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
+    from messagefoundry.restricted_file import administrators_enabled
+    from messagefoundry.store.store import _SDDL_OWNER, _current_user_sid, _read_dacl_sddl
 
     sddl = _read_dacl_sddl(path, owner=True)
-    if sddl is None:
+    match = _SDDL_OWNER.search(sddl) if sddl is not None else None
+    owner = _canonical_sid(match.group(1)) if match is not None else None
+    if owner is None or owner == _current_user_sid():
         return None
-    # Administrators as the owner counts as another account: it is the default owner of an elevated
-    # administrator's files on Windows Server, and the service account reads such a file through an
-    # entry that the owner-only rewrite would drop.
-    parsed = _parse_sddl_dacl(sddl)
-    if parsed is not None and parsed.owner is not None and parsed.owner == _current_user_sid():
+    if owner == ADMINISTRATORS_SID and administrators_enabled():
         return None
-    return sddl
+    return owner
 
 
-def _apply_windows_security(path: Path, sddl: str) -> bool:
-    """Write the owner and access list ``sddl`` describes onto ``path``; ``False``, logged, when the
-    access list could not be written. Windows only.
+def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
+    """Restrict ``path`` to the account that owned the live file and the editing account, and give
+    the ownership back; ``False``, logged, when the access list could not be written. Windows only.
 
-    An inherited access list stays inherited, so the replaced file takes its folder's entries as the
-    live file did. Naming another account as the owner needs the restore privilege, which an
-    elevated administrator holds but does not enable; when that is refused the access list alone is
-    written and the refusal is logged, since the access list is what lets that account read it. An
-    access list the store's SDDL parser does not model, a NULL one among them, is not copied, and
-    the caller makes the owner-only rewrite instead."""
-    from messagefoundry.store.store import _parse_sddl_dacl, _set_security_from_sddl
+    The owner-only rewrite would grant the editing account alone, so an elevated administrator's
+    edit of a file the service account owns would leave the service unable to read it (vault
+    BACKLOG #5619). The editor keeps its entry because it already held write access to the file.
+    Naming another account as the owner needs the restore privilege, which an elevated
+    administrator holds but does not enable; when that is refused the access list alone is written
+    and the refusal is logged, since the access list is what lets the owner read it."""
+    from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
-    parsed = _parse_sddl_dacl(sddl)
-    if parsed is None:
-        return False
-    result = _set_security_from_sddl(path, sddl, protected=parsed.protected)
+    editor = _current_user_sid()
+    grants = dict.fromkeys(sid for sid in (owner, editor) if sid)
+    sddl = f"O:{owner}D:P" + "".join(f"(A;;FA;;;{sid})" for sid in grants)
+    result = _set_security_from_sddl(path, sddl, protected=True)
     if result.failure is not None:
-        _log.warning(
-            "could not carry the access list of %s over its edit: %s", path, result.failure
-        )
+        _log.warning("could not restrict %s to its owner after the edit: %s", path, result.failure)
         return False
-    if result.owner_status == 0:
-        return True
-    if result.owner_status is not None:
+    if result.owner_status not in (None, 0):
         _log.warning(
-            "%s keeps its access list after the edit, but its owner could not be given back "
-            "(Win32 status %s); this account owns it now",
+            "%s is restricted to its owner %s after the edit, but the ownership could not be "
+            "given back (Win32 status %s); this account owns it now",
             path,
+            owner,
             result.owner_status,
         )
-    if result.dacl_status != 0:
+    if result.owner_status != 0 and result.dacl_status != 0:
         _log.warning(
-            "could not carry the access list of %s over its edit (Win32 status %s)",
+            "could not restrict %s to its owner after the edit (Win32 status %s)",
             path,
             result.dacl_status,
         )
