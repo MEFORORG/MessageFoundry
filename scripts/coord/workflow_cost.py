@@ -306,6 +306,58 @@ class _MaskNotes:
     held_newlines: set[int] = field(default_factory=set)  # newlines inside a blanked span
 
 
+def _template_end(src: str, start: int, interps: list[tuple[int, int]] | None = None) -> int:
+    """Index just past the template literal whose opening backtick is at ``start``.
+
+    Each top-level ``${...}`` span is appended to ``interps`` when given. A brace counts toward an
+    interpolation's depth only in code: one inside a string or a nested template is text, or a
+    ``${x ? '{' : ''}`` would never close and the rest of the file would mask with it.
+    """
+    n = len(src)
+    j = start + 1
+    while j < n:
+        c = src[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "`":
+            return j + 1
+        if c == "$" and j + 1 < n and src[j + 1] == "{":
+            close = _interp_end(src, j + 2)
+            if interps is not None and close < n:
+                interps.append((j + 2, close))
+            j = close + 1
+            continue
+        j += 1
+    return n
+
+
+def _interp_end(src: str, start: int) -> int:
+    """Index of the ``}`` closing an interpolation whose body starts at ``start``, or ``len(src)``."""
+    n = len(src)
+    depth = 0
+    j = start
+    while j < n:
+        c = src[j]
+        if c in "'\"":
+            j += 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j += 1
+            continue
+        if c == "`":
+            j = _template_end(src, j)
+            continue
+        if c == "{":  # an object or block inside the interpolation
+            depth += 1
+        elif c == "}":
+            if not depth:
+                return j
+            depth -= 1
+        j += 1
+    return n
+
+
 def _mask(src: str, notes: _MaskNotes | None = None) -> str:
     """Blank out comments, strings, template literals and regexes, PRESERVING length and newlines.
 
@@ -363,31 +415,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
             # A template literal masks whole, `${...}` interpolations included, so no pricer sees
             # a call inside one; re-entering code mode mid-string desynchronises far more often
             # than it helps. The residue reads the recorded interpolation spans instead.
-            j = i + 1
-            depth = 0
-            interp_start = 0
-            while j < n:
-                if src[j] == "\\":
-                    j += 2
-                    continue
-                if src[j] == "$" and j + 1 < n and src[j + 1] == "{":
-                    if not depth:
-                        interp_start = j + 2
-                    depth += 1
-                    j += 2
-                    continue
-                if src[j] == "{" and depth:  # an object or block inside the interpolation
-                    depth += 1
-                elif src[j] == "}" and depth:
-                    depth -= 1
-                    if not depth:
-                        notes.interps.append((interp_start, j))
-                    j += 1
-                    continue
-                if src[j] == "`" and depth == 0:
-                    break
-                j += 1
-            end = min(j + 1, n)
+            end = _template_end(src, i, notes.interps)
             blank(i, end)
             i, prev = end, "x"
             continue

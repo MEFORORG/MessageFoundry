@@ -502,6 +502,30 @@ def test_shapes_the_helper_rules_must_not_misread(
 
 
 @pytest.mark.parametrize(
+    ("label", "interp"),
+    [
+        ("a single-quoted brace", "${x ? '{' : ''}"),
+        ("a double-quoted brace", '${x ? "{" : ""}'),
+        ("a closing brace in a string", "${x ? '}' : ''}"),
+        ("an escaped quote before a brace", "${x ? '\\'{' : ''}"),
+        ("a nested template holding a brace", "${x ? `{` : ''}"),
+        ("a nested template with its own interpolation", "${x ? `a${'{'}b` : ''}"),
+    ],
+)
+def test_a_brace_inside_a_string_in_an_interpolation_does_not_mask_the_rest(
+    mod: ModuleType, label: str, interp: str
+) -> None:
+    """Regression from review: a brace in a string inside ``${}`` must not move the depth count.
+
+    Counted as code, ``'{'`` never closes, the template runs to end of file, and every fan after
+    it is masked, so the script prices an exact 0.
+    """
+    script = f"const s = `a {interp} b`\nconst R = [1, 2, 3]\nawait parallel(R.map(r => () => agent(r)))\n"
+    cost = mod.price_script(script)
+    assert (cost.agents, cost.exact) == (3, True), label
+
+
+@pytest.mark.parametrize(
     ("label", "script"),
     [
         (
