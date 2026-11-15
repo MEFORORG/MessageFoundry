@@ -321,7 +321,8 @@ export class TestBench {
   /**
    * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
    * each case's stored input is materialized to a fresh per-run temp dir, owner-only on POSIX, the
-   * dir itself is dry-run (`--show-phi`), and the `finally` tries to delete it with removeCaseDir.
+   * dir itself is dry-run (`--show-phi`), and the `finally` tries to delete it with removeCaseDir;
+   * if a case file fails to write, materializeCases tries to delete it before rethrowing instead.
    * What that delete and the sweep before each run remove, and what can stay on disk, is in the
    * deleteCaseDir and sweepStaleCaseDirs docblocks in collectionCaseFiles.ts (BACKLOG #5415). Cases
    * align to rows by the unique temp basename the CLI echoes back in `row.path` (robust to a case

@@ -109,13 +109,15 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 
 **Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):** this supersedes "the temp materialization
 is always cleaned up" in the sentence above: it is not always cleaned up, and case files can stay on
-disk. What must not break in its place: a run's `finally` tries to delete its directory; a sweep
-tries to delete old run directories when a Test Bench panel is created and before a collection run
-writes its own directory; and the delete never recurses, never follows a link that is an entry in
-the run directory, and unlinks only regular files named as case files in that directory. The only
-exception allowed is a race in which a path is swapped between a check and the act on it. The
-races known to remain, what the delete removes, and what stays are recorded in the `deleteCaseDir`
-and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
+disk. What must not break in its place: a run tries to delete its directory, in its `finally`, or
+before the error is rethrown when a case file fails to write; a sweep tries to delete old run
+directories when a Test Bench panel is created and before a collection run writes its own
+directory; and the delete never recurses, never follows a link that is an entry in the run
+directory, and unlinks only regular files named as case files in that directory. The only
+exception allowed is a race in which another process swaps the run directory, an entry in it, or
+a directory above it, after the run made it or the sweep listed it. The races known to remain,
+what the delete removes, and what stays are recorded in the `deleteCaseDir` and
+`sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
 ## Acceptance Criteria
 
@@ -175,8 +177,8 @@ and the sentence "Until then it stays on disk, with no bound if the Test Bench i
 The `finally` tries to delete a run directory and a later sweep can try to, but neither always
 removes it: case files, and the directory holding them, can stay with no bound, and a sweep can
 unlink the case files of a run still going more than an hour after its directory was last
-modified, in another window included. The sweep runs when a Test Bench panel is created or a
-collection runs; which directories it tries, and the races that can get past its checks, are in
+modified, in another window included. The sweep runs when a Test Bench panel is created and before
+a collection run writes its directory; which directories it tries, and the races that can get past its checks, are in
 the docblocks named below. The rest of the sentence beginning "Rerun writes transient PHI", "but a
 hard crash mid-run could leave a temp file", still holds. The detail is recorded in the
 `deleteCaseDir` and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.

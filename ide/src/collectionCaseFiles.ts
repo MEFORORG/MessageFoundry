@@ -23,7 +23,8 @@ export function caseFileName(i: number): string {
   return `case_${String(i).padStart(4, "0")}.hl7`;
 }
 
-/** A name caseFileName writes, the only name a run directory's deletion unlinks. */
+/** The only names a run directory's deletion unlinks. It matches every name caseFileName writes, and
+ *  also names it never writes, such as `case_00001.hl7`. */
 const CASE_FILE = /^case_\d{4,}\.hl7$/;
 
 /**
@@ -76,7 +77,8 @@ function unlinkWithRetries(file: string, retries: number): void {
  * What it does, in order:
  * 1. lstat `dir`. Anything but a plain directory, a symlink or junction included, throws, and
  *    nothing is removed. So does a `dir` already gone.
- * 2. List `dir`. An entry whose name matches CASE_FILE (`case_`, at least four digits, `.hl7`) and
+ * 2. List `dir`; a listing that fails throws at once, and nothing is removed. An entry whose name
+ *    matches CASE_FILE (`case_`, at least four digits, `.hl7`) and
  *    that lstats as a regular file is unlinked. Every other entry is left, at least a name that does
  *    not match and a matching name that is a directory, a link or another non-regular entry. No
  *    entry is entered, so a link among the entries is not followed.
@@ -85,7 +87,7 @@ function unlinkWithRetries(file: string, retries: number): void {
  *    retried. An entry already gone is skipped. An entry whose lstat fails, or whose unlink still
  *    fails, does not stop the others: once every listed entry has been tried, the first such error
  *    is thrown and `dir` is not removed.
- * 4. Otherwise `dir` is removed with rmdir, which is not retried. Apart from the first open limit
+ * 4. Otherwise `dir` is removed with rmdir, which is not retried. Apart from the open limits
  *    below, it throws, and leaves `dir`, if any entry is still in it or the rmdir fails for any
  *    other reason.
  *
@@ -98,13 +100,19 @@ function unlinkWithRetries(file: string, retries: number): void {
  * rmSync follows a junction and deletes its target's files.
  *
  * Open limits, at least these. `dir` is checked once, by the lstat of step 1, and each entry once, by
- * its lstat in step 2; the listing, every lstat and unlink, and the rmdir all go by path.
- * - If `dir`, or a directory above it, is swapped for a link after the step 1 lstat, the rest goes
- *   through the link. A swap before the listing lists the target's entries; a swap before an lstat
- *   or unlink, the retry waits included, acts on the listed names in the target. Either way regular
- *   files named as case files in the target can be unlinked. The rmdir of step 4 then acts on the
- *   link: on Windows it removes a junction itself even when its target still holds entries
- *   (measured on Node v24.20.0), and sweepStaleCaseDirs counts that as a directory removed.
+ * its lstat in step 2. A directory above `dir` is never checked. The listing, every lstat and
+ * unlink, and the rmdir all go by path.
+ * - If a directory above `dir` is swapped for a link at any time after `dir` was made, every step,
+ *   step 1 included, acts on the same names inside the link's target: regular files there named as
+ *   case files can be unlinked, and the directory there removed once it is empty.
+ * - If `dir` is replaced by another plain directory before the step 1 lstat, the steps act on that
+ *   directory instead.
+ * - If `dir` itself is swapped for a link after the step 1 lstat, the rest goes through the link. A
+ *   swap before the listing lists the target's entries; a swap before an lstat or unlink, the retry
+ *   waits included, acts on the listed names in the target. Either way regular files named as case
+ *   files in the target can be unlinked. The rmdir of step 4 then acts on the link itself: on
+ *   Windows it removes a junction even when its target still holds entries (measured on Node
+ *   v24.20.0, outside the extension host), and sweepStaleCaseDirs counts that as a directory removed.
  * - If an entry is swapped between its lstat and its unlink, whatever is then at that name is
  *   unlinked, a link included (the link itself, not its target); a directory there fails to unlink.
  */
@@ -158,18 +166,17 @@ export function removeCaseDir(dir: string): void {
  * Which entries it tries: a name starting with CASE_DIR_PREFIX that lstats as a directory, not a
  * symlink or junction, last modified more than `maxAgeMs` (STALE_CASE_DIR_MS, one hour) before
  * `now`, and, on POSIX, owned by this process's effective uid, since the OS temp directory can be
- * shared there, as `/tmp` is. On Windows no owner is checked: the default TEMP is per-user, but a TEMP pointed at a shared
- * directory is not. Each is deleted by deleteCaseDir with no in-pass retry, and any error is dropped,
- * with no log line or notice. A directory that is not removed is tried again by each later sweep that
+ * shared there, as `/tmp` is. On Windows no owner is checked: the default TEMP is per-user, but a
+ * TEMP pointed at a shared directory is not. Each is deleted by deleteCaseDir with no in-pass retry,
+ * and any error is dropped, with no log line or notice. A directory that is not removed is tried again by each later sweep that
  * finds it past these gates. So a case file a sweep could not unlink goes once a later sweep can
  * unlink it, while a directory still holding an entry deleteCaseDir leaves stays on every sweep.
  *
  * The age gate reads the directory's modification time, which at least the run's own case-file
  * writes set and each unlink in it updates, so a partial deletion restarts the hour. It cannot tell
  * whether a run is still going: the dry-run has no timeout, so a run whose directory was last
- * modified more than an
- * hour ago can have its case files unlinked by any later sweep, from another window included, while
- * its dry-run may still read them.
+ * modified more than an hour ago can have its case files unlinked by any later sweep, from another
+ * window included, while its dry-run may still read them.
  *
  * At least these stay until a sweep that reaches them can remove them: a directory left by a process
  * that ended before the run's `finally` ran, such as a crash, or a window close or reload while the
