@@ -1081,13 +1081,15 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
         5,
-        OPERATOR,
-        "The security editor's settings path, from the operator's setting. A workspace-set value "
-        "must resolve inside the workspace folder, and any path inside it must not leave through a "
-        "link; a user-set path outside the workspace is the operator's own (BACKLOG #5411). Two "
-        "sites in reachesRoot splice a link target read from disk, which a repository can hold, "
-        "onto the rest of the path; they are only resolved and compared with the workspace folder, "
-        "never opened, and any path that reaches the folder must still resolve inside it.",
+        GUARDED,
+        "The security editor's settings path, from the operator's setting; the rules it must meet "
+        "are in the securityConfigTarget docblock. Two sites in reachesRoot splice a link target "
+        "read from disk, which a repository can hold, onto the rest of the path, and pass the "
+        "result to lstat, readlink and realpath; on Windows those open handles and can contact SMB "
+        "for a UNC target. resolveLinks joins a resolved prefix to the missing tail; when the "
+        "setting reaches the workspace folder, its output, realTarget, is the path the CLI opens, "
+        "and the guard refuses the setting unless realTarget is inside that folder (BACKLOG #5411).",
+        "ide/src/securityEditorModel.ts::!inside(realRoot, realTarget)",
     ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
