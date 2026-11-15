@@ -583,24 +583,14 @@ def test_a_relative_link_behind_a_junction_that_opens_another_file_refuses(tmp_p
     """Measured: a relative link reached through a junction resolves its ``..`` against the path
     through the junction, so the open reads ``a\\x\\g.toml`` while the walk vetted ``real\\x``
     and the file its link leads to (round-e90390621c finding 1)."""
-    import _winapi
-
-    winapi: Any = _winapi  # typeshed declares CreateJunction for win32 only
-    real_c = tmp_path / "real" / "c"
-    real_c.mkdir(parents=True)
-    real_x = tmp_path / "real" / "x"
-    real_x.mkdir()
+    opened, walked, decoy = _junction_decoy_layout(tmp_path)
     final = tmp_path / "final" / "values.toml"
     final.parent.mkdir()
     final.write_text("", encoding="utf-8")
-    decoy = tmp_path / "a" / "x"
-    decoy.mkdir(parents=True)
-    (decoy / "g.toml").write_text("", encoding="utf-8")
-    winapi.CreateJunction(str(real_c), str(tmp_path / "a" / "b"))
-    _link(real_c / "f.toml", Path("..") / "x" / "g.toml")
-    _link(real_x / "g.toml", final)
+    decoy.write_text("", encoding="utf-8")
+    _link(walked, final)
     with pytest.raises(WiringError, match="another object than the walk"):
-        _file_and_folder([tmp_path / "a" / "b" / "f.toml"])
+        _file_and_folder([opened])
 
 
 def _junction_decoy_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -639,12 +629,16 @@ def test_a_file_only_the_open_or_only_the_walk_reaches_refuses(
     the open did not, the folder the open would create one in went unvetted (lander hold on
     fba252d79f, cases a and b)."""
     opened, walked, decoy = _junction_decoy_layout(tmp_path)
-    _file_and_folder([opened])  # control: neither reaches a file, so they agree
+    # Control: neither reaches a file, so they agree. This pass records a known gap that
+    # docs/SECURITY.md names, the folder the open would create the file in going unvetted; a fix
+    # that refuses it should replace this control rather than read the failure as a regression.
+    _file_and_folder([opened])
     (decoy if reached_by == "open" else walked).write_text("", encoding="utf-8")
     with pytest.raises(WiringError, match=refusal):
         _file_and_folder([opened])
 
 
+@pytest.mark.parametrize("folder", [False, True], ids=["file", "folder"])
 @pytest.mark.parametrize(
     ("reached_by", "refusal"),
     [
@@ -653,24 +647,34 @@ def test_a_file_only_the_open_or_only_the_walk_reaches_refuses(
     ],
 )
 def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
-    reached_by: str, refusal: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    reached_by: str,
+    refusal: str,
+    folder: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The same disagreement on every host, with the walk replaced, because the junction layout
-    above is Windows-only."""
+    above is Windows-only; for a folder too, as a reload passes the value file's folder."""
     import messagefoundry.config.wiring as wiring
 
-    values = tmp_path / "dev.toml"
-    other = tmp_path / "other.toml"
-    other.write_text("", encoding="utf-8")
-    if reached_by == "open":
-        values.write_text("", encoding="utf-8")
-    _file_and_folder([values])  # control: the real walk agrees with the open
+    values = tmp_path / "dev"
+    other = tmp_path / "other"
+    for made in [other, values] if reached_by == "open" else [other]:
+        if folder:
+            made.mkdir()
+        else:
+            made.write_text("", encoding="utf-8")
+
+    def check() -> list[Path]:
+        return _file_and_folder([], [values]) if folder else _file_and_folder([values])
+
+    check()  # control: the real walk agrees with the open
     walk_end: list[Path | None] = [values if reached_by == "open" else None]
     monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([tmp_path], walk_end[0]))
-    _file_and_folder([values])  # control: a replaced walk that agrees with the open passes
+    check()  # control: a replaced walk that agrees with the open passes
     walk_end[0] = None if reached_by == "open" else other
     with pytest.raises(WiringError, match=refusal):
-        _file_and_folder([values])
+        check()
 
 
 def test_a_link_into_a_file_where_a_folder_belongs_vets_that_file_s_folder(tmp_path: Path) -> None:
