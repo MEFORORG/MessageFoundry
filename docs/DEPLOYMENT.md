@@ -858,7 +858,9 @@ connectors **fail closed** on a weakened-TLS or cleartext configuration. The env
 an instance at `[security].enforcement = warn`. At `enforce`, the default, it has no effect in any
 cell. Where it applies it lifts that one refusal and nothing else: each entry names the other
 conditions its hop must still meet, and the credential rule still refuses what it reaches. It
-never reaches the store hop, a SQL Server `DATABASE` connection, or the cleartext-hop authority. It exists for **dev / trusted-lab** use only. Some of the same cells also
+never reaches the store hop or a SQL Server `DATABASE` connection, and it changes no cleartext-hop
+decision: the two non-connection cells below still pass it to the cleartext-hop authority, but only
+at `warn`, where that authority already WARNs. It exists for **dev / trusted-lab** use only. Some of the same cells also
 open for a per-connection `tls_hop_attested` or a loopback host, at any posture; the entries below
 say which.
 

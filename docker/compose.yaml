@@ -57,9 +57,11 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_USERNAME: "mefor"
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
-  # THIS LINE CHANGES NOTHING. The escape never reaches the store hop: a store login over
+  # AS SHIPPED, THIS LINE CHANGES NOTHING. Nothing in this file sets [security].enforcement = warn,
+  # and at enforce, the default, the escape has no effect in any cell. A copy that sets warn would
+  # let it lift the other cells docs/DEPLOYMENT.md lists, but never the store hop: a store login over
   # encrypt=false or trust_server_certificate=true is refused at every posture (owner ruling
-  # 2026-11-14, vault BACKLOG #3533 item 2). Nothing in this file sets those, or warn, either. The
+  # 2026-11-14, vault BACKLOG #3533 item 2), and nothing in this file sets those either. The
   # local Postgres below has no TLS set up, so as shipped the engines' verified store hop cannot
   # succeed here, with or without this line. Give the Postgres a certificate the engines trust, or
   # use a managed Postgres with a CA-trusted one, and remove this line. What the escape means:
