@@ -6196,8 +6196,7 @@ class RegistryRunner:
         **The halt is not the whole control; refusing to un-halt on a false premise is the other
         half.** Recovery is an operator action ("I fixed the disk"), and a control that simply
         believes them is a control with an off switch. So every path that would lift the halt asks
-        the guard to re-validate its dead sinks, and those its flap latch holds, by writing a real
-        record to them, and a process that
+        the guard to re-validate its dead sinks by writing a real record to them, and a process that
         still cannot log stays halted no matter how many times it is restarted.
 
         On success the latch is cleared, which matters as much as the refusal: ``_log_write_stopped``
@@ -6584,10 +6583,9 @@ class RegistryRunner:
                 # delivered while ``guard.can_log()`` read False throughout.
                 #
                 # :meth:`~messagefoundry.logging_guard.LogWriteGuard.revalidate` re-tests each DEAD
-                # sink, and each sink its flap latch holds (BACKLOG #5812), by writing a real record
-                # to it, so the ordinary case — a guard ``configure_logging`` built moments ago, with
-                # nothing dead or latched — has nothing to probe, answers True, and the clear happens
-                # exactly as before.
+                # sink by writing a real record to it, so the ordinary case — a guard
+                # ``configure_logging`` built moments ago, with nothing dead — has nothing to probe,
+                # answers True, and the clear happens exactly as before.
                 if guard.revalidate():
                     self._log_write_stopped = False  # a restart re-arms the halt
                     self._log_halted.clear()  # …and un-halts every inbound's internal stages

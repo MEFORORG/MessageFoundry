@@ -1090,9 +1090,10 @@ class LogSinkInfo(BaseModel):
     land, and an engine with no notifier configured sends no page — but ``/status`` answers over HTTP
     from process memory, which an application-log failure does not touch. ``state`` is ``healthy`` /
     ``rolled`` (stage 1 absorbed a write failure and healed) / ``unwritable`` (stage 2 — the
-    replacement failed too, and under ``[logging].on_write_failure="stop"`` this process's connections
-    were stopped). **Metadata only — never any log content** (no PHI): a sink label, a state, a count,
-    a scrubbed reason and a path."""
+    replacement failed too, or the sink keeps needing rolls; ADR 0162 section 1 and its amendment B
+    say when). ``unwritable`` does not by itself mean connections were stopped:
+    ``[logging].on_write_failure`` and the state of the other sinks decide that. **Metadata only —
+    never any log content** (no PHI): a sink label, a state, a count, a scrubbed reason and a path."""
 
     sink: str  # "stdout" | "file"
     state: str  # "healthy" | "rolled" | "unwritable"

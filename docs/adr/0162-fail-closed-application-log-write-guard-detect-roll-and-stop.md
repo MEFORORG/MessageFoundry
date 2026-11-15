@@ -388,37 +388,38 @@ again, and `can_log()` read True with no probe, until the bound tripped again.
 
 **The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).** It is an
 overlay in its own field, `_flap_latch`, holding a `_FlapLatch` per held sink, and never in the
-bound's `_roll_flap`.
+bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rule; in short:
 
 - The roll that trips the bound latches the sink, in the same hold of the guard's lock that writes the
-  bound's state, so the sink reads unwritable before `record_unwritable` runs.
-- A later roll keeps the latch while it comes within 60 seconds of the sink's last roll, stage-2
-  failure or failed check (below). The first roll after a longer gap releases it. A stage-2 failure
-  refreshes that clock but never starts a latch: a sink stage 2 alone declared dead is not latched.
-- A latched sink that stops rolling stays held until `revalidate()` writes a record to it. Section
-  4's "re-validate its dead sinks" now covers the sinks the latch holds too, but not in the same way.
-  A sink whose own state is `unwritable` gets section 4's probe, as before. A sink the latch alone
-  holds gets a **check**: one write, under the handler's own lock, that never rolls the sink. The
-  probe would make the guard weaker than the bound alone in two ways: `record_healthy` resets the
-  bound's window and streak, and the probe's roll heals a broken handle that the next record would
-  otherwise have rolled through `handleError`, where the bound counts it. So a landed check releases
-  only the latch, a failed check refreshes its clock, and a sink with no check stays held. When a
-  roll or a stage-2 failure moves the latch while the check runs, the check's answer is dropped.
-- `status()`, `can_log()` and `revalidate()` read a sink unwritable when its own state or the latch
-  says so. On `GET /status` the latch changes only the `state` field. The cause, the rolled-aside path
-  and the roll count are what the guard records with or without it.
+  bound's state, so a reader of `status()` or `can_log()` sees it unwritable before
+  `record_unwritable` runs.
+- A later roll keeps the latch while it comes within 60 seconds of the sink's last roll or stage-2
+  failure, and the first roll after a longer gap releases it. A stage-2 failure refreshes that clock
+  but never starts a latch: a sink stage 2 alone declared dead is not latched.
+- `revalidate()` releases the latch on every sink whose own state is not `unwritable`, **without
+  writing to it**, so for those sinks its answer is section 4's answer before this amendment. A sink
+  whose own state is `unwritable` gets section 4's probe exactly as before, and its latch goes only
+  with that state, through `record_healthy`. Any write to a sink the latch alone holds would make the
+  guard weaker than the bound alone: `record_healthy` resets the bound's window and streak, the
+  probe's roll heals a broken handle that the next record would otherwise have rolled through
+  `handleError`, where the bound counts it, and even one plain write can take a one-shot fault that
+  the next record would have met. A draft of this amendment did each of the last two, and review
+  found both.
+- `status()` and `can_log()` read a sink unwritable when its own state or the latch says so. On
+  `GET /status` the latch changes only the `state` field. The cause, the rolled-aside path and the
+  roll count are what the guard records with or without it. At least the runner's halt pages also
+  read `status()`, so a page that lists the unwritable sinks can name a latched one too.
 
 **What the latch does not change.** The code that computes the bound, its window and streak, the
 state the three `record_*` methods write, every stage-1 and stage-2 page and every stop request is the
-code on `main` before this amendment, line for line, and it does not read the latch. The check's one
-write is the latch's only effect on a sink. The pages are still one per roll past the bound, not one
-per break: the row's *one page per break* clause is not closed by this amendment.
+code on `main` before this amendment, line for line, and it does not read the latch. The latch never
+writes to, rolls or probes a sink. The pages are still one per roll past the bound, not one per
+break: the row's *one page per break* clause is not closed by this amendment.
 
-**Stricter than section 1, and stated rather than hidden.** A sink the latch holds reads unwritable
-while it may be accepting records. So `can_log()` can read False where section 1 alone would read
-True. `revalidate()` can too, when the check of a latch-only sink raises or the sink has no check;
-a re-arm gated on it, a runner start included, is then refused or comes up halted where section 1
-alone would have let it through.
+**Stricter than section 1 between recovery actions, and stated rather than hidden.** A sink the
+latch holds reads unwritable while it may be accepting records, so `can_log()` and `/status` can read
+it unwritable where section 1 alone would read `rolled`. `revalidate()`, and so every re-arm and
+runner start gated on it, answers as section 1 does.
 
 **The latch requests no stop of its own, and the stop decision does not read it.** With two sinks,
 one held by the latch alone and the other failing stage 2, `can_log()` and `/status` read every sink
@@ -430,17 +431,18 @@ the latch should also take part in the stop decision is left open.
 **How far "never weaker than section 1" was checked, and no further.** A side-by-side fuzz ran this
 guard beside `main`'s `logging_guard.py` (checked byte-identical to `origin/main` at the run) under a
 fake clock. Five configurations drive the guard directly: random rolls, stage-2 failures,
-`record_healthy` calls where `main` would probe, `revalidate()` with probe and check outcomes drawn
-once per step and shared, and runner restarts (escalation re-wired, then `revalidate()`), on one and
-two sinks, one of them with a probe-less sink and the `continue` policy. Two more drive each
-module's real `handleError`, probe and check over a fake stream whose write and roll faults are
-shared by both guards, so a probe that heals a handle shows up as a later difference. At every step
-it compared the reported state, `can_log()`, the `revalidate()` answer, stage-1 and stage-2 pages,
-every event, stop requests, the `/status` fields other than `state`, and the bound's own `_sinks` and
-`_roll_flap`. Over 8 seeds and those 7 configurations it found no step where `main` was stricter. It
-did find such steps on the previous attempt at this item, including a `revalidate()` that reset the
-bound, and, through the real-handler configurations, on a draft of this one that gave a latch-only
-sink the rolling probe. That is a sampled search over a fake clock and a fake stream, not a proof,
-and it does not model threads. [`tests/test_log_write_guard.py`](../../tests/test_log_write_guard.py)
-pins the cases by name, among them a revalidate between two flaps that must still stop at the moment
-`main` stops, and a check on a real file handler that must not heal its handle.
+`record_healthy` calls where `main` would probe, `revalidate()` with probe outcomes drawn once per
+step and shared, and runner restarts (escalation re-wired, then `revalidate()`), on one and two
+sinks, one of them with a probe-less sink and the `continue` policy. Two more drive each module's
+real `handleError` and probe over a fake stream whose write and roll faults are shared by both
+guards, so a write that heals a handle or takes a fault shows up as a later difference. At every
+step it compared the reported state, `can_log()`, the `revalidate()` answer, stage-1 and stage-2
+pages, every event, stop requests, the `/status` fields other than `state`, and the bound's own
+`_sinks` and `_roll_flap`. Over 8 seeds and those 7 configurations it found no step where `main` was
+stricter. It did find such steps on the previous attempt at this item, including a `revalidate()`
+that reset the bound, and, through the real-handler configurations, on a draft of this one that
+gave a latch-only sink the rolling probe. That is a sampled search over a fake clock and a fake
+stream, not a proof, and it does not model threads.
+[`tests/test_log_write_guard.py`](../../tests/test_log_write_guard.py) pins the cases by name, among
+them a revalidate between two flaps that must still stop at the moment `main` stops, and two
+revalidates on real handlers that must neither heal a broken handle nor take a one-shot fault.
