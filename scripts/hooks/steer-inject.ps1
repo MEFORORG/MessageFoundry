@@ -71,10 +71,11 @@ function Write-Context([string]$Text) {
 }
 
 # Say a fault once per cooldown per key, never on every tool call. Without the helper there is no
-# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet.
+# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet. An
+# empty key is said every time too.
 function Write-FaultOnce([string]$Key, [string]$Text) {
     $emit = $true
-    if (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue) {
+    if ($Key -and (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue)) {
         $emit = Test-CcxSayOnce -Key $Key -Minutes $FAULT_COOLDOWN_MINUTES `
             -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-steer-fault')
     }
@@ -95,11 +96,12 @@ try {
         if ($s.Root) { $project = $s.Root }
         elseif ($s.Reason) {
             $fault = $s.Reason
-            # Input that names neither (unparsed, or a blank cwd) is keyed on the project and the fault,
-            # or one such fault anywhere on the machine would silence every other for the cooldown.
+            # Input that names neither (unparsed, or a blank cwd) has no key that is this session's
+            # alone; CLAUDE_PROJECT_DIR names the primary for every session. So it is said every
+            # time: one session's stamp must not silence another's.
             $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId }
                         elseif ($s.Payload -and [string]$s.Payload.cwd) { 'cwd:' + [string]$s.Payload.cwd }
-                        else { 'input:' + [string]$env:CLAUDE_PROJECT_DIR + '|' + $s.Reason }
+                        else { '' }
         }
     } catch {
         $fault = "the hook could not read its input ($($_.Exception.Message))"

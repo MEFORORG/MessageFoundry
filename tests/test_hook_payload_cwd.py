@@ -400,6 +400,8 @@ def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") ->
         (b'{"cwd": "", "session_id": "s1"}', "blank cwd"),
         (b'{"cwd": "   ", "session_id": "s1"}', "blank cwd"),
         (b'{"cwd": null, "session_id": "s1"}', "blank cwd"),
+        (b'[{"cwd": "C:\\\\", "session_id": "s1"}]', "not a JSON object"),
+        (b'{"cwd": ".", "session_id": "s1"}', "relative cwd"),
     ],
 )
 def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, why: str) -> None:
@@ -453,7 +455,12 @@ def test_a_cwd_named_to_a_hook_started_outside_every_checkout_is_a_fault(tmp_pat
     outside = Path(os.path.realpath(tmp_path)) / "no-repo"
     outside.mkdir()
     got = _resolve(outside, tmp_path, {"cwd": str(wt), "session_id": "s1"})
-    assert got["Dir"] is None and "inside no checkout" in got["Reason"], got
+    assert got["Dir"] is None and "in no checkout this hook can read" in got["Reason"], got
+    # mail-drain's -AnchorRepo case: an -AllowOutside caller stays put there in silence, as before.
+    anchored = _resolve(
+        outside, tmp_path, {"cwd": str(wt), "session_id": "s1"}, "-ReadOnly -AllowOutside"
+    )
+    assert anchored["Dir"] is None and anchored["Reason"] == "", anchored
     # The controls: no cwd there is no fault, and -AllowOutside still takes a cwd in no checkout.
     assert _resolve(outside, tmp_path, {"session_id": "s1"})["Reason"] == ""
     scratch = Path(os.path.realpath(tmp_path)) / "scratch"

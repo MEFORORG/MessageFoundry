@@ -467,7 +467,7 @@ def test_input_it_cannot_use_reads_no_note_and_says_so(
     ctx = str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
     assert "PRIMARY-NOTE" not in ctx, "another session's note was read"
     assert (repo / ".claude" / "steer.txt").exists(), "another session's note was removed"
-    # Keyed on this fixture's project directory, so the throttle cannot hide it on a first run.
+    # No key is this session's alone, so it is said every time, never throttled.
     assert ctx.startswith("[steer] Could not read this session's worktree"), ctx
 
 
