@@ -1019,18 +1019,18 @@ half-second pause, and nothing bounds how long one attempt runs. At the default 
 a SQL Server pool wait uses up that budget on its own, so it is recorded at once rather than run
 into the request deadline. `provision-admin` has no request deadline, so on its repair branch at
 least the revoke before it sets the password and the one after a grant the store reported as made
-run on a longer budget: a re-run starts only while less than five minutes have passed since the
-first attempt, give or take its pause of up to 15 seconds, and nothing bounds how long one attempt
-runs. One it gives up on before it sets the password refuses the run with no password or role
-written, and its miss row, where the store accepts it, carries the change
+run on a longer budget of up to 30 attempts: a re-run starts only while less than five minutes
+have passed since the first attempt, give or take its pause of up to 15 seconds, and nothing bounds
+how long one attempt runs. One it gives up on before it sets the password refuses the run with no
+password or role written, and its miss row, where the store accepts it, carries the change
 `first_administrator_repair`. One it gives up on after a grant the store reported as made has a
 miss row, where the store accepts it, with the change `first_administrator_granted`; the run tries
 to page its `administrator_granted` alert, and the command exits non-zero with text naming
 `messagefoundry admin-revoke-sessions`, since a re-run refuses an account that holds the role. A
 run refused after it wrote to the account may leave that account's sessions live;
-`messagefoundry admin-revoke-sessions`, run with the `--service-config` or `--db` the command used,
-ends the sessions it finds, of every account (vault BACKLOG #3023). The directory reconciler's
-revoke counts its attempts the same way, but
+`messagefoundry admin-revoke-sessions`, run once the store answers, with the `--service-config` or
+`--db` the command used, ends the sessions it finds, of every account (vault BACKLOG #3023). The
+directory reconciler's revoke counts its attempts the same way, but
 its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
 always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
 recorded after the second wait. One it gives up on ends the pass, and its miss row counts the
