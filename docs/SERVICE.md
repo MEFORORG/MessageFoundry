@@ -699,8 +699,8 @@ NSSM environment.
   **Off Windows, no installer creates the directory**, and the engine still reads only the path
   `MEFOR_SECRETS_DIRECTORY` names. For a container, `docker/compose.yaml` carries a read-only bind
   mount at `/run/mefor/secrets`, commented out. For systemd, a unit can point the variable at its
-  credentials directory, which is not measured. Where each goes, and the modes and owners the
-  engine refuses on POSIX, are stated once, under *Where the directory is* in
+  credentials directory, which is not measured. What the engine refuses, on every platform, and
+  where each platform's directory goes are in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Linux, on a
   host or in a container, is not a supported v1 deployment target
   ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
