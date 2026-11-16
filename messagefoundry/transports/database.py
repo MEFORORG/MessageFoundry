@@ -2616,8 +2616,9 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
-    ``connecting`` says the error came from opening the connection, before the statement ran, so
-    no message can be at fault (BACKLOG #5713). There a refused login (class ``28``) is a
+    ``connecting`` says the error came from opening the connection, or from allocating the
+    statement's cursor on it, before the statement ran, so no message can be at fault (BACKLOG
+    #5713, #5749). There a refused login (class ``28``) is a
     ``credential_fault`` and a missing driver or DSN (class ``IM``, or unixODBC's ``01000``) a
     ``config_fault``, so the delivery worker stops the lane and keeps the queue (ADR 0095) rather
     than dead-letter every queued row on the same refusal. Any other permanent state there is
@@ -3967,7 +3968,16 @@ class DatabaseDestination(DestinationConnector):
         cur: Any = None
         discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                # BACKLOG #5749: a cursor the driver cannot allocate is the connection's failure,
+                # before the statement ran, so it is classified as a connect failure is: retried,
+                # or a stopped lane, never a dead-lettered message.
+                state = _sqlstate(exc)
+                if state is None:
+                    raise  # not a DB driver error → an internal/code error, as below
+                raise _classify_db_error(state, str(exc), connecting=True) from exc
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
