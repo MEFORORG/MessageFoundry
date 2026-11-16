@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry import __version__
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
@@ -588,6 +589,13 @@ def check_lockable_accounts(
             "and computes" + passkey_note,
         )
     parts: list[str] = []
+    if census.integrity_failed:
+        # BACKLOG #5505: named by stored id, never judged on fields the store could not read.
+        parts.append(
+            "record fails its integrity check (a stored cell does not parse), so whether it is "
+            "lockable cannot be told; restore the row or delete the account: "
+            + ", ".join(scrub_log_argument(i) for i in census.integrity_failed)
+        )
     if census.no_way_past:
         parts.append(
             "chosen password and no authenticator app or discoverable passkey (anyone who knows "

@@ -118,7 +118,9 @@ _FLOAT_INF: Final = float("inf")
 
 
 class RowSealError(Exception):
-    """A store write helper read a row whose seal does not verify, and refused the write.
+    """A stored row failed its integrity check, and the store refused it: a write helper read a
+    row whose seal does not verify, or a read met a row whose cells do not parse (BACKLOG #5505).
+    Nothing is written either way, so the message says only that.
 
     The helper never re-seals such a row, because the next honest write would otherwise turn a
     change made outside the helper into a sealed row. ``args`` are exactly ``(kind, subject)``
@@ -132,7 +134,7 @@ class RowSealError(Exception):
         self.subject = subject
 
     def __str__(self) -> str:
-        return f"the {self.kind} row's integrity seal does not verify; the write was refused"
+        return f"a stored {self.kind} row failed its integrity check and was refused; nothing was written"
 
 
 class RowSealUnverifiableError(Exception):

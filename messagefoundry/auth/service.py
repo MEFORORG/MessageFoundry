@@ -2970,10 +2970,14 @@ class LockableAccountCensus:
     #: discoverable or not. The cure is the store key for a cell that does not open, and removing
     #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
+    #: Every account whose users row does not parse, by its stored id (BACKLOG #5505). Its record
+    #: fails its integrity check, so whether it is lockable is unknown: it is named here and in
+    #: no other list, since every other list would read fields the store could not read.
+    integrity_failed: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
-        return not self.no_way_past and not self.undecryptable_totp
+        return not self.no_way_past and not self.undecryptable_totp and not self.integrity_failed
 
 
 @dataclass(frozen=True)
@@ -3220,7 +3224,13 @@ async def lockable_account_census(
             way_past_rp_id is None or cred.rp_id == way_past_rp_id
         ) and credential_id_hash_is_current(cred.credential_id_hash)
 
+    integrity_failed: list[str] = []
     for user in await store.list_users():
+        if user.unreadable:
+            # BACKLOG #5505: the list's stand-in, whose fields are invented. Named as failing its
+            # integrity check, never judged on those fields.
+            integrity_failed.append(user.id)
+            continue
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
         state = await _totp_secret_state(store, user) if user.totp_enabled else None
@@ -3316,6 +3326,7 @@ async def lockable_account_census(
         passkey_only=tuple(sorted(passkey_only)),
         unknown_beside_a_passkey=tuple(sorted(unknown_beside_a_passkey)),
         reset_would_remove_a_passkey=tuple(sorted(reset_removes)),
+        integrity_failed=tuple(sorted(integrity_failed)),
     )
 
 
@@ -16318,6 +16329,14 @@ class AuthService:
             )
         if census.clean:
             return census
+        if census.integrity_failed:
+            _log.warning(
+                "ADR 0197: %d account(s) have a record that fails its integrity check (a stored "
+                "cell does not parse), so whether each is lockable cannot be told: %s. Restore the "
+                "row from a backup, or delete the account (BACKLOG #5505).",
+                len(census.integrity_failed),
+                ", ".join(scrub_log_argument(i) for i in census.integrity_failed),
+            )
         if census.no_way_past:
             _log.warning(
                 "ADR 0197: %d local account(s) the MFA requirement covers hold a chosen password and "
@@ -16372,6 +16391,7 @@ class AuthService:
                     "undecryptable_totp": list(census.undecryptable_totp),
                     "reset_would_remove_a_passkey": list(keep_passkey),
                     "unknown_totp": list(census.unknown_totp),
+                    "integrity_failed": list(census.integrity_failed),
                 }
             ),
         )

@@ -643,20 +643,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
 
     async def _row_seal_refused(request: Request, exc: Exception) -> Response:
-        # BACKLOG #2592: the store refused a write because the row it read fails its integrity
-        # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
-        # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
-        # the row's kind, since this path does not pass the service loader that audits and alerts.
+        # BACKLOG #2592: the store refused a row that fails its integrity check, and wrote nothing.
+        # A write helper meets it when the row's seal does not verify, and since BACKLOG #5505 a
+        # raw read meets it when the row's cells do not parse, so the texts name neither a write
+        # nor a change. A 409 with a fixed text, never the row and never a 500. Logged with the
+        # row's kind, since this path does not pass the service loader that audits and alerts.
         assert isinstance(exc, RowSealError)
         _log.warning(
-            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
+            "a stored %s row failed its integrity check and was refused (BACKLOG #2592, #5505)",
             exc.kind,
         )
         return await http_exception_handler(
             request,
             HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"the {exc.kind} record fails its integrity check, so the change was refused",
+                f"a stored {exc.kind} record fails its integrity check, so the request was refused",
             ),
         )
 
