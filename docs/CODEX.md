@@ -31,7 +31,9 @@ claim a failed hook ran.
 
 Only a hook blocks. As in Claude Code, a hook's exit 2 blocks. So does a hook
 that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
-command that cannot start, or a defect in its group. Any other hook failure is a
+command that cannot start, a defect of its own such as an unsupported handler
+type or shell, or a defect in its group, such as a matcher that is not a valid
+regex, that keeps it from running. Any other hook failure is a
 non-blocking error. The bridge reports it on stderr and as a `systemMessage`,
 naming the hook, ignores that hook's output, and runs the remaining hooks. A JSON
 `permissionDecision` deny from a hook is a decision, not a failure, and is passed
@@ -42,10 +44,11 @@ bridge from running the hooks: settings that cannot be parsed, a missing session
 id, a payload that cannot be read as UTF-8 JSON, a payload whose
 `hook_event_name` differs from the registered event in more than case, or any
 other exception. The bridge reports it on stderr and as a `systemMessage`, and
-keeps any decision already gathered, such as an earlier hook's deny. Each hook
-group is judged on its own: a defect in a group, such as a matcher that is not a
-valid regex or an unsupported handler type or shell, is reported and that group
-skipped, so the groups after it still run.
+keeps any decision already gathered, such as an earlier hook's deny. A defect is
+judged where it belongs. A hook's own defect is reported and that hook skipped;
+the hooks before it have already run, and the hooks after it still run. A defect
+in a group, such as its matcher, is reported and that group skipped, and the
+groups after it still run.
 
 A launcher that cannot run the bridge never blocks either. In hook mode the
 bridge exits 0 to proceed or 10 to block, and `invoke.ps1` turns 10 into 2. Any

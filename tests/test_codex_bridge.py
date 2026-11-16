@@ -188,8 +188,15 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
         # A failed cmdlet as the last statement stays -Command's own non-blocking 1.
         ("Get-Item -LiteralPath 'no-such-item-b4'", "notice"),
+        # A grep-style stale exit 2, then a failed cmdlet: still the cmdlet's non-blocking 1.
+        (
+            "& '{py}' -c 'import sys; sys.exit(2)'; Get-Item -LiteralPath 'no-such-item-b4'",
+            "notice",
+        ),
+        # The hook's own final exit 2 still blocks, after a statement that succeeded.
+        ("Write-Output 'x' | Out-Null; & '{py}' -c 'import sys; sys.exit(2)'", "block"),
     ],
-    ids=["native-exit-2", "stale-exit-2", "failed-cmdlet"],
+    ids=["native-exit-2", "stale-exit-2", "failed-cmdlet", "stale-2-then-cmdlet", "own-final-2"],
 )
 def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, command, outcome):
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
@@ -579,7 +586,21 @@ def test_a_fault_under_the_tracked_settings_is_reported_and_never_blocks(
     "event", ["PreToolUse", "PermissionRequest", "Stop", "SubagentStop", "SessionStart"]
 )
 def test_a_fault_on_any_event_is_reported_and_never_blocks(bridge, tmp_path, capsys, event):
-    write_settings(tmp_path, {event: [DENY_GROUP], "disableAllHooks": True})
+    write_settings(tmp_path, {event: [DENY_GROUP]})
+    assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == 0
+    reported(capsys)
+
+
+@pytest.mark.parametrize("event", ["PreToolUse", "Stop", "SessionStart"])
+def test_disabled_hooks_report_nothing_even_without_a_session_id(bridge, tmp_path, capsys, event):
+    (tmp_path / ".claude").mkdir()
+    settings_file = tmp_path / ".claude/settings.json"
+    hooks = {event: [{"matcher": "", "hooks": [exits(2)]}]}
+    settings_file.write_text(json.dumps({"disableAllHooks": True, "hooks": hooks}))
+    assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == 0
+    assert capsys.readouterr() == ("", "")
+    # The twin: with hooks enabled, the same payload is a reported fault.
+    settings_file.write_text(json.dumps({"hooks": hooks}))
     assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == 0
     reported(capsys)
 
@@ -734,6 +755,33 @@ def test_a_registered_command_passes_a_decision_and_maps_no_decision(
         assert "no decision, not blocking" in json.loads(completed.stdout)["systemMessage"]
 
 
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize(("stub", "expected"), [("10", 2), ("0", 0), ("1", 1)])
+def test_the_launcher_ignores_a_callers_native_error_preference(tmp_path, stub, expected):
+    """With $PSNativeCommandUseErrorActionPreference on, exit 10 would throw and read as 1."""
+    root = tmp_path / "repo"
+    scripts = root / "scripts/codex"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/codex/invoke.ps1", scripts / "invoke.ps1")
+    (scripts / "bridge.py").write_text(_STUB_BRIDGE)
+    _link_python(root)
+    command = (
+        "$PSNativeCommandUseErrorActionPreference = $true; $ErrorActionPreference = 'Stop'; "
+        f"& '{scripts / 'invoke.ps1'}' hook --event Stop"
+    )
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=scripts,
+        env={**os.environ, "STUB_BRIDGE_EXIT": stub},
+        input="{}",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == expected, (completed.stdout, completed.stderr)
+
+
 def bridge_block_exit():
     spec = importlib.util.spec_from_file_location(
         "codex_bridge_c", ROOT / "scripts/codex/bridge.py"
@@ -826,8 +874,23 @@ def test_a_defective_group_is_skipped_and_later_groups_still_run(bridge, tmp_pat
     defective = {"matcher": ".*", "hooks": [handler("{}")], **defect}
     write_settings(tmp_path, {"PreToolUse": [defective, DENY_GROUP]})
     assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 0
-    result = reported(capsys, "skipped a hook group with a defect")
+    result = reported(capsys, "with a defect")
     assert result["hookSpecificOutput"] == DENIAL["hookSpecificOutput"]
+
+
+def test_an_advisory_hook_defect_beside_an_on_failure_hook_does_not_block(bridge, tmp_path, capsys):
+    """The defect is the advisory hook's own; the onFailure guard in the same group passed."""
+    guard = {**handler(json.dumps(DENIAL)), "onFailure": "block"}
+    write_settings(tmp_path, {"PreToolUse": [{"matcher": ".*", "hooks": [guard, UNSUPPORTED]}]})
+    assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 0
+    result = reported(capsys, "skipped a hook with a defect")
+    assert result["hookSpecificOutput"] == DENIAL["hookSpecificOutput"]
+
+
+def test_a_defect_in_the_on_failure_hook_itself_blocks(bridge, tmp_path):
+    advisory_then_guard = [handler("{}"), {**UNSUPPORTED, "onFailure": "block"}]
+    write_settings(tmp_path, {"PreToolUse": [{"matcher": ".*", "hooks": advisory_then_guard}]})
+    assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 2
 
 
 @pytest.mark.parametrize(

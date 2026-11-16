@@ -20,6 +20,8 @@ if ($args.Count -gt 0 -and $args[0] -eq 'hook') {
     # becomes 2 here. Anything else, a missing .venv, a crash, or the 2 that Python and argparse
     # exit with, is no decision: reported, and a non-blocking 1 on every event.
     # docs/CODEX.md, "Who decides a block", states the rule.
+    # With this preference on, the bridge's block exit 10 would throw and read as no decision.
+    $PSNativeCommandUseErrorActionPreference = $false
     $code = 1
     $why = ''
     try {

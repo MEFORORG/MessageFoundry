@@ -200,9 +200,15 @@ def git_bash() -> str | None:
 
 
 # -Command reports a native program's exit 2 as 1, which would turn a block into a non-blocking
-# error. This tail keeps -Command's own result, 0 or 1, except that a failed last statement which
-# left exit code 2 behind exits 2.
-POWERSHELL_EXIT_TAIL = "\nif (-not $?) { if ($LASTEXITCODE -eq 2) { exit 2 }; exit 1 }"
+# error. The head and tail keep -Command's own result, 0 or 1, except that a failed last statement
+# exits 2 when it left exit code 2 behind and no cmdlet error was recorded. A failed cmdlet records
+# one, so an earlier native exit 2 followed by a failed cmdlet stays a non-blocking 1. A cmdlet
+# error anywhere before a final native exit 2 also makes it 1. The head keeps a native exit from
+# recording an error where a PowerShell build defaults that preference on.
+POWERSHELL_EXIT_HEAD = "$PSNativeCommandUseErrorActionPreference = $false; $Error.Clear()\n"
+POWERSHELL_EXIT_TAIL = (
+    "\nif (-not $?) { if ($LASTEXITCODE -eq 2 -and $Error.Count -eq 0) { exit 2 }; exit 1 }"
+)
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
@@ -225,7 +231,8 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command + POWERSHELL_EXIT_TAIL]
+        script = POWERSHELL_EXIT_HEAD + command + POWERSHELL_EXIT_TAIL
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 
@@ -311,62 +318,77 @@ def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> i
     return 0
 
 
-def run_group(root: Path, payload: dict, env: dict[str, str], group: dict, result: dict) -> None:
+def run_one_hook(root: Path, payload: dict, env: dict[str, str], hook: dict, result: dict) -> None:
     event = payload["hook_event_name"]
+    if hook.get("type") != "command" or hook.get("async"):
+        raise ValueError(
+            f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
+        )
+    # Claude Code's hook contract: exit 2 blocks. Any other failure, a timeout or a command
+    # that cannot start included, is a non-blocking error unless the hook sets onFailure to
+    # block, and the remaining hooks still run. Only a successful hook's stdout is read.
+    try:
+        completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
+            hook_argv(root, hook),
+            input=json.dumps(payload),
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=hook.get("timeout", 30),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        captured = exc.stderr or ""
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", "replace")
+        print_hook_stderr(captured)
+        hook_failed(result, hook, f"timed out after {exc.timeout} seconds")
+        return
+    except OSError as exc:
+        hook_failed(result, hook, f"could not start ({exc})")
+        return
+    if completed.returncode == 2:
+        raise HookBlocked(completed.stderr.strip() or "Claude hook blocked this event")
+    print_hook_stderr(completed.stderr)
+    if completed.returncode:
+        hook_failed(result, hook, f"exited {completed.returncode}")
+        return
+    output = completed.stdout.strip()
+    if not output:
+        return
+    try:
+        update = json.loads(output)
+    except json.JSONDecodeError:
+        update = None
+    if not isinstance(update, dict):
+        if event not in PLAIN_CONTEXT_EVENTS:
+            print(output, file=sys.stderr)
+            return
+        output = output.replace(
+            "scripts\\coord\\seat.ps1",
+            "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
+        )
+        update = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": output}}
+    merge_output(result, update)
+
+
+def run_group(root: Path, payload: dict, env: dict[str, str], group: dict, result: dict) -> None:
     for hook in group.get("hooks", []):
-        if hook.get("type") != "command" or hook.get("async"):
-            raise ValueError(
-                f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
-            )
-        # Claude Code's hook contract: exit 2 blocks. Any other failure, a timeout or a command
-        # that cannot start included, is a non-blocking error unless the hook sets onFailure to
-        # block, and the remaining hooks still run. Only a successful hook's stdout is read.
         try:
-            completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
-                hook_argv(root, hook),
-                input=json.dumps(payload),
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=hook.get("timeout", 30),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            captured = exc.stderr or ""
-            if isinstance(captured, bytes):
-                captured = captured.decode("utf-8", "replace")
-            print_hook_stderr(captured)
-            hook_failed(result, hook, f"timed out after {exc.timeout} seconds")
-            continue
-        except OSError as exc:
-            hook_failed(result, hook, f"could not start ({exc})")
-            continue
-        if completed.returncode == 2:
-            raise HookBlocked(completed.stderr.strip() or "Claude hook blocked this event")
-        print_hook_stderr(completed.stderr)
-        if completed.returncode:
-            hook_failed(result, hook, f"exited {completed.returncode}")
-            continue
-        output = completed.stdout.strip()
-        if not output:
-            continue
-        try:
-            update = json.loads(output)
-        except json.JSONDecodeError:
-            update = None
-        if not isinstance(update, dict):
-            if event not in PLAIN_CONTEXT_EVENTS:
-                print(output, file=sys.stderr)
-                continue
-            output = output.replace(
-                "scripts\\coord\\seat.ps1",
-                "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
-            )
-            update = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": output}}
-        merge_output(result, update)
+            run_one_hook(root, payload, env, hook, result)
+        except HookBlocked:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            # A defect belongs to its own hook: it blocks only when that hook set onFailure to
+            # block. Any other hook's defect is reported and that hook skipped.
+            message = f"Codex bridge: skipped a hook with a defect: {type(exc).__name__}: {exc}"
+            if isinstance(hook, dict) and hook.get("onFailure") == "block":
+                raise HookBlocked(f"{message} (onFailure is block)") from exc
+            print(f"{message} (not blocking)", file=sys.stderr)
+            merge_output(result, {"systemMessage": f"{message} (not blocking)"})
 
 
 def blocks_on_failure(group: dict) -> bool:
@@ -378,10 +400,10 @@ def dispatch(root: Path, payload: dict, result: dict | None = None) -> dict:
     """Run the event's hooks, gathering their output into `result`, which a fault leaves intact."""
     result = {} if result is None else result
     event = payload["hook_event_name"]
-    env = child_environment(root, payload.get("session_id", ""))
     config = read_settings(root)
     if config.get("disableAllHooks"):
         return result
+    env = child_environment(root, payload.get("session_id", ""))
     if event == "SessionStart":
         unknown = set(config.get("hooks", {})) - set(EVENTS)
         context = (
@@ -405,8 +427,9 @@ def dispatch(root: Path, payload: dict, result: dict | None = None) -> dict:
         except HookBlocked:
             raise
         except (AttributeError, KeyError, TypeError, ValueError, re.error) as exc:
-            # Each group is judged on its own: a defect is reported and that group skipped, so
-            # the groups after it still run. A hook in it that set onFailure to block has failed.
+            # A defect in the group itself, such as its matcher, keeps all of its hooks from
+            # running: it is reported and the group skipped, so the groups after it still run,
+            # unless a hook in it set onFailure to block, which has then failed.
             message = (
                 f"Codex bridge: skipped a hook group with a defect: {type(exc).__name__}: {exc}"
             )
