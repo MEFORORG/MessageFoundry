@@ -5,9 +5,11 @@
 The first pass on this row mapped fourteen fields (``tests/test_anon_b214_5533.py``). Fields of
 the same class stayed unmapped inside segments the default map already scrubbed: names, ids,
 phones, birth places, a death date and visit locations. At least some fields of these segments
-still have no rule; ``rules.py`` names them. With ``require_full_coverage`` off, each
-one's value passed into the dataset as captured. This pins each to a kind, checks on both adapters
-that a made-up value in each is gone from the output, and keeps a control that shows the same
+still have no rule; ``rules.py`` names them. Plain ``anonymize`` passed each one's value into the
+dataset as captured. ``anonymize_checked`` refused at least a dashed SSN, a punctuated phone or an
+``MR``-typed id in them, and passed a name, a date or an undashed number; only
+``require_full_coverage`` refused a message with any value in them. This pins each to a kind,
+checks on both adapters that a made-up value in each is gone from the output, and keeps a control that shows the same
 value survives when its rule is taken away. Every message here is synthetic (CLAUDE.md section 9),
 and no test prints a message body.
 """

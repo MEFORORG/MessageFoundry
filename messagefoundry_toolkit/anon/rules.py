@@ -47,7 +47,7 @@ _FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
 class SurrogateKind(StrEnum):
     """The kind of surrogate a field gets. ``KEEP``/``DROP`` are overlay actions, not surrogates."""
 
-    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2/30, GT1-3, IN1-16, MRG-4/7)
+    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2/30, GT1-3, IN1-16, MRG-7); MRG-4, a CX
     ADDRESS = "address"  # XAD address (PID-11, NK1-4/32, GT1-5, IN1-19)
     MRN = "mrn"  # CX medical-record / patient identifier (PID-2/3/21, MRG-1/3)
     SSN = "ssn"  # social-security / national id (PID-19, NK1-37, GT1-12, IN2-2)
@@ -146,9 +146,12 @@ class FieldRule:
 # mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
 # that list still has no rule, and only the coverage report names it.
 #
-# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
-# with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
-# the surrogate mapping.
+# A surrogate is keyed on its kind and on the repetition's text, so a prior value in MRG keeps an
+# A40 merge's old-to-new linkage only where its kind matches the kind of the field it is the prior
+# value of. These match: MRG-1 with PID-3 (MRN), MRG-2 with PID-4, MRG-5 with PV1-19 and MRG-6 with
+# PV1-50 (ID), and MRG-7 with PID-5 (NAME). These do not: MRG-3, the prior account number, takes
+# MRN while PID-18 takes ID, and MRG-4, the prior patient id, is a CX paired with PID-2 but takes
+# NAME while PID-2 takes MRN.
 #
 # BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
