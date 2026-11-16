@@ -15,6 +15,7 @@ import argparse
 import inspect
 import re
 import sys
+import tracemalloc
 import types
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -363,7 +364,11 @@ def test_a_store_key_on_a_later_line_of_one_value_refuses(key: str, brk: str) ->
     assert posture.listed_keys == (key,)
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert f"{key} (in Parameters\\AppEnvironmentExtra)" in refusal
+    # The refusal says the name is not the string's first, so the operator looks below it.
+    assert (
+        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of a string whose first line is "
+        "another entry)"
+    ) in refusal
     assert _KEY_VALUE not in refusal
 
 
@@ -417,6 +422,63 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+
+
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_an_empty_store_key_above_another_variable_is_not_refused(key: str) -> None:
+    """Vault BACKLOG #5394: an empty ``KEY=`` line, then another variable's line. The key is
+    empty under the line reading, and the next line is not its value."""
+    posture = _service([f"{key}=\nMEFOR_AI_ENVIRONMENT=prod"])
+    assert posture.listed_keys == ()
+    assert service_env_refusal(posture) is None
+
+
+def test_a_path_form_oidc_key_is_not_inlined_by_another_variables_pem() -> None:
+    """The PEM header belongs to the variable on its own line, not to the path above it."""
+    posture = _service(
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\oidc.pem\nMEFOR_AI_ENVIRONMENT=-----BEGIN x"]
+    )
+    assert posture.listed_directory_names == ()
+    assert service_env_refusal(posture) is None
+
+
+def test_a_line_with_no_equals_sign_is_not_glued_onto_the_next() -> None:
+    posture = _service(["NOT A VARIABLE\nMEFOR_AI_ENVIRONMENT=prod"])
+    assert posture.listed == ()
+    glued = _service(["MEFOR_VALUE_A\nX=1"])
+    assert glued.listed_value_names == ("MEFOR_VALUE_A",)
+    assert glued.unplain_value_names == ("MEFOR_VALUE_A",)
+    assert service_env_refusal(glued) is not None
+
+
+def test_an_empty_env_value_above_another_line_is_still_empty() -> None:
+    posture = _service(["MEFOR_VALUE_A=\nMEFOR_VALUE_B=x"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_A", "MEFOR_VALUE_B")
+    assert posture.empty_value_names == ("MEFOR_VALUE_A",)
+
+
+def test_a_first_line_with_no_equals_sign_is_not_counted_twice() -> None:
+    """``MEFOR_VALUE_A`` with no equals sign, then ``MEFOR_VALUE_B=1``: one variable under
+    either reading, so the refusal counts one."""
+    posture = _service(["MEFOR_VALUE_A\nMEFOR_VALUE_B=1"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_B",)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "1 MEFOR_VALUE_* variable(s)" in refusal
+
+
+def test_a_long_multi_line_value_is_read_in_linear_memory() -> None:
+    """The head read the rest of the string again from every later line, about 160 MB for
+    4,000 lines. Each line is read once now."""
+    entry = "\n".join(f"MEFOR_VALUE_K{n}=synthetic-value-{n}" for n in range(4000))
+    tracemalloc.start()
+    try:
+        posture = _service([entry])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(posture.listed_value_names) == 4000
+    assert peak < 16 * 1024 * 1024, f"peak {peak} bytes"
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:
