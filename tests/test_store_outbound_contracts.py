@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""SQLite leg of the outbound-completion contracts (BACKLOG #5752, #5753).
+"""SQLite leg of the outbound-completion contracts (BACKLOG #5752, #5753, #5740).
 
 The same bodies run on Postgres from ``tests/test_store_outbound_contracts_postgres.py`` and on SQL
 Server from ``tests/test_store_outbound_contracts_sqlserver.py``, on their gated live legs.
@@ -19,6 +19,7 @@ from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests import _attachment_put_contract as attachment_put
+from tests import _dead_letter_purge_contract as dead_letter_purge
 from tests import _response_completion_contract as completion
 from tests._queue_tag_contract import RawFetch, RawSql
 
@@ -55,6 +56,26 @@ async def test_response_completion_contract(store: MessageStore, case: Any) -> N
 @pytest.mark.parametrize("case", attachment_put.CASES)
 async def test_attachment_put_contract(store: MessageStore, case: Any) -> None:
     await case(store, _fetch(store), _raw(store))
+
+
+@pytest.mark.parametrize("case", dead_letter_purge.CASES)
+async def test_dead_letter_purge_contract(store: MessageStore, case: Any) -> None:
+    await case(store, _fetch(store), _raw(store))
+
+
+@pytest.mark.parametrize("cls", [PostgresStore, SqlServerStore])
+def test_the_attachment_release_decrefs_exactly_what_it_deletes(cls: Any) -> None:
+    """BACKLOG #5740: on a server backend a tally SELECT and a later DELETE read two snapshots, so
+    the decref and the delete could cover different join rows. The release must take its counts
+    from the DELETE itself; the race is not reproducible on demand, so the shape is pinned."""
+    src = inspect.getsource(cls._release_message_attachments)
+    assert "SELECT attachment_id" not in src, cls.__name__
+    assert ("RETURNING attachment_id" in src) or ("OUTPUT deleted.attachment_id" in src)
+    # The behavioural contract above runs on these backends only on their gated legs, so the
+    # store-once release it needs is pinned here on every leg as well, before the payload blank.
+    purge = inspect.getsource(cls.purge_dead_letters)
+    assert purge.index("SET body_ref=NULL") < purge.index("UPDATE queue SET payload=''")
+    assert "UPDATE shared_body SET refcount" in purge, cls.__name__
 
 
 async def _bounded_store(tmp_path: pathlib.Path) -> tuple[MessageStore, AesGcmCipher]:
@@ -103,7 +124,7 @@ async def test_a_dedup_put_seals_nothing(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize("cls", [MessageStore, PostgresStore, SqlServerStore])
-def test_every_backend_dedups_and_reserves_before_it_seals(cls: type) -> None:
+def test_every_backend_dedups_and_reserves_before_it_seals(cls: Any) -> None:
     """The server backends' behaviour runs only on their gated legs; this pins the order of the
     three steps on every leg. The dedup read and the reservation both come before the seal."""
     src = inspect.getsource(cls.put_attachment)

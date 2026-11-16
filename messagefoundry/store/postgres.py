@@ -7521,8 +7521,8 @@ class PostgresStore:
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
 
         def _hash() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
@@ -7650,27 +7650,29 @@ class PostgresStore:
 
     async def _release_message_attachments(self, conn: Any, where: str, params: list[Any]) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
-        attachment sibling of the SQLite retention seam). Tally each distinct attachment the matching
-        messages reference via the ``message_attachment`` linkage, decref each by how many of these
-        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even
-        if the purge re-runs. Runs in the CALLER's transaction. **Re-run is a no-op:** a re-run finds the
-        join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
-        an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
-        (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        attachment sibling of the SQLite retention seam). DELETE the matching messages'
+        ``message_attachment`` join rows, then decref each attachment by how many of those rows named
+        it (GC at 0), so the release is exactly-once even if the purge re-runs. Runs in the CALLER's
+        transaction. **Re-run is a no-op:** a re-run finds the join rows gone and decrefs nothing — no
+        double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
+        holds. ``where`` is a code-controlled ``$N`` fragment (numbered from ``$1``)."""
+        # BACKLOG #5740: ONE statement deletes the join rows and reports what it deleted, so the
+        # decref covers exactly the rows removed. A tally SELECT and a separate DELETE each took their
+        # own READ COMMITTED snapshot, so a row that came to match between them was deleted without
+        # its decref (the document kept past retention) or decreffed without its delete (a document
+        # collected while a link still names it). Deleting them makes a re-run decref nothing.
+        deleted = await conn.fetch(
+            f"DELETE FROM message_attachment WHERE {where} RETURNING attachment_id", *params
+        )
+        counts: dict[str, int] = {}
+        for r in deleted:
+            key = str(r["attachment_id"])
+            counts[key] = counts.get(key, 0) + 1
         # The decrefs take the header locks in content-address order, as the ingress and
         # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
         # in Python as those are, so the database collation does not decide the order.
-        rows = await conn.fetch(
-            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
-            *params,
-        )
-        if not rows:
-            return
-        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
-            await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
-        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
-        await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
+        for ref in sorted(counts):
+            await self._decref_attachment(conn, ref, counts[ref])
 
     @staticmethod
     def _attachment_still_referenced_sql(msg_col: str, inflight_ph: int, dead_ph: int) -> str:
@@ -12030,8 +12032,39 @@ class PostgresStore:
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
             "destination_name", older_than, connection_cutoffs, start=2
         )
+        # stage is $1 and status $2 for the store-once release; its cutoff numbers from $3.
+        ref_cutoff_sql, ref_cutoff_params, _ = _pg_cutoff_case(
+            "destination_name", older_than, connection_cutoffs, start=3
+        )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # BACKLOG #5740, as on SQLite: release the shared bodies these dead rows reference and
+                # NULL their body_ref BEFORE blanking. This backend writes no store-once row, but a
+                # restored one carries a body_ref, and a blanked payload left with it set still read as
+                # replayable: its shared body (PHI) and its message's attachment were never released.
+                # One statement NULLs and reports the old refs, so the decref covers exactly them.
+                released = await conn.fetch(
+                    "WITH r AS (SELECT id, body_ref FROM queue"
+                    " WHERE stage=$1 AND status=$2 AND body_ref IS NOT NULL"
+                    f" AND updated_at < {ref_cutoff_sql} FOR UPDATE)"
+                    " UPDATE queue q SET body_ref=NULL FROM r WHERE q.id=r.id RETURNING r.body_ref",
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DEAD.value,
+                    *ref_cutoff_params,
+                )
+                ref_counts: dict[str, int] = {}
+                for r in released:
+                    key = str(r["body_ref"])
+                    ref_counts[key] = ref_counts.get(key, 0) + 1
+                for body_hash in sorted(ref_counts):
+                    await conn.execute(
+                        "UPDATE shared_body SET refcount = GREATEST(0, refcount - $1) WHERE hash=$2",
+                        ref_counts[body_hash],
+                        body_hash,
+                    )
+                    await conn.execute(
+                        "DELETE FROM shared_body WHERE hash=$1 AND refcount<=0", body_hash
+                    )
                 # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
                     "UPDATE queue SET payload=''"

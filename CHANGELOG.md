@@ -46,6 +46,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
+- **Store fixes for captured replies, attachments and the dead-letter purge, on all three
+  backends.** A captured-reply completion now writes only for an inflight row, so a second
+  completion no longer mints a second reply and re-ingress child, and the server backends serialize
+  the reply sequence so two rows of one message cannot collide after the partner accepted. A
+  detached document is deduplicated before it is sealed, its seals are reserved in the persisted
+  AES-GCM bound first, and a concurrent identical upload no longer fails on the primary key. The
+  Postgres and SQL Server dead-letter purge releases attachments from one statement and releases
+  the shared body of a restored row. (`BACKLOG #5752`, `#5753`, `#5740`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

@@ -13455,8 +13455,8 @@ class MessageStore:
         self._require_streaming_attachments()
 
         def _hash() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but

@@ -24,7 +24,7 @@ import asyncio
 from typing import Any
 
 from messagefoundry.store import OutboxStatus, Stage
-from tests._queue_tag_contract import RawFetch, RawSql
+from tests._queue_tag_contract import RawFetch, RawSql, _row_id
 
 LOOP = "IB_LOOP_5752"
 DEST = "OB_REPLY_5752"
@@ -82,17 +82,14 @@ async def assert_an_unclaimed_row_does_not_complete(
     mid = await store.enqueue_message(
         channel_id="IB_SRC", raw=RAW, deliveries=[(DEST, RAW)], now=1.0
     )
-    rows = await fetch(
-        "SELECT id FROM queue WHERE message_id=? AND stage=?", (mid, Stage.OUTBOUND.value)
-    )
-    (row,) = rows
+    row_id = await _row_id(fetch, mid, Stage.OUTBOUND.value)
     await store.complete_with_response(
-        str(row["id"]), body=REPLY, outcome="accepted", reingress_to=LOOP, now=2.0
+        row_id, body=REPLY, outcome="accepted", reingress_to=LOOP, now=2.0
     )
     assert await _seqs(fetch, mid) == []
     assert await _reingress_rows(fetch, mid) == 0
     # Still deliverable: the row is untouched, so the worker claims and sends it as before.
-    assert await _status(fetch, str(row["id"])) == OutboxStatus.PENDING.value
+    assert await _status(fetch, row_id) == OutboxStatus.PENDING.value
 
 
 async def assert_concurrent_completions_to_one_destination_both_capture(
