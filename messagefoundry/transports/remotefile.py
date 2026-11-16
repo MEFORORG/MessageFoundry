@@ -118,6 +118,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
+    FileKeyError,
     InboundHandler,
     NegativeAckError,
     PollStopGuard,
@@ -2731,9 +2732,10 @@ class RemoteFileDestination(DestinationConnector):
 def _remote_processed_dir(remote_dir: str, value: object) -> str:
     """The ``processed_subdir`` directory ``value`` names under ``remote_dir``, or ValueError for one
     that names the poll directory itself or a directory above it, as the File source refuses
-    (``file._archive_subdir``). A file "moved" there stays where the next poll lists it, so every
-    processed file would be handed over again on every poll: at least ``""``, ``"."``, ``".."`` and
-    ``"a/.."``. Purely lexical on POSIX paths, with no server call. An absolute value under a
+    (``file._archive_subdir``). A file "moved" to the poll directory itself stays where the next
+    poll lists it, so it would be handed over again on every poll: at least ``""``, ``"."`` and
+    ``"a/.."``. A directory above it (``".."``) is refused too, to keep the rule the same as the
+    local source's, where an ancestor hides every drop. Purely lexical on POSIX paths, with no server call. An absolute value under a
     relative ``remote_dir`` cannot be placed against it without the server, so it is let through.
     The value is withheld from the error, as the other setting refusals here do."""
     if not isinstance(value, str) or not value.strip():
@@ -2743,8 +2745,8 @@ def _remote_processed_dir(remote_dir: str, value: object) -> str:
     if posixpath.isabs(target) == posixpath.isabs(base):
         t_parts = [p for p in target.split("/") if p not in ("", ".")]
         b_parts = [p for p in base.split("/") if p not in ("", ".")]
-        t_up = len(t_parts) - len([p for p in t_parts if p != ".."])
-        b_up = len(b_parts) - len([p for p in b_parts if p != ".."])
+        t_up = t_parts.count("..")  # normpath leaves ".." only at the front
+        b_up = b_parts.count("..")
         if t_up > b_up or (len(t_parts) <= len(b_parts) and b_parts[: len(t_parts)] == t_parts):
             raise ValueError(
                 "REMOTEFILE processed_subdir must not be the poll directory or a directory above "
@@ -3196,8 +3198,8 @@ class RemoteFileSource(SourceConnector):
             disposed += 1
             if file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
-                await self._leave_record(file_key)
-                newly_recorded += 1
+                # Only a durable write counts, so a broken ledger does not draw a prune.
+                newly_recorded += await self._leave_record(file_key)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
@@ -3465,25 +3467,35 @@ class RemoteFileSource(SourceConnector):
             return True
         return False
 
-    async def _leave_record(self, file_key: str) -> None:
+    async def _leave_record(self, file_key: str) -> bool:
         """Mark a leave-in-place file ingested: the durable ledger (a HASHED key), then the bounded
-        cache. The ledger goes first, so a crash between the two leaves no cached key ahead of a
-        durable row (BACKLOG #5685). A ledger write that fails is logged, without the key or the
-        file name, and the key is still cached: the file is then handed over at most once in this
+        cache. Returns whether the durable row was written. The ledger goes first, so a write that
+        is cancelled leaves nothing cached (BACKLOG #5685). A ledger write that fails is logged,
+        without the key or the file name, and the key is still cached, so a cached key does not
+        always have a durable row behind it: the file is then handed over at most once in this
         process, and the rest of the poll goes on, rather than the file being handed over again on
         every poll while the ledger stays broken. With no durable row, a restart or a cache eviction
-        hands it over once more, which at-least-once allows."""
-        if self.processed_ledger is not None:
-            try:
-                with self._stop_guard.store_call():
-                    await self.processed_ledger.mark_processed(file_key)
-            except Exception as exc:  # noqa: BLE001 -- any store fault; the poll must go on
-                logger.warning(
-                    "REMOTEFILE processed-ledger write failed (%s); the file is remembered for this "
-                    "process only",
-                    _fault_detail(exc),
-                )
+        hands it over once more, which at-least-once allows. A malformed key (``FileKeyError``) is
+        a programming error, not a store fault, and still escapes."""
+        if self.processed_ledger is None:
+            self._seen_add(file_key)
+            return False
+        try:
+            with self._stop_guard.store_call():
+                await self.processed_ledger.mark_processed(file_key)
+        except FileKeyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- any store fault; the poll must go on
+            logger.warning(
+                "REMOTEFILE %s: processed-ledger write failed (%s); the file is remembered for "
+                "this process only",
+                self._connection or _where(self._host, self._remote_dir),
+                _fault_detail(exc),
+            )
+            self._seen_add(file_key)
+            return False
         self._seen_add(file_key)
+        return True
 
     async def _after_processing(self, path: str, name: str, read_size: int) -> None:
         if self._after_read == "leave":

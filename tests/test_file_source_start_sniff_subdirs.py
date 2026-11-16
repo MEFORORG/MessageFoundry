@@ -295,6 +295,7 @@ class _FailingLedger:
     def __init__(self) -> None:
         self.keys: set[str] = set()
         self.fail = True
+        self.pruned = 0
 
     async def is_processed(self, file_key: str) -> bool:
         return file_key in self.keys
@@ -305,7 +306,7 @@ class _FailingLedger:
         self.keys.add(file_key)
 
     async def prune(self) -> None:
-        return None
+        self.pruned += 1
 
 
 async def test_a_persistently_failing_leave_ledger_hands_each_file_over_once(
@@ -326,8 +327,25 @@ async def test_a_persistently_failing_leave_ledger_hands_each_file_over_once(
         await src._scan_once()
     assert len(rec.bodies) == 2, "each drop handed over exactly once in this process"
     assert ledger.keys == set()
+    assert ledger.pruned == 0, "a failed write is not counted as recorded, so it draws no prune"
     assert "processed-ledger write failed (OSError)" in caplog.text
     assert "CTL568" not in caplog.text, "no body in the log"
+
+
+async def test_a_malformed_ledger_key_still_escapes(tmp_path: Path) -> None:
+    """A FileKeyError is a programming error, not a store fault, so it is not swallowed."""
+    from messagefoundry.transports.base import FileKeyError
+
+    src = _source(tmp_path, after_read="leave")
+
+    class _Ledger(_FailingLedger):
+        async def mark_processed(self, file_key: str) -> None:
+            raise FileKeyError("synthetic")
+
+    src.processed_ledger = _Ledger()
+    with pytest.raises(FileKeyError):
+        await src._leave_record("fk1:" + "0" * 64)
+    assert "fk1:" + "0" * 64 not in src._processed_seen
 
 
 async def test_a_successful_leave_ledger_write_comes_before_the_cache(tmp_path: Path) -> None:

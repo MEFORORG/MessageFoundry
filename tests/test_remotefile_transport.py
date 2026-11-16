@@ -744,6 +744,7 @@ async def test_source_leave_failing_ledger_hands_each_file_over_once(
         await src._poll_once()
     assert sorted(h.bodies) == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"], "each handed over exactly once"
     assert len(ledger.keys) == 0
+    assert ledger.pruned == 0, "a failed write is not counted as recorded, so it draws no prune"
     assert "processed-ledger write failed (OSError)" in caplog.text
 
 

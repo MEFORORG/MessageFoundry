@@ -64,6 +64,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
+    FileKeyError,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
@@ -1505,8 +1506,9 @@ class FileSource(SourceConnector):
             # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
             # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
             with self._store_call():
-                await self._leave_record(file_key)
-            return _Step.RECORDED
+                recorded = await self._leave_record(file_key)
+            # Only a durable write counts as recorded, so a broken ledger does not draw a prune.
+            return _Step.RECORDED if recorded else _Step.CHARGED
         return _Step.CHARGED
 
     async def _quarantine(
@@ -1786,26 +1788,35 @@ class FileSource(SourceConnector):
             return True
         return False
 
-    async def _leave_record(self, file_key: str) -> None:
+    async def _leave_record(self, file_key: str) -> bool:
         """Mark a leave-in-place file ingested: the durable ledger (a HASHED key, no cleartext filename)
-        plus the bounded in-process cache. Idempotent on the store side. The ledger goes first, so a
-        crash between the two leaves no cached key ahead of a durable row (BACKLOG #5685, as the
-        remote source). A ledger write that fails is logged, without the key or the file name, and
-        the key is still cached: the file is then handed over at most once in this process, and the
+        plus the bounded in-process cache. Idempotent on the store side. Returns whether the durable
+        row was written. The ledger goes first, so a write that is cancelled leaves nothing cached
+        (BACKLOG #5685, as the remote source). A ledger write that fails is logged, without the key
+        or the file name, and the key is still cached, so a cached key does not always have a
+        durable row behind it: the file is then handed over at most once in this process, and the
         rest of the scan goes on, rather than the file being handed over again on every scan while
         the ledger stays broken. With no durable row, a restart or a cache eviction hands it over
-        once more, which at-least-once allows."""
-        if self.processed_ledger is not None:
-            try:
-                await self.processed_ledger.mark_processed(file_key)
-            except Exception as exc:  # noqa: BLE001 -- any store fault; the scan must go on
-                logger.warning(
-                    "file source %s: processed-ledger write failed (%s); the file is remembered "
-                    "for this process only",
-                    self.directory,
-                    type(exc).__name__,
-                )
+        once more, which at-least-once allows. A malformed key (``FileKeyError``) is a programming
+        error, not a store fault, and still escapes."""
+        if self.processed_ledger is None:
+            self._seen_add(file_key)
+            return False
+        try:
+            await self.processed_ledger.mark_processed(file_key)
+        except FileKeyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- any store fault; the scan must go on
+            logger.warning(
+                "file source %s: processed-ledger write failed (%s); the file is remembered for "
+                "this process only",
+                self.directory,
+                type(exc).__name__,
+            )
+            self._seen_add(file_key)
+            return False
         self._seen_add(file_key)
+        return True
 
     async def _emit(self, raw: bytes) -> bool:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO). Returns
