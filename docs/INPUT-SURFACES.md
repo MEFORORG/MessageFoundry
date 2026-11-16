@@ -161,10 +161,12 @@ registered today are at least these. Read the `register_source(...)` calls in
 engine, so treat it as untrusted. `_process_response_item` holds it to the size ceiling
 (`reingress_size_error`), then to at least checks 2 to 4 and 6 in the table above
 (`reingress_body_error`, BACKLOG #5616): check 2 on any text type, checks 3 and 4 on `hl7v2`, and
-check 6 on any type but `hl7v2`, binary included. Check 6 skips a reply that is empty or all white
+check 6 on any type but `hl7v2`. Among the binary types check 6 sniffs at least `dicom`; a
+`binary` or `text` reply passes it unchecked, because `_content_matches_declared` accepts both
+without a signature. Check 6 skips a reply that is empty or all white
 space. An `hl7v2` reply over the engine's default ceiling skips checks 2 to 4 and is left to check
-7, `Peek.parse`, which refuses it. Every `hl7v2` reply meets check 7, and a reply it admits then
-meets the document handle marker check the HL7 v2 row further down names. Check 1 does not run,
+7, `Peek.parse`, which refuses it. An `hl7v2` reply that passes those checks meets check 7, and a
+reply check 7 admits then meets the document handle marker check the HL7 v2 row further down names. Check 1 does not run,
 because the reply is already text, and check 8 does not run. A reply that fails is recorded with status `ERROR`.
 [ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 
