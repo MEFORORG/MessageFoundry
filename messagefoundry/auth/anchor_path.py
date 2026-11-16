@@ -393,25 +393,29 @@ def _verbatim_rest_is_plain(rest: str) -> bool:
     """Whether the text after a verbatim ``\\\\?\\`` or ``\\??\\`` prefix is already in the form
     the walk's normpath leaves it. Win32 hands a verbatim path to the kernel as written: it turns no
     ``/`` into a separator and collapses no ``.``, ``..`` or empty name, where the walk does all
-    three. One trailing separator is kept as written by both."""
+    three. One trailing separator is allowed, though normpath drops it: on a folder it names the
+    same object, and on a file the verbatim open fails."""
     names = rest.removesuffix("\\").split("\\")
     return "/" not in rest and all(name not in ("", ".", "..") for name in names)
 
 
 def _climbs_out_of_device(rest: str) -> bool:
-    """Whether a ``..`` in the text after a normalized device prefix (``\\\\.\\`` and any spelling
-    with a forward slash) climbs to or past its first name. Win32 collapses ``..`` against the
-    prefix itself, so ``\\\\.\\C:\\..\\UNC\\s\\x`` opens the share ``\\\\s\\x``, where the walk's
-    normpath stops at the drive and reads ``C:\\UNC\\s\\x``."""
+    """Whether a ``.`` or ``..`` in the text after a normalized device prefix (``\\\\.\\`` and any
+    spelling with a forward slash) reaches its first name or climbs past it. Win32 collapses
+    ``..`` against the prefix itself, so ``\\\\.\\C:\\..\\UNC\\s\\x`` opens the share
+    ``\\\\s\\x``, where the walk's normpath stops at the drive and reads ``C:\\UNC\\s\\x``. A final
+    ``.`` or ``..`` also drops the separator before it, so ``\\\\.\\C:\\x\\..`` opens the volume
+    device ``\\\\.\\C:``, where normpath reads the root folder ``C:\\``."""
     depth = 0
-    for name in rest.replace("/", "\\").split("\\"):
+    names = rest.replace("/", "\\").split("\\")
+    for name in names:
         if name == "..":
             depth -= 1
             if depth < 1:
                 return True
         elif name not in ("", "."):
             depth += 1
-    return False
+    return names[-1] in (".", "..") and depth <= 1
 
 
 def _strip_win_prefix(path: str) -> str | None:
@@ -423,10 +427,11 @@ def _strip_win_prefix(path: str) -> str | None:
     So does a device path whose text the walk would normalize into another object than Windows
     opens (vault BACKLOG #5515): a verbatim one (``\\\\?\\``, ``\\??\\``) holding a ``/`` or a
     ``.``, ``..`` or empty name (:func:`_verbatim_rest_is_plain`), and a normalized one whose
-    ``..`` climbs out of its first name (:func:`_climbs_out_of_device`). Neither is read as the
-    nearest plain path: which object the kernel reaches there is not emulated, so it is refused.
-    A device prefix written with a forward slash is returned as written, unless it climbs out;
-    :func:`windows_chain` names it a device path after its normpath."""
+    ``.`` or ``..`` reaches or climbs out of its first name (:func:`_climbs_out_of_device`).
+    Neither is read as the nearest plain path: which object the kernel reaches there is not
+    emulated, so it is refused. A device prefix written with a forward slash is returned as
+    written, unless it climbs out; :func:`windows_chain` names it a device path after its
+    normpath, except a volume GUID path, which it walks."""
     # A normalized device prefix: ``\\.\`` or ``\\?\`` in any mix of slashes, but not the verbatim
     # all-backslash ``\\?\``.
     head = path[:4]
@@ -606,9 +611,12 @@ def windows_chain(
         return [], WalkCause.plain(_DRIVE_RELATIVE)
     if not ntpath.isabs(full) and not full.startswith("\\\\"):
         # A working directory may itself carry a \\?\ prefix, which the loop below would refuse.
-        full = _strip_win_prefix(ntpath.join(cwd() if callable(cwd) else cwd, full))
-        if full is None:
+        # It is stripped before the join, not after: Win32 normalizes a relative name joined to
+        # it, so the joined text is not verbatim, and the verbatim check must not read it as such.
+        base = _strip_win_prefix(cwd() if callable(cwd) else cwd)
+        if base is None:
             return [], WalkCause.plain(_DEVICE_PATH)
+        full = ntpath.join(base, full)
     chain: list[tuple[str, str]] = []
     seen: set[str] = set()
 

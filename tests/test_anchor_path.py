@@ -50,7 +50,6 @@ from messagefoundry.auth.anchor_path import (
 from messagefoundry.auth.trust_anchors import AUDIT_ACTION, AnchorSpec, TrustAnchorError
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store import MessageStore
-from tests.test_odbc_path_walk_gaps import _probe
 from tests.test_trust_anchors import _block
 
 _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="reads a real NTFS DACL")
@@ -485,6 +484,19 @@ def test_a_prefixed_path_reads_as_its_plain_form() -> None:
     assert _win_chain_verdict({}, "\\\\.\\PhysicalDrive0").ok is None
 
 
+def _probe(links: dict[str, str] | None = None) -> ap.WinProbe:
+    """A probe where every name is a folder or a ``.pem`` file, except the ``links``."""
+    links = {k.lower(): v for k, v in (links or {}).items()}
+
+    def probe(p: str) -> tuple[str, str | None]:
+        key = p.lower()
+        if key in links:
+            return LINK, links[key]
+        return (FILE if key.endswith(".pem") else DIRECTORY), None
+
+    return probe
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -502,6 +514,11 @@ def test_a_prefixed_path_reads_as_its_plain_form() -> None:
         r"\\.\C:\certs\..\..\D:\ca.pem",
         "//?/Volume{0000}/../C:/certs/ca.pem",
         "//./C:/../UNC/files.test/share/ca.pem",
+        # A final `.` or `..` that lands on the first name opens the volume device \\.\C:, where
+        # normpath walked and cleared the root folder C:\.
+        r"\\.\C:\certs\..",
+        r"\\.\C:\.",
+        r"\\.\Volume{0000}\certs\..",
     ],
 )
 def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path: str) -> None:
@@ -518,14 +535,43 @@ def test_a_link_to_a_verbatim_path_normpath_would_change_is_not_walked() -> None
     assert cause is not None and cause.kind == "a link points at a path this check does not read"
 
 
+def test_a_subst_drive_onto_a_verbatim_path_normpath_would_change_is_not_walked() -> None:
+    """A ``subst`` target goes through the same check. Red as above: it walked C:\\other."""
+    _chain, cause = windows_chain(
+        r"S:\ca.pem",
+        r"C:\cwd",
+        _probe(),
+        drive_target=lambda drive: r"\??\C:\certs\..\other" if drive == "S:" else None,
+    )
+    assert cause is not None and cause.kind == "a drive stands for a path this check does not read"
+
+
+def test_a_config_link_to_a_verbatim_path_normpath_would_change_is_refused() -> None:
+    """The config-source link walk reads link targets through the same helper. Red as above."""
+    from messagefoundry.config.wiring import _windows_link_target
+
+    with pytest.raises(OSError, match="device path"):
+        _windows_link_target(r"\??\C:\real\..\other")
+    assert _windows_link_target(r"\??\C:\real") == r"C:\real"
+
+
+@pytest.mark.parametrize("anchor", [r".\certs\ca.pem", "certs/ca.pem", r"..\certs\ca.pem"])
+def test_a_relative_anchor_under_a_verbatim_working_directory_is_still_walked(anchor: str) -> None:
+    """Win32 normalizes a relative name joined to the working directory, so the join is not read
+    as a verbatim path. Red under: running the verbatim check over the joined text."""
+    _chain, cause = windows_chain(anchor, r"\\?\C:\svc", _probe())
+    assert cause is None
+
+
 @pytest.mark.parametrize(
     ("path", "anchor"),
     [
         (r"\\?\C:\certs\ca.pem", "C:\\certs\\ca.pem"),
-        ("\\\\?\\C:\\certs\\", "C:\\certs"),  # one trailing separator, kept as written by both
+        ("\\\\?\\C:\\certs\\", "C:\\certs"),  # one trailing separator
         (r"\\.\C:\certs\..\other\ca.pem", "C:\\other\\ca.pem"),  # `..` that stays under C:
         (r"\\.\C:/certs/ca.pem", "C:\\certs\\ca.pem"),  # Win32 turns `/` into `\` here
         ("//?/Volume{0000}/certs/./ca.pem", "\\\\?\\Volume{0000}\\certs\\ca.pem"),
+        (r"\\.\C:\certs\sub\..", "C:\\certs"),  # a final `..` that stays under C:
     ],
 )
 def test_a_device_path_windows_normalizes_the_same_way_is_still_walked(
