@@ -10262,7 +10262,8 @@ def security_loosenings(
     ``[alerts].webhook_tls_revocation_attested`` (BACKLOG #2193),
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
-    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
+    layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004),
+    ``[secret_rotation].allow_lost_audit_range_key`` (BACKLOG #4934), the two credential-reminder
     leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
     ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS

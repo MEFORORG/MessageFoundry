@@ -834,6 +834,29 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart. Nothing
   about the key or the store changes either way; only whether the engine agrees to start.
 
+### `[secret_rotation].allow_lost_audit_range_key = true` — the engine starts on a key change the audit chain cannot follow
+Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
+the next start may do.
+- **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
+  change. With it off, `serve` (and each `supervise` shard, and the supervisor before it records a
+  renewed API certificate) refuses to start when the store key differs from its stamp, or has none,
+  the chain has not been rolled to it, and the key the chain's current range is under is not
+  configured. With it on, that start goes ahead: its first audit row goes into that range under the
+  new key, never verifies there, and the chain breaks at that row. `audit-verify` reports the break,
+  and `rotate-key` cannot roll the chain afterwards.
+- **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
+  and every other start check. Rows before the break still verify. The setting changes nothing on a
+  start whose key is unchanged, whose chain has rolled, or whose range key is configured.
+- **When acceptable:** only when the key the chain's current range is under is truly lost, so no
+  `rotate-key` run can roll the chain anyway. If the key exists anywhere, put it back in
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key` until it exits 0 instead.
+- **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
+  the `audit-verify` output from before the start, and treat the break as a known event in any audit
+  review.
+- **Reversible:** the setting is, the break is not. The chain stays broken at that row, and turning
+  the setting back off makes the next start refuse again, because the chain's range is still under
+  the lost key.
+
 ### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
 Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A
 value below the shipped default (`30` and `14` days) is named too, as the sign-in limits are when looser

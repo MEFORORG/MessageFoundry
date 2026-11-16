@@ -770,10 +770,14 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    store with no keyed chain to ask, such as one whose audit rows open with no genesis row naming
    its key, so there a stamp proves only a changed key. On such a store, do not start `serve`
    between setting a new key and running `rotate-key`: that stamp stands however the run ends. On a
-   store with a keyed chain, do not start `serve` on the new key alone before a run's roll succeeds:
-   the chain's current range is then under a key it does not hold, so it keys new audit rows under
-   the new key, those rows never verify inside that range, and no later `rotate-key` can roll the
-   chain. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
+   store with a keyed chain, `serve` refuses to start on a changed key the chain has not rolled to
+   while the key the chain's current range is under is not configured (BACKLOG #4934): its first
+   audit row would go into that range under the new key, never verify there, and leave a chain no
+   later `rotate-key` can roll. Put that key back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run
+   `rotate-key` until it exits 0. `[secret_rotation].allow_lost_audit_range_key = true` starts
+   anyway, for a key that is truly lost; it is a named security loosening, and the chain breaks at
+   that start's first audit row. Other commands that open the store and write an audit row, such as
+   the `admin-*` commands, do not refuse, so do not run them in that state either. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
    verifies the whole chain first, so a chain whose rows do not verify, or whose rows open with no
    genesis row, refuses under every key, a new one included, and the record stays open. A newest
    range under a key that is not configured is not one of these, though `audit-verify` reports it

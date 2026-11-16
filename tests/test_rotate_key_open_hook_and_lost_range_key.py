@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -165,6 +167,31 @@ def test_the_refusal_needs_all_three_conditions(tmp_path: Path, case: str) -> No
         asyncio.run(_refusal(db, key_a))
 
 
+def test_a_stamp_naming_the_key_in_use_does_not_refuse(tmp_path: Path) -> None:
+    """The stamp arm alone: chain not rolled and its range key not configured, but the stamp
+    already names the key in use, so the start goes through. The other cases return before the
+    stamp is read."""
+    db, key_a, key_b = tmp_path / "s.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def stamp_key_b() -> None:
+        store = await _open(db, key_b)
+        try:
+            await store.upsert_secret_rotation_meta(
+                _DEK,
+                fingerprint=dek_fingerprint(_key_id(key_b)),
+                tracked_since=_OLD_DATE,
+                last_rotated=_OLD_DATE,
+            )
+            assert audit_chain_rolled(store) is False
+            assert audit_range_key_missing(store) is True
+        finally:
+            await store.close()
+
+    asyncio.run(stamp_key_b())
+    asyncio.run(_refusal(db, key_b))
+
+
 def test_the_override_starts_with_a_warning_and_is_a_named_loosening(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -260,6 +287,52 @@ def test_the_rows_after_a_refused_start_are_unchanged(tmp_path: Path) -> None:
     assert ROTATION_RECORD_ID not in rows
 
 
+@pytest.mark.parametrize("allow_lost", [False, True])
+def test_supervise_refuses_before_it_records_a_renewed_api_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_lost: bool
+) -> None:
+    """The supervisor writes an audit row for a renewed API pair before any shard starts, so it
+    takes the shards' refusal first, or a refused fleet would already have broken the chain. Under
+    the override it records the renewal, as the shards then start."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.api import tls
+    from messagefoundry.config.settings import ServiceSettings
+
+    db, key_a, key_b = tmp_path / "sup.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    recorded: list[object] = []
+
+    def renewed(*_args: object, replacements: list[object], **_kwargs: object) -> None:
+        replacements.append(object())
+
+    async def record(_store: object, replaced: list[object]) -> None:
+        recorded.extend(replaced)
+
+    monkeypatch.setattr(tls, "ensure_api_tls_material", renewed)
+    monkeypatch.setattr(tls, "record_generated_pair_replacements", record)
+    settings = ServiceSettings(
+        store=StoreSettings(path=str(db), encryption_key=key_b),
+        secret_rotation=SecretRotationSettings(allow_lost_audit_range_key=allow_lost),
+    )
+    before = _audit_rows(db)
+    if allow_lost:
+        cli._renew_api_tls_before_spawning(settings, str(db))
+        assert len(recorded) == 1
+        return
+    with pytest.raises(UnrolledStoreKeyRefused):
+        cli._renew_api_tls_before_spawning(settings, str(db))
+    assert recorded == []
+    assert _audit_rows(db) == before
+
+
+def _audit_rows(db: Path) -> int:
+    """The audit_log row count of a synthetic test store, read without opening it as a store."""
+    with closing(sqlite3.connect(db)) as conn:
+        (count,) = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    assert isinstance(count, int)
+    return count
+
+
 def _app_on_the_new_key_alone(tmp_path: Path, allow_lost: bool) -> Any:
     from messagefoundry.api import create_managed_app
     from messagefoundry.config.settings import EgressSettings
@@ -280,9 +353,12 @@ def _app_on_the_new_key_alone(tmp_path: Path, allow_lost: bool) -> Any:
 async def test_serve_refuses_a_start_on_the_new_key_alone(tmp_path: Path) -> None:
     """#4934 step 3, the wiring: the refusal aborts the serve lifespan."""
     app = await asyncio.to_thread(_app_on_the_new_key_alone, tmp_path, False)
+    before = _audit_rows(tmp_path / "serve.db")
     with pytest.raises(UnrolledStoreKeyRefused):
         async with app.router.lifespan_context(app):
             pass  # pragma: no cover -- startup must not reach here
+    # The point of the refusal: the refused start wrote no audit row into the unrolled range.
+    assert _audit_rows(tmp_path / "serve.db") == before
 
 
 async def test_serve_starts_on_the_new_key_alone_under_the_override(tmp_path: Path) -> None:

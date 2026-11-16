@@ -5238,7 +5238,13 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     from messagefoundry.config.anchor import anchored_store_path, resolve_project_root
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.pipeline.secret_rotation import refuse_unrolled_key_change
     from messagefoundry.store import open_store
+    from messagefoundry.store.store import (
+        SecretRotationMetaStore,
+        audit_chain_rolled,
+        audit_range_key_missing,
+    )
 
     cwd = Path.cwd()
     root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
@@ -5267,6 +5273,16 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
             keyless_chain_refusal=keyless_opt_out_refusal(shard_store, settings.security),
         )
         try:
+            # BACKLOG #4934: the audit row below is this store's first since the open, so it takes
+            # the shards' start refusal first, or a refused start would already have broken the chain.
+            if isinstance(store, SecretRotationMetaStore):
+                await refuse_unrolled_key_change(
+                    store,
+                    dek_key_id=store.cipher_info().active_key_id,
+                    audit_rolled=audit_chain_rolled(store),
+                    range_key_missing=audit_range_key_missing(store),
+                    allow_lost=settings.secret_rotation.allow_lost_audit_range_key,
+                )
             await record_generated_pair_replacements(store, replaced)
         finally:
             await store.close()
