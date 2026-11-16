@@ -152,6 +152,22 @@ async def _status(store: MessageStore, mid: str) -> str:
     return str(fetched["status"])
 
 
+async def _settled(store: MessageStore, mid: str) -> str:
+    """The message's status once the finalizer has decided it. The recorder notes a send before
+    its ``send`` returns, and the delivery worker's ``mark_done`` (which runs the finalizer) comes
+    after that, so a read straight after a wait on ``recorder.sent`` can still see ``routed``. The
+    status is returned rather than awaited for, so an assertion on it names the value it saw."""
+
+    async def decided() -> bool:
+        return await _status(store, mid) not in (
+            MessageStatus.RECEIVED.value,
+            MessageStatus.ROUTED.value,
+        )
+
+    await _until(decided)
+    return await _status(store, mid)
+
+
 async def _started(reg: Registry, store: MessageStore, recorder: _Recorder) -> RegistryRunner:
     runner = RegistryRunner(
         reg,
@@ -222,8 +238,8 @@ async def test_a_killed_worker_recovers_its_row_without_a_restart_in_fifo_order(
 
         await _until(both_sent)
         assert recorder.sent == ["KILL", "OK"]  # FIFO: the re-pended head first
-        assert await _status(store, killer) == MessageStatus.PROCESSED.value
-        assert await _status(store, after) == MessageStatus.PROCESSED.value
+        assert await _settled(store, killer) == MessageStatus.PROCESSED.value
+        assert await _settled(store, after) == MessageStatus.PROCESSED.value
         if stage in ("router", "transform"):
             assert kills == {stage: 1}
         if stage == "delivery-pace":
@@ -317,7 +333,7 @@ async def test_a_poison_row_is_dead_lettered_at_its_third_death_without_a_restar
             return "OK" in recorder.sent
 
         await _until(after_sent)
-        assert await _status(store, killer) == MessageStatus.ERROR.value
+        assert await _settled(store, killer) == MessageStatus.ERROR.value
         if stage == "router":
             # attempts stays 1: each re-pend undoes its claim's increment, as the fault arm's does.
             assert await _row(store, killer, Stage.INGRESS) == ("dead", 1, LIMIT)
@@ -326,7 +342,7 @@ async def test_a_poison_row_is_dead_lettered_at_its_third_death_without_a_restar
             assert await _row(store, killer, Stage.OUTBOUND) == ("dead", LIMIT, 0)
             assert recorder.attempts == ["KILL"] * LIMIT + ["OK"]
         assert recorder.sent == ["OK"]
-        assert await _status(store, after) == MessageStatus.PROCESSED.value
+        assert await _settled(store, after) == MessageStatus.PROCESSED.value
         await asyncio.sleep(0.2)  # a re-pend past the cap would re-claim it by now
         assert calls.count("KILL") == (LIMIT if stage == "router" else 1)
         assert recorder.attempts.count("KILL") == (LIMIT if stage == "delivery" else 0)
@@ -364,8 +380,8 @@ async def test_a_store_fault_during_the_re_pend_holds_the_lane_and_loses_nothing
         await _until(both_sent)
         assert recorder.sent == ["KILL", "OK"]
         assert len(calls) >= 3  # two failures, then the write that landed
-        assert await _status(store, killer) == MessageStatus.PROCESSED.value
-        assert await _status(store, after) == MessageStatus.PROCESSED.value
+        assert await _settled(store, killer) == MessageStatus.PROCESSED.value
+        assert await _settled(store, after) == MessageStatus.PROCESSED.value
     finally:
         await runner.stop()
 
@@ -487,7 +503,7 @@ async def test_a_repeated_death_no_row_is_charged_with_stops_re_pending_at_the_c
         await asyncio.sleep(0.2)  # a re-pend past the cap would re-claim KILL by now
         assert calls == ["KILL"] * LIMIT + ["OK"]
         assert (await _row(store, killer, Stage.INGRESS))[0] == "inflight"  # for the next start
-        assert await _status(store, after) == MessageStatus.PROCESSED.value
+        assert await _settled(store, after) == MessageStatus.PROCESSED.value
     finally:
         await runner.stop()
 
@@ -576,6 +592,11 @@ async def test_a_death_after_a_failed_send_does_not_mark_the_row_failed_twice(
         assert not kills  # the worker did die after the failed send
         assert len(marked) == 1  # one failed send, one mark_failed
         assert recorder.attempts == ["KILL", "KILL"]
+
+        async def marked_done() -> bool:  # mark_done runs after the send returns
+            return (await _row(store, mid, Stage.OUTBOUND))[0] != "inflight"
+
+        await _until(marked_done, timeout=5.0)
         status, attempts, _ = await _row(store, mid, Stage.OUTBOUND)
         assert (status, attempts) == ("done", 2)
     finally:
