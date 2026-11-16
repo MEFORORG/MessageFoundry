@@ -339,7 +339,9 @@ def _log_scrub_fault(exc: Exception) -> None:
 
 
 def _tee_line(
-    before: dict[str, object], after: dict[str, object], whole_detail: str = _FIELD_REDACTED
+    before: dict[str, object],
+    after: dict[str, object],
+    whole_detail: Callable[[], str] = lambda: _FIELD_REDACTED,
 ) -> str:
     """The line to log for a record whose fields the C0 scrub turned from ``before`` into
     ``after``. NO LESS THAN BEFORE, BY CONSTRUCTION (BACKLOG #3045): ``before`` is the record as
@@ -349,15 +351,20 @@ def _tee_line(
     its neighbours, so no check over a field alone can stand for it; an earlier version of this
     fix compared against one and shipped words the old line hid.
 
-    Each candidate is logged only if, on EVERY sink, every word what the handlers write for it
-    shows, counted and in both :func:`_line_words` readings, is one the same sink showed for the
-    old line, and what it writes parses as JSON wherever the old line's did (the parse floor,
-    review round-f23e89a6): the line with every scrubbed field, then
+    Each candidate is logged only if, on EVERY sink, every word the modelled reading of that sink
+    shows for it, counted and in both :func:`_line_words` readings, is one the same sink's reading
+    showed for the old line, and that reading parses as JSON wherever the old line's did (the
+    parse floor, review round-f23e89a6): the line with every scrubbed field, then
     the old line with each field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed
-    ``detail`` as ``whole_detail``, then the old line itself, which meets the bar trivially and
-    so ends the search. Each handler runs the whole chain again over the one shared record, so
-    the Nth sink writes what N passes leave (:func:`~messagefoundry.logging_setup.sink_readings`),
-    and the forwarder, the copy that leaves the box, is the last of up to three; a bar taken over
+    ``detail`` as what ``whole_detail`` returns, then the old line itself, which meets the bar
+    trivially and so ends the search. ``whole_detail`` is called only where the ``detail`` changed,
+    so an unchanged one costs none of its parses; :func:`emit_audit_tee` passes one that returns
+    the JSON string ``"[redacted]"`` where the old ``detail`` parsed, and otherwise ``[redacted]``
+    with the bound note of a ``detail`` longer than the window, which is not itself a JSON string.
+    A sink's reading is :func:`~messagefoundry.logging_setup.sink_readings`, a model, not the
+    formatter's output: each handler runs the whole installed filter chain again over the one
+    shared record, so the Nth reading is what N passes of those filters leave of the message, and
+    the forwarder, the copy that leaves the box, is the last of up to three; a bar taken over
     the first pass alone let a later sink show words main's same sink hid. The last candidate
     loses the C0 scrub for that record, and is reached only where hiding the changed fields
     whole still shows a word the old line hid elsewhere in it, and is logged once per process.
@@ -365,11 +372,12 @@ def _tee_line(
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
         return old_line
-    whole = {
-        k: v if after[k] == v else whole_detail if k == "detail" else _FIELD_REDACTED
-        for k, v in before.items()
-    }
     try:
+        # Only a changed detail calls whole_detail; a fault building it ships the old line.
+        whole = {
+            k: v if after[k] == v else whole_detail() if k == "detail" else _FIELD_REDACTED
+            for k, v in before.items()
+        }
         bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
         for candidate in (after,) if whole == after else (after, whole):
             line = json.dumps(candidate, ensure_ascii=False)
@@ -492,7 +500,10 @@ def emit_audit_tee(
     how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
     chain hid of the whole record as it was encoded before #3045, on each of up to three sinks,
     so on each sink it redacts no less than that line did there, and parses as JSON wherever that
-    line did. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
+    line did. Each sink there is a modelled reading, passes of the installed filter chain, not the
+    formatter's output. The whole-field ``detail`` that check can fall back to, and the parses
+    that build it, are built only for a ``detail`` the scrub changed.
+    ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
     through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
     ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
     HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no
@@ -525,7 +536,8 @@ def emit_audit_tee(
       anywhere in the scanned window, even in text past the 200 characters that would ship.
     * A field holding a control and longer than the handler chain's 64 KiB window does not, in
       practice, ship scrubbed. A ``detail`` is longer, encoded, than the window the per-field
-      check reads, so it ships whole as ``[redacted]``, with its bound note. Any other such field
+      check reads, so it ships whole as ``[redacted]`` with its bound note, which is not itself
+      a JSON string. Any other such field
       ships as the line before #3045 did, losing the scrub: that line was cut inside the field,
       so it hid every field after it, and hiding the field whole shows them. Its text beside a
       control can then pass, as before #3045.
@@ -602,10 +614,12 @@ def emit_audit_tee(
                     old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
                 )
             # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
-            whole_detail = (
-                _bounded_detail(_FIELD_REDACTED, note, old_detail) if detail else _FIELD_REDACTED
+            # Built lazily, so a record whose detail the scrub left alone never pays for it.
+            line = _tee_line(
+                record,
+                {**record, **scrubbed},
+                lambda: _bounded_detail(_FIELD_REDACTED, note, old_detail),
             )
-            line = _tee_line(record, {**record, **scrubbed}, whole_detail)
         except Exception as exc:  # noqa: BLE001 - a scrub fault ships the line before #3045
             _log_scrub_fault(exc)
             line = json.dumps(record, ensure_ascii=False)

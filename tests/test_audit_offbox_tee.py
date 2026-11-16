@@ -1038,13 +1038,34 @@ def test_a_fault_while_bounding_the_detail_ships_the_line_before_3045(monkeypatc
     assert scrubbed == _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=False)
 
 
+def test_a_detail_the_scrub_left_alone_never_builds_the_whole_field_detail(monkeypatch) -> None:
+    """Review of the PR 2864 repair: the whole-field ``detail`` cost two parses and a ``safe_text``
+    per audit row, even for a record the scrub left unchanged. It is built only where a changed
+    ``detail`` needs it. Synthetic values."""
+    calls: list[str] = []
+    real = audit_tee._bounded_detail
+
+    def counted(kept: str, note: str, old: str) -> str:
+        calls.append(kept)
+        return real(kept, note, old)
+
+    monkeypatch.setattr(audit_tee, "_bounded_detail", counted)
+    cases: list[dict[str, str | None]] = [
+        {"detail": "plain detail, no control"},
+        {"detail": json.dumps({"error": "plain"})},
+        {"actor": "\x01DOE JANE", "detail": "plain detail, no control"},
+    ]
+    _raw_tee_lines(cases, monkeypatch, scrub=True)
+    assert calls == []
+
+
 def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
     """Review of the PR 2864 repair: where the scrubbed line shows a word the old line hid,
     ``_tee_line`` hid a changed ``detail`` as bare ``[redacted]``, which is not the JSON a
     collector parsed before, and dropped any bound note. Synthetic values."""
     before: dict[str, object] = {"actor": "a", "detail": '{"e": "ok"}'}
     after: dict[str, object] = {"actor": "a", "detail": '{"e": "zebra"}'}
-    line = json.loads(audit_tee._tee_line(before, after, json.dumps("[redacted]")))
+    line = json.loads(audit_tee._tee_line(before, after, lambda: json.dumps("[redacted]")))
     assert json.loads(line["detail"]) == "[redacted]"
     note = " [redaction bound: dropped 9 more chars unscanned]"
     whole = audit_tee._bounded_detail("[redacted]", note, "[redacted]")
