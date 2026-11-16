@@ -347,16 +347,14 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     as set by a later line. Any other line, such as one of key material, belongs to the value
     above it, so a key whose value starts on the next line is not empty.
 
-    The first line's name is also kept with the whole rest of its string as its value, which is
-    what the whole-string reading sets. So ``KEY=`` above another variable's line, or a path-form
-    OIDC key above a line holding PEM armour, refuses as ``main`` refused it: under that reading
-    the key holds every line below it.
-
-    A first line with no equals sign sets nothing under the line reading. When it starts
-    ``MEFOR_VALUE_``, the whole-string reading sets one variable whose name starts with it and
-    holds a line break, and the engine loads that one. It is kept under the first line's name,
-    unless a later line sets a name :func:`_names` keeps, since both readings then describe the
-    same variable and it is counted once."""
+    Each string is also read whole, as ``main`` read it: the name before its first equals sign,
+    stripped, and everything after it as the value. That variable is kept when its name is one
+    the refusal is about. So ``KEY=`` above another variable's line, a path-form OIDC key above a
+    line holding PEM armour, a blank first line, or a line break before the equals sign refuses
+    as ``main`` refused it. Where that name still holds a line break, such as ``MEFOR_VALUE_A``
+    on a first line with no equals sign, the engine loads a variable whose name starts with it.
+    It is kept unless a later line sets a name :func:`_names` keeps, since both readings then
+    describe the same variable and it is counted once."""
     read: list[_Variable] = []
     for where, entry in entries:
         first, *rest_lines = _LINE_BREAK.split(entry)
@@ -388,22 +386,24 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             for number, written, value_parts in later
         ]
         if first_equals:
-            line_value = "\n".join(first_parts)
-            read.append(_Variable(where, first_written, line_value))
-            whole_value = entry.partition("=")[2]
-            if whole_value != line_value:
-                # The whole-string reading of the same name: every line after it is its value. A
-                # value empty on its own line but not in its string, or an inline key whose armour
-                # sits below another line's name, refuses under that reading, so it refuses here.
-                read.append(_Variable(where, first_written, whole_value))
-        elif (
-            first_written.upper().startswith(_VALUE_PREFIX)
-            and "=" in entry
-            and not _names(later_variables)
+            read.append(_Variable(where, first_written, "\n".join(first_parts)))
+        # The whole-string reading, exactly as ``main`` read every entry: the name is everything
+        # before the first equals sign, stripped, and the value everything after it. Kept when that
+        # name is one the refusal is about, so a blank first line, a line break before the equals
+        # sign, or a value empty on its own line but not in its string refuses as ``main`` refused
+        # it. A name that still holds a line break is counted once: only when no later line sets a
+        # name :func:`_names` keeps, since both readings then describe the same variable.
+        whole_written, whole_equals, whole_value = entry.partition("=")
+        whole_written = whole_written.strip()
+        broken = _LINE_BREAK.search(whole_written) is not None
+        if (
+            whole_equals
+            and _refused_name(whole_written.upper())
+            and not (broken and _names(later_variables))
         ):
-            # Counted once: only when no later line names a variable the refusal keeps. A later
-            # line whose value is empty, blank or a path is not one, so the broken name stands.
-            read.append(_Variable(where, first_written, entry.partition("=")[2], broken=True))
+            # A broken name is kept under its first line, as the line reading names it.
+            name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
+            read.append(_Variable(where, name, whole_value, broken=broken))
         read.extend(later_variables)
     return read
 

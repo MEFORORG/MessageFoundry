@@ -432,13 +432,17 @@ function Disable-RefusedService {
 
       ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
       DISPLAY name, so the service is found by Name and disabled as the object (-InputObject); a name
-      that matches no service exactly is reported as not disabled. The hand advice names sc.exe,
+      that matches no service exactly is reported as not disabled. A failed SCM read is
+      reported with its own message, not as a missing service. The hand advice names sc.exe,
       which opens a service by its name only.
     #>
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
     try {
-        $exact = @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
-            Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -notlike 'NoServiceFoundForGivenName,*') { throw }
+            $found = @()
+        }
+        $exact = $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
         if (-not $exact) { throw "no service is named exactly '$ServiceName'" }
         Set-Service -InputObject $exact -StartupType Disabled -ErrorAction Stop
         return "'$ServiceName' was set to Disabled so $Consequence."

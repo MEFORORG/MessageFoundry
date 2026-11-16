@@ -910,8 +910,13 @@ def test_the_helper_installer_checks_both_installed_copies(report: dict[str, Any
                 "nssm call, so the file the SCM starts as SYSTEM is not the file checked"
             )
     # A rejected copy is deleted, both binaries, and a failed deletion disables the registration.
+    # The call is named by its consequence: Disable-RefusedService's own Set-Service, inside the
+    # pinned block, is there whatever this path does.
     assert _at(commands, _named("Remove-Item", "$TargetExe", "$TargetNssm"))
-    assert _at(commands, _named("Set-Service", "Disabled"))
+    assert _at(
+        commands,
+        _named("Disable-RefusedService", "$ServiceName", "the registration cannot start them"),
+    ), "a copy that failed its check and could not be deleted leaves the registration able to start"
 
 
 def test_the_helper_installer_points_the_registration_before_the_start(

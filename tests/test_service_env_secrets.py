@@ -452,6 +452,23 @@ def test_a_first_name_whose_whole_string_holds_a_secret_refuses(entry: str) -> N
 @pytest.mark.parametrize(
     "entry",
     [
+        "\nMEFOR_STORE_ENCRYPTION_KEY=\nOTHER=1",
+        "MEFOR_STORE_ENCRYPTION_KEY\n=abc",
+        "MEFOR_STORE_PASSWORD\r\n==",
+        "\nMEFOR_VALUE_A\nX=1",
+        "\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem\nX=-----BEGIN x",
+    ],
+)
+def test_every_string_main_refused_whole_still_refuses(entry: str) -> None:
+    """``main`` read each string whole: the stripped name before the first equals sign, and the
+    rest. A blank first line, or a line break before the equals sign, still names a secret-class
+    variable under that reading, so the line reading must not let it through."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
         "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=",
         "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=   ",
         "MEFOR_VALUE_A\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem",

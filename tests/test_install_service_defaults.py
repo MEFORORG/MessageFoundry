@@ -678,6 +678,11 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
         "  $calls = [Collections.Generic.List[string]]::new()\n"
         "  $display = @{ W32Time = 'Windows Time' }\n"
         "  function Get-Service { param($Name, $ErrorAction)\n"
+        # As the cmdlet does, an unreadable SCM throws only under -ErrorAction Stop; any other
+        # preference returns nothing, which is what a silenced read looks like.
+        "    if ($Name -eq 'Unreadable') { if ($ErrorAction -ne 'Stop') { return }\n"
+        "      throw [System.Management.Automation.ErrorRecord]::new(\n"
+        "      [Exception]::new('RPC server unavailable'), 'RpcError', 'NotSpecified', $Name) }\n"
         "    @(@('Svc', 'Locked', 'W32Time') | Where-Object { $_ -eq $Name -or $display[$_] -eq $Name } |\n"
         "      ForEach-Object { [pscustomobject]@{ Name = $_ } }) }\n"
         "  function Set-Service { param($Name, $InputObject, $StartupType, $ErrorAction)\n"
@@ -690,6 +695,7 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
         "    failed = (Disable-RefusedService -ServiceName 'Locked' -Consequence 'it cannot start')\n"
         "    gone = (Disable-RefusedService -ServiceName 'Gone' -Consequence 'it cannot start')\n"
         "    display = (Disable-RefusedService -ServiceName 'Windows Time' -Consequence 'it cannot start')\n"
+        "    unread = (Disable-RefusedService -ServiceName 'Unreadable' -Consequence 'it cannot start')\n"
         "    calls = @($calls)\n"
         "  } | ConvertTo-Json -Compress\n"
     )
@@ -707,6 +713,10 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
     assert got["calls"] == ["Svc", "Locked"], (
         f"a service other than the exact name was disabled: {got['calls']}"
     )
+    # A failed SCM read keeps its own reason, rather than reading as a missing service.
+    assert got["unread"].startswith(
+        "WARNING: 'Unreadable' could NOT be set to Disabled (RPC server unavailable)"
+    ), got
     # The hand advice opens the service by its name only, never by a display name.
     assert 'sc.exe config "Gone" start= disabled' in got["gone"]
     assert "Set-Service -Name" not in got["gone"]
