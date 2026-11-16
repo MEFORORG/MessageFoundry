@@ -25,7 +25,6 @@ import {
   pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineTargetIsSet, engineUrl, environments, runJson, serviceConfig, workspaceDir } from "./cli";
-import { aiPolicyCliArgs } from "./cliJson";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
@@ -120,7 +119,12 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
   url: aiPolicyEngineUrl,
   readToken: peekToken,
   getPolicy: (url, route, token) => getJson<AiPolicyWire>(url, route, token),
-  getCliPolicy: () => runJson<AiPolicyWire>(aiPolicyCliArgs(serviceConfig()), workspaceDir()),
+  // Always names `messagefoundry.serviceConfig`, set or not (BACKLOG #5405). With no flag the CLI
+  // reads `./messagefoundry.toml` only if it exists and otherwise answers the built-in default,
+  // which can enable assistance; named, a missing or unreadable file is refused, and
+  // pickOfflinePolicy then fails closed to the unverified policy.
+  getCliPolicy: () =>
+    runJson<AiPolicyWire>(["ai-policy", "--service-config", serviceConfig()], workspaceDir()),
   targetConfigured: engineTargetIsSet,
 };
 
