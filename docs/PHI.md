@@ -117,7 +117,11 @@ error text, unwrapped, as every reason of a single decrypt's 400. That shape was
 either project's source at a commit, so a release that wraps or prefixes the text would turn such a
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
-`vault_transit` any failure to open one, an outage included, reads as a queue tag failure. Transit
+`vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure. An
+outage does not (BACKLOG #5765): a failure `gave_no_verdict` names, at least an unreachable Vault,
+a 5xx and a refused token, is no tag failure, and the claim sets the row aside for five seconds
+rather than dead-letter it (BACKLOG #5735). Such a row is retried with no cap and no alert of its
+own while the failure lasts. Transit
 gives the same AEAD refusal when the data key it is pointed at is not the one that sealed the cell,
 so a recreated key, or another Vault's key of the same name, would read as a moved cell for every
 such cell. An unmarked value refused in a message or saved-search cell is audited, and its alert is

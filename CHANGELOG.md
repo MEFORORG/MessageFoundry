@@ -46,17 +46,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
-- **A key-service outage during a claim no longer dead-letters the row or raises a false
-  integrity alert.** On a `vault_transit` store, a queue payload that could not be opened because
-  Vault gave no verdict (unreachable, a 5xx, a refused token) was read as the row failing its queue
-  tag: the claim dead-lettered a healthy message and wrote an `integrity_drift` alert and audit row.
-  Now that failure, and on SQLite a failed read of the store, puts the row back to `pending` five
-  seconds ahead, and in a FIFO claim every later row of its lane with it, so the lane never
-  delivers past it; the claim's other rows and lanes go on. A dead-letter write that fails sets the
-  row aside the same way, rather than leaving it `inflight` until a restart. On Vault Transit only
-  Vault's own authentication refusal of a value counts as a tag failure, as it already did for the
-  message cells, so a key-version policy refusal no longer raises a false alert either. A real tag
-  failure is dead-lettered and reported as before. (`BACKLOG #5765`, `BACKLOG #5735`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

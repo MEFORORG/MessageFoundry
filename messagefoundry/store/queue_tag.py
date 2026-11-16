@@ -222,20 +222,13 @@ def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | 
 def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
     """Whether ``exc``, raised opening the marked value ``stored``, says the cell failed its tag.
 
-    The rule :func:`~messagefoundry.store.cell_tag.open_tagged_cell` applies (BACKLOG #5765). An
-    outage says nothing about the cell. Under a cipher that holds the value's key, any failure is
-    the tag's. Vault Transit cannot name its keys, so :func:`is_tag_failure` counts every marked
-    value as held there; only its :class:`UnauthenticatedCipherError`, Vault's AEAD refusal of the
-    value itself, is a tag failure, and a key-version or policy refusal or a malformed reply keeps
-    the cipher's own error."""
-    if is_transient_open_failure(exc) or not is_tag_failure(cipher, stored):
-        return False
-    if callable(getattr(cipher, "holds_key_for", None)):
-        return True
-    return (
-        isinstance(exc, UnauthenticatedCipherError)
-        and getattr(cipher, "names_no_keys", False) is True
-    )
+    An outage says nothing about the cell (BACKLOG #5765), so a key service that gave no verdict is
+    never a tag failure. Otherwise :func:`is_tag_failure` decides, so under Vault Transit, which
+    cannot name its keys, every other refusal of a marked value still counts as one. That is
+    deliberately louder than :func:`~messagefoundry.store.cell_tag.open_tagged_cell`, which keeps a
+    non-AEAD Transit refusal as the cipher's own error: narrowing this control would rest on
+    matching Vault's error text, and that change is not this fix's to make."""
+    return not is_transient_open_failure(exc) and is_tag_failure(cipher, stored)
 
 
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
