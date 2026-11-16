@@ -134,7 +134,10 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "reschedule_claimed": (1, 0),
     "reset_stale_inflight": (1, 0),
     "reclaim_expired_leases": (1, 0),
-    "recover_inflight_on_promotion": (1, 0),
+    # --- The promotion recovery: fail-CLOSED, as a claim (BACKLOG #5759). It takes over OTHER
+    # owners' rows, so a stale node's write is declined; the successor and the sweep recover them.
+    # This departs from the letter of C1 pending an owner ruling; the method's docstring says so. ---
+    "recover_inflight_on_promotion": (1, 1),
     # --- TERMINAL resolves: fail-OPEN guarded, spliced via the _resolve_guard helper. ---
     "dead_letter_now": (1, 1),
     "mark_done": (1, 1),
@@ -196,7 +199,6 @@ _UNGUARDED_REASONS: dict[str, str] = {
     "reclaim_expired_leases": (
         "Owner-BLIND periodic recovery, by its own docstring. Bounded to already-expired row leases."
     ),
-    "recover_inflight_on_promotion": "Runs on the successor, at promotion, by definition un-fenced.",
     "dead_letter_missing_destinations": (
         "ADR 0157 D11: also writes over PENDING rows, where D1's re-pend fallback is meaningless. Runs"
         " only from _start_graph, and the successor re-runs the identical sweep. Flagged for the owner,"
@@ -287,6 +289,7 @@ def test_the_claim_guard_is_referenced_only_by_the_claim_paths() -> None:
         "claim_next_fifo",
         "claim_next_fifo_batch",
         "claim_fifo_heads",
+        "recover_inflight_on_promotion",
     }
     # The resolve guard is spliced through exactly one helper, so every terminal resolve inherits the
     # fail-open polarity from a single place and cannot drift site by site.

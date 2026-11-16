@@ -7846,17 +7846,39 @@ class PostgresStore:
         NOT re-pending it risks a row stranded ``inflight`` under a one-shot lease with no owner left to
         resolve it, which the count-and-log invariant forbids. This errs the way the invariant allows.
         The shipping SQL Server on-promotion ``reset_stale_inflight`` makes the same trade, less
-        precisely — it is owner-blind where this is owner-scoped. Returns the number of rows re-pended."""
+        precisely — it is owner-blind where this is owner-scoped. Returns the number of rows re-pended.
+
+        **Fenced on the held epoch, fail-closed, like a claim (BACKLOG #5759).** The caller's gate is
+        an in-memory leader check, so a node that stalls between that check and this write could land
+        it after a successor took the lease and claimed rows, and re-pend the successor's live rows:
+        to this node they are just another owner's. With an epoch armed the write carries
+        ``_EPOCH_GUARD_CLAIM``, so it matches nothing once the successor's acquire has bumped
+        ``leader_lease.leader_epoch``. ADR 0157 C1 says never to guard a write that returns a claimed
+        row to PENDING, and this guard departs from its letter; that departure awaits an owner ruling
+        and is not settled by this docstring. The reading it rests on: C1's reason is that a fenced
+        re-pend strands the row, and here it does not, since the successor runs this same recovery
+        on its own promotion and the lease-gated ``reclaim_expired_leases`` sweep re-pends whatever
+        a declined write leaves, so a declined recovery costs latency. A declined write returns 0,
+        as an empty recovery does. The guard is read in this statement's snapshot, so a
+        write already executing when the successor's acquire commits is not fenced; it closes the
+        stall before the write, which is the window the row names."""
         now = time.time() if now is None else now
+        args: list[object] = [
+            OutboxStatus.PENDING.value,
+            now,
+            OutboxStatus.INFLIGHT.value,
+            self._owner,
+        ]
+        epoch_guard = ""
+        if self._leader_epoch is not None:
+            epoch_guard = _EPOCH_GUARD_CLAIM.format(k=5, h=6)
+            args.extend([self._lease_key, self._leader_epoch])
         async with self._timed_acquire() as conn, conn.transaction():
             result = await conn.execute(
                 "UPDATE queue SET status=$1, owner=NULL, lease_expires_at=NULL,"
                 " next_attempt_at=$2, updated_at=$2"
-                " WHERE status=$3 AND owner IS DISTINCT FROM $4",
-                OutboxStatus.PENDING.value,
-                now,
-                OutboxStatus.INFLIGHT.value,
-                self._owner,
+                f" WHERE status=$3 AND owner IS DISTINCT FROM $4{epoch_guard}",
+                *args,
             )
         return _rowcount(result)
 

@@ -50,6 +50,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   another node held the lease while it was paused, now demotes and promotes again on both
   coordinators, so the engine tears its graph down and runs the promotion recovery instead of
   carrying on as leader. (`BACKLOG #5746`)
+- With a leader epoch armed, the Postgres on-promotion recovery now carries the claim's
+  fail-closed epoch guard, so a node that stalled between its leader check and the write no longer
+  re-pends a successor's live rows. A recovery statement already running when the successor's
+  acquire commits is not fenced. (`BACKLOG #5759`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

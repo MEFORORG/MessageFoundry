@@ -527,3 +527,32 @@ async def test_fenced_write_is_recovered_without_a_sweep(store) -> None:
         assert msg is not None and msg["status"] == MessageStatus.PROCESSED.value
     finally:
         await successor.close()
+
+
+async def test_a_stale_promotion_recovery_spares_the_successors_rows(store) -> None:
+    """BACKLOG #5759. A node that read itself leader at epoch 5 and stalled before its promotion
+    recovery wrote, while a successor took the lease at epoch 6 and claimed a row, must not re-pend
+    that row: to the stale node it is just another owner's. Before the fix the recovery carried no
+    epoch guard and re-pended it. The current leader's own recovery still lands."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    successor = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        await _seed_epoch(store, 6)
+        successor.set_leader_epoch(6, lease_key=_LEASE_KEY)
+        mid = await store.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+        )
+        assert await successor.claim_next_fifo("OB1", now=200.0) is not None
+
+        store.set_leader_epoch(5, lease_key=_LEASE_KEY)  # the stalled ex-leader's armed epoch
+        assert await store.recover_inflight_on_promotion(now=210.0) == 0
+        row = (await store.outbox_for(mid))[0]
+        assert row["status"] == OutboxStatus.INFLIGHT.value
+        assert row["owner"] == successor._owner
+
+        store.set_leader_epoch(6, lease_key=_LEASE_KEY)  # a current leader recovers as before
+        assert await store.recover_inflight_on_promotion(now=220.0) == 1
+    finally:
+        await successor.close()
