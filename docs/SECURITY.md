@@ -4173,8 +4173,8 @@ at least control 2's row and the `POST /ui/login` and `POST /ui/login/passkey` r
 Once the route runs and its same-origin and configured-authentication checks pass, it pops the
 challenge its handle cookie names, whatever the sign-in's outcome, before it consults the sign-in
 limiter. The POST is **paid** when that pop finds the challenge still staged and the begin leg's
-hit still in the window. That is decided from the staged challenge alone, by
-`take_passkey_challenge`, before the form is parsed or any account is read, so a POST whose handle
+hit still in the window. `take_passkey_challenge` decides that from the staged challenge and the
+limiter's own state alone, before the form is parsed or any account is read, so a POST whose handle
 cookie names such a challenge is paid with or without an assertion in the form, and whatever
 username it names. A paid POST passes control 2 without the limiter checking room in, or
 charging, either dimension, per address or global, for it, so it passes even while the limiter is
