@@ -11,13 +11,16 @@ its row survives. A single ``DELETE ... OUTPUT`` / ``RETURNING`` reports only wh
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
+from messagefoundry.store.store import MessageStore
 from tests.test_sqlserver_sync_handoff_offline import _acm
+from tests.test_transform_state import _route_one_handler
 
 _CUTOFF = 1_000.0
 
@@ -135,3 +138,36 @@ async def test_postgres_purge_state_keeps_a_key_refreshed_mid_purge() -> None:
     assert ("ns", "live") in store._state_cache
     assert ("ns", "stale") not in store._state_cache and ("ns", "stale") not in table.rows
     assert purged == 1
+
+
+async def test_sqlite_purge_state_reads_and_deletes_in_one_immediate_transaction(
+    tmp_path: Path,
+) -> None:
+    """SQLite: the SELECT that names the evicted keys and the DELETE share one ``BEGIN IMMEDIATE``
+    transaction, so another process cannot refresh a listed key between them. An idle pass takes
+    no write lock at all (the control)."""
+    store = await MessageStore.open(tmp_path / "state.db")
+    try:
+        mid, routed = await _route_one_handler(store)
+        await store.transform_handoff(
+            routed_id=routed,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[],
+            state_ops=[("ns", "old", "x")],
+            now=1_000.0,
+        )
+        traced: list[str] = []
+        await store._db.set_trace_callback(traced.append)
+        assert await store.purge_state(older_than=500.0) == 0  # control: nothing expired
+        assert not any(s.startswith("BEGIN") for s in traced)
+        assert await store.purge_state(older_than=1_500.0) == 1
+        off: Any = None  # sqlite3 clears the trace on None; aiosqlite's stub types only a callable
+        await store._db.set_trace_callback(off)
+        begin = traced.index("BEGIN IMMEDIATE")
+        select = next(i for i, s in enumerate(traced) if s.startswith("SELECT namespace, key"))
+        delete = next(i for i, s in enumerate(traced) if s.startswith("DELETE FROM state"))
+        assert begin < select < delete
+        assert ("ns", "old") not in store.state_view()
+    finally:
+        await store.close()

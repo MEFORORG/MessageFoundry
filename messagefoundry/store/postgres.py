@@ -10108,7 +10108,7 @@ class PostgresStore:
                 resealed += 1
                 # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
                 # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
-                # leaves no write uncharged (BACKLOG #5738).
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
                 await self._charge_bound_batch()
         return resealed, refused
 

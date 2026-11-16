@@ -15125,7 +15125,7 @@ class SqlServerStore:
                 resealed += 1
                 # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
                 # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
-                # leaves no write uncharged (BACKLOG #5738).
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
                 await self._charge_bound_batch()
         return resealed, refused
 
@@ -16619,19 +16619,25 @@ class SqlServerStore:
         """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
         ``MessageStore._write_session`` states the contract, ``owner`` included (BACKLOG #5742).
         Call it on ``cur`` inside an open transaction. The read takes ``UPDLOCK, ROWLOCK``, so the
-        compare on the seal is a second guard, not the only one. ``owner`` is checked after that
-        read, before the seal check; :meth:`_keep_or_end_session` probes the owner unlocked first,
-        so a foreign row is normally not locked at all. The write reports through ``OUTPUT``,
+        compare on the seal is a second guard, not the only one. ``owner`` filters that read;
+        :meth:`_keep_or_end_session` probes the owner unlocked first, so a foreign row normally
+        never reaches the ``UPDLOCK`` read at all. The write reports through ``OUTPUT``,
         which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
-        await cur.execute(
-            "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
-        )
+        if owner is None:
+            await cur.execute(
+                "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
+            )
+        else:
+            await cur.execute(
+                "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=? AND user_id=?",
+                (token_hash, owner),
+            )
         columns = [c[0] for c in cur.description]
         rows = await cur.fetchall()
         if not rows:
             return None
         current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
-        if current.revoked_at is not None or (owner is not None and current.user_id != owner):
+        if current.revoked_at is not None:
             return None
         await session_writer_seal_check(self._row_sealer, current)
         updated = await seal_session_async(self._row_sealer, change(current))
@@ -16914,10 +16920,13 @@ class SqlServerStore:
         first, without a lock hint, as :meth:`_write_session_txn` reads it, and a foreign row is
         neither seal-checked, re-sealed, nor locked under ``UPDLOCK`` outside the documented lock
         order. A row the probe does not see, such as one whose insert had not committed, still
-        meets the owner check in :meth:`_write_session` before its seal check."""
-        await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
-        owners = await cur.fetchall()
-        if owners and str(owners[0][0]) != restamp.user_id:
+        meets the owner filter on :meth:`_write_session`'s read before its seal check."""
+        # Compared in SQL, under the column's collation, as the sweep and the end compare it.
+        await cur.execute(
+            "SELECT 1 FROM sessions WHERE token_hash=? AND user_id<>?",
+            (token_hash, restamp.user_id),
+        )
+        if await cur.fetchall():
             return RevokeResult(revoked)
         if not outcome.tripped and restamp.kept(
             await write_kept_session(

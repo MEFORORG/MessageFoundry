@@ -435,7 +435,8 @@ async def _writer_txn(
     takes it at the first write, and a writer in another process that committed after the block's
     read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
     The ``asyncio`` lock already serializes this process, so only a block that must decide on a
-    read across processes needs it: the first-administrator grant.
+    read across processes needs it: at least the first-administrator grant, and ``purge_state``,
+    whose read names the keys it evicts (BACKLOG #5734).
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -19385,9 +19386,10 @@ class MessageStore:
             if written is not None:
                 resealed += 1
                 # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-                # 11.3.4), charged after each committed record so an interrupted pass leaves no write
-                # uncharged (BACKLOG #5738). Through the public checkpoint, which takes the writer
-                # lock the charge's commit needs and unwinds a failed add.
+                # 11.3.4), charged after each committed record, so an interrupted pass leaves at
+                # most the one record in flight to the reserve-ahead (BACKLOG #5738). Through the
+                # public checkpoint, which takes the writer lock its commit needs and unwinds a
+                # failed add.
                 await self.checkpoint_cipher_invocations()
         return resealed, refused
 
@@ -21881,9 +21883,15 @@ class MessageStore:
         ``set_at``); per-namespace policy is a documented follow-up. Returns the number of entries
         purged. Off by default — the RetentionRunner calls it only when ``state_max_age_days`` is set."""
         now = time.time() if now is None else now
+        # An idle pass stays a plain read: no write lock, no commit.
+        async with self._read() as db:
+            cur = await db.execute("SELECT 1 FROM state WHERE set_at < ? LIMIT 1", (older_than,))
+            if await cur.fetchone() is None:
+                return 0
         # BEGIN IMMEDIATE: the SELECT and the DELETE share one write transaction, so an engine shard
         # in another process cannot refresh a listed key between them; the cache would otherwise
-        # drop a key whose row survives (BACKLOG #5734). ``RETURNING`` needs SQLite 3.35.
+        # drop a key whose row survives (BACKLOG #5734). Not ``DELETE ... RETURNING``, which needs
+        # SQLite 3.35, newer than some system libraries a Linux Python links.
         async with _writer_txn(self._db, self._lock, immediate=True):
             cur = await self._db.execute(
                 "SELECT namespace, key FROM state WHERE set_at < ?", (older_than,)

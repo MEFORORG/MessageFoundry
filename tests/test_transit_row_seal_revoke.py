@@ -250,7 +250,7 @@ class _MssqlCur:
 
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         # The kept session's owner probe (BACKLOG #5742) reads no row here, so the write runs.
-        self._probe = sql.startswith("SELECT user_id FROM sessions")
+        self._probe = sql.startswith("SELECT 1 FROM sessions WHERE token_hash=? AND user_id<>?")
 
     async def fetchall(self) -> list[Any]:
         return [] if self._probe else [("x",)]
