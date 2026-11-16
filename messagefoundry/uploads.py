@@ -35,6 +35,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -567,6 +568,72 @@ def sanitize_filename(name: str | None) -> str:
     return base[:_MAX_FILENAME]
 
 
+class _MalformedSidecarError(ValueError):
+    """A sidecar that reached the JSON parse but is not metadata this store would have written
+    (BACKLOG #5387, #5388). Its message names only the defect, never a value from the sidecar."""
+
+
+def _sidecar_text(d: dict[str, Any], key: str, default: str) -> str:
+    value = d.get(key, default)
+    if not isinstance(value, str):
+        raise _MalformedSidecarError(f"field {key!r} is not a string")
+    return value
+
+
+def _sidecar_count(d: dict[str, Any], key: str) -> int:
+    value = d.get(key, 0)
+    # bool is an int subclass, and no field here is ever written as one.
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _MalformedSidecarError(f"field {key!r} is not a non-negative integer")
+    return value
+
+
+def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
+    """The metadata a decrypted sidecar holds, checked rather than trusted (BACKLOG #5387).
+
+    On a store that passes unmarked sidecars (keyless, ``vault_transit``, or
+    ``allow_unmarked_ciphertext``) the JSON is not bound to its path, so a planted one could name
+    another upload's ``file_id`` for the prune to delete, or carry a negative ``size`` that lifts a
+    quota. So the ``file_id`` must be the path's own id, each count a non-negative integer, the
+    timestamp a finite non-negative number and every text field a string, and the filename is
+    sanitized as :meth:`UploadStore.save` sanitizes it. Anything else, including JSON that does not
+    parse or nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388)."""
+    try:
+        d = json.loads(raw)
+    except (ValueError, RecursionError):
+        # ValueError covers JSONDecodeError and an integer past the digit limit.
+        raise _MalformedSidecarError("not valid JSON") from None
+    if not isinstance(d, dict):
+        raise _MalformedSidecarError("not a JSON object")
+    if d.get("file_id") != file_id:
+        raise _MalformedSidecarError("its file_id is not its own upload id")
+    uploaded_at = d.get("uploaded_at", 0.0)
+    if not isinstance(uploaded_at, (int, float)) or isinstance(uploaded_at, bool):
+        raise _MalformedSidecarError("field 'uploaded_at' is not a number")
+    try:
+        stamp = float(uploaded_at)
+    except OverflowError:
+        raise _MalformedSidecarError("field 'uploaded_at' is out of range") from None
+    if not math.isfinite(stamp) or stamp < 0:
+        raise _MalformedSidecarError("field 'uploaded_at' is not a finite non-negative number")
+    return UploadedFileMeta(
+        file_id=file_id,
+        filename=sanitize_filename(_sidecar_text(d, "filename", "upload")),
+        uploader=_sidecar_text(d, "uploader", ""),
+        # Tolerant, like every other optional field — a sidecar without the key yields "", which
+        # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
+        # into no operator's quota. That is the fail-closed end state, not a migration gap: there
+        # is deliberately no fallback to ``uploader`` here, because a name fallback would
+        # reintroduce exactly the recycled-username reachability this field exists to close.
+        uploader_id=_sidecar_text(d, "uploader_id", ""),
+        content_type=_sidecar_text(d, "content_type", "hl7v2"),
+        size=_sidecar_count(d, "size"),
+        sha256=_sidecar_text(d, "sha256", ""),
+        uploaded_at=stamp,
+        message_count=_sidecar_count(d, "message_count"),
+    )
+
+
 def content_type_for(filename: str) -> str:
     """Best-effort format tag from the filename extension (display + browse hint only)."""
     lower = filename.lower()
@@ -1013,23 +1080,7 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "meta", file_id),
             allow_unmarked=self._passes_unmarked,
         )
-        d = json.loads(raw)
-        return UploadedFileMeta(
-            file_id=str(d["file_id"]),
-            filename=str(d.get("filename", "upload")),
-            uploader=str(d.get("uploader", "")),
-            # Tolerant, like every other optional field — a sidecar without the key yields "", which
-            # matches NOBODY at the ownership check (api/app.py ``_may_access_upload``) and buckets
-            # into no operator's quota. That is the fail-closed end state, not a migration gap: there
-            # is deliberately no fallback to ``uploader`` here, because a name fallback would
-            # reintroduce exactly the recycled-username reachability this field exists to close.
-            uploader_id=str(d.get("uploader_id", "")),
-            content_type=str(d.get("content_type", "hl7v2")),
-            size=int(d.get("size", 0)),
-            sha256=str(d.get("sha256", "")),
-            uploaded_at=float(d.get("uploaded_at", 0.0)),
-            message_count=int(d.get("message_count", 0)),
-        )
+        return _meta_from_json(raw, file_id)
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
         """Every ``(file_id, sidecar path)`` pair in the uploads root, as :meth:`_walk_sidecars`
@@ -1104,8 +1155,9 @@ class UploadStore:
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. Each of those is cut from the
         stored text, so the cipher bounds what it echoes of one (BACKLOG #5553). The malformed-shape branch
-        logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
-        echo that field's value back into the message.
+        names only the field and the defect (:class:`_MalformedSidecarError`), or for any other
+        ``ValueError`` only its TYPE, because such an error can echo a field's value back into the
+        message.
 
         **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
         through the cipher's tag-failure hook, once per upload per hour
@@ -1156,6 +1208,11 @@ class UploadStore:
                 # the part the class check reads is still one rotate-key can never seal. An
                 # OSError is not, so a stalled read is not paid twice under _quota_lock.
                 classify = isinstance(exc, UnicodeDecodeError)
+            except _MalformedSidecarError as exc:
+                # Decrypted, but not metadata this store wrote, or not this upload's (BACKLOG
+                # #5387). Left out of the listing, the quota and the prune. The message names
+                # only the defect, never a value.
+                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, exc)
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
