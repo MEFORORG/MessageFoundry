@@ -349,11 +349,11 @@ async def test_a_lookup_pool_borrows_with_its_statement_timeout(
     assert pool_executor._shutdown
 
 
-async def test_a_driver_refusing_the_timeout_attribute_does_not_fail_the_borrow(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+async def test_a_driver_refusing_the_timeout_attribute_stops_the_lane(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
-    """pyodbc's setter hands the value to the driver, which may refuse it. The borrow goes on, with
-    a warning, rather than raising out of _acquire and leaking the connection."""
+    """pyodbc's setter hands the value to the driver, which may refuse it. The borrow fails closed
+    as a config_fault naming the setting, and the connection, which ran nothing, goes back."""
 
     class _RefusesTimeout(RawConn):
         @property
@@ -366,10 +366,19 @@ async def test_a_driver_refusing_the_timeout_attribute_does_not_fail_the_borrow(
                 raise _DriverError("HYC00", "[HYC00] optional feature not implemented")
 
     _aioodbc_serving(monkeypatch, rig, raw_type=_RefusesTimeout, blocks=never)
-    with caplog.at_level("WARNING", logger="messagefoundry.transports.database"):
+    with pytest.raises(NegativeAckError) as caught:
         await _destination().send('{"a": 1}')
-    assert "statement_timeout could not be applied" in caplog.text
-    assert rig.pools[0].free == [rig.conn]
+    assert caught.value.config_fault and "statement_timeout" in str(caught.value)
+    assert rig.pools[0].free == [rig.conn] and "execute:start" not in rig.log
+
+
+async def test_a_cursor_refusal_with_no_timeout_set_is_not_blamed_on_it(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    _aioodbc_serving(monkeypatch, rig, raw_type=_NoQueryTimeout, blocks=never)
+    with pytest.raises(DeliveryError) as caught:
+        await _with({"statement_timeout": 0}).send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError)
 
 
 def test_the_factories_declare_the_statement_timeout() -> None:

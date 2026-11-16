@@ -3430,7 +3430,7 @@ def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None
         return None
 
 
-def _apply_statement_timeout(pool: Any, conn: Any) -> None:
+async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
     pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
@@ -3438,22 +3438,38 @@ def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     with no call running on a connection just lent, as the SQL Server store sets
     ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
     connection attribute, so the write is skipped when the connection already holds the value: a
-    connection lent before, and ``0`` on a fresh one. Never raises: a connection the write cannot
-    reach, or whose driver refuses it, is logged and used with no limit, since refusing it would
-    fail every borrow and leak the connection this was handed."""
+    connection lent before, and ``0`` on a fresh one.
+
+    **A driver that refuses the value fails the borrow closed.** The connection goes back to
+    ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
+    so the lane stops rather than running with a bound the operator believes is set. A
+    connection with no driver handle to write to is left to the call gate, which refuses it, and
+    a driver connection with no ``timeout`` at all, not pyodbc's shape, is logged and used as is."""
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
-    if seconds is None:
+    raw = getattr(conn, "_conn", None)
+    if seconds is None or raw is None:
+        return
+    current = getattr(raw, "timeout", None)
+    if current is None:
+        logger.warning(
+            "DATABASE: a pooled connection has no driver timeout to set, so its statements run "
+            "with no statement_timeout"
+        )
         return
     try:
-        raw = conn._conn
-        if raw.timeout != seconds:
+        if current != seconds:
             raw.timeout = seconds
-    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; logged, never raised
-        logger.warning(
-            "DATABASE: the statement_timeout could not be applied to a pooled connection, so a "
-            "statement on it runs with no time limit: %s",
-            type(exc).__name__,
-        )
+    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
+        await _return_to_pool(pool, conn)
+        state = _log_sqlstate(exc)
+        raise NegativeAckError(
+            "database driver refused statement_timeout"
+            + (f" [{state}]" if state else f" ({type(exc).__name__})")
+            + "; set statement_timeout = 0 on this connection if it cannot take one",
+            code=state or "db",
+            permanent=True,
+            config_fault=True,
+        ) from exc
 
 
 def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
@@ -3492,7 +3508,7 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    _apply_statement_timeout(pool, conn)
+    await _apply_statement_timeout(pool, conn)
     return conn
 
 
@@ -3932,7 +3948,7 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
 _QUERY_TIMEOUT_REFUSED_STATES = frozenset({"HYC00", "HY092"})
 
 
-def _cursor_refused(exc: Exception) -> DeliveryError | None:
+def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
     """The classified error for a ``conn.cursor()`` that raised ``exc``, or ``None`` when ``exc``
     is no driver error, which the caller re-raises unchanged (BACKLOG #5749).
 
@@ -3944,7 +3960,8 @@ def _cursor_refused(exc: Exception) -> DeliveryError | None:
     state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE, as _connect reads it
     if state is None:
         return None
-    if state in _QUERY_TIMEOUT_REFUSED_STATES:
+    seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    if state in _QUERY_TIMEOUT_REFUSED_STATES and seconds:
         return NegativeAckError(
             f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
             "timeout, set statement_timeout = 0 on this connection",
@@ -3971,7 +3988,9 @@ async def _probe_db(
         try:
             cur = await conn.cursor()
         except Exception as exc:
-            refused = _cursor_refused(exc)  # classified as send() classifies it (BACKLOG #5749)
+            refused = _cursor_refused(
+                exc, pool
+            )  # classified as send() classifies it (BACKLOG #5749)
             if refused is None:
                 raise
             discard = True
@@ -4177,7 +4196,7 @@ class DatabaseDestination(DestinationConnector):
             try:
                 cur = await conn.cursor()
             except Exception as exc:
-                refused = _cursor_refused(exc)
+                refused = _cursor_refused(exc, pool)
                 if refused is None:
                     raise  # not a DB driver error, so an internal/code error, as below
                 discard = (
@@ -5344,8 +5363,8 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
     the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
     cancellation is let through.
 
-    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
-    lookup's own statement, it runs until the driver returns."""
+    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is bounded by the
+    pool's ``statement_timeout`` where it set one, as a lookup's pool does (BACKLOG #5756)."""
     reading = await _read_login_roles(pool, acquire_timeout)
     _log_login_role_reading(reading, label)
     return reading

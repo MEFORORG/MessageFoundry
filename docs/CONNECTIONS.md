@@ -4712,12 +4712,16 @@ Facts that are easy to get wrong, stated plainly first:
   BACKLOG #5756). Every borrow applies it as pyodbc's connection `timeout`, the ODBC query timeout
   of each statement, the way the store applies `[store].command_timeout`. A statement that runs
   past it fails with `HYT00`, a **transient** error: a send or poll retries, while a `db_lookup`,
-  which is single-shot, raises into its Handler. It also bounds how long a connection stop or
-  reload waits for an in-flight statement. It is not known to bound a `COMMIT`, a call on the
-  connection rather than a statement. On a driver that does not support the ODBC query timeout,
-  pyodbc refuses the cursor while it is set; the connector reads `HYC00` or `HY092` there as a
-  configuration fault that names `statement_timeout`, and such a connection needs `0`. Both are
-  readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
+  which is single-shot, raises into its Handler. A `mark_statement` that times out leaves its row
+  unmarked, so the row re-emits, a duplicate, on the next poll; a mark that can wait on a lock
+  longer than this needs a larger value. It also bounds how long a connection stop or reload
+  waits for an in-flight statement. It is not known to bound a `COMMIT`, a call on the connection
+  rather than a statement. A driver that refuses the value when a borrow sets it fails that
+  borrow as a configuration fault that names `statement_timeout`. A driver that takes it on the
+  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
+  connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
+  mark or lookup at least reports it as an ordinary failure. Such a connection needs `0`. Both
+  refusals are readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
   sets **no** statement timeout. The connector also exposes `connect_timeout` (default 15 s, a
   **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects), `pool_max`
   and `acquire_timeout`; there is no `timeout_seconds`. Each DATABASE pool runs aioodbc's driver
