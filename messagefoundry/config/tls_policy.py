@@ -301,7 +301,7 @@ def harden_crl_check(
     record_held_copy: bool = True,
     chain: bool = False,
 ) -> None:
-    """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+    """Load a CRL onto a *verifying* ``ctx`` and turn on revocation checking (BACKLOG #1005).
 
     With ``chain``, revocation is checked for every certificate in the peer's chain, not only the
     leaf (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627), so a revoked intermediate CA refuses
@@ -312,8 +312,9 @@ def harden_crl_check(
     A single-tier CA, whose own CRL covers its leaves, behaves as without it.
 
     The listeners that require a client certificate pass it: the API listener (#5627) and, since
-    vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. Each pins
-    its client CA, so the CAs the start rule reads are the operator's. Every other hop keeps the
+    vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. On each,
+    the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
+    store. Every other hop keeps the
     leaf check, at least the outbound hops under ``[tls].crl_file``: one may verify against the
     OS trust store, whose roots no CRL file names, so the start rule would refuse it.
 
@@ -473,13 +474,18 @@ def harden_crl_check(
                 "Check that the engine's account can write to its temporary directory, and that "
                 "there is room for the file"
             ) from exc
-    # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
-    _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
+    # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged. On a
+    # whole-chain hop the own-CRL rule (vault BACKLOG #5627, #5511) refuses a file that would
+    # refuse every client under a loaded CA. It goes in the reload's order: after a proven bad
+    # signature, before the warning that the file is loaded (messagefoundry.pki.own_crl_reason).
+    _check_crl_signatures(
+        pem,
+        anchors,
+        label=label,
+        crl_file=crl_file,
+        refusal=own_crl_reason(anchors, pem) if chain else None,
+    )
     if chain:
-        # Vault BACKLOG #5627, #5511: a loaded CA with no CRL of its own would refuse every client
-        # under it at the handshake, so say so at start (messagefoundry.pki.own_crl_reason).
-        if (why := own_crl_reason(anchors, pem)) is not None:
-            raise ValueError(f"{label}: {why}")
         ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN  # carries the leaf bit too
     else:
         ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
@@ -598,7 +604,12 @@ _UNCONFIRMED_SHOWN = 3
 
 
 def _check_crl_signatures(
-    pem: bytes, anchors: Sequence[bytes], *, label: str, crl_file: str
+    pem: bytes,
+    anchors: Sequence[bytes],
+    *,
+    label: str,
+    crl_file: str,
+    refusal: str | None = None,
 ) -> None:
     """Check the signature of each CRL in the judged bytes ``pem`` against ``anchors``, the hop's
     own CA list as DER (vault BACKLOG #2905, owner ruling 2026-10-05).
@@ -635,7 +646,10 @@ def _check_crl_signatures(
     context build measured at about 9 ms.
 
     There is no setting that turns this off and none that widens it, as for the expired-CRL
-    refusal in :func:`judge_crl_bytes`."""
+    refusal in :func:`judge_crl_bytes`.
+
+    ``refusal``, where given, is raised after a proven bad signature and before the warning, so a
+    start the caller refuses never first logs that the file is loaded (vault BACKLOG #5511)."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
         PROVEN_BAD_SIGNATURE,
@@ -672,6 +686,8 @@ def _check_crl_signatures(
             f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
             "signed, or remove this CRL if a good one from that issuer is already in the file"
         )
+    if refusal is not None:
+        raise ValueError(f"{label}: {refusal}")
     unconfirmed = [signature for signature in judged if signature.state != "verified"]
     finding = tuple(signature.state for signature in judged)
     if not unconfirmed or not first_unconfirmed_signature(crl_file, fingerprint, finding):

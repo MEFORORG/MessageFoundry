@@ -14,6 +14,8 @@ minted there. No PHI.
 
 from __future__ import annotations
 
+import gc
+import logging
 import ssl
 from collections.abc import Callable
 from pathlib import Path
@@ -21,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.pipeline import crl_reload
 from messagefoundry.transports.dicom import _server_ssl_context
 from messagefoundry.transports.mllp import _mllp_ssl_context
 from tests import test_api_tls_client_trust as _api_suite
@@ -84,18 +87,45 @@ def test_the_chain_check_admits_a_client_whose_chain_nobody_revoked(
 @_LISTENERS
 @pytest.mark.usefixtures("clean_anchor_checks")
 def test_a_loaded_client_ca_with_no_crl_of_its_own_refuses_the_build(
-    build: _Builder, two_tier: _TwoTier, tmp_path: Path
+    build: _Builder, two_tier: _TwoTier, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A site that supplies only the issuing intermediate's CRL is refused at start, naming the
-    root, rather than built to refuse every client at the handshake. The control is the same CA
-    file with the root's CRL added, which builds and admits the client."""
+    root, rather than built to refuse every client at the handshake. The refusal is not preceded
+    by the signature warning that says the file is loaded. The control is the same CA file with
+    the root's CRL added, which builds and admits the client."""
     crl = tmp_path / "inter-crl-only.pem"
     crl.write_bytes(two_tier.inter_crl_file.read_bytes())
-    with pytest.raises(
-        ValueError,
-        match=r"inbound connection 'IB_PARTNER_\w+' tls_crl_file .*'CN=Client Root'.* have no CRL "
-        "of their own",
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"),
+        pytest.raises(
+            ValueError,
+            match=r"inbound connection 'IB_PARTNER_\w+' tls_crl_file .*'CN=Client Root'.* have no "
+            "CRL of their own",
+        ),
     ):
         _listener(build, two_tier, crl)
+    assert "The file is loaded" not in caplog.text
     crl.write_bytes(two_tier.revokes_nothing.read_bytes())
     _handshake(_client(two_tier), _listener(build, two_tier, crl))
+
+
+@_LISTENERS
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_reload_refuses_a_file_that_leaves_a_loaded_client_ca_without_its_own_crl(
+    build: _Builder, two_tier: _TwoTier, tmp_path: Path
+) -> None:
+    """The running-hop reload applies the start's own-CRL rule to these listeners too, since it
+    keys on the chain flag the listener's context now carries. Replacing the file with the
+    intermediate's CRL alone is a file to fix, and the hop keeps the copy it holds."""
+    crl = tmp_path / "client-crl.pem"
+    crl.write_bytes(two_tier.revokes_nothing.read_bytes())
+    ctx = _listener(build, two_tier, crl)
+    crl.write_bytes(two_tier.inter_crl_file.read_bytes())
+
+    gc.collect()
+    (outcome,) = [o for o in crl_reload.reload_replaced_crls() if Path(o.path) == crl.resolve()]
+
+    assert outcome.refusal is not None and outcome.refusal.remedy == crl_reload.FIX
+    assert "have no CRL of their own" in outcome.refusal.reason
+    assert outcome.reloaded == 0
+    _handshake(_client(two_tier), ctx)  # the copy it holds still admits the client

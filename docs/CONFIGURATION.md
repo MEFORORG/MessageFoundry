@@ -2473,9 +2473,8 @@ these cases after that WARNING (the paragraph after this list says which). At le
 **`[api].tls_client_crl_file` refuses more at start (vault BACKLOG #5627).** That hop checks the
 whole client chain, so each CA loaded from `[api].tls_client_ca_file` needs a CRL of its own in
 the file; that setting's row says what counts. An inbound connection's `tls_crl_file` on an MLLP,
-HTTP or DICOM listener does the same against its `tls_ca_file` (vault BACKLOG #5511), so all that
-this paragraph says of the API hop holds there too. So on that hop at least the second bullet's case
-refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
+HTTP or DICOM listener does the same against its `tls_ca_file` (vault BACKLOG #5511). So on each of
+those hops at least the second bullet's case refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
 SHA-1 CRL with no key identifier among them. The SHA-1 trade-off above does not arise there for
 such a CRL, since it never loads. A CRL of the first bullet's kind can refuse too, at least where
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
