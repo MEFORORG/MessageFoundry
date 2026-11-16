@@ -172,6 +172,24 @@ def test_the_decoded_sniff_reads_a_bounded_head(monkeypatch: pytest.MonkeyPatch)
     assert not file_mod._content_matches_encoded(ContentType.HL7V2, far, "utf-16-le")
 
 
+def test_the_decoded_sniff_gives_utf16_the_utf8_verdict() -> None:
+    """The decoded head is spelled as UTF-8 again, so the sniff strips the same leading noise from
+    it as from a UTF-8 file: a form feed before MSH is refused on both encodings."""
+    from messagefoundry.transports import file as file_mod
+
+    text = "\x0c" + _HL7
+    assert not file_mod._content_matches_encoded(ContentType.HL7V2, text.encode("utf-8"), "utf-8")
+    assert not file_mod._content_matches_encoded(ContentType.HL7V2, text.encode("utf-16"), "utf-16")
+
+
+def test_a_lone_surrogate_in_the_decoded_head_never_raises() -> None:
+    """utf-7 decodes ``+2AA-`` to a lone surrogate, which a strict UTF-8 encode refuses; the sniff
+    must answer no match rather than raise out of the scan."""
+    from messagefoundry.transports import file as file_mod
+
+    assert not file_mod._content_matches_encoded(ContentType.HL7V2, b"+2AA-MSH|", "utf-7")
+
+
 async def test_an_ascii_encoding_admits_only_what_the_raw_sniff_admits(tmp_path: Path) -> None:
     """A form feed before MSH fails the raw HL7 sniff. The decoded head would strip it, so on a
     utf-8 inbound the decoded sniff must not run and the drop stays quarantined as before."""
@@ -232,7 +250,9 @@ def test_an_unnormalised_archive_subdir_is_normalised(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows path forms")
-@pytest.mark.parametrize("value", ["\\", "/", "\\Users", "C:", "arch.", "arch ", "a./b"])
+@pytest.mark.parametrize(
+    "value", ["\\", "/", "\\Users", "C:", "Z:", "Z:arch", "arch.", "arch ", "a./b"]
+)
 def test_windows_root_drive_and_trailing_dot_values_are_refused(tmp_path: Path, value: str) -> None:
     """A root-relative or drive-relative value is not absolute on Windows and names the drive root,
     an ancestor or the watch directory; a trailing dot or space is stripped by Win32 at creation, so

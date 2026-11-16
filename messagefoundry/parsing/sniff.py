@@ -82,8 +82,9 @@ _TEXT_SNIFF_HEAD_CHARS = 8
 def text_sniff_head(text: str) -> bytes:
     """UTF-8 head bytes of an already-DECODED body, to hand to :func:`_content_matches_declared`.
 
-    The file sources sniff a file's original bytes because they have no declared encoding to decode
-    with. A network listener does: it decodes with the connection's ``encoding`` before anything else,
+    The file sources sniff a file's original bytes first, and a head decoded with their declared
+    encoding only when that fails on an encoding that does not read as ASCII
+    (``transports/file.py``, ``_content_matches_encoded``). A network listener decodes first: it decodes with the connection's ``encoding`` before anything else,
     so sniffing its ORIGINAL bytes would quarantine a legitimate ``encoding="utf-16"`` JSON body, which
     leads with the two BOM bytes and then ``{`` interleaved with NULs, never a bare ``{``. Sniffing the
     decoded head instead makes the check encoding-independent, and identical to the byte sniff for every

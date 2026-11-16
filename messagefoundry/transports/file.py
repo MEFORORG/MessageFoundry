@@ -54,7 +54,6 @@ from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 from messagefoundry.parsing.sniff import (
     _content_matches_declared,
     _looks_like_hl7,
-    text_sniff_head,
 )
 from messagefoundry.parsing.split import one_message_bytes, split_batch
 from messagefoundry.redaction import safe_exc, safe_name
@@ -91,7 +90,7 @@ __all__ = [
     "DEFAULT_MAX_FILE_BYTES",
     "DEFAULT_MAX_ITEMS_PER_POLL",
     "LEAVE_SEEN_CACHE_MAX",
-    # Re-exported from parsing.sniff (ASVS 5.2.2) so remotefile.py + existing tests import them here.
+    # Re-exported from parsing.sniff (ASVS 5.2.2) so existing tests import them here.
     "_content_matches_declared",
     "_looks_like_hl7",
     "DEFAULT_MAX_DECOMPRESSED_BYTES",
@@ -798,23 +797,26 @@ _SNIFF_PROBE = " \t\r\n\x0b\x0cMSHFBISA{[<"
 
 
 def _decoded_sniff_head(raw: bytes, encoding: str) -> bytes:
-    """The head of ``raw`` decoded with ``encoding``, as :func:`text_sniff_head` hands it to the
-    content sniff (BACKLOG #5684).
+    """The head of ``raw`` decoded with ``encoding`` and spelled again as UTF-8, for the content
+    sniff (BACKLOG #5684).
 
     The runner decodes a file source's bytes with its configured ``encoding``, so the sniff must
     read them the same way: a UTF-16 or UTF-32 drop leads with a BOM and NUL-interleaved
     characters, never a bare ``MSH`` or ``{``, and a raw-byte sniff would quarantine every such
     file. Only the first ``_SNIFF_DECODE_MAX`` bytes are decoded, in one ``bytes.decode`` as the
-    runner decodes, so a large file is not decoded whole here; a character cut at that edge, or an
-    undecodable byte, becomes U+FFFD, which no magic matches. A codec that refuses the bytes or the
-    error handler outright yields an empty head, which matches nothing either."""
+    runner decodes, so a large file is not decoded whole here. The text goes back to the sniff as
+    UTF-8 bytes, so the sniff strips exactly the leading noise it strips from a UTF-8 file (a
+    decoded BOM is a UTF-8 BOM again), and the same text gets the same verdict on either encoding.
+    A character cut at the edge, an undecodable byte or a lone surrogate becomes a replacement,
+    which no magic matches. A codec that refuses the bytes or the error handler outright yields an
+    empty head, which matches nothing either."""
     try:
         text = raw[:_SNIFF_DECODE_MAX].decode(encoding, errors="replace")
     except (LookupError, UnicodeError):
         # No such codec (config load refuses one), or one that refuses the bytes or the error
         # handler: nothing decodes, so nothing matches.
         return b""
-    return text_sniff_head(text)
+    return text.encode("utf-8", errors="replace")
 
 
 @functools.cache
@@ -849,7 +851,8 @@ def _archive_subdir(directory: Path, value: object, knob: str) -> Path:
     lexically. A value that names the watch directory itself or one above it puts that directory
     among every drop's parents, so every drop would be skipped and none counted: at least ``""``,
     ``"."``, ``".."``, ``"a/.."``, ``"../in"`` for a watch directory named ``in``, an absolute path
-    to either, and on Windows a root-relative ``"\\"`` or a drive-relative ``"C:"``. An unnormalised
+    to either, and on Windows a root-relative ``"\\"``. A drive-relative value (``"C:"``) is refused
+    on Windows too, because it names whatever that drive's current directory is. An unnormalised
     value (``"x/../a"``) would never compare equal to a listed parent, so files moved there would
     be listed and ingested again on every recursive scan; on Windows a name ending in a dot or a
     space does the same, because Win32 strips that end when it creates the directory, so it is
@@ -861,6 +864,12 @@ def _archive_subdir(directory: Path, value: object, knob: str) -> Path:
         raise ValueError(f"file source {knob} must name a directory (value withheld)")
     if sys.platform == "win32":
         sub = Path(value)
+        if sub.drive and not sub.root:
+            # Drive-relative ("C:", "C:arch"): it resolves against that drive's current directory,
+            # which depends on the process, so it names no fixed directory.
+            raise ValueError(
+                f"file source {knob} must not be drive-relative on Windows (value withheld)"
+            )
         for part in sub.parts[1:] if sub.anchor else sub.parts:
             if part not in (os.curdir, os.pardir) and part != part.rstrip(". "):
                 raise ValueError(
