@@ -2158,7 +2158,7 @@ def test_a_marker_unreadable_at_the_teardown_is_not_taken_as_unrecorded(tmp_path
     assert dr_backup._records_another_reason(item, "restored-store") is False
     assert dr_backup._records_another_reason(item, "rollback-failed") is True
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(dr_backup, "_read_spare_reason", lambda marker: "")
+        mp.setattr(dr_backup, "_read_spare_marker", lambda marker: None)
         assert dr_backup._records_another_reason(item, "rollback-failed") is False
 
 
@@ -2449,6 +2449,107 @@ def test_a_withholding_retried_under_the_lock_decides_the_refusal(
     assert "which no sweep removes" in refusal, refusal
     (leftover,) = dest.parent.glob("mefor-restore-*")
     assert not (leftover / ".lock-held").exists()
+    shutil.rmtree(leftover)
+
+
+def _rollback_failed_relabel_refused(
+    tmp_path: Path, key_b64: str, capsys: Any, unreadable: Callable[[bool, bool], bool]
+) -> tuple[str, Path, list[str]]:
+    """Run a restore whose rollback cannot remove --to and whose relabel to `rollback-failed`
+    does not land, with every spare-marker read returning "cannot be read" wherever
+    ``unreadable(in_release, unlocked)`` says so. Returns the refusal line, the leftover and the
+    ERROR messages."""
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    state = {"in_release": False, "unlocked": False}
+    real_read = dr_backup._read_spare_marker
+    real_release = dr_backup._Staging.release
+    real_unlock = dr_backup._unlock_and_close
+
+    def read(marker: Path) -> str | None:
+        if unreadable(state["in_release"], state["unlocked"]):
+            return None
+        return real_read(marker)
+
+    def release(self: Any, **kwargs: Any) -> str | None:
+        state["in_release"] = True
+        try:
+            return real_release(self, **kwargs)
+        finally:
+            state["in_release"] = False
+
+    def unlock(fd: int) -> None:
+        if state["in_release"]:
+            state["unlocked"] = True
+        real_unlock(fd)
+
+    errors = _ErrorRecords()
+    with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
+        _hold(
+            mp, lambda p: _is_staged_store(p) or (p.name, p.parent.name) == ("msg.db", "restored")
+        )
+        _refuse_marker_reason(mp, "rollback-failed")
+        mp.setattr(dr_backup, "_read_spare_marker", read)
+        mp.setattr(dr_backup._Staging, "release", release)
+        mp.setattr(dr_backup, "_unlock_and_close", unlock)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    (refusal,) = [line for line in _refusal(capsys).splitlines() if line.startswith("error:")]
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    return refusal, leftover, errors.messages
+
+
+def test_a_teardown_never_rereads_and_remarks_what_the_release_withheld(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The release finds the spare unrecorded and withholds the directory under the lock. Every
+    # marker read after the unlock then fails, as under a scanner without read sharing. The
+    # teardown used to read the spare again, take it as recorded, and re-mark the directory,
+    # undoing the withholding while the refusal promised no sweep.
+    refusal, leftover, _ = _rollback_failed_relabel_refused(
+        tmp_path, key_b64, capsys, lambda in_release, unlocked: unlocked
+    )
+    assert not (leftover / ".lock-held").exists(), "the teardown re-marked a withheld directory"
+    assert "which no sweep removes" in refusal, refusal
+    shutil.rmtree(leftover)
+
+
+def test_a_withholding_made_after_the_lock_dropped_promises_no_outcome(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The release cannot read the marker while it holds the lock, so it withholds nothing; the
+    # teardown's later read finds the spare unrecorded and withholds after the unlock, when a
+    # sweep can have taken the directory first. The refusal must say a sweep can still remove it,
+    # never that none will.
+    refusal, leftover, _ = _rollback_failed_relabel_refused(
+        tmp_path, key_b64, capsys, lambda in_release, unlocked: in_release and not unlocked
+    )
+    assert "which no sweep removes" not in refusal, refusal
+    assert "which a sweep can still remove" in refusal, refusal
+    shutil.rmtree(leftover)
+
+
+def test_a_release_whose_spare_check_raises_still_unlocks_and_tears_down(
+    tmp_path, key_b64, capsys
+) -> None:
+    def fails(path: Path, spared: object) -> object:
+        raise RuntimeError("synthetic failure checking the spares")
+
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    errors = _ErrorRecords()
+    with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
+        _hold(mp, _is_staged_store)
+        mp.setattr(dr_backup, "_spare_records", fails)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    assert "restore failed (cleanup)" in _refusal(capsys)
+    assert any("could not check its spares" in m for m in errors.messages), errors.messages
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    # The teardown ran: the archive was emptied and the directory re-marked for the next sweep.
+    assert (leftover / "archive.tar").stat().st_size == 0
+    assert (leftover / ".lock-held").exists()
     shutil.rmtree(leftover)
 
 
