@@ -45,20 +45,23 @@ class SaturationSignal:
 class SaturationDetector:
     """A bounded per-lane depth-sample history that fires when the backlog is RISING SUSTAINED.
 
-    ``sustain_samples`` is how many consecutive non-decreasing steps (with a net rise end-to-end) must
-    be observed before :meth:`observe` returns a :class:`SaturationSignal`. The history is capped at
+    ``sustain_samples`` is how many consecutive rising steps must be observed before :meth:`observe`
+    returns a :class:`SaturationSignal`. The history is capped at
     ``sustain_samples + 1`` samples (constant memory), so an old spike ages out of the window and a
     lane that has since drained stops firing on its own.
 
     The decision (evaluated over the full window once it is primed):
 
-    * **net rise** — the newest depth is strictly greater than the oldest in the window (``dN > d0``),
-      i.e. arrivals exceeded departures over the window (ingest > drain); and
-    * **sustained** — no step in the window *decreased* (every ``d[i+1] >= d[i]``). A single drop means
-      the worker drained at some point in the window, so the growth is a burst being cleared, not
-      saturation — and it does **not** fire.
+    * **sustained rise** — every step in the window rose (every ``d[i+1] > d[i]``), so arrivals
+      exceeded departures at every step (ingest > drain), not only end to end. A single drop means the
+      worker drained at some point in the window, so the growth is a burst being cleared, not
+      saturation — and it does **not** fire. A flat step means nothing arrived beyond what drained,
+      so it does not fire either (BACKLOG #5768): a primed idle lane taking one message, or one
+      tick's burst, is ``[0, 0, 0, 1]``, which rises end to end and is not saturating.
+    * **a measurable span** — the window's newest timestamp is after its oldest. A wall clock that
+      stepped back or stood still gives no rate to report, so the window does not fire.
 
-    A flat window (``dN == d0``) or a window with any decrease returns ``None``.
+    A window with any flat or falling step, or a non-positive span, returns ``None``.
     """
 
     __slots__ = ("_sustain", "_samples")
@@ -78,15 +81,16 @@ class SaturationDetector:
             return None  # window not yet primed — need sustain_samples + 1 observations
         window = list(self._samples)
         depths = [d for _, d in window]
-        if depths[-1] <= depths[0]:
-            return None  # no net rise across the window → not becoming overloaded
         for prev, cur in zip(depths, depths[1:]):  # noqa: B905
-            if cur < prev:
+            if cur <= prev:
                 # A decrease anywhere in the window = the lane drained during it. That is a
-                # bursty-but-DRAINING lane, not saturation — do not fire (the key property).
+                # bursty-but-DRAINING lane, not saturation — do not fire (the key property). A flat
+                # step is no growth either (BACKLOG #5768).
                 return None
         span = window[-1][0] - window[0][0]
-        growth = (depths[-1] - depths[0]) / span if span > 0 else 0.0
+        if span <= 0:
+            return None  # the clock stepped back or stood still: no rate to report
+        growth = (depths[-1] - depths[0]) / span
         return SaturationSignal(
             depth=depths[-1],
             depth_start=depths[0],

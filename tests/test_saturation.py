@@ -90,3 +90,33 @@ def test_reset_clears_history() -> None:
 def test_sustain_samples_floor() -> None:
     with pytest.raises(ValueError):
         SaturationDetector(sustain_samples=1)  # fewer than 2 can't tell a burst from growth
+
+
+# --- BACKLOG #5768: a flat step is not a rise, and a window with no time span has no rate ----------
+
+
+@pytest.mark.parametrize(
+    "depths",
+    [
+        [0, 0, 0, 1],  # a primed idle lane takes one message
+        [0, 0, 5, 5],  # one tick's burst, then nothing more arrives
+        [0, 5, 5, 10],  # a flat step mid-window
+        [3, 4, 5, 5],  # rises, then stops rising
+    ],
+)
+def test_a_window_with_a_flat_step_does_not_fire(depths: list[int]) -> None:
+    assert _feed(SaturationDetector(sustain_samples=3), depths) is None
+
+
+def test_the_flat_step_ages_out_and_sustained_rise_then_fires() -> None:
+    det = SaturationDetector(sustain_samples=2)  # keeps 3 samples
+    assert _feed(det, [0, 0, 1]) is None
+    sig = det.observe(3.0, 2)  # window [0, 1, 2]: every step rose
+    assert sig is not None and sig.depth_start == 0 and sig.depth == 2
+
+
+@pytest.mark.parametrize("stamps", [[5.0, 5.0, 5.0], [5.0, 4.0, 3.0]], ids=["still", "back"])
+def test_a_window_with_no_forward_time_span_does_not_fire(stamps: list[float]) -> None:
+    det = SaturationDetector(sustain_samples=2)
+    results = [det.observe(ts, depth) for ts, depth in zip(stamps, [1, 2, 3], strict=True)]
+    assert results[-1] is None

@@ -2038,7 +2038,9 @@ async def test_saturation_realert_throttle_fires_suppresses_then_refires(
     monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
 
     # sustain_samples=3 needs 4 samples to prime; the 4th (rising end-to-end) is the first page.
+    # The clock moves between samples: a window with no time span has no rate (BACKLOG #5768).
     for _ in range(4):
+        clock[0] += 1.0
         await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
     assert len(sink.saturations) == 1
 
