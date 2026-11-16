@@ -270,7 +270,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At least these. At ingress, both shared handlers refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses, and a segment that the message structure for the type in MSH-9 has no place for. Two kinds of misplaced segment are not refused, only listed in `unvalidated_segments`: a Z-segment, and, in a structure with HL7's any-segment slot, such as `MFN_M01`, a segment the message's version defines. On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
+| HL7 v2 | At least these. At ingress, both shared handlers and the Loopback re-ingress refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses. What else strict validation holds the segments to, and what it lets through, segment order and Z-segments among them, is stated in [HL7-VALIDATION.md](HL7-VALIDATION.md). On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`, called by both handlers and `RegistryRunner._peek_for_loopback`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
@@ -323,8 +323,9 @@ It does hold them to a structure when it loads them. The rules live in
   helper, loaded only when a sibling imports it. A helper that has the name of a module already
   there is refused: a standard-library module, an installed module, or one the process has already
   imported (`_refuse_shadowing_helper`).
-- Before any module runs, `_assert_safe_config_source` refuses a configuration directory, or a
-  file in it, that it reads as writable by another account. A dev and test escape,
+- Before any module runs, `_assert_safe_config_source` refuses at least a configuration directory,
+  or a file in it, that it reads as writable by another account, and on Windows one whose owner or
+  access list it cannot read. A dev and test escape,
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same
   environment, turns the refusal into a warning; under `enforce` the escape does nothing.
   [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2) states what the check reads and
@@ -463,12 +464,12 @@ unauthenticated reads, `GET /health` and `GET /ui`.
 
 **The tee relay** (`python -m tee`) is a standalone application, not part of the engine.
 `_build_parser` in [`tee/__main__.py`](../tee/__main__.py) defines its subcommands, and `--help`
-prints them. The parser itself checks at least two forms, and a value that fails either is a usage
-error. `_parse_endpoint` needs a colon in each `host:port` option and a port from 1 to 65535 after
-the last one; it does not check the host. `_parse_age` holds each age option to `Nd`, `Nh`, `Nm` or
-a `YYYY-MM-DD` date. Other options are checked only when the command runs, or not at all: at least
-`run --log-level` takes any text and falls back to `INFO`. [TEE-RELAY.md](TEE-RELAY.md) describes
-the relay.
+prints them. The parser holds at least two kinds of option to a form of the relay's own.
+`_parse_endpoint` needs a colon in each `host:port` option and a port from 1 to 65535 after the
+last one; it does not check the host. `_parse_age` holds each age option to a count of days, hours
+or minutes, such as `7d`, or to a date. Other options are held to a type or a list of choices by
+the parser, or to no form at all: at least `run --log-level` takes any text.
+[TEE-RELAY.md](TEE-RELAY.md) describes the relay.
 
 **The network helper** (`mefor-net-helper.exe`, Windows only) takes one request per connection on
 its named pipe, a single line of JSON, and reads `mefor-net-helper.conf` at start.
