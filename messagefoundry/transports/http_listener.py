@@ -2198,7 +2198,25 @@ class HttpSource(SourceConnector):
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
         # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
         # the handler refuses it.
-        receipt = await self._handler(request.body)
+        try:
+            receipt = await self._handler(request.body)
+        except Exception as exc:
+            # BACKLOG #5680, the HTTP twin of the MLLP listener's #1619 arm: a fault inside the
+            # inbound handler, such as a store outage at the ingress commit, is an engine-side
+            # failure. Left to `_on_client`, an OSError (TimeoutError included) read as `peer_reset`
+            # with no log line and no answer, and anything else as `framing_error`. Nothing is
+            # accepted here, so a 500 is the honest answer and the sender's retry is the recovery.
+            # Returns True: the failure emitted its own kind, so the outer `closed` is suppressed.
+            reason = safe_exc(exc)
+            logger.error(
+                "HTTP source %s: a request failed in the inbound handler: %s (peer=%s)",
+                self._log_name,
+                reason,
+                peer_host or "unknown",
+            )
+            await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
+            await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
+            return True
         # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
         # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
         # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer

@@ -323,6 +323,48 @@ async def test_an_empty_body_under_an_unusable_codec_name_is_not_a_configuration
         assert str(rows[0]["error"]).startswith(error_prefix), rows[0]["error"]
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(OSError("store volume went away"), id="oserror"),
+        pytest.param(TimeoutError("ingress commit timed out"), id="timeouterror"),
+        pytest.param(RuntimeError("unexpected handler fault"), id="other"),
+    ],
+)
+async def test_a_handler_fault_is_handler_error_with_a_500_and_a_log_line(
+    fault: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5680: a fault inside the inbound handler is engine-side. It must be recorded as
+    ``handler_error`` with an ERROR line and answered 500, never read as the peer's ``peer_reset``
+    (an OSError, TimeoutError included) or ``framing_error`` (anything else)."""
+    from messagefoundry.transports.receipt import receipt_handler
+
+    @receipt_handler
+    async def failing(body: bytes) -> object:
+        raise fault
+
+    ic = build_inbound_connection("IB_HTTP", Http(port=0), router="r")
+    cfg = _source_config(ic, "127.0.0.1", {})
+    cfg.settings["port"] = 0
+    source = build_source(cfg, egress=EgressSettings(deny_by_default=False))
+    assert isinstance(source, HttpSource)
+    events: list[tuple] = []
+
+    async def sink(kind: str, peer_host: str | None, reason: str | None) -> None:
+        events.append((kind, peer_host, reason))
+
+    source.on_connection_event = sink
+    await source.start(failing)
+    try:
+        with caplog.at_level(logging.ERROR, logger=http_mod.__name__):
+            resp = await _http(source.sockport, body=b"payload")
+    finally:
+        await source.stop()
+    assert resp.status == 500
+    assert [e[0] for e in events] == ["established", "handler_error"]
+    assert any("inbound handler" in r.getMessage() for r in caplog.records)
+
+
 async def test_post_ingress_failure_does_not_change_http_status(store: MessageStore) -> None:
     """AC-3: the 202 is returned at ingress, BEFORE any routing/transform runs — no worker is draining
     here, so a downstream failure (which would happen later) cannot retroactively change the status."""
