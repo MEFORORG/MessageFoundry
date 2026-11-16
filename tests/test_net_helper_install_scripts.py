@@ -59,6 +59,16 @@ def _psq(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+#: The scripts the harness parses and whose service-name parameters it binds.
+_SCRIPTS = (
+    "install-net-helper.ps1",
+    "uninstall-net-helper.ps1",
+    "install-service.ps1",
+    "uninstall-service.ps1",
+)
+_SCRIPTS_PS = ", ".join(_psq(name) for name in _SCRIPTS)
+
+
 # ONE pwsh PROCESS FOR THE WHOLE FILE. This test imports the engine, so tests/tooling_manifest.txt
 # correctly leaves it off the path-gated tooling tier and it runs on every engine leg of every code
 # PR. Measured on this box: three spawns cost 1.16s of a 1.83s file, and ci.yml records a ~2.4x
@@ -76,7 +86,7 @@ $report = @{{}}
 
 # ParseFile parses; it never runs the file.
 $parse = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1', 'uninstall-service.ps1')) {{
+foreach ($name in @({_SCRIPTS_PS})) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $errs = $null
   $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
@@ -88,7 +98,7 @@ $report['parse'] = $parse
 # ACTUALLY binds. The two are asked separately on purpose -- matching text is not a matching
 # decision, and `param(...)` is the only thing that can answer the second question.
 $names = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1', 'uninstall-service.ps1')) {{
+foreach ($name in @({_SCRIPTS_PS})) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
   foreach ($p in $ast.ParamBlock.Parameters) {{
@@ -315,15 +325,7 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
         )
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "install-net-helper.ps1",
-        "uninstall-net-helper.ps1",
-        "install-service.ps1",
-        "uninstall-service.ps1",
-    ],
-)
+@pytest.mark.parametrize("name", _SCRIPTS)
 def test_the_script_parses(ast_report: dict[str, object], name: str) -> None:
     # No CI leg runs these scripts, so a syntax error would first show up on an operator's node
     # mid-install. Parsing is not running: ParseFile never executes the file.
