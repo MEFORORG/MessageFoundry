@@ -2884,6 +2884,20 @@ def _login_timeout(s: Mapping[str, Any], label: str) -> int:
 #: The largest ``statement_timeout`` pyodbc's ``Connection.timeout`` takes on every platform.
 _MAX_STATEMENT_TIMEOUT = 2**31 - 1
 
+#: The generic driver families (:data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`)
+#: an unset ``statement_timeout`` defaults to 30 on, because the driver is known to take pyodbc's
+#: ``Connection.timeout`` setter, which writes ``SQL_ATTR_CONNECTION_TIMEOUT`` (BACKLOG #5756).
+#:
+#: * ``msodbc``, Microsoft's ODBC Driver for SQL Server: the SQL Server store sets
+#:   ``[store].command_timeout`` through the same setter on the same driver
+#:   (``store/sqlserver.py``, ``SqlServerStore._statement_timeout``). That is a reading of this
+#:   repository's code, not a measurement of the driver.
+#:
+#: Not listed, so they default to ``0``: ``psqlodbc``, whose source is reported to refuse the
+#: attribute (``HYC00``), and ``mysql``, for which nothing here shows either way. A family is
+#: added only with evidence that its driver takes the setter.
+_TIMEOUT_DEFAULT_FAMILIES = frozenset({"msodbc"})
+
 
 def _statement_timeout(s: Mapping[str, Any], label: str) -> int:
     """A DATABASE connection's ``statement_timeout`` setting, in whole seconds, ``0`` for no limit
@@ -2895,17 +2909,19 @@ def _statement_timeout(s: Mapping[str, Any], label: str) -> int:
     connection after it. A statement that runs past it fails with ``HYT00``, a transient error, so a
     hung statement no longer holds its connection, its lane, its poll or a stop without bound.
 
-    **Unset, the default depends on the dialect.** The SQL Server preset defaults to
-    :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT`: Microsoft's ODBC driver
-    takes the setter, which the SQL Server store already uses for ``[store].command_timeout``.
-    The generic dialect defaults to ``0``, no limit, so a default generic connection sets nothing
-    and behaves as before: a driver it reaches may refuse the connection attribute pyodbc's
-    setter writes, as psqlODBC is reported to. A value the operator sets is applied on either
-    dialect, and a driver that refuses it stops the lane (:func:`_apply_statement_timeout`)."""
+    **Unset, the default depends on the driver.** It is
+    :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT` on the SQL Server preset
+    and on a generic connection whose ``odbc_driver`` is in :data:`_TIMEOUT_DEFAULT_FAMILIES`,
+    Microsoft's, and ``0``, no limit, on every other generic connection, psqlODBC and MySQL
+    among them. A value the operator sets is applied whatever the
+    driver, and a driver that refuses it fails the borrow as a ``config_fault``
+    (:func:`_apply_statement_timeout`)."""
     value = s.get("statement_timeout")
     if value is None:
-        generic = str(s.get("dialect", "sqlserver")).lower() == "generic"
-        return 0 if generic else DEFAULT_DB_STATEMENT_TIMEOUT
+        if str(s.get("dialect", "sqlserver")).lower() != "generic":
+            return DEFAULT_DB_STATEMENT_TIMEOUT
+        family = generic_driver_family(s.get("odbc_driver"))
+        return DEFAULT_DB_STATEMENT_TIMEOUT if family in _TIMEOUT_DEFAULT_FAMILIES else 0
     return whole_seconds(
         value,
         f"{label} statement_timeout must be a whole number of seconds, 0 for no limit, at most "
@@ -3472,12 +3488,18 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     try:
         current = getattr(raw, "timeout", None)
     except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
+        if not _raised_by_a_driver(exc):
+            # A bug is not misread as a transport failure: the connection goes back, since no
+            # call ran on it, and the exception propagates unchanged, as _cursor_refused's does.
+            await _return_to_pool(pool, conn)
+            raise
         await _close_and_release(pool, conn, None, discard=True)
         raise DeliveryError(
             f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
         ) from exc
     if current is None:
-        _warn_no_driver_timeout(pool)
+        if seconds:  # a pool that asked for no limit loses nothing here
+            _warn_no_driver_timeout(pool)
         return
     if current == seconds:
         return

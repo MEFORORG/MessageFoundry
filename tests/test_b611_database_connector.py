@@ -398,18 +398,41 @@ def test_the_factories_declare_the_statement_timeout() -> None:
     [
         ({}, DEFAULT_DB_STATEMENT_TIMEOUT),
         ({"statement_timeout": None}, DEFAULT_DB_STATEMENT_TIMEOUT),
+        ({"dialect": "sqlserver", "odbc_driver": "PostgreSQL Unicode"}, 30),
+        ({"dialect": "generic", "odbc_driver": "ODBC Driver 18 for SQL Server"}, 30),
+        ({"dialect": "Generic", "odbc_driver": " odbc driver 17 for sql server "}, 30),
+        ({"dialect": "generic", "odbc_driver": "PostgreSQL Unicode"}, 0),
+        (
+            {
+                "dialect": "generic",
+                "odbc_driver": "PostgreSQL ANSI(x64)",
+                "statement_timeout": None,
+            },
+            0,
+        ),
+        ({"dialect": "generic", "odbc_driver": "MySQL ODBC 8.0 Unicode Driver"}, 0),
+        ({"dialect": "generic", "odbc_driver": "Some Other Driver"}, 0),
         ({"dialect": "generic"}, 0),
-        ({"dialect": "Generic", "statement_timeout": None}, 0),
-        ({"dialect": "generic", "statement_timeout": 5}, 5),
+        ({"dialect": "generic", "odbc_driver": "PostgreSQL Unicode", "statement_timeout": 5}, 5),
+        (
+            {
+                "dialect": "generic",
+                "odbc_driver": "ODBC Driver 18 for SQL Server",
+                "statement_timeout": 0,
+            },
+            0,
+        ),
         ({"dialect": "sqlserver", "statement_timeout": 0}, 0),
     ],
 )
-def test_an_unset_statement_timeout_takes_the_dialects_default(
+def test_an_unset_statement_timeout_takes_the_driver_familys_default(
     settings: dict[str, Any], expected: int
 ) -> None:
-    """Finding A: psqlODBC is reported to refuse the attribute pyodbc's setter writes, so a
-    default of 30 on the generic dialect would stop every default generic lane. Unset there, the
-    connector sets nothing, as before #5756; a value the operator sets is still applied."""
+    """Finding A, keyed by driver family on the Manager's answer: psqlODBC is reported to refuse
+    the attribute pyodbc's setter writes, so a default of 30 there would stop every default
+    generic lane on it. Only Microsoft's driver, on either dialect, defaults to 30; any family not
+    known to take the setter defaults to 0. A value the operator sets is applied whatever the
+    driver."""
     assert database._statement_timeout(settings, "t") == expected
 
 
@@ -448,8 +471,22 @@ async def test_a_transient_setter_failure_retries_and_discards_the_connection(
     assert "execute:start" not in rig.log
 
 
+#: A stand-in driver module: :func:`database._raised_by_a_driver` counts an exception class from a
+#: module that declares the DB-API ``apilevel``.
+_FAKE_DRIVER = types.ModuleType("b611_fake_driver")
+_FAKE_DRIVER.apilevel = "2.0"  # type: ignore[attr-defined]
+
+
 class _ClosedHandle(Exception):
-    """pyodbc's shape for a closed connection: a message, no SQLSTATE."""
+    """pyodbc's shape for a closed connection: a message, no SQLSTATE, a driver's class."""
+
+
+_ClosedHandle.__module__ = _FAKE_DRIVER.__name__
+
+
+@pytest.fixture
+def fake_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, _FAKE_DRIVER.__name__, _FAKE_DRIVER)
 
 
 class _TimeoutReadFails(RawConn):
@@ -462,6 +499,7 @@ class _TimeoutReadFails(RawConn):
         pass
 
 
+@pytest.mark.usefixtures("fake_driver")
 async def test_a_timeout_read_that_raises_discards_the_connection(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
@@ -498,3 +536,41 @@ async def test_a_driver_with_no_timeout_warns_once_per_pool(
             await dest.send('{"a": 1}')
     warned = [r for r in caplog.records if "no driver timeout" in r.getMessage()]
     assert len(warned) == 1
+
+
+class _TimeoutReadBug(RawConn):
+    @property
+    def timeout(self) -> int:
+        raise RuntimeError("a bug in the binding")
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        pass
+
+
+async def test_a_timeout_read_that_is_no_driver_error_propagates_unchanged(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """Finding 4: the borrow re-raises a non-driver error unchanged and returns the connection,
+    which ran nothing, open. Before the repair it raised its own transient DeliveryError and
+    discarded a healthy connection each time.
+
+    ``_connect`` still reads any connect-time failure with no SQLSTATE as a transient connect
+    failure (BACKLOG #5713), so a send sees that, with the bug unchanged as its cause."""
+    _aioodbc_serving(monkeypatch, rig, raw_type=_TimeoutReadBug, blocks=never)
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().send('{"a": 1}')
+    cause = caught.value.__cause__
+    assert isinstance(cause, RuntimeError) and str(cause) == "a bug in the binding"
+    assert rig.pools[0].free == [rig.conn] and not rig.conn.closed
+
+
+async def test_a_driver_with_no_timeout_does_not_warn_when_no_limit_was_asked(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 6: a pool whose statement_timeout is 0 loses nothing to a driver with no
+    ``timeout``, so the warning that a bound was dropped is not logged."""
+    _aioodbc_serving(monkeypatch, rig, raw_type=_NoDriverTimeout, blocks=never)
+    with caplog.at_level("WARNING", logger=database.logger.name):
+        await _with({"statement_timeout": 0}).send('{"a": 1}')
+    assert not [r for r in caplog.records if "no driver timeout" in r.getMessage()]

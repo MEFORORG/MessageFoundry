@@ -77,8 +77,9 @@ class ConnectorType(str, Enum):  # noqa: UP042
 # Defined once so the declared default and the applied default cannot drift (BACKLOG #2089).
 DEFAULT_DB_CONNECT_TIMEOUT = 15
 #: The default DATABASE ``statement_timeout`` on the SQL Server preset, in seconds (BACKLOG #5756):
-#: the store's own ``[store].command_timeout`` default. 0 is no limit. The generic dialect
-#: defaults to 0, since a driver it reaches may refuse the setting (``_statement_timeout``).
+#: the store's own ``[store].command_timeout`` default. 0 is no limit. On the generic dialect it
+#: applies only to a driver family known to take the setting, and other families default to 0
+#: (``transports/database.py``, ``_TIMEOUT_DEFAULT_FAMILIES``).
 DEFAULT_DB_STATEMENT_TIMEOUT = 30
 
 
