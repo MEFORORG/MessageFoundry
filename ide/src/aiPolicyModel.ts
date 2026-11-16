@@ -134,20 +134,11 @@ export function evaluatedPermission(v: unknown): boolean | null {
  */
 export function mergeAuthoritativePolicy(cached: AiPolicy | null, fresh: AiPolicy): AiPolicy {
   const permitted = evaluatedPermission(fresh.assistPermitted);
-  // `mode` is narrowed for the same reason as the bit (BACKLOG #5406): a 200 that omits it, or
-  // carries a non-string, reaches the cache as a string the gate disables.
-  const mode = typeof fresh.mode === "string" ? fresh.mode : UNRECOGNIZED_MODE;
   if (permitted === null && cached?.assistPermitted === false) {
-    return { ...fresh, mode, assistPermitted: false };
+    return { ...fresh, assistPermitted: false };
   }
-  return { ...fresh, mode, assistPermitted: permitted };
+  return { ...fresh, assistPermitted: permitted };
 }
-
-/**
- * The mode a missing or non-string `mode` is narrowed to (BACKLOG #5406). {@link assistantState}
- * names no such mode, so it disables assistance for it.
- */
-export const UNRECOGNIZED_MODE = "unrecognized";
 
 /**
  * Apply the gating rules to a resolved policy. `enabled` false means the chat handler must not call
@@ -173,15 +164,6 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "MessageFoundry AI policy could not be verified (engine unreachable) — assistance is disabled until it can be confirmed.",
     };
   }
-  if (p.mode === "managed_endpoint") {
-    // Engine-brokered path (ADR 0135): the ENGINE brokers the call to the customer-managed / self-hosted
-    // LLM under central per-use audit. Enabled when the caller holds ai:assist (or it is unknown offline);
-    // chat.ts routes this mode to the engine broker instead of the local vscode.lm model.
-    if (p.assistPermitted === false) {
-      return { enabled: false, message: "Your role does not include the ai:assist permission." };
-    }
-    return { enabled: true };
-  }
   if (p.mode === "managed_claude" || p.mode === "managed_claude_baa") {
     return {
       enabled: false,
@@ -189,7 +171,10 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "Your MessageFoundry policy uses a managed AI provider, which this extension version does not yet support. Assistance is unavailable.",
     };
   }
-  if (p.mode !== "byo") {
+  // managed_endpoint is the engine-brokered path (ADR 0135): the ENGINE brokers the call to the
+  // customer-managed / self-hosted LLM under central per-use audit, and chat.ts routes it there
+  // instead of the local vscode.lm model.
+  if (p.mode !== "byo" && p.mode !== "managed_endpoint") {
     // An ALLOW-list, not a deny-list (BACKLOG #5406): a mode this version does not name -- a newer
     // engine's, or a missing or malformed one -- disables assistance rather than falling through to
     // the local model (SEC-022, CWE-636).
@@ -202,7 +187,7 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
   if (p.assistPermitted === false) {
     return { enabled: false, message: "Your role does not include the ai:assist permission." };
   }
-  // BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
+  // byo or managed_endpoint with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
   return { enabled: true };
 }
 
@@ -352,14 +337,14 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
 const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /** A carried entry as the carrier may use it: a deny-shaped object the gate disables, as it is;
- *  anything else as {@link MALFORMED_DENY}. The gate check is kept as a second guard beside the
- *  gate's own allow-list. Never throws, and never permits. */
+ *  anything else as {@link MALFORMED_DENY}. Every deny-shaped policy is one the gate disables, since
+ *  the gate is an allow-list (BACKLOG #5406). Never throws, and never permits. */
 function carriedEntry(value: unknown): AiPolicy {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return MALFORMED_DENY;
   }
   const p = value as AiPolicy;
-  return typeof p.mode === "string" && isPolicyDeny(p) && !assistantState(p).enabled ? p : MALFORMED_DENY;
+  return typeof p.mode === "string" && isPolicyDeny(p) ? p : MALFORMED_DENY;
 }
 
 // Every read-modify-write of the carrier runs on this one chain, so two resolves that overlap cannot

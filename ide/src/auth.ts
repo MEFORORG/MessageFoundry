@@ -50,6 +50,18 @@ function secretKey(url: string): string {
   return SECRET_PREFIX + url.replace(/\/+$/, "");
 }
 
+/**
+ * Whether `url` is a target {@link assertTargetAllowed} refuses credentials or a token to, showing
+ * the refusal when it is (SEC-005). Every path here that sends a password or a bearer asks first.
+ */
+function targetRefused(url: string): boolean {
+  const gate = assertTargetAllowed(url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+  }
+  return !gate.ok;
+}
+
 export async function clearToken(ctx: vscode.ExtensionContext, url: string): Promise<void> {
   await ctx.secrets.delete(secretKey(url));
 }
@@ -99,9 +111,7 @@ export async function signOut(ctx: vscode.ExtensionContext, url: string): Promis
   if (!token) {
     return true; // nothing to revoke
   }
-  const gate = assertTargetAllowed(url);
-  if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+  if (targetRefused(url)) {
     await clearToken(ctx, url);
     return false;
   }
@@ -143,9 +153,7 @@ export async function peekToken(
 export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
   // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS
   // refusal — never prompt for or send credentials in clear to a non-loopback host (SEC-005).
-  const gate = assertTargetAllowed(url);
-  if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+  if (targetRefused(url)) {
     return undefined;
   }
   let provider = "local";
@@ -266,9 +274,7 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  const gate = assertTargetAllowed(url);
-  if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+  if (targetRefused(url)) {
     return undefined;
   }
   const first = await ensureToken(ctx, url);

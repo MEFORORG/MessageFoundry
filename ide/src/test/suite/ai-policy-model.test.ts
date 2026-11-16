@@ -166,12 +166,10 @@ suite("assistantState fails closed on a mode it does not name (BACKLOG #5406)", 
     }
   });
 
-  test("G3: a fresh answer with a missing or non-string mode is narrowed to a string the gate disables", () => {
+  test("G3: a fresh answer with a missing or non-string mode disables assistance through the merge", () => {
     for (const bad of [undefined, null, 7, true, {}, ["byo"]]) {
       const fresh = { ...policy({ assistPermitted: true }), mode: bad as unknown as string };
-      const merged = mergeAuthoritativePolicy(null, fresh);
-      assert.strictEqual(typeof merged.mode, "string", JSON.stringify(bad));
-      assert.strictEqual(assistantState(merged).enabled, false, JSON.stringify(bad));
+      assert.strictEqual(assistantState(mergeAuthoritativePolicy(null, fresh)).enabled, false, JSON.stringify(bad));
     }
   });
 

@@ -129,12 +129,13 @@ suite("untrusted-workspace capability (SEC-004)", () => {
   // restrictedConfigurations until the workspace is trusted, so the keys that name a path the
   // extension reads or writes, or that switch on network activity, must be listed there.
   test("an untrusted workspace cannot set a path setting or switch on live status", () => {
-    const restricted = pkg().capabilities?.untrustedWorkspaces?.restrictedConfigurations;
+    const manifest = pkg();
+    const restricted = manifest.capabilities?.untrustedWorkspaces?.restrictedConfigurations;
     assert.ok(Array.isArray(restricted), "untrustedWorkspaces declares no restrictedConfigurations");
     for (const key of WORKSPACE_RESTRICTED) {
       assert.ok(restricted.includes(key), `${key} is not in restrictedConfigurations`);
     }
-    const declared = Object.keys(pkg().contributes.configuration.properties);
+    const declared = Object.keys(manifest.contributes.configuration.properties);
     for (const key of restricted) {
       assert.ok(declared.includes(String(key)), `restrictedConfigurations names an undeclared key: ${key}`);
     }
@@ -144,8 +145,9 @@ suite("untrusted-workspace capability (SEC-004)", () => {
     // A family check over the hand list above, as the scope suite does for targets: a new path or
     // polling setting trips it until someone files it.
     const smellsLikeAPathOrPoll = /dir|path|config|file|liveStatus|poll|interval/i;
-    const props = pkg().contributes.configuration.properties;
-    const restricted = pkg().capabilities?.untrustedWorkspaces?.restrictedConfigurations ?? [];
+    const manifest = pkg();
+    const props = manifest.contributes.configuration.properties;
+    const restricted = manifest.capabilities?.untrustedWorkspaces?.restrictedConfigurations ?? [];
     for (const [key, prop] of Object.entries(props)) {
       if (prop.scope !== "machine" && smellsLikeAPathOrPoll.test(key.replace(/^messagefoundry\./, ""))) {
         assert.ok(restricted.includes(key), `${key} names a path or polling; restrict it (BACKLOG #5404)`);
