@@ -1587,27 +1587,33 @@ class MLLPDestination(DestinationConnector):
                 )
             raise DeliveryError(f"unparseable ACK: {unparseable}")
         msa1 = ack.field("MSA-1")
+        # BACKLOG #82: correlate the reply to the send. A positive ACK whose MSA-2 does not echo the
+        # sent MSH-10 is NOT a valid accept for THIS message (a stale/mis-framed reply, or a peer that
+        # answered a different send) -- raise a retryable DeliveryError so the pipeline retries per the
+        # at-least-once path (on the persistent lane this also discards the cached connection via
+        # _discard_unparseable, correct since a mis-correlated reply implies socket desync). Control ids
+        # only in the exception text -- never a full payload, never a raised log level. Read
+        # separator-aware via Peek. Note: the `if sent_control_id` guard means an unreadable OWN MSH-10
+        # skips correlation (nothing to correlate), per the design decision.
+        #
+        # BACKLOG #5681: a reject (AR/CR) is correlated too, because it is final -- a stray reject for
+        # ANOTHER message would otherwise permanently dead-letter this one and leave the desynchronized
+        # persistent socket cached. A MATCHING reject stays final, and AE/CE stays a retried
+        # NegativeAckError whatever its MSA-2, both unchanged.
+        if sent_control_id and msa1 in ("AA", "CA", "AR", "CR"):
+            ack_control_id = ack.field("MSA-2")
+            if ack_control_id != sent_control_id:
+                # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
+                # sized too, and it is interpolated into this raise. Clamped HERE and not at the
+                # read above, because the comparison must see the field the peer actually sent --
+                # bounding first would silently correlate a long control id against its own prefix.
+                raise DeliveryError(
+                    f"ACK control-id mismatch: "
+                    f"MSA-1={msa1} "
+                    f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
+                    f"!= sent MSH-10={sent_control_id!r}"
+                )
         if msa1 in ("AA", "CA"):
-            if sent_control_id:
-                # BACKLOG #82: correlate the reply to the send. A positive ACK whose MSA-2 does not echo
-                # the sent MSH-10 is NOT a valid accept for THIS message (a stale/mis-framed reply, or a
-                # peer that answered a different send) — raise a retryable DeliveryError so the pipeline
-                # retries per the at-least-once path (on the persistent lane this also discards the cached
-                # connection via _discard_unparseable, correct since a mis-correlated reply implies socket
-                # desync). Control ids only in the exception text — never a full payload, never a raised
-                # log level. Read separator-aware via Peek. Note: the `if sent_control_id` guard means an
-                # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
-                ack_control_id = ack.field("MSA-2")
-                if ack_control_id != sent_control_id:
-                    # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
-                    # sized too, and it is interpolated into this raise. Clamped HERE and not at the
-                    # read above, because the comparison must see the field the peer actually sent --
-                    # bounding first would silently correlate a long control id against its own prefix.
-                    raise DeliveryError(
-                        f"ACK control-id mismatch: "
-                        f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
-                        f"!= sent MSH-10={sent_control_id!r}"
-                    )
             if self.capture_response:
                 # Unbounded on purpose: this branch runs only when msa1 is exactly AA or CA, so the
                 # peer cannot size it here (BACKLOG #1847 bounds the one that can, below).
