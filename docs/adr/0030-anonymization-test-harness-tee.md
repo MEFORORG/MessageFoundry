@@ -121,6 +121,15 @@
   the §3 field list and changes none of its ratified choices:** the coded fields of those segments
   stay `KEEP` by omission, and `rules.py` names them with the reason. A field of those segments
   that is neither mapped nor named there still has no rule; the coverage report names it.
+- **AMENDED 2026-11-16 (BACKLOG #5533): twenty more default rules of the same class.** The
+  default map adds the names `GT1-4`, `GT1-42`, `GT1-45` and `NK1-26` as `NAME`; the ids
+  `GT1-19`, `GT1-29`, `NK1-12`, `PV1-5` and `PV1-50` as `ID`; `GT1-46` as `PHONE`; `GT1-24`
+  (the guarantor's death date) as `DATE`, like `PID-29`; the birth places `GT1-56` and `NK1-38`,
+  the organization names `GT1-21` and `GT1-51`, and `PV1-37` (a discharge location with its
+  date) as `FREETEXT`; and `PV1-52` as `PROVIDER`. `MRG-2`, `MRG-5` and `MRG-6` take `ID`, the
+  kind of the field each is the prior value of (`PID-4`, `PV1-19`, `PV1-50`), so the merge
+  linkage survives as it does for `MRG-1`. **This adds to the §3 field list and changes none of
+  its ratified choices.**
 - **AMENDED 2026-11-10 (BACKLOG #5532, #5541): the leak-check reads an escaped value decoded.**
   The structural detectors read each unmapped value as written and each of its components and
   subcomponents decoded from its HL7 escape sequences, the parts the engine's `Message` and `Peek`
@@ -319,7 +328,8 @@ routing/validation realism survive, and the coded clinical segments (DG1/AL1/PR1
 were added to this list; see the status banner. AMENDED 2026-10-05, #2330: eight more date fields
 were added, `PR1-5` among them, and the PR1 codes are still `KEEP`. AMENDED 2026-11-10, #5533:
 `PID-2/21/23`, `NK1-13/30/31/32/33/37`, `GT1-2` and `PV1-6/11/42/43` were added; see the status
-banner.)*
+banner. AMENDED 2026-11-16, #5533: `GT1-4/19/21/24/29/42/45/46/51/56`, `NK1-12/26/38`,
+`MRG-2/5/6` and `PV1-5/37/50/52` were added.)*
 
 **Free-text default = full redaction.** `OBX-5` and `NTE-3` carry narrative that *commonly embeds
 identifiers* (name/MRN/DOB/phone) which field-level surrogation cannot reach, and the leak-check (§5) only
