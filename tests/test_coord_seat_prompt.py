@@ -317,3 +317,25 @@ class TestThePromptLandsOnTheSessionsWorktree:
         common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
         seats = Path(common) / "mefor-coord" / "seats"
         assert not list(seats.rglob("s1.json")), "a record was stamped for a checkout nobody named"
+
+
+class TestNotesCapReadsTheCollapsedLength:
+    """BACKLOG #5764: the -Notes cap took Substring(0, Min(2000, raw length)) of the
+    whitespace-collapsed string, so notes under 2000 characters with a whitespace run asked for
+    more characters than they held, the Substring threw, and no declaration was written."""
+
+    @staticmethod
+    def declare(repo: Path, notes: str) -> dict:
+        proc = seat(
+            repo, "-Declare", "-Seat", "builder9", "-Goal", "g", "-SessionId", "s1", "-Notes", notes
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return record(repo)
+
+    def test_short_notes_with_a_whitespace_run_are_collapsed_and_written(self, repo: Path) -> None:
+        assert self.declare(repo, "a    b		c")["notes"] == "a b c"
+
+    def test_long_notes_are_capped_at_2000_after_collapsing(self, repo: Path) -> None:
+        # 3001 characters collapse to 2001 ("a " * 1000 + "b"), so the cap still bites, at 2000.
+        got = self.declare(repo, "a  " * 1000 + "b")["notes"]
+        assert got == ("a " * 1000)[:2000]

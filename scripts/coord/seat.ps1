@@ -1081,6 +1081,8 @@ try {
                       else { $null }
     $seatRoster = Resolve-SeatAgainstRoster -Label $labelUnderTest
 
+    # Capped by the COLLAPSED length (BACKLOG #5764): the raw length overran a collapsed string.
+    $collapsedNotes = if ($Notes) { $Notes -replace '\s+', ' ' } else { '' }
     $rec = [ordered]@{
         schema           = $SCHEMA
         writerVersion    = $WRITER
@@ -1140,7 +1142,7 @@ try {
         allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $lifecycleAt)
         handoff          = $handoffObj
         predecessor      = $pred
-        notes            = if ($Declare -and $Notes) { $collapsedNotes = $Notes -replace '\s+', ' '; $collapsedNotes.Substring(0, [Math]::Min(2000, $collapsedNotes.Length)) } else { Prior 'notes' '' }
+        notes            = if ($Declare -and $Notes) { $collapsedNotes.Substring(0, [Math]::Min(2000, $collapsedNotes.Length)) } else { Prior 'notes' '' }
     }
 
     # Carried forward ONLY where it exists, so a record never cleared keeps its old shape. Without

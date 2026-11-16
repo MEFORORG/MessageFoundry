@@ -644,7 +644,11 @@ async def test_metadata_outbound_simulated(
 
 @pytest.mark.parametrize("down", ["paused", "failed", "filtered", "not_deployed", "graph_stopped"])
 async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
-    engine: Engine, client: httpx.AsyncClient, tmp_path: Path, down: str
+    engine: Engine,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    down: str,
 ) -> None:
     """BACKLOG #5762: the outbound row read the GRAPH's running flag, so a lane that delivers
     nothing read running in the same payload whose error names why. The baseline proves the
@@ -655,7 +659,8 @@ async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
             "OB", reg.outbound["OB"].spec, metadata={"tier": "gold"}, deployed=False
         )
     rr = engine.add_registry(reg)
-    rr._running = True  # the graph runs; only the lane state varies
+    # The graph runs, and only the lane state varies; monkeypatch restores it for the teardown.
+    monkeypatch.setattr(rr, "_running", True)
     if down != "not_deployed":
         assert (await client.get("/connections/OB/metadata")).json()["running"] is True
     if down == "paused":
@@ -668,7 +673,6 @@ async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
         rr._running = False
     body = (await client.get("/connections/OB/metadata")).json()
     assert body["running"] is False, body
-    rr._running = False
 
 
 async def test_metadata_404(engine: Engine, client: httpx.AsyncClient, tmp_path: Path) -> None:
