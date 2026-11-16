@@ -191,10 +191,12 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   the separate `messagefoundry-toolkit` distribution (ADR 0201), installed at the engine's own version
   (`pip install "messagefoundry-toolkit==<version>"`, or `pip install -r requirements-dev.txt` in a
   scaffolded config repo). Without it, both say so and name the distribution. In this repository's
-  checkout the toolkit imports from the source tree, so nothing extra is installed. Every CLI run,
-  and the Test Bench's Debug launch, passes `-P -X disable-remote-debug` as serve does, so the
-  workspace folder is not on the import path: a config module can import its `_`-prefixed siblings,
-  but not a top-level workspace package that is not installed into that interpreter.
+  checkout the toolkit imports from the source tree, through the editable install in the
+  checkout's own `.venv`, so nothing extra is installed. Every CLI run passes
+  `-P -X disable-remote-debug` as serve does, so the working directory is not put on the import
+  path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
+  that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
+  and does not take these options.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security

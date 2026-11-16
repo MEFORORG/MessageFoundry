@@ -40,8 +40,6 @@
 // but not the whole text of a foreign exception it wraps (vault BACKLOG #3765), and the identifier
 // an import or name error or a bad call argument names. Every command that imports config modules
 // can print them, `connection upsert` and `remove` included.
-import { connectionServiceConfig } from "./connectionWizardModel";
-import { SERVE_DEFAULT_SERVICE_CONFIG } from "./engineControlModel";
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {
@@ -59,22 +57,6 @@ export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
 export const ENGINE_MODULE: CliModule = "messagefoundry";
 export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
 
-/**
- * The `messagefoundry ai-policy` argv (sans the `--json` runJson appends) for the IDE's offline
- * fallback (BACKLOG #5405). `setting` is `messagefoundry.serviceConfig` and `isSet` whether the
- * operator set it. It always names a file: with no flag the CLI reads `./messagefoundry.toml` only
- * if it exists and otherwise answers the built-in default, which can enable assistance. Named, a
- * missing or unreadable file is refused, and pickOfflinePolicy then fails closed to the unverified
- * policy.
- *
- * The file is the one Start hands serve: {@link connectionServiceConfig}, which reads an unset or
- * blank setting as no flag, so serve reads `messagefoundry.toml`, named here explicitly. Bound with
- * `=`, as serve's own flag is, so a path that starts with a dash stays a value.
- */
-export function aiPolicyCliArgs(setting: unknown, isSet: boolean): string[] {
-  const file = connectionServiceConfig(setting, isSet) ?? SERVE_DEFAULT_SERVICE_CONFIG;
-  return ["ai-policy", `--service-config=${file}`];
-}
 
 /** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
  *  module does not compile until it names its command. */

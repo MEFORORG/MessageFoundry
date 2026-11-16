@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// How the IDE launches the Python CLI. cli.ts, aiPolicy.ts and testBench.ts import vscode, so these
+// How the IDE launches the Python CLI. cli.ts and aiPolicy.ts import vscode, so these
 // read their source and pin the decisions on the node-side leg that runs on every CI job.
 import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
-import { ENGINE_MODULE, TOOLKIT_MODULE, aiPolicyCliArgs } from "../../cliJson";
-import { INTERPRETER_OPTIONS, cliArgv } from "../../engineControlModel";
+import { ENGINE_MODULE, TOOLKIT_MODULE } from "../../cliJson";
+import { INTERPRETER_OPTIONS, aiPolicyCliArgs, cliArgv } from "../../engineControlModel";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 
@@ -57,13 +57,6 @@ suite("the IDE launches the CLI with -P ahead of -m (BACKLOG #5409)", () => {
 
   test("control: the pre-fix runner argv fails the predicate", () => {
     assert.ok(!launchesThroughCliArgv('execFile(\n      pythonPath(),\n      ["-m", module, ...args],'));
-  });
-
-  test("the Test Bench Debug launch passes the same interpreter options", () => {
-    const src = code("testBench.ts");
-    const m = /private async debugRow\([\s\S]*?\n {2}\}/.exec(src);
-    assert.ok(m, "debugRow moved; re-point this scan before trusting it");
-    assert.ok(/pythonArgs:\s*\[\.\.\.INTERPRETER_OPTIONS\]/.test(m[0]), "debugRow launches without the interpreter options");
   });
 });
 

@@ -20,7 +20,7 @@ export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
  *  its held wrapper) and serve. `-P` keeps the working directory off the import path, so all of
  *  them import the same engine; `-X disable-remote-debug` is what serve's enforce refusal names
  *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) takes them too,
- *  through {@link cliArgv} (BACKLOG #5409), and the Test Bench Debug launch passes them as `pythonArgs`. */
+ *  through {@link cliArgv} (BACKLOG #5409). */
 export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
 
 /**
@@ -49,11 +49,31 @@ export const SERVE_DEFAULT_SERVICE_CONFIG = "messagefoundry.toml";
  * fork guard judges that file.
  */
 export { connectionServiceConfig as startServiceConfigValue } from "./connectionWizardModel";
+import { connectionServiceConfig } from "./connectionWizardModel";
 
 /** The `--service-config` element serve, the probe and provision-admin share, or none when undefined.
  *  Bound with `=`, so a path that starts with a dash stays a value and never becomes a flag. */
 function serviceConfigFlag(serviceConfig: string | undefined): string[] {
   return serviceConfig === undefined ? [] : [`--service-config=${serviceConfig}`];
+}
+
+/**
+ * The `messagefoundry ai-policy` argv (sans the `--json` runJson appends) for the IDE's offline
+ * fallback (BACKLOG #5405). `setting` is `messagefoundry.serviceConfig` and `isSet` whether the
+ * operator set it. It always names a file: with no flag the CLI reads `./messagefoundry.toml` only
+ * if it exists and otherwise answers the built-in default, which can enable assistance. Named, a
+ * missing or unreadable file is refused, and pickOfflinePolicy then fails closed to the unverified
+ * policy.
+ *
+ * The file is the one Start hands serve ({@link startServiceConfigValue}), except that an unset or
+ * blank setting, where serve gets no flag and reads {@link SERVE_DEFAULT_SERVICE_CONFIG}, names
+ * that file explicitly. Bound by {@link serviceConfigFlag}, as serve's own flag is.
+ */
+export function aiPolicyCliArgs(setting: unknown, isSet: boolean): string[] {
+  return [
+    "ai-policy",
+    ...serviceConfigFlag(connectionServiceConfig(setting, isSet) ?? SERVE_DEFAULT_SERVICE_CONFIG),
+  ];
 }
 
 /**
@@ -84,15 +104,12 @@ export function buildServeInvocation(opts: {
     command: opts.python,
     // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
     // interpreter's remote debugging on. The argv is the launch that refusal names.
-    args: [
-      ...INTERPRETER_OPTIONS,
-      "-m",
-      "messagefoundry",
+    args: cliArgv("messagefoundry", [
       "serve",
       "--config",
       opts.configDir,
       ...serviceConfigFlag(opts.serviceConfig),
-    ],
+    ]),
   };
 }
 
@@ -248,15 +265,12 @@ export function buildProvisionInvocation(opts: { python: string; serviceConfig?:
   command: string;
   args: string[];
 } {
-  const args = [
-    ...INTERPRETER_OPTIONS,
-    "-m",
-    "messagefoundry",
+  const args = cliArgv("messagefoundry", [
     "provision-admin",
     `--username=${opts.username}`,
     `--email=${opts.email.trim()}`,
     ...serviceConfigFlag(opts.serviceConfig),
-  ];
+  ]);
   return { command: opts.python, args };
 }
 

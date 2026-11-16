@@ -25,7 +25,7 @@ import {
   pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineTargetIsSet, engineUrl, environments, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
-import { aiPolicyCliArgs } from "./cliJson";
+import { aiPolicyCliArgs } from "./engineControlModel";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
