@@ -225,7 +225,7 @@ function Get-BoxActivity {
                 # two reads and slipping past both.
                 $unparsed = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable |
                               Where-Object { $_.Unreadable })
-                $l = Get-SessionLiveness -SessionId $SessionId -ConfigRoot $ConfigRoot
+                $l = Get-SessionLiveness -SessionId $SessionId -ConfigRoot $ConfigRoot -Worktree $WorktreePath -AnonymousFreshHours $FreshHours
                 $fenceState = [string]$l.State
                 $fenceVeto = Test-OccupancyVeto -State $fenceState
                 if ($fenceVeto) {

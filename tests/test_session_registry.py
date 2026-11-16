@@ -460,29 +460,70 @@ def test_with_no_usable_startedat_the_file_age_decides(
     assert liveness(config_root, "5491ffff")["State"] == state
 
 
-def test_no_anonymous_veto_leaves_a_gone_match_gone(config_root: Path) -> None:
-    """For a caller that reports those records once itself, as fleet.ps1 does."""
+@pytest.mark.parametrize(
+    ("anon_cwd", "state"),
+    [
+        ("here", "UNREADABLE"),
+        ("here-sub", "UNREADABLE"),
+        ("elsewhere", "DEAD"),
+        (None, "UNREADABLE"),
+    ],
+    ids=["same-worktree", "inside-worktree", "other-worktree", "no-cwd-fails-closed"],
+)
+def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
+    config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
+) -> None:
+    """A record naming no session vetoes a lookup for its own tree, case and slashes aside, and not
+    one for another tree. One with no readable cwd cannot be placed, so it vetoes everywhere."""
+    here = tmp_path / "wt-here"
+    cwds = {
+        "here": str(here).upper().replace("\\", "/") + "/",
+        "here-sub": str(here / "sub"),
+        "elsewhere": str(tmp_path / "wt-elsewhere"),
+    }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
-    _anonymous(config_root, "99009.json", {"pid": os.getpid(), "startedAt": NOW_MS})
+    record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}
+    if anon_cwd is not None:
+        record["cwd"] = cwds[anon_cwd]
+    _anonymous(config_root, "99009.json", record)
     got = _strict(
-        f"(Get-SessionLiveness -SessionId '5491abab' -ConfigRoot '{config_root}' -NoAnonymousVeto).State"
+        f"(Get-SessionLiveness -SessionId '5491abab' -ConfigRoot '{config_root}' "
+        f"-Worktree '{here}').State"
     )
-    assert got == "DEAD"
+    assert got == state
+
+
+def test_a_vanished_record_file_ages_zero_whatever_its_startedat() -> None:
+    """A file gone between the listing and the read is the shape of one being replaced right now,
+    so it is fresh even with a two-day-old startedAt."""
+    got = _strict(
+        '$row = [pscustomobject]@{ Record = (\'{"startedAt": '
+        f"{NOW_MS - 48 * 3600 * 1000}"
+        "}' | ConvertFrom-Json); File = (Join-Path $env:TEMP 'mefor-5491-vanished-9f3a.json') }; "
+        "$a = @(Get-AnonymousSessionRecords -Records @($row)); '{0}|{1}' -f $a.Count, $a[0].Fresh"
+    )
+    assert got == "1|True"
 
 
 def _fleet(
-    tmp_path: Path, anonymous: dict[str, Any] | None, coord: Path | None = None
-) -> tuple[dict[str, Any], Path, Path]:
+    tmp_path: Path,
+    anonymous: dict[str, Any] | None,
+    coord: Path | None = None,
+    anon_in_seat_worktree: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
-    registry record that names no session. Returns the JSON, the repo and the anonymous file."""
+    registry record that names no session. The record's cwd is the seat's worktree, or another
+    worktree, unless ``anonymous`` sets its own. Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
     write_session(root, pid=never_live_pid(), session_id="5491dead-0000-0000-0000-000000000000")
     repo = tmp_path / "repo"
+    seat_wt = repo / "seat-worktree"
     anon = root / "sessions" / "99010.json"
     if anonymous is not None:
-        anon.write_text(json.dumps({"cwd": str(repo), **anonymous}), encoding="utf-8")
+        cwd = str(seat_wt) if anon_in_seat_worktree else str(repo / "other-worktree")
+        anon.write_text(json.dumps({"cwd": cwd, **anonymous}), encoding="utf-8")
 
     repo.mkdir()
     for args in (
@@ -500,7 +541,7 @@ def _fleet(
         "asOf": stamp,
         "lifecycle": "open",
         "boxKey": "box-5491",
-        "worktree": str(repo / "absent"),
+        "worktree": str(seat_wt),
         "sessionId": "5491dead-0000-0000-0000-000000000000",
         "sessionKey": "5491dead",
         "seat": "builder",
@@ -527,43 +568,61 @@ def _fleet(
         check=False,
         env=env,
     )
+    return proc, anon
+
+
+def _fleet_json(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     assert proc.returncode in (0, 2), proc.stderr
     j: dict[str, Any] = json.loads(proc.stdout)
-    return j, repo, anon
+    return j
 
 
-def _anonymous_stops(j: dict[str, Any]) -> list[str]:
-    return [s for s in j["receipt"]["stopConditions"] if s.startswith("anonymousLiveRecords=")]
-
-
-def test_fleet_reports_an_anonymous_record_once_and_keeps_each_seats_own_verdict(
+def test_fleet_reads_a_seat_with_an_anonymous_record_in_its_worktree_as_possibly_running(
     tmp_path: Path,
 ) -> None:
-    """A live record naming no session must not mark every gone seat POSSIBLY RUNNING. It is one
-    stop condition instead, so no seat is offered for respawn while it exists, and it counts as a
-    live session in the repo without reading as a seat writer that failed."""
-    j, _, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
-    rows = {r["Box"]: r for r in j["rows"]}
-    assert rows["box-5491"]["Fence"] == "DEAD", rows["box-5491"]
+    """The record may be this seat relaunched, so the seat must not read INTERRUPTED, which -Chip and
+    respawn.ps1 treat as respawnable. It counts as a live session without reading as a writer that
+    failed, and the receipt names it."""
+    proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
+    assert row["State"] == "POSSIBLY RUNNING", row
     receipt = j["receipt"]
     assert receipt["anonymousLiveRecords"] == 1, receipt
     assert str(anon) in receipt["anonymousLiveRecordFiles"]
-    stops = _anonymous_stops(j)
-    assert len(stops) == 1 and str(anon) in stops[0] and "respawn" in stops[0], stops
-    assert receipt["liveSessionsInRepo"] == 1, receipt
     assert receipt["liveSessionsWithoutRecord"] == 0, receipt
 
 
-def test_fleet_fires_no_anonymous_stop_without_such_a_record(tmp_path: Path) -> None:
-    """The twin: with only the seat's own DEAD record, no anonymous stop and a zero count."""
-    j, _, _ = _fleet(tmp_path, None)
-    assert j["receipt"]["anonymousLiveRecords"] == 0, j["receipt"]
-    assert _anonymous_stops(j) == []
+def test_fleet_leaves_a_seat_alone_when_the_anonymous_record_is_in_another_worktree(
+    tmp_path: Path,
+) -> None:
+    """The twin: a record in another worktree is not this seat, so the seat keeps its own verdict."""
+    proc, _ = _fleet(
+        tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS}, anon_in_seat_worktree=False
+    )
+    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    assert row["Fence"] == "DEAD", row
+    assert row["State"] in ("INTERRUPTED", "ORPHANED-STALE"), row
 
 
-def test_fleet_names_a_failed_anonymous_scan_as_a_stop_not_a_count(tmp_path: Path) -> None:
-    """An instrument that failed must not read as one stray record. The scan is made to throw in a
-    copy of the scripts, so the real ones are untouched."""
+def test_fleet_suppresses_the_roster_for_an_anonymous_record_with_no_cwd(tmp_path: Path) -> None:
+    """It cannot be placed, so no seat can be told apart from a relaunch: exit 4 and nothing on
+    stdout, which respawn.ps1 reads as a fleet run with no JSON and stops on."""
+    proc, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": None})
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "ROSTER SUPPRESSED" in proc.stderr and str(anon) in proc.stderr, proc.stderr
+
+
+def test_fleet_renders_with_no_anonymous_record(tmp_path: Path) -> None:
+    """The twin: nothing anonymous, a normal roster and a zero count."""
+    proc, _ = _fleet(tmp_path, None)
+    assert _fleet_json(proc)["receipt"]["anonymousLiveRecords"] == 0
+
+
+def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Path) -> None:
+    """An instrument that failed must not read as no record. The scan is made to throw in a copy of
+    the scripts, so the real ones are untouched."""
     coord = tmp_path / "coord"
     coord.mkdir()
     for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
@@ -572,21 +631,30 @@ def test_fleet_names_a_failed_anonymous_scan_as_a_stop_not_a_count(tmp_path: Pat
         "\nfunction Get-AnonymousSessionRecords { throw 'scan-broke-5491' }\n"
     )
     (coord / "session-registry.ps1").write_text(broken, encoding="utf-8")
-    j, _, _ = _fleet(tmp_path, None, coord=coord)
-    assert j["receipt"]["anonymousLiveRecords"] is None, j["receipt"]
-    stops = _anonymous_stops(j)
-    assert len(stops) == 1 and "scan-broke-5491" in stops[0], stops
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "scan-broke-5491" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize(
-    ("pid", "refused"), [("not-a-number", True), (None, False)], ids=["unreadable", "dead"]
+    ("pid", "anonymous", "refusal"),
+    [
+        ("not-a-number", None, "UNREADABLE"),
+        (None, None, None),
+        (None, "primary", "names no session"),
+        (None, "elsewhere", None),
+    ],
+    ids=["unreadable", "dead", "anonymous-in-its-tree", "anonymous-elsewhere"],
 )
 def test_sessions_rehome_refuses_an_unreadable_fence(
-    tmp_path: Path, pid: str | None, refused: bool
+    tmp_path: Path, pid: str | None, anonymous: str | None, refusal: str | None
 ) -> None:
     """sessions.ps1 moves a transcript, so an UNREADABLE fence must stop it. A non-numeric pid used
-    to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. The
-    twin, a DEAD record, passes the guard and finds the transcript already filed."""
+    to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. A
+    record naming no session in the transcript's birth tree stops it too, and the refusal names that
+    record rather than calling a dead session RUNNING. The twins, a DEAD record alone or beside an
+    anonymous record in another tree, pass the guard and find the transcript already filed."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "worktree").mkdir(parents=True)
     (repo / "scripts" / "coord").mkdir(parents=True)
@@ -620,6 +688,10 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
         ),
         encoding="utf-8",
     )
+    anon = root / "sessions" / "2.json"
+    if anonymous is not None:
+        cwd = primary if anonymous == "primary" else str(tmp_path / "elsewhere")
+        anon.write_text(json.dumps({"startedAt": NOW_MS, "cwd": cwd}), encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k.upper() not in {"USERPROFILE"}}
     env["USERPROFILE"] = str(home)
     proc = subprocess.run(
@@ -632,8 +704,10 @@ def test_sessions_rehome_refuses_an_unreadable_fence(
         check=False,
         env=env,
     )
-    if refused:
-        assert proc.returncode != 0 and "UNREADABLE" in proc.stderr, proc.stdout + proc.stderr
+    if refusal:
+        assert proc.returncode != 0 and refusal in proc.stderr, proc.stdout + proc.stderr
+        if anonymous:
+            assert "2.json" in proc.stderr and "still RUNNING" not in proc.stderr, proc.stderr
     else:
         assert proc.returncode == 0 and "already filed" in proc.stdout, proc.stdout + proc.stderr
     assert transcript.exists()

@@ -131,7 +131,10 @@ if ($Check) {
     $shared = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
     if (-not $shared.Error -and $shared.Source -ne 'local') {
         $sharedFile = Join-Path (Join-Path $shared.Path 'backlog') "$TombstoneNumber.json"
-        if (Test-Path -LiteralPath $sharedFile) {
+        # A root that names this clone's own mefor-coord, by any spelling, is the local registry:
+        # warning about it would send an operator to delete the one tombstone stale copies read.
+        $isLocal = [System.IO.Path]::GetFullPath($sharedFile).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($file).TrimEnd('\')
+        if (-not $isLocal -and (Test-Path -LiteralPath $sharedFile)) {
             Write-Host "WARNING: a record sits at $sharedFile on the shared root. This script never writes there, and a live allocator reading that share would be lifted by it; check it and remove it by hand."
         }
     }

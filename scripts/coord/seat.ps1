@@ -814,7 +814,8 @@ function Invoke-ClearHandoff {
         if ($bad.Count -gt 0) {
             return (Refuse "$($bad.Count) session registry file(s) cannot be read, so the fence is incomplete; first: $($bad[0].File) ($($bad[0].Error)).")
         }
-        $l = Get-SessionLiveness -SessionId $sid
+        # The seat's worktree scopes the veto by records that name no session to this tree.
+        $l = Get-SessionLiveness -SessionId $sid -Worktree $(if ($names -contains 'worktree') { [string]$rec.worktree } else { '' })
     } catch {
         return (Refuse "the liveness lookup for session $sid failed: $($_.Exception.Message)")
     }

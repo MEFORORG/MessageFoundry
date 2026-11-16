@@ -172,7 +172,7 @@ foreach ($row in $sessionRows) {
     if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
     # A record that names no session is still a live session here, whatever its age, so it counts.
     # It cannot be matched to a seat record, so it is left out of liveWithoutRecord below; the
-    # anonymous-record stop reports it instead. A bare read of the field throws under StrictMode.
+    # receipt's anonymousLiveRecords names it instead. A bare read of the field throws under StrictMode.
     $liveSid = [string](Get-RecordField $row.Record 'sessionId')
     $l = Test-RecordLiveness -Record $row.Record
     if ($l.State -eq 'LIVE') {
@@ -186,12 +186,17 @@ foreach ($row in $sessionRows) {
 }
 
 # Registry records that name no session and are LIVE or fresh (session-registry.ps1,
-# Get-AnonymousSessionRecords). Reported once, by file, and as a stop condition below rather than as a
-# veto on every seat: a seat that relaunched may be one of them, so no seat is safe to respawn.
+# Get-AnonymousSessionRecords). A seat whose worktree holds one reads POSSIBLY RUNNING through its own
+# fence below, because each seat's lookup passes its worktree. One with no readable cwd cannot be
+# placed, and a failed scan cannot be trusted, so either suppresses the roster and exits non-zero:
+# respawn.ps1 stops on a fleet run that prints no JSON.
 $anonymousLive = @()
+$anonymousNoCwd = @()
 $anonymousReadError = ''
 try {
-    $anonymousLive = @(Get-AnonymousSessionRecords -Records $sessionRows | Where-Object { $_.Fresh } | ForEach-Object { $_.File })
+    $fresh = @(Get-AnonymousSessionRecords -Records $sessionRows | Where-Object { $_.Fresh })
+    $anonymousLive = @($fresh | ForEach-Object { $_.File })
+    $anonymousNoCwd = @($fresh | Where-Object { -not $_.Cwd } | ForEach-Object { $_.File })
 } catch {
     $anonymousReadError = $_.Exception.Message
 }
@@ -428,9 +433,10 @@ foreach ($r in $records) {
     $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
     if ($isHere -and $fenceAvailable -and $sid) {
-        # Each seat's verdict comes from its own record. A fresh record naming no session would turn
-        # every gone seat UNREADABLE here, so it is reported once in the receipt instead.
-        try { $fence = (Get-SessionLiveness -SessionId $sid -NoAnonymousVeto).State } catch { $fence = 'UNKNOWN' }
+        # The seat's worktree scopes the anonymous-record veto: a fresh record naming no session in
+        # THIS worktree may be this seat relaunched, so it reads POSSIBLY RUNNING, never INTERRUPTED,
+        # while one in another worktree leaves this seat's own verdict alone.
+        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State } catch { $fence = 'UNKNOWN' }
     }
 
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
@@ -500,8 +506,8 @@ foreach ($r in $records) {
 $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
-if ($anonymousLive.Count -gt 0) { $stops += "anonymousLiveRecords=$($anonymousLive.Count) -- registry record(s) name no session and are live or freshly written ($($anonymousLive -join '; ')); a relaunched seat may be one of them, so no seat below is safe to respawn" }
-if ($liveWithoutRecord.Count -gt 0) { $stops +="liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
+if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
+if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
@@ -614,6 +620,15 @@ $receipt = [ordered]@{
 # ---------------------------------------------------------------------------------------------
 # Render.
 # ---------------------------------------------------------------------------------------------
+
+# ROSTER SUPPRESSED, exit 4, for the two conditions under which no seat can be told apart from a
+# relaunch of itself. Nothing goes to stdout in any mode, so -Chip writes no replacement briefing and
+# respawn.ps1, which stops on a fleet run with no parseable JSON, sends nobody. The stops go to stderr.
+if ($anonymousReadError -or $anonymousNoCwd.Count -gt 0) {
+    [Console]::Error.WriteLine('fleet.ps1: ROSTER SUPPRESSED (exit 4). A confident roster here could send a replacement seat into a worktree a live session holds:')
+    foreach ($s in $stops) { [Console]::Error.WriteLine("  - $s") }
+    exit 4
+}
 
 if ($Chip) {
     $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1

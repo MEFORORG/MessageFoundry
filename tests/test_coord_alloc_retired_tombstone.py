@@ -346,6 +346,20 @@ def test_check_warns_of_a_record_on_the_share_and_never_touches_it(
     assert share_file.exists() is on_share
 
 
+def test_check_does_not_warn_when_the_root_is_the_local_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root naming this clone's own mefor-coord is the local registry. A warning there would send
+    an operator to delete the one tombstone stale copies read."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    assert _tombstone(repo).returncode == 0
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(_common_dir(repo) / "mefor-coord").upper())
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert "PRESENT" in checked.stdout and "WARNING" not in checked.stdout, checked.stdout
+
+
 def test_an_unresolvable_shared_root_does_not_block_the_local_tombstone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
