@@ -326,6 +326,26 @@ def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
     assert f"ABSENT: {local}" in absent.stdout
 
 
+@pytest.mark.parametrize("on_share", [True, False], ids=["record-on-share", "share-clean"])
+def test_check_warns_of_a_record_on_the_share_and_never_touches_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_share: bool
+) -> None:
+    """A tombstone an older revision left on a configured share could lift a live allocator there,
+    so -Check names it. The exit code stays the local registry's, and the share file is untouched."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    shared = tmp_path / "shared-root"
+    share_file = shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    share_file.parent.mkdir(parents=True)
+    if on_share:
+        share_file.write_text(json.dumps({"tombstone": True}), encoding="utf-8")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 1, checked.stdout + checked.stderr
+    assert ("WARNING" in checked.stdout) is on_share, checked.stdout
+    assert share_file.exists() is on_share
+
+
 def test_an_unresolvable_shared_root_does_not_block_the_local_tombstone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

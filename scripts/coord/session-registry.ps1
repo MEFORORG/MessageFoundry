@@ -173,6 +173,21 @@ function Get-RecordField($Record, [string]$Name) {
     return $null
 }
 
+# A record's startedAt as a UTC DateTime, or $null when it is missing, not a number, out of
+# FromUnixTimeMilliseconds's range, or in the future (a minute of slop for clock jitter). Parsed as a
+# double and rounded, as the [int64] cast this replaced did, so a fractional value still counts; NaN
+# fails both bounds. A future start cannot be a real registration, so it is unusable, which keeps a
+# far-future value from reading STALE where the old cast threw, and from never aging out.
+function Get-RecordStartedUtc($Record) {
+    $ms = 0.0
+    if (-not [double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
+            [cultureinfo]::InvariantCulture, [ref]$ms) -or
+        -not ($ms -ge -62135596800000 -and $ms -le 253402300799999)) { return $null }
+    $at = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
+    if ($at -gt [DateTime]::UtcNow.AddMinutes(1)) { return $null }
+    return $at
+}
+
 # Every registry record, with the root it came from attached.
 #
 # -IncludeUnreadable also returns a row for every file that could NOT be parsed (Record = $null,
@@ -239,18 +254,11 @@ function Test-RecordLiveness {
         # upgrading it to LIVE: an unverifiable fence is not a passed fence.
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; start time unreadable" }
     }
-    # Parsed as a double and rounded, as the [int64] cast this replaced did, so a fractional value is
-    # still fenced. The bounds are FromUnixTimeMilliseconds's own; NaN fails both comparisons.
-    $startedMs = 0.0
-    $registered = $null
-    if ([double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
-            [cultureinfo]::InvariantCulture, [ref]$startedMs) -and
-        $startedMs -ge -62135596800000 -and $startedMs -le 253402300799999) {
-        $registered = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$startedMs).LocalDateTime
-    }
-    if ($null -eq $registered) {
+    $startedUtc = Get-RecordStartedUtc $Record
+    if ($null -eq $startedUtc) {
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no usable startedAt" }
     }
+    $registered = $startedUtc.ToLocalTime()
 
     # A process cannot have started after the session it hosts registered (small forward slop for
     # clock jitter). Started much later => this pid was recycled onto a different process.
@@ -259,7 +267,7 @@ function Test-RecordLiveness {
         return @{ State = "STALE"; Detail = "pid $procId reused (process started $([long]$delta)m after the session)" }
     }
     if ($delta -lt (-1 * $StartSkewMinutes)) {
-        # [long], not [int]: a far-future startedAt puts the gap past Int32 minutes, and the cast threw.
+        # [long], not [int]: a gap past Int32 minutes made the cast throw.
         return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([long](-$delta))m" }
     }
     return @{ State = "LIVE"; Detail = "" }
@@ -271,11 +279,15 @@ function Test-RecordLiveness {
 # mid-write, so a gone answer beside one is not a gone answer. Under StrictMode the lookup used to
 # throw on it, which seat.ps1 refused on; skipping it silently would turn that refusal into a clear.
 #
-# WHY ONLY A FRESH ONE VETOES. A record that never gains its session id would otherwise block every
-# clear on the box until someone deleted it. Fresh means its startedAt, or the file's last write when
-# startedAt is unusable, is within $FreshHours. The default of 24 is box-activity.ps1's FreshHours,
-# which bounds its own veto over unparsed registry files: the same "may be this session mid-launch"
-# shape. An older one is returned with Fresh = $false, for the caller to report.
+# WHICH ONES VETO (Fresh = $true). A LIVE one always does: its pid and start time say it is running,
+# and it stops vetoing on its own when that process exits. A non-LIVE one (UNVERIFIED or UNREADABLE)
+# vetoes only while fresh, or a record that never gains its session id would block every clear on
+# the box until someone deleted it. Its age is taken from the newer of its startedAt and its file's
+# last write, a future value of either being ignored; a file that vanished between the listing and
+# this read is the shape of one being replaced right now, so it counts as fresh. The default of 24
+# hours is box-activity.ps1's FreshHours, which bounds its own veto over unparsed registry files: the
+# same "may be this session mid-launch" shape. An older one is returned with Fresh = $false, for the
+# caller to report.
 function Get-AnonymousSessionRecords {
     [CmdletBinding()]
     param(
@@ -289,20 +301,14 @@ function Get-AnonymousSessionRecords {
         if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
         $state = (Test-RecordLiveness -Record $r.Record -StartSkewMinutes $StartSkewMinutes).State
         if ($state -in @('DEAD', 'STALE')) { continue }
-        $at = $null
-        $ms = 0.0
-        if ([double]::TryParse([string](Get-RecordField $r.Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
-                [cultureinfo]::InvariantCulture, [ref]$ms) -and
-            $ms -ge -62135596800000 -and $ms -le 253402300799999) {
-            $at = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
-        } else {
-            $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
-            # A file that vanished between the listing and this read is the shape of one being
-            # replaced right now, so it counts as fresh.
-            $at = if ($item) { $item.LastWriteTimeUtc } else { $now }
-        }
-        $ageH = ($now - $at).TotalHours
-        $out += [pscustomobject]@{ File = $r.File; State = $state; AgeHours = $ageH; Fresh = ($ageH -lt $FreshHours) }
+        $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
+        $times = @((Get-RecordStartedUtc $r.Record), $(if ($item) { $item.LastWriteTimeUtc })) |
+            Where-Object { $null -ne $_ -and $_ -le $now.AddMinutes(1) }
+        $ageH = if ($times) { ($now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours }
+                elseif (-not $item) { 0 }
+                else { [double]::PositiveInfinity }
+        $fresh = ($state -eq 'LIVE') -or ($ageH -lt $FreshHours)
+        $out += [pscustomobject]@{ File = $r.File; State = $state; AgeHours = $ageH; Fresh = $fresh }
     }
     return $out
 }
@@ -331,7 +337,7 @@ function Get-SessionLiveness {
         $fresh = @($anon | Where-Object { $_.Fresh } | ForEach-Object { $_.File })
         $old = @($anon | Where-Object { -not $_.Fresh } | ForEach-Object { $_.File })
         if ($fresh.Count -gt 0) {
-            return @{ Veto = $true; Note = "but $($fresh.Count) possibly-live record(s) written in the last ${AnonymousFreshHours}h name no session, and one may be it: $($fresh -join '; ')" }
+            return @{ Veto = $true; Note = "but $($fresh.Count) record(s) that are LIVE or were written in the last ${AnonymousFreshHours}h name no session, and one may be it:$($fresh -join '; ')" }
         }
         if ($old.Count -gt 0) {
             return @{ Veto = $false; Note = "; $($old.Count) older record(s) name no session and do not veto: $($old -join '; ')" }

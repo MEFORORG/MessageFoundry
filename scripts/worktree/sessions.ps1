@@ -252,7 +252,10 @@ if ($Rehome) {
     # A negative from one signal must never by itself authorise a destructive move.
     . "$PSScriptRoot\..\coord\session-registry.ps1"
     $reg = Get-SessionLiveness -SessionId $s.Id
-    if ($reg.State -in @("LIVE", "UNVERIFIED") -and -not $Force -and -not $WhatIfPreference) {
+    # UNREADABLE vetoes too: the fence could not be evaluated, or a record naming no session may be
+    # this one (session-registry.ps1's header). Such a record used to throw here, which stopped the
+    # move; reading UNREADABLE must stop it the same way (BACKLOG #5491).
+    if ($reg.State -in @("LIVE", "UNVERIFIED", "UNREADABLE") -and -not $Force -and -not $WhatIfPreference) {
         throw ("Session $($s.Id) is $($reg.State) in the session registry (pid $($reg.Record.pid)" +
                "$(if ($reg.Detail) { "; $($reg.Detail)" })) -- it is still RUNNING and moving its " +
                "transcript would corrupt it. Its transcript may look idle: subagent output is filed " +

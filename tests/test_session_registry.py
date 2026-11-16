@@ -408,11 +408,48 @@ def _anonymous(config_root: Path, name: str, record: dict[str, Any], age_h: floa
 
 def test_an_old_record_naming_no_session_is_reported_but_does_not_veto(config_root: Path) -> None:
     """The twin of the veto: one that never gains its id must not block every clear for good. Its
-    startedAt is two days old, and it has no pid, so its own fence is UNREADABLE, not gone."""
-    _anonymous(config_root, "99007.json", {"startedAt": NOW_MS - 48 * 3600 * 1000})
+    startedAt and its file are two days old, and it has no pid, so its fence is UNREADABLE."""
+    _anonymous(config_root, "99007.json", {"startedAt": NOW_MS - 48 * 3600 * 1000}, age_h=48)
     got = liveness(config_root, "5491eeee")
     assert got["State"] == "UNKNOWN", got
     assert "99007.json" in got["Detail"], got
+
+
+def test_an_old_startedat_on_a_freshly_written_file_still_vetoes(config_root: Path) -> None:
+    """Age is the newer of startedAt and the file's last write: a rewrite seconds ago is fresh."""
+    _anonymous(config_root, "99011.json", {"startedAt": NOW_MS - 48 * 3600 * 1000})
+    assert liveness(config_root, "5491a1a1")["State"] == "UNREADABLE"
+
+
+@pytest.mark.parametrize(("age_h", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
+def test_a_future_startedat_is_ignored_and_the_file_age_decides(
+    config_root: Path, age_h: float, state: str
+) -> None:
+    """A negative age is not fresh, or one future-dated record would veto until that date."""
+    future = NOW_MS + 10 * 365 * 24 * 3600 * 1000
+    _anonymous(config_root, "99012.json", {"startedAt": future}, age_h=age_h)
+    assert liveness(config_root, "5491b2b2")["State"] == state
+
+
+@pytest.mark.parametrize(
+    ("record", "state"),
+    [
+        ({"pid": os.getpid(), "startedAt": NOW_MS}, "UNREADABLE"),
+        ({"startedAt": NOW_MS}, "UNKNOWN"),
+    ],
+    ids=["live-vetoes-whatever-its-age", "unreadable-past-the-bound-does-not"],
+)
+def test_a_live_record_naming_no_session_vetoes_past_the_freshness_bound(
+    config_root: Path, record: dict[str, Any], state: str
+) -> None:
+    """A LIVE one stops vetoing when its process exits, so the bound does not apply to it. A bound of
+    zero hours makes every record old; only the LIVE one still vetoes."""
+    _anonymous(config_root, "99013.json", record)
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491c3c3' -ConfigRoot '{config_root}' "
+        "-AnonymousFreshHours 0).State"
+    )
+    assert got == state
 
 
 @pytest.mark.parametrize(("age_h", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
@@ -433,17 +470,20 @@ def test_no_anonymous_veto_leaves_a_gone_match_gone(config_root: Path) -> None:
     assert got == "DEAD"
 
 
-def test_fleet_reports_an_anonymous_record_once_and_keeps_each_seats_own_verdict(
-    tmp_path: Path,
-) -> None:
-    """A fresh record naming no session must not mark every gone seat POSSIBLY RUNNING."""
+def _fleet(
+    tmp_path: Path, anonymous: dict[str, Any] | None, coord: Path | None = None
+) -> tuple[dict[str, Any], Path, Path]:
+    """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
+    registry record that names no session. Returns the JSON, the repo and the anonymous file."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
     write_session(root, pid=never_live_pid(), session_id="5491dead-0000-0000-0000-000000000000")
-    anon = _anonymous(root, "99010.json", {"pid": os.getpid(), "startedAt": NOW_MS})
-
     repo = tmp_path / "repo"
+    anon = root / "sessions" / "99010.json"
+    if anonymous is not None:
+        anon.write_text(json.dumps({"cwd": str(repo), **anonymous}), encoding="utf-8")
+
     repo.mkdir()
     for args in (
         ["init", "-q", "-b", "main"],
@@ -477,7 +517,7 @@ def test_fleet_reports_an_anonymous_record_once_and_keeps_each_seats_own_verdict
         if k.upper() not in {"USERPROFILE", "MEFOR_COORD_ROOT", "CLAUDE_CODE_SESSION_ID"}
     }
     env.update(USERPROFILE=str(home), MEFOR_COORD_ROOT=str(shared))
-    fleet = REGISTRY.parent / "fleet.ps1"
+    fleet = (coord or REGISTRY.parent) / "fleet.ps1"
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), "-Json"],
         cwd=str(repo),
@@ -488,11 +528,115 @@ def test_fleet_reports_an_anonymous_record_once_and_keeps_each_seats_own_verdict
         env=env,
     )
     assert proc.returncode in (0, 2), proc.stderr
-    j = json.loads(proc.stdout)
+    j: dict[str, Any] = json.loads(proc.stdout)
+    return j, repo, anon
+
+
+def _anonymous_stops(j: dict[str, Any]) -> list[str]:
+    return [s for s in j["receipt"]["stopConditions"] if s.startswith("anonymousLiveRecords=")]
+
+
+def test_fleet_reports_an_anonymous_record_once_and_keeps_each_seats_own_verdict(
+    tmp_path: Path,
+) -> None:
+    """A live record naming no session must not mark every gone seat POSSIBLY RUNNING. It is one
+    stop condition instead, so no seat is offered for respawn while it exists, and it counts as a
+    live session in the repo without reading as a seat writer that failed."""
+    j, _, anon = _fleet(tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS})
     rows = {r["Box"]: r for r in j["rows"]}
     assert rows["box-5491"]["Fence"] == "DEAD", rows["box-5491"]
-    assert j["receipt"]["anonymousLiveRecords"] == 1, j["receipt"]
-    assert str(anon) in j["receipt"]["anonymousLiveRecordFiles"]
+    receipt = j["receipt"]
+    assert receipt["anonymousLiveRecords"] == 1, receipt
+    assert str(anon) in receipt["anonymousLiveRecordFiles"]
+    stops = _anonymous_stops(j)
+    assert len(stops) == 1 and str(anon) in stops[0] and "respawn" in stops[0], stops
+    assert receipt["liveSessionsInRepo"] == 1, receipt
+    assert receipt["liveSessionsWithoutRecord"] == 0, receipt
+
+
+def test_fleet_fires_no_anonymous_stop_without_such_a_record(tmp_path: Path) -> None:
+    """The twin: with only the seat's own DEAD record, no anonymous stop and a zero count."""
+    j, _, _ = _fleet(tmp_path, None)
+    assert j["receipt"]["anonymousLiveRecords"] == 0, j["receipt"]
+    assert _anonymous_stops(j) == []
+
+
+def test_fleet_names_a_failed_anonymous_scan_as_a_stop_not_a_count(tmp_path: Path) -> None:
+    """An instrument that failed must not read as one stray record. The scan is made to throw in a
+    copy of the scripts, so the real ones are untouched."""
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
+        shutil.copy2(REGISTRY.parent / name, coord / name)
+    broken = REGISTRY.read_text(encoding="utf-8") + (
+        "\nfunction Get-AnonymousSessionRecords { throw 'scan-broke-5491' }\n"
+    )
+    (coord / "session-registry.ps1").write_text(broken, encoding="utf-8")
+    j, _, _ = _fleet(tmp_path, None, coord=coord)
+    assert j["receipt"]["anonymousLiveRecords"] is None, j["receipt"]
+    stops = _anonymous_stops(j)
+    assert len(stops) == 1 and "scan-broke-5491" in stops[0], stops
+
+
+@pytest.mark.parametrize(
+    ("pid", "refused"), [("not-a-number", True), (None, False)], ids=["unreadable", "dead"]
+)
+def test_sessions_rehome_refuses_an_unreadable_fence(
+    tmp_path: Path, pid: str | None, refused: bool
+) -> None:
+    """sessions.ps1 moves a transcript, so an UNREADABLE fence must stop it. A non-numeric pid used
+    to throw in the fence, which stopped the move; reading UNREADABLE must stop it the same way. The
+    twin, a DEAD record, passes the guard and finds the transcript already filed."""
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "worktree").mkdir(parents=True)
+    (repo / "scripts" / "coord").mkdir(parents=True)
+    shutil.copy2(REGISTRY.parents[1] / "worktree" / "sessions.ps1", repo / "scripts" / "worktree")
+    shutil.copy2(REGISTRY, repo / "scripts" / "coord")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True)
+    primary = (
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        .stdout.splitlines()[0]
+        .removeprefix("worktree ")
+        .replace("/", "\\")
+    )
+    home = tmp_path / "home"
+    root = home / ".claude"
+    sid = "5491eeee-1111-2222-3333-444444444444"
+    slug = "".join(c if c.isalnum() else "-" for c in primary)
+    transcript = root / "projects" / slug / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "cwd": primary}) + "\n", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(transcript, (old, old))
+    (root / "sessions").mkdir()
+    (root / "sessions" / "1.json").write_text(
+        json.dumps(
+            {"pid": pid if pid else never_live_pid(), "sessionId": sid, "startedAt": NOW_MS}
+        ),
+        encoding="utf-8",
+    )
+    env = {k: v for k, v in os.environ.items() if k.upper() not in {"USERPROFILE"}}
+    env["USERPROFILE"] = str(home)
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(repo / "scripts" / "worktree" / "sessions.ps1"), "-Rehome", sid[:8]],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        env=env,
+    )
+    if refused:
+        assert proc.returncode != 0 and "UNREADABLE" in proc.stderr, proc.stdout + proc.stderr
+    else:
+        assert proc.returncode == 0 and "already filed" in proc.stdout, proc.stdout + proc.stderr
+    assert transcript.exists()
 
 
 def test_a_gone_match_beside_a_live_record_naming_no_session_is_unreadable(
@@ -515,10 +659,11 @@ def test_a_dead_record_naming_no_session_does_not_veto(config_root: Path) -> Non
     assert liveness(config_root, "5491dddd")["State"] == "UNKNOWN"
 
 
-def test_a_far_future_startedat_is_stale_not_a_throw_under_strict_mode() -> None:
-    """The gap in minutes passes Int32 there; the detail's cast must not throw."""
+def test_a_far_future_startedat_is_unverified_not_stale_or_a_throw_under_strict_mode() -> None:
+    """No session registers in the future, so the start is unusable: UNVERIFIED, which every caller
+    treats as possibly live. The cast this replaced threw, which stopped them all; STALE would not."""
     record = {"pid": os.getpid(), "sessionId": "s", "startedAt": 200_000_000_000_000}
-    assert _strict_fence(record) == "STALE"
+    assert _strict_fence(record) == "UNVERIFIED"
 
 
 def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(

@@ -170,10 +170,10 @@ foreach ($row in $sessionRows) {
     $cwd = $null
     if ($row.Record.PSObject.Properties.Name -contains 'cwd') { $cwd = Get-NormPath ([string]$row.Record.cwd) }
     if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
-    # A record that names no session cannot be matched to a seat record, so counting it would report
-    # a writer failure that is not one. A bare read of the field throws under this file's StrictMode.
+    # A record that names no session is still a live session here, whatever its age, so it counts.
+    # It cannot be matched to a seat record, so it is left out of liveWithoutRecord below; the
+    # anonymous-record stop reports it instead. A bare read of the field throws under StrictMode.
     $liveSid = [string](Get-RecordField $row.Record 'sessionId')
-    if (-not $liveSid) { continue }
     $l = Test-RecordLiveness -Record $row.Record
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
@@ -185,17 +185,19 @@ foreach ($row in $sessionRows) {
     }
 }
 
-# Fresh, possibly-live registry records that name no session (session-registry.ps1,
-# Get-AnonymousSessionRecords). Reported once here, by file, rather than as a veto on every seat.
+# Registry records that name no session and are LIVE or fresh (session-registry.ps1,
+# Get-AnonymousSessionRecords). Reported once, by file, and as a stop condition below rather than as a
+# veto on every seat: a seat that relaunched may be one of them, so no seat is safe to respawn.
 $anonymousLive = @()
+$anonymousReadError = ''
 try {
     $anonymousLive = @(Get-AnonymousSessionRecords -Records $sessionRows | Where-Object { $_.Fresh } | ForEach-Object { $_.File })
 } catch {
-    $anonymousLive = @("(the read failed: $($_.Exception.Message))")
+    $anonymousReadError = $_.Exception.Message
 }
 
 $recordedSessionIds = @($records | ForEach-Object { [string]$_.Rec.sessionId } | Where-Object { $_ })
-$liveWithoutRecord = @($liveInRepo | Where-Object { $recordedSessionIds -notcontains $_.SessionId })
+$liveWithoutRecord = @($liveInRepo | Where-Object { $_.SessionId -and $recordedSessionIds -notcontains $_.SessionId })
 
 # Writer heartbeat. "Installed", "resolvable" and "actually ran" are three different sentences and
 # the first alone answers the neighbouring question.
@@ -497,7 +499,9 @@ foreach ($r in $records) {
 
 $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
-if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
+if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
+if ($anonymousLive.Count -gt 0) { $stops += "anonymousLiveRecords=$($anonymousLive.Count) -- registry record(s) name no session and are live or freshly written ($($anonymousLive -join '; ')); a relaunched seat may be one of them, so no seat below is safe to respawn" }
+if ($liveWithoutRecord.Count -gt 0) { $stops +="liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
@@ -577,8 +581,9 @@ $receipt = [ordered]@{
     recordsUnreadable         = $unreadableRecords
     liveSessionsInRepo        = $liveInRepo.Count
     liveSessionsWithoutRecord = $liveWithoutRecord.Count
-    anonymousLiveRecords      = $anonymousLive.Count
-    anonymousLiveRecordFiles  = if ($anonymousLive.Count) { $anonymousLive -join '; ' } else { 'none' }
+    # Null, not 0, when the scan failed: an unmeasured count must not read as none.
+    anonymousLiveRecords      = if ($anonymousReadError) { $null } else { $anonymousLive.Count }
+    anonymousLiveRecordFiles  = if ($anonymousReadError) { "the scan failed: $anonymousReadError" } elseif ($anonymousLive.Count) { $anonymousLive -join '; ' } else { 'none' }
     writerHeartbeatIn        = $heartbeats.Count
     writerErrorLines          = $writerErrors
     repoWorktrees             = $repoWorktrees.Count

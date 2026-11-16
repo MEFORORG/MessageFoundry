@@ -114,7 +114,7 @@ $thisHost = Get-CoordHost
 # PRESENT. The share helps no stale copy, and it can hurt: at least a share another repository also
 # names could carry the record to a LIVE allocator. So it stays off the share. (A vault worktree of
 # THIS clone shares the local registry instead; the header's ONE SHARED-REGISTRY CASE covers it.)
-$registry = Join-Path $GitCommonDir 'mefor-coord' 'alloc' 'backlog'
+$registry = Join-Path (Join-Path (Join-Path $GitCommonDir 'mefor-coord') 'alloc') 'backlog'
 $file = Join-Path $registry "$TombstoneNumber.json"
 
 function Test-IsTombstone([string]$Path) {
@@ -125,6 +125,16 @@ function Test-IsTombstone([string]$Path) {
 }
 
 if ($Check) {
+    # A tombstone on a configured share was never this script's to write there (an older revision
+    # did), and it could lift a live allocator that reads that share. Warn; never write or remove it,
+    # and leave the exit code to the local registry. An unresolvable share is skipped silently.
+    $shared = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
+    if (-not $shared.Error -and $shared.Source -ne 'local') {
+        $sharedFile = Join-Path (Join-Path $shared.Path 'backlog') "$TombstoneNumber.json"
+        if (Test-Path -LiteralPath $sharedFile) {
+            Write-Host "WARNING: a record sits at $sharedFile on the shared root. This script never writes there, and a live allocator reading that share would be lifted by it; check it and remove it by hand."
+        }
+    }
     if (-not (Test-Path -LiteralPath $file)) {
         Write-Host "ABSENT: $file"
         exit 1
