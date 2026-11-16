@@ -66,7 +66,7 @@ A text body is any `content_type` that is not binary. Today the binary types are
 | 3 | The body holds no MLLP frame byte (`0x0B` or `0x1C`) inside the message | `check_decoded`, `IngressFrameByteRejected` | `hl7v2` only |
 | 4 | The body holds one `MSH` segment, not two or more | `check_decoded`, `IngressMultipleMessagesRejected` | `hl7v2` only |
 | 5 | The decoded text is no longer than `INGRESS_MAX_BYTES` | `check_decoded` | every text type except `hl7v2` |
-| 6 | The first bytes match the declared type | `check_declared_type` | every text type except `hl7v2` |
+| 6 | The first bytes match the declared type | `check_declared_type` | every text type except `hl7v2`. It sniffs `json`, `fhir`, `xml` and `x12`; a `text` body passes it unchecked |
 | 7 | The body parses as an HL7 v2 message, inside its size limits | `Peek.parse` | `hl7v2` only |
 | 8 | The message passes strict structural validation | `validate` in `parsing/validate.py` | `hl7v2`, and only when the inbound turns it on |
 
@@ -89,8 +89,9 @@ check 3, and
 ### What a binary body must pass
 
 A binary body is never decoded as text. It must be no larger than `INGRESS_MAX_BYTES`
-(`check_binary_size`), and its first bytes must match the declared type (`check_declared_type`). It
-is then carried as base64 by `carry_binary_ingress`.
+(`check_binary_size`), and `check_declared_type` holds its first bytes to the declared type. Of the
+binary types it sniffs only `dicom`; a `binary` body passes it unchecked, because opaque bytes have
+no reliable signature. It is then carried as base64 by `carry_binary_ingress`.
 [ADR 0028](adr/0028-base64-binary-carriage-codec.md) defines that carriage form.
 
 ### What happens to a body that fails a check
@@ -165,9 +166,15 @@ check 6 on any type but `hl7v2`. Among the binary types check 6 sniffs at least 
 `binary` or `text` reply passes it unchecked, because `_content_matches_declared` accepts both
 without a signature. Check 6 skips a reply that is empty or all white
 space. An `hl7v2` reply over the engine's default ceiling skips checks 2 to 4 and is left to check
-7, `Peek.parse`, which refuses it. An `hl7v2` reply that passes those checks meets check 7, and a
-reply check 7 admits then meets the document handle marker check the HL7 v2 row further down names. Check 1 does not run,
-because the reply is already text, and check 8 does not run. A reply that fails is recorded with status `ERROR`.
+7, `Peek.parse`, which refuses it. An `hl7v2` reply that passes those checks meets check 7. A
+reply check 7 admits meets the document handle marker check the HL7 v2 row further down names only
+when `_read_ingress_fields` then reads its fields; a fault there of a type `PEEK_READ_FAULTS` names
+refuses the reply first, with `REINGRESS_PEEK_FAILED`. Check 1 does not run, because the reply is
+already text, and check 8 does not run. A reply a check refuses is recorded with status `ERROR`,
+with at least these exceptions. A reply that does not decrypt, or that holds a lone surrogate
+(`_unstorable_reply`), is dead-lettered by `dead_letter_now` before the size ceiling, and no
+`ERROR` child is stored for it. A refused reply on a token the handoff stores no child for, such as
+a depth-capped token, gets no `ERROR` child either.
 [ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 
 The two file sources run the type check themselves, before the shared handler. They call the same
