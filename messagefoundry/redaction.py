@@ -260,8 +260,11 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: no value printed on any of nine log paths that the code before it hid. The price: where such a
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
-#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
-#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
+#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme,
+#: and narrower in one way: since BACKLOG #5386 that pattern's user may be empty, and this arm's
+#: may not, so a password-only DSN does not switch the encoded run off and a PID run beside it is
+#: still hidden. The price is that run's own: where such a DSN sits in the run's token, the run takes
+#: it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
 #: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
 #: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
@@ -279,7 +282,7 @@ _CREDENTIAL_AHEAD = re.compile(
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
     r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
-    r"""|(?i:\bbearer)\s|://[^\s:/]*:[^\s/@]+@"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
     r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
 )
 

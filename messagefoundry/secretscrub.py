@@ -1285,13 +1285,18 @@ _KEY_MATERIAL = re.compile(
 # without a red -- and a differential arm that fails if either earlier head ever redacts something this
 # one does not.
 #
-# THE USER MAY BE EMPTY, AND EITHER HALF MAY HOLD AN "@" (BACKLOG #5386). The user was
+# THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@" (BACKLOG #5386). The user was
 # ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
-# printed the password whole, and neither did a user holding an "@", as the ``user@server`` login of
-# a hosted database or an e-mail address does. The password was ``[^\s/@]+``, so it stopped at its
-# own first "@": an unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed.
-# Now the user is ``[^\s:/]*``, running to the first ":". The password is the old first segment,
-# taken possessively, then a run that may hold an "@", and the match ends at the last "@" in it.
+# printed the password whole. The password was ``[^\s/@]+``, so it stopped at its own first "@": an
+# unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed. Now the user is
+# ``[^\s:/@]*``. The password is the old first segment, taken possessively, then a run that may hold
+# an "@", and the match ends at the last "@" in it.
+#
+# THE USER STILL HOLDS NO "@". A user running to the first ":" was tried and regressed: in
+# ``postgres://svc@db:5432;sslpassword=Tail@Secret9`` it read ``svc@db`` as the user and ``5432;...``
+# as the password, and the member's tail printed; in ``http://user@host:8080,admin@corp`` it hid a
+# port and a host that hold no secret. So a user holding an "@", as the ``user@server`` login of a
+# hosted database does, is a residual: its password prints, as it did before #5386.
 #
 # A FURTHER SEGMENT STOPS AT A SEPARATOR, and it has to. Running the password to the last "@" in
 # the token was tried first and swallowed the next member's label whenever that member's value held
@@ -1309,7 +1314,7 @@ _KEY_MATERIAL = re.compile(
 # not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
 # reads no nested quantifier.
 _DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

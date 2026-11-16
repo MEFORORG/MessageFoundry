@@ -3148,11 +3148,25 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         *secretscrub._KEY_MATERIAL_WORDS,
     }
     assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
-    # The arm is the DSN pattern's user, colon and first password segment, then the "@" every match
-    # reaches next, so it matches wherever the pattern does (BACKLOG #5386).
-    url_arm = r"://[^\s:/]*:[^\s/@]+@"
+    # The arm is the DSN pattern's colon and first password segment, then the "@" every match reaches
+    # next. Its user takes ``+`` where the pattern's takes ``*`` since BACKLOG #5386, the exception
+    # ``_CREDENTIAL_AHEAD``'s comment states, so the user classes are held apart here.
+    url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
-    assert r"://[^\s:/]*):[^\s/@]++" in secretscrub._DSN_PASSWORD.pattern
+    assert r"://[^\s:/@]*):[^\s/@]++" in secretscrub._DSN_PASSWORD.pattern
+
+
+def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:
+    """The URL arm keeps a non-empty user (review of BACKLOG #5386). With an empty user allowed, a
+    password-only DSN switched the encoded run off and the PID run beside it printed. Positive
+    control: the same run alone is hidden, and a DSN with a user still switches it off."""
+    run = "id=PID%7C1%7C%7CMRN4455667%5E%5E%5EH"
+    assert "MRN4455667" not in redaction.redact(f"x {run}")
+    assert "MRN4455667" not in redaction.redact(f"smtp://:pw@corp.invalid:587 {run}")
+    assert "MRN4455667" not in redaction.redact(f"smtp://ops@corp.invalid:587,x {run}")
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://ops:pw@corp.invalid:587") is not None
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://:pw@corp.invalid:587") is None
+    assert redaction._CREDENTIAL_AHEAD.search("smtp://ops@corp.invalid:587,admin@corp") is None
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:

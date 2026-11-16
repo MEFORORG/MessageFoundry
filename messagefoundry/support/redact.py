@@ -521,10 +521,10 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# Why the user is ``*`` and both halves may hold an "@" (BACKLOG #5386) is stated on the same
-# pattern in ``messagefoundry/secretscrub.py``.
+# Why the user may be empty and the password may hold an "@", and why the user still may not hold one
+# (BACKLOG #5386), is stated on the same pattern in ``messagefoundry/secretscrub.py``.
 _DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
 )
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.

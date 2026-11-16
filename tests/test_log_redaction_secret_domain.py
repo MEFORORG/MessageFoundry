@@ -1288,17 +1288,6 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             ("pw-At", "Sign_Pw-72"),
             "://svc:",
         ),
-        # A user holding an "@": the hosted-database user@server login, and an e-mail address.
-        (
-            "store dsn postgres://svc@mydb:pw-Usr_At_Pw-74@mydb.db.invalid:5432/mefor",
-            ("pw-Usr_At_Pw-74",),
-            "://svc@mydb:",
-        ),
-        (
-            "alerts smtp://alerts@corp.invalid:pw-Smtp_Pw-75@smtp.invalid:587",
-            ("pw-Smtp_Pw-75",),
-            "smtp://alerts@corp.invalid:",
-        ),
         # Both at once, two "@" signs in the password.
         (
             "store dsn mssql+pyodbc://:pw@Two@Ats-73@db.invalid/mefor",
@@ -1357,6 +1346,49 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
         for piece in pieces:
             assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
+
+
+@pytest.mark.parametrize(
+    ("line", "pieces", "kept"),
+    [
+        # A user-only DSN with a later member whose value holds an "@". A user running to the first
+        # ":" read ``svc@db`` as the user and swallowed the member's label, so its tail printed.
+        (
+            "store dsn postgres://svc@db.invalid:5432;sslpassword=Tail@Mem_Sec-79",
+            ("Tail", "Mem_Sec-79"),
+            "postgres://svc@db.invalid:5432;sslpassword=",
+        ),
+        # No secret at all: a user, a port and a second address. Nothing here may be hidden.
+        (
+            "proxy http://user@host.invalid:8080,admin@corp.invalid up",
+            (),
+            "proxy http://user@host.invalid:8080,admin@corp.invalid up",
+        ),
+    ],
+)
+def test_a_dsn_user_holding_no_password_is_not_read_as_one(
+    line: str, pieces: tuple[str, ...], kept: str
+) -> None:
+    """The review of BACKLOG #5386 measured both of these regress when the user could hold an "@".
+    Both copies of the pattern refuse them, and the public entry points mask only the member's value."""
+    for label, pattern in (
+        ("support.redact pattern", redact_mod._DSN_PASSWORD),
+        ("secretscrub pattern", scrub_mod._DSN_PASSWORD),
+    ):
+        assert pattern.search(line) is None, f"{label} matched {line!r}"
+    for label, out in (
+        ("support.redact", redact_log_line(line)),
+        ("secretscrub", scrub_credentials(line)),
+    ):
+        for piece in pieces:
+            assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
+        assert kept in out, f"{label}: over-redacted -- got {out!r}"
+    # Positive control: the same shape with a password is still read, so the refusal above is the
+    # user class and not a pattern that matches nothing.
+    with_pw = line.replace("svc@", "svc:pw-Ctl_Pw-80@").replace("user@", "user:pw-Ctl_Pw-80@")
+    for pattern in (redact_mod._DSN_PASSWORD, scrub_mod._DSN_PASSWORD):
+        assert pattern.search(with_pw) is not None
+    assert "pw-Ctl_Pw-80" not in scrub_credentials(with_pw)
 
 
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
