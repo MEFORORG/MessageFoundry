@@ -351,7 +351,8 @@ def _tee_line(
 
     Each candidate is logged only if, on EVERY sink, every word what the handlers write for it
     shows, counted and in both :func:`_line_words` readings, is one the same sink showed for the
-    old line: the line with every scrubbed field, then
+    old line, and what it writes parses as JSON wherever the old line's did (the parse floor,
+    review round-f23e89a6): the line with every scrubbed field, then
     the old line with each field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed
     ``detail`` as ``whole_detail``, then the old line itself, which meets the bar trivially and
     so ends the search. Each handler runs the whole chain again over the one shared record, so
@@ -369,11 +370,14 @@ def _tee_line(
         for k, v in before.items()
     }
     try:
-        bars = [_line_words(reading) for reading in sink_readings(old_line)]
+        bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
         for candidate in (after,) if whole == after else (after, whole):
             line = json.dumps(candidate, ensure_ascii=False)
             readings = sink_readings(line)
-            if all(_shows_no_more(r, bar) for r, bar in zip(readings, bars, strict=True)):
+            if all(
+                _shows_no_more(r, words) and (_parses(r) or not parsed)
+                for r, (words, parsed) in zip(readings, bars, strict=True)
+            ):
                 return line
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)
@@ -487,7 +491,8 @@ def emit_audit_tee(
     text passes before it is encoded, wherever it holds a C0 control; :func:`_scrub_field` says
     how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
     chain hid of the whole record as it was encoded before #3045, on each of up to three sinks,
-    so on each sink it redacts no less than that line did there. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
+    so on each sink it redacts no less than that line did there, and parses as JSON wherever that
+    line did. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
     through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
     ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
     HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no

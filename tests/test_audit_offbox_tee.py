@@ -954,6 +954,34 @@ def test_no_sink_shows_a_word_the_line_before_3045_hid_there(monkeypatch) -> Non
     assert not shown, shown[:10]
 
 
+def _unparsed_per_sink_where_main_parsed(
+    cases: list[dict[str, str | None]], monkeypatch
+) -> list[tuple[int, str]]:
+    """Each sink and case where the line before #3045, read on that sink, parsed as JSON and this
+    code's line, read on the same sink, does not."""
+    from messagefoundry.logging_setup import sink_readings
+
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    unparsed = []
+    for case, old, new in zip(cases, before, after, strict=True):
+        for sink, (old_out, new_out) in enumerate(
+            zip(sink_readings(old), sink_readings(new), strict=True), start=1
+        ):
+            if audit_tee._parses(old_out) and not audit_tee._parses(new_out):
+                unparsed.append((sink, ascii(case)))
+    return unparsed
+
+
+def test_a_line_that_parsed_on_main_still_parses_on_every_sink(monkeypatch) -> None:
+    """Review round-f23e89a6, finding 1: the word bar alone shipped a scrubbed line that parsed
+    on no sink where main's line parsed on each. The parse floor ships a later candidate that
+    parses there, or main's line. Synthetic value."""
+    cases: list[dict[str, str | None]] = [{"actor": "abc^Authorization: abcdef0123456789abcd\r| x"}]
+    assert not _unparsed_per_sink_where_main_parsed(cases, monkeypatch)
+    assert not _shown_per_sink_that_main_hid(cases, monkeypatch)
+
+
 #: Pieces for the seeded per-sink fuzz: controls, the log alphabet's DEL and U+2028, and the
 #: label, name, token and delimiter shapes the counterexamples above are made of.
 _FUZZ_PIECES = (
@@ -977,6 +1005,9 @@ def test_a_seeded_fuzz_shows_no_word_on_any_sink_the_line_before_3045_hid(monkey
         cases.append(_sweep_case(field, value))
     shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
     assert not shown, shown[:10]
+    # The parse floor: no sink loses the JSON that main's line kept there.
+    unparsed = _unparsed_per_sink_where_main_parsed(cases, monkeypatch)
+    assert not unparsed, unparsed[:10]
 
 
 def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> None:
