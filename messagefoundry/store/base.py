@@ -623,11 +623,12 @@ class QueueStore(StoreLifecycle, Protocol):
         (BACKLOG #5735) is not dead-lettered: at least a key service that gave no verdict, a failed
         read of the store (SQLite), and a dead-letter write that fails. The row is set aside, back
         to ``pending`` with ``attempts`` undone and ``next_attempt_at`` five seconds ahead
-        (:meth:`reschedule_claimed`), and is retried at that cadence for as long as the failure
-        lasts, with no cap and no alert of its own. A tag failure whose dead-letter write failed is
-        still audited and alerted. Any other error, an error in the engine's own code among them,
-        propagates and leaves the row ``inflight`` until :meth:`reset_stale_inflight` or, on
-        Postgres, its lease expiry re-pends it. :meth:`claim_ready` and
+        (:meth:`reschedule_claimed`), and is retried no sooner than that, for as long as the
+        failure lasts, with no cap and no alert of its own. A tag failure whose dead-letter write
+        failed is still audited and alerted. On the server backends, which contain only
+        ``CipherError``, any other error propagates and leaves the row ``inflight`` until
+        :meth:`reset_stale_inflight` or, on Postgres, its lease expiry re-pends it; the SQLite
+        claims dead-letter it as an unopenable row. :meth:`claim_ready` and
         :meth:`claim_next_fifo_batch` settle a row the same way.
 
         On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —

@@ -108,8 +108,8 @@ QUEUE_TAG_SELECT: Final = ", ".join(QUEUE_TAG_COLUMNS)
 
 #: How long a per-lane claim sets a row aside when opening it failed for a reason that is not the
 #: row (BACKLOG #5735): the row goes back to ``pending`` with ``next_attempt_at`` this far ahead, so
-#: a key-service outage is retried at this cadence rather than on every sweep, with no cap and no
-#: alert. Only ``claim_fifo_heads`` does not use it: it hands the fault to the pooled dispatcher's
+#: a key-service outage is retried no sooner than this rather than on every sweep, with no cap and
+#: no alert of its own. Only ``claim_fifo_heads`` does not use it: it hands the fault to the pooled dispatcher's
 #: ADR 0070 T17 path, whose own backoff, ``infra_fault_policy`` and ``lane_stuck`` alert bound it.
 #: Pooled mode still runs per-lane claims, at least an unordered lane's ``claim_ready`` and a batch
 #: window's ``claim_next_fifo``, and those are not bounded.

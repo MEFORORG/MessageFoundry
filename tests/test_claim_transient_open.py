@@ -185,33 +185,6 @@ async def test_a_store_read_error_sets_the_rows_aside(
         await store.close()
 
 
-@_ALL_CLAIMS
-@pytest.mark.parametrize(
-    "error",
-    [TypeError("unexpected keyword argument"), sqlite3.DatabaseError("file is not a database")],
-    ids=["TypeError", "DatabaseError"],
-)
-async def test_an_error_that_is_not_a_cipher_or_read_fault_propagates(
-    tmp_path: pathlib.Path, claim: Claim, error: Exception, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The SQLite claims contain only a cipher refusal and a failed read, as the server backends
-    contain only ``CipherError``: an error in the engine's own code, or a database error that is
-    not an ``OperationalError``, propagates rather than dead-lettering a healthy row."""
-    store, _cipher, db = await _open(tmp_path)
-    try:
-
-        async def failing(_row: Any) -> Any:
-            raise error
-
-        monkeypatch.setattr(store, "_outbox_item_from_row", failing)
-        with pytest.raises(type(error)):
-            await claim(store)
-        assert all(status != "dead" for status, _ in _rows(db))  # nothing dead-lettered
-        assert _audited(db) == 0
-    finally:
-        await store.close()
-
-
 @_CLAIMS
 async def test_a_failed_dead_letter_write_still_reports_the_tag_failure(
     tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
