@@ -506,13 +506,20 @@ def _ruff_repo_rev() -> str:
 
 def _locked_ruff_version() -> str:
     """The ruff constraints.lock installs -- what CI and every provisioned venv actually get."""
-    m = re.search(r"^ruff==(\S+)$", _CONSTRAINTS.read_text(encoding="utf-8"), re.MULTILINE)
-    assert m, (
+    # Marker-safe, as quality-advisory.yml reads it: uv writes `ruff==X ; <marker>` under the
+    # [tool.uv] environments limit, so the version ends at the first space or `;`. With markers,
+    # a resolver fork can pin ruff twice, once per platform, so every line is read, not the first.
+    found = re.findall(r"^ruff==([^\s;]+)", _CONSTRAINTS.read_text(encoding="utf-8"), re.MULTILINE)
+    assert found, (
         "no `ruff==<version>` line in constraints.lock, so there is nothing to hold the pre-commit "
         "rev against. constraints.lock is the hashless export of uv.lock; if ruff left the dev "
         "extra, this test goes with it rather than passing vacuously."
     )
-    return m.group(1)
+    assert len(set(found)) == 1, (
+        f"constraints.lock pins ruff at more than one version, {sorted(set(found))}, so one "
+        "pre-commit rev cannot match what every platform installs."
+    )
+    return found[0]
 
 
 def _pyproject_ruff_specifier() -> SpecifierSet:

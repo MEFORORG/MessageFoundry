@@ -17,7 +17,8 @@
   need #1498 open.** The Lander filed both on 2026-09-27 for Manager batch 164. This ADR names them
   as of 2026-10-02. §7.1 says which rows each covers. The five ODBC rows are a named gap by owner
   ruling since 2026-10-05, and their driver test is BACKLOG #3009. The paragraph below §7.1's ODBC
-  table holds the ruling's limits.
+  table holds the ruling's limits. §7.1's amendment of 2026-11-11 summarises the test's two
+  recorded results.
   **The three Vault hops §7.1 graded *a guard is possible* are guarded as of 2026-10-13, by owner
   ruling of that date (vault BACKLOG #2983).** Each refuses unless its own settings pair attests,
   and no CRL lever is built. §12 holds the ruling and its limits.
@@ -742,7 +743,9 @@ site could set, until BACKLOG #2987 removed it.) So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
 `ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
 crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
-true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
+true, as before. *(Corrected 2026-11-09, vault BACKLOG #2977 item 8: this read "as before; with
+`verify_tls=false` the hop is the verify-off gate's (#200), ECH or not". A REST destination with
+`ech_egress` and `verify_tls=false` is now refused at construction, before that gate.)*
 
 The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
 in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
@@ -835,7 +838,9 @@ an attested hop its record says no certificate revocation checking (OCSP/CRL) is
 the guard credits a CRL that the handshake still consults. That record and that ALLOW contradict
 each other. Whether such a context's CRL should admit the hop is not decided here. The AI broker writes its own records, not the
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
-because it dials rest.py's shared opener, which never relaxes. *(Note 2026-11-04: the open limit above is closed by
+because neither opener it can dial relaxes: rest.py's shared opener, or, since BACKLOG #5527, the
+anchored opener it holds, built by rest.py's `_no_redirect_opener`, which never calls
+`relax_verify_expiry`. *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
 words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
@@ -1050,7 +1055,7 @@ proposed accept, and only an owner ruling makes it one.
 | `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Corrected 2026-10-04: BACKLOG #2169 is built, on this row and the OAuth2 row below. With an ECH sidecar set, the guard is handed no opener, so a CRL cannot relax the refusal (§4.3). The note this replaces, added 2026-10-02, read: "open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.")* |
 | the same `_open_token_hop`, as used by `OAuth2ClientCredentialsProvider` in `transports/http_auth.py` (the OAuth2 client-credentials token hop) | the client secret, the access token | **Guarded** | the same `refuse_unrevoked_verified_hop` call (BACKLOG #2112, PR 1670). It was unguarded at `800cb7461`. `http_auth.py` builds no opener of its own since BACKLOG #2115 |
 | the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Guarded** | `refuse_unrevoked_verified_hop` in `FhirLookupExecutor.__init__`, on the verifying branch, called after that lookup's opener is built and handed it, so a `[tls].crl_file` that reaches the lookup's own context relaxes the refusal. The attestation is the lookup's typed `tls_revocation_attested`, mirrored into its settings by the runner. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the file's only revocation call is in the FHIR destination. A lookup connection is not a destination".)* |
-| the shared opener, as used by `transports/ai_broker.py` | the `[ai]` API key; code sent for assistance | **Guarded by attestation, by owner ruling 2026-10-27; no CRL lever is built** | `_refuse_an_unrevoked_ai_hop`, which `AiBroker.__init__` calls last, after every other refusal. It asks `RevocationHopGuard.capture(...).disposition()` on the context of the opener the broker dials through, today the shared opener, which loads no CRL, and acts on the answer with the hop's own texts. Off the box it crosses an enforcing posture only on `[ai].endpoint_revocation_attested` with its mandatory reason, and an unknown posture counts as enforcing, as on the Vault hops (§12). *(Graded "Needs a guard, tracked by #2193" until 2026-10-30, when BACKLOG #2193 slice (e) built it. It read: "no revocation call in the file".)* |
+| `transports/ai_broker.py`, `_endpoint_opener`: the shared opener, or one held anchored opener when the `[tls]` anchor narrows | the `[ai]` API key; code sent for assistance | **Guarded** | `_refuse_an_unrevoked_ai_hop`, which `AiBroker.__init__` calls last, after every other refusal. It asks `RevocationHopGuard.capture(...).disposition()` on the context of the opener the broker dials through, and acts on the answer with the hop's own texts. `_endpoint_opener` resolves the instance `[tls]` policy, which the `POST /ai/chat` route hands the broker where the app holds one (an engine started by `messagefoundry serve`; a direct `create_app` holds none unless its embedder sets `app.state.tls_settings`), so there `[tls].internal_ca_file`, under `[tls].trust_anchor_mode` `augment` or `pinned`, and, where it is set, `[tls].crl_file` reach an endpoint that is not loopback on that anchored opener; with neither, it is the shared opener, which loads no CRL. Off the box it crosses an enforcing posture on that CRL or on `[ai].endpoint_revocation_attested` with its mandatory reason, and an unknown posture counts as enforcing, as on the Vault hops (§12). *(Graded "Guarded by attestation, by owner ruling 2026-10-27; no CRL lever is built" until 2026-11-10, when BACKLOG #5527 threaded the `[tls]` policy to the broker. Its Why read: "on the context of the opener the broker dials through, today the shared opener, which loads no CRL, and acts on the answer with the hop's own texts. Off the box it crosses an enforcing posture only on `[ai].endpoint_revocation_attested` with its mandatory reason". The note of 2026-11-10 below says how.)* *(Graded "Needs a guard, tracked by #2193" until 2026-10-30, when BACKLOG #2193 slice (e) built it. It read: "no revocation call in the file".)* |
 | `transports/email.py`, through `build_smtp_tls_context` | message bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in the EMAIL destination |
 | `auth/oidc_http.py`, `build_idp_opener` | the client secret, the authorization code | **Guarded** | `_refuse_idp_revocation` in `auth/service.py` (BACKLOG #1887) |
 | `logging_setup.py`, `_build_tls_context`, `forward.tls_verify=true` | audit records | **Guarded** | `_refuse_forward_revocation` (BACKLOG #1498, §4.3) |
@@ -1098,7 +1103,9 @@ reached them.
 **Note 2026-10-28: the LDAPS AD bind is guarded (BACKLOG #2193 slice (b), owner ruling 2026-10-27).** The LDAPS row of the table above says how. The counts paragraph below names LDAPS as one of its seven hops; it no longer needs a guard. Two facts the row does not carry. A Kerberos sign-in adds no hop: the SPNEGO acceptor reads a ticket the browser sent and builds no TLS context, and the directory lookups a Kerberos or OIDC sign-in makes are binds over this one guarded context, since every bind in `auth/ldap.py` is an ldap3 SIMPLE bind. And `messagefoundry check` has no leg for this guard, where it reports the OIDC legs' through its required `oidc-revocation` leg (BACKLOG #2131). At least `serve`, `provision-admin` and `messagefoundry check-privileges` reach it. This note does not re-check the paragraph's other counts.
 
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker (guarded by
-attestation since 2026-10-30, see the note of that date below), the DICOM SCU,
+attestation since 2026-10-30, see the note of that date below, and crossing on a set `[tls].crl_file`
+too since 2026-11-10 where the `[tls]` section reaches the app and the endpoint is not loopback,
+BACKLOG #5527), the DICOM SCU,
 FTPS, LDAPS (guarded since 2026-10-28, see the note above), the alert and security-notice SMTP hop,
 and the alert webhook. BACKLOG #2193 tracks
 all seven, one checklist line per hop. No row in this table needs an owner answer now. DIRECT,
@@ -1121,7 +1128,46 @@ this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
 The counts paragraph above names the alert SMTP hop and the alert webhook among its seven. The webhook is now guarded; the SMTP hop is guarded only when it carries a login, and the hop with no login is declined, not guarded. The AI broker, also among the seven, is guarded too, as the next note says. This note does not re-check the paragraph's other counts.
 
-**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is never handed a CRL. The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
+**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. *(Superseded 2026-11-10 on the CRL lever, kept as the record: BACKLOG #5527 built it, and the note of 2026-11-10 on the AI broker below says how. The attestation pair and every other fact in this note stand.)* Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is never handed a CRL. *(That later lever is built, 2026-11-10, BACKLOG #5527: the broker dials a held anchored opener whenever the `[tls]` anchor narrows, and the shared opener is still never handed a CRL.)* The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
+
+**Note 2026-11-10: the `[tls]` policy reaches the AI broker endpoint, and `[tls].crl_file` is its CRL lever (BACKLOG #5527).** This is the later CRL lever the note of 2026-10-30 and §12 foresaw. The owner ruling of 2026-10-27 (decision d20261028T002738077-d931ce, recorded by the batch 453 Manager under the owner's delegation) chose the attestation pair and *"no CRL lever is built"*; §12 reads that choice as a statement about that build, not about the hop. The broker used to dial rest.py's shared opener on the OS trust store, so neither `[tls].internal_ca_file` nor `[tls].crl_file` reached the hop. A deploying site that set `[tls].trust_anchor_mode = "pinned"` would have had its AI endpoint verified against every public root, and a site that set `[tls].crl_file` would have had that CRL silently skipped on this hop, refused under enforce and crossed on attestation or warn with the certificate unchecked. What was built, located by symbol:
+
+- `POST /ai/chat` in `api/app.py` hands `ai_broker_from_settings` the `[tls]` policy the app stashes, as the alerts test send does. A direct `create_app` holds none unless its embedder sets `app.state.tls_settings`, and none resolves as the empty policy does.
+- `_endpoint_opener` in `transports/ai_broker.py` resolves the anchor through rest.py's `http_family_trust_anchor`, which each HTTP-family hop uses, with no connection CA. An anchor that narrows gets an anchored opener, built through rest.py's `_no_redirect_opener` and held as the next bullet but one says. One that narrows nothing gets the shared opener, which is never mutated. A loopback endpoint takes neither file, the exemption `resolve_trust_anchor` gives every hop.
+- The guard is unchanged. It already read `crl_checked` off the context of the opener the broker dials, so a CRL that reaches that context crosses an enforcing posture with no attestation and logs no attested crossing line. Its refusal text now offers `[tls].crl_file` beside the attestation pair, on the terms the next bullet but one states.
+- The broker is built per request, but its anchored opener is held: one slot for the process, keyed on the resolved anchor, which every request shares. So its context is a live hop like a connection's: `loaded_crls` records the CRL it holds, the expiry monitor judges that copy, and `crl_reload` brings it current when the file is replaced. A replacement `crl_reload` refuses, and a CA file changed in place, take a restart, as on a connection. A changed `[tls]` policy builds a new one.
+- The refusal offers `[tls].crl_file` only to a broker handed a `[tls]` policy, and the warn line names it on the same terms; a direct `create_app` hands none unless its embedder sets `app.state.tls_settings`, and with none, setting it would change nothing.
+- The CRL is instance-wide. `VERIFY_CRL_CHECK_LEAF` refuses a peer whose issuer has no CRL in the file, so once `[tls].crl_file` is set, an AI endpoint it reaches (off-box, on an app the `[tls]` section reaches, such as one `serve` starts) under a public CA the file does not cover fails its handshake. The attestation pair does not change that: it lifts the refusal, not the CRL on the context. That is the trade every hop `[tls].crl_file` reaches makes, and there is no per-hop opt-out. Such a site puts the endpoint issuer's CRL in the file, or leaves `[tls].crl_file` unset and attests.
+- `security_loosenings()` still names a set attestation pair. Its text states the three conditions a CRL check needs (`[tls].crl_file` set, the `[tls]` section reaching the app, an endpoint that is not loopback), and claims no CRL check on at least a loopback endpoint or an app the section never reached, such as a direct `create_app` whose embedder did not set it. `tests/test_ai_broker_revocation_guard.py` pins at least the route's threading, the anchor reaching the context, the shared-opener and loopback arms, the held opener and its `loaded_crls` record, the anchored opener's redirect refusal, and both refusal texts. No test performs a handshake, so the instance-wide failure above rests on `VERIFY_CRL_CHECK_LEAF`'s documented behaviour, not on a test here. Nothing pins that `create_managed_app` stashes the `[tls]` section the route reads; the alerts test send relies on the same stash.
+
+**Note 2026-11-10: the SMTP decline does not rest on an alert body being PHI-free, and an alert
+body is not PHI-free in the shipped code (BACKLOG #5021).** The decline in the 2026-10-30 note on
+slices (c) and (d) rests on no credential crossing the hop. What a body carries is in the [PHI.md
+logging inventory](../PHI.md#logging-inventory-1611--1623): its row for the `[alerts]` SMTP
+transport (row 11) and its row for the security-event notifier (row 12). The owner ruled on
+2026-11-09 (decision record `d20261110T081839838-3120c4`, stamped in UTC on 2026-11-10) that the
+decline stands, and that alerts are to be made PHI-free by routing every off-box alert through
+one key allowlist. That allowlist is not built in the shipped code; it is the off-box alert key
+allowlist row, unallocated. The same ruling holds that the PHI-free alert claims in
+[ADR 0133](0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)
+and [ADR 0044](0044-operator-alert-state.md), false in the shipped code, become true again once
+that allowlist is built. A key allowlist filters only the alert copies routed through it, so
+those claims can become true only for those copies. The allowlist's own row has to say which
+copies it routes. The other copies of an alert's text are not made PHI-free by it, and at least
+these stay as the shipped code has them: the stored `alert_instance.reason` and
+`connection_event.reason`, which a remote store or an audited reveal can still carry off the box,
+and the `LoggingAlertSink` line, which goes into the application log and from there wherever that
+log goes, unless the allowlist is built to cover that path too. The PHI.md logging inventory rows
+7, 8 and 13 and the [data-at-rest inventory](../PHI.md#2-where-phi-lives--data-at-rest-inventory)
+rows for those two columns say what each holds and where it goes. That limit is a reading of
+what a key allowlist can do, set by the Manager 30df8519 brief under BACKLOG #5021; it is not
+part of the owner ruling. Separately, a Manager decision (class B, Manager 30df8519, decision
+record `d20261110T082816880-1913c6`), not the owner ruling, names two exemptions stated beside,
+or justified by, a PHI-free alert body, to be re-checked against that allowlist once it is built:
+[ADR 0029](0029-email-smtp-destination.md)'s decline to gate the sender domain of the `[alerts]`
+sink and the security notifier, and the `[alerts]` sinks sitting outside `[egress]`
+deny-by-default ([DEPLOYMENT.md](../DEPLOYMENT.md)). This note does not establish that no other
+exemption rests on that premise.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
@@ -1170,16 +1216,18 @@ of the list above:
 
 | Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Grade |
 |---|---|---|---|---|
-| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
-| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
+| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
-**The ODBC hops are a named gap by owner ruling, and the driver test is still owed.** BACKLOG #2194
+**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded results;
+the run on the SQL Server test box is still owed.** *(Until 2026-11-11 this lead-in ended "and the
+driver test is still owed.")* BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
 ruled on 2026-10-05, in an AskUserQuestion answer to the batch 191 Manager. The record is R6 of the
 vault's `docs/security/ASVS-OWNER-RULINGS-2026-10-05.md`. The answer, verbatim, is
@@ -1195,14 +1243,25 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **The drivers' own revocation behaviour is still unmeasured.** The ruling's "then test it" half
-  is owed. It needs a SQL Server whose certificate can be revoked. A control connection to a
-  certificate that is not revoked shows that a refusal comes from the revocation. Until #3009
-  runs, nothing here says whether Driver 18 checks revocation.
+- **Driver 18 was tested on one build on Windows Server 2022, and other drivers were not
+  tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
+  Server whose certificate can be revoked. A control connection to a certificate that is not
+  revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
+  states what the runs measured and which run is still owed.
+  *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
+  unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate
+  can be revoked. A control connection to a certificate that is not revoked shows that a refusal
+  comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
+  revocation.")*
 - **What a result would mean for the grade is not ruled.** If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
+  *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. That
+  amendment does not change the grade. A Manager decided under the owner's delegation of
+  2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
+  named, and that #2194's guard and driver-control options are not reopened now: decision
+  d20261112T022118464-c27c39, logged 2026-11-12 UTC.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1234,6 +1293,72 @@ chosen option gives for building no guard:
   (*code*). A guard on `db_lookup`, reference-sync or the store would therefore refuse every
   off-loopback hop under `enforce`, unless a new lever were built with it. No declared egress
   terminator exists for these hops either.
+
+**Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
+public summary of two private test records in the vault, each recording one run of the vault's
+ODBC revocation runbook that reached a result. Their contents beyond this summary are not repeated
+here. It changes no code. For the grade, see the limit *What a result would mean for the grade is
+not ruled*, under the ruling above, and its note of 2026-11-11.
+
+- **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
+  UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
+  2026-10-17. The first run's record says it ran on a disposable virtual machine built for the
+  test, not on the SQL Server test box, and that the runbook puts the next run there. The second
+  run's record says it ran inside a virtual machine, after a revert to checkpoint
+  `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
+  `post-3009-acl-2026-10-17`, and does not say which machine that is. An earlier scripted run
+  stopped at Step 2, as designed, and changed nothing. Neither record says a run took place on the
+  SQL Server test box. The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
+  a Manager decided so under the owner's delegation of 2026-11-11, decision
+  d20261112T022119877-2ccc8b, logged 2026-11-12 UTC.
+- **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
+  build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
+  build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
+  messagefoundry 0.3.2 and pyodbc 5.3.0, and each says beside them "The engine's Python supplies
+  only pyodbc." The limit on strings below says what that leaves out.
+- **How the revocation was published.** In each run, a throwaway test root issued two server
+  certificates and revoked one. An HTTP listener on the same machine served a signed CRL listing
+  it. The other certificate was the control. SQL Server ran on each in turn. Before the legs,
+  Windows' own chain check reported the revoked certificate as revoked, fetching the list to do
+  so, and passed the control.
+- **Which shapes were tried.** At least these, as connection strings the runbook carries. The
+  first record says they were copied from engine commit `c818a16d5b`, which predates the
+  amendment of 2026-10-17 below:
+  - the store and the DATABASE SQL Server preset, one string;
+  - `db_lookup`;
+  - the generic dialect naming Driver 18;
+  - the store with a matching `ServerCertificate` pin under `Encrypt=yes`;
+  - the store with the other certificate pinned under `Encrypt=yes`.
+
+  The first four ran on both certificates, with the CRL cache cleared and again with the list
+  cached; the fifth ran with the cache cleared only. The second run's script added two strings of
+  its own, the two pinned strings with `Encrypt=strict` in place of `Encrypt=yes`, run with the
+  cache cleared only. The store has not sent the two `Encrypt=yes` pinned strings since that
+  amendment (`odbc_connection_string`, `messagefoundry/odbc_dsn.py`, *code*), and neither record
+  compares its current string with a tested one.
+- **What the driver did.** Every leg of the five `Encrypt=yes` strings connected, on the revoked
+  certificate as on the control. The list's listener logged no request during any leg of either
+  run. Read by the runbook's own table, for the first four strings the driver did not use this
+  list, fetched or cached. The strict string with a matching pin connected on both certificates.
+  No strict leg ran without a pin or with the list cached, so this does not show that the pin is
+  the reason no list was fetched. The strict string with the other certificate pinned was
+  refused on both certificates, with an error that names certificate usage, not the pin. What
+  the pin legs mean for the pin is the amendment of 2026-10-17 below. For the strict legs that
+  reading is the second record's own, because the runbook's table has no row for them.
+- **The limits.** At least these.
+  - Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM. Linux, macOS,
+    other Driver 18 builds, and other drivers, which the generic dialect and the `odbc_driver`
+    setting can name, were not measured.
+  - Only a CRL over HTTP. No OCSP responder was offered, so this does not show that the driver
+    never checks revocation.
+  - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
+    off-box hop was exercised. The server's name resolved to an IPv6 address of that machine,
+    link-local in the first record, so both records say the legs probably connected over IPv6.
+  - Only strings written out in the runbook and the script. No leg ran any engine builder or
+    pool, so the result says nothing about how the engine builds or sends its own strings.
+  - Only a throwaway root, with no intermediate CA.
+
+*(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
 
 **What is open on the three Vault hops.** *(Built on 2026-10-13, under vault BACKLOG #2983;
 §12 is the record. This paragraph and its two facts are kept as written. Fact 1 no longer holds:
@@ -1271,15 +1396,21 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 **Amendment 2026-10-17 -- decision: the store pins the SQL Server certificate under
 `Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
-`Encrypt=yes`, and both stay inside the last-wins tail (*code*). The reason: on the Driver 18.7 build
-tested on Windows, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+`Encrypt=yes`, and both sit in the TLS tail, which follows every other part (*code*).
+*(**CORRECTED 2026-11-11:** this sentence ended "and both stay inside the last-wins tail", tagged
+*code*. The code places the tail last, and that is all it does with the position (*code*). Which
+occurrence of a repeated keyword a driver uses, how far that was measured, and what guards
+against a second TLS keyword are stated in the module docstring of
+`messagefoundry/odbc_dsn.py`.)* The reason: on the Driver 18.7 build tested on Windows, the
+`ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
 decisions too:
 
-1. **No silent fall back.** Strict encryption is TDS 8.0, which SQL Server 2022 and later speak, and
-   2022 is the engine's supported floor. A server that cannot speak it refuses the connection. The
+1. **No silent fall back.** Strict encryption is TDS 8.0. A server that cannot speak it refuses the
+   connection. *(Note 2026-11-15: this said SQL Server 2022 and later speak it; SQL Server 2022 on
+   Linux refused the strict pinned login in CI, so the claim is cut.)* The
    engine never retries with `Encrypt=yes`, because that is the shape that left the pin unenforced.
 2. **The escaped dev posture is unchanged.** Where `trust_server_certificate` or `encrypt = false`
    is escaped, the string carries no pin and no `strict`, so strict cannot quietly turn
@@ -1318,7 +1449,9 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
   read "Five more rows wait on an owner answer, beside DIRECT.")*
 - Three more hops could take a guard, beside the seven BACKLOG #2193 tracks. *(Since 2026-10-13
   those three, the Vault hops, are guarded by attestation; §12.)*
-- The ODBC drivers' own revocation behaviour is still not established. BACKLOG #3009 is the test.
+- Whether the ODBC drivers check revocation is still not established. The amendment of
+  2026-11-11 above states what BACKLOG #3009's test measured. *(Until 2026-11-11 this read: "The
+  ODBC drivers' own revocation behaviour is still not established. BACKLOG #3009 is the test.")*
 
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
@@ -1422,7 +1555,10 @@ cells, whose old grade is quoted once, in the grades bullet:
 
 **Where the facts live.** The paragraph below §7.1's ODBC table is where this file states the
 ruling's limits and what the test must show. Other places name the ruling and point there. When
-BACKLOG #3009 has a result, it goes in that paragraph.
+BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
+amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
+must show is still stated in that paragraph's limit *Driver 18 was tested on one build on
+Windows Server 2022, and other drivers were not tested*.)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 

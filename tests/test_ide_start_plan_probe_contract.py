@@ -10,7 +10,8 @@ text, so a rewording here would leave the mocha suite green while the IDE misrea
 Start would report a refusal, or worse, provision over a store that needs nothing.
 
 This file closes that gap. It reads the fragments and the probe username out of the TypeScript, runs
-the probe the IDE runs -- the same argv, no ``--db``, no terminal -- and checks each answer carries the
+the probe the IDE runs with ``messagefoundry.serviceConfig`` at its default -- the same argv, no
+``--db``, no ``--service-config``, no terminal -- and checks each answer carries the
 fragment the IDE looks for, in the ``--json`` error object on stdout, the only place the IDE reads
 an answer from. Both arms set the IDE's condition, stdin not a terminal, explicitly, so the result
 does not depend on how pytest was started.
@@ -34,6 +35,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.store import MessageStore
+from scripts.security.js_lexer import blank_js_comments
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
@@ -62,9 +64,30 @@ def _probe_argv() -> list[str]:
 
 
 def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """If the TypeScript stops building this argv, the two tests below stop describing the IDE."""
-    src = _MODEL.read_text(encoding="utf-8")
-    assert '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`' in src
+    """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
+
+    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
+    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
+    nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
+    the pin ends at the array's close, so an element added after the flag reds it.
+    """
+    raw = _MODEL.read_text(encoding="utf-8")
+    src = " ".join(blank_js_comments(raw).split())
+    # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
+    assert "Each value is bound with" in raw
+    assert "Each value is bound with" not in src
+    assert re.search(
+        re.escape(
+            '"provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`, '
+            "...serviceConfigFlag(opts.serviceConfig)"
+        )
+        + r",? \];",
+        src,
+    )
+    assert (
+        "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "
+        "return serviceConfig === undefined ? [] :" in src
+    )
     assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
@@ -127,7 +150,9 @@ def test_a_store_run_only_by_directory_administrators_answers_with_the_no_termin
                 audits=(),
             )
             await AuthService(store, AuthSettings()).initialize()
-            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await store.set_user_roles(
+                "dir-a", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
         finally:
             await store.close()
 

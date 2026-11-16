@@ -267,7 +267,8 @@ see its *What it widens* and *Left open*.
 - **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
   `install-service.ps1`, would restore a record of administrator reads where "Audit File System" is on.
 - **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
-  `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
+  `mefor-restore-` directory beside the destination, made by `_open_staging` since BACKLOG #5617
+  rather than a `TemporaryDirectory`) still calls
   `_secure_file`, which grants the operator's user SID but removes only INHERITED entries. That leaves
   `archive.tar`, and `extracted_store.db` until it is placed, with the operator plus any entry the
   file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
@@ -379,8 +380,8 @@ time can read as an account that does not exist. On any lookup failure, 1332 or 
 directory is refused as not hardened, so no trio DACL is written, and each store file takes the
 existing owner-only fallback, `_secure_file` (decision d20261106T140017335-d24848). That start still
 opens the store, but the fallback can bring back the Wave 0 lockout between the service and the
-provisioning operator. The fallback grants full control to the account `_current_user` names, read
-from the environment, and keeps a file's explicit entries, because it replaces only the principal
+provisioning operator. The fallback grants full control to the account `_current_user_sid` reads
+from the process token (vault BACKLOG #5612; it read a name from the environment before), and keeps a file's explicit entries, because it replaces only the principal
 it names (measured, above). A file that already exists keeps any trio entries it carries: the main
 database file, and a `-wal` or `-shm` still on disk because another process has the store open or a
 crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit

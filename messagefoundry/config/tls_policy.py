@@ -299,8 +299,16 @@ def harden_crl_check(
     *,
     setting: str | None = None,
     record_held_copy: bool = True,
+    chain: bool = False,
 ) -> None:
     """Load a CRL onto a *verifying* ``ctx`` and turn on leaf revocation checking (BACKLOG #1005).
+
+    With ``chain``, revocation is checked for every certificate in the peer's chain, not only the
+    leaf (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627), so a revoked intermediate CA refuses
+    the clients under it. Every CA in the chain then needs its issuer's CRL in the file, or each
+    client under it is refused with ``unable to get certificate CRL``: that fails closed. A
+    single-tier CA, whose own CRL covers its leaves, behaves as without it. The API listener
+    passes it; every other hop keeps the leaf check.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -460,6 +468,8 @@ def harden_crl_check(
     # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
     _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+    if chain:
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 
@@ -851,6 +861,13 @@ def context_checks_revocation(ctx: ssl.SSLContext | None) -> bool:
     if ctx is None:
         return False
     return bool(ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+
+def context_checks_chain_revocation(ctx: ssl.SSLContext) -> bool:
+    """Whether ``ctx`` consults a CRL for every certificate in the peer's chain, not the leaf alone
+    (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627). That flag carries the leaf flag's bit too
+    (:func:`context_checks_revocation` says how that was measured), so both bits must be set."""
+    return ctx.verify_flags & ssl.VERIFY_CRL_CHECK_CHAIN == ssl.VERIFY_CRL_CHECK_CHAIN
 
 
 #: OpenSSL ``X509_V_FLAG_NO_CHECK_TIME`` (``openssl/x509_vfy.h``) — a **stable public constant**
@@ -2107,8 +2124,8 @@ class InsecureHopRefused(ValueError):
 
 class StoreTlsRefused(InsecureHopRefused):
     """The store open refused the engine-to-store hop's own TLS settings (BACKLOG #5000). At
-    least: a weakened hop (``trust_server_certificate`` on or ``encrypt`` off) the escape does not
-    cover, on either server backend; a SQL Server ``[store].ssl_root_cert`` pin the engine must not
+    least: a weakened hop (``trust_server_certificate`` on or ``encrypt`` off) on either server
+    backend, which nothing permits (vault BACKLOG #3533 item 2); a SQL Server ``[store].ssl_root_cert`` pin the engine must not
     send, its trust-anchor checks included; and a ``ValueError`` the PostgreSQL store's TLS context
     builder raises at the open, such as an unreadable pin file or a CRL file that cannot be judged.
     Raised before the store dials. The PostgreSQL pool's per-connection rebuild does not raise it.
@@ -2941,9 +2958,10 @@ class TrustAnchorPolicy:
     connector's client-verify context resolves the same anchor at both ``build_check`` and live
     construction. Those are not its only receivers. It also reaches at least the
     ``FhirLookupExecutor`` (``transports/fhir.py``, built by ``pipeline/wiring_runner.py``, #1180),
-    the alerts SMTP sink (``pipeline/alert_sinks.py``) and its test send (``api/app.py``), and the
-    security notifier (``pipeline/security_notify.py``), each through
-    :func:`resolve_trust_anchor`."""
+    the alerts SMTP sink (``pipeline/alert_sinks.py``) and its test send (``api/app.py``), the
+    security notifier (``pipeline/security_notify.py``), and the engine AI broker
+    (``transports/ai_broker.py``, which the ``POST /ai/chat`` route in ``api/app.py`` hands it,
+    BACKLOG #5527), each through :func:`resolve_trust_anchor`."""
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"

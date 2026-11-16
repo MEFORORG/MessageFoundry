@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The SQLite store's cipher-covered cells, declared as data (BACKLOG #1719, ASVS 11.3.3).
+"""Each store's cipher-covered cells, declared as data (BACKLOG #1719, ASVS 11.3.3).
 
 ``MessageStore._CIPHER_COLUMNS`` lists the cipher-covered cells whose AAD binds to the row ``id``. The
 rest bind to a composite or natural key, so each has its own migration and rotation pass inside the
 store, and until this module no caller outside it could read them back. This module names those cells
 and the columns each writer binds into ``cell_aad``, in the order it binds them, and joins both kinds
-into :data:`SQLITE_CIPHER_CELLS`. The full restore-verify reads every sealed value in them back
-through the cipher, so a ciphertext whose tag no longer authenticates fails the verify instead of
-surfacing at first use. It selects the values :func:`_sealed_test` calls sealed, so a text value
-whose marker itself is damaged is not reached by that pass.
+into :data:`SQLITE_CIPHER_CELLS`. :data:`POSTGRES_CIPHER_CELLS` and :data:`SQLSERVER_CIPHER_CELLS`
+are the same cells as each server store seals them, paged by primary key, and only ``cipher-audit``
+reads them. The full restore-verify, whose snapshot is always SQLite, reads every sealed value in
+:data:`SQLITE_CIPHER_CELLS` back through the cipher, so a ciphertext whose tag no longer
+authenticates fails the verify instead of surfacing at first use. It also reads the non-blank values
+with no marker, so a text value whose marker itself is damaged fails it on a surface the keyed store
+has sealed, unless ``[store].allow_unmarked_ciphertext`` is set.
 
-:func:`read_cipher_cells` is the one walk over those cells. The restore-verify stops at its first
+:func:`read_cipher_cells` is the one walk over a SQLite store's cells, and
+:func:`read_server_cipher_cells` its twin for a server store. The restore-verify stops at its first
 failure; :func:`audit_cipher_cells`, behind ``messagefoundry cipher-audit``, reads a LIVE store with
 it to the end and also counts, in a keyed store, the non-blank text values that carry no marker,
 which is where a damaged marker lands.
@@ -19,38 +23,65 @@ which is where a damaged marker lands.
 It is READ-ONLY: nothing here writes a cell, and the store's own passes do not consume it. Driving
 every pass from one declaration is BACKLOG #1169's scope, not this one's. Until then two guards keep
 this list honest. ``tests/test_store_cipher_sweep_parity.py`` fails when ``store.py`` gains a composite
-cipher cell this module does not name. ``tests/test_cipher_cells_readback.py`` writes each cell through
-the real store writer, proves the AAD here opens it, and proves a flipped byte fails it.
+cipher cell this module does not name, and ``tests/test_cipher_cells_readback.py`` does the same for
+``postgres.py`` and ``sqlserver.py`` against their inventories. ``tests/test_cipher_cells_readback.py``
+also writes each cell through the real store writer, proves the AAD here opens it, and proves a
+flipped byte fails it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
-from collections.abc import Callable, Generator, Iterable
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Mapping, Sequence
+from contextlib import aclosing
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
 
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store.cell_tag import is_row_tagged, row_tag_aad, row_tag_columns
-from messagefoundry.store.crypto import MARKER_PREFIX, Cipher, CipherError, cell_aad
+from messagefoundry.store.crypto import (
+    BATCH_MAX_CHARS,
+    BATCH_MAX_ITEMS,
+    MARKER_PREFIX,
+    BatchCipher,
+    Cipher,
+    CipherError,
+    CipherItem,
+    CipherUnavailableError,
+    batch_chars,
+    cell_aad,
+    decrypt_or_error,
+    detached,
+    gave_no_verdict,
+)
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, QueueTagError, queue_row_aad
 from messagefoundry.store.store import MessageStore, _sqlite_readonly_uri
 
 __all__ = [
     "COMPOSITE_CIPHER_CELLS",
     "DEFAULT_CHUNK_ROWS",
+    "POSITION",
+    "POSTGRES_CIPHER_CELLS",
     "SQLITE_CIPHER_CELLS",
+    "SQLSERVER_CIPHER_CELLS",
     "CellReading",
     "CellTally",
     "CipherAudit",
     "CipherCell",
+    "CipherCellSource",
     "CipherWalkInterrupted",
     "audit_cipher_cells",
+    "audit_server_cipher_cells",
     "cell_present",
     "connect_readonly",
     "keyed_store_mismatch",
     "read_cipher_cells",
+    "read_server_cipher_cells",
+    "server_cell_present",
+    "server_keyed_store_mismatch",
+    "server_walk_tables",
     "store_tables",
     "with_first_failure",
 ]
@@ -72,7 +103,18 @@ class CipherCell:
 
     ``check`` is for a cell whose reader refuses a value that opened: it takes the opened value and
     the ``aad_columns`` values, and raises :class:`CipherError` where that reader would (the queue
-    payload's sealed ``shared_body`` reference against its ``body_ref`` column)."""
+    payload's sealed ``shared_body`` reference against its ``body_ref`` column).
+
+    ``order`` is the columns a server-store walk pages by, the table's primary key (a server table
+    has no ``rowid``); the SQLite walk pages by ``rowid`` and does not read it. On a server cell
+    the ``"position"`` locator stands where SQLite's ``rowid`` does: the value's 1-based place, in
+    ``order``, among the values the walk fetched for the cell. A walk that reads unmarked values
+    fetches every non-NULL value; a ``sealed_only`` walk fetches only the values that start with
+    the marker in any ASCII case, so one row can hold a different position in each. A later write
+    may shift it.
+
+    ``chunk_cap`` bounds a server walk's chunk for a cell whose rows are large, since a server
+    driver fetches a whole chunk at once where SQLite reads it one row at a time."""
 
     table: str
     column: str
@@ -80,6 +122,8 @@ class CipherCell:
     locator: tuple[str, ...] = ("rowid",)
     builder: Callable[..., bytes] | None = None
     check: Callable[..., None] | None = None
+    order: tuple[str, ...] = ("rowid",)
+    chunk_cap: int | None = None
 
     def aad(self, *key: object) -> bytes:
         """The AAD the writer bound for this cell, given the ``aad_columns`` values in order."""
@@ -171,6 +215,60 @@ SQLITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
     *(_id_keyed_cell(t, c) for t, c in MessageStore._CIPHER_COLUMNS),
     *COMPOSITE_CIPHER_CELLS,
 )
+
+#: The pseudo-locator of a server cell whose key can itself be PHI; see :class:`CipherCell`.
+POSITION = "position"
+
+#: Rows a server walk reads per chunk of ``attachment_chunk``: each row is one 1 MiB slice, so the
+#: usual chunk would hold hundreds of MiB at once. The store's own seal pass batches it the same.
+_ATTACHMENT_CHUNK_ROWS = 16
+
+#: The id-keyed cells both server stores seal, pinned to each module's ``cell_aad`` calls by a test.
+_SERVER_ID_KEYED: tuple[tuple[str, str], ...] = (
+    ("messages", "raw"),
+    ("messages", "error"),
+    ("queue", "last_error"),
+    ("messages", "summary"),
+    ("messages", "metadata"),
+    ("users", "totp_secret"),
+    ("search_presets", "criteria"),
+)
+
+#: The server stores' composite cells: SQLite's, with each table's primary key to page by, and a
+#: ``position`` locator wherever SQLite falls back to ``rowid``.
+_SERVER_ORDER: dict[str, tuple[str, ...]] = {
+    "response": _RESPONSE_KEY,
+    "state": ("namespace", "key"),
+    "reference": ("name", "version", "key"),
+    "shared_body": ("hash",),
+    "attachment_chunk": ("attachment_id", "seq"),
+}
+
+
+def _server_cell(cell: CipherCell) -> CipherCell:
+    """``cell`` as a server walk reads it: paged by its table's primary key, and located by
+    ``position`` where SQLite's ``rowid`` stood."""
+    locator = (POSITION,) if cell.locator == ("rowid",) else cell.locator
+    cap = _ATTACHMENT_CHUNK_ROWS if cell.table == "attachment_chunk" else None
+    return replace(
+        cell, locator=locator, order=_SERVER_ORDER.get(cell.table, ("id",)), chunk_cap=cap
+    )
+
+
+def _server_cells() -> tuple[CipherCell, ...]:
+    return tuple(
+        _server_cell(c)
+        for c in (*(_id_keyed_cell(t, c) for t, c in _SERVER_ID_KEYED), *COMPOSITE_CIPHER_CELLS)
+    )
+
+
+#: Every cipher-covered cell of the PostgreSQL store. ``tests/test_cipher_cells_readback.py`` pins
+#: it to every ``cell_aad`` cell in ``postgres.py``, so a new ciphered column there reds until it is
+#: listed here.
+POSTGRES_CIPHER_CELLS: tuple[CipherCell, ...] = _server_cells()
+
+#: Every cipher-covered cell of the SQL Server store, pinned to ``sqlserver.py`` the same way.
+SQLSERVER_CIPHER_CELLS: tuple[CipherCell, ...] = _server_cells()
 
 #: Rows one statement of :func:`read_cipher_cells` reads. Each chunk is its own short read
 #: transaction, so a walk of a live store never holds one snapshot open across a whole table.
@@ -313,14 +411,18 @@ def read_cipher_cells(
     cells fails its tag here as it would at a live read, and then put through the cell's ``check``.
     A cell :func:`cell_present` says the store lacks is skipped: an older store predates it.
 
-    Which values are sealed is :func:`_sealed_test`'s; :func:`_open` says which of them fail
+    Which values are sealed is :func:`_sealed_test`'s; :class:`_Opening` says which of them fail
     without a decrypt.
 
     The rows of each cell are read in ``rowid`` order, ``chunk_rows`` at a time. Each chunk is one
-    statement, read one row at a time and opened as it is read, and its readings are yielded only
-    once the statement is closed. So no read transaction stays open while the caller works, a
-    writer on a live store waits on at most one chunk's decrypts, and memory holds one stored value
-    at a time. The schema version is read after every chunk; a change raises
+    statement, read one row at a time. Its sealed values are opened as they are read, or, under a
+    :class:`~messagefoundry.store.crypto.BatchCipher`, in batches of at most
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_ITEMS` values and
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_CHARS` characters (BACKLOG #6706). Its
+    readings are yielded only once the statement is closed, in row order. So no read
+    transaction stays open while the caller works, a writer on a live store waits on at most one
+    chunk's decrypts, and memory holds at most one batch of stored values. The schema version is
+    read after every chunk; a change raises
     :class:`CipherWalkInterrupted`. A decrypt that failed because the key service did
     (:func:`_is_outage`) ends the walk after its reading is yielded.
 
@@ -332,7 +434,8 @@ def read_cipher_cells(
     none is.
 
     The cipher decides keylessness, never a value: a decrypted value may itself begin with the
-    marker. Under ``vault_transit`` every decrypt is one Transit request."""
+    marker. Under ``vault_transit`` a batch is as few Transit requests as the cipher's own bounds
+    allow (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many`)."""
     if chunk_rows < 1:
         raise ValueError(f"chunk_rows must be at least 1, not {chunk_rows}")
     keyless = not cipher.encrypts
@@ -361,89 +464,152 @@ def read_cipher_cells(
         width = len(spec.locator)
         last: int | None = None
         while True:
-            readings: list[CellReading] = []
+            opening = _Opening(spec, cipher)
             count = 0
-            outage = False
             bound = (chunk_rows,) if last is None else (last, chunk_rows)
             cursor = conn.execute(first if last is None else after, params + bound)
             for rowid, sealed, *row in cursor:
                 count, last = count + 1, int(rowid)
                 where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
                 if not sealed:
-                    readings.append(CellReading(spec, unsealed_kind, where))
+                    opening.note(CellReading(spec, unsealed_kind, where))
                 elif not isinstance(stored, str):
                     # Only a BLOB is sealed and not text; see `_sealed_test` for why it fails.
-                    readings.append(CellReading(spec, "blob", where))
+                    opening.note(CellReading(spec, "blob", where))
                 elif keyless:
                     # The sealed test ignores case; the marker does not. A keyless store's plaintext
                     # that only resembles it is not a sealed cell.
                     if cipher.is_encrypted(stored):
-                        readings.append(CellReading(spec, "keyless", where))
-                else:
-                    reading = _open(spec, cipher, stored, key, where)
-                    readings.append(reading)
-                    if reading.error is not None and _is_outage(reading.error):
-                        # One timeout is the evidence; every later value would wait out its own and
-                        # then read as damaged. Stop, and let the caller say which it was.
-                        outage = True
-                        break
+                        opening.note(CellReading(spec, "keyless", where))
+                elif opening.add(stored, key, where):
+                    break  # the key service failed; see _open_queued
             cursor.close()  # ends the chunk's read transaction even when the loop broke early
+            readings = _opened(opening)
             if _schema_version(conn) != version:
                 raise CipherWalkInterrupted(
                     f"the store's schema changed while {table}.{column} was read (a VACUUM or a "
                     "migration), so its rowid chunks no longer line up"
                 )
             yield from readings
-            if outage:
+            if opening.outage:
                 return
             if count < chunk_rows:
                 break
 
 
-def _is_outage(error: CipherError) -> bool:
-    """Whether a failed decrypt was the key service failing rather than the value. The Transit
-    cipher raises :class:`CipherError` for both, from the client's own error: an ``OSError`` for
-    an unreachable Vault (a ``requests`` connection error or timeout is one), and an ``hvac``
-    error for a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac``
-    raises as ``InvalidRequest``; any other ``hvac`` error (a sealed Vault, a token refused, a
-    5xx) is the service. At least those shapes; a cause of any other kind counts as the value's."""
-    cause = error.__cause__
-    if isinstance(cause, OSError):
-        return True
-    return (
-        cause is not None
-        and type(cause).__module__.split(".")[0] == "hvac"
-        and type(cause).__name__ != "InvalidRequest"
-    )
+#: Whether a failed decrypt was the key service failing rather than the value; shared with the
+#: Transit batch path so the two never disagree (BACKLOG #6706).
+_is_outage = gave_no_verdict
 
 
-def _open(
-    spec: CipherCell,
-    cipher: Cipher,
-    stored: str,
-    key: list[object],
-    where: tuple[object, ...],
+def _failed(
+    spec: CipherCell, cipher: Cipher, stored: str, where: tuple[object, ...], exc: CipherError
 ) -> CellReading:
-    """Open one text value :func:`_sealed_test` called sealed, under a key, and run its cell's
-    check; the plaintext goes no further. A marker in another case fails here without a decrypt:
+    holds = getattr(cipher, "holds_key_for", None)
+    foreign = callable(holds) and not holds(stored)
+    return CellReading(spec, "failed", where, exc, foreign_key=foreign)
+
+
+class _Opening:
+    """One chunk's sealed text values, queued to be opened under a key, each reading kept at its
+    row's place. Each value is opened with its cell's AAD and then put through its cell's
+    ``check``; the plaintext goes no further. A marker in another case fails without a decrypt:
     the cipher would otherwise hand it to its unmarked-value rule and, under
-    ``allow_unmarked_ciphertext``, return it with no tag checked."""
-    if not stored.startswith(MARKER_PREFIX):
-        return CellReading(
-            spec,
-            "failed",
-            where,
-            CipherError(f"the value's at-rest marker is not spelled {MARKER_PREFIX!r}"),
-        )
-    try:
-        opened = cipher.decrypt(stored, aad=spec.aad(*key))
-        if spec.check is not None:
-            spec.check(opened, *key)
-    except CipherError as exc:
-        holds = getattr(cipher, "holds_key_for", None)
-        foreign = callable(holds) and not holds(stored)
-        return CellReading(spec, "failed", where, exc, foreign_key=foreign)
-    return CellReading(spec, "opened", where)
+    ``allow_unmarked_ciphertext``, return it with no tag checked. :func:`_open_queued` opens the
+    queue and :func:`_opened` ends the chunk."""
+
+    def __init__(self, spec: CipherCell, cipher: Cipher) -> None:
+        self.spec, self.cipher = spec, cipher
+        self.readings: list[CellReading | None] = []
+        self.pending: list[tuple[int, str, list[object], tuple[object, ...], bytes]] = []
+        self.chars = 0
+        # A batch cipher's queue is cut at the bounds Transit cuts its requests at, so it is one
+        # request. Any other cipher opens value by value, as before, so it stops at its first
+        # outage and holds one value at a time.
+        self.limit = BATCH_MAX_ITEMS if isinstance(cipher, BatchCipher) else 1
+        #: Whether a value failed because the key service did (:func:`_is_outage`).
+        self.outage = False
+
+    def note(self, reading: CellReading) -> None:
+        """Place a reading that needed no decrypt at the next place."""
+        self.readings.append(reading)
+
+    def add(self, stored: str, key: list[object], where: tuple[object, ...]) -> bool:
+        """Queue one value at the next place, opening the queue first when this value would take
+        it past a bound. True when that queue met an outage; this value is then not read, and
+        the caller stops reading."""
+        spec = self.spec
+        if not stored.startswith(MARKER_PREFIX):
+            error = CipherError(f"the value's at-rest marker is not spelled {MARKER_PREFIX!r}")
+            self.readings.append(CellReading(spec, "failed", where, error))
+            return False
+        try:
+            aad = spec.aad(*key)
+        except CipherError as exc:
+            self.readings.append(_failed(spec, self.cipher, stored, where, exc))
+            return False
+        cost = batch_chars(stored, aad)
+        full = len(self.pending) >= self.limit or self.chars + cost > BATCH_MAX_CHARS
+        if self.pending and full and _open_queued(self):
+            return True
+        self.pending.append((len(self.readings), stored, key, where, aad))
+        self.readings.append(None)
+        self.chars += cost
+        return False
+
+
+def _decrypt_values(cipher: Cipher, items: list[CipherItem]) -> list[str | CipherError]:
+    """Each value of ``items`` opened under its own AAD, in order: its plaintext, or the
+    :class:`CipherError` that value alone failed with. A batch cipher opens them in as few
+    requests as its bounds allow (BACKLOG #6706); a reply of another length is refused rather
+    than zipped."""
+    if isinstance(cipher, BatchCipher):
+        opened = cipher.decrypt_many(items)
+        if len(opened) == len(items):
+            return opened
+        # No verdict on any value, so the walk stops on it as an outage rather than read one.
+        short = f"{type(cipher).__name__} answered {len(opened)} of {len(items)} values"
+        return [CipherUnavailableError(short) for _ in items]
+    return [decrypt_or_error(cipher, stored, aad) for stored, aad in items]
+
+
+def _open_queued(opening: _Opening) -> bool:
+    """Open every value ``opening`` holds queued and place its reading. At the first value the key
+    service failed (:func:`_is_outage`), drop every reading after it, since a walk value by value
+    would not have read them, and return True: every later value would wait out its own timeout
+    and then read as damaged."""
+    pending, opening.pending, opening.chars = opening.pending, [], 0
+    if not pending:
+        return False
+    spec, cipher = opening.spec, opening.cipher
+    results = _decrypt_values(cipher, [(stored, aad) for _, stored, _, _, aad in pending])
+    for (slot, stored, key, where, _), result in zip(pending, results, strict=True):
+        reading = CellReading(spec, "opened", where)
+        if isinstance(result, CipherError):
+            reading = _failed(spec, cipher, stored, where, result)
+        elif spec.check is not None:
+            try:
+                spec.check(result, *key)
+            except CipherError as exc:
+                # Detached: this frame holds the batch's other plaintexts (BACKLOG #6706).
+                reading = _failed(spec, cipher, stored, where, detached(exc))
+        opening.readings[slot] = reading
+        if reading.error is not None and _is_outage(reading.error):
+            del opening.readings[slot + 1 :]
+            opening.outage = True
+            return True
+    return False
+
+
+def _opened(opening: _Opening) -> list[CellReading]:
+    """End ``opening``'s chunk: open what is still queued, unless an outage stopped it, and
+    return every reading in row order."""
+    if not opening.outage:
+        _open_queued(opening)
+    placed = [r for r in opening.readings if r is not None]
+    if len(placed) != len(opening.readings):  # every queued slot is filled or cut by the open
+        raise RuntimeError("a queued cipher cell was never opened")
+    return placed
 
 
 @dataclass(slots=True)
@@ -507,6 +673,14 @@ def with_first_failure(mismatch: str, first: str | None) -> str:
     return mismatch if first is None else f"{mismatch}; also found before it: {first}"
 
 
+def _keyed_mismatch_line(table: object, column: object, source: str) -> str:
+    # Read from the store, so bounded and escaped like a locator: a planted row cannot forge a line.
+    return (
+        f"{_shown(table)}.{_shown(column)} is recorded as keyed in this {source}, but the "
+        f"store settings resolved no key to read it (keyless open of a keyed {source})"
+    )
+
+
 def keyed_store_mismatch(
     conn: sqlite3.Connection, cipher: Cipher, tables: set[str], *, source: str = "store"
 ) -> str | None:
@@ -520,13 +694,46 @@ def keyed_store_mismatch(
     keyed = conn.execute(
         "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
     ).fetchone()
-    if keyed is None:
-        return None
-    # Read from the file, so bounded and escaped like a locator: a planted row cannot forge a line.
-    return (
-        f"{_shown(keyed[0])}.{_shown(keyed[1])} is recorded as keyed in this {source}, but the "
-        f"store settings resolved no key to read it (keyless open of a keyed {source})"
-    )
+    return None if keyed is None else _keyed_mismatch_line(keyed[0], keyed[1], source)
+
+
+class _Tallier:
+    """Folds readings into a :class:`CipherAudit`, for :func:`audit_cipher_cells` and
+    :func:`audit_server_cipher_cells` alike, so the backends' verdicts cannot drift apart."""
+
+    def __init__(self, audit: CipherAudit) -> None:
+        self._audit = audit
+        self._tally = {(t.table, t.column): t for t in audit.tallies}
+        self._first: str | None = None
+
+    def add(self, reading: CellReading) -> bool:
+        """Count ``reading``; True when the walk must stop. A keyless reading stops it, recorded as
+        the key mismatch, since every later one would say the same. A decrypt the key service
+        failed (:func:`_is_outage`) is raised: every later value would wait out its own timeout and
+        then read as damaged, which an outage is not."""
+        found = self._tally[(reading.cell.table, reading.cell.column)]
+        if reading.kind == "keyless":
+            self._audit.key_mismatch = with_first_failure(reading.failure(), self._first)
+            return True
+        if reading.kind == "opened":
+            found.opened += 1
+        elif reading.kind in ("failed", "blob"):
+            if reading.error is not None and _is_outage(reading.error):
+                raise reading.error
+            if reading.kind == "blob":
+                found.blob += 1
+            else:
+                found.failed += 1
+            if found.first_failure is None:
+                found.first_failure = reading.failure()
+            self._first = self._first or found.first_failure
+        elif reading.kind == "legacy":
+            found.legacy += 1
+        else:
+            found.unmarked += 1
+            if found.first_unmarked is None:
+                found.first_unmarked = f"{found.name} {reading.where} carries no at-rest marker"
+        return False
 
 
 def audit_cipher_cells(
@@ -540,11 +747,8 @@ def audit_cipher_cells(
     stops at its first failure. Counts unmarked values in a keyed store.
 
     The verdict precedence is :func:`keyed_store_mismatch`'s, then a keyless reading's, then a
-    failure's, so it does not depend on which value the walk meets first. Two things stop the
-    walk: a sealed text value under a keyless cipher, recorded as the key mismatch, since every
-    other one would say the same; and a decrypt that failed because the key service was
-    unreachable (:func:`_is_outage`), which is raised: every later value would wait out its own
-    timeout and then read as damaged, which an outage is not."""
+    failure's, so it does not depend on which value the walk meets first. What stops the walk is
+    :meth:`_Tallier.add`'s to say."""
     wanted = tuple(cells)
     tables = store_tables(conn)
     audit = CipherAudit(
@@ -553,33 +757,212 @@ def audit_cipher_cells(
     audit.key_mismatch = keyed_store_mismatch(conn, cipher, tables)
     if audit.key_mismatch is not None:
         return audit
-    tally = {(t.table, t.column): t for t in audit.tallies}
-    first: str | None = None
+    tallier = _Tallier(audit)
     for reading in read_cipher_cells(
         conn, cipher, cells=wanted, chunk_rows=chunk_rows, unmarked=True
     ):
-        found = tally[(reading.cell.table, reading.cell.column)]
-        if reading.kind == "keyless":
-            audit.key_mismatch = with_first_failure(reading.failure(), first)
+        if tallier.add(reading):
             break
-        if reading.kind == "opened":
-            found.opened += 1
-        elif reading.kind in ("failed", "blob"):
-            if reading.error is not None and _is_outage(reading.error):
-                raise reading.error
-            if reading.kind == "blob":
-                found.blob += 1
-            else:
-                found.failed += 1
-            if found.first_failure is None:
-                found.first_failure = reading.failure()
-            first = first or found.first_failure
-        elif reading.kind == "legacy":
-            found.legacy += 1
-        else:
-            found.unmarked += 1
-            if found.first_unmarked is None:
-                found.first_unmarked = f"{found.name} {reading.where} carries no at-rest marker"
+    return audit
+
+
+# --- the server stores (PostgreSQL, SQL Server) ------------------------------
+
+
+class CipherCellSource(Protocol):
+    """What a server store offers :func:`read_server_cipher_cells`: four reads, each one statement,
+    implemented by ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes."""
+
+    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
+
+    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None: ...
+
+    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool: ...
+
+    async def cipher_walk_chunk(
+        self,
+        table: str,
+        column: str,
+        select: Sequence[str],
+        order: Sequence[str],
+        after: Sequence[Any] | None,
+        limit: int,
+        *,
+        sealed_only: bool,
+    ) -> list[tuple[Any, ...]]: ...
+
+
+def server_cell_present(spec: CipherCell, columns: Mapping[str, frozenset[str]]) -> bool:
+    """:func:`cell_present` for a server store, from :meth:`CipherCellSource.cipher_walk_columns`."""
+    have = columns.get(spec.table)
+    needed = {spec.column, *spec.aad_columns, *spec.order, *spec.locator} - {POSITION}
+    return have is not None and have.issuperset(needed)
+
+
+def server_walk_tables(cells: Iterable[CipherCell]) -> tuple[str, ...]:
+    """The tables a server walk of ``cells`` asks the columns of: theirs and ``keyed_surface``."""
+    return tuple(dict.fromkeys((*(c.table for c in cells), "keyed_surface")))
+
+
+def _server_select(spec: CipherCell) -> tuple[str, ...]:
+    """The columns a server chunk selects before the value: the paging key first, then the
+    locator and the AAD columns, each once."""
+    named = (*spec.order, *(c for c in spec.locator if c != POSITION), *spec.aad_columns)
+    return tuple(dict.fromkeys(named))
+
+
+def _is_sealed_text(stored: str) -> bool:
+    """:func:`_sealed_test` for one text value: the marker in any ASCII case."""
+    head = stored[: len(MARKER_PREFIX)]
+    return head.isascii() and head.lower() == MARKER_PREFIX.lower()
+
+
+def _read_server_chunk(
+    spec: CipherCell,
+    cipher: Cipher,
+    rows: list[tuple[Any, ...]],
+    position: int,
+    *,
+    unmarked: bool,
+    unsealed_kind: ReadingKind,
+) -> tuple[list[CellReading], int, bool]:
+    """Classify one chunk's rows as :func:`read_cipher_cells` classifies a SQLite row. Returns the
+    readings, the position of the last row read, and whether a key-service outage stopped it. Run
+    in a worker thread: under ``vault_transit`` each batch of decrypts is a Transit request."""
+    index = {c: i for i, c in enumerate(_server_select(spec))}
+    keyless = not cipher.encrypts
+    opening = _Opening(spec, cipher)
+    for row in rows:
+        position += 1
+        stored = row[-1]
+        where = tuple(position if c == POSITION else row[index[c]] for c in spec.locator)
+        if not isinstance(stored, str):
+            # Every server cipher column is text, so a driver handing back anything else is a
+            # damaged row, failed as SQLite fails a BLOB.
+            opening.note(CellReading(spec, "blob", where))
+            continue
+        if stored == "":
+            continue  # every purge path writes '' (see read_cipher_cells)
+        if not _is_sealed_text(stored):
+            if unmarked:
+                opening.note(CellReading(spec, unsealed_kind, where))
+            continue
+        if keyless:
+            # The sealed test ignores case; the marker does not (see read_cipher_cells).
+            if cipher.is_encrypted(stored):
+                opening.note(CellReading(spec, "keyless", where))
+            continue
+        key = [row[index[c]] for c in spec.aad_columns]
+        if opening.add(stored, key, where):
+            break
+    # After an outage the walk ends, so the position returned with it is never read.
+    return _opened(opening), position, opening.outage
+
+
+async def read_server_cipher_cells(
+    source: CipherCellSource,
+    cipher: Cipher,
+    *,
+    cells: Iterable[CipherCell],
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    unmarked: bool = False,
+    columns: Mapping[str, frozenset[str]] | None = None,
+) -> AsyncGenerator[CellReading]:
+    """:func:`read_cipher_cells` for a PostgreSQL or SQL Server store: the same readings, by the
+    same rules, so ``cipher-audit`` reads every backend alike.
+
+    A server table has no ``rowid``, so each cell is paged by its ``order`` key, ``chunk_rows`` at
+    a time (``chunk_cap`` lowers it), and each chunk is one SELECT that ends before the next. A row
+    added behind the walk's key while it runs is not read. Nothing renumbers a key, so there is no
+    schema-version check. The marker test runs here rather than in SQL, because neither server's
+    ``LIKE`` reads case as SQLite's does; ``sealed_only`` only narrows what a chunk fetches. The
+    decrypts run off the event loop. ``columns`` is :meth:`CipherCellSource.cipher_walk_columns`
+    for :func:`server_walk_tables`, when the caller already holds it."""
+    if chunk_rows < 1:
+        raise ValueError(f"chunk_rows must be at least 1, not {chunk_rows}")
+    wanted = tuple(cells)
+    unmarked = unmarked and cipher.encrypts
+    if columns is None:
+        columns = await source.cipher_walk_columns(server_walk_tables(wanted))
+    keyed_table = "keyed_surface" in columns
+    for spec in wanted:
+        if not server_cell_present(spec, columns):
+            continue
+        unsealed_kind: ReadingKind = "unmarked"
+        if unmarked and not await source.cipher_walk_surface_sealed(
+            spec.table, spec.column, keyed=keyed_table
+        ):
+            unsealed_kind = "legacy"
+        limit = chunk_rows if spec.chunk_cap is None else min(chunk_rows, spec.chunk_cap)
+        after: tuple[Any, ...] | None = None
+        position = 0
+        while True:
+            rows = await source.cipher_walk_chunk(
+                spec.table,
+                spec.column,
+                _server_select(spec),
+                spec.order,
+                after,
+                limit,
+                sealed_only=not unmarked,
+            )
+            if not rows:
+                break
+            after = tuple(rows[-1][: len(spec.order)])
+            readings, position, outage = await asyncio.to_thread(
+                _read_server_chunk,
+                spec,
+                cipher,
+                rows,
+                position,
+                unmarked=unmarked,
+                unsealed_kind=unsealed_kind,
+            )
+            for reading in readings:
+                yield reading
+            if outage:
+                return
+            if len(rows) < limit:
+                break
+
+
+async def server_keyed_store_mismatch(
+    source: CipherCellSource, cipher: Cipher, columns: Mapping[str, frozenset[str]]
+) -> str | None:
+    """:func:`keyed_store_mismatch` for a server store, ``columns`` naming the tables it holds."""
+    if cipher.encrypts or "keyed_surface" not in columns:
+        return None
+    keyed = await source.cipher_walk_keyed_surface()
+    return None if keyed is None else _keyed_mismatch_line(keyed[0], keyed[1], "store")
+
+
+async def audit_server_cipher_cells(
+    source: CipherCellSource,
+    cipher: Cipher,
+    *,
+    cells: Iterable[CipherCell],
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    columns: Mapping[str, frozenset[str]] | None = None,
+) -> CipherAudit:
+    """:func:`audit_cipher_cells` for a PostgreSQL or SQL Server store, through
+    :func:`read_server_cipher_cells`, with the same precedence and the same stops."""
+    wanted = tuple(cells)
+    if columns is None:
+        columns = await source.cipher_walk_columns(server_walk_tables(wanted))
+    audit = CipherAudit(
+        [CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted]
+    )
+    audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
+    if audit.key_mismatch is not None:
+        return audit
+    tallier = _Tallier(audit)
+    walk = read_server_cipher_cells(
+        source, cipher, cells=wanted, chunk_rows=chunk_rows, unmarked=True, columns=columns
+    )
+    async with aclosing(walk):
+        async for reading in walk:
+            if tallier.add(reading):
+                break
     return audit
 
 

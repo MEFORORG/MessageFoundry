@@ -169,6 +169,7 @@ Defaults:
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
+| Secrets directory (`-SecretsDir`) | the one the service already names, else `<DataDir>-secrets`; named to the service as `MEFOR_SECRETS_DIRECTORY` |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
 
@@ -322,8 +323,15 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 
 **`set AppEnvironmentExtra` replaces the service's whole list of extra variables.** Pass every
 variable the service needs in one call, or the ones you leave out are gone at the next start.
-**The store key does not go in that list:** the engine refuses to start with it there, because any
-local user can read the list. Use the DPAPI key file (see
+That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
+no file in the secrets directory, and every secret moved there is missing, with no error naming
+the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
+**No secret goes in that list:** any local user can read it. Where the engine could read the
+service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
+settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
+or retired store key found in their own environment, never another secret setting. Use the DPAPI
+key file for
+the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
@@ -598,8 +606,8 @@ What counts as expected start-up code, and what each entry leaves open, is in
 
 PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI.md](PHI.md) §3).
 The key is a base64 32-byte secret. Two ways to supply it. **Under the Windows service, use the
-DPAPI key file.** The engine refuses to start when the store key is in the service's NSSM
-environment.
+DPAPI key file.** `serve` and `supervise` refuse to start when the store key is in the service's
+NSSM environment.
 
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
@@ -630,8 +638,9 @@ environment.
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
-  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
-  service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
+  `rotate-key`, never in the service's NSSM list: `serve` and `supervise` refuse to start with it
+  there. The service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3,
+  BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
@@ -645,26 +654,48 @@ environment.
   your own host.
   **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 
-  **The engine refuses to start when the store key, or a retired one, is in that list**, or in
-  the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
-  BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
-  that runs `messagefoundry rotate-key`, not in the service. Other engine secrets there are named,
-  not refused. What the engine reads, what it names and what it does not cover are in
-  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
+  **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
+  list**, or in the service's own `Environment` registry value, whatever `[security].enforcement`
+  says (vault BACKLOG #2595). An application that builds the API itself, with `create_app` or
+  `create_managed_app`, raises on the same finding as it is built. Move the key to the DPAPI key
+  file above. A retired key belongs in the shell that runs `messagefoundry rotate-key`, not in the
+  service. What the engine reads, what it refuses and what it does not cover are in
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
-  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
-  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  settings other than the store key and its retired keys, among them the database password, and
+  every `MEFOR_VALUE_*` value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
-  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
-  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
-  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
-  broad group can read or change. The files are plain, protected by their access list alone, and
-  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
-  are stated once, in
-  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
-  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
-  left in the NSSM list is still named, not refused.
+  from it. **The installer creates it**, restricted, and adds `MEFOR_SECRETS_DIRECTORY=<its path>`
+  to the service's NSSM list, keeping the entries already there; a path in the NSSM list is not a
+  secret. The path is `-SecretsDir`, else the one the service already names, else
+  `<DataDir>-secrets`, beside the data directory and not in it, so a backup of the data directory
+  does not copy the plain files. The installer refuses a path that is a volume root, a junction, a
+  file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
+  at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
+  engine install, the checkout, the Windows folder and Program Files. It refuses a path another
+  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
+  `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
+  access list in one step. The directory starts empty: as an administrator, create or copy in one
+  file per setting, named as its variable, and restart the service. Do not move a file in: a
+  moved file keeps its old access list. Each run makes Administrators the
+  owner and removes every grant there but SYSTEM's, Administrators' and the service account's,
+  whose own grant it keeps, and refuses when any is left or the account holds no read. It refuses
+  an existing directory the service does not already name, since restricting a folder someone else
+  made does not shut them out, and one the service names whose owner is no longer Administrators
+  or SYSTEM. A refusal
+  after the service is registered sets the service to Disabled. A folder above the directory that the installer
+  creates is administrator-only; one that already existed is yours to restrict, since the engine
+  does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
+  with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
+  access list it needs, and the rest of the rules are stated once, in
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
+  of the engine's own secret settings other than the store key and its retired keys here from the
+  service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
+  list, and not if it could not (the previous bullet links where that is stated).
+  A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
+  active environment's value file if it is not a secret and is the same for every instance (the
+  previous bullet's link says when and why).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
@@ -676,8 +707,7 @@ environment.
 >
 > Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
 > [`[store]`](CONFIGURATION.md#store--message-store--db) and
-> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
-> says which other key providers are not built. For any other source, fetch the secret in your
+> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection). For any other source, fetch the secret in your
 > service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
 > file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
 > **managed identity**, and any credential with no reference field. An AD **gMSA** has no
@@ -697,10 +727,26 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   icacls "D:\hl7\config" /inheritance:r /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)R"
   icacls "D:\hl7\config" /setowner "*S-1-5-32-544" /T /C
   ```
+  `/T` walks the tree, and the walk goes through a junction (measured with `/reset /T`), so remove
+  any junction or link inside the dir first, or the command changes what it points at. That holds
+  for every `/T` recipe in this section. `/inheritance:r` and `/grant` also leave an explicit entry
+  for any other account in place; read the result with `icacls`.
   The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`:
   it strips inherited ACEs and locks the dir to SYSTEM + Administrators (full) and the run-as
   account (read+execute) — no companion flag needed, since the run-as account defaults to the
-  virtual account. It is **opt-in** because the config dir often lives inside a developer's repo
+  virtual account. It also removes at least the well-known broad entries (Everyone, Users,
+  Authenticated Users and others) from the dir, makes Administrators the owner of each file and
+  folder below it that it does not skip (see below), resets each one's DACL to inherit only those
+  grants, discarding its own
+  entries, and reads each owner and DACL back. What the read-back finds is named in a warning
+  instead of the "locked" line: at least an entry for another account, an owner it could not set,
+  a missing read for the run-as account, and a deny entry on the dir. The lockdown skips, and names
+  in a warning, at least a junction, any other folder reparse point, a file link, a file reparse
+  point whose link type it cannot read, and a file it reads as hard-linked, each as its checks of
+  the item read it. It changes each other
+  item with icacls /L. A hard-linked file it does not detect is changed under every name it has.
+  A write grant the run-as account held below the dir becomes read, and
+  is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.
 - **Fix an existing tree that inherits a broad write grant** without a full ACL reset. A config dir
@@ -719,7 +765,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the loader reads, and
     **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
     `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
-    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). A `NULL` DACL (everyone allowed)
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). The principals that may hold one
+    are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the owner, the run-as account (never
+    LocalService or NetworkService, which other services share) and a Domain, Schema or Enterprise
+    Admins group the local Administrators lookup resolves. A grant to any other account is refused,
+    an administrator's own account included, because it works without elevation. A conditional,
+    object or compound allow entry with a write-class right is refused too, since the guard cannot
+    tell whom it applies to (ADR 0036, amended for BACKLOG #5622). A `NULL` DACL (everyone allowed)
     is likewise refused. If the guard **cannot finish its read**, it **refuses** to load: a check
     that could not finish has not shown the code safe to run. That covers at least a Win32 API
     error, an owner SID it cannot resolve, a DACL it cannot enumerate, and this process's own token
@@ -731,8 +783,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
     currently say — a clean DACL owned by a low-privilege account is not evidence of anything. The
-    owner passes when it is **the account the engine runs as**, a **well-known administrator SID**
-    (SYSTEM, `BUILTIN\Administrators`, or a domain SID ending in RID 500/512/518/519), or a
+    owner passes when it is **the account the engine runs as** (never LocalService or
+    NetworkService, which other services share), a **well-known administrator SID**
+    (SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, or a domain SID ending in RID
+    500/512/518/519), or a
     **resolved direct member of the local Administrators group**. Anything else is refused, **and so
     is a membership lookup that cannot be completed**, the same as a DACL read that cannot finish
     (ADR 0036 Decision 3 as amended).
@@ -751,7 +805,38 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       Windows. `/T` covers the `*.py` files, which the guard vets individually; `/C` keeps the walk
       going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
       first one and leaving the rest on the old owner — check its summary line for skipped files.
+      Remove any junction or link inside the dir first, for the reason given above.
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
+  - **An engine run as LocalService or NetworkService earns no self-trust**
+    ([ADR 0036](adr/0036-windows-config-source-trust.md) Amendment E). Other services share
+    LocalService (`S-1-5-19`) and NetworkService (`S-1-5-20`), which is why the grantee and owner
+    rules above never count either as the account the engine runs as. On a site that ran the
+    engine as one of them, the guard would refuse, at load or at `serve` start, a path it checks
+    that the shared account owns, or on which an entry grants the shared account write. The one
+    exception is the owner check's: a shared-account owner that is a direct member of the local
+    Administrators group passes, and so do its own grants. That covers a config editor run as that
+    account: the folder it writes into, the file it leaves, and its own validation load where it
+    runs one. A load stops at the first path it refuses. The refusal is the guard's own message.
+    Under this rule it names the shared account as a write grantee or as the owner, though another
+    entry the guard refuses on the same path can be reported first. A `/config/reload` caller gets
+    only a 422, and the reason is in the engine log. The refusal is deliberate and stays: the owner
+    ruled on 2026-11-15 to keep it fail-closed. The remedy takes all three of these:
+    - **Run the engine under an account that is its own:** the installer's default per-service
+      virtual account, or a dedicated local account or gMSA passed with `-ServiceAccount`, with the
+      caveat [Restrict the service token](#restrict-the-service-token) records for a named account.
+    - **Do not run the config editors as LocalService or NetworkService,** whether from the CLI or
+      through the VS Code extension: at least `connection`, `codeset`, `alert` and `security`.
+    - **Leave every path the guard checks owned by the `BUILTIN\Administrators` group, readable by
+      the engine account, writable only by SYSTEM and `BUILTIN\Administrators`, and with no entry
+      for LocalService or NetworkService.** `-LockConfigDir` sets the folders it locks read-only to
+      the engine account, but it replaces only the entries for SYSTEM, Administrators and the
+      run-as account and leaves any other explicit entry. A file a config editor wrote carries its
+      own protected access list and does not take its folder's grants, so the lockdown does not
+      change that list, and the engine account needs a grant on that file itself.
+
+    An editor run elevated has an open problem of its own: its rewrite can replace a config file
+    with a new one, discarding the file's existing access list, owner and mode
+    (vault BACKLOG #5619).
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
@@ -773,10 +858,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       reaches each file through two links (`<file>` to `..data/<file>`, and `..data` to a dated
       folder the kubelet swaps on update), and that layout has not been measured against the walk.
       It has not been measured against the current check either (see `docker/README.md`). And the
-      POSIX check is shared: the `serve` start check of the settings and value files
-      (`assert_trusted_start_paths`) runs the same code, so adding the walk there changes what
-      every start refuses, and adding it to the config load alone gives the two checks different
-      answers to one question.
+      POSIX policy is shared: the `serve` start check of the settings and value files
+      (`assert_trusted_start_paths`) judges each path by the same code. That start check does not
+      take this walk either, but it does walk the links an open of each file passes through, as
+      it models the open, and vets the folders holding them, as the value-file paragraph in
+      [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+      states. The config load's trust list still vets each module by its own path, not the links
+      it passes through, so the two checks answer a linked file differently.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
@@ -971,12 +1059,17 @@ parked by the DR run-profile, or is `deployed = false` keeps showing `failed` / 
 alert.
 
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
-*and* outbounds — from the web console, or by restarting the service; the retained queue then drains.
+*and* outbounds — from the web console, or by restarting the service. Under the pooled claim mode, a
+router, transform or response lane that is STOPPED when you restart a connection stays STOPPED
+after that restart.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
 re-checks by writing a real record to each dead sink at the moment you ask, so a restart issued
 against a still-broken disk leaves the connection halted (and its listener down) and raises another
 `log_write_failed` naming the refusal, rather than quietly resuming with no log. That is deliberate:
 otherwise "restart it again" would be a way around the control.
+`GET /status` may report a flapping sink `unwritable` even when nothing was halted: from the roll
+that trips the flap bound until a roll more than 60 s after its last roll or failure, or until the
+engine re-validates the log, which it does at least on a restart (ADR 0162 amendment B).
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
 start being routed again, but it deliberately never resumes a paused **outbound** (that is an
 operator decision), so the backlog moves one stage and stops. Restarting the service does both.

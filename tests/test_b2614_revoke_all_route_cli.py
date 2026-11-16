@@ -31,7 +31,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore, RevokeResult
+from messagefoundry.store.store import MessageStore, OperatorAudit, RevokeResult, no_audit_row
 from tests._admin_account import create_local_user_chosen
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
 from tests.test_api_auth import PW, _clear_must_change
@@ -196,7 +196,7 @@ async def _miss(store: MessageStore, db: Path, token_hash: str) -> str:
     sweep's commit has."""
     snapshot = await store.get_session(token_hash)
     assert snapshot is not None and snapshot.revoked_at is None
-    await store.revoke_user_sessions(snapshot.user_id)
+    await store.revoke_user_sessions(snapshot.user_id, audit=no_audit_row)
     await _sqlite_raw(db)(
         "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
         (snapshot.seal, token_hash),
@@ -270,7 +270,11 @@ async def test_signing_out_elsewhere_from_a_declined_session_counts_the_others_o
     real = store.revoke_user_sessions
 
     async def _missed_first(
-        user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         if except_token_hash is not None:
             await _miss(store, db, except_token_hash)
@@ -278,7 +282,7 @@ async def test_signing_out_elsewhere_from_a_declined_session_counts_the_others_o
             await store.create_session(
                 token_hash=hash_token(mint_token()), user_id=user_id, expires_at=4_000_000_000.0
             )
-        return await real(user_id, except_token_hash=except_token_hash, now=now)
+        return await real(user_id, except_token_hash=except_token_hash, now=now, audit=audit)
 
     async with _client(engine, service) as c:
         root = await _login(c, "root")

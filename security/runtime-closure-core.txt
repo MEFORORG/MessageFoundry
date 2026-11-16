@@ -30,7 +30,7 @@ certifi==2026.10.23
 cffi==2.1.1
 click==8.5.0
 cryptography==50.0.2
-fastapi==0.162.0
+fastapi==0.162.2
 h11==0.16.0
 hl7apy==1.3.5
 httpcore==1.0.9
@@ -42,8 +42,8 @@ opentelemetry-api==1.45.2
 psutil==7.2.2
 pyasn1==0.6.5
 pycparser==3.0
-pydantic==2.14.2
-pydantic-core==2.50.2
+pydantic==2.14.3
+pydantic-core==2.50.4
 pyspnego==0.12.4
 sspilib==0.6.0
 starlette==1.10.0

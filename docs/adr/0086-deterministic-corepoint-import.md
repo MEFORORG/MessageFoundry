@@ -175,6 +175,10 @@ copy (`MsgTreeCopy`), and the message-lifecycle / logging / alerting verbs (`Msg
 without the export's data dictionary a fabricated path would silently write the wrong field, which is
 strictly worse than a marker a human must clear.
 
+*Narrowed 2026-11-14 (BACKLOG #5556):* this table is the flat reading. A role-marked statement is
+read from its spans instead (§2(b″)). Which other `@Data` takes the flat reading is stated once,
+in the first gap under §2(b″).
+
 **Control flow is emitted as real nested Python** — `if`/`elif`/`else`, `for`, `while`, `break`,
 `try`/`except` — with the *condition* left as an explicit dead placeholder (`if False:` /
 `for _item in []:`) beside the original text, because a Corepoint condition is not a Python
@@ -196,12 +200,24 @@ handler keeps its `sends` list, so the handler neither filters silently nor gain
 `messagefoundry check` reports that outbound as unreferenced until someone finishes the send, which
 is accurate. The summary counts the statement as unmapped.
 
-Field writes map onto `msg` only for the one handle the list delivers. A list that delivers two
-different handles maps no field write at all.
+For a field write that takes the flat reading, see the gap on flat-reading writes below.
 
 At least these gaps remain:
 
-- A markup-free `MsgSend` carries no handle role, so it renders as before.
+- A markup-free `MsgSend` carries no handle role, so it renders as before. *Narrowed 2026-11-14
+  (BACKLOG #5556); this bullet is where the rule is stated, and the code and other sections point
+  here.* Span markup is matched with case folded on the ASCII letters alone, so
+  `<SPAN CLASS='keyword'>` is read as roles and takes the handle and write gates. A `<Line>` whose
+  `@Data` holds no span the role layer reads takes the flat reading only when
+  `strip_markup(data) == data.strip()`, that is, when neither the tag strip nor `html.unescape`
+  changes it (`_unread_markup` in `corepoint_import.py`). Otherwise it is unread markup, whatever
+  the exporter meant: so is text holding a `<...>` run or an entity, a legacy one with no
+  semicolon included. There a `MsgSend` is refused like a send of an unknown handle, a field write
+  the flat reading would map is left unmapped, and the handle scan counts the send as a delivery of
+  no known handle and a `MsgTreeCopy` as holding nothing.
+- A field write that takes the flat reading checks no handle: the flat reading keeps only a path's
+  leaf, so `ItemClear %OUT/PID-19`, read flat, writes `msg`, even in a list that delivers two
+  handles. `ItemClear %OUT/MSH-2` and `ItemClear %OUT/OBX-5`, read flat, also map onto `msg`.
 - The handle scan does not see statement order or branches. A send that runs before its clone is
   made, or a clone made on one branch only, still counts as `msg`.
 
@@ -551,9 +567,10 @@ At least these limits remain:
   that was not measured: the validated export is not in this repository.
 - The marker and the statement share one 200-character comment, so a statement longer than about
   90 characters is cut. Under a `@Disabled` ancestor the preview shows only the verb.
-- A statement with no role markup names no handle the scan can read. So a markup-free write still
-  maps onto `msg` and a markup-free send still sends it, in such a list as in any other (§2(b″)).
-  The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
+- A statement with no role markup names no handle the scan can read. So a write that takes the
+  flat reading still maps onto `msg` and such a send still sends it, in such a list as in any
+  other. The same holds for such a `MsgTreeCopy` on a `<Line>`. Which statements take the flat
+  reading is stated once, in the first gap under §2(b″) (BACKLOG #5556).
 - The refusal at a send on a `<Line>`, and the reason on a declined write, still name the two
   older causes: no single input handle, or an overwritten input. The marker carries the true one.
   A send in a Block's or a Call's `@Data` names its own cause in its refusal.
@@ -939,8 +956,9 @@ At least these limits remain:
 ### AC-6 (amendment, 2026-07-24 — the validated XML layer)
 
 - **AC-6a (markup)** — a markup-wrapped `@Data` SHALL yield its plain statement, and the fixture's
-  wrapped statements SHALL classify into vocabulary calls.
-  → `::test_strip_markup_recovers_the_verb`, `::test_markup_stripped_statements_classify_in_the_fixture`
+  flat writes SHALL classify into vocabulary calls. *Amended 2026-11-14 (BACKLOG #5556):* those
+  writes are written to take the flat reading (the first gap under §2(b″) says which do).
+  → `::test_strip_markup_recovers_the_verb`, `::test_the_fixtures_flat_writes_reach_the_vocabulary`
 - **AC-6b (`<Block>`)** — a `<Block>` SHALL emit a comment with its body inline, never an action.
   → `::test_block_becomes_a_comment_never_an_action`
 - **AC-6c (`@Disabled`)** — a `@Disabled` subtree SHALL be preserved as a comment, never emitted as

@@ -13,12 +13,15 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.verify import checks, cipher_policy
 from messagefoundry.verify.cipher_policy import ProbeFailed, ProbeUnavailable
 from messagefoundry.verify.model import CheckResult, Status
@@ -228,21 +231,24 @@ def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
 
 _POWERSHELL = ("WindowsPowerShell", "v1.0", "powershell.exe")
 
+#: These tests' PowerShell timeout. A cold Windows PowerShell 5.1 start with module analysis can
+#: take over the probe's 30 s on a CI runner, and here no probe error mapping turns the timeout
+#: into a reading, so a slow start would fail the test for a reason it does not test.
+_TEST_TIMEOUT_S = 60
+
 
 def _run_powershell(
-    text: str, env: dict[str, str] | None = None
+    text: str, pins: Mapping[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    from messagefoundry.childenv import system_tool_environment
-    from messagefoundry.service_status import _system_exe
-
-    return subprocess.run(
-        [_system_exe(*_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", text],
-        env={**system_tool_environment(), **(env or {})},
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    """``text`` through the probe's own PowerShell start, so these tests cannot drift from its
+    arguments or environment (BACKLOG #3803 S5). ``pins``, when given, replace the probe's fixed
+    ``PATH`` and ``PSModulePath``: ``{}`` is the start-up names alone, as unpinned."""
+    # The start reads _PROBE_TIMEOUT_S when it runs, so the longer bound reaches it alone.
+    with mock.patch.object(cipher_policy, "_PROBE_TIMEOUT_S", _TEST_TIMEOUT_S):
+        if pins is None:
+            return cipher_policy._powershell(text)
+        with mock.patch.object(cipher_policy, "_powershell_pins", lambda: dict(pins)):
+            return cipher_policy._powershell(text)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
@@ -272,6 +278,39 @@ def test_a_missing_module_folder_exits_not_on_this_host() -> None:
     assert _run_powershell(text).returncode == cipher_policy._NO_CMDLET_EXIT
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_an_empty_module_folder_exits_not_on_this_host(tmp_path: Path) -> None:
+    """BACKLOG #3803 S2, measured: a module folder that is there with no module in it gives the
+    import the error id a missing folder gives, so the probe exits "not on this host" and the row
+    reads MANUAL (:func:`test_a_host_without_the_tls_cmdlet_is_manual`), never a PASS."""
+    empty = tmp_path / "TLS"
+    empty.mkdir()
+    quoted = str(empty).replace("'", "''")  # a single-quoted literal doubles its apostrophes
+    text = cipher_policy._SUITES_COMMAND.replace('"$PSHOME\\Modules\\TLS"', f"'{quoted}'")
+    assert text != cipher_policy._SUITES_COMMAND
+    assert _run_powershell(text).returncode == cipher_policy._NO_CMDLET_EXIT
+
+
+def test_the_tests_powershell_is_the_probes_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #3803 S5: the helper that runs other text through the real PowerShell took its own
+    arguments and an unpinned environment, so a test could pass on a start the probe never makes.
+    It now takes the probe's start: the same call, but for the text and a longer timeout."""
+    seen: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="TLS_AES_256_GCM_SHA384\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    cipher_policy._windows_enabled_suites()
+    _run_powershell("$PSVersionTable")
+    (probe_argv, probe_kwargs), (test_argv, test_kwargs) = seen
+    assert probe_argv[:-1] == test_argv[:-1] and test_argv[-1] == "$PSVersionTable"
+    assert test_kwargs.pop("timeout") == _TEST_TIMEOUT_S
+    assert probe_kwargs.pop("timeout") == cipher_policy._PROBE_TIMEOUT_S
+    assert probe_kwargs == test_kwargs
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="parses with Windows PowerShell's parser")
 def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
     """PowerShell's own parser lists every command the text runs. The only name allowed is the
@@ -291,7 +330,9 @@ def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
             "{ $n = $c.GetCommandName(); if (-not $n) { $n = '& ' + $c.CommandElements[0].Extent.Text }; "
             "[Console]::Out.WriteLine($n) }"
         )
-        done = _run_powershell(lister, {"MF_PROBE_TEXT": str(script)})
+        done = _run_powershell(
+            lister, {**cipher_policy._powershell_pins(), "MF_PROBE_TEXT": str(script)}
+        )
         assert done.returncode == 0, done.stderr[:300]
         return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
@@ -435,7 +476,17 @@ def test_the_openssl_start_gets_its_own_variables_and_no_python_one(
 _PLANTED_SUITE = "TLS_PLANTED_AES_256_GCM_SHA384"
 #: At least the two helpers the Lander found shadowed, and the cmdlet the probe exists to run.
 #: ``Import-Module`` is planted too, though a Core cmdlet always wins over a ``PATH`` external.
-_PLANTED_COMMANDS = ("Join-Path", "Test-Path", "Get-TlsCipherSuite", "Import-Module")
+#: So are ``Out-Default`` and ``Set-StrictMode``, which PowerShell itself looks up by a bare name
+#: and the probe text never names (BACKLOG #3803 S3): both are Core cmdlets, so this measures that
+#: a plant cannot answer for them on the operator's ``PATH`` either, not only under the pin.
+_PLANTED_COMMANDS = (
+    "Join-Path",
+    "Test-Path",
+    "Get-TlsCipherSuite",
+    "Import-Module",
+    "Out-Default",
+    "Set-StrictMode",
+)
 #: The probe text as it stood at the hold: bare ``Join-Path`` and ``Test-Path``. The positive
 #: control, so the plant is shown to run where a bare name is looked up.
 _SHADOWABLE_COMMAND = (
@@ -472,6 +523,8 @@ def _plant_on_path(
         "Test-Path": "True",
         "Get-TlsCipherSuite": _PLANTED_SUITE,
         "Import-Module": "",
+        "Out-Default": _PLANTED_SUITE,
+        "Set-StrictMode": "",
     }
     for name in _PLANTED_COMMANDS:
         (planted / f"{name}.cmd").write_text(
@@ -1476,10 +1529,14 @@ def test_no_odbc_driver_means_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
 
 
-def _with_pyodbc(monkeypatch: pytest.MonkeyPatch, reading: Status) -> CheckResult:
-    """pyodbc reads as installed and the policy read returns ``reading``."""
+def _pyodbc_importable(monkeypatch: pytest.MonkeyPatch) -> None:
     real = checks._can_import
     monkeypatch.setattr(checks, "_can_import", lambda module: module == "pyodbc" or real(module))
+
+
+def _with_pyodbc(monkeypatch: pytest.MonkeyPatch, reading: Status) -> CheckResult:
+    """pyodbc reads as installed and the policy read returns ``reading``."""
+    _pyodbc_importable(monkeypatch)
     stub = CheckResult("host.ciphers", "t", reading, "stub reading", evidence="stub evidence")
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", lambda: stub)
     return stub
@@ -1510,7 +1567,7 @@ def test_pyodbc_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", must_not_run)
     r = checks.check_host_cipher_policy(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
-    assert "no ODBC Driver 18 hop in the graph in 'cfg'" in r.detail
+    assert "no ODBC hop in the graph in 'cfg'" in r.detail
 
 
 @pytest.mark.parametrize(
@@ -1570,6 +1627,383 @@ def test_a_raising_read_under_an_unknown_configuration_is_manual(
     assert r.status is Status.MANUAL and "ValueError: unexpected" in r.detail
 
 
+# --- host.odbc, gated on the same census (BACKLOG #3803 R6) -------------------------------------
+
+_DRIVER_18 = "ODBC Driver 18 for SQL Server"
+
+
+def _odbc_drivers(monkeypatch: pytest.MonkeyPatch, *drivers: str | Exception) -> None:
+    """pyodbc reads as installed, and its ``drivers()`` lists ``drivers``, or raises the one
+    exception given."""
+
+    def listed() -> list[str]:
+        if drivers and isinstance(drivers[0], Exception):
+            raise drivers[0]
+        return [str(d) for d in drivers]
+
+    _pyodbc_importable(monkeypatch)
+    monkeypatch.setitem(sys.modules, "pyodbc", types.SimpleNamespace(drivers=listed))
+
+
+def test_a_missing_driver_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pyodbc installed and no hop configured is not a FAIL, as for ``host.ciphers``: the row read
+    FAIL on a stock host with pyodbc and no Driver 18, and made ``verify`` exit 1. The reading
+    stays in the detail."""
+    _odbc_drivers(monkeypatch, "SQL Server")
+    r = checks.check_sqlserver_odbc_driver(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
+    assert (r.id, r.status) == ("host.odbc", Status.SKIP)
+    assert "no hop naming a SQL Server driver in the graph in 'cfg'" in r.detail
+    assert "not found" in r.detail
+
+
+_STORE_HOP = ("the [store] backend is sqlserver", _DRIVER_18)
+_DRIVER_17 = "ODBC Driver 17 for SQL Server"
+
+
+def _needing(*needs: tuple[str, str], unknown: str | None = None) -> checks.OdbcHops:
+    return checks.OdbcHops(
+        found=tuple(label for label, _ in needs), unknown=unknown, needs=tuple(needs)
+    )
+
+
+@pytest.mark.parametrize(
+    ("drivers", "hops", "expect"),
+    [
+        # A hop's registered driver missing FAILs, Driver 18 or another (code review round 5,
+        # finding 2): a Driver 17 hop on a host with Driver 18 alone read SKIP at 08cba626b1.
+        (("SQL Server",), _needing(_STORE_HOP), Status.FAIL),
+        ((_DRIVER_18,), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.FAIL),
+        ((_DRIVER_18, _DRIVER_17), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.PASS),
+        # pyodbc's list is read in any case, as the driver managers look a name up.
+        ((_DRIVER_17.upper(),), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.PASS),
+        # An unreadable driver list is ERROR on any ODBC hop, not only one naming Driver 18
+        # (finding 1): a PostgreSQL hop read SKIP at 08cba626b1.
+        ((RuntimeError("no driver manager"),), _A_HOP, Status.ERROR),
+        (
+            (RuntimeError("no driver manager"),),
+            checks.OdbcHops(found=("DATABASE connection OB_PG",)),
+            Status.ERROR,
+        ),
+        ((RuntimeError("no driver manager"),), checks.OdbcHops(unknown="x"), Status.MANUAL),
+        ((RuntimeError("no driver manager"),), checks.OdbcHops(), Status.SKIP),
+        # A graph hop unread, or its driver not told, is MANUAL even with Driver 18 listed, since
+        # the hop may need another driver (code review round 6, finding 2).
+        (("SQL Server",), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
+        ((_DRIVER_18,), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
+        # The store backend not known: a listed Driver 18 answers it, since the store needs that.
+        (
+            ("SQL Server",),
+            checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"),
+            Status.MANUAL,
+        ),
+        ((_DRIVER_18,), checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"), Status.PASS),
+        (
+            (RuntimeError("no driver manager"),),
+            checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"),
+            Status.MANUAL,
+        ),
+        # A hop on another vendor's driver only: nothing for this row to check.
+        (("SQL Server",), checks.OdbcHops(found=("DATABASE connection OB_PG",)), Status.SKIP),
+    ],
+)
+def test_each_hops_driver_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+    drivers: tuple[str | Exception, ...],
+    hops: checks.OdbcHops,
+    expect: Status,
+) -> None:
+    _odbc_drivers(monkeypatch, *drivers)
+    r = checks.check_sqlserver_odbc_driver(lambda: hops)
+    assert r.status is expect, r.detail
+    if expect is Status.FAIL:
+        label, name = hops.needs[0]
+        assert f"{label} needs {name!r}" in r.detail
+    if expect is Status.ERROR:
+        assert r.evidence.startswith("ODBC hops: ") and "no driver manager" in r.detail
+    if expect is Status.MANUAL:
+        reason = hops.unknown or hops.unless_18
+        assert f"({reason})" in r.detail or f"not read: {reason}" in r.detail
+
+
+def test_a_driver_library_path_is_judged_by_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hop naming the driver library by a path is judged by whether the file is there, since the
+    driver manager loads it from the path, not from pyodbc's list (code review round 5, finding 4:
+    it read MANUAL in a fully read configuration at 08cba626b1)."""
+    library = tmp_path / "libmsodbcsql-18.3.so.3.1"
+    _odbc_drivers(monkeypatch, "SQL Server")
+    hops = checks.OdbcHops(
+        found=("DatabaseLookup LK",), paths=(("DatabaseLookup LK", str(library)),)
+    )
+    missing = checks.check_sqlserver_odbc_driver(lambda: hops)
+    assert missing.status is Status.FAIL and "which is not a file" in missing.detail
+    library.write_bytes(b"")
+    assert checks.check_sqlserver_odbc_driver(lambda: hops).status is Status.PASS
+
+
+def test_each_row_reads_its_own_census(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``host.odbc`` reads every hop with its driver, ``host.ciphers`` the hops that take the host
+    policy, and ``run_host_checks`` hands each row its own answer."""
+    _odbc_drivers(monkeypatch, "SQL Server")
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    monkeypatch.setattr(sys, "platform", "linux")
+    results = checks.run_host_checks(
+        ports={},
+        writable_dir=tmp_path,
+        odbc_hops=lambda: _A_HOP,
+        driver_hops=lambda: checks.OdbcHops(judged="the graph"),
+    )
+    rows = {r.id: r for r in results}
+    assert (rows["host.odbc"].status, rows["host.ciphers"].status) == (Status.SKIP, Status.FAIL)
+
+
+def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """BACKLOG #3803 R2: the hop census and the self smoke read one load of ``--config``, so the
+    config modules run once. The control: the census did load it, as the hop SKIP shows."""
+    from messagefoundry.config import wiring
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    graph = tmp_path / "config"
+    graph.mkdir()
+    loads: list[bool] = []
+    real = wiring.load_config
+
+    def counted(d: Any, allow_empty: bool = False, **kw: Any) -> Any:
+        loads.append(allow_empty)
+        return real(d, allow_empty=allow_empty, **kw)
+
+    monkeypatch.setattr(wiring, "load_config", counted)
+    _odbc_drivers(monkeypatch, "SQL Server")
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    results = run_verify(
+        config_dir=str(graph), service_config=str(service), sections=["host", "smoke"]
+    )
+    rows = {r.id: r for r in results}
+    assert rows["host.odbc"].status is Status.SKIP, rows["host.odbc"].detail
+    # The shared load allows an empty graph; the smoke still refuses one, as on its own load.
+    assert rows["smoke.self"].status is Status.FAIL
+    assert "config failed to load" in rows["smoke.self"].detail
+    assert loads == [True]
+
+
+@pytest.mark.parametrize("raised", [WiringError, SystemExit, OSError, LookupError])
+def test_a_failed_shared_load_is_read_once_by_both(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
+) -> None:
+    """The failure path of the one load: the census reads it as unknown and the smoke as a FAIL,
+    and the modules run once. A config module that exits at import, or a load that raises what the
+    census tolerates, ends the smoke row and not the verify run (code review round 3, finding 5)."""
+    from messagefoundry.config import wiring
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    graph = tmp_path / "config"
+    graph.mkdir()
+    loads: list[str] = []
+
+    def broken(d: Any, allow_empty: bool = False, **kw: Any) -> Any:
+        loads.append(str(d))
+        raise raised("bad graph")
+
+    monkeypatch.setattr(wiring, "load_config", broken)
+    _odbc_drivers(monkeypatch, "SQL Server")
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    results = run_verify(
+        config_dir=str(graph), service_config=str(service), sections=["host", "smoke"]
+    )
+    rows = {r.id: r for r in results}
+    assert rows["host.odbc"].status is Status.MANUAL and "bad graph" in rows["host.odbc"].detail
+    assert "not read: the " in rows["host.odbc"].detail
+    assert rows["smoke.self"].status is Status.FAIL
+    assert "config failed to load" in rows["smoke.self"].detail
+    assert len(loads) == 1
+
+
+def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
+    """BACKLOG #3803 R3: one wiring-level reader of the entries that open an ODBC connection. An
+    ``env()`` driver is ``None``; a connection that is not deployed is never built, so it is left
+    out. An inbound is named by its record name, so one that shares an outbound's name stays a
+    hop of its own."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        InboundConnection,
+        Registry,
+        env,
+        odbc_hops,
+    )
+
+    poll = InboundConnection(
+        name="OB_B", spec=ConnectionSpec(type=ConnectorType.DATABASE, settings={}), router="r"
+    )
+    reg = Registry(
+        inbound={"OB_B": poll},
+        outbound={
+            "OB_B": _database("OB_B"),
+            "OB_ENV": _database("OB_ENV", driver=env("db_driver")),
+            "OB_DARK": _database("OB_DARK", deployed=False),
+            "OB_PG": _database("OB_PG", "generic", driver="PostgreSQL Unicode"),
+        },
+    )
+    driver_18 = "ODBC Driver 18 for SQL Server"
+    assert odbc_hops(reg) == [
+        ("DATABASE connection", "OB_B", "sqlserver", driver_18),
+        ("DATABASE connection", "OB_ENV", "sqlserver", None),
+        ("DATABASE connection", "OB_PG", "generic", "PostgreSQL Unicode"),
+        ("DATABASE connection", "inbound:OB_B", "sqlserver", driver_18),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dialect", "driver", "ciphers", "odbc"),
+    [
+        # The preset's default: a hop of both rows, needing Driver 18.
+        (None, None, "found", "needs"),
+        # The generic dialect on Microsoft's Driver 18 (the code review's round-one finding 1).
+        ("generic", "ODBC Driver 18 for SQL Server", "found", "needs"),
+        # Another Microsoft driver takes the host policy, and host.odbc checks that driver
+        # (code review round 5, finding 2).
+        (None, "ODBC Driver 17 for SQL Server", "found", "needs"),
+        # Another vendor's driver is an ODBC hop, with no SQL Server driver to check; its own TLS is
+        # not read.
+        ("generic", "PostgreSQL Unicode", "unknown", "other"),
+        # The preset builds only on a Microsoft driver, so an env() driver there still takes the
+        # host policy (round two, finding 1); which driver it needs is not known.
+        (None, "env", "found", "unknown"),
+        # A preset entry on another vendor's driver is refused at build, so nothing dials it and it
+        # is no hop of either row (code review round 3, finding 2).
+        (None, "PostgreSQL Unicode", "none", "none"),
+        # The library named by its path: judged by the file, not pyodbc's list (round 5, finding 4).
+        (None, "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "path"),
+        (None, r"C:\Windows\System32\msodbcsql18.dll", "found", "path"),
+        (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "path"),
+        # A bare library file name is searched for by the loader, and a relative path is read from
+        # the service's working directory, so neither is judged here (round 6, finding 3).
+        (None, "msodbcsql18.dll", "found", "unknown"),
+        (None, "lib/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
+        # The preset sends the name as written and refuses a padded one at build, so it is no hop.
+        (None, " ODBC Driver 18 for SQL Server ", "none", "none"),
+        # An env() dialect naming the library by path can only be on the preset, which alone takes
+        # a path (code review round 4, finding 2).
+        ("env", "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "path"),
+        # A dialect the build refuses is no hop (round 4, finding 5).
+        ("mssql", None, "none", "none"),
+        # A driver every arm the entry can take refuses is no hop (round 4, finding 6).
+        ("env", "FreeTDS", "none", "none"),
+        ("generic", "FreeTDS", "none", "none"),
+        # An env() dialect on another vendor's allowed driver may be generic, with its own TLS.
+        ("env", "PostgreSQL Unicode", "unknown", "other"),
+    ],
+)
+def test_each_row_counts_the_hops_its_driver_question_reaches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dialect: str | None,
+    driver: str | None,
+    ciphers: str,
+    odbc: str,
+) -> None:
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.wiring import env
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    odbc_driver = env("db_driver") if driver == "env" else driver
+    odbc_dialect = env("db_dialect") if dialect == "env" else dialect
+    _registry_with(
+        monkeypatch, outbound={"OB_X": _database("OB_X", odbc_dialect, driver=odbc_driver)}
+    )
+
+    def outcome(hops: checks.OdbcHops) -> str:
+        return "found" if hops.found else "unknown" if hops.unknown else "none"
+
+    def needed(hops: checks.OdbcHops) -> str:
+        if hops.unknown:
+            return "unknown"
+        return (
+            "path" if hops.paths else "needs" if hops.needs else "other" if hops.found else "none"
+        )
+
+    if odbc == "path" and not Path(str(driver)).is_absolute():
+        odbc = "unknown"  # a path absolute on another platform only is not judged here
+    settings = ServiceSettings()
+    assert outcome(_hops(tmp_path, settings=settings)) == ciphers
+    hops = _hops(tmp_path, settings=settings, drivers=True)
+    assert needed(hops) == odbc
+    if odbc == "needs":
+        assert hops.needs == (("DATABASE connection OB_X", (driver or _DRIVER_18).strip()),)
+    if odbc == "path":
+        assert hops.paths == (("DATABASE connection OB_X", driver),)
+
+
+def test_the_driver_census_reads_the_graph_beside_a_sql_server_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The store names Driver 18, and host.odbc still reads the graph's hops for their own
+    drivers, where host.ciphers stops at the first hop."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import StoreBackend
+
+    monkeypatch.chdir(tmp_path)
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", driver=_DRIVER_17)})
+    settings = SimpleNamespace(store=SimpleNamespace(backend=StoreBackend.SQLSERVER))
+    hops = _hops(tmp_path, settings=settings, drivers=True)
+    assert hops.needs == (
+        ("the [store] backend is sqlserver", _DRIVER_18),
+        ("DATABASE connection OB_X", _DRIVER_17),
+    )
+    assert hops.unknown is None
+
+
+def test_the_stores_need_survives_a_graph_read_that_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SQL Server store still needs Driver 18 when the graph read raises what the census did not
+    foresee, so a host without it FAILs (code review round 6, finding 1: MANUAL at 335205b3f0)."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.verify.runner import _driver_hops
+
+    def broken() -> Any:
+        raise LookupError("unforeseen")
+
+    (tmp_path / "config").mkdir()
+    settings = SimpleNamespace(store=SimpleNamespace(backend=StoreBackend.SQLSERVER))
+    hops = _driver_hops(settings, "service.toml", str(tmp_path / "config"), broken)  # type: ignore[arg-type]
+    assert hops.needs == (("the [store] backend is sqlserver", _DRIVER_18),)
+    assert hops.unknown is not None and "LookupError" in hops.unknown
+    _odbc_drivers(monkeypatch, "SQL Server")
+    assert checks.check_sqlserver_odbc_driver(lambda: hops).status is Status.FAIL
+
+
+def test_a_kept_load_failure_holds_no_traceback_in_its_chain() -> None:
+    """Round 6, finding 4: the cause and the context are both cleared, and a group's members."""
+    from messagefoundry.verify.runner import _without_tracebacks
+
+    try:
+        try:
+            raise KeyError("context")
+        except KeyError:
+            raise ValueError("top") from TypeError("cause")
+    except ValueError as exc:
+        kept = exc
+    context, cause = kept.__context__, kept.__cause__
+    assert context is not None and cause is not None
+    try:
+        raise ExceptionGroup("g", [OSError("member")])
+    except ExceptionGroup as group:
+        held = group
+    cause.__context__ = held
+    _without_tracebacks(kept)
+    chain = [kept, context, cause, cause.__context__, *held.exceptions]
+    assert all(e is not None and e.__traceback__ is None for e in chain)
+
+
 def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:
     return next(r for r in results if r.id == "host.ciphers")
 
@@ -1600,9 +2034,13 @@ def test_verify_on_a_host_with_pyodbc_and_no_hop_does_not_fail(
     graph = tmp_path / "config"
     graph.mkdir()
     _with_pyodbc(monkeypatch, Status.FAIL)
+    # BACKLOG #3803 R6: host.odbc read FAIL on the same host, pyodbc without Driver 18.
+    _odbc_drivers(monkeypatch, "SQL Server")
     results = run_verify(config_dir=str(graph), service_config=str(service), sections=["host"])
     row = _host_ciphers_row(results)
     assert row.status is Status.SKIP, row.detail
+    odbc = next(r for r in results if r.id == "host.odbc")
+    assert odbc.status is Status.SKIP, odbc.detail
 
 
 def test_a_sqlite_file_without_the_services_store_variable_reports_manual(
@@ -1640,6 +2078,49 @@ def test_verify_without_a_service_config_reports_manual(
     assert "no service config was read" in row.detail
 
 
+def test_the_fast_host_check_with_driver_18_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No --config given and Driver 18 listed: host.odbc PASSes, as at 08cba626b1 (code review
+    round 7, finding 10). Without Driver 18 it is MANUAL, since the graph was not read."""
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    _odbc_drivers(monkeypatch, _DRIVER_18)
+    results = run_verify(
+        config_dir="samples/config", service_config=str(service), sections=["host"]
+    )
+    row = next(r for r in results if r.id == "host.odbc")
+    assert row.status is Status.PASS, row.detail
+    _odbc_drivers(monkeypatch, "SQL Server")
+    results = run_verify(
+        config_dir="samples/config", service_config=str(service), sections=["host"]
+    )
+    row = next(r for r in results if r.id == "host.odbc")
+    assert row.status is Status.MANUAL and "--config was left at" in row.detail
+
+
+@pytest.mark.parametrize("driver", ["env", "msodbcsql18.dll"])
+def test_an_unreadable_list_is_an_error_on_a_hop_whose_driver_is_not_told(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, driver: str
+) -> None:
+    """Round 7, finding 1: an env() driver or a bare library name is still an ODBC hop, so an
+    unreadable driver list is ERROR, not MANUAL, and verify exits 1."""
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.wiring import env
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    odbc_driver = env("db_driver") if driver == "env" else driver
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", driver=odbc_driver)})
+    hops = _hops(tmp_path, settings=ServiceSettings(), drivers=True)
+    _odbc_drivers(monkeypatch, RuntimeError("no driver manager"))
+    r = checks.check_sqlserver_odbc_driver(lambda: hops)
+    assert r.status is Status.ERROR, r.detail
+    assert "DATABASE connection OB_X" in r.evidence
+
+
 def test_verify_with_no_config_dir_reports_manual(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1664,21 +2145,30 @@ def _registry_with(monkeypatch: pytest.MonkeyPatch, **parts: Any) -> None:
 
 
 def _hops(
-    config_dir: Path, *, settings: Any = None, service_config: str | None = "service.toml"
+    config_dir: Path,
+    *,
+    settings: Any = None,
+    service_config: str | None = "service.toml",
+    drivers: bool = False,
 ) -> checks.OdbcHops:
-    from messagefoundry.verify.runner import _odbc_hops
+    """The ``host.ciphers`` census, or with ``drivers`` the ``host.odbc`` one."""
+    from messagefoundry.verify.runner import _driver_hops, _Graph, _odbc_hops
 
-    return _odbc_hops(settings, service_config, str(config_dir))
+    graph = _Graph(str(config_dir))
+    census = _driver_hops if drivers else _odbc_hops
+    return census(settings, service_config, str(config_dir), graph)
 
 
-def _database(dialect: str | None = None) -> Any:
+def _database(name: str, dialect: Any = None, *, deployed: bool = True, driver: Any = None) -> Any:
+    """An outbound DATABASE connection named ``name``, on ``dialect`` and ``driver`` when given."""
     from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection
 
-    settings = {} if dialect is None else {"dialect": dialect}
-    return OutboundConnection(
-        name="x", spec=ConnectionSpec(type=ConnectorType.DATABASE, settings=settings)
-    )
+    settings: dict[str, Any] = {} if dialect is None else {"dialect": dialect}
+    if driver is not None:
+        settings["odbc_driver"] = driver
+    spec = ConnectionSpec(type=ConnectorType.DATABASE, settings=settings)
+    return OutboundConnection(name=name, spec=spec, deployed=deployed)
 
 
 def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1696,7 +2186,11 @@ def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_
     )
     _registry_with(
         monkeypatch,
-        outbound={"OB_DB": _database(), "OB_SQL": _database("SQLServer"), "OB_F": file_outbound},
+        outbound={
+            "OB_DB": _database("OB_DB"),
+            "OB_SQL": _database("OB_SQL", "SQLServer"),
+            "OB_F": file_outbound,
+        },
         references={
             "REF_DB": ReferenceSpec("REF_DB", ReferenceSourceSpec("database", {})),
             "REF_F": ReferenceSpec("REF_F", ReferenceSourceSpec("file", {})),
@@ -1718,10 +2212,12 @@ def test_a_generic_dialect_connection_alone_is_unknown(
     not be the one it takes; neither "hop" nor "no hop" is known."""
     from messagefoundry.config.settings import ServiceSettings
 
-    _registry_with(monkeypatch, outbound={"OB_PG": _database("generic")})
+    _registry_with(
+        monkeypatch, outbound={"OB_PG": _database("OB_PG", "generic", driver="PostgreSQL Unicode")}
+    )
     hops = _hops(tmp_path, settings=ServiceSettings())
     assert not hops.found
-    assert hops.unknown is not None and "OB_PG uses a generic ODBC driver" in hops.unknown
+    assert hops.unknown is not None and "OB_PG uses the driver 'PostgreSQL Unicode'" in hops.unknown
 
 
 def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1817,7 +2313,7 @@ def test_an_inbound_database_connection_is_a_hop(
         name="IB_DB", spec=ConnectionSpec(type=ConnectorType.DATABASE, settings={}), router="r"
     )
     _registry_with(monkeypatch, inbound={"IB_DB": poll})
-    assert _hops(tmp_path).found == ("DATABASE connection IB_DB",)
+    assert _hops(tmp_path).found == ("DATABASE connection inbound:IB_DB",)
 
 
 def test_another_platform_takes_no_census(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1839,7 +2335,10 @@ def test_another_platform_takes_no_census(monkeypatch: pytest.MonkeyPatch) -> No
 def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _hide_pyodbc(monkeypatch)
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert "host.ciphers" in {r.id for r in results}
 

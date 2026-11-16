@@ -763,6 +763,22 @@ async def _assert_restart_reconcile_contract(store: Any) -> None:
         # The owner filter runs in this backend's SQL: own rows and unowned ones, never a sibling's.
         owned = {str(r["id"]) for r in await store.list_executing_approvals(claim_owner=mine_owner)}
         assert mine in owned and legacy in owned and sibling not in owned
+        # Its complement, the sibling scan, also in SQL: other owners' rows, never an unowned one.
+        others = await store.list_executing_approvals(not_claimed_by=mine_owner)
+        others_ids = {str(r["id"]) for r in others}
+        assert sibling in others_ids and mine not in others_ids and legacy not in others_ids
+        # A move guarded on the claim owner is checked on the row read in the write (BACKLOG
+        # #1562): the wrong owner, or "no owner" on an owned row, moves nothing.
+        for guard in (mine_owner, None):
+            assert not await store.decide_pending_approval(
+                sibling,
+                status="interrupted",
+                approver=_APPROVER,
+                decided_at=5_500.0,
+                from_status="executing",
+                from_claim_owner=guard,
+            )
+        assert await _status(store, sibling) == "executing"
 
         restarted = _gate(store, _never_runs, claim_owner=mine_owner)
         found = await restarted.reconcile_after_restart()
@@ -775,6 +791,9 @@ async def _assert_restart_reconcile_contract(store: Any) -> None:
         assert await _status(store, mine) == "interrupted"
         assert await _status(store, legacy) == "interrupted"
         assert await _status(store, sibling) == "executing", "a sibling's live release was moved"
+        # The move keeps the claim time rather than writing the restart's (BACKLOG #1562).
+        moved_row = await store.get_pending_approval(mine)
+        assert moved_row is not None and float(moved_row["decided_at"]) == 5_000.0
 
         for approval_id, owner in ((mine, mine_owner), (legacy, None)):
             rows = await _resolved_rows(store, approval_id, "approval.interrupted")

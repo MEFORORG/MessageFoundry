@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 from messagefoundry.api.models import UploadedFileList, UploadedMessagesResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
-from ._common import _pager
+from ._common import _pager, _refilled_field_value
 
 __all__ = [
     "uploaded_log_delete_confirm",
@@ -193,6 +193,7 @@ def _browse_filters(
             el("input", name="field_path", value=field_path or None, placeholder="PID-3"),
         ),
         el("label", "Field value", el("input", name="field_value", value=field_value or None)),
+        _refilled_field_value(field_path, field_value),
         el("label", "Substring", el("input", name="content", value=content or None)),
         el("input", name="message_type", value=message_type or None, placeholder="type (optional)"),
         el(

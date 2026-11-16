@@ -111,6 +111,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -123,9 +124,26 @@ from messagefoundry.redaction import json_loads_or_refusal
 #: keeps the in-process keyed/keyless path (byte-identical to pre-ADR-0138 for the default cipher).
 AuditMacFn = Callable[[bytes], str]
 
+
+@runtime_checkable
+class AuditMacVerifier(Protocol):
+    """An :data:`AuditMacFn` that also checks a STORED MAC itself (BACKLOG #2720).
+
+    The audit walk asks :meth:`verify` whether a row's stored MAC is the MAC of the row's bytes,
+    rather than computing a fresh MAC and comparing the two. Transit's ``verify`` call is one: it
+    checks a MAC at the key version the MAC names, so a row made under an older version still
+    verifies after the key rotates."""
+
+    def __call__(self, data: bytes, /) -> str: ...
+
+    def verify(self, data: bytes, stored: str, /) -> bool: ...
+
+
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hmac import HMAC
+
+    from messagefoundry.store.row_seal import TransitSealBackend
 
 _log = logging.getLogger(__name__)
 
@@ -167,6 +185,19 @@ _ALG_AES_256_GCM = "a256gcm"
 _NONCE_BYTES = 12  # 96-bit random nonce, the standard size for AES-GCM
 _GCM_TAG_BYTES = 16  # the AES-GCM authentication tag every sealed value ends with
 _KEY_ID_LEN = 16  # hex chars of the SHA-256 key fingerprint embedded as key_id
+#: The most characters of one marker field an error message echoes (BACKLOG #5553). A version, an
+#: algorithm id or a key id is cut from the stored text, so a damaged or planted value decides its
+#: length, and the message reaches logs, refusals and HTTP answers. Every real one is far shorter.
+_ECHO_LIMIT = 32
+
+
+def _echo(field: str) -> str:
+    """``repr`` of a marker field cut from a stored value, at most :data:`_ECHO_LIMIT` characters of
+    it, with the full length named when it was cut (BACKLOG #5553)."""
+    if len(field) <= _ECHO_LIMIT:
+        return repr(field)
+    return f"{field[:_ECHO_LIMIT]!r}... ({len(field)} characters)"
+
 
 # HKDF info label for the audit-chain HMAC key (#190). Versioned so a future re-derivation is an
 # additive label, never a silent change to an existing deployment's derived key.
@@ -430,7 +461,8 @@ class _UnmarkedPolicy:
             _log.debug("cipher refusal hook raised; the refusal itself still stands")
 
     def _pass_unmarked(self, stored: str, aad: bytes | None, allow_unmarked: bool) -> str:
-        """Return an unmarked ``stored`` when policy permits it, else raise :class:`CipherError`."""
+        """Return an unmarked ``stored`` when policy permits it, else raise
+        :class:`UnmarkedCipherError`."""
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
@@ -448,13 +480,47 @@ class _UnmarkedPolicy:
         else:
             cause = "a stripped marker or a planted row"
             fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
-        _log.warning(
-            "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
-        )
+        if (table, column) not in _ROW_TAGGED_CELLS or _first_unmarked_in_interval(table, column):
+            # A tagged message or preset cell logs once per column per interval: a list over a
+            # keyless run's rows meets one in every row, this names no row, and the cell-tag
+            # layer audits each row and logs once per column per interval (BACKLOG #5650). Every
+            # other column, an upload among them, logs on every refusal.
+            _log.warning(
+                "refused an unmarked value in cipher column %s.%s: %s; %s",
+                table,
+                column,
+                cause,
+                fix,
+            )
         self.report_unmarked(table, column)
-        raise CipherError(
+        raise UnmarkedCipherError(
             f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
+
+
+#: The cells :mod:`messagefoundry.store.cell_tag` binds to a row tag, whose unmarked-value WARNING
+#: is throttled per column. Named here because cell_tag imports this module;
+#: ``tests/test_cell_tag.py`` asserts the two lists agree.
+_ROW_TAGGED_CELLS: frozenset[tuple[str, str]] = frozenset(
+    {("messages", c) for c in ("raw", "error", "summary", "metadata")}
+    | {("search_presets", "criteria")}
+)
+#: How long the unmarked-value WARNING for one tagged cell column is logged once per process.
+_UNMARKED_LOG_INTERVAL_S = 3600.0
+_unmarked_logged: dict[tuple[str, str], float] = {}
+_unmarked_lock = threading.Lock()
+
+
+def _first_unmarked_in_interval(table: str, column: str) -> bool:
+    """Whether the unmarked-value WARNING for ``table.column`` has not been logged within the
+    interval; records it. The refusal itself, and its hook, are never throttled here."""
+    key, now = (table, column), time.monotonic()
+    with _unmarked_lock:
+        last = _unmarked_logged.get(key)
+        if last is not None and now - last < _UNMARKED_LOG_INTERVAL_S:
+            return False
+        _unmarked_logged[key] = now
+    return True
 
 
 def allows_unmarked(cipher: Cipher) -> bool:
@@ -608,6 +674,16 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class TransitSealRefused(Exception):
+    """Transit answered a row seal ``verify`` with HTTP 400 or 403 (ADR 0217). ``status`` is that
+    code and nothing else; the row sealer classifies it with its probe. Raised by the backend
+    (``crypto_transit``), read by the sealer (``row_seal``). Not a :class:`CipherError`."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
 class UnauthenticatedCipherError(CipherError):
     """No configured key's AEAD tag verified the value (BACKLOG #2593).
 
@@ -619,14 +695,83 @@ class UnauthenticatedCipherError(CipherError):
     :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
     wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
     not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
-    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift. The Vault
-    Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift.
+
+    The Vault Transit cipher gives it where Vault's reason for refusing a value is wholly the AEAD's
+    own authentication failure (BACKLOG #5650): ``decrypt`` raises it for an HTTP 400 that says so,
+    and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, read only
+    from a 2xx batch reply: a batch Vault refuses is asked for value by value through ``decrypt``,
+    and its body is never read. Only the single ``decrypt`` reaches
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell`; for the batch, read only by the
+    cipher-cell walk, the per-value text changes only the error's class, and so the class name a
+    reason line renders, never containment, audit or alert. Its other failures include at least an outage
+    (:class:`CipherUnavailableError`), a refused unmarked value (:class:`UnmarkedCipherError`), and
+    a key-version refusal, a 403 and a 404, which are plain :class:`CipherError`."""
+
+
+class CipherUnavailableError(CipherError):
+    """The service that holds the key gave no verdict on the value, so a later try may succeed
+    (BACKLOG #3734).
+
+    :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
+    ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
+    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Its batch
+    paths also give it where no value was judged (BACKLOG #6706): for each value of a batch whose
+    reply does not match the request (returned by ``decrypt_many``, raised by ``encrypt_many``),
+    and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
+    (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
+    its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
+    Every other Transit failure stays a :class:`CipherError` of another class: at least a refused
+    AEAD tag as :class:`UnauthenticatedCipherError` (BACKLOG #5650), a refused unmarked value as
+    :class:`UnmarkedCipherError`, and plain :class:`CipherError` for others. A
+    reader that tells an outage from a value's failure by :func:`gave_no_verdict` still reads some
+    of those as an outage: one whose cause is an ``OSError`` or an ``hvac`` error other than a 400
+    (a 403, say). A refused tag, Vault's 400, is read as the value's.
+
+    It lives here rather than beside the Transit cipher so that ``uploads.py``, a leaf that imports
+    only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
+    a refused value answers 423. Still a :class:`CipherError`, so every other caller handles it as
+    it did before."""
+
+
+class UnmarkedCipherError(CipherError):
+    """A keyed cipher refused a non-blank unmarked value in a covered column: a stripped marker or
+    a planted row (BACKLOG #1169). Raised by the unmarked-value seam, which has already fired the
+    refusal hook, so a reader that contains it raises no second alert (BACKLOG #5650). The seam
+    logs a WARNING for every refusal, except in a tagged message or preset cell, where it logs once
+    per column per interval, and the cell-tag layer audits each row and logs once per column per
+    interval. Its own class, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` can tell it from a key or format
+    problem without reading its text. The name keeps the ``CipherError`` token, as
+    :class:`UnauthenticatedCipherError`'s does."""
+
+
+class AuditVerifyTimedOutError(CipherError):
+    """A Transit check of one stored audit MAC failed with HTTP 408 or 504 on both asks, while a
+    verify over fixed input succeeded before and after (BACKLOG #8222).
+
+    The chain walk lets it end the walk, so the walk could not run. Every other caller of
+    ``_audit_row_mac`` (``store.py``), the store open among them, reads it as the MAC not verifying,
+    as before BACKLOG #8222."""
+
+
+class AuditMacMalformedError(CipherError):
+    """A MAC provider answered an audit MAC request with a non-empty string that is not a
+    well-formed MAC, such as a Transit reply naming no key version (BACKLOG #8222).
+
+    Its caller decides what that means. Appending a row refuses it, so no malformed MAC is written.
+    The chain walk's check of a range row's handover tag reads it as a tag that does not match, a
+    break at that row, as it read such a reply before engine PR 2903. The store open does not catch
+    it, so the open refuses, as on engine PR 2903; that path is unruled and on the owner's queue."""
 
 
 class AuditKeyVersionRefusedError(CipherError):
-    """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
+    """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
+    read as a refusal of that version, while
+    Transit still answers under the latest. Transit's own refusal is one cause; the subclass
+    :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
 
-    The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
+    The version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
     a walk that could not run. Transit also refuses a version its policy retires, so the break says
     both."""
@@ -640,6 +785,26 @@ class AuditKeyVersionRefusedError(CipherError):
         return (
             f"Transit refused audit key version {self.version}: the key does not hold it, or its "
             "policy retires it"
+        )
+
+
+class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
+    """A Transit check of a stored audit MAC at one key version got HTTP 400 that
+    :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
+    refusal, or whose reading runs out of memory or stack, while the key still answers under the
+    latest (BACKLOG #6707).
+
+    The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
+    page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
+    handler of its parent handles it as it handles a refused version; the chain walk, for one,
+    reports a break at that row and goes on. Only the text differs. It names the version only,
+    never the key or the reply, because the walk puts it in the tamper alert."""
+
+    def __str__(self) -> str:
+        return (
+            f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
+            "read as a version refusal, so the version could not be confirmed; the key may not "
+            "hold it, or its policy may retire it"
         )
 
 
@@ -719,6 +884,120 @@ class Cipher(Protocol):
     def authz_root(self) -> bytes | None: ...
 
     def retired_authz_roots(self) -> Sequence[bytes]: ...
+
+    def row_seal_backend(self) -> TransitSealBackend | None:
+        """The Transit backend this cipher's store seals authority rows through, or ``None`` when
+        its seals, if any, are keyed in-process from :meth:`authz_root` (ADR 0217, item 3.7)."""
+        ...
+
+
+#: One value, and the AAD its cell binds, for a :class:`BatchCipher`.
+CipherItem = tuple[str, bytes | None]
+
+#: The most values one batch carries (BACKLOG #6706): one Transit ``batch_input`` request, or one
+#: batch a cipher-cell walk opens.
+BATCH_MAX_ITEMS = 128
+#: The most base64 characters, values and associated data together (:func:`batch_chars`), that
+#: a batch of more than one value carries (BACKLOG #6706). Kept under a common proxy body bound
+#: (nginx's 1 MiB default) and far under Vault's own 32 MiB, with room for the JSON around it. A
+#: value larger than this is a batch of its own, which Transit sends as a single request, as before.
+BATCH_MAX_CHARS = 512 * 1024
+
+
+def b64_chars(n: int) -> int:
+    """The length of the base64 text of ``n`` bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+def batch_chars(stored: str, aad: bytes | None) -> int:
+    """What a sealed value counts against :data:`BATCH_MAX_CHARS`: itself and its AAD as base64."""
+    return len(stored) + (b64_chars(len(aad)) if aad is not None else 0)
+
+
+@runtime_checkable
+class BatchCipher(Protocol):
+    """A cipher that opens and seals several values per call to its key service (BACKLOG #6706).
+    Only :class:`~messagefoundry.store.crypto_transit.TransitCipher` is one. :func:`encrypt_many`
+    and the cipher-cell walk (``store/cipher_cells.py``) use the single-value methods of every
+    other cipher."""
+
+    def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]: ...
+
+    def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
+
+
+def gave_no_verdict(error: CipherError) -> bool:
+    """Whether a failed decrypt was the key service failing rather than the value (BACKLOG #6706).
+
+    A :class:`CipherUnavailableError` is one whatever its cause. Otherwise the cause decides: the
+    Transit cipher raises :class:`CipherError` from the client's own error, an ``OSError`` for an
+    unreachable Vault (a ``requests`` connection error or timeout is one) and an ``hvac`` error for
+    a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac`` raises as
+    ``InvalidRequest``; any other ``hvac`` error (a token refused, a 5xx) is the service. At least
+    those shapes; a cause of any other kind counts as the value's. The cipher-cell walk and the
+    Transit batch path read it alike."""
+    if isinstance(error, CipherUnavailableError):
+        return True
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return True
+    return (
+        cause is not None
+        and type(cause).__module__.split(".")[0] == "hvac"
+        and type(cause).__name__ != "InvalidRequest"
+    )
+
+
+#: The most exceptions :func:`detached` clears in one error's graph. Far past any real chain;
+#: reaching it is logged, never silent.
+_DETACH_LIMIT = 10_000
+
+
+def detached(error: CipherError) -> CipherError:
+    """``error``, with the traceback cleared on every exception reachable from it through
+    ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
+    for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
+    through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
+    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops
+    and logs a WARNING."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        if len(seen) >= _DETACH_LIMIT:
+            _log.warning(
+                "an error's exception graph has more than %d links; the rest keep their tracebacks",
+                _DETACH_LIMIT,
+            )
+            break
+        seen.add(id(link))
+        link.__traceback__ = None
+        pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(link.exceptions)
+    return error
+
+
+def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
+    """``cipher.decrypt(stored, aad=aad)``, with its :class:`CipherError` returned, not raised,
+    and :func:`detached`."""
+    try:
+        return cipher.decrypt(stored, aad=aad)
+    except CipherError as exc:
+        return detached(exc)
+
+
+def encrypt_many(cipher: Cipher, items: Sequence[CipherItem]) -> list[str]:
+    """Each plaintext of ``items`` sealed under its own AAD, in order. Any failure raises, as
+    :meth:`Cipher.encrypt` does, so no value is returned for a batch that did not all seal."""
+    if isinstance(cipher, BatchCipher):
+        sealed = cipher.encrypt_many(items)
+        if len(sealed) != len(items):
+            raise CipherError(f"{type(cipher).__name__} sealed {len(sealed)} of {len(items)}")
+        return sealed
+    return [cipher.encrypt(plaintext, aad=aad) for plaintext, aad in items]
 
 
 def _fingerprint(key: bytes | bytearray) -> str:
@@ -1344,6 +1623,10 @@ class IdentityCipher:
         """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
         return None
 
+    def row_seal_backend(self) -> None:
+        """No Transit backend: a keyless store writes and checks no row seals (ADR 0217)."""
+        return None
+
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No DEK, so no retired roots either."""
         return ()
@@ -1407,6 +1690,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         self._invocations = 0
         self._warned_gcm_soft = False
         self._bound_enabled = False
+        # True once a grant has carried the key's persisted total in (BACKLOG #5608). Until then an
+        # enabled bound knows only this process's spend, so `_count_invocation` refuses to encrypt.
+        self._bound_hydrated = False
         self._bound_total = 0
         self._reserve_remaining = 0
         # The counter is mutated from MORE THAN the event-loop thread: the ADR 0134 uploaded-logs store
@@ -1592,6 +1878,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
         return self._authz_root
 
+    def row_seal_backend(self) -> None:
+        """No Transit backend: this cipher's row seals are keyed from :meth:`authz_root`."""
+        return None
+
     def retired_authz_roots(self) -> Sequence[bytes]:
         """The authorization roots of the retired keys (BACKLOG #2592). A session seal is never
         verified under one. Every other sealed record, a user's among them, is, while the key stays
@@ -1621,6 +1911,15 @@ class AesGcmCipher(_UnmarkedPolicy):
     @property
     def invocation_bound_enabled(self) -> bool:
         return self._bound_enabled
+
+    @property
+    def invocation_bound_hydrated(self) -> bool:
+        """Whether a grant has handed this cipher the key's persisted total (BACKLOG #5608).
+
+        An enabled bound that is not hydrated has never read the key's lifetime count, so the
+        ceiling cannot be enforced against it and :meth:`encrypt` refuses until a store's
+        checkpoint hydrates it. A cipher no store bounds is never refused for this."""
+        return self._bound_hydrated
 
     def set_refill_hook(self, hook: Callable[[], None] | None) -> None:
         """Register the callback fired when the reserve crosses the refill watermark (``None`` clears it).
@@ -1714,11 +2013,23 @@ class AesGcmCipher(_UnmarkedPolicy):
         with self._count_lock:
             return -self._reserve_remaining
 
+    def forfeit_invocation_reserve(self) -> None:
+        """Drop any unspent reserve, keeping an overspend (BACKLOG #5608).
+
+        A store open calls this through its strict first pass: a reserve still held was charged to
+        the row another store handle read, so counting it against this store's row would subtract
+        invocations that row never saw. Dropping it can only raise the figure; the strict pass also
+        floors its grant at the figure from before (``gcm_bound._add_then_grant``), so reading a row
+        that other handle never charged cannot lower it either."""
+        with self._count_lock:
+            self._reserve_remaining = min(self._reserve_remaining, 0)
+
     def grant_invocations(self, count: int, cumulative_total: int) -> None:
         """Hand the cipher a reserved block: ``count`` invocations, with ``cumulative_total`` being the
         key's persisted total AFTER the atomic add that reserved them. A NEGATIVE ``count`` is a
         settlement refund of an unspent reserve (see :meth:`invocation_settlement`)."""
         with self._count_lock:
+            self._bound_hydrated = True
             self._reserve_remaining += count
             # A refund LOWERS the key's persisted total, so the authoritative post-add figure replaces
             # ours; a reservation can only raise it, and `max` there guards a stale/racy read.
@@ -1744,6 +2055,14 @@ class AesGcmCipher(_UnmarkedPolicy):
         uploaded-logs store); the refill hook, the WARNING and the raise all happen OUTSIDE it, so a slow
         hook or log handler never serializes concurrent encrypts."""
         with self._count_lock:
+            if self._bound_enabled and not self._bound_hydrated:
+                # BACKLOG #5608: the bound is on but has never read the key's persisted total, so a
+                # key already at the ceiling would pass. Nothing is counted, since nothing is sealed.
+                raise CipherError(
+                    "the AES-GCM invocation bound has not read this data key's persisted total yet "
+                    f"(store key {self._active_id!r}); nothing is encrypted under it until a store "
+                    "checkpoint reads it"
+                )
             self._invocations += 1
             write = self._write  # read under the lock bind_store_salt swaps it under
             want_refill = False
@@ -1811,7 +2130,7 @@ class AesGcmCipher(_UnmarkedPolicy):
     def _alg_checked(self, alg: str, version: str) -> None:
         if alg != _ALG_AES_256_GCM:
             raise CipherError(
-                f"unknown/unsupported at-rest cipher algorithm {alg!r} in mfenc:{version} marker; "
+                f"unknown/unsupported at-rest cipher algorithm {_echo(alg)} in mfenc:{version} marker; "
                 "this build registers only AES-256-GCM"
             )
 
@@ -1842,7 +2161,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Transit cipher reads) must NOT be passed through as plaintext or mis-decrypted — fail closed.
         version = stored[len(MARKER_PREFIX) :].partition(":")[0]
         raise CipherError(
-            f"unknown at-rest marker version {version!r}; this build decodes mfenc:v1, mfenc:v2 and "
+            f"unknown at-rest marker version {_echo(version)}; this build decodes mfenc:v1, mfenc:v2 and "
             "mfenc:v4 only"
         )
 
@@ -1878,11 +2197,11 @@ class AesGcmCipher(_UnmarkedPolicy):
         try:
             raw = base64.b64decode(blob)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-            raise CipherError(f"malformed ciphertext (bad base64, key_id={key_id!r})") from exc
+            raise CipherError(f"malformed ciphertext (bad base64, key_id={_echo(key_id)})") from exc
         if len(raw) < _NONCE_BYTES + _GCM_TAG_BYTES:
             # Too short to hold a nonce and a tag. AESGCM.decrypt would raise a bare ValueError for a
             # short nonce, which no caller contains as a CipherError (BACKLOG #2593).
-            raise CipherError(f"malformed ciphertext (too short, key_id={key_id!r})")
+            raise CipherError(f"malformed ciphertext (too short, key_id={_echo(key_id)})")
         nonce, ct = raw[:_NONCE_BYTES], raw[_NONCE_BYTES:]
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
@@ -1941,10 +2260,10 @@ class AesGcmCipher(_UnmarkedPolicy):
                 if locked:
                     _unlock_memory(pt)
             raise CipherError(
-                f"decrypted value is not valid UTF-8 (key_id={key_id!r}); the row is corrupt"
+                f"decrypted value is not valid UTF-8 (key_id={_echo(key_id)}); the row is corrupt"
             )
         raise UnauthenticatedCipherError(
-            f"no configured key decrypts this value (key_id={key_id!r}); if rotating, supply the "
+            f"no configured key decrypts this value (key_id={_echo(key_id)}); if rotating, supply the "
             "prior key via MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
         )
 

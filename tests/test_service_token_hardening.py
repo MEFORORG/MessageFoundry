@@ -711,14 +711,15 @@ def test_the_smoke_leg_locks_each_key_file_the_engine_judges_in_the_samples_grap
     from messagefoundry.config.wiring import load_config
 
     script = _smoke_step_script("Install the service")
-    # The leg's MEFOR_VALUE_* entries, one per line, with their PowerShell variables left unexpanded.
+    # The leg's MEFOR_VALUE_* files, one `"NAME" = value` line each in the table it writes to the
+    # secrets directory (vault BACKLOG #8212 item 7), with their PowerShell variables unexpanded.
     entries = [
-        line.strip().rstrip("`").strip().strip('"')
+        line.strip().split("=", 1)
         for line in script.splitlines()
         if line.strip().startswith('"MEFOR_VALUE_')
     ]
-    assert all("=" in entry for entry in entries), f"a value entry with no '=': {entries}"
-    environ = dict(entry.split("=", 1) for entry in entries)
+    assert all(len(entry) == 2 for entry in entries), f"a value line with no '=': {entries}"
+    environ = {name.strip().strip('"'): value.strip().strip('"') for name, value in entries}
     assert environ.get("MEFOR_VALUE_REGISTRY_CLIENT_KEY") == "$key", (
         f"CONTROL FAILED: the leg's value entries were not read: {sorted(environ)}"
     )

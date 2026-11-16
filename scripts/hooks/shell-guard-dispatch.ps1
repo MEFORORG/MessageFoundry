@@ -289,7 +289,8 @@ foreach ($ShellGuardPath in @($ShellGuardPaths | Where-Object { $_ })) {
     $ShellGuardContext = [string]$ShellGuardParsed.hookSpecificOutput.additionalContext
     if ($ShellGuardContext) { $ShellGuardContexts.Add($ShellGuardContext) }
 }
-if ($ShellGuardContexts.Count) {
+# A kept decision exits 0 too, so a failed guard beside one gets the notice even with no context.
+if ($ShellGuardContexts.Count -or ($ShellGuardFailed -and $null -ne $ShellGuardKept)) {
     # Writing a context exits 0, which would hide a failed guard behind it; say so in the context.
     if ($ShellGuardFailed) {
         $ShellGuardContexts.Add('shell-guard-dispatch: at least one shell guard FAILED OPEN on this call, so it checked nothing; the hook stderr names it.')

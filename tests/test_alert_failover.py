@@ -314,6 +314,11 @@ class _FakeSqlStore:
     async def _execute(self, sql: str, params: tuple[Any, ...]) -> None:
         self.executed.append(sql)
 
+    async def _execute_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> None:
+        self.executed.append(sql)  # the release's entry point (BACKLOG #5064)
+
 
 def test_sqlserver_coordinator_helpers_emit_lockstep() -> None:
     # The SQL Server sibling emits the SAME events via the SAME helper names as DbCoordinator.

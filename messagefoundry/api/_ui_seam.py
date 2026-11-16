@@ -508,8 +508,9 @@ from typing import Any
 #: which the branch had already taken. Re-derived with ``--write`` on the merged tree; the digest
 #: did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
 #:
-#: Vault BACKLOG #3189 and #3031 (at 0b2a8d6524e4acc6) merged with main after PR 2352 landed
-#: there at 6d7dcabe1103f08d. The #3192 review-repair entry above is that branch's own, kept once.
+#: Vault BACKLOG #3189 and #3031 (at seam digest 0b2a8d6524e4acc6) merged with main after PR 2352
+#: landed there, at seam digest 6d7dcabe1103f08d. That value, here and in the entry above, is a
+#: seam digest, not a commit. The #3192 review-repair entry above is that branch's own, kept once.
 #: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
 #: covers every entry above.
 #:
@@ -863,12 +864,62 @@ from typing import Any
 #: over both, from ``a71505053af14cae`` and ``e233fc19966d856a`` to ``ae0ea5c81cc935b7``. The
 #: three #2955 entries just above are engine PR 2852's, kept once.
 #:
+#: Vault BACKLOG #3748 item 5: the ``AdminHandlers`` projection ``user_summary`` was renamed
+#: ``user_summary_scoped``, because it now withholds the channel scope unless its caller passes the
+#: REQUIRED keyword ``show_scope``. A console built before that calls it without the keyword and
+#: would raise TypeError on the user pages at request time, which the handshake would not catch,
+#: since an ``AdminHandlers`` field is recorded by name only (the #3259 blind spot). The rename is
+#: the deliberate bump: it moves the recorded name, so such a console refuses to mount instead.
+#: Re-derived with ``--write``, from ``2a4589213e5e782c`` to ``4f631135c80e1120`` on its own branch.
+#:
+#: Merge of the #3748 entry with main after engine PR 2851, at seam digest ``ae0ea5c81cc935b7``
+#: (a digest, not a commit): each was derived without the other's change, so neither held for the
+#: merged surface. Re-derived with ``--write``
+#: over both, from ``4f631135c80e1120`` and ``ae0ea5c81cc935b7`` to ``f44b72b2102da33e``.
+#:
+#: BACKLOG #5520: ``GET /users``, which the users page renders through ``admin.list_users``, now
+#: lists an account whose record fails its integrity seal as the new ``IntegrityFailedUser``, its id
+#: alone. The page imports the DTO, so the surface grew. An older console on this engine would
+#: render such a row by reading ``username`` and ``roles`` off it, and raise; the digest refuses it
+#: at mount instead. Re-derived with ``--write``, from ``f44b72b2102da33e`` to ``4b5769ef2c675677``.
+#:
+#: BACKLOG #5931: ``POST /ui/account/mfa/verify`` gains a dependency ahead of its confirm gate.
+#: It sends an empty code to the re-auth before the gate can spend a held grant. The route's
+#: recorded gate chain grew. Re-derived with ``--write``, from ``4b5769ef2c675677`` to
+#: ``6737556a16ce6d15``.
+#:
+#: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
+#: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
+#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
+#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
+#: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
+#:
+#: BACKLOG #5559: ``AdminHandlers`` gained ``checked_user``, ``auth_routes._checked_user``, and the
+#: console's user pages read the account through it rather than the store. What each page answers
+#: for a record that fails its seal is docs/SECURITY.md's to say, in *What an admin user read
+#: reports*. Two changes the digest does not see, as it records field names only:
+#: ``user_summary_scoped`` takes ``role_ids`` None for a checked record, and
+#: ``refuse_own_channel_scope`` lost its ``target`` parameter, which the console no longer passes.
+#: So an older console on this engine would raise TypeError on every channel scope save, which
+#: passed ``target``, and a newer console on an older engine would raise AttributeError on the user
+#: pages, which call ``checked_user``. The digest refuses both pairs at mount. Re-derived with
+#: ``--write``, from ``c537067c6952d93c`` to ``796ce45eeff0cf1e``. Then ``api.security`` gained
+#: ``account_read_errors``, the failures those post-action pages fall back on, which the console
+#: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
+#:
+#: The OIDC start legs' session read: ``AuthService`` gained ``session_shows_signed_in``, which
+#: the console's "leaving this site" page and IdP hop call to decide whether they show Sign-out
+#: and the session watchdog. A method the console calls, so a skew would be an AttributeError at
+#: request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "ae0ea5c81cc935b7"
+ENGINE_UI_SEAM: str = "bc56eed44a1590fd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -991,6 +1042,9 @@ class AdminHandlers:
 
     list_roles: Callable[..., Awaitable[Any]]
     list_users: Callable[..., Awaitable[Any]]
+    # BACKLOG #5559: ``auth_routes._checked_user``, the seal-checked account read the console's
+    # user pages make; its docstring says what it answers.
+    checked_user: Callable[..., Awaitable[Any]]
     list_custom_roles: Callable[..., Awaitable[Any]]
     create_user: Callable[..., Awaitable[Any]]
     update_user: Callable[..., Awaitable[Any]]
@@ -1031,7 +1085,7 @@ class AdminHandlers:
     my_security_events: Callable[..., Awaitable[Any]]
     # Sync DTO projections (kept engine-side so the console never imports store.UserRecord — the
     # ``user`` arg stays opaque/Any across the seam).
-    user_summary: Callable[..., Any]
+    user_summary_scoped: Callable[..., Any]
     current_user: Callable[..., Any]
     # BACKLOG #1143 (ADR 0184 slice B): one account's stored (issuer, sub) plus the issuer a bind
     # would use, for the federated-identity screen. Takes the store row and the AuthService.

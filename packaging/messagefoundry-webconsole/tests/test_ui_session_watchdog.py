@@ -399,9 +399,14 @@ async def test_every_authenticated_page_carries_the_watchdog_hook(engine: Engine
         pages.webauthn_enroll_page("{}"),
         pages.oidc_landing(),
         pages.reauth_continue("/ui/x", "Do x"),
+        pages.idp_handoff("https://idp.example/authorize", session=True),
     ):
         assert "data-mf-session-watchdog" in markup
     assert "data-mf-session-watchdog" not in pages.sso_challenge()
+    # a page served without a live session must not carry the hook: its first probe would 303
+    assert "data-mf-session-watchdog" not in pages.idp_handoff(
+        "https://idp.example/authorize", session=False
+    )
 
 
 def test_app_js_blanks_the_document_before_redirecting() -> None:

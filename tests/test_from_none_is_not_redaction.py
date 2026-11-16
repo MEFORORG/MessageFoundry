@@ -108,8 +108,10 @@ _APP = "messagefoundry/api/app.py::create_app"
 _HTTP = "::HTTPException"
 _NOTHING_WITHHELD = "the detail is str(exc), so nothing is withheld"
 _UPLOAD_MISS = (
-    "the caught error names a file id or the cipher's own type-only text; below it sits the "
-    "Transit exception (may echo ciphertext, never plaintext) or, on malformed Transit output, a "
+    "the caught error names a file id or the cipher's own text (a type name, or a reply refusal's "
+    "fixed text); below it sits the Transit exception from a READ, a decrypt whose request holds "
+    "ciphertext and never plaintext (a save's encrypt outage is raised outside its handler, "
+    "BACKLOG #3734), or, on malformed Transit output, a "
     "UnicodeDecodeError that cannot hold stored content while both upload writers store ASCII "
     "(base64 body, json.dumps metadata)"
 )
@@ -308,8 +310,9 @@ _ALLOWED: tuple[_Allowed, ...] = (
         count=2,
     ),
     _Allowed(
-        f"{_APP}.upload_file::<no handler>" + _HTTP,
-        _SAFE + "the 415 is raised outside any handler, so this from None does nothing",
+        f"{_APP}.upload_file::UploadNotTextError" + _HTTP,
+        _SAFE + "it carries the upload's display name and the sniff's fixed reason, never content; "
+        "the 415 detail is that reason, and the same uploader gets the name back on a 400",
     ),
     _Allowed(
         f"{_APP}.upload_file::MultipartTooLargeError" + _HTTP,

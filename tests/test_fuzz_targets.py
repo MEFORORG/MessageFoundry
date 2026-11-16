@@ -51,8 +51,6 @@ from fuzz.targets import (
     WORK_DIR_ENV,
     FuzzTarget,
     HarnessRefusal,
-    _is_batch_header_shape,
-    _is_short_msh2_shape,
     libfuzzer_argv,
     work_paths,
     work_root,
@@ -62,6 +60,7 @@ from messagefoundry.framing import FrameDecoder
 from messagefoundry.mllpcodec import frame as mllp_frame
 from messagefoundry.parsing import HL7PeekError, Peek, compression
 from messagefoundry.parsing.binary import (
+    BinaryCarriageError,
     UnreadableDelimitersError,
     extract_obx_document,
     iter_obx_documents,
@@ -630,104 +629,96 @@ def test_the_compression_target_catches_a_wrong_deflate_tail(
         TARGETS_BY_NAME["compression"].run(seed)
 
 
-def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> None:
-    """The first registered binary-carriage finding is still live in the engine, through
-    ``extract_obx_document``, and the two halves already fixed stay fixed.
+def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() -> None:
+    """BACKLOG #2873 regression: the first retired binary-carriage finding stays fixed.
 
-    It pins three things on the reproducer. ``extract_obx_document`` still raises the bare
-    ``ValueError``: that is the live finding. ``strip_documents`` returns the body unchanged with
-    ``(text, 0, 0)`` and does not raise, so a regression of its unreadable-delimiters guard turns
-    this red. ``iter_obx_documents`` refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
-
-    **When the extract assertion fails, the defect is fixed.** That is the instruction to delete its
-    ``KNOWN_FINDINGS`` entry and its shape check in ``_is_known_binary_carriage_finding``, to keep
-    this test's strip and detach assertions, and to keep the reproducer on as a ``binary_carriage``
-    seed so the fix cannot quietly regress -- the same retirement BACKLOG #1594's finding went
-    through.
+    ``Peek.parse`` still accepts the body (see ``fuzz/README.md``, *Known findings*).
+    ``extract_obx_document`` refuses it as ``UnreadableDelimitersError``, not a
+    ``BinaryCarriageError``, with nothing chained and neither MSH-1 nor MSH-2 quoted;
+    ``strip_documents`` returns it unchanged and ``iter_obx_documents``
+    refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
     """
-    assert any(f.reproducer == SHORT_MSH2_REPRODUCER for f in KNOWN_FINDINGS)
+    assert SHORT_MSH2_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
     text = SHORT_MSH2_REPRODUCER.decode("ascii")
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
     message = Message.parse(text)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+    with pytest.raises(UnreadableDelimitersError) as caught:
         extract_obx_document(message)
-    # The retention strip's half is fixed: it returns the body unchanged rather than raising, so
-    # the retention pass skips the row. The detach scan's half too: it refuses the body by name,
-    # which both listeners record (BACKLOG #5099). Only the extract above is still live.
+    assert not isinstance(caught.value, BinaryCarriageError)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
     assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
-    assert _is_short_msh2_shape(text)
-    assert not _is_batch_header_shape(text)
 
 
-def test_the_batch_header_finding_still_reproduces_through_the_raw_helpers() -> None:
-    """The second registered binary-carriage finding is still live in the engine.
+def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers() -> None:
+    """BACKLOG #2873 regression: the second retired binary-carriage finding stays fixed.
 
-    **When this test fails, the defect is fixed** -- retire it the way the docstring above says.
+    ``Peek.parse`` still refuses the body and ``Message.parse`` still accepts it (BACKLOG #2874).
+    ``extract_obx_document`` refuses it as ``UnreadableDelimitersError``, naming the missing MSH.
     """
-    assert any(f.reproducer == BATCH_HEADER_REPRODUCER for f in KNOWN_FINDINGS)
+    assert BATCH_HEADER_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
     text = BATCH_HEADER_REPRODUCER.decode("ascii")
     with pytest.raises(HL7PeekError):
         Peek.parse(text)
     message = Message.parse(text)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+    with pytest.raises(UnreadableDelimitersError, match="^the body has no MSH,") as caught:
         extract_obx_document(message)
-    assert _is_batch_header_shape(text)
-    assert not _is_short_msh2_shape(text)
+    assert not isinstance(caught.value, BinaryCarriageError)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
 
 
-@pytest.mark.parametrize("reproducer", [SHORT_MSH2_REPRODUCER, BATCH_HEADER_REPRODUCER])
-def test_a_carve_out_does_not_swallow_a_different_valueerror_on_its_own_reproducer(
-    reproducer: bytes, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The exception half of the discriminator: right shape, wrong error, so it must escape.
-
-    The first draft checked only the input, and on a matching body swallowed this planted error.
-    """
-    TARGETS_BY_NAME["binary_carriage"].run(reproducer)  # control: the real defect is recognised
-    monkeypatch.setattr(Message, "count_segments", _boom(ValueError("other")))
-    with pytest.raises(ValueError, match="other"):
-        TARGETS_BY_NAME["binary_carriage"].run(reproducer)
-
-
-def test_a_carve_out_does_not_swallow_the_engine_message_on_any_other_body(
+def test_extract_obx_document_lets_a_valueerror_subclass_from_the_delimiter_read_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The input half of the discriminator: right error, wrong shape, so it must escape.
-
-    The planted error carries the engine's own separators message, on a body whose separators ARE
-    readable and that has neither registered shape. It is planted in the detach scan, which runs
-    inside the carve-out's ``try``: a fault planted in ``Message`` would first fire in the bare
-    ``strip_documents`` call, which sits outside that ``try``, and escape before the shape check
-    ran, so a carve-out that swallowed every engine-message ``ValueError`` would still pass.
-    """
-    text = _OBX_ED_ADT.decode()
-    assert not _is_short_msh2_shape(text) and not _is_batch_header_shape(text)
-    planted = _boom(ValueError("cannot determine HL7 separators: planted"))
-    monkeypatch.setattr(fuzz_targets, "iter_obx_documents", planted)
-    # The control: the same plant on a registered shape is swallowed, which proves it sits inside
-    # the carve-out's try. Were the scan moved outside it, this call would raise.
-    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
-    with pytest.raises(ValueError, match="planted"):
-        TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
-
-
-def test_a_carve_out_does_not_swallow_a_valueerror_subclass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only a BARE ``ValueError`` is the finding; a codec error with the same text is something else."""
+    """A ``ValueError`` subclass out of the delimiter read is not refused as the sender's header: it
+    escapes ``extract_obx_document`` as itself. This pins that the guard does not over-catch; it
+    does not tell the guard apart from no guard, since ``Message.field`` lets the subclass out too."""
 
     class Other(ValueError):
         pass
 
-    monkeypatch.setattr(
-        Message, "count_segments", _boom(Other("cannot determine HL7 separators: subclass"))
-    )
+    message = Message.parse(_OBX_ED_ADT.decode())
+    monkeypatch.setattr(Message, "_encoding_chars", _boom(Other("subclass")))
     with pytest.raises(Other):
-        TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
+        extract_obx_document(message)
+
+
+@pytest.mark.parametrize("reproducer", [SHORT_MSH2_REPRODUCER, BATCH_HEADER_REPRODUCER])
+def test_the_binary_carriage_target_has_no_carve_out_left_on_a_retired_reproducer(
+    reproducer: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The carve-out came out with the findings (BACKLOG #2873): a bare ``ValueError`` carrying the
+    engine's separators message, planted in the detach scan or in the extract on a body of either
+    retired shape, now escapes the target. Were a carve-out restored around either call, its plant
+    would be swallowed. Each plant sits alone, so the extract plant is reached with the real scan.
+    """
+    TARGETS_BY_NAME["binary_carriage"].run(reproducer)  # control: the real body runs clean
+    planted = _boom(ValueError("cannot determine HL7 separators: planted"))
+    for name in ("iter_obx_documents", "extract_obx_document"):
+        with monkeypatch.context() as patch:
+            patch.setattr(fuzz_targets, name, planted)
+            with pytest.raises(ValueError, match="planted"):
+                TARGETS_BY_NAME["binary_carriage"].run(reproducer)
+
+
+def test_the_binary_carriage_target_catches_an_unreadable_refusal_of_a_readable_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The target accepts ``UnreadableDelimitersError`` from the extract only on a body whose
+    delimiters the engine cannot read (BACKLOG #2873): an extract guard that refused a readable
+    body would otherwise pass every input silently."""
+    TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)  # control: the real extract runs clean
+    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)  # control: a real refusal
+    for name in ("iter_obx_documents", "extract_obx_document"):
+        with monkeypatch.context() as patch:
+            patch.setattr(fuzz_targets, name, _boom(UnreadableDelimitersError("planted")))
+            with pytest.raises(AssertionError, match=f"^{name} refused readable delimiters"):
+                TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

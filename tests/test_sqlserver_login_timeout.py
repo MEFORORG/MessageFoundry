@@ -112,7 +112,6 @@ async def test_dedicated_claim_connection_passes_the_login_timeout(
     calls = _install_recording_aioodbc(monkeypatch)
     store = object.__new__(SqlServerStore)  # the offline-test idiom: no pool, no I/O
     store._settings = _settings()
-    store._posture = None
     await store._connect_claim_conn()
     assert len(calls["connect"]) == 1
     assert calls["connect"][0].get("timeout") == _LOGIN_TIMEOUT
@@ -140,7 +139,6 @@ def test_sync_handoff_pool_passes_the_login_timeout(monkeypatch: pytest.MonkeyPa
 
     store = object.__new__(SqlServerStore)
     store._settings = _settings()
-    store._posture = None
     store._sync_pools = {}
     pool = store.open_sync_handoff_pool("routed", 2)
     try:

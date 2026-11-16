@@ -112,17 +112,24 @@ _DIGIT_HEAD = "MSH4^~\\&4A4B4C4D42026010144ORU^R014M14P42.5.1\rPID414411^^^H^MR4
         (f"{_DASH_HEAD}\rOBX-1-ST-8480^S^LN--{_SSN}", "OBX-1-ST-8480^S^LN--[REDACTED]-45-6789"),
         # A rule scrubbed the last part: 6789 lands in OBX-5.
         (f"{_DASH_HEAD}\rOBX-1-ST-{_SSN}", "OBX-1-ST-123-45-[REDACTED]"),
-        # The sender escaped the separator, as HL7 asks: no detector decodes an escape.
-        (f"{_DASH_HEAD}\rZZZ-1-{_ESCAPED}", f"ZZZ-1-{_ESCAPED}"),
         # A digit separator: the shapes' digit boundaries read it as part of the number.
         (f"{_DIGIT_HEAD}\rZZZ414{_SSN}", f"ZZZ414{_SSN}"),
     ],
-    ids=["first-part-scrubbed", "last-part-scrubbed", "escaped", "digit-separator"],
+    ids=["first-part-scrubbed", "last-part-scrubbed", "digit-separator"],
 )
 def test_what_still_passes(anon: ModuleType, message: str, line: str) -> None:
     """The limits docs/PHI.md section 9 states, pinned so that a change here moves the docs with
     it. Every one of these lines leaves the anonymizer as shown, and nothing refuses it."""
     assert _checked(anon, message).split("\r")[-1] == line
+
+
+@_NO_SCANNER
+@_SIDES
+def test_a_shape_whose_separators_the_sender_escaped_is_refused(anon: ModuleType) -> None:
+    """This was on the list above until BACKLOG #5532: the detectors now decode an escape, so the
+    number with its dashes written as ``\\F\\`` is found in the one field that holds it."""
+    with pytest.raises(anon.LeakError, match="SSN-shaped value in ZZZ-2"):
+        _checked(anon, f"{_DASH_HEAD}\rZZZ-1-{_ESCAPED}")
 
 
 @_NO_SCANNER

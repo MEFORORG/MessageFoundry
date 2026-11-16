@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``python -m harness --fuzz``: exit 0 when every invariant held, 1 when one broke, 2 on setup."""
+"""``python -m harness --fuzz``: exit 0 when every invariant held, 1 when one broke or the run
+checked nothing (``CampaignResult.vacuous``), 2 on setup."""
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from harness.endpoints import Endpoints
 from harness.fuzz.campaign import FuzzConfig, SetupError, replay, run
-from harness.fuzz.transport import build_transport
+from harness.fuzz.transport import DEFAULT_ENDPOINT, build_transport
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.terminal_text import escape_for_terminal
 
@@ -59,7 +60,7 @@ def main(
         transport = build_transport(driver, endpoints, endpoint, timeout=reply_timeout)
     except (KeyError, ValueError) as exc:
         return fail_setup(f"bad endpoint or option: {exc}")
-    target = f"{driver} endpoint {endpoint or 'default'!r}"
+    target = f"{driver} endpoint {endpoint or DEFAULT_ENDPOINT!r}"
     try:
         with EngineClient(engine_url, cacert=cacert) as client:
             if token:
@@ -80,7 +81,10 @@ def main(
         # once the campaign runs is recorded in the result, never raised, so it still exits 1.
         return fail_setup(str(exc))
     if not result.ok:
-        if not replay_files:
+        # A vacuous run's one failure names no case, so there is nothing to replay. A real
+        # failure whose file could not be written still gets the hint: its seed rebuilds it.
+        vacuous_only = [f.reason for f in result.failures] == [result.vacuous]
+        if not vacuous_only and not replay_files:
             where = f"--fuzz-driver {driver}" + (f" --fuzz-endpoint {endpoint}" if endpoint else "")
             print(f"replay with: python -m harness --fuzz-replay FILE {where} (seed {seed})")
         return EXIT_INVARIANT

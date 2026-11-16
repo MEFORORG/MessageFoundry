@@ -127,6 +127,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
+import js_lexer  # noqa: E402
 
 # The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
@@ -344,7 +345,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0197 Amendment A (AC-A9): store.crypto for CipherError alone, so the lockable-account census
     # can tell a TOTP cell the store key does not open apart from any other store error.
     # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
-    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret.
+    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret. And
+    # (BACKLOG #3770) the keyed digest of the past-cap log line, prefixed with a per-process secret.
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
@@ -580,6 +582,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
     # cipher seam. No key of its own.
     "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #5651: the embedded-document strip's shared batch transform opens each candidate's raw
+    # cell through cell_tag and re-seals the stripped body through the store cipher, under the row's
+    # tag. From store.crypto it takes at least the Cipher type, CipherError, gave_no_verdict (to tell
+    # a key-service outage from a bad value) and detached (to clear a returned error's traceback).
+    # No key of its own.
+    "messagefoundry/store/document_strip.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1103,7 +1111,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_probe",
             "tls_context:via messagefoundry.logging_setup",
             # BACKLOG #2532: at warn a store-opening command runs the PostgreSQL store's revocation
-            # guard at least once per open (admin-reset-totp opens twice and runs it twice), on the
+            # guard at least once per open (admin-reset-totp opens twice, and a third time to
+            # record a notice whose send failed (BACKLOG #5634), and runs it once per open), on the
             # verifying context the store's own builder makes (the pinned CA or
             # the system trust store, plus any CRL), so it logs serve's WARNING. It builds that
             # context and handshakes nothing; the store's open builds its own again.
@@ -1241,6 +1250,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.oidc_http",
             "hash:via messagefoundry.auth.tokens",
             # BACKLOG #3772: _bounded_address_text, a SHA-256 dedupe key over over-long client text.
+            # BACKLOG #3770: _address_log_field, a SHA-256 over a per-process secret prefix
+            # (_ADDRESS_LOG_KEY, from secrets.token_urlsafe) and the text, a keyed digest that keeps
+            # an unparsed address out of the log; a reading aid, not an authenticator.
             "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).
@@ -1321,6 +1333,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.set_ciphersuites()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
+            # Vault BACKLOG #5627: harden_crl_check(chain=True), the API listener's whole-chain CRL.
+            "tls_context:.verify_flags |= VERIFY_CRL_CHECK_CHAIN",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",
@@ -1379,9 +1393,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.keywrap",
         }
     ),
+    # BACKLOG #5372: verify() parses a pinned certificate and loads its key before signxml's call,
+    # so an unreadable anchor is not blamed on the document.
     "messagefoundry/parsing/xml/signature.py": frozenset(
         {
+            "key_cert:.public_key()",
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_public_key",
+            "key_cert:cryptography.x509.load_pem_x509_certificate",
             "sign_verify:.verify()",
         }
     ),
@@ -1564,6 +1582,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
+            # Vault BACKLOG #6706: encrypt_many hands a batch cipher several values per call.
+            "cipher:.encrypt_many()",
             "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
             "csprng:os.urandom",
             "hash:hashlib.sha256",
@@ -1581,7 +1601,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
+            # Vault BACKLOG #6706: a batch of one goes through the cipher's own single-value encrypt
+            # and decrypt (the latter through store.crypto's decrypt_or_error).
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
             "mac:.generate_hmac()",
+            # ADR 0217: a row seal's HMAC, and BACKLOG #2720: an audit row's stored MAC, each
+            # checked INSIDE Transit (transit/verify), never compared in process. A MAC check, not
+            # a signature.
+            "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
@@ -1618,19 +1646,38 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
+            # ADR 0217: the Transit sealer's fixed-length input, its cache key and its key id are
+            # SHA-256 digests with no key. The input is load-bearing: Transit MACs that digest, not
+            # the row, so a seal also rests on SHA-256's collision resistance.
+            "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # ADR 0217: RowSealer.verify_async awaits nothing and calls its own self.verify, the
+            # local constant-time HMAC check above, so a store's await reaches every backend; a
+            # MAC check, not a signature.
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
-    # tag its row's routing fields build.
-    "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
-    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed.
-    "messagefoundry/store/cipher_cells.py": frozenset({"cipher:.decrypt()"}),
+    # tag its row's routing fields build. BACKLOG #5610: reseal_unless_tag_failure re-seals a rotated
+    # tagged cell under the active key with the same tag (AES-GCM encrypt through the store cipher).
+    "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()", "cipher:.encrypt()"}),
+    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed,
+    # several per call to a batch cipher (decrypt_many, vault BACKLOG #6706), else one at a time
+    # through store.crypto's decrypt_or_error.
+    "messagefoundry/store/cipher_cells.py": frozenset(
+        {"cipher:.decrypt_many()", "cipher:via messagefoundry.store.crypto"}
+    ),
     # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
     # cipher) under the tag its row's id and channel or owner build.
     "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #5651: the strip's batch transform opens a message's raw cell (through cell_tag) and
+    # encrypts the stripped body under the same row tag, in a worker thread. The AEAD runs inside
+    # the store cipher.
+    "messagefoundry/store/document_strip.py": frozenset(
+        {"cipher:.encrypt()", "cipher:via messagefoundry.store.cell_tag"}
+    ),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.
@@ -1668,8 +1715,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.store.store",
             # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
             "sign_verify:via messagefoundry.store.store",
-            "tls_context:.check_hostname = False",
-            "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.config.tls_policy",
         }
@@ -1713,14 +1758,19 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify), and
+            # session_seal_ok_async the same through either sealer's verify_async (ADR 0217).
+            "sign_verify:.verify_async()",
             "sign_verify:.verify()",
         }
     ),
     # Vault BACKLOG #2484: the broker dials through rest.py's shared verifying opener, which it now
     # obtains by calling rest._shared_no_redirect_opener() rather than reading a module constant, so
-    # the operation arm sees the hop. Before this it was IMPORT_ONLY; the opener is rest.py's, built
-    # through tls_policy, and the broker builds no context of its own.
+    # the operation arm sees the hop. Before this it was IMPORT_ONLY. BACKLOG #5527: where the [tls]
+    # anchor narrows, the broker holds an anchored opener from rest._no_redirect_opener, whose
+    # context loads [tls].internal_ca_file under augment or pinned and [tls].crl_file where set.
+    # Either way the context is built in rest.py through tls_policy, so the arms below are
+    # unchanged.
     "messagefoundry/transports/ai_broker.py": frozenset(
         {
             "key_cert:via messagefoundry.transports.rest",
@@ -1853,6 +1903,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.check_hostname = False",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
+            # BACKLOG #5530: the FTPS data channel is wrapped with the control channel's own context,
+            # so it takes that channel's verify posture, and offers the control channel's session
+            # for reuse. Reuse is best-effort under TLS 1.3; _SessionReusingFtpTls says when.
+            "tls_context:.wrap_socket()",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",
         }
@@ -2179,7 +2233,8 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
 #: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
 #: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
 #: value, a tuple-target, augmented and ``setattr`` posture assignment, a bare sibling import under
-#: ``scripts/``, and a first-party provider reached three ways (absolute import, package re-export,
+#: ``scripts/``, an import name reused by a function-local import, and a first-party provider
+#: reached three ways (absolute import, package re-export,
 #: relative import) from modules with no crypto import of their own, which is the BACKLOG #1164
 #: shape. If the instrument does not report exactly this, one of those matchers is dead, and every
 #: clean result it gives about the tree is void.
@@ -2209,6 +2264,11 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     "selftest/relative.py": "from . import seam\n\n\ndef go():\n    seam.build()\n",
     "scripts/st/helper.py": "import hashlib\n\n\ndef h(b):\n    return hashlib.sha1(b)\n",
     "scripts/st/user.py": "import helper\n\n\ndef go(b):\n    return helper.h(b)\n",
+    # BACKLOG #5579: a function-local import reusing a crypto module's name must not hide it.
+    "selftest/shadow.py": (
+        "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+        "def other():\n    from mylib import thing as hashlib\n    return hashlib\n"
+    ),
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
@@ -2233,6 +2293,7 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/relative.py": frozenset({"tls_context:via selftest.seam"}),
     "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
     "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
+    "selftest/shadow.py": frozenset({"hash:hashlib.md5"}),
 }
 
 
@@ -2327,30 +2388,44 @@ def find_violations(
     return undocumented, stale
 
 
-def _is_comment_only(line: str) -> bool:
-    """True for a line that is nothing but a ``//`` or block-comment line.
+def _js_code(text: str) -> list[str]:
+    """The code of a TypeScript/JavaScript source, one entry per line: the UNION of two views.
 
-    DELIBERATELY CONSERVATIVE, and the direction matters. A code line carrying a TRAILING comment is
-    still scanned in full, so a call cannot be hidden by putting a ``//`` earlier on the same line;
-    the cost is that a line beginning with ``*`` for some non-comment reason is skipped. The error
-    this can make is a false POSITIVE (flagging a call quoted inside a string), never a false
-    negative, which is the only safe direction for a security gate. Stripping comments properly would
-    need a JS lexer, and a naive strip would cut a line at the ``//`` of a URL and hide what follows.
+    1. The lexer view, :func:`js_lexer.blank_js_comments`, which skips string, template and regex
+       literals and blanks only real comments. It sees what BACKLOG #5578 found hidden: a call after
+       an inline ``/* */``, or on a ``*`` continuation line. The JS line terminators CR, U+2028 and
+       U+2029 are folded to ``\\n`` for it, because each ends a ``//`` comment.
+    2. The per-line view this gate used before #5578: every line, split by ``splitlines``, that does
+       not start with ``//``, ``*`` or ``/*``. A trailing comment stays on its line.
 
-    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` uses the same rule
-    for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it is unusable.
-    """
-    stripped = line.lstrip()
-    return stripped.startswith(("//", "*", "/*"))
+    The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
+    says how) and blank real code; the per-line view still scans every line it scanned before. So
+    the gate scans at least what it scanned before #5578: the per-line view is unchanged, and only
+    the lexer's input drops a leading BOM. The cost is false positives from both views: the per-line
+    view's old ones (a prose line inside a block comment that does not start with ``*``), and the
+    lexer's (a comment-shaped line inside a template literal, or a real comment line kept after a
+    literal misread).
+
+    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
+    lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
+    is unusable."""
+    # The BOM is dropped for the lexer only, so a BOM-led ``/**`` opens its comment there; the
+    # per-line view reads the text exactly as it did before #5578.
+    folded = text.removeprefix("\ufeff")
+    for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
+        folded = folded.replace(terminator, "\n")
+    lexed = js_lexer.blank_js_comments(folded).split("\n")
+    per_line = [
+        line for line in text.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))
+    ]
+    return lexed + per_line
 
 
 def randomness_tokens_in(text: str) -> set[str]:
     """The randomness-source tokens (strong and weak) a non-Python source draws from."""
     found: set[str] = set()
     patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
-    for line in text.splitlines():
-        if _is_comment_only(line):
-            continue
+    for line in _js_code(text):
         for token, pattern in patterns.items():
             if token not in found and pattern.search(line):
                 found.add(token)
@@ -2685,12 +2760,11 @@ def _pattern_tokens(
 
 
 def non_python_operation_tokens_in(text: str) -> set[str]:
-    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comment-only lines
-    are skipped by the same conservative rule as the randomness arm (:func:`_is_comment_only`)."""
+    """The ``class:token`` operations a TypeScript/JavaScript source performs, read from the same
+    two-view code as the randomness arm (:func:`_js_code`)."""
     found: set[str] = set()
-    for line in text.splitlines():
-        if not _is_comment_only(line):
-            found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
+    for line in _js_code(text):
+        found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
     # A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
     # ``_CIPHER_STRING`` for why.
     names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}
@@ -2806,8 +2880,13 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
         "sign_verify",
     ),
     "Rfc2898DeriveBytes": (re.compile(r"\bRfc2898DeriveBytes\b", re.I), "kdf"),
+    # A certificate parsed, singly or as a collection (import-db-ca.ps1 reads a bundle into one).
     "X509": (
-        re.compile(r"\bX509Certificate2\]::new\b|New-Object\s+\S*X509Certificate2\b", re.I),
+        re.compile(
+            r"\bX509Certificate2(?:Collection)?\]::new\b"
+            r"|New-Object\s+\S*X509Certificate2(?:Collection)?\b",
+            re.I,
+        ),
         "key_cert",
     ),
     "X509Store": (
@@ -2847,10 +2926,14 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 #: The maintained PowerShell operation inventory. Bidirectional, like the others.
 POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
-    # Parses the operator's CA certificate (so a malformed file fails before anything is touched and
-    # the operator sees what they are about to trust), then INSTALLS it into the machine root store.
-    # A trust-anchor decision for the whole host, not only for the engine.
-    "scripts/service/import-db-ca.ps1": frozenset({"key_cert:X509", "key_cert:Import-Certificate"}),
+    # Parses the operator's CA certificate file into a collection (so a malformed file fails before
+    # anything is touched and the operator sees every certificate they are about to trust), checks
+    # whether each one's signature verifies under its own key (to tell a self-signed root from an
+    # issuing CA), then INSTALLS each one through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md
+    # section 5.2 says which). A trust-anchor decision for the whole host, not only the engine.
+    "scripts/service/import-db-ca.ps1": frozenset(
+        {"key_cert:X509", "key_cert:X509Store", "sign_verify:SignData"}
+    ),
     # Downloads the NSSM service wrapper and checks it against a pinned SHA-256 before extracting it:
     # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
     # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine

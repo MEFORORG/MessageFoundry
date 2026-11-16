@@ -510,6 +510,10 @@ async def test_an_interrupted_release_offers_the_resolve_and_not_approve(engine:
         r = await checker.get("/ui/approvals")
         assert r.status_code == 200
         assert "Interrupted releases" in r.text
+        # decided_at is the claim time on a row a restart or an operator interrupt moved, so the
+        # column does not claim it is only the cut-off time (BACKLOG #1562).
+        assert "<th>Cut off or claimed</th>" in r.text
+        assert "<th>Cut off</th>" not in r.text
         assert approval_id in r.text
         assert f'formaction="{_resolve(approval_id)}"' in r.text
         assert f'formaction="{_resolve(approval_id, "effects_not_applied")}"' in r.text
@@ -797,3 +801,17 @@ async def test_a_stale_window_lands_the_approver_back_on_the_page(engine: Engine
         assert await _status(engine, approval_id) == "pending"
         landed = await checker.get("/ui/approvals?m=approve_again")
         assert "Nothing was released" in landed.text
+
+
+def test_the_not_authorized_note_names_a_deleted_requester_and_an_unbound_auth_service() -> None:
+    """Vault BACKLOG #3748 item 4 and L5: the engine marks a request ``requester_not_authorized``
+    for a deleted or disabled requester and when no auth service is bound to check one, as well as
+    for a lost permission or scope. The note said only that the requester's authority could be
+    restored, which is never so for a deleted account and is no fault of the requester's when
+    nothing can check it."""
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    note = page_module._BLOCKED["requester_not_authorized"]
+    assert "deleted" in note and "no auth service is bound" in note
+    assert "never for a deleted account" in note
+    assert "{verb}" in note

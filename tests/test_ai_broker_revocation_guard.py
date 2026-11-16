@@ -4,23 +4,35 @@
 (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
 Every call sends ``[ai].api_key`` over https that verifies the endpoint's certificate, and stdlib
-ssl checks no CRL and no OCSP. So an off-box endpoint is refused under an enforcing or unknown
-posture unless ``[ai].endpoint_revocation_attested`` is set with its reason. No CRL lever is built
-for this hop. All endpoints and keys here are synthetic.
+ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]`` section
+reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
+(docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
+enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
+is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
+``[tls].internal_ca_file`` under ``augment`` or ``pinned`` and ``[tls].crl_file`` reach its
+opener; the last section pins that.
+All endpoints, keys, certificates and CRLs here are synthetic.
 """
 
 from __future__ import annotations
 
+import datetime
+import inspect
 import json
 import ssl
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from messagefoundry.api import create_app
-from messagefoundry.config import tls_policy
+from messagefoundry.config import loaded_crls, tls_policy
 from messagefoundry.config.ai_policy import AiMode
 from messagefoundry.config.settings import (
     AiSettings,
@@ -36,11 +48,17 @@ from messagefoundry.config.settings import (
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
+    TlsSettings,
     security_loosenings,
 )
-from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, HopPosture
+from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
+    HopPosture,
+    TrustAnchorPolicy,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
+from messagefoundry.transports import rest
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.rest import _shared_no_redirect_opener, opener_tls_context
 from tests.test_revocation_guard_remaining_hops import _guard_log
@@ -56,10 +74,13 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged and no process-wide attestation set."""
+    """Each test starts with no crossing logged, no anchored opener held and no process-wide
+    attestation set."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
+    # raising=True: a renamed slot must fail here, or held openers would leak across tests.
+    monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
@@ -71,6 +92,7 @@ def _broker(
     posture: HopPosture | None,
     attested: bool = False,
     reason: str | None = None,
+    policy: TrustAnchorPolicy | None = None,
 ) -> AiBroker:
     return AiBroker(
         endpoint=endpoint,
@@ -79,6 +101,7 @@ def _broker(
         posture=posture,
         revocation_attested=attested,
         revocation_attested_reason=reason,
+        trust_anchor_policy=policy,
     )
 
 
@@ -118,8 +141,8 @@ def test_an_off_box_endpoint_with_no_attestation_is_refused(posture: HopPosture 
     message = str(info.value)
     assert "no revocation check" in message
     assert _PAIR in message and "endpoint_revocation_attested_reason" in message
-    # It offers only a lever that reaches this hop: no CRL setting, no connection's pair.
-    assert "No CRL can reach this hop" in message
+    # It offers only levers that reach this hop. With no [tls] policy handed in, no CRL can
+    # reach it, so [tls].crl_file is not offered (BACKLOG #5527); nor is a connection's pair.
     assert "[tls].crl_file" not in message
     assert "tls_revocation_attested=true" not in message
     assert _KEY not in message
@@ -186,9 +209,9 @@ def test_the_process_wide_attestation_does_not_cross_an_enforcing_posture(
 def test_the_decision_reads_the_context_the_broker_dials_with(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``crl_checked`` is read off the shared opener's own context, never a setting. That opener
-    loads no CRL today; a context that checks one would cross, so a later CRL lever can start
-    there."""
+    """``crl_checked`` is read off the context of the opener the broker dials, never a setting.
+    With no ``[tls]`` policy that is the shared opener, which loads no CRL; the last section pins
+    the opener a CRL reaches."""
     seen: list[ssl.SSLContext | None] = []
 
     def checks(ctx: ssl.SSLContext | None) -> bool:
@@ -239,8 +262,8 @@ def test_an_attested_hop_whose_context_skips_time_validity_keeps_the_crossing_li
     monkeypatch: pytest.MonkeyPatch, ai_log: list[str]
 ) -> None:
     """Such a context accepts a lapsed CRL, so its CRL does not silence the line, as at
-    ``RevocationHopGuard.enforce_construction``. No CRL reaches this hop today, so the context's two
-    answers are stood in for; the test above is the control."""
+    ``RevocationHopGuard.enforce_construction``. The engine never builds this hop's context to skip
+    time validity, so the context's two answers are stood in for; the test above is the control."""
     monkeypatch.setattr(tls_policy, "context_checks_revocation", lambda ctx: True)
     monkeypatch.setattr(tls_policy, "skips_validity_period", lambda ctx: True)
     _broker(posture=_ENFORCING, attested=True, reason=_REASON)
@@ -353,7 +376,9 @@ def test_the_attestation_is_a_named_loosening_that_carries_its_reason() -> None:
     )
     assert switch in named
     assert _REASON in named[switch]
-    assert "No CRL lever is built for this hop" in named[switch]
+    # BACKLOG #5527: a CRL reaches this hop on some paths now, so the entry says which.
+    assert "checks no CRL unless all three hold: [tls].crl_file is set" in named[switch]
+    assert "No CRL lever is built" not in named[switch]
 
 
 # --- the route -----------------------------------------------------------------------------------
@@ -454,3 +479,295 @@ def test_security_show_names_the_pair_from_the_file(
     entries = {e["switch"]: e["risk"] for e in data["loosenings"]}
     assert _SWITCH in entries
     assert _REASON in entries[_SWITCH]
+
+
+# --- the [tls] policy reaches the broker's opener (BACKLOG #5527) -------------------------------
+
+
+class _Pki(NamedTuple):
+    """A synthetic internal CA and a CRL it signed, each as a PEM path."""
+
+    ca_file: str
+    crl_file: str
+
+
+_PKI_CN = "mefor-5527-synthetic-internal-ca"
+
+
+@pytest.fixture(scope="module")
+def pki(tmp_path_factory: pytest.TempPathFactory) -> _Pki:
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _PKI_CN)])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 30 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(name)
+        .last_update(now - day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    folder = tmp_path_factory.mktemp("pki5527")
+    ca_path = folder / "internal_ca.pem"
+    crl_path = folder / "internal_crl.pem"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    crl_path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    return _Pki(ca_file=str(ca_path), crl_file=str(crl_path))
+
+
+def _context(broker: AiBroker) -> ssl.SSLContext:
+    ctx = opener_tls_context(broker._opener, connector="AI endpoint")
+    assert ctx is not None
+    return ctx
+
+
+def _anchor_cns(ctx: ssl.SSLContext) -> list[str]:
+    """The common name of each root the context trusts, read off the context itself."""
+    names: list[str] = []
+    for cert in ctx.get_ca_certs():
+        for rdn in cert.get("subject", ()):
+            names.extend(str(pair[1]) for pair in rdn if pair[0] == "commonName")
+    return names
+
+
+def test_a_tls_crl_reaches_the_broker_and_crosses_an_enforcing_posture(
+    pki: _Pki, ai_log: list[str]
+) -> None:
+    """The row's own failing case. With ``[tls].crl_file`` set, the broker dials an opener of its
+    own whose context checks that CRL, so an off-box endpoint crosses enforce with no attestation
+    and logs no crossing line. Red on the parent commit: the shared opener carried no CRL, so the
+    broker refused the hop."""
+    broker = _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=pki.crl_file))
+    assert broker._opener is not _shared_no_redirect_opener()
+    assert _context(broker).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert ai_log == []
+
+
+def test_a_pinned_internal_ca_is_the_only_root_the_broker_trusts(pki: _Pki) -> None:
+    """``pinned`` trusts the internal CA alone, so the opener is the broker's own and its context
+    holds no system root. Red on the parent commit: the broker dialled the shared opener on the
+    OS trust store whatever ``[tls].internal_ca_file`` named."""
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned")
+    broker = _broker(posture=_WARN, policy=policy)
+    assert broker._opener is not _shared_no_redirect_opener()
+    ctx = _context(broker)
+    assert _anchor_cns(ctx) == [_PKI_CN]
+    # No CRL rode along, so the hop still checks none: an internal CA alone is not a revocation
+    # lever, and the enforcing refusal still applies.
+    assert not ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    with pytest.raises(AiBrokerError, match="no revocation check"):
+        _broker(posture=_ENFORCING, policy=policy)
+
+
+def test_an_augmenting_internal_ca_is_added_to_the_broker_roots(pki: _Pki) -> None:
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="augment")
+    broker = _broker(posture=_WARN, policy=policy)
+    assert broker._opener is not _shared_no_redirect_opener()
+    assert _PKI_CN in _anchor_cns(_context(broker))
+
+
+def test_the_internal_ca_and_its_crl_ride_together(pki: _Pki) -> None:
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    ctx = _context(_broker(posture=_ENFORCING, policy=policy))
+    assert _anchor_cns(ctx) == [_PKI_CN]
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        None,
+        TrustAnchorPolicy(),
+        # system mode ignores the internal CA, so nothing narrows and the file is never read.
+        TrustAnchorPolicy(internal_ca_file="unused-in-system-mode.pem", mode="system"),
+    ],
+    ids=["none", "empty", "system-mode-ca"],
+)
+def test_a_policy_that_narrows_nothing_keeps_the_shared_opener(
+    policy: TrustAnchorPolicy | None,
+) -> None:
+    """The shared opener is reused, never copied or mutated: callers compare it by identity."""
+    broker = _broker(posture=_WARN, policy=policy)
+    assert broker._opener is _shared_no_redirect_opener()
+
+
+def test_a_loopback_endpoint_takes_neither_the_internal_ca_nor_the_crl(pki: _Pki) -> None:
+    """``resolve_trust_anchor`` exempts a loopback host from both, matching the guard's on-box
+    arm, so an on-box gateway under a different local PKI is not broken by the org's CA or CRL."""
+    policy = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    broker = _broker(
+        endpoint="https://127.0.0.1:8443/v1/messages",
+        allowed=("127.0.0.1",),
+        posture=_ENFORCING,
+        policy=policy,
+    )
+    assert broker._opener is _shared_no_redirect_opener()
+
+
+def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) -> None:
+    """Where a ``[tls]`` policy reaches the broker, ``[tls].crl_file`` is a way across, so the
+    refusal and the warn line both offer it beside the pair. The control is the first test in this
+    file, which hands no policy and is offered no CRL."""
+    with pytest.raises(AiBrokerError) as info:
+        _broker(posture=_ENFORCING, policy=TrustAnchorPolicy())
+    message = str(info.value)
+    assert "Set [tls].crl_file" in message
+    assert "instance-wide" in message  # the CRL reaches every other hop too
+    assert _PAIR in message
+    _broker(posture=_WARN, policy=TrustAnchorPolicy())
+    assert len(ai_log) == 1
+    assert "[tls].crl_file" in ai_log[0]
+    assert _PAIR in ai_log[0]
+
+
+def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
+    """The broker is built per request, but its anchored opener is built once for an anchor, so
+    ``crl_reload`` can bring its CRL current and the expiry monitor sees one live copy. A changed
+    policy builds a new one."""
+    crl = TrustAnchorPolicy(crl_file=pki.crl_file)
+    first = _broker(posture=_ENFORCING, policy=crl)
+    second = _broker(posture=_ENFORCING, policy=crl)
+    assert second._opener is first._opener
+    # Held, the context is recorded as a live copy of the CRL, which is what the expiry monitor
+    # judges and crl_reload brings current.
+    held = _context(first)
+    assert any(ctx is held for ctx, _ in loaded_crls.held_contexts())
+    # ADR 0135 AC-7: the anchored opener refuses redirects as the shared one does.
+    # `handlers` is set in OpenerDirector.__init__ but absent from typeshed's stub.
+    handlers = vars(first._opener)["handlers"]
+    assert any(isinstance(h, rest._NoRedirectHandler) for h in handlers)
+    pinned = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    third = _broker(posture=_ENFORCING, policy=pinned)
+    assert third._opener is not first._opener
+    assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
+
+
+def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:
+    """Either file failing to load is an ``AiBrokerError``, which the route answers 503, never an
+    unhandled 500."""
+    missing = str(tmp_path / "gone.pem")
+    with pytest.raises(AiBrokerError, match="endpoint opener refused"):
+        _broker(posture=_ENFORCING, policy=TrustAnchorPolicy(crl_file=missing))
+    with pytest.raises(AiBrokerError, match=r"endpoint opener refused: \[tls\]\.internal_ca_file"):
+        _broker(posture=_WARN, policy=TrustAnchorPolicy(internal_ca_file=missing, mode="pinned"))
+
+
+async def test_the_route_hands_the_broker_the_instance_tls_policy(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki
+) -> None:
+    """``POST /ai/chat`` reads the ``[tls]`` section the managed app stashes, as the alerts test
+    send does. With its CRL the unattested hop answers 200 under enforce; the route test above is
+    the control that answers 503 without it. Red on the parent commit: 503."""
+    seen: list[ssl.SSLContext] = []
+
+    def fake_chat(self: AiBroker, prompt: str) -> str:
+        seen.append(_context(self))
+        return "synthetic reply"
+
+    monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    app.state.tls_settings = TlsSettings(crl_file=pki.crl_file)
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "synthetic prompt"})
+    assert r.status_code == 200
+    assert len(seen) == 1
+    assert seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- the posture entry claims no CRL check where [tls].crl_file does not reach (#5527) ---------
+
+
+@pytest.mark.parametrize(
+    ("path", "names_the_path"),
+    [
+        ("direct-create-app", "a direct create_app holds none unless the embedder sets it"),
+        ("loopback", "a loopback endpoint"),
+    ],
+    ids=["direct-create-app", "loopback"],
+)
+async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_reach(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki, path: str, names_the_path: str
+) -> None:
+    """The ``GET /security/posture`` entry must not say a CRL is checked on a path where none is,
+    whatever ``[tls].crl_file`` the instance names. Two such paths: a direct ``create_app`` whose
+    embedder set no ``app.state.tls_settings``, so no ``crl_file`` reaches its route; and a
+    loopback endpoint on an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve``
+    stashes it, which ``resolve_trust_anchor`` exempts from the CRL. In both arms a ``crl_file``
+    is configured where it would matter if reached: the loopback app holds it, and for the direct
+    ``create_app`` the process environment names it and the process already holds the anchored
+    opener that CRL builds, as a ``serve``-hosted broker in the same process would. Each arm checks
+    the context the route really dials with, then reads the entry. Red on 547561b4da: the entry
+    said "no CRL unless [tls].crl_file is set", a CRL check on both paths."""
+    dialled: list[AiBroker] = []
+
+    def fake_chat(self: AiBroker, prompt: str) -> str:
+        dialled.append(self)
+        return "synthetic reply"
+
+    monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
+    if path == "direct-create-app":
+        # The fact the entry's clause rests on: create_app has no [tls] parameter, so whatever
+        # crl_file the instance's [tls] names has no way into this app.
+        assert "tls_settings" not in inspect.signature(create_app).parameters
+        # The instance's [tls] does name a CRL: the process environment carries it.
+        monkeypatch.setenv("MEFOR_TLS_CRL_FILE", pki.crl_file)
+        # And the process already holds the CRL-checking opener that policy builds for this very
+        # endpoint, so a route that fell back to the environment or reused the held slot would
+        # dial a CRL here.
+        primed = _broker(posture=_ENFORCING, policy=TlsSettings(crl_file=pki.crl_file).policy())
+        assert _context(primed).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+        assert ai_broker_mod._anchored_opener is not None
+        ai = _managed_ai(
+            endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON
+        )
+        app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+        assert getattr(app.state, "tls_settings", None) is None
+    else:
+        ai = _managed_ai(
+            endpoint="https://127.0.0.1:8443/v1/messages",
+            allowed_endpoints=["127.0.0.1"],
+            endpoint_revocation_attested=True,
+            endpoint_revocation_attested_reason=_REASON,
+        )
+        app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+        app.state.tls_settings = TlsSettings(crl_file=pki.crl_file)
+    async with _client(app) as c:
+        chat = await c.post("/ai/chat", json={"prompt": "synthetic prompt"})
+        posture = await c.get("/security/posture")
+    assert chat.status_code == 200
+    assert len(dialled) == 1
+    assert not _context(dialled[0]).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    if path == "direct-create-app":
+        # Not the held anchored opener: the route dialled the shared one, on the OS trust store.
+        assert dialled[0]._opener is _shared_no_redirect_opener()
+    assert posture.status_code == 200
+    risk = {e["switch"]: e["risk"] for e in posture.json()["loosenings"]}[_SWITCH]
+    assert "unless [tls].crl_file is set" not in risk
+    assert "check no CRL whatever [tls].crl_file says" in risk
+    assert names_the_path in risk

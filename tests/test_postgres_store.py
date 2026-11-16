@@ -4,9 +4,10 @@
 
 **Gated**: skipped unless ``MEFOR_TEST_POSTGRES`` is set (plus ``MEFOR_STORE_*`` connection env),
 so it's a no-op locally and in normal CI. A CI Postgres service-container job sets the env and runs it
-for real. Requires the ``postgres`` extra (``asyncpg``). For the loopback dev Postgres
-(``encrypt=false``) also set ``MEFOR_ALLOW_INSECURE_TLS=1`` (``scripts/dev/postgres.ps1`` exports it),
-or the fixture errors on the bind-guard rather than skipping.
+for real. Requires the ``postgres`` extra (``asyncpg``). The server must speak verified TLS: a
+store hop with ``encrypt=false`` or ``trust_server_certificate=true`` is refused at every posture,
+whatever ``MEFOR_ALLOW_INSECURE_TLS`` says (vault BACKLOG #3533 item 2), so the fixture errors on
+that refusal rather than skipping.
 
 Beyond the SQL Server parity tests, this also exercises the **staged pipeline** Postgres supports
 (ingress → routed → outbound, finalize PROCESSED; the ROUTED→FILTERED collapse), reference snapshots,
@@ -59,6 +60,7 @@ from tests._keyed_reopen_contract import (
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._keyless_blank_contract import keyed_cipher
+from tests._passthrough_marker_scope_contract import CASES as PT_MARKER_SCOPE_CASES
 from tests._queue_tag_contract import RawFetch, RawSql
 from tests._reingress_refused_body_contract import CASES as REINGRESS_REFUSED_BODY_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
@@ -117,6 +119,8 @@ _TABLES = (
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
     "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
+    "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+    #                     key would stop every key rotation in a later test
     "user_roles",
     "ad_group_role_map",
     "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it
@@ -549,6 +553,13 @@ async def test_ingress_handoff_parity(store) -> None:
 async def test_reingress_refused_body_contract(store, case) -> None:
     """Vault BACKLOG #4796: a refused loopback re-ingress is charged to the refused-body allowance,
     the same contract the SQLite suite runs: past it only the head is stored, inside it the whole."""
+    await case(store)
+
+
+@pytest.mark.parametrize("case", PT_MARKER_SCOPE_CASES)
+async def test_passthrough_marker_scope_contract(store, case) -> None:
+    """BACKLOG #5614: a pass-through marker is scoped to its parent's channel, the same contract the
+    SQLite suite runs, so a dead one is listed under the parent's channel, not the pass-through's."""
     await case(store)
 
 
@@ -1055,7 +1066,7 @@ async def test_auth_users_roles_sessions(store) -> None:
     user = await store.get_user_by_username("alice")
     assert user is not None and user.id == "u1" and user.password_hash == "hash"
 
-    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0)
+    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0, audits=())
     assert await store.get_user_role_ids("u1") == ["operator"]
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
@@ -1102,6 +1113,14 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
 
     await assert_concurrent_removals_leave_one(store)
+
+
+async def test_account_write_audit_contract(store) -> None:
+    """BACKLOG #2221 and #3018 step 4 on Postgres: each audited account write commits its row in
+    its own transaction, or neither lands. The contract is ``tests/_account_write_audit_contract.py``."""
+    from tests._account_write_audit_contract import assert_account_write_audit_contract
+
+    await assert_account_write_audit_contract(store)
 
 
 async def test_role_write_if_held_contract(store) -> None:
@@ -3241,19 +3260,78 @@ async def test_db_coordinator_config_version_bump_and_round_trip(store) -> None:
     # A fresh DB initializes to version 0 (the INSERT ... ON CONFLICT bootstraps the row).
     assert a.is_clustered() is True
     assert await a.config_version() == 0
+    assert a.config_digest_cached(0) is None, "a fresh row holds no initiator's digest"
     # Bumping increments and persists; the new value is cached for the cheap sync read.
-    assert await a.bump_config_version() == 1
+    assert await a.bump_config_version(digest="digest-1") == 1
     assert a.config_version_cached() == 1
-    assert await a.bump_config_version() == 2
+    assert a.config_digest_cached(1) == "digest-1"
+    # vault BACKLOG #3109: the digest is read with the version, by the same statement.
+    assert await b.config_version() == 1 and b.config_digest_cached(1) == "digest-1"
+    assert await a.bump_config_version(digest=None) == 2
+    assert a.config_digest_cached(2) is None, "an unknown digest replaces the previous bump's"
 
     # A SECOND coordinator handle reads the persisted, bumped value (shared via the single row).
     assert await b.config_version() == 2
     assert b.config_version_cached() == 2
+    assert b.config_digest_cached(2) is None, "not version 1's digest beside version 2"
+    assert b.config_digest_cached(1) is None, "the cache holds only the version it read"
+    assert await a.bump_config_version(digest="digest-3") == 3
+    assert await b.config_version() == 3 and b.config_digest_cached(3) == "digest-3"
 
     # The single row is exactly id=1 (single-row invariant).
     async with store._pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, config_version FROM cluster_config")
-    assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["config_version"] == 2
+        rows = await conn.fetch("SELECT id, config_version, config_digest FROM cluster_config")
+    assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["config_version"] == 3
+    assert rows[0]["config_digest"] == "digest-3"
+
+
+async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
+    """vault BACKLOG #3109: a cluster_config created before config_digest gets its two columns from
+    the schema batch, and its existing row reads as an unknown digest."""
+    from messagefoundry.pipeline.cluster import DbCoordinator
+    from messagefoundry.store.postgres import _SCHEMA
+
+    (create,) = [s for s in _SCHEMA if "CREATE TABLE IF NOT EXISTS cluster_config" in s]
+    migrations = [s for s in _SCHEMA if "'cluster_config'" in s and "config_digest" in s]
+    assert len(migrations) == 2, migrations
+    try:
+        async with store._pool.acquire() as conn:
+            await conn.execute("DROP TABLE cluster_config")
+            await conn.execute(
+                "CREATE TABLE cluster_config (id INTEGER PRIMARY KEY,"
+                " config_version BIGINT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)"
+            )
+            await conn.execute("INSERT INTO cluster_config VALUES (1, 5, 0)")
+            for migration in (*migrations, *migrations):  # a second run is a no-op
+                await conn.execute(migration)
+        a = DbCoordinator(store._pool, "node-A")
+        assert await a.config_version() == 5 and a.config_digest_cached(5) is None
+        assert await a.bump_config_version(digest="d") == 6 and a.config_digest_cached(6) == "d"
+    finally:
+        # The schema marker still matches, so a later open would not restore a table this test
+        # dropped or left without its columns; put both back whatever happened above.
+        async with store._pool.acquire() as conn:
+            for statement in (create, *migrations):
+                await conn.execute(statement)
+
+
+async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store) -> None:
+    """vault BACKLOG #3109: an engine that predates the digest still bumps the version, with the
+    statement it always ran, and leaves the previous bump's digest in the row. That digest is
+    stamped with the earlier version, so no reader sets it beside the new one."""
+    from messagefoundry.pipeline.cluster import DbCoordinator
+
+    a = DbCoordinator(store._pool, "node-A")
+    b = DbCoordinator(store._pool, "node-B")
+    await a.config_version()
+    assert await a.bump_config_version(digest="digest-1") == 1
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE cluster_config SET config_version = config_version + 1, updated_at = 0"
+        )
+    assert await b.config_version() == 2 and b.config_digest_cached(2) is None
+    assert await a.bump_config_version(digest="digest-3") == 3
+    assert await b.config_version() == 3 and b.config_digest_cached(3) == "digest-3"
 
 
 async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
@@ -3292,7 +3370,7 @@ async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     assert reloads == []
 
     # A real operator reload on node A bumps the shared token in the DB.
-    assert await a.bump_config_version() == 1
+    assert await a.bump_config_version(digest=None) == 1
     # B has NOT yet refreshed its cache from the DB, so its convergence poll still reads 0 → no reload.
     # (The cached poll is what gates convergence, so the DB bump alone does nothing until B's tick.)
     assert b.config_version_cached() == 0
@@ -4816,6 +4894,17 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
 # --- ALERT-19: alert_instance CRUD lifecycle + reason cipher-at-rest, on real Postgres --------------
 
 
+async def test_alert_generation_bounds_the_resolve_pg(store) -> None:
+    """BACKLOG #3269, #4916: the generation-bounded resolves, the shared contract."""
+    from tests._alert_generation_contract import (
+        check_alert_generation_contract,
+        check_fenced_resolve_contract,
+    )
+
+    await check_alert_generation_contract(store)
+    await check_fenced_resolve_contract(store)
+
+
 async def test_alert_instance_lifecycle_pg(store) -> None:
     from messagefoundry.store.store import AlertSummary
 
@@ -5161,6 +5250,10 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
             audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
+        # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
+        # would stop this run. The fixture does not clear this table, so this test does.
+        async with seed._pool.acquire() as conn:
+            await conn.execute("DELETE FROM pending_approvals")
     finally:
         await seed.close()
 
@@ -5703,6 +5796,29 @@ async def test_user_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_notice_gate_seal_contract(store) -> None:
+    """BACKLOG #5629: the startup security-notice gate weighs only sealed records, the same
+    contract the SQLite suite runs, on a keyed handle. The fixture truncates the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._notice_gate_seal_contract import assert_notice_gate_reads_sealed_rows
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_notice_gate_reads_sealed_rows(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_role_seal_contract(store) -> None:
     """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
     contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
@@ -5732,6 +5848,29 @@ async def test_role_seal_contract(store) -> None:
             )
         assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
         await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_reseal_outcome_contract(store) -> None:
+    """Vault BACKLOG #5635: ``reencrypt_to_active`` records what its re-seal passes left under a
+    key it does not hold, for ``rotate-key`` to read, on a keyed handle. ``raw`` runs each
+    statement outside the store's helpers. The fixture truncates the tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._reseal_outcome_contract import assert_reseal_outcome_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_reseal_outcome_contract(keyed, raw)
     finally:
         await keyed.close()
 
@@ -5998,7 +6137,6 @@ import time
 from pathlib import Path
 
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import PostgresStore
 
 
@@ -6022,7 +6160,7 @@ def rendezvous(latch_dir, tag, peers, timeout=60.0):
 async def main() -> None:
     tag, rows, latch_dir, peers = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
     store = await PostgresStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     try:
         rendezvous(latch_dir, tag, peers)
@@ -6404,3 +6542,81 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     finally:
         # Leave no chain under a key nobody holds for a later module on this database.
         await empty_audit_log()
+
+
+# --- vault BACKLOG #4607 step 6: a row that keeps killing its worker is dead-lettered ------------
+
+
+async def _pg_death_row(store, row_id: str) -> tuple[str, int, int]:
+    async with store._pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT status, attempts, worker_deaths FROM queue WHERE id=$1", row_id
+        )
+    return str(r["status"]), int(r["attempts"]), int(r["worker_deaths"])
+
+
+async def test_record_worker_death_counts_then_dead_letters_at_the_cap(store) -> None:
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    for death in (1, 2, 3):
+        # Past the recovery below, which re-pends the row due at its own now (300).
+        item = await store.claim_next_fifo("IB", now=400.0, stage=Stage.INGRESS.value)
+        assert item is not None and item.message_id == mid
+        counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+        assert (counted.deaths, counted.dead) == (death, death == 3)
+        if death < 3:
+            # Below the cap only the count moved; recovery keeps it, and the next claim does not
+            # raise it.
+            assert await _pg_death_row(store, item.id) == ("inflight", death, death)
+            await store.reset_stale_inflight(now=300.0)
+    assert await _pg_death_row(store, item.id) == ("dead", 3, 3)
+    msg = await store.get_message(mid)
+    assert msg is not None and msg["status"] == MessageStatus.ERROR.value
+
+
+async def test_record_worker_death_counts_a_re_pended_row_and_skips_a_resolved_one(store) -> None:
+    """A lease sweep may re-pend the row before the death is recorded; it still counts. A row
+    already resolved is never counted."""
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    await store.reset_stale_inflight(now=300.0)
+    counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (1, False)
+    assert await _pg_death_row(store, item.id) == ("pending", 1, 1)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    sent = await store.claim_next_fifo("OB1", now=200.0)
+    assert sent is not None
+    assert await store.mark_done(sent.id, now=201.0)
+    counted = await store.record_worker_death(sent.id, 1, "delivery worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    assert await _pg_death_row(store, sent.id) == ("done", 1, 0)
+
+
+async def test_record_worker_death_fenced_rolls_back_whole_and_re_pends(store) -> None:
+    """ADR 0157 C3: a fenced dead-letter rolls the increment back with it and re-pends the row."""
+    lease_key = "public:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    store.set_leader_epoch(5, lease_key=lease_key)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    store.set_leader_epoch(3, lease_key=lease_key)  # demoted after the claim
+    counted = await store.record_worker_death(item.id, 1, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    # C3 re-pends through release_claimed, which also returns the claim's attempt.
+    assert await _pg_death_row(store, item.id) == ("pending", 0, 0)
+    assert store.fenced_writes == 1
+
+
+async def test_mark_failed_at_its_cap_leaves_a_done_row_done(store) -> None:
+    """A late death after the send was marked done must not turn a delivered row DEAD."""
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    assert await store.mark_done(item.id, now=201.0)
+    outcome = await store.mark_failed(item.id, "late death", RetryPolicy(max_attempts=1))
+    assert outcome == FailOutcome()
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value

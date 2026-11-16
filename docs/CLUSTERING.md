@@ -85,8 +85,9 @@ Start the same `serve` command on each host/process — e.g.:
 python -P -X disable-remote-debug -m messagefoundry serve --service-config messagefoundry.toml --config ./config
 ```
 
-(For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env and
-`MEFOR_ALLOW_INSECURE_TLS=1` for a loopback, no-TLS database — DEV convenience only.)
+(For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env. The
+database must serve TLS the engine can verify, since nothing permits a weakened store hop; its
+`-RootCert` names the CA to pin.)
 
 ## What each node does
 
@@ -122,7 +123,9 @@ cluster coordinates the parts that must not double-run or interleave:
   measured on the database's own clock, so node clock skew doesn't affect who may hold it); a standby
   acquires only once that lease has **expired**. A leader that cannot renew within
   `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops *reporting itself* leader before
-  the lease can expire and a standby acquire it (the split-brain guard). Two caveats if you tune these
+  the lease can expire and a standby acquire it (the split-brain guard). A leader whose own heartbeat
+  has not landed for `node_timeout_seconds` stands down too, because its siblings already read it as
+  dead, and it claims nothing until a heartbeat lands ([BACKLOG #5710](BACKLOG.md)). Two caveats if you tune these
   down from the shipped `10 / 20 / 30`: the usable margin is smaller than `ttl - fence`, because the
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
@@ -213,8 +216,16 @@ releases its lease. It is true at least in these cases:
 
 - while the node leads;
 - on a self-fenced node, whose flag is clear (so it reports `standby`) while its lease row still
-  names it;
+  names it, and the same way on a node that stood down because its own heartbeat lapsed;
+- after the node refused a lease claim that returned past `leader_fence_timeout_seconds`, which
+  renewed its row even though the node did not lead on it, possibly without ever reporting leader;
 - while an earlier stepdown's release write is owed, after a `503` that could not confirm it.
+
+The second and third cases end once the node finds the lease naming another node: a claim the
+database answers that way, or, while its claims are paused, the read each paused tick takes instead
+of claiming. A node standing down on a lapsed heartbeat does neither until a heartbeat lands, so
+for it the case lasts at least that long. A paused read clears only those cases; an owed write
+stays owed until a stepdown sends it.
 
 It means "may own". The write only matches a row that names this node, so if another node has
 already taken the lease, the stepdown releases nothing and answers `409`. The web console reads this
@@ -538,10 +549,11 @@ longer one can miss it. A clean stop needs no pause, because a stopped node does
 **A slow store during the pause does not block a retried stepdown.** While paused, each tick reads
 who owns the lease, and it reads while holding the lock a stepdown waits on. A stepdown waits for
 that lock only up to `leader_fence_timeout_seconds`, and the retry after a `release-unconfirmed` is
-the call most likely to arrive then. So the read gets its own limit: the smaller of the store's
-statement timeout and three quarters of the fence timeout. At the shipped settings that is 15
-seconds on SQL Server, where `[store].command_timeout` (30) is longer than the fence (20), and the
-4.5 second renew timeout on Postgres. A read that misses the limit fails, the node logs it and stays
+the call most likely to arrive then. So the read gets its own limit: three quarters of the fence
+timeout, 15 seconds at the shipped settings. Inside it the read's statement runs under the smaller
+of the renew timeout and half that limit, 4.5 seconds at the shipped settings (4 on SQL Server,
+which counts whole seconds), rather than the 30 second `[store].command_timeout`, which is longer
+than the 20 second fence; [BACKLOG #5064](BACKLOG.md) brought SQL Server's read under it. A read that misses the limit fails, the node logs it and stays
 paused, and the stepdown gets the lock in time ([BACKLOG #2540](BACKLOG.md)).
 
 The limit is on the read, and cleaning up after a stalled read takes a little longer. On Postgres the

@@ -20,10 +20,12 @@ It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works
   single-instance MVP; multi-instance batching is deferred).
 - ``POST {base}/studies`` (the server assigns the study) or ``POST {base}/studies/{study_uid}`` (store
   into a known study) when a ``study_uid`` is configured. ``Accept: application/dicom+json``.
-- Response classification refines the HTTP-status retry model: a 2xx whose ``application/dicom+json`` body
-  carries a per-instance **FailedSOPSequence** (``00081198``) → the instance was rejected → permanent
-  dead-letter; other 4xx / a 409 (all instances failed) / a refused 3xx → permanent; 5xx / 408 / 429 /
-  connection-timeout → transient retry. **The HTTP status wins when in doubt; a 5xx stays transient.**
+- Response classification refines the HTTP-status retry model: some 2xx replies are a permanent
+  refusal, a per-instance **FailedSOPSequence** (``00081198``) among them, though not every 2xx that
+  fails to confirm the store. :func:`_stowrs_refusal` holds the rule, and docs/CONNECTIONS.md
+  *DICOMweb*, *Status classification*, states it in full. Other 4xx, a 409 (all instances failed)
+  or a refused 3xx is permanent; 5xx / 408 / 429 / connection-timeout is a transient retry. **A
+  5xx stays transient**, but a 2xx is not always a delivery (BACKLOG #5914).
 
 **PHI:** a STOW-RS ``dicom+json`` response can name patient/study identifiers, so it is **never** echoed
 into a log/error — only the HTTP status and a redacted URL are. **Idempotency:** delivery is
@@ -36,7 +38,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
-import json
 import logging
 import secrets
 import urllib.error
@@ -47,6 +48,7 @@ from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -104,6 +106,22 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
+# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914);
+# see _names_an_instance.
+_REFERENCED_SOP_SEQUENCE = "00081199"
+_REFERENCED_SOP_INSTANCE_UID = "00081155"
+# PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
+# InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
+# malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
+# sequence.
+_ELEMENT_KEYS = frozenset({"vr", "Value"})
+# Written by name, never as a raw character an editor can silently drop (as fhir.py's _BOM).
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+_JSON_WHITESPACE = (
+    " \t\r\n"  # RFC 8259 section 2; str.strip() would also take NBSP and C0 separators
+)
+# The advice a reply refusal that does not prove a rejection carries: the partner may have stored it.
+_NOT_SENT = "not sent again, and the partner may hold the instance, so check it before a replay"
 
 
 # DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters.
@@ -124,6 +142,22 @@ _UID_DIGITS = frozenset("0123456789")
 _DICOM_UID_MAX_LEN = 64
 
 
+def _uid_components_ok(value: str) -> bool:
+    """True when every dot-separated component is non-empty and entirely ASCII digits."""
+    # Requiring non-empty is what makes '..', a leading dot and a trailing dot illegal -- they are
+    # excluded STRUCTURALLY, not by enumeration. A trailing newline is excluded for free (it lands
+    # inside the final component and is not a digit), which is the hole a `$`-anchored regex would
+    # have left open -- #1240's defect.
+    return all(part and _UID_DIGITS.issuperset(part) for part in value.split("."))
+
+
+def _is_uid(value: object) -> bool:
+    """True when ``value`` is a string of dot-separated ASCII-digit components, at most 64
+    characters: the grammar :func:`_reject_non_uid` gates, which admits leading-zero components
+    although PS3.5 forbids them (that docstring says why)."""
+    return isinstance(value, str) and len(value) <= _DICOM_UID_MAX_LEN and _uid_components_ok(value)
+
+
 def _reject_non_uid(value: str, field: str) -> None:
     """Gate a configured DICOM UID to its PS3.5 grammar before it flows into the URL path.
 
@@ -142,11 +176,7 @@ def _reject_non_uid(value: str, field: str) -> None:
         raise ValueError(
             f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character UID limit of DICOM"
         )
-    # Every component must be non-empty and entirely ASCII digits. Requiring non-empty is what makes
-    # '..', a leading dot and a trailing dot illegal -- they are excluded STRUCTURALLY, not by
-    # enumeration. A trailing newline is excluded for free (it lands inside the final component and is
-    # not a digit), which is the hole a `$`-anchored regex would have left open -- #1240's defect.
-    if not all(part and _UID_DIGITS.issuperset(part) for part in value.split(".")):
+    if not _uid_components_ok(value):
         raise ValueError(
             f"DICOMweb {field} is not a valid UID for DICOM (dot-separated digits, no other characters)"
         )
@@ -161,25 +191,103 @@ def _reject_url_control_chars(value: str, field: str) -> None:
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
 
 
-def _stowrs_failed(body: str) -> bool:
-    """True if the STOW-RS ``application/dicom+json`` response carries a non-empty ``FailedSOPSequence``
-    — i.e. at least one instance was rejected despite a 2xx envelope. Tolerant of shape; PHI-safe (reads
-    only the *presence* of the failure sequence, never its contents)."""
-    try:
-        obj = json.loads(body)
-    except ValueError:
-        return False
-    # The response is a single dicom+json dataset object (defensively also accept a 1-element list).
-    datasets = obj if isinstance(obj, list) else [obj]
+def _reply_is_empty(body: str) -> bool:
+    """True for a reply with nothing in it: empty, or only JSON whitespace once a leading BOM is
+    dropped. send() and :func:`_stowrs_refusal` both read emptiness through this one test."""
+    return not body.lstrip(_BOM).strip(_JSON_WHITESPACE)
+
+
+def _element_values(element: Any) -> list[Any] | None:
+    """The ``Value`` array of a dicom+json SQ or UI element, ``[]`` when it has none, or ``None``
+    when the element is in a shape dicom+json does not allow: not an object, a ``Value`` that is not
+    an array, or any key but ``vr`` and ``Value``. One reader, so the two sides cannot drift."""
+    if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
+        return None
+    value = element.get("Value", [])
+    return value if isinstance(value, list) else None
+
+
+def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | None:
+    """Every item of the ``tag`` sequence across the datasets, in order, or ``None`` when the
+    element is present in a shape :func:`_element_values` refuses. An absent element, or one with
+    no ``Value`` and no other key, is an empty sequence (PS3.18 F.2.5). Only the shape is read,
+    never an item's contents (PHI-safe)."""
+    items: list[Any] = []
     for ds in datasets:
-        if not isinstance(ds, dict):
+        if tag not in ds:
             continue
-        failed = ds.get(_FAILED_SOP_SEQUENCE)
-        if isinstance(failed, dict):
-            value = failed.get("Value")
-            if isinstance(value, list) and value:
-                return True
-    return False
+        value = _element_values(ds[tag])
+        if value is None:
+            return None
+        items.extend(value)
+    return items
+
+
+def _names_an_instance(item: Any) -> bool:
+    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
+    has ``vr`` ``UI``, passes :func:`_element_values`, and holds exactly one value (the attribute's
+    VM is 1): a string that passes :func:`_is_uid` once trailing NUL or space padding, which a
+    binary-to-JSON converter can leave, is dropped. Anything else confirms nothing (BACKLOG #5914):
+    no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one entry.
+    The UID is tested, never logged or returned (PHI-safe)."""
+    if not isinstance(item, dict):
+        return False
+    element = item.get(_REFERENCED_SOP_INSTANCE_UID)
+    if not isinstance(element, dict) or element.get("vr") != "UI":
+        return False
+    value = _element_values(element)
+    if value is None or len(value) != 1:
+        return False
+    uid = value[0]
+    return isinstance(uid, str) and _is_uid(uid.rstrip("\0 "))
+
+
+def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
+    """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
+    that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
+    re-send would get the same reply.
+
+    - ``unparseable-reply``: the body is not JSON, repeats a key at any depth (``json.loads`` keeps
+      the last of two, so a FailedSOPSequence could be read two ways), is nested past json's
+      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), or is not
+      a dataset object or a non-empty array of them.
+    - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
+      does not allow -- that direction fails closed.
+    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
+      no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
+      ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
+
+    An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
+    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 dataset that confirms nothing
+    and is not refused above, ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
+    the rule in full.
+
+    Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
+    unconfirmed = ("unconfirmed-202", f"no ReferencedSOPSequence confirming the store; {_NOT_SENT}")
+    if _reply_is_empty(body):
+        return unconfirmed if status == 202 else None
+    # A refused parse is (None, hint), and None is not a dataset, so the hint need not be read.
+    obj, _ = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
+    if isinstance(obj, dict):
+        datasets = [obj]
+    elif isinstance(obj, list) and obj and all(isinstance(ds, dict) for ds in obj):
+        datasets = obj
+    else:
+        return "unparseable-reply", f"a reply that is not parseable dicom+json; {_NOT_SENT}"
+    failed = _sequence_items(datasets, _FAILED_SOP_SEQUENCE)
+    if failed is None:
+        # A malformed sequence proves no rejection, so it carries the replay advice.
+        return (
+            "failed-sop",
+            f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
+        )
+    if failed:
+        return "failed-sop", "a FailedSOPSequence (instance rejected)"
+    if status == 202:
+        referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
+        if not any(_names_an_instance(i) for i in referenced):
+            return unconfirmed
+    return None
 
 
 def _classify_stowrs(status: int, base_url: str) -> DeliveryError:
@@ -397,18 +505,11 @@ class DicomWebDestination(DestinationConnector):
         dicom_bytes = recover_dicom_object_bytes(payload, label="DICOMweb STOW-RS")
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         body, status = await asyncio.to_thread(self._post, dicom_bytes)
-        # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
-        # 2xx: a body that reports a FailedSOPSequence means the instance was rejected despite the 2xx.
-        if _stowrs_failed(body):
-            raise NegativeAckError(
-                f"DICOMweb {_redact_url(self.base_url)} returned HTTP {status} with a FailedSOPSequence "
-                "(instance rejected)",
-                code="failed-sop",
-                permanent=True,
-            )
+        # A non-2xx, or a 2xx that _stowrs_refusal refuses, already raised inside _post (transient
+        # retry / permanent dead-letter).
         if not self.capture_response:
             return None
-        if not body:
+        if _reply_is_empty(body):
             return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
         return DeliveryResponse(body=body, outcome="accepted", detail=f"HTTP {status}")
 
@@ -485,8 +586,8 @@ class DicomWebDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read. A STOW-RS reply is a small result
                 # document, so the 16 MiB ceiling refuses only a peer that is broken or hostile.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. A FailedSOPSequence can sit inside a 2xx, so send() reads this body in
-                # both capture modes, and the refusal is permanent.
+                # re-send. A FailedSOPSequence can sit inside a 2xx, so the body is classified
+                # below in both capture modes, and the refusal is permanent.
                 body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,
@@ -494,7 +595,6 @@ class DicomWebDestination(DestinationConnector):
                     body_is_needed=True,
                 )
                 status = int(getattr(resp, "status", 200))
-                return body, status
         except urllib.error.HTTPError as exc:
             # Non-2xx: classify transient vs permanent. Raised for BOTH capturing and non-capturing — a
             # non-2xx is a transport/server failure, not a captured reply. PHI-safe: never the body.
@@ -532,6 +632,20 @@ class DicomWebDestination(DestinationConnector):
                 f"DICOMweb {_redact_url(self.base_url)} sent a malformed HTTP reply "
                 f"({type(exc).__name__})"
             ) from exc
+        # BACKLOG #5914: a 2xx does not by itself confirm the store. Classified on this worker thread,
+        # after the response is closed, and outside the try: no urllib arm above can retype a fault
+        # here, and with no handler active no decode error -- which holds the whole body -- rides
+        # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
+        # text names no reply content.
+        refused = _stowrs_refusal(body, status)
+        if refused is not None:
+            code, reason = refused
+            raise NegativeAckError(
+                f"DICOMweb {code}: HTTP {status} with {reason} ({_redact_url(self.base_url)})",
+                code=code,
+                permanent=True,
+            )
+        return body, status
 
 
 register_destination(ConnectorType.DICOMWEB, DicomWebDestination)

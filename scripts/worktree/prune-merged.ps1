@@ -21,11 +21,15 @@
 
       (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
                         its OWN upstream branch is gone (squash-merged + remote-deleted),
-      (b) clean      -- no uncommitted tracked changes AND no untracked files (see below),
+      (b) clean      -- no uncommitted tracked changes AND no untracked files (see below), and none of
+                        the work git status cannot see: skip-worktree or assume-unchanged edits, an
+                        ignored entry that is not a regenerable cache, a nested checkout or link, or an
+                        inherited git redirect variable (worktree-gates.ps1 Test-WorktreeClean),
       (c) unlocked   -- `git worktree lock` is git's own "in use" flag and this script honours it,
       (d) unoccupied -- no live Claude session is sitting in it OR in a worktree nested inside it, its
-                        git metadata has not been touched within -IdleHours, and it does not contain
-                        another registered worktree.
+                        git metadata and working tree (its top level and cache files, below) have
+                        not been written within -IdleHours, and it does not contain another
+                        registered worktree.
 
     "SIBLING" IS NOT A PREFIX MATCH. The candidate set used to be every registered worktree whose path
     starts with `<primary>-`, which silently includes `<primary>-pins/.claude/worktrees/x` -- a
@@ -56,6 +60,14 @@
          the LAST ENTRY IN logs/HEAD -- the reflog is read by CONTENT, never by mtime, because a
          `git gc` rewrites every reflog in place and moved all 48 of them to one identical mtime on
          2026-08-18, vetoing the whole repository at once (Get-ReflogLastEntry has the measurement).
+         The WORKING TREE is read too, against the same window, through the read
+         finished-worktree-removal.ps1 makes (worktree-gates.ps1 Get-WorkingTreeActivity): its top
+         folder, each entry directly under it, and the files in the caches that function names at
+         the tree's root, so a session that ran pytest or mypy there and no git command still vetoes
+         (BACKLOG #5603). Not every run writes its cache: ruff leaves .ruff_cache untouched when no
+         file changed. A file edited in place two levels down moves none of these. The newer of the
+         two readings is the tree's activity. An unreadable working tree, which includes a cache too
+         big to date, vetoes even under -Name and -IdleHours 0, as unreadable git metadata does.
          This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
          biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
          worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
@@ -73,8 +85,10 @@
       * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
         compare, and neither spelling normalises to the worktree's own path;
       * a session that never registered;
-      * a session that only Writes/Edits files and runs no git command: it touches none of the metadata
-        signal 2 reads, so signal 2 goes quiet on it as well;
+      * a session that only Writes/Edits files below the top level and runs no git command, and no
+        test or type-check run that rewrites a root-level cache (a lint run with nothing changed
+        writes none): it touches none of the git metadata, top-level entries or cache files signal 2
+        reads, so signal 2 goes quiet on it as well;
       * a session whose ONLY git command rewrites the reflog without appending to it -- in practice
         `git gc` or `git reflog expire`. Signal 2 stopped counting that on 2026-08-18 and this is the
         price: the same write that used to veto the entire repository for 36 hours now vetoes nothing.
@@ -116,7 +130,7 @@
     a FAILED fetch (merge decisions then rest on stale refs), a gh PR probe that errored, and every
     -Name-confirmed worktree. -Name is the one worth spelling out: it is -IdleHours 0 scoped to one
     tree, and since signal 1 has been measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can
-    leave a candidate with no working occupancy signal at all. It stays available because there are
+    leave a candidate with at least signal 1 and signal 2's unknown-reading veto. It stays available because there are
     legitimate uses, but it is never silent -- an operator who believes they are fenced when they are
     not is worse off than one who knows they aren't.
 
@@ -214,7 +228,8 @@
       C4 unlocked         `git worktree lock` is git's own "in use" flag
       C5 unoccupied       no live session in it or in a worktree nested inside it (signal 1)
       C6 clean            no uncommitted tracked changes and no untracked files
-      C7 idle             its private git metadata has not been touched within -IdleHours (signal 2)
+      C7 idle             its private git metadata and its working tree's top level and cache files
+                          have not been written within -IdleHours (signal 2)
       C8 merged           the same merge test the worktree pass uses
       C9 unowned          NO SESSION TRANSCRIPT FOR THE OWNING SESSION HAS BEEN WRITTEN WITHIN
                           -IdleHours. The owning session id is parsed out of the worktree name (the
@@ -282,7 +297,8 @@ param(
     # Config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry. Setting it
     # explicitly REPLACES the real registry, so the run is reported as reduced-assurance.
     [string[]]$ConfigRoot,
-    # A worktree whose git metadata was touched more recently than this is treated as occupied.
+    # A worktree whose git metadata or working tree was written more recently than this is treated as
+    # occupied.
     #
     # RAISED FROM 36 TO 72, AND THE OLD NUMBER'S OWN MEASUREMENT IS WHY. This comment used to read
     # "36h: longer than any plausible working day ... it was once measured within 1.6h of expiring on
@@ -295,8 +311,9 @@ param(
     # THE COST IS FEWER REMOVALS, WHICH IS THE CHEAP DIRECTION. A false SKIP is a minor annoyance and
     # a false PRUNE destroys a session, so widening the veto trades nothing this script values.
     #
-    # 0 turns signal 2 OFF and the run says so in red -- and so does anything under the 12h floor,
-    # because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
+    # 0 lifts a recent signal 2 reading (an unknown one still vetoes) and the run says so in red --
+    # and so does anything under the 12h floor, because only the literal 0 used to be declared:
+    # `-IdleHours 0.5`, typed for "half an hour",
     # released every worktree on this repo and printed no warning at all.
     [double]$IdleHours = 72,
     # Liveness fence tolerance, passed through to the shared fence.
@@ -387,7 +404,7 @@ $RepoLeaf = Split-Path $RepoRoot -Leaf
 $activityVeto = ($IdleHours -gt 0)
 $reducedAssurance = @()
 if (-not $activityVeto) {
-    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): signal 2 is OFF, so a session writing in by absolute path is invisible to this run'
+    $reducedAssurance += 'recent-activity veto lifted (-IdleHours 0): a RECENT signal 2 reading no longer vetoes, so a session writing in by absolute path is invisible to this run; an unknown reading still vetoes'
 }
 elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
     # Only the literal 0 used to be declared. Everything between 0 and the floor disarmed signal 2 just
@@ -603,6 +620,20 @@ if ($Name) {
 # --- One decision pass; two renderers ------------------------------------------------------------
 $idleCut = (Get-Date).AddHours(-1 * $IdleHours)
 
+# Occupancy signal 2, read for every pass that asks it: the newer of the private git metadata
+# (Get-WorktreeActivity) and the working tree (Get-WorkingTreeActivity, the read
+# finished-worktree-removal.ps1 holds to the same window), with which reading it was. The working
+# tree is what sees a test, lint or mypy run that touched no git metadata (BACKLOG #5603). When is
+# $null, and What names the reading, when either cannot be read: an unreadable tree is never idle.
+function Get-TreeActivity([string]$Path) {
+    $git = Get-WorktreeActivity -Path $Path
+    if ($null -eq $git) { return [pscustomobject]@{ When = $null; What = 'git metadata unreadable' } }
+    $tree = Get-WorkingTreeActivity -Path $Path
+    if ($null -eq $tree) { return [pscustomobject]@{ When = $null; What = 'working tree unreadable, or a cache too big to date' } }
+    if ($tree -gt $git) { return [pscustomobject]@{ When = $tree; What = 'the working tree was written' } }
+    return [pscustomobject]@{ When = $git; What = 'git metadata was touched' }
+}
+
 # Test-WorktreeClean, the ONE cleanliness routine (decision pass, report-only pass, and the re-check
 # immediately before removal), lives in worktree-gates.ps1 so the nightly .claude/worktrees removal
 # calls it too.
@@ -660,29 +691,30 @@ function Get-Decision {
         $reasons += "liveness fence unavailable -- $($occ.Detail)"
     }
 
-    $c = Test-WorktreeClean -Path $Wt.Path
+    $c = Test-WorktreeClean -Path $Wt.Path -Primary $RepoRoot
     $clean = [bool]$c.Clean
     $reasons += @($c.Reasons)
 
     # Occupancy 2: recent activity. The signal that does not need a recorded cwd, and the only one that
     # saw the sessions signal 1 missed.
-    $activity = Get-WorktreeActivity -Path $Wt.Path
+    $tact = Get-TreeActivity -Path $Wt.Path
+    $activity = $tact.When
     $activityAge = $null
     if ($null -eq $activity) {
-        $reasons += 'activity unknown (git metadata unreadable) -- cannot establish nobody is in it'
+        $reasons += "activity unknown ($($tact.What)) -- cannot establish nobody is in it"
     }
     elseif (-not $activityVeto) {
         $activityAge = [math]::Round(((Get-Date) - $activity).TotalHours, 2)
-        $notes += "activity veto OFF (-IdleHours 0); this worktree was touched $activityAge h ago"
+        $notes += "recent-activity veto lifted (-IdleHours 0); this worktree was touched $activityAge h ago"
     }
     else {
         $activityAge = [math]::Round(((Get-Date) - $activity).TotalHours, 2)
         if ($activity -gt $idleCut) {
             if ($Confirmed) {
-                $notes += "recent activity ($activityAge h ago) overridden by -Name"
+                $notes += "recent activity ($($tact.What) $activityAge h ago) overridden by -Name"
             }
             else {
-                $reasons += "recently active ($activityAge h ago, < $IdleHours h) -- someone may be working here by absolute path; confirm with -Name $leaf"
+                $reasons += "recently active ($($tact.What) $activityAge h ago, < $IdleHours h) -- someone may be working here by absolute path; confirm with -Name $leaf"
             }
         }
     }
@@ -784,11 +816,12 @@ foreach ($w in $occ.Worktrees) {
     if (@(Get-WorktreeOccupants -Occupancy $occ -Path $w.Path -IncludeNested).Count -gt 0) { $reportHeld++; continue }
     # A tree containing another registered worktree is structural, not finished.
     if (@(Get-NestedWorktrees -Occupancy $occ -Path $w.Path).Count -gt 0) { $reportHeld++; continue }
-    $clean = Test-WorktreeClean -Path $w.Path
-    if (-not $clean.Clean) { $reportHeld++; continue }
-    # Signal 2: the same idle proxy the decision pass uses. Unknown activity withholds the row.
-    $act = Get-WorktreeActivity -Path $w.Path
+    # Signal 2: the same idle proxy the decision pass uses. Unknown activity withholds the row. Read
+    # before the cleanliness reads, whose whole-tree walk is the slow one; either only withholds.
+    $act = (Get-TreeActivity -Path $w.Path).When
     if ($null -eq $act -or $act -gt $idleCut) { $reportHeld++; continue }
+    $clean = Test-WorktreeClean -Path $w.Path -Primary $RepoRoot
+    if (-not $clean.Clean) { $reportHeld++; continue }
     $idleH = [math]::Round(((Get-Date) - $act).TotalHours, 1)
 
     # WHAT REMOVAL ACTUALLY RISKS -- and the first two cuts of this both got it wrong.
@@ -1036,23 +1069,28 @@ if ($ReapVenvs) {
             }
             else { Add-Verdict 'C5' 'unoccupied' 'PASS' 'no veto-worthy session is placed in it or in a nested tree' }
 
-            # C6
-            $c = Test-WorktreeClean -Path $w.Path
-            if (-not $c.Clean) { Add-Verdict 'C6' 'clean' 'FAIL' ($c.Reasons -join '; ') }
-            else { Add-Verdict 'C6' 'clean' 'PASS' 'no uncommitted tracked change and no untracked file' }
+            # C6. Status, and the whole-tree walk, which reaches inside the .venv for a nested checkout, a
+            # link or a data file that clearing it would delete. The flagged-file and ignored-entry reads
+            # find work outside the .venv, which clearing it leaves, so they are left to a removal of
+            # the whole tree. The walk refuses on a hit anywhere in the tree, the stricter direction.
+            $c = Test-WorktreeClean -Path $w.Path -StatusOnly
+            $c6 = @($c.Reasons) + @(Get-HiddenWorkReasons -Path $w.Path -Checks 'nested')
+            if ($c6.Count -gt 0) { Add-Verdict 'C6' 'clean' 'FAIL' ($c6 -join '; ') }
+            else { Add-Verdict 'C6' 'clean' 'PASS' 'no uncommitted tracked change, no untracked file, and no nested checkout, link or cached data file' }
 
             # C7
-            $act = Get-WorktreeActivity -Path $w.Path
+            $tact = Get-TreeActivity -Path $w.Path
+            $act = $tact.When
             $actAge = $null
             if ($null -eq $act) {
-                Add-Verdict 'C7' 'idle' 'FAIL' 'activity unknown (git metadata unreadable) -- cannot establish nobody is in it'
+                Add-Verdict 'C7' 'idle' 'FAIL' "activity unknown ($($tact.What)) -- cannot establish nobody is in it"
             }
             else {
                 $actAge = [math]::Round(((Get-Date) - $act).TotalHours, 2)
                 if ($act -gt $idleCut) {
-                    Add-Verdict 'C7' 'idle' 'FAIL' "git metadata touched $actAge h ago, inside the $IdleHours h window"
+                    Add-Verdict 'C7' 'idle' 'FAIL' "$($tact.What) $actAge h ago, inside the $IdleHours h window"
                 }
-                else { Add-Verdict 'C7' 'idle' 'PASS' "git metadata last touched $actAge h ago, outside the $IdleHours h window" }
+                else { Add-Verdict 'C7' 'idle' 'PASS' "git metadata, and the working tree's top level and cache files, last written $actAge h ago, outside the $IdleHours h window" }
             }
 
             # C9 -- ownership. BOTH of its empty answers are a SKIP, and they are reported as
@@ -1196,7 +1234,7 @@ if ($ReapVenvs) {
 # line, while the flag it is equivalent to got a red banner.
 $confirmedActually = @($decisions | Where-Object { $_.Confirmed } | ForEach-Object { $_.Leaf })
 if ($confirmedActually.Count -gt 0) {
-    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those, and signal 1 has been measured vetoing 0 of 4 real siblings"
+    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- a recent signal 2 reading no longer vetoes those (an unknown one still does), and signal 1 has been measured vetoing 0 of 4 real siblings"
 }
 
 # The gh receipt, written from what the probes ANSWERED (see Test-Merged).
@@ -1222,7 +1260,7 @@ $blindSpots = @(
     'a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)',
     'a cwd recorded as a UNC or 8.3 short path',
     'a session that never registered',
-    'a session that only edits files and runs no git command (invisible to signal 2 as well)'
+    'a session that only edits files below the top level and runs no git command and no test or type check that rewrites a root-level cache (invisible to signal 2 as well)'
 )
 
 if (-not $Json) {
@@ -1240,7 +1278,7 @@ if (-not $Json) {
     Write-Host "  It DOES see VS Code sessions (the match is path-based, not surface-based). It CANNOT see:" -ForegroundColor DarkGray
     foreach ($b in $blindSpots) { Write-Host "    - $b" -ForegroundColor DarkGray }
     if ($activityVeto) {
-        Write-Host ("  Which is why git metadata touched within {0}h also counts as occupied." -f $IdleHours) -ForegroundColor DarkGray
+        Write-Host ("  Which is why git metadata, or a working tree's top level or cache files, written within {0}h also counts as occupied." -f $IdleHours) -ForegroundColor DarkGray
     }
     foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
     Write-Host "  refs: $fetchDetail" -ForegroundColor DarkGray
@@ -1542,34 +1580,39 @@ if ($Apply -and $prunable.Count -gt 0) {
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
-        # Signal 2, re-read. It was the ONE signal missing from this block, and it is the only one with
-        # measured coverage of the class of worktree this tool prunes (signal 1 vetoed 0 of 4 real
-        # siblings). The window is a gh round trip per candidate -- measured at 0.56s -- plus every
-        # removal before this one, which is exactly the interval the re-check exists to close.
-        if ($activityVeto -and -not $d.Confirmed) {
-            $a2 = Get-WorktreeActivity -Path $d.Path
-            $cut2 = (Get-Date).AddHours(-1 * $IdleHours)
-            if ($null -eq $a2) {
-                $d.Outcome = 'skipped'
-                $d.OutcomeDetail = 're-check: activity became unreadable -- cannot establish nobody is in it'
-                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
-                continue
-            }
-            if ($a2 -gt $cut2) {
-                $d.Outcome = 'skipped'
-                $d.OutcomeDetail = "re-check: git metadata was touched $([math]::Round(((Get-Date) - $a2).TotalHours, 2)) h ago, inside the $IdleHours h window"
-                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
-                continue
-            }
-        }
         # Same routine the decision pass used, so the reason survives: this used to flatten a vanished
         # directory, an exit-128 status, an untracked file and a real edit into "no longer clean".
-        $c2 = Test-WorktreeClean -Path $d.Path
+        # BEFORE signal 2: its whole-tree walk is the slow read, so the fresh activity reading is the
+        # last one before the removal (BACKLOG #5603).
+        $c2 = Test-WorktreeClean -Path $d.Path -Primary $RepoRoot
         if (-not $c2.Clean) {
             $d.Outcome = 'skipped'
             $d.OutcomeDetail = "re-check: $($c2.Reasons -join '; ')"
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
+        }
+        # Signal 2, re-read. It was the ONE signal missing from this block, and it is the only one with
+        # measured coverage of the class of worktree this tool prunes (signal 1 vetoed 0 of 4 real
+        # siblings). The window is a gh round trip per candidate -- measured at 0.56s -- plus every
+        # removal before this one, which is exactly the interval the re-check exists to close.
+        # Read in every mode: -IdleHours 0 and -Name lift a RECENT reading, never an unreadable one,
+        # as in the decision pass, so a tree that went unreadable since then is still skipped.
+        $t2 = Get-TreeActivity -Path $d.Path
+        $a2 = $t2.When
+        if ($null -eq $a2) {
+            $d.Outcome = 'skipped'
+            $d.OutcomeDetail = "re-check: activity became unreadable ($($t2.What)) -- cannot establish nobody is in it"
+            Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+            continue
+        }
+        if ($activityVeto -and -not $d.Confirmed) {
+            $cut2 = (Get-Date).AddHours(-1 * $IdleHours)
+            if ($a2 -gt $cut2) {
+                $d.Outcome = 'skipped'
+                $d.OutcomeDetail = "re-check: $($t2.What) $([math]::Round(((Get-Date) - $a2).TotalHours, 2)) h ago, inside the $IdleHours h window"
+                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+                continue
+            }
         }
 
         # --force suppresses git's refusal on untracked/modified files -- the exact refusal that would
@@ -1790,7 +1833,7 @@ if ($Json) {
                     idleHours     = $_.IdleH
                     safety        = $_.Landed
                     claudeManaged = (Test-ClaudeManagedPath $_.Path)
-                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change and no untracked file; git metadata idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
+                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change, no untracked file, no flagged file, no unsafe ignored entry and no nested checkout or link; git metadata, and the working tree's top level and cache files, idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
                 }
             })
         # $null when -ReapVenvs was not asked for; an object with `ran: false` when it WAS asked for

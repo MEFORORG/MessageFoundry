@@ -97,8 +97,15 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
+from ..pages import restore_eol
 from ..pages._common import _seg
-from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
+from ._common import (
+    UI_BODY_FILTER_RULES,
+    _form_pairs,
+    blank_to_none,
+    check_filters,
+    for_echo,
+)
 from .oidc import reauth_idp_response
 
 _log = logging.getLogger(__name__)
@@ -1582,12 +1589,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def _resubmit_form(request: Request) -> dict[str, str]:
         """The urlencoded resubmit form, parsed once per request and kept in the ASGI scope for the
         gate's repeat check and the route alike. Stdlib, because the engine has no
-        python-multipart dependency, so ``request.form()`` would fail."""
+        python-multipart dependency, so ``request.form()`` would fail.
+
+        The submitted body's line breaks are rewritten here to the original's terminator style, the
+        ``eol`` field the editor rendered (BACKLOG #5930), so the repeat key and the spend key both
+        hash the body that is resubmitted. An ``eol`` that ``restore_eol`` does not know leaves the
+        body as sent, and the route refuses it. Blank fields are kept, so an empty ``eol`` is
+        refused too. ``restore_eol`` is a global of this module so the seam digest hashes its body;
+        ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` says what it misses."""
         cache = request.scope.setdefault("mf_2625", {})
         cached = cache.get("form")
         if isinstance(cached, dict):
             return cached
-        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        form = dict(await _form_pairs(request))
+        if "eol" in form and "raw" in form:
+            restored = restore_eol(form["raw"], form["eol"])
+            if restored is not None:
+                form["raw"] = restored
         cache["form"] = form
         return form
 
@@ -1663,6 +1681,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=400,
             )
 
+        if "eol" in form and form["eol"] not in pages.EDIT_EOL_TERMINATORS:
+            # Only the editor's fixed set restores terminators (BACKLOG #5930); anything else
+            # is refused rather than resubmitted with line breaks nobody chose.
+            return await _reject("invalid input")
         if mode == "direct" and not to:
             return await _reject(
                 "choose an outbound connection for a direct send, or re-route instead"
@@ -1863,6 +1885,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.idp_step_up_required:
             # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
             # says for any satisfied session. Nothing rotated, so the cookie is still live.
+            return RedirectResponse("/ui", status_code=303)
+        if await auth.mfa_satisfied(token):
+            # A session that already met its factor owes this page nothing, as the GET says, so
+            # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
+            # has already audited and charged the code. The re-render below is pending-only.
             return RedirectResponse("/ui", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
@@ -2151,9 +2178,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
-    # is untouched) that verifies an assertion and stamps the session's MFA leg ONLY —
-    # the operator still submits POST /ui/reauth (password) for reauth_at + the WP-L3-13
-    # client re-anchor. NOT registered as a continuation (body-carrying JSON — part of the
+    # is untouched) that verifies an assertion, marks the session's factor and, when that
+    # completes a pending factor, re-anchors it as a TOTP code does, stamping the window only
+    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). The pages stage an
+    # assertion only after reading that the session has not met its factor, so an ordinary
+    # /ui/reauth step-up
+    # of a satisfied session gets no passkey and steps up with the password. An assertion can
+    # still arrive for a session that met its factor after the ceremony was staged (two tabs
+    # share the challenge, which moves with the session's re-key); it marks the factor and
+    # re-keys, and moves no anchor and no window.
+    # An action-bound grant still comes only from a credential step-up, at least the password
+    # leg of POST /ui/reauth, POST /me/reauth and the IdP leg (ADR 0077), never from this route.
+    # NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
     # must-change confinement is mirrored manually like /ui/mfa's, NOT like both /ui/reauth
     # handlers: a must-change session that still owes its factor must pass. For a passkey-only

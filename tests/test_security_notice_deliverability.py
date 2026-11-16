@@ -34,8 +34,12 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     StoreSettings,
 )
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import TransitSealUnavailableError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._notice_gate_seal_contract import assert_notice_gate_reads_sealed_rows
+from tests.test_user_seal import _raw_for
 
 _ENFORCE = SecuritySettings(enforcement=SecurityEnforcement.ENFORCE)
 _WARN = SecuritySettings(enforcement=SecurityEnforcement.WARN)
@@ -89,6 +93,7 @@ async def _call(
     # synthetic, and there is no such instance now. Its preconditions are down to two.
     await _assert_security_notice_is_deliverable(
         store,
+        auth=AuthService(store, AuthSettings()),
         auth_settings=auth or AuthSettings(notify_security_events=True),
         alerts_settings=alerts or AlertsSettings(security_notifications_required=True),
         security_settings=security,
@@ -211,6 +216,69 @@ async def test_the_gate_is_silent_outside_its_two_preconditions(
     store = await _store_with_admin(email=None)
     try:
         await _call(store, **kwargs)  # type: ignore[arg-type]
+    finally:
+        await store.close()
+
+
+async def _gate_contract(path: Path) -> None:
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        await assert_notice_gate_reads_sealed_rows(store, _raw_for(path))
+    finally:
+        await store.close()
+
+
+async def test_the_gate_weighs_only_sealed_records_on_sqlite(tmp_path: Path) -> None:
+    # BACKLOG #5629: on a keyed store an address, a role row or a disabled flag written outside the
+    # store must not satisfy the gate. The Postgres and SQL Server suites run the same contract.
+    await _gate_contract(tmp_path / "sealed.db")
+
+
+async def test_the_contract_fails_when_no_seal_is_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the contract above: with the service's seal check switched off, a raw write
+    # satisfies the gate and the contract must fail, so a green contract is evidence the gate reads
+    # sealed records and not the store's unchecked rows.
+    import messagefoundry.auth.service as service_module
+
+    async def _holds(*_: object) -> bool:
+        return True
+
+    monkeypatch.setattr(service_module, "user_seal_ok_async", _holds)
+    with pytest.raises(pytest.fail.Exception):
+        await _gate_contract(tmp_path / "unchecked.db")
+
+
+@pytest.mark.parametrize(
+    ("security", "alerts", "refuses"),
+    [
+        (_ENFORCE, AlertsSettings(security_notifications_required=True), True),
+        (_WARN, AlertsSettings(security_notifications_required=True), False),
+        (_ENFORCE, AlertsSettings(security_notifications_required=False), False),
+    ],
+)
+async def test_a_transit_outage_refuses_only_where_the_gate_enforces(
+    monkeypatch: pytest.MonkeyPatch,
+    security: SecuritySettings,
+    alerts: AlertsSettings,
+    refuses: bool,
+) -> None:
+    # BACKLOG #5629: the checked read can meet a Vault transit Outage. It leaves the question
+    # unsettled, so it refuses under enforce with the gate on, and is only a warning where the
+    # dials promise no more than one.
+    async def _outage(self: AuthService) -> None:
+        raise TransitSealUnavailableError("transit did not answer")
+
+    store = await _store_with_admin(email="ops@example.test")
+    try:
+        monkeypatch.setattr(AuthService, "list_checked_users", _outage)
+        if refuses:
+            with pytest.raises(RuntimeError) as exc:
+                await _call(store, security=security, alerts=alerts)
+            assert "Vault transit did not answer" in str(exc.value)
+        else:
+            await _call(store, security=security, alerts=alerts)  # must not raise
     finally:
         await store.close()
 

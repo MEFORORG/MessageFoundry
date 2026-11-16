@@ -17,7 +17,10 @@
     (`git -C $x status ...`), never a splatted verb, or that scan cannot see what runs.
 
     WHAT IT WRITES ON PURPOSE: refs and FETCH_HEAD from the `git fetch origin main` in each clone, and
-    the report files in -OutDir. The fetch passes --no-auto-maintenance, so it cannot start a
+    the report files in -OutDir. At least one more write can happen while the claim and allocation
+    registries are resolved: when a UNC shared root does not answer, coord-root.ps1 writes its
+    unreachable-root cache into a mefor-coord folder, creating it if need be. That folder is this
+    clone's, or that of the repository a tree's mefor.claimsRoot names. The fetch passes --no-auto-maintenance, so it cannot start a
     `gc --auto` (which would expire reflogs and prune worktree records), and never --prune, so it
     deletes no ref. Status passes --no-optional-locks, so it does not rewrite any worktree's index.
     That last one matters beyond tidiness: prune-merged.ps1 reads the index mtime as recent activity,
@@ -58,15 +61,35 @@
         moving after its PR merged carries work that PR did not land;
       * that PR merged more than -HoldHours ago;
       * none of its commit date, its private git files and its last reflog entry moved within
-        -IdleHours (the recent-activity signal prune-merged.ps1 also relies on, read the same way
-        but without that tool's floor);
+        -IdleHours, and without prune-merged.ps1's floor. Get-PrivateGitActivity reads the mtimes of
+        index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG and MERGE_MSG in the admin dir the .git
+        file names, and the timestamp in the last line of logs/HEAD, with no fallback to that file's
+        mtime when the line does not parse. A failed read holds the tree, naming the file. It is
+        NOT prune-merged.ps1's reading: whenever Get-PrivateGitActivity reads nothing and no read
+        failed (at least: no .git file, or no gitdir line in it), only the commit date can hold the
+        tree, so a tree whose commit date is not inside -IdleHours is proposed, where prune-merged.ps1
+        holds a tree whose activity is unknown. Nor does it read the working tree (its top level and
+        test, lint and type-check caches), which prune-merged.ps1 and the nightly removal also hold a
+        tree on, so a tree a session ran pytest or mypy in without git can still be proposed here;
       * `git status --porcelain --untracked-files=normal` is empty. An untracked `.venv` alone goes to
         a human, because removing it needs --force, and --force also turns off git's own refusal of a
         tree somebody has started editing since this report ran;
       * it is not locked, contains no other registered worktree, and the shared liveness fence
         (scripts\coord\occupancy.ps1, the one prune-merged.ps1 uses) could look and found no session
         in it or in a worktree nested inside it. A DEAD record there holds it too: once the tree is
-        gone that record is unplaceable, and occupancy.ps1 then keeps the fence unavailable.
+        gone that record is unplaceable, and occupancy.ps1 then keeps the fence unavailable;
+      * it holds nothing the removal would take beyond the files git status lists, and nobody holds it
+        (BACKLOG #5647): no file flagged skip-worktree or assume-unchanged, no commit only its HEAD
+        reflog or its own refs/worktree, refs/bisect or refs/rewritten hold, no allocation naming it
+        whose item is not provably on origin/main (the retired-allocator tombstone aside), and no
+        claim naming it. An unreadable registry or record holds it too, and so does every merged
+        tree while a GIT_* redirect or GIT_CONFIG carrier is set, since either can falsify these
+        reads. These checks have to be here, because for a tree under .claude/worktrees the owner
+        cannot be routed through remove.ps1 instead: its -Path refuses every such tree.
+    The report shares the nightly .claude/worktrees removal's ownership and flagged-file readers, NOT
+    its whole gate set. At least the ignored-file, nested-checkout, could-not-open and working-tree
+    activity checks are not read here (prune-merged.ps1 reads the working-tree activity too), so a
+    tree the nightly or prune-merged.ps1 refuses can still be proposed here.
 
     THE FENCE SEES A SESSION BY THE CWD IT LAUNCHED IN. A session writing into a worktree by absolute
     path from somewhere else, or relocated into it after launch, is invisible to it. The activity
@@ -76,11 +99,15 @@
 
     WHY THIS IS NOT prune-merged.ps1 -Json. That tool decides for the `<repo>-<name>` siblings only and
     excludes `.claude/worktrees` by design. This report covers every registered worktree of each clone
-    and only proposes. Its predicate is deliberately stricter on the merge (the exact tip) and has no
-    reflog read; a prune-merged fix to occupancy lands here through occupancy.ps1, which both share.
+    and only proposes. Its predicate is deliberately stricter on the merge (the exact tip). A
+    prune-merged fix to occupancy lands here through occupancy.ps1, and a fix to the claim,
+    allocation, flagged-file or worktree-only-commit reader through worktree-gates.ps1, which the
+    nightly .claude/worktrees removal shares.
 
     COST IS BOUNDED. One `git status` per existing worktree, run with -Throttle in parallel, plus a
-    fixed handful of calls per clone. No network call is made per worktree.
+    fixed handful of calls per clone. Each MERGED tree that exists also costs about eight git calls
+    and a read of the claim and allocation registries, one tree at a time; on a UNC shared root
+    those registry reads cross the network, once per tree. No API call is made per worktree.
 
     OUTPUT. `hygiene-<yyyy-MM-dd>.md` and `.json` in -OutDir, one pair per day (a later run the same day
     replaces it), plus `latest.md` and `latest.json`. Nothing here deletes old reports.
@@ -108,7 +135,8 @@
 
 .PARAMETER IdleHours
     A merged worktree whose commit date, index or HEAD moved within this many hours is held for a human.
-    Default 72, prune-merged.ps1's default. 0 turns the hold off.
+    Default 72, prune-merged.ps1's default. 0 turns the hold off; a failed read of that activity still
+    holds the tree.
 
 .PARAMETER ConfigRoot
     Claude config roots for the liveness fence. Defaults to every <userprofile>\.claude* registry.
@@ -162,6 +190,11 @@ $env:GCM_INTERACTIVE = 'never'
 . "$PSScriptRoot\..\coord\occupancy.ps1"
 # Read-only by the same rule as this file; the lock WRITES live in seat-lock.ps1, which is not loaded.
 . "$PSScriptRoot\worktree-audit.ps1"
+# The coordination root resolver, and the shared removal gates: the claim, allocation, flagged-file and
+# worktree-only-commit readers the nightly removal also judges a tree by (BACKLOG #5647). Both are held
+# to this file's read-only rule by the same scan.
+. "$PSScriptRoot\..\coord\coord-root.ps1"
+. "$PSScriptRoot\worktree-gates.ps1"
 
 if (-not $Gh) { $Gh = if ($env:MEFOR_HYGIENE_GH) { $env:MEFOR_HYGIENE_GH } else { 'gh' } }
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
@@ -243,33 +276,90 @@ function ConvertTo-Instant($Value) {
 # FILE names that dir. No git call, so it cannot move what it measures. The files are the ones
 # prune-merged.ps1 reads. The reflog is read by the timestamp in its LAST ENTRY, never by mtime,
 # because a `git gc` rewrites every reflog in place (prune-merged.ps1's header has the measurement).
+# Returns When (the newest reading, or $null) and Unreadable (the file whose read failed, or $null). A
+# file a git command deletes between Test-Path and Get-Item sets Unreadable, which the caller holds
+# the tree on, keeping any reading already taken, rather than ending the report under its 'Stop'
+# preference. For the admin files, caught: ItemNotFoundException, DriveNotFoundException,
+# IOException and UnauthorizedAccessException; anything else still throws. For the .git file and
+# the logs/HEAD read, ANY failure sets Unreadable to that file and Error to the exception's type: that
+# catch-all ends in a hold naming the file and the type, not a silenced error.
 function Get-PrivateGitActivity([string]$Worktree) {
-    $dot = Join-Path $Worktree '.git'
-    if (-not (Test-Path -LiteralPath $dot -PathType Leaf)) { return $null }
+    $none = [pscustomobject]@{ When = $null; Unreadable = $null; Error = $null }
     $txt = ''
-    try { $txt = Get-Content -LiteralPath $dot -Raw -ErrorAction Stop } catch { return $null }
-    if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return $null }
+    try {
+        $dot = Join-Path $Worktree '.git'
+        if (-not (Test-Path -LiteralPath $dot -PathType Leaf)) { return $none }
+        $txt = Get-Content -LiteralPath $dot -Raw -ErrorAction Stop
+    }
+    catch { return [pscustomobject]@{ When = $null; Unreadable = '.git'; Error = $_.Exception.GetType().Name } }
+    if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return $none }
     $gitdir = $Matches[1].Trim()
     if (-not [System.IO.Path]::IsPathRooted($gitdir)) { $gitdir = Join-Path $Worktree $gitdir }
     $newest = $null
-    foreach ($name in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')) {
-        $f = Join-Path $gitdir $name
-        if (Test-Path -LiteralPath $f -PathType Leaf) {
-            $t = [DateTimeOffset](Get-Item -LiteralPath $f).LastWriteTimeUtc
-            if (-not $newest -or $t -gt $newest) { $newest = $t }
+    $name = ''
+    try {
+        foreach ($name in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')) {
+            $f = Join-Path $gitdir $name
+            if (Test-Path -LiteralPath $f -PathType Leaf) {
+                $t = [DateTimeOffset](Get-Item -LiteralPath $f -Force -ErrorAction Stop).LastWriteTimeUtc
+                if (-not $newest -or $t -gt $newest) { $newest = $t }
+            }
+        }
+        $name = 'logs/HEAD'
+        $reflog = Join-Path $gitdir 'logs/HEAD'
+        if (Test-Path -LiteralPath $reflog -PathType Leaf) {
+            try { $last = Get-Content -LiteralPath $reflog -Tail 1 -ErrorAction Stop }
+            catch { return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $_.Exception.GetType().Name } }
+            # `<old> <new> <name> <<email>> <unix-seconds> <tz>\t<message>`
+            if ($last -and ([string]$last -match '>\s+(\d{9,})\s+[+-]\d{4}')) {
+                # An epoch past what a date can hold is a reading that failed, not one to drop.
+                $secs = 0L
+                if (-not [int64]::TryParse($Matches[1], [ref]$secs) -or $secs -gt 253402300799) {
+                    return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $null }
+                }
+                $t = [DateTimeOffset]::FromUnixTimeSeconds($secs)
+                if (-not $newest -or $t -gt $newest) { $newest = $t }
+            }
         }
     }
-    $reflog = Join-Path $gitdir 'logs/HEAD'
-    if (Test-Path -LiteralPath $reflog -PathType Leaf) {
-        $last = Get-Content -LiteralPath $reflog -Tail 1 -ErrorAction SilentlyContinue
-        # `<old> <new> <name> <<email>> <unix-seconds> <tz>\t<message>`
-        if ($last -and ([string]$last -match '>\s+(\d{9,})\s+[+-]\d{4}')) {
-            $t = [DateTimeOffset]::FromUnixTimeSeconds([int64]$Matches[1])
-            if (-not $newest -or $t -gt $newest) { $newest = $t }
-        }
+    catch [System.Management.Automation.ItemNotFoundException], [System.Management.Automation.DriveNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+        return [pscustomobject]@{ When = $newest; Unreadable = $name; Error = $null }
     }
-    return $newest
+    return [pscustomobject]@{ When = $newest; Unreadable = $null; Error = $null }
 }
+
+# WHAT `git worktree remove` WOULD TAKE WITH A TREE BEYOND THE FILES git status LISTS, AND WHO MAY
+# STILL HOLD IT (BACKLOG #5647; the header's predicate list names each hold). Each reason holds a merged
+# tree for a human. CANNOT-TELL HOLDS, a read that throws included. The flagged-file read and
+# Get-OwnershipHolds are worktree-gates.ps1's, the ones the nightly removal judges a tree by, so those
+# readers cannot drift apart. Returns the reasons, none for a tree that passes.
+function Get-ReportHolds {
+    param([string]$Primary, [string]$Path, [string]$Branch, $Coord)
+    $out = [System.Collections.Generic.List[string]]::new()
+    # Read once per run: each makes every git reading below answer for something else.
+    if ($script:envHold) { $out.Add($script:envHold); return , $out }
+    try {
+        $flagged = Get-FlaggedFileCount $Path
+        if ($flagged -lt 0) { $out.Add('its files flagged skip-worktree or assume-unchanged could not be read') }
+        elseif ($flagged -gt 0) { $out.Add("$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see") }
+        if ($Coord.Error) {
+            # Held already, so the remaining reads would add reasons to a tree no list proposes.
+            $out.Add("the coordination root could not be resolved, so its claims and allocations are unknown: $($Coord.Error)")
+            return , $out
+        }
+        $out.AddRange([string[]]@(Get-OwnershipHolds -Primary $Primary -Path $Path -Branch $Branch `
+                    -OwnClaimsDir (Join-Path $Coord.Path 'claims') -AllocDir (Join-Path $Coord.Path 'alloc')))
+    }
+    # A throw here (a git command line past the Windows length limit, for one) would otherwise reach the
+    # script's trap and fail the whole report. It holds this tree instead.
+    catch { $out.Add("its ownership could not be read: $($_.Exception.Message)") }
+    return , $out
+}
+
+$envSet = @(@($GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) }) + @(Get-GitConfigCarriers))
+$script:envHold = if ($envSet.Count -gt 0) {
+    "$($envSet -join ', ') is set in this run's environment, so git's readings of the tree may answer for another repository, index or config"
+} else { '' }
 
 function Get-CloneReport($R) {
     # The liveness fence first: it also parses `worktree list` (with HEAD) and names the primary, so
@@ -396,6 +486,8 @@ function Get-CloneReport($R) {
     }
 
     $now = [DateTimeOffset]::Now
+    # Resolved and probed once per clone, for every merged tree's claim and allocation reads.
+    $coord = Resolve-CoordSharedRoot -From $root
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($e in $others) {
         $norm = ConvertTo-Norm $e.Path
@@ -444,6 +536,7 @@ function Get-CloneReport($R) {
             if ($e.Locked) { $reasons.Add("locked$(if ($e.LockReason) { ": $($e.LockReason)" })") }
             $nested = @(Get-NestedWorktrees -Occupancy $occ -Path $e.Path)
             if ($nested.Count -gt 0) { $reasons.Add("contains $($nested.Count) other registered worktree(s); removing it would take them too") }
+            foreach ($held in (Get-ReportHolds -Primary $root -Path $e.Path -Branch $e.Branch -Coord $coord)) { $reasons.Add($held) }
             if (-not $occ.Available) { $reasons.Add("the liveness fence could not look: $($occ.Detail)") }
             else {
                 $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $e.Path -IncludeNested)
@@ -461,8 +554,14 @@ function Get-CloneReport($R) {
                 $age = ($now - $mergedAt).TotalHours
                 if ($age -lt $HoldHours) { $reasons.Add(("merged {0:N1} h ago, inside the {1} h hold: its session may still be there" -f $age, $HoldHours)) }
             }
+            $gitRead = Get-PrivateGitActivity $e.Path
+            if ($gitRead.Unreadable) {
+                $where = if ($gitRead.Unreadable -eq '.git') { 'the .git file' } else { "$($gitRead.Unreadable) in its git dir" }
+                if ($gitRead.Error) { $where += ", $($gitRead.Error)" }
+                $reasons.Add("git activity could not be read ($where): a session may still be working there")
+            }
             if ($IdleHours -gt 0) {
-                $touched = @(Get-PrivateGitActivity $e.Path)
+                $touched = @($gitRead.When)
                 if ($e.Head -and $dates.ContainsKey($e.Head)) { $touched += ConvertTo-Instant $dates[$e.Head] }
                 $newest = $touched | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
                 if ($newest) {
@@ -471,7 +570,13 @@ function Get-CloneReport($R) {
                 }
             }
             if ($reasons.Count -gt 0) { $verdict = 'HUMAN' }
-            else { $verdict = 'REMOVE'; $command = $plain }
+            else {
+                $verdict = 'REMOVE'
+                # The host circuit breaker CLAUDE.md section 5 requires of a command handed to the owner:
+                # on a shared coordination root the other PC can have a tree at the same path.
+                $hostQ = "'$(([Environment]::MachineName) -replace "'", "''")'"
+                $command = "if ([Environment]::MachineName -ne $hostQ) { Write-Host ""STOP     this must run on $([Environment]::MachineName), but this is `$([Environment]::MachineName); nothing ran"" } else { $plain }"
+            }
         }
         elseif ($mergeState -eq 'UNKNOWN') { $verdict = 'UNKNOWN' }
 
@@ -651,8 +756,8 @@ foreach ($c in $report.clones) {
     $md.Add("")
     if ($c.cleanup.remove.Count -eq 0) { $md.Add("No worktree passes every check, so nothing is proposed.") }
     else {
-        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see.")
-        $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked.**" }))
+        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see. None has a file flagged skip-worktree or assume-unchanged, a commit only its HEAD reflog or its own refs hold, an allocation not on origin/main, or a claim.")
+        $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked; a failed read of it still holds the tree.**" }))
         $md.Add("``git worktree remove`` also deletes gitignored files: a ``.venv`` and caches, but also any local ``.env`` or store file. Run them from a plain terminal:")
         $md.Add("")
         $md.Add('```powershell')
@@ -660,7 +765,7 @@ foreach ($c in $report.clones) {
         $md.Add('```')
         if ($c.claimReconcile) {
             $md.Add("")
-            $md.Add("Afterwards, release the claims those worktrees held. Run it without -Apply first; see docs/WORKTREES.md:")
+            $md.Add("None of them held a claim when this report ran. A claim taken in one since then is left behind by its removal, so reconcile afterwards. Run it without -Apply first; see docs/WORKTREES.md:")
             $md.Add("")
             $md.Add('```powershell')
             $md.Add($c.claimReconcile)

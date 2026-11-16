@@ -170,6 +170,11 @@ class _SqlStore:
         owner = params[1] if _LEASE_SQL in sql else params[2]
         return await self.writes.run(sql, owner)
 
+    async def _execute_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> int:
+        return await self._execute(sql, params)  # the release; the clamp is not modelled here
+
 
 def _pg(pool: _PgPool, node: str, mono: _Clock) -> DbCoordinator:
     return DbCoordinator(

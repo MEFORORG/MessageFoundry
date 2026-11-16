@@ -118,7 +118,9 @@ def test_resolve_key_provider_wires_the_vault_module(monkeypatch: pytest.MonkeyP
     assert provider.active_key() == KEY_A
 
 
-def test_vault_surfaces_built_in_retired_keys() -> None:
+def test_vault_surfaces_built_in_retired_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Construction checks the KEK name, so the runner's own environment must not supply one.
+    monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
     key_b = base64.b64encode(b"\x01" * 32).decode("ascii")
     provider = keyprovider_vault.build_provider(
         StoreSettings(encryption_keys_retired=f" {KEY_A} , {key_b} ,")
@@ -254,7 +256,8 @@ def test_an_aes128_kek_is_refused_with_the_steps_that_fix_it(
     assert "rotating the key keeps its type" in message  # the fix that does not work
     # The wrapped DEK is sealed under the old key, so a new key alone would fail the next unwrap.
     assert "re-wrap the DEK" in message and "MEFOR_STORE_VAULT_WRAPPED_DEK" in message
-    supported = message.split("Supported types: ", 1)[1].split(" (ASVS", 1)[0]
+    # A withdrawn type's refusal carries no floor clause, so the list ends at the sentence's end.
+    supported = message.split("Supported types: ", 1)[1].split(". ", 1)[0]
     assert "aes256-gcm96" in supported.split(", ") and "aes128-gcm96" not in supported.split(", ")
     assert KEY_A not in message  # and no key material rides the refusal
     # Refused BEFORE the unwrap: nothing was decrypted under the withdrawn key.
@@ -288,3 +291,147 @@ def test_the_three_uses_have_distinct_allowed_type_sets() -> None:
     # Owner ruling R4 of 2026-09-26 (BACKLOG #2043): the audit and KEK sets inherit the data set,
     # so dropping AES-128 there has to drop it from all three.
     assert not [t for t in data | audit | kek if t.startswith("aes128")]
+
+
+# --- the KEK name is checked before it reaches a Vault path (BACKLOG #6010) -------------------------
+#
+# hvac quotes the name into the request path with "/" left unescaped, and requests drops ".."
+# segments, so before this check "a/../../../sys/x" reached /v1/sys/x with the store token, and the
+# capability probe asked about a path no request takes.
+
+_MALFORMED_KEK_NAMES = [
+    "a/../../../sys/policy/x",  # walks out of the Transit mount, to /v1/sys/policy/x
+    "a/../../keys/other",  # stays in the mount, but names another key's path
+    "..",
+    "kek/sub",
+    ".kek",  # a dot at either end
+    "kek-",  # a hyphen at either end
+    " kek",
+    "kek\n",
+    "kék",  # not ASCII
+]
+
+
+@pytest.mark.parametrize("name", _MALFORMED_KEK_NAMES)
+def test_a_malformed_kek_name_refuses_at_construction_and_in_the_probe(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", name)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", _WRAPPED_DEK)
+    transit = _FakeTransit(KEY_A)
+    monkeypatch.setattr(
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(transit)
+    )
+    with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_TRANSIT_KEY") as excinfo:
+        keyprovider_vault.build_provider(StoreSettings())
+    assert name not in str(excinfo.value)  # fixed text: the name is not echoed
+    with pytest.raises(KeyProviderError, match="not a Vault transit key name"):
+        keyprovider_vault.kek_required_capabilities()
+
+
+def test_a_kek_name_changed_after_construction_is_checked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``active_key`` reads the name again through the same check, so a name that changed between
+    construction and the unwrap still never reaches a request path."""
+    transit = _FakeTransit(KEY_A)
+    provider = _provider_on(monkeypatch, transit)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "a/../../../sys/x")
+    with pytest.raises(KeyProviderError, match="not a Vault transit key name"):
+        provider.active_key()
+    assert transit.read_calls == [] and transit.calls == []
+
+
+@pytest.mark.parametrize("name", ["mefor-store-kek", "kek.v2", "K_1", "a", "a.b-c_d"])
+def test_a_well_formed_kek_name_unwraps_and_names_the_probe_paths(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    transit = _FakeTransit(KEY_A)
+    _configure_env(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", name)
+    monkeypatch.setattr(
+        keyprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(transit)
+    )
+    assert keyprovider_vault.build_provider(StoreSettings()).active_key() == KEY_A
+    assert transit.read_calls == [name] and transit.calls == [(name, _WRAPPED_DEK)]
+    assert set(keyprovider_vault.kek_required_capabilities()) == {
+        f"transit/keys/{name}",
+        f"transit/decrypt/{name}",
+    }
+
+
+# --- the unwrapped DEK is base64 of exactly 32 bytes (BACKLOG #6710) --------------------------------
+
+
+_NOT_A_32_BYTE_KEY = [
+    base64.b64encode(b"\x02" * 16).decode("ascii"),  # a 16-byte DEK
+    base64.b64encode(b"\x02" * 33).decode("ascii"),  # one byte too many
+    base64.b64encode(KEY_A.encode("ascii")).decode("ascii"),  # wrapped as its own base64
+    base64.urlsafe_b64encode(b"\xfb" * 32).decode("ascii"),  # URL-safe alphabet
+    KEY_A.rstrip("="),  # unpadded
+    KEY_A + "\n",
+    " " + KEY_A,
+    "not base64 at all",
+]
+
+
+@pytest.mark.parametrize("plaintext", _NOT_A_32_BYTE_KEY)
+def test_a_plaintext_that_is_not_base64_of_32_bytes_refuses(
+    monkeypatch: pytest.MonkeyPatch, plaintext: str
+) -> None:
+    provider = _provider_on(monkeypatch, _FakeTransit(plaintext))
+    with pytest.raises(KeyProviderError, match="not base64 of 32 bytes") as excinfo:
+        provider.active_key()
+    assert plaintext.strip() not in str(excinfo.value)  # no key material in the refusal
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+def test_a_misshapen_dek_refuses_at_the_key_seam(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Before this check ``resolve_active_key`` returned a misshapen DEK unjudged, and only a later
+    decode refused it. Now the seam refuses it, with its fixed text for a key source that failed,
+    which names the setting to check and no key material."""
+    from messagefoundry.store.base import resolve_active_key
+
+    plaintext = _NOT_A_32_BYTE_KEY[0]
+    _provider_on(monkeypatch, _FakeTransit(plaintext))
+    with pytest.raises(KeyProviderError, match=r"check \[store\]\.key_provider") as excinfo:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert plaintext not in str(excinfo.value)
+
+
+def test_the_32_byte_shape_matches_what_the_store_cipher_decodes() -> None:
+    """The text pattern stands in for ``crypto._decode_key``, so pin the two together both ways:
+    keys whose last character carries non-zero spare bits, which both accept, and every refused
+    shape above, which both refuse."""
+    from messagefoundry.store.crypto import _decode_key
+
+    for raw in (b"\x00" * 32, b"\xff" * 32, bytes(range(32))):
+        key = base64.b64encode(raw).decode("ascii")
+        loose = key[:42] + "B="  # non-canonical spare bits: b64decode still yields 32 bytes
+        for text in (key, loose):
+            assert len(_decode_key(text, "k")) == 32
+            assert keyprovider_vault._B64_32_BYTES.fullmatch(text) is not None
+    for text in _NOT_A_32_BYTE_KEY:
+        with pytest.raises(ValueError):
+            _decode_key(text, "k")
+        assert keyprovider_vault._B64_32_BYTES.fullmatch(text) is None
+
+
+# --- a withdrawn key type is not refused as a shortfall against the floor (BACKLOG #6010 item 1) ---
+
+
+def test_the_withdrawn_type_refusal_does_not_claim_a_sub_128_bit_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``aes128-gcm96`` meets the 128-bit floor; it is refused by ruling. CONTROL: ``rsa-2048``,
+    which is below the floor, still gets the floor's clause."""
+    withdrawn, below_floor = "aes128-gcm96", "rsa-2048"
+    with pytest.raises(KeyProviderError) as excinfo:
+        _provider_on(monkeypatch, _FakeTransit(KEY_A, key_type=withdrawn)).active_key()
+    message = str(excinfo.value)
+    assert "at least 128 bits of security" not in message
+    assert "meets the 128-bit floor of ASVS 11.2.3" in message
+    with pytest.raises(KeyProviderError) as control:
+        _provider_on(monkeypatch, _FakeTransit(KEY_A, key_type=below_floor)).active_key()
+    assert "at least 128 bits of security" in str(control.value)
+    assert "meets the 128-bit floor" not in str(control.value)

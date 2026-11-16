@@ -10,7 +10,8 @@ cipher the message store uses (identity/plaintext-on-disk only when no key is co
 at-rest tier as the File-connector spill dirs, documented in ``docs/PHI.md`` §2).
 
 This is a **leaf** module: it imports only the pure ``store.crypto`` cipher seam + the pure
-``parsing.split``/``parsing.peek`` HL7 library. It never imports the store instance, a transport, a
+``parsing.split``/``parsing.peek`` HL7 library, and ``config.atomic_edit``'s cross-process file lock
+(:func:`_pair_lock`). It never imports the store instance, a transport, a
 connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
 cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
@@ -29,6 +30,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import errno
 import functools
 import hashlib
 import json
@@ -36,6 +38,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
@@ -43,12 +46,13 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import S_ISLNK, S_ISREG
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
-from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
+from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
+from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.store.content_search import SearchSpec, row_matches
@@ -57,7 +61,10 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     Cipher,
     CipherError,
+    CipherUnavailableError,
+    UnauthenticatedCipherError,
     cell_aad,
+    gave_no_verdict,
 )
 
 _log = logging.getLogger(__name__)
@@ -110,6 +117,14 @@ _CANCELLED_REMOVAL_WAIT_SECONDS = 5.0
 # unlinks that hang can hold at most this many threads, never the pool every ``asyncio.to_thread``
 # in the engine shares. A removal past the cap queues on the pool and still runs.
 _CANCELLED_REMOVAL_WORKERS = 2
+
+# How long a pair removal, or a ``rotate-key`` re-seal's replace, waits for the uploads root's
+# cross-process pair lock (:func:`_pair_lock`, BACKLOG #3181 item 5). Each holder keeps it only
+# across its unlinks, or across one re-check and one rename, so a wait this long means a stalled
+# file system. Then an engine removal goes on without the lock, and the re-seal skips the half, or
+# at the pass's first check writes nothing.
+# Under the 5 s bounds above, so a removal that waits it out still ends inside them.
+_PAIR_LOCK_TIMEOUT_SECONDS = 2.0
 
 
 @functools.cache
@@ -206,12 +221,65 @@ def _is_inflight(name: str) -> bool:
         return name in _inflight_names
 
 
+#: How long one upload's sidecar tag failure is reported once (BACKLOG #5553). Every listing,
+#: quota check and prune meets the same sidecar, so without this each would raise the alert again.
+_TAG_REPORT_INTERVAL_S = 3600.0
+#: The most upload ids remembered; the oldest is forgotten first.
+_TAG_REPORTED_MAX = 4096
+#: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
+_TAG_REF_LEN = 12
+_tag_reported: dict[str, float] = {}
+# Scans run on worker threads, so the read-modify-write holds this lock.
+_tag_reported_lock = threading.Lock()
+
+
+def _first_tag_report(fid: str) -> bool:
+    """Whether upload ``fid``'s tag failure has not been reported within the interval; records it."""
+    now = time.monotonic()
+    with _tag_reported_lock:
+        last = _tag_reported.get(fid)
+        if last is not None and now - last < _TAG_REPORT_INTERVAL_S:
+            return False
+        _tag_reported.pop(fid, None)
+        _tag_reported[fid] = now
+        while len(_tag_reported) > _TAG_REPORTED_MAX:
+            _tag_reported.pop(next(iter(_tag_reported)))
+    return True
+
+
+def _not_a_plain_file(path: Path) -> str | None:
+    """Why ``path`` must not be read, from its ``lstat``: it is a symbolic link or a Windows
+    name-surrogate reparse point such as a junction (BACKLOG #5552), or it is not a regular file,
+    such as a FIFO, whose open would block the reader for good. ``None`` when it is a regular file,
+    or when it cannot be checked; the caller's own read then meets and names that fault."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if _names_a_link(info):
+        return "it is a link and was not followed"
+    if not S_ISREG(info.st_mode):
+        return "it is not a regular file"
+    return None
+
+
+def _names_a_link(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symbolic link or a name-surrogate reparse point."""
+    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    return S_ISLNK(info.st_mode) or bool(
+        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    )
+
+
 class UploadError(Exception):
     """Base class for uploaded-logs storage failures."""
 
 
 class UploadPathError(UploadError):
-    """A file_id is malformed or resolves outside the uploads root (path-traversal guard, ADR 0134)."""
+    """A file_id is malformed or resolves outside the uploads root (path-traversal guard, ADR 0134).
+
+    ``UploadStore._paths`` also raises it for a path that does not resolve to itself, such as a
+    symbolic link inside the root (BACKLOG #5552)."""
 
 
 class UploadTooLargeError(UploadError):
@@ -222,9 +290,10 @@ class UploadContentError(UploadError):
     """An upload's extension is not permitted, or its content contradicts its extension (ASVS 5.2.2).
 
     The uploaded-logs feature accepts only text diagnostic logs; a disallowed extension or a
-    content/extension mismatch (PNG bytes in a ``.hl7``, a non-``<`` body in a ``.xml``, a NUL-bearing
-    ``.txt``) is refused at the chokepoint before anything is written. The API maps it to HTTP 400 and a
-    metadata-only ``upload.reject`` audit.
+    content/extension mismatch (a ``.hl7`` with no HL7 header, a non-``<`` body in a ``.xml``) is
+    refused at the chokepoint before anything is written. The API maps it to HTTP 400 and a
+    metadata-only ``upload.reject`` audit, and its subclass :class:`UploadNotTextError`, a body that
+    is not plain text, to HTTP 415.
 
     ``str(exc)`` names the file, for the uploader's own 400 response. ``reason`` is the same text
     without the name, and is what the audit row records: the audit log is plaintext and kept, and an
@@ -239,6 +308,14 @@ class UploadContentError(UploadError):
         # The default rebuilds from ``self.args``, the one formatted message, which this signature
         # does not take; copy and pickle would raise TypeError.
         return (type(self), (self.display, self.reason))
+
+
+class UploadNotTextError(UploadContentError):
+    """An upload's body is not plain text (ASVS 14.2.8): it begins with a binary container's
+    signature, holds a NUL byte, or has a control-dense 8 KiB window, as
+    ``parsing.sniff.nontext_upload_reason`` judges it. ``reason`` is that function's
+    text. The API answers it 415, where any other :class:`UploadContentError` is 400 (BACKLOG
+    #5551)."""
 
 
 class UploadQuotaError(UploadError):
@@ -337,6 +414,14 @@ class UploadUnreadableError(UploadError, CipherError):
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
     :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
+
+
+class UploadUnavailableError(UploadError, CipherError):
+    """The store cipher's key service gave no verdict on an uploaded file, so a later try may
+    succeed (BACKLOG #3734). Raised for :class:`~messagefoundry.store.crypto.CipherUnavailableError`
+    where :class:`UploadUnreadableError` would otherwise be, and from :meth:`UploadStore.save`. The
+    file is neither refused nor changed, and nothing was removed. The API answers it 503 with
+    ``Retry-After``. The message is the cipher's own, as :class:`UploadUnreadableError`'s is."""
 
 
 #: The text of the refusal :meth:`UploadStore.delete` raises when its caller's read was refused
@@ -498,33 +583,40 @@ _ALLOWED_UPLOAD_EXTENSIONS = (".hl7", ".hl7v2", ".txt", ".xml")
 
 
 def validate_upload_content(display: str, data: bytes) -> None:
-    """Extension-allowlist + content-vs-extension sniff for an uploaded file (ASVS 5.2.2). Raises
-    :class:`UploadContentError` when the sanitized display filename's extension is not permitted, or when
-    the content's leading bytes contradict the extension:
+    """Text-only check, extension allowlist and content-vs-extension sniff for an uploaded file.
 
-    * ``.hl7``/``.hl7v2`` → an MSH/FHS/BHS HL7 header sniff (rejects e.g. PNG bytes in a ``.hl7``);
+    First, the whole body must be plain text (ASVS 14.2.8, ``parsing.sniff.nontext_upload_reason``):
+    no binary container signature, no NUL byte anywhere, and no control-dense window. A failure
+    raises :class:`UploadNotTextError`, which the route answers 415. It is checked here, at the
+    chokepoint, and nowhere else, so every caller of :meth:`UploadStore.save` meets it (BACKLOG
+    #5551).
+
+    Then (ASVS 5.2.2) it raises :class:`UploadContentError` when the sanitized display filename's
+    extension is not permitted, or when the content's leading bytes contradict the extension:
+
+    * ``.hl7``/``.hl7v2`` → an MSH/FHS/BHS HL7 header sniff;
     * ``.xml`` → a leading ``<`` after any BOM/whitespace;
-    * ``.txt`` → NUL-free (``.txt`` has no magic signature, so content validation is necessarily weak —
-      the same residual the plain-text connectors carry).
+    * ``.txt`` → nothing more (``.txt`` has no magic signature, so content validation is necessarily
+      weak — the same residual the plain-text connectors carry).
 
-    Pure + off-loop friendly (no I/O). Reuses the shared ``parsing.sniff`` magic-byte helpers, so the
-    upload chokepoint and the File connectors enforce the same sniff."""
+    Pure (no I/O), but linear in the body, so :meth:`UploadStore.save` runs it off the event loop.
+    Reuses the shared ``parsing.sniff`` magic-byte helpers, so the upload chokepoint and the File
+    connectors enforce the same sniff."""
+    nontext = nontext_upload_reason(data)
+    if nontext is not None:
+        raise UploadNotTextError(display, nontext)
     if not display.lower().endswith(_ALLOWED_UPLOAD_EXTENSIONS):
         raise UploadContentError(
             display,
             f"has a disallowed extension; permitted: {', '.join(_ALLOWED_UPLOAD_EXTENSIONS)}",
         )
     ctype = content_type_for(display)
-    if ctype == "hl7v2":
-        if not _looks_like_hl7(data):
-            raise UploadContentError(
-                display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
-            )
-    elif ctype == "xml":
-        if not _lstrip_bom_ws(data).startswith(b"<"):
-            raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
-    elif b"\x00" in data:  # text (.txt) — no magic; NUL-free is the only structural check
-        raise UploadContentError(display, "declares .txt but contains NUL bytes (not plain text)")
+    if ctype == "hl7v2" and not _looks_like_hl7(data):
+        raise UploadContentError(
+            display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
+        )
+    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
+        raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 
 def _decode_text(data: bytes) -> str:
@@ -647,14 +739,14 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
-    #: True when the uploads root could not be listed, as when it is missing or is not a directory,
-    #: so the pass read nothing (BACKLOG #4940). An unmounted volume and a directory never created
-    #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
-    #: volume's uploads would stay under the prior key while the run reported success.
-    #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
-    #: that goes away mid-run. It is not a skip: ``rotate-key`` aborts on it before its audit roll.
-    #: A root it can list is never missing, empty or not; what that leaves uncaught is in
-    #: docs/PHI.md, at the ``rotate-key`` passage.
+    #: True when the uploads root could not be listed, as when it is missing or is not a directory
+    #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
+    #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
+    #: that is not mounted reads as no uploads; docs/PHI.md's ``rotate-key`` passage, under "It
+    #: refuses only a path it cannot list", names at least the cases it leaves uncaught. Also True
+    #: when a non-empty listing is followed by a root that is no directory, at the check right after
+    #: the listing or at the pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts
+    #: on it before its audit roll.
     root_missing: bool = False
 
     @property
@@ -847,16 +939,22 @@ class UploadStore:
 
     def _paths(self, file_id: str) -> tuple[Path, Path]:
         """Resolve the (blob, meta) paths for ``file_id`` with the ADR 0134 path-traversal guard:
-        reject any id that is not the exact 32-hex shape, then resolve and assert both paths sit
-        **directly under** the canonical uploads root. Raises :class:`UploadPathError` on any mismatch —
-        without touching the filesystem for a bad id."""
+        reject any id that is not the exact 32-hex shape, then resolve and assert each path is
+        **itself**, directly under the canonical uploads root. Raises :class:`UploadPathError` on any
+        mismatch — without touching the filesystem for a bad id.
+
+        **What it refuses (BACKLOG #5552): a path that does not resolve to itself,** such as a
+        symbolic link or a junction to another file, wherever that file is. Such a link to ANOTHER
+        upload's file inside the root would otherwise let a delete, prune or discard under one id
+        act on the other upload. **A hard link is not refused:** it is a second name for the same
+        file and resolves to itself. Nor is a symbolic link that loops back to itself, which
+        resolves to itself too; it reaches no other file, and its own read fails. A refused pair
+        is left to an operator, and the prune logs each one it leaves."""
         blob, meta = self._paths_unfollowed(file_id)
-        root = blob.parent
-        blob, meta = blob.resolve(), meta.resolve()
-        # Belt-and-suspenders: a validated 32-hex id cannot contain a separator, but verify the resolved
-        # parent IS the root so no symlink/normalization trick lands the write elsewhere.
-        if blob.parent != root or meta.parent != root:
-            raise UploadPathError(f"upload id {file_id!r} resolves outside the uploads root")
+        if blob.resolve() != blob or meta.resolve() != meta:
+            raise UploadPathError(
+                f"upload id {file_id!r} names a link or resolves elsewhere; it is not followed"
+            )
         return blob, meta
 
     def _paths_unfollowed(self, file_id: str) -> tuple[Path, Path]:
@@ -956,12 +1054,17 @@ class UploadStore:
                 yield fid, entry
 
     def _scan_metas_sync(
-        self, held: list[_UnsealableUpload] | None = None
+        self, held: list[_UnsealableUpload] | None = None, *, outage_raises: bool = False
     ) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
         log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
         pass. Pure filesystem read — the caller runs it off the event loop.
+
+        **An outage is the exception (BACKLOG #3734).** A sidecar the key service gave no verdict
+        on is logged with its upload id on a line of its own. With ``outage_raises`` it then raises
+        :class:`UploadUnavailableError`, ending the scan, so a quota count is never taken with the
+        sidecar left out; without it, it is skipped like the rest.
 
         **Each failure class is caught on its own and logged distinctly (BACKLOG #1169, CLAUDE.md
         §6).** One blanket ``except Exception`` used to fold all three into a single
@@ -999,23 +1102,50 @@ class UploadStore:
         by the id in a sidecar's JSON.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
-        marker versions and algorithm names, never a decrypted value. The malformed-shape branch
+        marker versions and algorithm names, never a decrypted value. Each of those is cut from the
+        stored text, so the cipher bounds what it echoes of one (BACKLOG #5553). The malformed-shape branch
         logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
-        echo that field's value back into the message."""
+        echo that field's value back into the message.
+
+        **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
+        through the cipher's tag-failure hook, once per upload per hour
+        (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
+        place, such as another upload's sidecar moved under this id. A value under a key that is
+        not configured is a key fault, not that, and is only logged.
+
+        **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
+        logged and skipped: a followed link read a file outside the root, or another upload's
+        sidecar, and a FIFO would block the scan, and the ``_quota_lock`` a save holds over it, for
+        good. One planted between that check and the read is still opened."""
         out: list[UploadedFileMeta] = []
         sink = held if self._refuses_plaintext else None
         bodies: set[str] = set()
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            refused = _not_a_plain_file(entry)
+            if refused is not None:
+                _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
+                continue
             classify = False
+            stored = ""
             try:
-                out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
+                stored = entry.read_text(encoding="utf-8")
+                out.append(self._decrypt_meta(stored, fid))
             except CipherError as exc:
+                if isinstance(exc, CipherUnavailableError):
+                    # Its own line, so an outage never reads as the refusal logged below. Logged
+                    # before the raise too, so the sidecar that stopped a count is named.
+                    _log.warning("uploaded-file sidecar %s: key service unavailable: %s", fid, exc)
+                    if outage_raises:
+                        # A count with a sidecar it could not read is not a count (BACKLOG #3734).
+                        raise UploadUnavailableError(str(exc)) from exc
+                    continue
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
+                self._report_tag_failure(fid, stored, exc)
                 classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
@@ -1041,6 +1171,30 @@ class UploadStore:
             for name in self._body_checks.copy().keys() - bodies:
                 self._body_checks.pop(name, None)
         return out
+
+    def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
+        """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
+        failing under a key the cipher holds, once per upload per :data:`_TAG_REPORT_INTERVAL_S`
+        (BACKLOG #5553). The tests are ``store/cell_tag.py``'s ``_tag_failure_kind``, inlined
+        because that module imports beyond this leaf's set: a verdict was given, a cipher that names
+        its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
+        its refusal is the value's own tag. The reason names a prefix of the upload id, as
+        ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
+        beside it names the whole id."""
+        if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
+            return
+        cipher = self._cipher
+        if not cipher.is_encrypted(stored):
+            return
+        holds = getattr(cipher, "holds_key_for", None)
+        held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
+        report = getattr(cipher, "report_tag_failure", None)
+        if not (held and callable(report) and _first_tag_report(fid)):
+            return
+        report(
+            "uploaded_file",
+            f"an uploaded-file sidecar failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
+        )
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
         """``fid`` as an upload ``rotate-key`` cannot seal, or ``None`` when it is not one.
@@ -1133,18 +1287,21 @@ class UploadStore:
         filename: str,
         uploader: str,
         uploader_id: str,
-        content_type: str | None = None,
     ) -> UploadedFileMeta:
-        """Persist an uploaded file (encrypted at rest) and return its metadata.
+        """Persist an uploaded file (encrypted at rest) and return its metadata. Its format tag is
+        derived from its extension; a caller cannot set one (BACKLOG #5551).
 
         ``uploader_id`` is the owning account's immutable ``Identity.user_id``; ``uploader`` is its
         username, kept for display and the audit rows only. Both are required — a file written with
         no ``uploader_id`` would be readable by nobody but a ``files:access_any`` holder while still
         billing to nobody's quota, so an empty one is a programming error and is refused here.
 
-        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
-        on a disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when
-        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4).
+        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadNotTextError`
+        on a body that is not plain text (ASVS 14.2.8), :class:`UploadContentError` on a disallowed
+        extension / content mismatch (ASVS 5.2.2), :class:`UploadQuotaError` when
+        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4), or
+        :class:`UploadUnavailableError` when the cipher's key service gave no verdict, before anything
+        is written (BACKLOG #3734).
 
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
@@ -1166,11 +1323,14 @@ class UploadStore:
                 f"upload is {len(data)} bytes; the limit is {self._max_bytes}"
             )
         display = sanitize_filename(filename)
-        # Extension allowlist + content-vs-extension sniff at the chokepoint (ASVS 5.2.2). Both upload
-        # surfaces (POST /uploads and POST /ui/uploaded-logs/upload) reach save(), so a disallowed
-        # extension or a content/extension mismatch is refused here before any PHI is written.
-        validate_upload_content(display, data)
-        ctype = content_type or content_type_for(display)
+        # Text-only check, extension allowlist + content-vs-extension sniff at the chokepoint (ASVS
+        # 14.2.8, 5.2.2). Both upload surfaces (POST /uploads and POST /ui/uploaded-logs/upload) reach
+        # save(), so a non-text body, a disallowed extension or a content/extension mismatch is
+        # refused here before any PHI is written. It reads the whole body (BACKLOG #5551), so it runs
+        # off the loop like the rest.
+        await asyncio.to_thread(validate_upload_content, display, data)
+        # Always derived from the extension the check above judged, never a caller's label (#5551).
+        ctype = content_type_for(display)
         file_id = secrets.token_hex(16)
         # Set by the write thread once the sidecar lands; read only after that thread has finished.
         landed = False
@@ -1213,8 +1373,11 @@ class UploadStore:
             )
             root = self._ensure_root()
             blob_path, meta_path = self._paths(file_id)
-            blob_ct = self._encrypt_blob(data, file_id)
-            meta_ct = self._encrypt_meta(meta)
+            try:
+                blob_ct = self._encrypt_blob(data, file_id)
+                meta_ct = self._encrypt_meta(meta)
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             # Atomic-ish write: tmp + os.replace so a reader never sees a half-written ciphertext.
             #
             # The two writes are ordered body-then-sidecar because the sidecar is the listing key, so
@@ -1308,11 +1471,16 @@ class UploadStore:
         task, held like the other stragglers. A cancelled caller waits up to
         ``_LEDGER_CANCEL_WAIT_SECONDS`` for it, then propagates while it goes on. If the removal is
         itself cancelled before it finishes, such as by the shutdown drain, an ERROR names the
-        ``file_id``, so a stored file with no creation row is never left without a record."""
-        removal = asyncio.ensure_future(self._discard_under_lock(file_id))
-        self._hold(removal, functools.partial(_log_discard_unfinished, file_id=file_id))
+        ``file_id``, so a stored file with no creation row is never left without a record. The
+        wait is :meth:`_run_to_completion`'s (vault BACKLOG #3740 item 12), which also logs a
+        removal still running at the bound."""
         try:
-            return await _wait_to_completion(removal, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
+            return await self._run_to_completion(
+                self._discard_under_lock(file_id),
+                what=f"the removal of upload {file_id}",
+                on_late=functools.partial(_log_discard_unfinished, file_id=file_id),
+                held=True,
+            )
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -1350,11 +1518,13 @@ class UploadStore:
         take ``_quota_lock``."""
         blob_path, meta_path = self._paths(file_id)
         try:
-            blob_path.unlink(missing_ok=True)
-            try:
-                meta_path.unlink()
-            except FileNotFoundError:
-                return False
+            # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
+            with _pair_lock(meta_path):
+                blob_path.unlink(missing_ok=True)
+                try:
+                    meta_path.unlink()
+                except FileNotFoundError:
+                    return False
         except OSError as exc:
             _log.error(
                 "upload %s was cancelled after its file landed, or its upload.create row failed, "
@@ -1956,9 +2126,13 @@ class UploadStore:
         An upload ``rotate-key`` cannot seal counts too, at its body's size on disk (BACKLOG #2322).
         Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why.
         Both kinds come from one walk of the directory (BACKLOG #3184). The never-sealable ones are
-        also counted apart, for the refusal to name (BACKLOG #3183)."""
+        also counted apart, for the refusal to name (BACKLOG #3183).
+
+        A sidecar the key service gave no verdict on raises :class:`UploadUnavailableError` rather
+        than being left out, so an outage cannot lower the count a quota is checked against
+        (BACKLOG #3734)."""
         held: list[_UnsealableUpload] = []
-        metas = self._scan_metas_sync(held)
+        metas = self._scan_metas_sync(held, outage_raises=True)
         sizes = [m.size for m in metas if m.uploader_id == uploader_id]
         mine = [h.size for h in held if h.uploader_id == uploader_id]
         held_files, held_bytes = len(mine), sum(mine)
@@ -1990,6 +2164,8 @@ class UploadStore:
                 return self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
 
@@ -2005,6 +2181,8 @@ class UploadStore:
                 return self._decrypt_blob(blob_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
 
@@ -2017,7 +2195,9 @@ class UploadStore:
         An upload ``rotate-key`` cannot seal is deleted too, although its sidecar is refused
         (BACKLOG #2322). The metadata returned then carries only its id, its body's size on disk and
         its sidecar's mtime (:meth:`_UnsealableUpload.as_meta`). Any other refused upload still
-        raises :class:`UploadUnreadableError`, and nothing is removed.
+        raises :class:`UploadUnreadableError`, and nothing is removed. A sidecar the cipher's key
+        service gave no verdict on raises :class:`UploadUnavailableError`, and nothing is removed
+        (BACKLOG #3734).
 
         ``sidecar_refused`` says the caller's own :meth:`get_meta` was just refused. The sidecar is
         then not decrypted again, so one delete raises one cipher WARNING and one alert, not two.
@@ -2042,6 +2222,9 @@ class UploadStore:
                     meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
                 except FileNotFoundError as exc:
                     raise UploadNotFoundError(file_id) from exc
+                except CipherUnavailableError as exc:
+                    # No verdict on the sidecar, so it is not classed and nothing is removed.
+                    raise UploadUnavailableError(str(exc)) from exc
                 except CipherError as exc:
                     refusal = str(exc)
             if meta is None:
@@ -2059,8 +2242,10 @@ class UploadStore:
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
             # listing key, so once it is gone the file is invisible even if the blob lingers).
-            blob_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
+            # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
+            with _pair_lock(meta_path):
+                blob_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
             return meta
 
         return await asyncio.to_thread(_delete)
@@ -2144,6 +2329,13 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
+        if pairs and not os.path.isdir(self._root):
+            # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
+            _log.warning(
+                "uploads root %s is gone after it was listed; no uploaded file was read", self._root
+            )
+            return ResealResult(root_missing=True)
+        gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2159,8 +2351,14 @@ class UploadStore:
             # _encrypt_blob). Body FIRST, as save() writes it: the sidecar is the listing key, and a
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
-            body = self._reseal_half(cipher, fid, blob_path, "body")
-            meta = self._reseal_half(cipher, fid, meta_path, "meta", over=(body, blob_path))
+            body = self._reseal_half(cipher, fid, blob_path, "body", gate=gate)
+            meta = self._reseal_half(
+                cipher, fid, meta_path, "meta", over=(body, blob_path), gate=gate
+            )
+            if gate.root_gone():
+                # The root went before the lock check, which runs before the pass's first write, so
+                # nothing was written: the BACKLOG #4940 outcome, as above. _pair_lock logged it.
+                return ResealResult(root_missing=True)
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
             # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
@@ -2205,6 +2403,7 @@ class UploadStore:
         kind: Literal["body", "meta"],
         *,
         over: tuple[_Half, Path] | None = None,
+        gate: _ResealLockCheck,
     ) -> _Half:
         """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
@@ -2214,8 +2413,17 @@ class UploadStore:
         Anything that is neither a regular file nor a symlink holds no value, so it is reported and
         left alone, and it is not a skip, like a missing body. A symlink is not followed, because that would re-seal or read a
         file this store does not own. It is a skip, because its target may be a real upload still
-        under the prior key. This guards an offline command against what is on disk when it looks,
-        not against a writer racing it."""
+        under the prior key. That check guards against what is on disk when it looks, not against
+        a writer racing it.
+
+        **The write never re-creates a removed file (BACKLOG #3181 item 5).** ``rotate-key`` refuses
+        a held store only on SQLite, so an engine on a server store can delete an upload while this
+        runs, and a plain replace brought the sidecar back. The replace now happens under
+        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``gate`` is the
+        pass's one pair-lock check, made at the first half that needs a write. When it failed (the
+        lock was busy, refused or timed out, taking it failed, or the root was gone), each half that
+        needs a write is a skip before it is decrypted. A write that finds the uploads root
+        gone, or the lock not to be had, is a skip too."""
         try:
             info = path.lstat()
             if S_ISLNK(info.st_mode):
@@ -2294,6 +2502,19 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
+        blocked = gate.check()
+        if blocked == "gone":
+            # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
+            # logged the gone directory.
+            return _Half.SKIPPED
+        if blocked is not None:
+            _log.warning(
+                "uploaded file %s (%s): skipped, nothing is written: %s",
+                fid,
+                kind,
+                _RESEAL_BLOCKED[blocked],
+            )
+            return _Half.SKIPPED
         try:
             sealed = _reencrypt_value(cipher, stored, cell_aad("uploaded_file", kind, fid))
         except _UnopenableValueError:
@@ -2313,8 +2534,44 @@ class UploadStore:
             return _Half.SKIPPED
         del stored  # the write holds its own copy, so free this file-sized buffer before it
         try:
-            _atomic_write_text(self._root, path, sealed)
-        except OSError as exc:
+            _atomic_write_text(self._root, path, sealed, seen=info)
+        except _ChangedUnderReseal as changed:
+            # BACKLOG #3181 item 5: a running engine removed or replaced it after the read. Nothing
+            # is written, so a deleted pair stays deleted. A removed body is a lost one, as at the
+            # read; anything else is a skip, as a sidecar gone at the read is. That is also what
+            # an unmounted volume looks like, so it must never read as done.
+            if changed.gone and kind == "body":
+                _log.warning(
+                    "uploaded file %s (body): removed while this pass ran; not re-created", fid
+                )
+                return _Half.LOST
+            _log.warning(
+                "uploaded file %s (%s): skipped, it was %s while this pass ran, so nothing was "
+                "written over it or in its place; re-run to confirm",
+                fid,
+                kind,
+                changed,
+            )
+            return _Half.SKIPPED
+        except (_PairLockFailed, OSError) as exc:
+            # The lock's failure is read as _pair_lock logged it, never classified again: a root
+            # that came back in between would make the two disagree.
+            if isinstance(exc, _PairLockFailed):
+                gone = exc.kind == "gone"
+                exc = exc.cause
+            else:
+                gone = _root_gone(exc, self._root)
+            if gone:
+                # The target's own absence is _ChangedUnderReseal. Its error would name the lock
+                # file when the root went before the lock's open, so this half's warning does not
+                # give it as the cause.
+                _log.warning(
+                    "uploaded file %s (%s): skipped, could not be written: the uploads directory "
+                    "is gone",
+                    fid,
+                    kind,
+                )
+                return _Half.SKIPPED
             # The write failed and the temp-and-replace left the file as it was. A skip, like a read
             # failure, so one file that cannot be written does not stop the pass.
             _log.warning(
@@ -2516,43 +2773,53 @@ class UploadStore:
         Never raises: a raise would drop the pass's list, and with it the audit rows for every
         pair already deleted. ``_paths`` resolves the path, which can touch the filesystem, so an
         ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
-        # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+        # A sidecar whose id fails the path guard, or whose pair holds a link, is left alone (never
+        # blindly unlinked) and named, so an operator can remove it (BACKLOG #5552). The id is cut
+        # short: an unsealed sidecar's JSON chooses it.
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:
-            return False
-        except OSError as exc:
-            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
-            return False
-        # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
-        # because the body is the PHI the audit row records the deletion of. Sidecar-first
-        # reported a pair whose body unlink was refused and left the body on disk, and it
-        # opened a window where a body with no sidecar is exactly what a concurrent pass's
-        # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
-        # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
-        # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
-        # can overlap), so only its leftover sidecar is cleared, with no second report.
-        try:
-            blob_path.unlink()
-        except FileNotFoundError:
-            with contextlib.suppress(OSError):
-                meta_path.unlink(missing_ok=True)
-            return False
-        except OSError as exc:
-            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
-            return False
-        # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
-        # body gone and clears the sidecar without reporting the pair again.
-        try:
-            meta_path.unlink(missing_ok=True)
-        except OSError as exc:
             _log.warning(
-                "uploaded-logs prune removed the body of %s but not its sidecar; the next "
-                "pass will clear it: %s",
-                meta.file_id,
-                exc,
+                "uploaded-logs prune left %r for an operator: its id fails the path guard or its "
+                "pair holds a link",
+                meta.file_id[:40],
             )
-        return True
+            return False
+        except OSError as exc:
+            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+            return False
+        # Under the pair lock, so a rotate-key re-seal cannot put either half back (BACKLOG
+        # #3181 item 5).
+        with _pair_lock(meta_path):
+            # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
+            # because the body is the PHI the audit row records the deletion of. Sidecar-first
+            # reported a pair whose body unlink was refused and left the body on disk, and it
+            # opened a window where a body with no sidecar is exactly what a concurrent pass's
+            # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
+            # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
+            # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
+            # can overlap), so only its leftover sidecar is cleared, with no second report.
+            try:
+                blob_path.unlink()
+            except FileNotFoundError:
+                with contextlib.suppress(OSError):
+                    meta_path.unlink(missing_ok=True)
+                return False
+            except OSError as exc:
+                _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+                return False
+            # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
+            # body gone and clears the sidecar without reporting the pair again.
+            try:
+                meta_path.unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning(
+                    "uploaded-logs prune removed the body of %s but not its sidecar; the next "
+                    "pass will clear it: %s",
+                    meta.file_id,
+                    exc,
+                )
+            return True
 
     async def prune_on_save(
         self, audit: Callable[[UploadedFileMeta], Awaitable[None]]
@@ -2600,8 +2867,13 @@ class UploadStore:
         what: str = "a task run to completion",
         on_cancel: Callable[[], None] | None = None,
         on_late: Callable[[asyncio.Future[Any]], None] | None = None,
+        held: bool = False,
     ) -> T:
         """Run ``coro`` as its own task, so a cancellation of the caller does not cut it short.
+
+        With ``held``, the task is held from the start rather than only once its caller is
+        cancelled, so the shutdown drain waits for it, and cancels it, while its caller still
+        waits, and ``on_late`` is given the finished task whatever its caller did (:meth:`discard`).
 
         The task is outside the caller's cancel scope, so the request deadline does not reach its
         awaits. A cancelled caller calls ``on_cancel`` first, then waits up to
@@ -2615,6 +2887,9 @@ class UploadStore:
         surfaces here as the same ``CancelledError``, so ``on_cancel`` runs again on this path: a
         sweep's thread outlives its task, and must still be told to stop."""
         task = asyncio.create_task(coro)
+        late = on_late or functools.partial(_log_late_failure, what=what)
+        if held:
+            self._hold(task, late)
         try:
             return await _wait_to_completion(
                 task, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, on_cancel=on_cancel
@@ -2628,7 +2903,8 @@ class UploadStore:
                     what,
                     _LEDGER_CANCEL_WAIT_SECONDS,
                 )
-            self._hold(task, on_late or functools.partial(_log_late_failure, what=what))
+            if not held:
+                self._hold(task, late)
             raise
 
     def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
@@ -3160,8 +3436,303 @@ async def _wait_to_completion[T](
     return fut.result()
 
 
-def _atomic_write_text(root: Path, path: Path, text: str) -> None:
+class _PairLockBusy(TimeoutError):
+    """``edit_lock``'s ``busy_error`` for the pair lock: another holder kept it past the wait."""
+
+
+type _PairLockFailure = Literal["busy", "gone", "timeout", "refused", "failed"]
+
+
+def _not_a_file_errnos(platform: str) -> frozenset[int]:
+    """What opening the lock path raises on ``platform`` when something planted there is not a
+    regular file. ``EISDIR``: a directory. ``ENXIO``: a socket, on Linux. On macOS and the BSDs,
+    ``EOPNOTSUPP`` is a socket and ``EFTYPE`` is a link that ``O_NOFOLLOW`` refused, as NetBSD
+    reports one; ``EMLINK`` is such a link on FreeBSD and DragonFly. Never on Linux, where
+    ``EOPNOTSUPP`` comes from a FUSE or 9p mount, not a planted file."""
+    codes = {errno.EISDIR, errno.ENXIO}
+    if platform.startswith(("darwin", "freebsd", "openbsd", "netbsd", "dragonfly")):
+        codes.add(errno.EOPNOTSUPP)
+        eftype = getattr(errno, "EFTYPE", None)
+        if eftype is not None:
+            codes.add(eftype)
+    if platform.startswith(("freebsd", "dragonfly")):
+        codes.add(errno.EMLINK)
+    return frozenset(codes)
+
+
+#: Like a planted link, a planted directory or socket is a refusal, so the engine logs it at ERROR
+#: with the advice to remove it.
+_NOT_A_FILE = _not_a_file_errnos(sys.platform)
+
+
+def _root_gone(exc: OSError, root: Path) -> bool:
+    """Whether ``exc`` is a ``FileNotFoundError`` or ``NotADirectoryError`` while the uploads root
+    ``root`` is no directory, as when it is missing or was replaced by a file, and not one from
+    under a root still there. ``os.path.isdir`` follows links, so a root that is a link to a
+    missing target is gone too."""
+    return isinstance(exc, FileNotFoundError | NotADirectoryError) and not os.path.isdir(root)
+
+
+def _lock_name(path: Path) -> str:
+    """The pair lock file for ``path``, as it is logged and as ``_unlocked_logged`` keys it."""
+    return scrub_log_argument(str(lock_path_for(path)))
+
+
+def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
+    """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
+    another holder kept it past the wait. ``gone``: a ``FileNotFoundError`` or
+    ``NotADirectoryError`` while the root is no directory (:func:`_root_gone`).
+    ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
+    the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
+    account owns; a ``_PairLockBusy`` with a cause is one too, as is what ``_NOT_A_FILE`` names,
+    and a ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as
+    ``EIO`` or ``ESTALE`` from a network file system."""
+    if isinstance(exc, _PairLockBusy):
+        return "refused" if exc.__cause__ is not None else "busy"
+    if _root_gone(exc, root):
+        return "gone"
+    if isinstance(exc, FileNotFoundError):
+        return "refused"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:
+        return "refused"
+    return "failed"
+
+
+class _PairLockFailed(Exception):
+    """What :func:`_pair_lock` raises for the re-seal when it cannot take the lock: ``kind`` is the
+    failure it classified and logged, and ``cause`` is the error. The caller reads ``kind`` rather
+    than classifying ``cause`` again, since a root that went or came back in between would make the
+    two disagree."""
+
+    def __init__(self, kind: _PairLockFailure, cause: OSError) -> None:
+        super().__init__(kind, cause)
+        self.kind: _PairLockFailure = kind
+        self.cause = cause
+
+
+class _ResealLockCheck:
+    """The re-seal pass's one pair-lock check in the uploads root, made at the first half that
+    needs a write and remembered for the rest of the pass. Finding a lock it cannot take per half
+    would decrypt and re-encrypt each upload first, then wait out the lock for each write, so once
+    it fails every half that needs a write is a skip and nothing is written. A pass in which every
+    half is already current takes no lock."""
+
+    def __init__(self, lock: Path) -> None:
+        self._lock = lock
+        self._checked = False
+        self.failure: _PairLockFailure | None = None
+
+    def root_gone(self) -> bool:
+        """Whether the check ran and found the uploads root gone."""
+        return self.failure == "gone"
+
+    def check(self) -> _PairLockFailure | None:
+        """Take and release the lock the first time, and return why that failed, or None."""
+        if not self._checked:
+            # Marked checked only once the attempt ends in a lock taken or a _PairLockFailed. Any
+            # other exception propagates and leaves it unchecked, so it never reads as success.
+            try:
+                with _pair_lock(self._lock, for_reseal=True):
+                    pass
+            except _PairLockFailed as failed:
+                self.failure = failed.kind
+            self._checked = True
+        return self.failure
+
+
+#: What a busy pair lock tells the ``rotate-key`` operator to do.
+_RERUN_WHEN_FREE = "re-run rotate-key once whatever holds the lock releases it"
+
+#: What a re-seal half skipped for a failed first pair-lock check logs as the cause.
+_RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
+    "busy": f"the uploads pair lock was still held when the wait ran out; {_RERUN_WHEN_FREE}",
+    "timeout": "the file system timed out taking the uploads pair lock",
+    "refused": "the uploads pair lock could not be taken",
+    "failed": "the file system failed taking the uploads pair lock",
+    "gone": "the uploads directory was gone at the pair-lock check",
+}
+
+
+# The lock files whose refusal an engine removal has logged at ERROR since this process last took
+# them, so a lock that stays refused is one ERROR, not one per pair on every prune pass. Taking the
+# lock clears its entry, so a refusal that comes back gets its ERROR again.
+_unlocked_logged: set[str] = set()
+_unlocked_logged_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
+    """The cross-process lock over the pairs in ``path``'s directory, the uploads root (BACKLOG
+    #3181 item 5). Blocking, so call it off the event loop; re-entrant in one thread.
+
+    The engine's removals of a pair (:meth:`UploadStore.delete`, the retention prune and a discard)
+    hold it across their unlinks, and ``rotate-key``'s re-seal holds it across the check that the
+    file it read is still there and the rename that replaces it (:func:`_replace_if_unchanged`). So
+    while both hold it, a pair an engine removes while ``rotate-key`` runs is not re-created by the
+    re-seal, on any store backend: the re-seal either replaces the file before the removal takes the
+    lock, and the removal then takes the new file away, or finds it gone and writes nothing.
+    ``rotate-key`` is a separate process, so ``_quota_lock`` cannot do this. At least these leave
+    the re-seal's check and rename unguarded: a file system that cannot lock, where both sides go on
+    unlocked with a WARNING (:func:`~messagefoundry.config.atomic_edit.edit_lock`), and an engine
+    removal that could not take the lock, below. The orphan sweep and a save's own cleanup do not
+    take it; neither removes a pair the re-seal walks.
+
+    **A lock the engine cannot take does not stop it removing uploads.** Retention and delete must
+    not depend on a file anyone who can write the uploads directory can plant, so the removal goes
+    on unlocked. A refusal is logged at ERROR, naming the lock file and the likely cause: a lock
+    file another account created, as when ``rotate-key`` ran as root or as an administrator. While
+    it lasts, each later refusal of that lock file is logged at DEBUG; once this process takes the
+    lock again, the next refusal is an ERROR again. A lock whose directory is gone is not logged:
+    there is nothing left to remove. A lock still held when the wait runs out is not a refusal: it
+    is logged at WARNING each time, with ``edit_lock``'s own reason, and never uses up that ERROR.
+    Nor is an OS timeout, which is logged at WARNING each time as a timeout, nor any other error
+    that is not a refusal, which is logged at WARNING each time, naming the error
+    (:func:`_pair_lock_failure`).
+    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised as
+    :class:`_PairLockFailed`, carrying the failure it was logged as. At the pass's first check that
+    stops every write; at a half's write, that half is a skip."""
+    with contextlib.ExitStack() as held:
+        try:
+            _refuse_a_planted_link(lock_path_for(path))
+            held.enter_context(
+                edit_lock(path, busy_error=_PairLockBusy, timeout=_PAIR_LOCK_TIMEOUT_SECONDS)
+            )
+        except OSError as exc:
+            lock = _lock_name(path)
+            failure = _pair_lock_failure(exc, lock_path_for(path).parent)
+            consequence = (
+                "rotate-key skips each file it would write under it"
+                if for_reseal
+                else "This removal goes on without it, so a rotate-key run meanwhile could "
+                "re-create the removed upload"
+            )
+            if failure == "busy":
+                _log.warning(
+                    "uploaded-logs pair lock: %s. %s%s",
+                    codec_safe_str(exc),
+                    consequence,
+                    f"; {_RERUN_WHEN_FREE}" if for_reseal else "",
+                )
+            elif failure in ("timeout", "failed"):
+                _log.warning(
+                    "uploaded-logs pair lock %s: the file system %s taking it (%s: %s). %s",
+                    lock,
+                    "timed out" if failure == "timeout" else "failed",
+                    type(exc).__name__,
+                    codec_safe_str(exc),
+                    consequence,
+                )
+            elif failure == "gone":
+                if for_reseal:
+                    _log.warning(
+                        "rotate-key could not open the uploads pair lock %s: its directory is gone",
+                        lock,
+                    )
+            elif for_reseal:
+                _log.error(
+                    "rotate-key could not take the uploads pair lock %s (%s), so it writes no "
+                    "uploaded file while it cannot. Run rotate-key as the account the engine runs "
+                    "as. If another account owns the lock file, or it is not a regular file, "
+                    "delete it while neither the engine nor rotate-key runs",
+                    lock,
+                    codec_safe_str(exc),
+                )
+            else:
+                with _unlocked_logged_lock:
+                    first = lock not in _unlocked_logged
+                    _unlocked_logged.add(lock)
+                _log.log(
+                    logging.ERROR if first else logging.DEBUG,
+                    "uploaded-logs pair lock %s could not be taken (%s), so uploads are removed "
+                    "without it, and a rotate-key run meanwhile could re-create a removed upload. "
+                    "If another account owns it, as when rotate-key ran as root or an "
+                    "administrator, give it to the engine's service account; if it is not a "
+                    "regular file, remove it. Until this process takes the lock again, later "
+                    "refusals of it are logged at DEBUG",
+                    lock,
+                    codec_safe_str(exc),
+                )
+            if for_reseal:
+                raise _PairLockFailed(failure, exc) from exc
+        else:
+            if _unlocked_logged:
+                with _unlocked_logged_lock:
+                    _unlocked_logged.discard(_lock_name(path))
+        yield
+
+
+#: The reparse-tag bit of a Windows reparse point that names another path, such as a symbolic
+#: link or a junction (``IO_REPARSE_TAG_NAME_SURROGATE``), as ``pipeline/dr_backup.py`` tests it. A
+#: cloud-files, dedup or tiering placeholder lacks it and names no other path.
+_NAME_SURROGATE_TAG = 0x20000000
+
+
+def _refuse_a_planted_link(lock: Path) -> None:
+    """Refuse the pair lock file ``lock`` before ``edit_lock`` opens it when it is a symbolic link
+    or a name-surrogate reparse point: raises :class:`_PairLockBusy` chained from an
+    ``ELOOP``, the shape ``edit_lock`` gives a link its ``O_NOFOLLOW`` open refuses, so
+    :func:`_pair_lock_failure` reads it as a refusal. Windows has no ``O_NOFOLLOW``, so there
+    ``edit_lock`` follows a planted link and creates or locks its target. A link planted after this
+    ``lstat`` and before that open is still followed there. A missing lock path is left to
+    ``edit_lock``; any other ``lstat`` error is raised as it is."""
+    try:
+        info = lock.lstat()
+    except FileNotFoundError:
+        return  # edit_lock creates it, or fails and _pair_lock classifies and logs why
+    # Any other lstat error propagates, so _pair_lock classifies and logs it as it would the open's,
+    # and no open follows a path this could not check.
+    if _names_a_link(info):
+        loop = OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(lock))
+        raise _PairLockBusy(
+            f"{lock} is a link; the uploads pair lock is not taken through it -- remove it"
+        ) from loop
+
+
+class _ChangedUnderReseal(Exception):
+    """The file a re-seal read was removed (``gone``) or replaced before its write, so nothing was
+    written (BACKLOG #3181 item 5)."""
+
+    def __init__(self, *, gone: bool) -> None:
+        super().__init__("removed" if gone else "replaced")
+        self.gone = gone
+
+
+def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    """Whether two ``lstat`` results are one unchanged file. The engine never writes a pair in place,
+    only by temp-and-replace, so a rewrite gives a new file id, and the size and times catch most of
+    what a file system that reports none would hide. The change time is a creation time on Windows,
+    so a replacement's is new there; a false "changed" makes that half a skip."""
+    return os.path.samestat(a, b) and (a.st_size, a.st_mtime_ns, a.st_ctime_ns) == (
+        b.st_size,
+        b.st_mtime_ns,
+        b.st_ctime_ns,
+    )
+
+
+def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
+    """``os.replace(tmp, path)`` only while ``path`` is still the file ``seen`` describes, under
+    :func:`_pair_lock`. Raises :class:`_ChangedUnderReseal` and leaves ``path`` alone otherwise. A
+    plain replace creates ``path`` when it is gone, which re-created a pair an engine deleted while
+    ``rotate-key`` ran (BACKLOG #3181 item 5)."""
+    with _pair_lock(path, for_reseal=True):
+        try:
+            now = path.lstat()
+        except FileNotFoundError as exc:
+            raise _ChangedUnderReseal(gone=True) from exc
+        if not _same_file(now, seen):
+            raise _ChangedUnderReseal(gone=False)
+        os.replace(tmp, path)
+
+
+def _atomic_write_text(
+    root: Path, path: Path, text: str, *, seen: os.stat_result | None = None
+) -> None:
     """Write ``text`` to ``path`` via a temp file + ``os.replace`` (atomic on the same dir), owner-only.
+
+    With ``seen``, the replace is :func:`_replace_if_unchanged`'s: the temp is written first, outside
+    the lock, and ``path`` is replaced only if it is still that file.
 
     **On any failure the temp is removed rather than left behind (BACKLOG #1678).** Without this, a
     write that raises — disk full is the realistic trigger and the blob is the large write — leaves a
@@ -3182,7 +3753,10 @@ def _atomic_write_text(root: Path, path: Path, text: str) -> None:
                 os.chmod(
                     tmp, 0o600
                 )  # best-effort (Windows / restricted FS) — directory ACL is the backstop
-            os.replace(tmp, path)
+            if seen is None:
+                os.replace(tmp, path)
+            else:
+                _replace_if_unchanged(tmp, path, seen)
         except BaseException:
             with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)

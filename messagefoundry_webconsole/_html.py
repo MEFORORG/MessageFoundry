@@ -157,9 +157,10 @@ def page(
     ``script-src 'self'`` CSP would block, and no canary that same policy would ALLOW (which would read
     as "CSP not enforced" on a perfectly conforming browser).
 
-    ``head_extra`` appends markup to the ``<head>`` and is ``None`` for every existing caller, so the
-    rendered document is byte-identical unless a caller opts in. It exists for the federated-login
-    landing hop (ADR 0142), which needs a ``<meta http-equiv="refresh">``: a pragma directive is only
+    ``head_extra`` appends markup to the ``<head>``. It defaults to ``None``, which leaves the
+    rendered document byte-identical, and a caller opts in. It exists for the federated-login hops
+    (ADR 0142), the landing hop and the start legs' hop to the IdP, which each need a
+    ``<meta http-equiv="refresh">``: a pragma directive is only
     conforming inside ``<head>``, and relying on browsers' tolerance of one in ``<body>`` would make a
     security-critical redirect depend on undefined behaviour.
     """
@@ -482,10 +483,12 @@ def _default_nav(active: str) -> Markup:
     # Right cluster: the live status glyphs then Sign out, grouped so nav's space-between keeps the links
     # left and this block flush right (heart sits directly left of Sign out, alerts left of the heart).
     right = el("div", _nav_status_icons(), _logout_form(), class_="navright")
-    # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately: a nav is rendered
-    # ONLY on an authenticated page (the two unauthenticated entry pages pass nav=Markup("")), so the
-    # hook is present exactly where a live session's rendered PHI needs discarding when that session
-    # ends — with no per-render authentication plumbing to keep in sync. minimal_nav carries it too.
+    # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately, so the hook is
+    # present wherever a live session's rendered PHI needs discarding when that session ends, with no
+    # per-render authentication plumbing to keep in sync. minimal_nav carries it too, but only when
+    # its caller says a live session exists: on a page served without one, the watchdog's first probe
+    # would send the browser to the login page. A page served without a session never renders this
+    # full nav.
     return el(
         "nav",
         el("div", brand, *groups, class_="navlinks"),
@@ -494,9 +497,17 @@ def _default_nav(active: str) -> Markup:
     )
 
 
-def minimal_nav() -> Markup:
+def minimal_nav(*, session: bool = True) -> Markup:
     """The **confinement chrome**: the brand wordmark plus the one-click POST Sign-out form, and
     nothing else (ASVS 7.4.4).
+
+    Only with ``session`` true does the chrome carry the Sign-out form and the session watchdog.
+    It is not always what the request presents: a page served at the cross-site IdP callback gets
+    no ``SameSite=Strict`` session cookie and keeps the default. A page that may be served without
+    one, at least the OIDC "leaving this site" page and the IdP hop, passes what its route found:
+    with no session the watchdog's first probe gets a 303 from ``GET /ui/session-status`` and sends
+    the browser to the login page, so such a page would never be usable, and it has no session to
+    sign out of. The default is ``True``.
 
     Authenticated pages that deliberately drop the full nav — step-up re-auth, the forced
     must-change-password page, passkey enrolment, the federated landing hop — used to render
@@ -514,6 +525,8 @@ def minimal_nav() -> Markup:
     itself — see :func:`_default_nav`.
     """
     brand = el("a", wordmark(tm=True), href="/ui", class_="brand")
+    if not session:
+        return el("nav", el("div", brand, class_="navlinks"))
     right = el("div", _logout_form(), class_="navright")
     return el("nav", el("div", brand, class_="navlinks"), right, data_mf_session_watchdog=True)
 

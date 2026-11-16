@@ -62,7 +62,7 @@ concurrency:
   # in-flight `cla` run of an UNRELATED one. `cla` is a REQUIRED context and a cancelled run is not
   # a success, so the victim cannot merge until something re-runs it -- and what it waits on reports
   # `conclusion: cancelled` with `steps: 0` and no downloadable log (measured on run 34560869543; a
-  # healthy run has 5 steps), so it renders in the fail column with NOTHING TO READ. That is why the
+  # healthy run then had 5 steps, 6 since the pre-check step), so it renders in the fail column with NOTHING TO READ. That is why the
   # cause sat unattributed: the evidence is not in the victim's own run, it is in the start time of a
   # run on somebody else's branch. Measured 2026-09-11 over this workflow's last 100 runs, with
   # security.yml as a paired control; numbers and method in BACKLOG #1533.
@@ -170,11 +170,80 @@ jobs:
           # It needs the action's FILES on disk, which this checkout still provides.
           persist-credentials: false
 
+      # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). The action reads one page of 100
+      # commits, and matches its allowlist on a commit's free-text git name when no account is
+      # linked. scripts/security/cla_precheck.py reads every commit and refuses what the action would
+      # pass unsigned; its docstring states the two rules it refuses on. It runs on the
+      # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
+      # earlier step fails the action still runs and this step does not.
+      #
+      # FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling 2026-11-13). Exit 1
+      # WITH the script's `CLA pre-check refused` annotation is a refusal and fails the required
+      # `cla` context; exit 1 without it (an import-time traceback) is a fault. Exit 3 is a fault --
+      # a GitHub outage, a malformed reply, bad input, a bug in the script. A fault warns and passes,
+      # because this
+      # workflow runs from the DEFAULT branch: a step that failed on every fault would wedge every
+      # pull request, including the one reverting it. EXIT 2 IS NOT A FAULT AND FAILS: it is what
+      # python3 returns when it cannot open the script, so a renamed script fails loudly instead of
+      # switching the check off. Event data reaches the script through `env:` only, never a
+      # templated `run:` line (zizmor's template-injection rule). CLA_ALLOWLIST and the two
+      # CLA_SIGNATURES_* values must equal the action's `with:` below;
+      # tests/test_merge_gate_controls.py pins them equal and pins the script path to a real file.
+      - name: CLA pre-check (every commit, unlinked allowlisted names)
+        if: >-
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+           (github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
+          github.event_name == 'pull_request_target'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLA_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          CLA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CLA_ALLOWLIST: 'wshallwshall,dependabot[bot],github-actions[bot]'
+          CLA_SIGNATURES_PATH: 'signatures/version1/cla.json'
+          CLA_SIGNATURES_BRANCH: 'cla-signatures'
+        run: |
+          set +e
+          out="$(python3 scripts/security/cla_precheck.py 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          # Bash builtins only. A refusal is the annotation at the START of a line.
+          refused=no
+          case $'\n'"$out" in
+            *$'\n::error title=CLA pre-check refused::'*) refused=yes ;;
+          esac
+          if [ "$rc" -eq 1 ] && [ "$refused" = yes ]; then
+            exit 1
+          fi
+          if [ "$rc" -eq 3 ] || [ "$rc" -eq 1 ]; then
+            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit $rc, no refusal), so this run rests on the CLA action alone"
+            exit 0
+          fi
+          exit "$rc"
+
+      # THE COMMENT ARM RUNS ONLY ON A PULL REQUEST'S COMMENTS (BACKLOG #5645). GitHub delivers
+      # `issue_comment` for comments on plain issues AND on pull requests, and only the second carries
+      # `github.event.issue.pull_request`. Without that test, a `recheck` or sign comment on a plain
+      # issue ran the action against an issue number, with this job's write-scoped token. The
+      # `pull_request_target` arm is unchanged, and on `merge_group` the step still skips (the `on:`
+      # note above says why that green is accepted). tests/test_merge_gate_controls.py evaluates this
+      # condition per event and fails against the form without the pull-request test.
+      #
+      # `!cancelled()` LETS THIS STEP RUN AFTER THE PRE-CHECK REFUSES. Without a status function
+      # GitHub adds an implicit `success()`, so a refusal would skip the action, and an unsigned
+      # author the ACTION sees would get no request to sign and could not record a sign comment.
+      # The action does NOT see what the pre-check refuses: for those commits it may judge every
+      # author signed and say so in its comment, while the job is red. The job still fails, because
+      # the pre-check step failed, so the `cla` context stays red either way; read the pre-check's
+      # annotations for why.
       - name: CLA Assistant
         if: >-
-          (github.event.comment.body == 'recheck' ||
-           github.event.comment.body == 'I have read the CLA and I agree to its terms.') ||
-          github.event_name == 'pull_request_target'
+          !cancelled() &&
+          ((github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+           (github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
+          github.event_name == 'pull_request_target')
         uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1); upstream archived, see .github/actions/cla-assistant-lite/README.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

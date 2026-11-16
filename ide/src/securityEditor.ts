@@ -7,13 +7,15 @@
 // read-only (GET /security/posture). The switches are pure data (booleans/ints/strings, no code), so —
 // like connections.toml (ADR 0007) and [[alerts.rules]] (ADR 0014) — they are GUI-manageable.
 //
-// Every switch defaults to the SECURE position; when the operator moves one to its insecure value the
-// form shows a plain-language loosening warning in place (CISA "make deviations from safe defaults
-// obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
+// Every switch defaults to the SECURE position; when the operator moves one to its insecure value, or a
+// session limit above its default, the form shows a plain-language loosening warning in place (CISA
+// "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
+import * as fs from "node:fs";
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
+import { ShownFile, saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
 
 interface ShowResult {
   values: Record<string, unknown>;
@@ -22,7 +24,9 @@ interface ShowResult {
   loosenings: { switch: string; risk: string }[];
 }
 
-let panel: vscode.WebviewPanel | undefined;
+// The open panel and the file its form shows. The file is held per panel, so a late refresh from a
+// disposed panel can neither set it nor save through it.
+let panel: { readonly view: vscode.WebviewPanel; readonly shown: ShownFile } | undefined;
 
 /** Open the [security] editor: loads the current switches + secure defaults and saves edits via the CLI. */
 export async function openSecurityEditor(context: vscode.ExtensionContext): Promise<void> {
@@ -31,21 +35,32 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
     void vscode.window.showInformationMessage("MessageFoundry: open a workspace folder first.");
     return;
   }
-  if (panel) {
-    panel.reveal(vscode.ViewColumn.Active);
-    void refresh(panel);
+  // Refused at the command, as newRoute.ts refuseUntrusted() does, so no panel opens to go stale
+  // after a trust grant. configPath() checks again, before any file-system call.
+  if (!vscode.workspace.isTrusted) {
+    void vscode.window.showWarningMessage(
+      "MessageFoundry: trust this workspace to edit its security settings. The editor reads the workspace's folders to check its settings path.",
+    );
     return;
   }
-  panel = vscode.window.createWebviewPanel(
+  if (panel) {
+    panel.view.reveal(vscode.ViewColumn.Active);
+    void refresh(panel.view, panel.shown);
+    return;
+  }
+  const current = vscode.window.createWebviewPanel(
     "messagefoundry.securityEditor",
     "Security Settings",
     vscode.ViewColumn.Active,
     { enableScripts: true },
   );
-  const current = panel;
+  const shown = new ShownFile();
+  const opened = { view: current, shown };
+  panel = opened;
   current.onDidDispose(
     () => {
-      if (panel === current) {
+      shown.dispose();
+      if (panel === opened) {
         panel = undefined;
       }
     },
@@ -53,29 +68,60 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
     context.subscriptions,
   );
   current.webview.onDidReceiveMessage(
-    async (m: { command?: string; updates?: Record<string, unknown> }) => {
-      if (m?.command === "save" && m.updates) {
-        await save(m.updates, current);
+    async (m: { command?: string; updates?: unknown }) => {
+      if (m?.command === "save") {
+        // Checked here as well as in the webview: this is what reaches the file (BACKLOG #5411).
+        const problem = saveUpdatesProblem(m.updates, FIELDS);
+        if (problem !== null) {
+          postToWebview(current.webview, { command: "error", message: `Not saved: ${problem}.` });
+          return;
+        }
+        await save(m.updates as Record<string, unknown>, current, shown);
       } else if (m?.command === "cancel") {
         current.dispose();
       }
     },
   );
   current.webview.html = formHtml(current.webview);
-  await refresh(current);
+  await refresh(current, shown);
+}
+
+/** The service-settings file to read and write, within the rules of securityConfigTarget
+ *  (BACKLOG #5411), or undefined after the refusal is posted to the webview. */
+function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
+  // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
+  const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
+  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
+  const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
+  const target = securityConfigTarget(ws, serviceConfig(), { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+    lstat: fs.lstatSync,
+    realpath: fs.realpathSync.native,
+  });
+  if (!target.ok) {
+    postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
+    return undefined;
+  }
+  return target.path;
 }
 
 /** Re-read `security show` and push the current state (values + defaults + loosenings) to the webview. */
-async function refresh(current: vscode.WebviewPanel): Promise<void> {
+async function refresh(current: vscode.WebviewPanel, shown: ShownFile, resolved?: string): Promise<void> {
   const ws = workspaceDir();
-  if (!ws) {
+  if (!ws || shown.disposed) {
+    return;
+  }
+  shown.clear();
+  // After a save, the file just written, so the state shown is that file's even if the setting moved.
+  const file = resolved ?? configPath(ws, current);
+  if (file === undefined) {
     return;
   }
   try {
-    const state = await runJson<ShowResult>(
-      ["security", "show", "--service-config", serviceConfig()],
-      ws,
-    );
+    const state = await runJson<ShowResult>(securityShowArgs(file), ws);
+    if (shown.disposed) {
+      return;
+    }
+    shown.set(file);
     postToWebview(current.webview, { command: "state", state });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -87,21 +133,32 @@ async function refresh(current: vscode.WebviewPanel): Promise<void> {
 async function save(
   updates: Record<string, unknown>,
   current: vscode.WebviewPanel,
+  shown: ShownFile,
 ): Promise<void> {
   const ws = workspaceDir();
-  if (!ws) {
+  if (!ws || shown.disposed) {
+    return;
+  }
+  const file = configPath(ws, current);
+  if (file === undefined) {
+    return;
+  }
+  if (!shown.matches(file)) {
+    postToWebview(current.webview, {
+      command: "error",
+      message:
+        "Not saved: the settings file this form shows is not the one messagefoundry.serviceConfig names now. " +
+        "Run Edit Security Settings to read the file again.",
+    });
     return;
   }
   try {
-    await runJson(
-      ["security", "set", "--service-config", serviceConfig(), "--data", JSON.stringify(updates)],
-      ws,
-    );
+    await runJson(securitySetArgs(file, updates), ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
-  await refresh(current);
+  await refresh(current, shown, file);
   void vscode.window.showInformationMessage(
     "MessageFoundry: saved [security] settings. Restart the engine to apply (read at startup).",
   );

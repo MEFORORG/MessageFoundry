@@ -344,8 +344,9 @@ async def test_the_check_reads_the_set_the_revoke_ends(engine: Engine) -> None:
 
 async def test_a_role_id_in_another_case_names_the_same_holders(engine: Engine) -> None:
     """RED when: the holder set matches the role id exactly. A store that compares ids without
-    case finds the role from ``CUSTOM:...``, so an exact match would let that spelling save with
-    the window alone and revoke nobody (the vault BACKLOG #3259 class)."""
+    case finds the role from another spelling (the vault BACKLOG #3259 class), so the step-up gate
+    asks for proof for that spelling too. The save itself refuses any inexact id since BACKLOG
+    #5725 (tests/test_custom_role_exact_id.py)."""
     service = await _service(engine)
     role = await service.create_custom_role(
         display_name="Lab readers", description=None, permissions=["messages:read"], actor="t"

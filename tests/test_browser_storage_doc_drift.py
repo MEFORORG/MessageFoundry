@@ -27,6 +27,8 @@ import re
 
 import pytest
 
+from scripts.security.js_lexer import blank_js_comments
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _PHI_MD = _ROOT / "docs" / "PHI.md"
 _APP_JS = _ROOT / "messagefoundry_webconsole" / "static" / "app.js"
@@ -37,86 +39,12 @@ _FORBIDDEN_APIS = ("sessionStorage", "indexedDB")
 #: A quoted string-literal prefix handed to a storage setter, e.g. ``var PREFIX = "mfcols:v2:";``.
 _PREFIX_LITERAL = re.compile(r'PREFIX\s*=\s*"([^"]+)"')
 
-#: Characters after which a ``/`` opens a regex literal rather than dividing.
-_REGEX_OPENERS = frozenset("(,=:[!&|?{};+-*%<>~^")
-#: Keywords after which a ``/`` opens a regex literal too (``return /x/.test(s)``).
-_REGEX_KEYWORDS = frozenset(
-    {
-        "return",
-        "typeof",
-        "case",
-        "do",
-        "else",
-        "in",
-        "of",
-        "void",
-        "delete",
-        "throw",
-        "new",
-        "yield",
-    }
-)
-
-
-def _js_code(source: str) -> str:
-    """``source`` with every JavaScript comment blanked to spaces; string literals are kept.
-
-    The presence probes below read this, not the raw file (BACKLOG #2056). ``app.js`` names
-    ``localStorage`` in comments, so deleting the real storage calls left a raw scan True. A small
-    scanner, not a parser: it skips quoted strings, template literals and regex literals (a ``/``
-    after an operator, an opening bracket or a keyword such as ``return``) so a ``//`` inside one is
-    not read as a comment. A template literal's ``${}`` holes are treated as string. A quote with no
-    closing quote on its line ends at the newline, so one misread cannot run to the end of the file.
-    Newlines are kept.
-    """
-    out: list[str] = []
-    i, n = 0, len(source)
-    prev = ""
-    while i < n:
-        char, nxt = source[i], source[i + 1 : i + 2]
-        end = i + 1
-        if char in "'\"`":
-            while end < n and source[end] != char and (char == "`" or source[end] != "\n"):
-                end += 2 if source[end] == "\\" else 1
-            end += 1
-        elif char.isalnum() or char in "_$":
-            while end < n and (source[end].isalnum() or source[end] in "_$"):
-                end += 1
-            out.append(source[i:end])
-            # A property named like a keyword (``obj.in``) is an operand, so a / after it divides.
-            prev = "x" if i and source[i - 1] == "." else source[i:end]
-            i = end
-            continue
-        elif char == "/" and nxt in ("/", "*"):
-            close = source.find("\n" if nxt == "/" else "*/", i + 2)
-            end = n if close == -1 else close + (0 if nxt == "/" else 2)
-            out.append("".join(c if c == "\n" else " " for c in source[i:end]))
-            i = end
-            continue
-        elif char == "/" and (not prev or prev in _REGEX_OPENERS or prev in _REGEX_KEYWORDS):
-            in_class = False
-            while end < n and source[end] != "\n":
-                if source[end] == "\\":
-                    end += 2
-                    continue
-                if source[end] == "/" and not in_class:
-                    break
-                if source[end] == "[":
-                    in_class = True
-                elif source[end] == "]":
-                    in_class = False
-                end += 1
-            end += 1
-        out.append(source[i:end])
-        if not char.isspace():
-            prev = char
-        i = end
-    return "".join(out)
-
 
 @functools.cache
 def _app_js_code() -> str:
-    return _js_code(_APP_JS.read_text(encoding="utf-8"))
+    # Comment-blanked, never raw (BACKLOG #2056): app.js names localStorage in comments, so a raw
+    # read stayed True after the real storage calls were deleted.
+    return blank_js_comments(_APP_JS.read_text(encoding="utf-8"))
 
 
 def _storage_bullet() -> str:
@@ -189,19 +117,19 @@ def test_js_code_blanks_comments_and_keeps_code() -> None:
     """The instrument, pinned both ways: a comment is ABSENT, a string or a call is PRESENT, and a
     ``//`` inside a string or a regex literal does not start a comment."""
     mention = '// localStorage\n/* var PREFIX = "old:v1:"; */\nvar x = 1;\n'
-    assert "localStorage" not in _js_code(mention)
-    assert not _PREFIX_LITERAL.findall(_js_code(mention))
+    assert "localStorage" not in blank_js_comments(mention)
+    assert not _PREFIX_LITERAL.findall(blank_js_comments(mention))
     real = (
         r'var u = "http://h/x"; var r = s.replace(/\//g, "_"); var t = `a//b`;' + "\n"
         'var PREFIX = "mfcols:v2:"; localStorage.setItem(PREFIX, "1"); // trailing\n'
     )
-    code = _js_code(real)
+    code = blank_js_comments(real)
     assert _PREFIX_LITERAL.findall(code) == ["mfcols:v2:"]
     assert "localStorage.setItem" in code and "trailing" not in code
     assert '"http://h/x"' in code and "`a//b`" in code
-    after_keyword = _js_code('function f(s) { return /"/.test(s); } // gone\nvar k = 1;\n')
+    after_keyword = blank_js_comments('function f(s) { return /"/.test(s); } // gone\nvar k = 1;\n')
     assert "gone" not in after_keyword and "var k = 1;" in after_keyword
-    assert "localStorage" not in _js_code("var r = obj.in / 2; // localStorage\n")
+    assert "localStorage" not in blank_js_comments("var r = obj.in / 2; // localStorage\n")
 
 
 def test_the_presence_probes_fail_when_the_storage_code_is_gone() -> None:
@@ -215,7 +143,7 @@ def test_the_presence_probes_fail_when_the_storage_code_is_gone() -> None:
         "localStorage.", "window.noStorage."
     )
     assert "localStorage" in mutated and "mfcols:v2:" in mutated, "the mentions must survive"
-    code = _js_code(mutated)
+    code = blank_js_comments(mutated)
     assert "localStorage" not in code
     assert not _PREFIX_LITERAL.findall(code)
     assert "mfcols:v2:" not in code

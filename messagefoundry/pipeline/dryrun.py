@@ -54,6 +54,7 @@ from messagefoundry.parsing import (
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.sniff import _lstrip_bom_ws
 from messagefoundry.parsing.split import one_message_bytes
+from messagefoundry.parsing.validate import warm_validation
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -641,24 +642,63 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     return view
 
 
-class UserCodeCalledSysExit(Exception):
-    """A Router, an ``accepts=`` predicate or a Handler called ``sys.exit()`` during a preview.
+_SYSTEM_EXIT_CODE: Any = vars(SystemExit)["code"]  # the C slot's descriptor, for from_exit
 
-    :func:`route_message` turns the ``SystemExit`` into this, so its callers' ``except Exception``
-    reports the message as ``ERROR`` rather than letting the exit leave ``dry_run`` and end
-    ``messagefoundry check`` with whatever code the script passed, 0 included, which reads as a pass.
-    The text is the live runner's own (``wiring_runner.UserCodeCalledSysExit``, vault BACKLOG #3134),
-    kept as a copy because ``wiring_runner`` imports this module, and
-    ``tests/test_user_code_system_exit.py`` fails if the two drift. It names an integer exit code and
-    nothing else: ``sys.exit("...")`` carries the author's text,
-    which could quote a field. It is raised outside the ``except`` that caught the exit, so the
-    ``SystemExit``, and that text, is not on its ``__context__`` either. ``KeyboardInterrupt`` is not
-    converted; it stops the preview."""
+
+class UserCodeCalledSysExit(Exception):
+    """A Router, an ``accepts=`` predicate or a Handler raised ``SystemExit``, ``sys.exit()`` called
+    at run time (vault BACKLOG #3134). The one definition, for the dry run and the live runner alike
+    (vault BACKLOG #5105): it lives here because ``wiring_runner`` imports this module, which cannot
+    import ``wiring_runner`` back, and ``wiring_runner`` re-exports it.
+
+    **In a preview**, :func:`route_message` turns the ``SystemExit`` into this, so its callers'
+    ``except Exception`` reports the message as ``ERROR`` rather than letting the exit leave
+    ``dry_run`` and end ``messagefoundry check`` with whatever code the script passed, 0 included,
+    which reads as a pass. It is raised outside the ``except`` that caught the exit, so the
+    ``SystemExit``, and its text, is not on its ``__context__`` either.
+
+    **In the live engine** it is converted at least where the engine runs that code in-process, so
+    the message takes the internal-error policy as for any other raise. At ``[sandbox].mode``
+    subprocess or isolated, the worker's ``_run_one`` converts at least a ``sys.exit()`` raised while
+    the Router, predicate or Handler runs, a generator Router's body included, and reports this
+    class's text as an error; the parent then raises ``SandboxError`` carrying it, and the worker
+    serves the next message. At least one case is not converted: at ``mode=off``, a ``sys.exit()`` in
+    the ``__str__`` of an exception user code raised, which the internal-error path renders on the
+    event loop.
+
+    **Why convert it at all:** a Router or Handler runs once per message, after the ACK, in a worker
+    thread, and a ``SystemExit`` there is a script habit in one piece of logic, not a request to stop
+    the engine. Left alone, asyncio re-raises it out of the event loop and every connection stops.
+    (``config/wiring.py`` refuses an ``env()`` cast's ``SystemExit`` the same way, BACKLOG #5105.)
+    Only ``SystemExit`` is converted, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router
+    or Handler code raises itself still escapes. A ``KeyboardInterrupt`` would still stop every
+    connection, since in a worker thread it is no Ctrl+C. Converting it too is not done here.
+
+    Redacted by construction: the text names an integer exit code and nothing else, since
+    ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
+    underscore because the name reaches operators, in a dead-letter reason and an alert detail."""
 
     @classmethod
     def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
-        code = exc.code
-        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        # The base slot, not ``exc.code``: a SystemExit subclass can make ``code`` a property,
+        # which is user code that could exit again inside the arm converting this exit.
+        # A caller's isinstance() can be fooled by a faked ``__class__``; such an object has no
+        # slot to read, so it names no code rather than raise inside the converting arm.
+        is_exit = issubclass(type(exc), SystemExit)
+        code: object = _SYSTEM_EXIT_CODE.__get__(exc, SystemExit) if is_exit else None
+        named = ""
+        # type() first, since isinstance() alone may read a user-defined ``__class__``; the
+        # isinstance() after it only narrows for mypy. bool cannot be subclassed, so ``is`` will do.
+        if issubclass(type(code), int) and isinstance(code, int) and type(code) is not bool:
+            # int.__int__, not f"{code}" or int(code): an int subclass's own __format__, __str__ or
+            # __int__ is user code, which could raise, exit again or print a field. The base slot
+            # copies the plain value without calling any of them.
+            try:
+                named = f" with code {int.__int__(code)}"
+            except ValueError:
+                # Past sys.get_int_max_str_digits() an int will not convert to text, and this
+                # must not raise: its callers convert a fault, they do not expect another.
+                named = " with an integer code too long to print"
         return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
 
 
@@ -836,6 +876,17 @@ class DryRunResult:
     # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
     # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
+    # True only when ``error`` is the strict-validation timeout, so a caller can tell that refusal
+    # from every other ERROR without matching its text (BACKLOG #5107): ``check`` does not let a
+    # timeout on its own satisfy a bare ERROR, since it says nothing about the message. Its rule,
+    # with the exceptions, is in ``docs/ADOPTER-CI.md`` section 3.
+    strict_timed_out: bool = False
+    # The strict validator's own content refusal, on time or late (BACKLOG #5107). On time it is
+    # ``error``; past the timeout ``error`` reports the timeout, as the listener would, and this
+    # keeps the verdict the validate still returned. ``None`` when strict validation refused
+    # nothing, or past the timeout passed or raised. **PHI, under the same obligation as
+    # ``error``:** it is the joined hl7apy errors, which can quote the message.
+    strict_refusal: str | None = None
 
 
 class NoInboundError(ValueError):
@@ -949,8 +1000,17 @@ def _dry_run_raw(
     )
 
 
-def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
-    """Strict-validate ``text`` under the listener's timeout; the refusal text, or ``None`` if valid.
+class _StrictRefusal(NamedTuple):
+    """A strict-validation refusal: the listener's text, whether it is the timeout, and the
+    content refusal the validate returned, on time or late, if it returned one."""
+
+    text: str
+    timed_out: bool
+    verdict: str | None
+
+
+def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal | None:
+    """Strict-validate ``text`` under the listener's timeout; the refusal, or ``None`` if valid.
 
     The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread`` and refuses
     with ``strict-validation timed out after <N>s`` once the timeout
@@ -958,7 +1018,8 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     function is synchronous, so it validates **inline and measures**: when the validate took longer
     than that timeout, the result is the listener's text word for word (the parity test compares the
     two), whatever the validate returned or raised, since the listener had usually given up on it by
-    then (the exception is below). A
+    then (the exception is below). A content refusal the late validate did return is kept beside
+    that text as ``verdict``, so ``check`` can still count it (BACKLOG #5107). A
     validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
     disabled (``strict_timeout_s <= 0``) nothing times out.
 
@@ -972,9 +1033,17 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     fired; the preview validates one message at a time and does not model that. Nor does it model
     the listener's late-result recovery: a validate that began before the deadline and finished
     after it, but before the listener handled the timeout, is used there as if it had not timed out,
-    while a dry run reports any validate past the timeout as timed out. Below the timeout the
-    verdict matches; the wall clock, the concurrency and that boundary case do not."""
+    while a dry run reports any validate past the timeout as timed out. And the preview's clock
+    starts after :func:`~messagefoundry.parsing.validate.warm_validation`, so it does not count the
+    process's cold ``hl7apy`` import or its choice-group probe, nor, when the warm-up can parse the
+    body's MSH, the version's library or the structure's reference load (BACKLOG #5107), where the listener's clock counts them on the first
+    validate of each after a start. Nor does the listener keep a late validate's content refusal,
+    which the preview returns as ``verdict`` for ``check``. Below the timeout the verdict matches;
+    at least the wall clock, the concurrency, that boundary case, a listener's first validate and
+    a late verdict do not."""
     timeout = strict_validate_timeout(ic)
+    if timeout is not None:
+        warm_validation(text)
     started = time.monotonic()
     fault: Exception | None = None
     try:
@@ -990,11 +1059,25 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
                 "dry-run strict validation raised %s after its timeout; reported as timed out",
                 type(fault).__name__,
             )
-        return f"strict-validation timed out after {timeout}s"
+        # Kept beside the timeout, not in place of it: the listener would have answered the
+        # timeout, but a refusal the validator did return says the content is invalid, which a
+        # slow runner must not hide from ``check`` (BACKLOG #5107).
+        late = None if fault is not None or result.ok else _refusal_text(result.errors)
+        return _StrictRefusal(
+            f"strict-validation timed out after {timeout}s", timed_out=True, verdict=late
+        )
     if fault is not None:
         raise fault
     # On ``ok`` alone, as the listener refuses: a fault's text can be empty.
-    return None if result.ok else "; ".join(result.errors)[:200]
+    if result.ok:
+        return None
+    refusal = _refusal_text(result.errors)
+    return _StrictRefusal(refusal, timed_out=False, verdict=refusal)
+
+
+def _refusal_text(errors: list[str]) -> str:
+    """The listener's refusal text for a failed strict validate."""
+    return "; ".join(errors)[:200]
 
 
 @runs_author_code
@@ -1095,7 +1178,9 @@ def dry_run(
             message_type=mt,
             control_id=cid,
             summary=summ,
-            error=refused,
+            error=refused.text,
+            strict_timed_out=refused.timed_out,
+            strict_refusal=refused.verdict,
         )
 
     try:

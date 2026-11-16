@@ -403,6 +403,7 @@ const connection: Receiver = {
         routers: ["route_adt"],
         transports: ["mllp", "file"],
         fieldGroups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
         siblings: undefined,
         clone: undefined,
       }),
@@ -1259,8 +1260,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
   // 2026-10-29, BACKLOG #1123). Every malformed state the suite already discards is a trigger, so a
   // case added there is covered here too. Each first renders a state with insecure values, so
-  // 'loosened' is set and defaults are held, and edits two controls without saving, one of them
-  // into a loosening.
+  // 'loosened' is set and defaults are held, and edits two controls into a loosening without
+  // saving: a session limit above its default, and a Yes/No.
 
   /** The page's own `defaults` binding, read in the page's realm: the object collectUpdates() reads. */
   function heldDefaults(p: Page): string[] {
@@ -1289,7 +1290,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.strictEqual(save.disabled, false, `${why}: the good state did not render`);
       assert.deepStrictEqual(
         loosenedFields(p),
-        ["field-allow_unencrypted_phi", "field-local_access_only", "field-require_mfa"],
+        [
+          "field-allow_unencrypted_phi",
+          "field-local_access_only",
+          "field-max_session_hours",
+          "field-require_mfa",
+        ],
         `${why}: the good state and the edit did not mark their loosenings`,
       );
       const held = heldDefaults(p);
@@ -1385,6 +1391,116 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     for (const k of keys) {
       assert.ok(!doc.getElementById("field-" + k).classList.contains("loosened"), `${k}: marked while off`);
     }
+  });
+
+  test("Security Settings: a session limit is marked loosened only above the default the state carries", () => {
+    // Vault BACKLOG #2600: security_loosenings() names each session limit above its shipped default,
+    // and 0 or less is stricter. The default is read from the state, so the control at the end moves
+    // it and the same value stops being a loosening.
+    for (const key of ["sign_out_after_idle_minutes", "max_session_hours"]) {
+      const field = FIELDS.find((f) => f.key === key);
+      assert.ok(field?.looserAboveDefault, `${key}: not read against its default`);
+      assert.ok(field?.risk, `${key}: a loosening needs its risk text`);
+      const marked = (value: number, defaults?: number): boolean => {
+        const p = security.load();
+        p.deliver(
+          variant(STATE_OK, (c) => {
+            c.state.values[key] = value;
+            if (defaults !== undefined) { c.state.defaults[key] = defaults; }
+          }),
+        );
+        assert.deepStrictEqual(p.warnings, [], `${key}=${value}: discarded`);
+        return p.window.document.getElementById("field-" + key).classList.contains("loosened");
+      };
+      const shipped = SECURITY_SHOW.defaults[key] as number;
+      assert.strictEqual(marked(shipped + 1), true, `${key}: above the default is not marked`);
+      assert.strictEqual(marked(shipped), false, `${key}: the default is marked`);
+      assert.strictEqual(marked(shipped - 1), false, `${key}: a stricter value is marked`);
+      assert.strictEqual(marked(0), false, `${key}: 0, which ends every session, is marked`);
+      assert.strictEqual(marked(shipped + 1, shipped + 1), false, `${key}: read against a fixed number`);
+      // An unsaved edit marks it too, as a Yes/No does.
+      const p = security.load();
+      p.deliver(STATE_OK);
+      const input = p.window.document.getElementById("in-" + key);
+      input.value = String(shipped + 100);
+      input.dispatchEvent(new p.window.Event("input"));
+      assert.ok(p.window.document.getElementById("field-" + key).classList.contains("loosened"), `${key}: an edit is not marked`);
+    }
+  });
+
+  // BACKLOG #5412: a number field that is cleared, or holds text that is not a whole number at or
+  // above the field's minimum, must never be saved as 0, which for the retention switch is the
+  // insecure keep-indefinitely value. A cleared field resets the switch to its secure default; any
+  // other bad value refuses the Save, names the field and posts nothing.
+  test("Security Settings: a cleared number field is saved as a reset to the default, never as 0", () => {
+    const ints = FIELDS.filter((f) => f.type === "int");
+    assert.ok(ints.some((f) => f.key === "delete_message_bodies_after_days"), "the retention switch is not a number field");
+    for (const f of ints) {
+      const p = security.load();
+      p.deliver(variant(STATE_OK, (c) => (c.state.values[f.key] = 7)));
+      const input = p.window.document.getElementById("in-" + f.key);
+      for (const blank of [""]) {
+        p.posted.length = 0;
+        input.value = blank;
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 1, `${f.key}=${JSON.stringify(blank)}: Save did not post`);
+        assert.strictEqual(p.posted[0].updates[f.key], null, `${f.key}=${JSON.stringify(blank)}: not sent as a reset`);
+        assert.ok(
+          !p.window.document.getElementById("field-" + f.key).classList.contains("loosened"),
+          `${f.key}=${JSON.stringify(blank)}: a cleared field is marked loosened`,
+        );
+      }
+      assert.strictEqual(refusalShown(p), "", `${f.key}: a cleared field was refused`);
+    }
+  });
+
+  test("Security Settings: Save refuses a number below the minimum or not a whole number, and posts nothing", () => {
+    const ints = FIELDS.filter((x) => x.type === "int");
+    assert.deepStrictEqual(ints.filter((x) => x.min !== undefined).map((x) => x.key), ["delete_message_bodies_after_days"]);
+    for (const f of ints) {
+      // "unparseable" is what a browser holds for text it cannot read as a number, such as "1e": an
+      // empty value with validity.badInput set. jsdom never sets badInput, so the case stubs it.
+      for (const bad of [...(f.min === undefined ? [] : [String(f.min - 1)]), "1.5", "unparseable"]) {
+        const p = security.load();
+        p.deliver(STATE_OK);
+        const input = p.window.document.getElementById("in-" + f.key);
+        if (bad === "unparseable") {
+          Object.defineProperty(input, "validity", { configurable: true, value: { badInput: true } });
+          input.value = "";
+        } else {
+          input.value = bad;
+        }
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 0, `${f.key}=${bad}: Save posted a bad value`);
+        assert.ok(refusalShown(p).includes(f.label), `${f.key}=${bad}: the refusal does not name the field: "${refusalShown(p)}"`);
+        // Fixing the value lets Save through again: the refusal holds nothing back.
+        delete input.validity;
+        input.value = "5";
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 1, `${f.key}: a good value after a refusal did not post`);
+        assert.strictEqual(p.posted[0].updates[f.key], 5);
+      }
+    }
+    // A session limit has no minimum: 0 or less is stricter, and the engine takes it, so a stored
+    // negative value does not block a Save of some other switch.
+    const neg = security.load();
+    neg.deliver(variant(STATE_OK, (c) => (c.state.values.max_session_hours = -1)));
+    neg.window.document.getElementById("save").click();
+    assert.strictEqual(neg.posted.length, 1, "a stored negative session limit blocked Save");
+    assert.strictEqual(neg.posted[0].updates.max_session_hours, -1);
+    // THE CONTROL: an explicit 0 the operator types is still sent as 0, and marked loosened.
+    const p = security.load();
+    p.deliver(STATE_OK);
+    const input = p.window.document.getElementById("in-delete_message_bodies_after_days");
+    input.value = "0";
+    input.dispatchEvent(new p.window.Event("input"));
+    assert.ok(p.window.document.getElementById("field-delete_message_bodies_after_days").classList.contains("loosened"));
+    p.window.document.getElementById("save").click();
+    assert.strictEqual(p.posted.length, 1);
+    assert.strictEqual(p.posted[0].updates.delete_message_bodies_after_days, 0);
   });
 
   for (const r of RECEIVERS) {

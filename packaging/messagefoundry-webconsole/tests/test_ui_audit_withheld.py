@@ -12,9 +12,12 @@ an OIDC-only account never holds.
 from __future__ import annotations
 
 import json
+from typing import Any
 
+import pytest
 from _ui_clients import auth_service, cookie_login, provision, ui_client
 
+from messagefoundry.api.security import ExportStopped
 from messagefoundry.auth import Role
 from messagefoundry.auth.audit_visibility import AUDIT_WITHHELD_HEADER
 from messagefoundry.pipeline import Engine
@@ -109,6 +112,47 @@ async def test_the_console_export_streams_the_engine_export_from_the_cookie(engi
     assert len(rows) == 1 and rows[0]["actor"] == "aud"
     detail = json.loads(rows[0]["detail"])
     assert detail["count"] == 1 and detail["withheld"] is True
+
+
+async def test_the_console_export_stops_when_its_cookie_session_is_revoked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``/ui/audit/export`` hands the engine handler no token, or one it cannot resolve
+    again, so a cookie session revoked mid-export streams on to the end (BACKLOG #3469 finding 3).
+    Seven rows at a page of two; the revoke lands as the second page is read, so the first page is
+    sent and the second is not."""
+    from messagefoundry.api import auth_routes
+
+    monkeypatch.setattr(auth_routes, "_AUDIT_EXPORT_PAGE", 2)
+    service = await auth_service(engine)
+    uid = await provision(service, "aud", [Role.AUDITOR.value])
+    for i in range(7):
+        await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+    real = engine.store.list_audit
+    fired = False
+
+    async def revoke_on_the_second_page(**kw: Any) -> Any:
+        nonlocal fired
+        rows = await real(**kw)
+        if kw.get("before_id") is not None and not fired:
+            fired = True
+            await service.revoke_sessions_for_user(uid, actor="admin")
+        return rows
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "aud")
+        monkeypatch.setattr(engine.store, "list_audit", revoke_on_the_second_page)
+        try:
+            with pytest.raises(ExportStopped):
+                await c.get("/ui/audit/export", params={"actor": "alice"})
+        finally:
+            monkeypatch.setattr(engine.store, "list_audit", real)
+    assert fired
+    stops = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="audit.export.stopped", limit=5)
+    ]
+    assert stops == [{"count": 7, "streamed": 2, "reason": "standing_changed"}]
 
 
 async def test_the_console_export_refuses_a_filter_the_engine_route_would(engine: Engine) -> None:

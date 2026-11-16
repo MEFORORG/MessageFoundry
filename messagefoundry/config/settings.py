@@ -65,7 +65,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
-from messagefoundry.childenv import outside_engine_namespace
+from messagefoundry.childenv import pass_environment_refusal
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -399,8 +399,8 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 def insecure_tls_allowed() -> bool:
     """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
-    SQL Server, for one) are MITM-able, so the escape lets one through only when
+    Set is not honoured. Certificate-validation overrides (``tls_verify=false`` on MLLP, for one)
+    are MITM-able, so the escape lets one through only when
     ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
     cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
     add that condition. Under ``enforce``, the default, or where the code knows no posture, the
@@ -439,15 +439,16 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
 
     The **weakened-TLS / cleartext-escape** cells route their global-escape check through
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
-    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
-    (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
+    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
     (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
     named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
-    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
-    out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
+    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the out-of-gate
+    #329 cells, whose construction never stamps the contextvar). The engine<->store hop and the SQL
+    Server DATABASE connection no longer ask: a weakened one refuses at every posture (owner ruling
+    2026-11-14, vault BACKLOG #3533 item 2). Semantics: the escape must
     be set, AND a posture must be known, AND it must not be enforcing. For a known posture this is
     :func:`hop_insecure_escape_downgrades`, which it calls rather than repeats (vault BACKLOG #3753).
 
@@ -520,15 +521,15 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
     ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
-    **Why the dial is read from the environment and not from loaded settings.** The check runs inside
-    ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
-    boot load, and offline commands. At least ``check`` and ``dryrun`` load config before they read
-    any settings, and the worker never reads a settings file. A posture handed down by each caller
-    would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
-    an environment variable, so the dial that unlocks it is read from the same place, the same way in
-    every one of those processes. The sandbox worker's environment is an allowlist, so
-    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
-    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
+    **Why the dial is read from the environment and not from loaded settings.** The check runs in every
+    process that reads a config directory, through ``load_config`` or ``read_trusted_snapshot``:
+    ``serve``, a reload, a sandbox session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
+    load config before they read any settings. A posture handed down by each caller would be missed
+    by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is an environment
+    variable, so the dial that unlocks it is read from the same place, the same way in every one of
+    those processes. The sandbox worker is not one of them: it loads the snapshot its parent read
+    and checked, sent in the boot frame (vault BACKLOG #2596), so neither variable is in its
+    environment (vault BACKLOG #2587).
 
     **Where "never under enforce" holds.** For a process whose settings come from
     :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
@@ -560,8 +561,7 @@ def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> 
 
     ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
     same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
-    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
-    config-source check reads what the engine's read."""
+    set. The escape's clamp reads every one of them."""
     env = os.environ if environ is None else environ
     key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
     return tuple(
@@ -709,7 +709,8 @@ class StoreSettings(_Section):
         default=False,
         description=(
             "Execute the pooled claim via the two lane-family versioned procs "
-            "(dbo.mefor_claim_fifo_heads_cid_v2/_dst_v2; fixed-arity CALL) instead of the ~3KB ad-hoc "
+            "(mefor_claim_fifo_heads_cid_v2/_dst_v2 in the store's schema; fixed-arity CALL) "
+            "instead of the ~3KB ad-hoc "
             "batch. Fails safe to the batch (loud) whenever the startup gate cannot verify both "
             "deployed bodies against this build — at least: a missing proc, a body matching no form "
             "this build deploys, a definition this principal cannot read (no VIEW DEFINITION, or "
@@ -780,9 +781,9 @@ class StoreSettings(_Section):
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
-    # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
-    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # single built-in source; `vault` is the one external envelope-decrypt provider (a lazy, optional
+    # extra, store/keyprovider_vault.py). Any other name fails closed (vault BACKLOG #2595 slice D
+    # removed the external names nobody built). Every external provider counts as a
     # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
@@ -1202,8 +1203,9 @@ class StoreSettings(_Section):
 
         * On SQL SERVER or SQLITE: neither ever sees an ``SSLContext`` — SQL Server pins via an ODBC
           keyword string and SQLite uses no TLS — so no CRL can be loaded on either.
-        * With ``encrypt=false`` or ``trust_server_certificate=true``: ``_build_ssl`` returns no
-          context or a verify-off one, and a CRL means nothing on a hop that verifies no certificate.
+        * With ``encrypt=false`` or ``trust_server_certificate=true``: the hop verifies no
+          certificate, so a CRL means nothing there. ``_build_ssl`` refuses such a hop at open in
+          any case (vault BACKLOG #3533 item 2); this names the CRL setting at load.
 
         Before BACKLOG #300 this also refused ``ssl_crl_file`` without ``ssl_root_cert``, because the
         default path returned ``True`` and asyncpg built the context. The engine builds that context
@@ -2515,8 +2517,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
     ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
     (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
-    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
-    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
+    ``MEFOR_*`` variable at all, no secret a library reads on the engine's behalf, and no
+    interpreter variable that starts a console
+    (:func:`messagefoundry.childenv.pass_environment_refusal`, reused so the rules cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
@@ -2525,16 +2528,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
     by :func:`_reject_passed_secret_references`, which sees every section."""
     for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(
-                f"{key}: an entry is not an environment variable name; "
-                "list names only, never NAME=value"
-            )
-        if not outside_engine_namespace(name):
-            raise ValueError(
-                f"{key}: {name} is one of the engine's own variables; "
-                f"it may not be passed to {receiver}"
-            )
+        refusal = pass_environment_refusal(name)
+        if refusal:
+            raise ValueError(f"{key}: {refusal}; it may not be passed to {receiver}")
     return names
 
 
@@ -2554,8 +2550,10 @@ class SandboxSettings(_Section):
     zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
-    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial fails the message's call
+    **post-ACK** (no NAK), never dropping it, and the ``[delivery] internal_error`` policy handles
+    it: ``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+    or transform halts.
 
     **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
 
@@ -2569,9 +2567,12 @@ class SandboxSettings(_Section):
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
-      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and fails
+      that message's call post-ACK, for the ``[delivery] internal_error`` policy to handle
+      (``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+      or transform halts). A busy-loop can no longer wedge intake, **and** a legitimately slow
+      Handler that used to finish now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with
+      it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2599,8 +2600,10 @@ class SandboxSettings(_Section):
     # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
     # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
     # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
-    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
-    # worker is recycled (ADR 0087, amendment of 2026-10-11).
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it fails, for the
+    # [delivery] internal_error policy to handle (dead-letter under the default continue; under stop
+    # the inbound's routing or transform halts), and its worker is recycled (ADR 0087, amendment
+    # of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
@@ -2726,12 +2729,15 @@ class LogWriteFailurePolicy(str, Enum):  # noqa: UP042
 
 
 class SyslogProtocol(str, Enum):  # noqa: UP042
-    # RFC 5426; fire-and-forget, never blocks the engine (the default).
+    # RFC 5426; fire-and-forget, never blocks the engine (the default). One unframed record per
+    # datagram.
     UDP = "udp"
-    # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
+    # RFC 6587 octet counting (BACKLOG #5924; docs/CONFIGURATION.md forward_protocol states the
+    # framing); connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
     # timeout so a wedged collector can't block the event loop — synchronous send).
     TCP = "tcp"
-    # RFC 5425; syslog over an ssl-wrapped TCP socket (native, no local agent needed — ADR 0080). Same
+    # RFC 5425 octet-counted frames, the same as tcp, over an ssl-wrapped TCP socket (native, no
+    # local agent needed — ADR 0080). Same
     # down-at-startup-skipped + bounded-timeout posture as tcp; the handshake is also bounded so a
     # collector that stalls TLS can't block the event loop. Requires a CA trust anchor unless
     # verification is explicitly disabled (see LoggingSettings.forward_tls_*).
@@ -4316,6 +4322,14 @@ class AuthSettings(_Section):
         cannot see."""
         return self.ad_enabled and self.ad_session_recheck_seconds > 0
 
+    @property
+    def ad_reconcile_unreached_window(self) -> int:
+        """How many of one account's last probes the unreachable-account page weighs (BACKLOG
+        #3100, #3709 closing step 6): ``2K - 1`` for K ``ad_reconcile_outage_passes``, so K
+        failures in it outnumber the answers. Said once here, for the service and the loosening
+        text alike."""
+        return 2 * self.ad_reconcile_outage_passes - 1
+
     @model_validator(mode="after")
     def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
         """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
@@ -4730,8 +4744,10 @@ class AiSettings(_Section):
     allowed_endpoints: list[str] = []
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
-    # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
-    # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
+    # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
+    # reaches the app serving POST /ai/chat, and the endpoint is not loopback (BACKLOG #5527;
+    # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
+    # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
@@ -5239,6 +5255,41 @@ def _bare_domain_entries(
     return cleaned
 
 
+def pinned_host_port(entry: str) -> tuple[str, int] | None:
+    """``entry`` read as a loopback ``host:port``, or ``None`` when it is not one.
+
+    The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
+    the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
+    port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
+    host and a port. The ``host[:port]`` lists have their own entry parse, in ``transports.egress``
+    (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
+    least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
+    ``:`` outside brackets, or none inside them; and a host the
+    sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
+    machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
+    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
+    host, _, port = entry.strip().rpartition(":")
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+        if ":" not in host:
+            return None
+    elif ":" in host:
+        return None
+    # The length cap first: int() refuses a string of more than 4300 digits with its own error.
+    if not (port.isascii() and port.isdigit()) or len(port) > 5:
+        return None
+    number = int(port)
+    # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
+    # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
+    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+        return None
+    try:
+        return ipaddress.ip_address(host).compressed, number
+    except ValueError:
+        return host.lower(), number
+
+
 class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
@@ -5247,8 +5298,9 @@ class EgressSettings(_Section):
     is empty refuses every destination of that type; once a transport's list is set, a destination of
     that transport not on it is **refused at config load/reload** (fail-closed), checked against the
     resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
-    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
-    their own ``[alerts]`` host allowlists.
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks keep their own ``[alerts]`` host
+    allowlists. They send no message body, but some alerts carry free-text detail (the docs/PHI.md
+    logging-inventory rows for the ``[alerts]`` webhook and SMTP transports, rows 10 and 11).
 
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
@@ -5325,6 +5377,25 @@ class EgressSettings(_Section):
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
+    # The ECH-SIDECAR address allowlist (BACKLOG #5528, ADR 0139). Each entry is "host:port", and
+    # the port is REQUIRED: an entry with none is refused at load rather than read as any port, as
+    # the `host[:port]` lists such as `allowed_http` read it. The host must be one the sidecar
+    # resolver reads as this machine, or the entry could never match. NOT a destination list: it
+    # gates the loopback sidecar an `ech_egress` REST connection sends every request to, body and
+    # credential headers included, and the token-endpoint POST too on a SMART or OAuth2
+    # connection. Loopback alone does not bound that hop: without this list a connection could
+    # name any port on this host, and whatever listened there would receive it. Its own list, not
+    # `allowed_http`, for the reason `allowed_proxy` is: the sidecar is an intermediary, not where
+    # PHI is meant to end up.
+    #
+    # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` above: an `ech_egress`
+    # connection is refused at config load while this list is empty, whatever
+    # `[security].block_unlisted_outbound` says. An instance with no ECH connection is never refused
+    # for an empty list, though a malformed entry is refused at load either way.
+    # The gate is `_check_ech_sidecar_egress` in messagefoundry/transports/egress.py, and it
+    # parses each entry with `pinned_host_port`, defined above this class. Env (comma-separated):
+    # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
+    allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
     # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
     # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
@@ -5360,6 +5431,7 @@ class EgressSettings(_Section):
         "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
+        "allowed_ech_sidecar",
         "allowed_syslog",
         mode="before",
     )
@@ -5453,6 +5525,30 @@ class EgressSettings(_Section):
             "subdomain as its own entry",
         )
 
+    @field_validator("allowed_ech_sidecar", mode="after")
+    @classmethod
+    def _ech_sidecar_entries_pin_a_port(cls, value: list[str]) -> list[str]:
+        """Refuse at load an entry :func:`pinned_host_port` cannot read, so one with no port is
+        never taken for any port (BACKLOG #5528). Whitespace is stripped and a blank entry skipped.
+        The refusal names the entry by position among the non-blank ones, not by text: an operator
+        who pasted the sidecar's URL, credential and all, would otherwise find it in the error. The
+        env form drops blank items before this runs, so the position skips blanks in both forms."""
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip()
+            if not item:
+                continue
+            if pinned_host_port(item) is None:
+                raise ValueError(
+                    f"[egress].allowed_ech_sidecar entry {len(cleaned) + 1} (counting non-blank "
+                    "entries) is not a loopback 'host:port'. "
+                    "Write the sidecar's loopback host and its port, such as '127.0.0.1:8123', "
+                    "'localhost:8123' or '[::1]:8123'; an entry with no port is refused rather "
+                    "than read as any port"
+                )
+            cleaned.append(item)
+        return cleaned
+
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
 #:
@@ -5520,6 +5616,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
+        # BACKLOG #2903 (ADR 0216): the Vault privilege preflight found a Vault token over-granted,
+        # or could not read it, at start.
+        "vault_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
@@ -5884,8 +5983,9 @@ class AlertsSettings(_Section):
 
     A transport is *enabled* when its essentials are present: ``webhook_url`` for the webhook;
     ``email_smtp_host`` + ``email_from`` + at least one ``email_to`` for email. The SMTP password is a
-    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads carry only the
-    connection name + queue shape (no PHI)."""
+    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads have no
+    message-body field, but they are not PHI-free: some events still send free-text detail off the
+    box, and docs/PHI.md row 10 names at least some of them."""
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
@@ -6382,9 +6482,11 @@ class ClusterSettings(_Section):
     # take over until the lease it just re-extended expires again.
     #
     # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
-    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER only
-    # the claim/renew, as SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused
-    # there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
+    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
+    # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
+    # and the paused tick's owner read at the smaller of this and half its own budget, at least,
+    # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
+    # under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -9047,9 +9149,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
       They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
       caller whose two disagree reports the ``[auth]`` value, so it can miss a new loosening or
-      keep one just removed: at least the ``security set`` preview, which pairs the edited
-      ``[security]`` with the ``[auth]`` it loaded before the edit, and a ``security show`` that
-      could not load the whole file and fell back to a default ``[auth]``.
+      keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
+      read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.
@@ -9066,7 +9167,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       revokes nothing, so the page about a revocation gap arrives later. The load bounds it to 2 to
       100, inside which a larger value is still looser. ``run - 1`` intervals after the first such
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
-      interval's entry says so too.
+      interval's entry says so too. The same value bounds one account the directory keeps failing
+      for, at that many of up to its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100,
+      #3709). A value other than 3 changes which failure patterns raise that page, and when. It
+      does not simply delay it: a pattern that pages at one value may never page at another.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9616,6 +9720,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         # (run - 1) intervals after the first such pass is the least time to the page, never its
         # estimate.
         run = auth.ad_reconcile_outage_passes
+        window = auth.ad_reconcile_unreached_window
         floor = (
             f"at least {run} passes that read it unreachable, no sooner than "
             f"{(run - 1) * interval} s after the first of them"
@@ -9628,8 +9733,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
-                    f"which comes after at least {run} of that account's own probes running "
-                    f"fail, at least {(run - 1) * interval} s after its first such probe",
+                    f"which comes once {run} of up to that account's last {window} probes "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe. The "
+                    "longer interval spaces that account's probes further apart, which changes "
+                    "which failures that vary over time raise that page, and when, and a failure "
+                    "bounded in time can end before it pages at all",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9642,7 +9750,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for, so that page waits longer too",
+                    f"keeps failing for, at {run} of up to its last {window} probes. A value "
+                    "other than the default changes which failure patterns raise that page, and "
+                    "when. It does not simply delay it: a pattern that pages at one value may "
+                    "never page at another",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9665,9 +9776,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
                     "denominator, so a smaller wave of revocations aborts the pass. In an estate "
-                    "larger than the sample each account is probed less often, so the page about "
-                    "one account the directory keeps failing for, which counts that account's "
-                    "probes, comes more passes later too",
+                    "larger than the sample each account is probed less often, which changes "
+                    "which failures that vary over time raise the page about one account the "
+                    "directory keeps failing for, and when, since it counts that account's "
+                    "probes, and a failure bounded in time can end before it pages at all",
                 )
             )
         brake = (
@@ -10110,6 +10222,7 @@ def security_loosenings(
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
     service_env: ServiceEnvPosture | None,
+    listener_trusted_proxy_hops: Sequence[str] = (),
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -10122,11 +10235,16 @@ def security_loosenings(
     SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
-    BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
-    AD timeout, step-up window, TOTP skew and temporary-password life
-    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
-    the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
+    BACKLOG #2600), the ``[auth]`` settings :func:`_auth_limit_loosenings` lists, each named only
+    when set looser than its shipped default (#1131, vault BACKLOG #2600 step 4): at least the
+    sign-in, PHI-read and admin-write limiters, the lockout, the time floors, the session cap, the
+    ``[security]`` session limits (read off their ``[auth]`` copies), the step-up window, TOTP
+    skew, temporary-password life, recovery-code count, password length floor, AD timeouts, the
+    directory reconciler and federated sign-in (that function's docstring reads each field, and
+    the numeric census in ``tests/test_security_posture_defaults.py`` is the field list, red on a
+    numeric ``[auth]`` field neither named nor exempt with a reason, so these groups name no
+    field to fall behind), the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings`
+    lists, read the same way
     (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
     #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),
@@ -10247,10 +10365,13 @@ def security_loosenings(
 
     ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
-    Windows service, which engine secrets that service's registry-held environment list names,
-    and whether a store key reaches it through its environment. A store key in that list refuses
-    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
-    for ``remote_debug``.
+    Windows service, whether its registry-held environment lists could be read, and whether a
+    store key reaches it through its environment. An engine secret or any ``MEFOR_VALUE_*``
+    variable in those lists refuses the
+    start of ``serve`` and ``supervise``, and the build of ``create_app`` and
+    ``create_managed_app``, which never reach this registry then; a caller that reads it with no
+    refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
+    engine finds its service. ``None`` has the meaning it has for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -10272,7 +10393,10 @@ def security_loosenings(
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
     ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
     ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
-    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    (ADR 0139), and ``listener_trusted_proxy_hops`` is an inbound ``Http()`` listener with a
+    non-empty ``trusted_proxies`` (BACKLOG #5525), read by ``listener_trusted_proxy_hops``, which
+    walks the ``HTTP`` inbounds. That one alone has a default, empty, so the callers that have no
+    graph need not name it; every caller with a graph passes it. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10730,17 +10854,28 @@ def security_loosenings(
     # BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern: the AI endpoint's revocation
     # attestation. Named whenever the flag is set, whatever [ai].mode is, so the text claims no hop
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
+    # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
+    # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
+    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
+    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
+    # arguments. Loopback could be read off ai.endpoint, but the
+    # app half would still be static, so both stay named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
                 "ai.endpoint_revocation_attested",
                 "revocation of the [ai].endpoint server certificate is attested as covered outside "
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
-                "verifies that certificate but its own handshake checks no CRL and no OCSP, and the "
-                "attestation adds no check. Wherever the revocation refusal would apply to that hop "
-                "it is lifted, so a revoked certificate is caught only if what the reason names "
-                "really covers it. No CRL lever is built for this hop. It never lifts a cleartext "
-                "refusal",
+                "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
+                "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
+                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
+                "whatever [tls].crl_file says. The "
+                "attestation adds no check. Where no CRL is checked, the revocation refusal is "
+                "lifted wherever it would apply to that hop, so a revoked certificate is caught "
+                "there only if what the reason "
+                "names really covers it. It never lifts a cleartext refusal",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
@@ -10959,6 +11094,25 @@ def security_loosenings(
                 "sidecar listener encrypts the hop. A name marked possibly has an env() value this "
                 "reading could not resolve, and the above holds of it only if it resolves to an "
                 "http:// sidecar with ech_egress on",
+            )
+        )
+    # BACKLOG #5525, owner ruling 2026-11-10: an HTTP listener that keys its failed-attempt budget
+    # on the client a listed proxy forwards. Reported for any non-empty list, as [api] ranges are
+    # for theirs: each listed proxy may key the budget on any address it writes.
+    if listener_trusted_proxy_hops:
+        named = ", ".join(sorted(listener_trusted_proxy_hops))
+        out.append(
+            (
+                "listener_trusted_proxies",
+                f"{len(listener_trusted_proxy_hops)} HTTP listener(s) key the failed-attempt budget "
+                f"on the client address a listed proxy writes in X-Forwarded-For ({named}) -- "
+                "each listed proxy, and every host inside a listed range, may write any address "
+                "there and so hold a fresh per-peer budget per address (for most IPv6, per /64). Guessing "
+                "through it is then bounded by the global budget, plus the per-peer budget of each "
+                "address it writes that authenticated recently, which the global budget exempts; "
+                "writing a partner's address also spends that partner's budget. A name marked "
+                "range lists a "
+                "range; a name marked possibly has an env() value this reading could not resolve",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like

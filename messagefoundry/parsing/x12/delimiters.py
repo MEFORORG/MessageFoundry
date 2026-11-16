@@ -21,6 +21,7 @@ error/dead-letter path. This module is **pure** (no I/O, no engine imports): it 
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from messagefoundry.parsing.x12.errors import X12PeekError
@@ -29,6 +30,10 @@ __all__ = [
     "Delimiters",
     "discover_delimiters",
     "find_isa_start",
+    "isa_end",
+    "isa_separators_line_up",
+    "iter_segments",
+    "skip_leading_noise",
     "ISA_SEGMENT_LEN",
     "ELEMENT_SEP_OFFSETS",
     "DEFAULT_MAX_INTERCHANGE_BYTES",
@@ -59,11 +64,24 @@ def _element_separator_offsets() -> tuple[int, ...]:
 
 
 ELEMENT_SEP_OFFSETS = _element_separator_offsets()
+# The sanity-gate positions: every element-separator offset but the defining one at +3.
+_GATE_SEP_OFFSETS = ELEMENT_SEP_OFFSETS[1:]
+# (element number, start, end) of each ISA element's data relative to the ISA start, from the same
+# widths: ISA01 is (1, 4, 6) and ISA16 is (16, 104, 105).
+_ISA_ELEMENT_SPANS = tuple(
+    (number, offset + 1, offset + 1 + width)
+    for number, (offset, width) in enumerate(
+        zip(ELEMENT_SEP_OFFSETS, _ISA_ELEMENT_WIDTHS, strict=True), 1
+    )
+)
 _COMPONENT_SEP_OFFSET = 104  # ISA16
 _SEGMENT_TERM_OFFSET = 105
 _REPETITION_SEP_OFFSET = 82  # ISA11
 _VERSION_START, _VERSION_END = 84, 89  # ISA12 (5 chars), e.g. "00501"
 _REPETITION_MIN_VERSION = "00501"  # ISA11 is a repetition separator from 005010 onward
+_REPETITION_MIN_VERSION_BYTES = _REPETITION_MIN_VERSION.encode("ascii")
+# Cosmetic whitespace tolerated before a segment (a pretty-printed feed puts a newline after each one).
+_SEGMENT_WHITESPACE = " \t\r\n\x0b\x0c"
 
 # Leading characters tolerated before the ISA: whitespace + the UTF-8 BOM (U+FEFF) — pretty-printed or
 # BOM-prefixed feeds.
@@ -85,16 +103,67 @@ class Delimiters:
     repetition: str | None
 
 
+def skip_leading_noise(raw: str, start: int = 0) -> int:
+    """Index of the first character at/after ``start`` that is not whitespace or a BOM
+    (``len(raw)`` if there is none)."""
+    i, n = start, len(raw)
+    while i < n and raw[i] in _LEADING_NOISE:
+        i += 1
+    return i
+
+
 def find_isa_start(raw: str, start: int = 0) -> int:
     """Index of the ``ISA`` that opens the next interchange at/after ``start`` (skipping leading
     whitespace/BOM). Raises :class:`X12PeekError` if no ``ISA`` is found there."""
-    i = start
-    n = len(raw)
-    while i < n and raw[i] in _LEADING_NOISE:
-        i += 1
+    i = skip_leading_noise(raw, start)
     if raw[i : i + 3] != "ISA":
         raise X12PeekError("X12 interchange does not begin with an ISA segment")
     return i
+
+
+def isa_separators_line_up(buf: str | bytes | bytearray, isa: int) -> bool:
+    """Whether the ``ISA`` at ``isa`` could open an interchange: every fixed element-separator
+    position present in ``buf`` holds the character at +3, and the element separator, the component
+    separator (+104), the segment terminator (+105) and, from 00501, the repetition separator (+82)
+    that are present are mutually distinct. Positions past the end of ``buf`` are not yet known, so a
+    short header passes. The distinctness check is what fails "ISA" followed by a run of one
+    character, such as padded "VISA" text, which lines up at every separator position.
+
+    Structural only, the same positions and distinctness rule as :func:`discover_delimiters`: it never
+    reads element data, so an ISA with a delimiter inside an element still passes and the parse
+    refuses it (BACKLOG #5536, #5921)."""
+    sep = buf[isa + 3 : isa + 4]
+    for offset in _GATE_SEP_OFFSETS:
+        found = buf[isa + offset : isa + offset + 1]
+        if not found:
+            return True
+        if found != sep:
+            return False
+    return _isa_delimiters_distinct(buf, isa)
+
+
+def _isa_delimiters_distinct(buf: str | bytes | bytearray, isa: int) -> bool:
+    """The distinctness half of :func:`isa_separators_line_up`. Only for a caller that has already
+    read every gate position and found the separator there, so ISA12 is present: whether the element separator, the component
+    separator, the segment terminator and, from 00501, the repetition separator that are present are
+    mutually distinct."""
+    sep = buf[isa + 3 : isa + 4]
+    # Every gate position is present, so ISA12 (offsets 84 to 88, before the last gate at 103) is too.
+    delims = [
+        sep,
+        buf[isa + _COMPONENT_SEP_OFFSET : isa + _COMPONENT_SEP_OFFSET + 1],
+        buf[isa + _SEGMENT_TERM_OFFSET : isa + _SEGMENT_TERM_OFFSET + 1],
+    ]
+    version = buf[isa + _VERSION_START : isa + _VERSION_END]
+    if isinstance(version, str):
+        has_repetition = version >= _REPETITION_MIN_VERSION
+    else:
+        has_repetition = version >= _REPETITION_MIN_VERSION_BYTES
+    if has_repetition:
+        delims.append(buf[isa + _REPETITION_SEP_OFFSET : isa + _REPETITION_SEP_OFFSET + 1])
+    present = [d for d in delims if d]
+    # Compared pairwise rather than through a set: a bytearray slice is not hashable.
+    return all(present[i] != d for i in range(len(present)) for d in present[i + 1 :])
 
 
 def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
@@ -123,7 +192,7 @@ def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
 
     # Sanity gate: every fixed element-separator position (except the defining one at +3) must hold the
     # element separator — catches a mis-sized / non-X12 header before we trust the offsets.
-    for offset in ELEMENT_SEP_OFFSETS[1:]:
+    for offset in _GATE_SEP_OFFSETS:
         if raw[start + offset] != element:
             raise X12PeekError(
                 f"X12 ISA header malformed: expected element separator {element!r} at offset {offset}"
@@ -137,4 +206,54 @@ def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
     if len(set(distinct)) != len(distinct):
         raise X12PeekError(f"X12 delimiters are not mutually distinct: {distinct!r}")
 
+    # The element separator and the segment terminator may not appear in ISA element data (the X12
+    # standard's own rule). The engine reads the ISA by offset, but a tokenizer that splits it on them,
+    # a partner's for one, would let a terminator inside ISA06 open a segment there, so a sender id
+    # could forge an ST or an IEA, or an element separator shift every ISA element after it (BACKLOG
+    # #5536). For a CR+LF terminator both characters are refused. The component and repetition
+    # separators are not: nothing splits the ISA on them, and a 00501 header still carrying ISA11 "U"
+    # would otherwise refuse every id holding a U. Every element is checked, ISA11 and ISA16 too: the
+    # distinctness check above already keeps the element separator and the terminator's first
+    # character out of them, and an LF there beside a CR+LF terminator is refused here. The message
+    # names the element only, never its value.
+    forbidden = set(element) | set(segment)
+    for number, lo, hi in _ISA_ELEMENT_SPANS:
+        if not forbidden.isdisjoint(raw[start + lo : start + hi]):
+            raise X12PeekError(
+                f"X12 ISA header malformed: ISA-{number:02d} holds a delimiter character; "
+                "the element separator and segment terminator may not appear in element data"
+            )
+
     return Delimiters(element=element, component=component, segment=segment, repetition=repetition)
+
+
+def isa_end(isa_start: int, delimiters: Delimiters) -> int:
+    """Index just past the ISA's own segment terminator, where the first body segment begins
+    (``isa_start + 106``, or ``+ 107`` for a ``CR``+``LF`` terminator)."""
+    return isa_start + _SEGMENT_TERM_OFFSET + len(delimiters.segment)
+
+
+def iter_segments(raw: str, isa_start: int, delimiters: Delimiters) -> Iterator[list[str]]:
+    """Yield each segment of the interchange at ``isa_start`` as its element list (``[tag, e1, …]``),
+    stopping after ``IEA``. Tolerates cosmetic whitespace before a segment.
+
+    The ISA's list is ``ISA`` and its 16 elements, each read at its fixed span, and the body is
+    tokenized only from :func:`isa_end` on, so nothing in the fixed-width header can open a segment or
+    shift an element (BACKLOG #5536). ``delimiters`` must come from :func:`discover_delimiters` on
+    this ISA."""
+    element, terminator = delimiters.element, delimiters.segment
+    yield ["ISA", *(raw[isa_start + lo : isa_start + hi] for _, lo, hi in _ISA_ELEMENT_SPANS)]
+    # Walk with find rather than split the remainder, so the body is neither copied whole nor split
+    # past the IEA (X12Peek runs this walk on the routing path).
+    pos, n = isa_end(isa_start, delimiters), len(raw)
+    while pos < n:
+        idx = raw.find(terminator, pos)
+        end = n if idx == -1 else idx
+        stripped = raw[pos:end].lstrip(_SEGMENT_WHITESPACE)
+        pos = end + len(terminator)
+        if not stripped:
+            continue
+        fields = stripped.split(element)
+        yield fields
+        if fields[0] == "IEA":
+            return

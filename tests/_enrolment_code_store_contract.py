@@ -164,7 +164,7 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
         admin_off, code_digest=_digest("a"), expires_at=later, issuer_id="admin-1"
     )
     assert await store.remove_unless_last_admin(
-        admin_off, AdminRemoval.DISABLE, admin_role_id="administrator"
+        admin_off, AdminRemoval.DISABLE, admin_role_id="administrator", audits=()
     )
     assert await _code(store, admin_off) == (None, None, None)
 

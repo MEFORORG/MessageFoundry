@@ -182,8 +182,8 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
-| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, a caller standing in the tree or running a copy of the script that lives in it, a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
 ### `-Path` is the checked route, and a session may run it
@@ -240,7 +240,7 @@ is a copy for readers and can lag it.
   records it. That covers the primary, another repository's worktree, a plain directory, and a
   junction, `subst` or 8.3 spelling of a real worktree.
 - The tree you are standing in, and a tree that holds the copy of the script being run.
-- A tree under `.claude/worktrees`. The next section says why.
+- A tree under `.claude/worktrees`, other than a segment above the primary. The next section says why.
 - A tree that holds another registered worktree.
 - A tree git has locked.
 - A detached HEAD whose commit no ref holds.
@@ -315,7 +315,10 @@ population is worse than no route to it, so a session has none. (BACKLOG #1038, 
 batch 184.) Removing one of those trees stays the user's decision. The user's one standing route is
 the opt-in nightly step, `run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees` (owner request
 2026-11-05), which refuses `-Apply` inside Claude Code; *Run it nightly* below says what it checks
-and what it cannot see.
+and what it cannot see. A `.claude/worktrees` segment
+that lies *above* the primary checkout does not count, so a clone made inside another checkout's
+harness folder still reaches its own trees (vault BACKLOG #2985, item 3); the worktree gate's own
+classifier still counts that segment, so its deny text offers no `-Path` line for them.
 
 One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
 worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
@@ -332,9 +335,10 @@ running batch.
 So `-Path` also refuses on a held **claim** and on **recent activity**, the last four entries in
 the list above. `-Name` refuses on the same four. A claim names the worktree that took it,
 whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
-activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
-`.ruff_cache`. Uncommitted work is dated path by path, at any depth. None is proof that a tree is
-free:
+activity is read from the tree's top folder, each entry directly under it, and every cache
+`$WORKING_TREE_ACTIVITY_CACHES` in [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1)
+names, `.mypy_cache` among them. Uncommitted work is dated path by path, at any depth. None is
+proof that a tree is free:
 
 - Work that was never claimed, in a tree nobody has committed to or written in for six hours,
   passes all four.
@@ -343,9 +347,10 @@ free:
 - A tree that passes all four still goes through the route's own content rules above. On `-Name`,
   older untracked files and ignored files go with it.
 
-**The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
-`git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
-registrations too.
+**The occupancy check is on `-Path` only.** `-Name` has none. Neither route runs a blanket
+`git worktree prune`: `git worktree remove` already drops the target's own registration, and a
+prune also drops other worktrees' registrations whose directories are missing for the moment, with
+their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
 ### `-Name` removes the sibling this copy made
 
@@ -365,7 +370,9 @@ pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts  
 ```
 
 The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes and a git repository inside the tree block removal; `-Discard`
+uncommitted **tracked** changes, a file flagged skip-worktree or assume-unchanged, and a git
+repository inside the tree block removal. With `-Force` the run names the flagged files it lets
+go. `-Discard`
 parks the tracked changes instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
@@ -507,7 +514,13 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
 2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
-   git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
+   git metadata (`index`, `HEAD`, `logs/HEAD`, …), and of the working tree's top level and the files
+   in its test, lint and type-check caches (`Get-WorkingTreeActivity` in
+   [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1), the read the `.claude/worktrees`
+   removal makes too), so a session that ran pytest or mypy at the tree's root and no git command
+   still vetoes. Not every run writes its cache (ruff leaves `.ruff_cache` alone when no file
+   changed), and a file edited in place below the top level moves neither reading. This is the
+   signal that does
    **not** depend on a recorded cwd.
 
 **The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
@@ -554,17 +567,21 @@ that session and this script. The run therefore prints how many candidates signa
 rather than letting "the fence ran" imply "the fence covered it".
 
 What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
-that never registered; and a session that only edits files and runs no git command (invisible to
-signal 2 as well, since it touches none of the metadata files).
+that never registered; and a session that only edits files below the top level and runs no git
+command and no test or type check that rewrites a root-level cache (invisible to signal 2 as well,
+since it moves none of the git metadata, top-level entries or cache files it reads).
 
 Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
 an operator who believes they are fenced when they are not is worse off than one who knows they
 aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
-measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
-explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
-that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
-`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
-`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
+measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" releases trees signal 2 would
+have held); an explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a
+**gh PR probe that errored**; and every **`-Name`-confirmed worktree**. Under `-IdleHours 0` and
+`-Name`, a **recent** signal 2 reading no longer vetoes; an **unknown** one (the git metadata or the
+working tree could not be read) still does, in the decision pass and the `-Apply` re-check alike.
+`-Name` is worth spelling out — it is `-IdleHours 0` scoped to one tree, and since signal 1 has been
+measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can leave a candidate that a session is
+actively working in with no occupancy signal that would stop it. A negative
 `-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
 while appearing to set it.
 
@@ -707,7 +724,8 @@ harness locks a live agent's worktree (observed 2026-11-05 with the reason `clau
 long is not seen**, and its tree can be removed under it. Its committed work survives through refs,
 since the branch is never deleted. The ignored cache directories go with the tree, and what is inside
 one is read only for a few data-like names; an ignored entry git lists outside them, such as a `.env`
-or a `*.db` store, refuses it. The header says what else the step does not see.
+or a `*.db` store, refuses it, except the two local files the header names as tolerated. The header
+says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
@@ -752,6 +770,15 @@ A merged worktree is proposed for removal only when all of these hold:
 - `git status` lists nothing. An untracked `.venv` alone is held too, because removing it needs
   `--force`.
 - No lock, no nested worktree, and no session record in it, live or dead.
+- Nothing the removal would take that `git status` does not show, and nobody holding it (BACKLOG
+  #5647): no file flagged skip-worktree or assume-unchanged, no commit that only its HEAD reflog or
+  its own `refs/worktree`, `refs/bisect` or `refs/rewritten` hold, no allocation naming it whose
+  item is not provably on `origin/main` (the retired-allocator tombstone aside), and no claim naming
+  it. A registry or record that cannot be read holds it too. The readers are the ones the nightly
+  `.claude/worktrees` removal uses, in `worktree-gates.ps1`. For a tree under
+  `.claude/worktrees`, routing the removal through `remove.ps1` instead would not help: `-Path`
+  refuses every such tree. The report shares those readers, not the nightly step's whole gate set,
+  so a tree that step refuses for an ignored file or a nested checkout can still be proposed here.
 
 Any merged worktree that fails one of those goes to NEEDS A HUMAN LOOK with its reasons. The session
 check is the liveness fence `prune-merged.ps1` uses, with the same limit. It cannot see a session
@@ -777,8 +804,9 @@ pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1 -Unregister
 ```
 
 The task runs the **primary checkout's** copy of the report, as you, at run level Limited. It refuses
-to register or unregister from inside Claude Code. After you run the proposed removals, run `claim-reconcile.ps1`
-(below) to release the claims those worktrees held.
+to register or unregister from inside Claude Code. A proposed worktree held no claim when the report
+ran. After you run the proposed removals, run `claim-reconcile.ps1` (below) to release any claim
+taken in one since then.
 
 The Lander owns the hygiene its own merges leave (see CLAUDE.md section 5). After it lands a PR that
 changes a hook, it flags that the installed hooks are stale. It also reports merged branches whose

@@ -79,8 +79,10 @@ def _shard_result(
             )
             real_scan = uploads._scan_metas_sync
 
-            def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
-                out = real_scan(held)
+            def _slow_scan(
+                held: list[Any] | None = None, *, outage_raises: bool = False
+            ) -> list[UploadedFileMeta]:
+                out = real_scan(held, outage_raises=outage_raises)
                 time.sleep(_SCAN_OVERLAP_SECONDS)  # widen the scan -> write window
                 return out
 

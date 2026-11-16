@@ -41,6 +41,7 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "shown_error_class",
     "store_restored_detail",
     "utc_or_unknown",
 ]
@@ -202,14 +203,22 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
         )
     else:
         cause = (
-            "Config most likely reads a variable the worker lacks: add it to "
-            "[sandbox].pass_environment and restart."
+            "Config likely reads a variable the worker lacks: list it in "
+            "[sandbox].pass_environment (no MEFOR_* name, no secret) and restart."
         )
     return (
         f"{cause} Until then every message on this inbound fails at routing or transform: "
         'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
         '"stop". A WARNING line in the engine log names what differs.'
     )
+
+
+def shown_error_class(error_class: str | None) -> str:
+    """The exception class a ``connection_error`` alert shows in the log and off the box, or the
+    fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
+    if type(error_class) is str and error_class.isascii() and error_class.isidentifier():
+        return error_class
+    return "unnamed error"
 
 
 #: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
@@ -407,7 +416,8 @@ class AlertSink(Protocol):
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
         event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content.
+        transport text, so an implementation must not assume it is free of message content, and must
+        not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
@@ -435,7 +445,10 @@ class AlertSink(Protocol):
         a lone engine, so each bound on each process is its own instance: a drained backlog cannot
         resolve a low-disk pause, and one node's clear cannot resolve another node's pause (BACKLOG
         #2272). An unpinned cluster node's id changes on every restart, so that node clears its own
-        instances when it stops. It is not
+        instances when it stops, and a subject no process raises again for
+        :data:`~messagefoundry.pipeline.intake_bound.STALE_SECONDS` is resolved by the sweep of
+        another engine process with an alert sink on the same store, where one runs (BACKLOG
+        #3269). It is not
         a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
         Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``. Carries counts and sizes only: no
@@ -459,8 +472,10 @@ class AlertSink(Protocol):
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        """A served TLS certificate is expired or within the configured warn window. ``name`` labels
-        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        """A watched certificate is expired or within the configured warn window: a served or
+        presented TLS certificate, or a certificate setting such as the OIDC client certificate. ``name`` labels
+        which cert (``"api"``, a connection name, or a setting's dotted name such as
+        ``"auth.oidc_client_certificate"``); ``path`` is the PEM file; ``not_after`` is the
         ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
@@ -668,7 +683,11 @@ class AlertSink(Protocol):
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
         step-up return's audit budget uses ``step_up_return:audit_budget:<action>`` when its
         all-callers backstop stops a row, at most once a window per action (BACKLOG #3965); that
-        row was shed by the budget, not refused by the store. ``action`` is
+        row was shed by the budget, not refused by the store. The directory reconciler uses
+        ``directory-reconciler:<action>`` for a row a completed pass could not write, once per
+        action per pass (BACKLOG #3018 step 2), and a directory sign-in
+        ``directory-sign-in:<action>`` for a role-sync row the store refused twice (BACKLOG
+        #2221). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
@@ -711,7 +730,10 @@ class AlertSink(Protocol):
         ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
         A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
         with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
-        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route. A directory
+        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route; when that
+        role sync holds an error until after its revoke and notice, or the revoke raises, the
+        route has no outcome, and the service raises it with ``via`` = ``directory_sign_in``
+        instead (BACKLOG #2221). A directory
         reconcile pass whose role re-diff newly grants it (vault BACKLOG #3141) raises it with
         ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``. The offline
         ``provision-admin`` command raises it on every Administrator it grants (vault BACKLOG #3849
@@ -757,8 +779,9 @@ class AlertSink(Protocol):
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
-        ``passes`` the page names), raised once per run; or that many of one account's probes running
-        have failed to reach the directory, an outage pass's probes included
+        ``passes`` the page names), raised once per run; or that setting's count of one account's
+        last ``2K - 1`` probes, K being the setting, have failed to reach the directory, an outage
+        pass's probes included
         (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
         once as the account enters that state. The type's name predates every case but the first.
         Read ``reason`` before naming the cause.
@@ -913,7 +936,31 @@ class AlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
-        warning for the same subject, so a fixed grant clears the dashboard."""
+        warning for the same subject, so a fixed grant clears the dashboard, fenced as the ADR 0044
+        BACKLOG #4916 amendment states, so a warning another process raised may stay open."""
+        ...
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        """The Vault privilege preflight found a Vault token over-granted, or could not read it, at
+        start (BACKLOG #2903, ADR 0216). ``finding`` is ``"over_granted"`` or ``"unobservable"``.
+        ``refusing_count`` is how many of the over-grants are in the class that refuses a start
+        under ``enforce`` (the root policy, a grant on an administrative path); it is 0 for a token
+        whose over-grants are all in the warning class, and means nothing for ``"unobservable"``.
+        ``name`` is the subject, ``vault:<hop>`` (``vault:store`` or ``vault:secrets``). ``detail``
+        is the hop's judgment with control characters escaped: policy names, paths and capabilities
+        only, never a token, an accessor or a digest of either, and no message content. Fired
+        before any refusal, so a refused start still pages, and on a grant the opt-out accepts,
+        which quiets nothing. Emitted by
+        :func:`~messagefoundry.vault_preflight.run_vault_privilege_preflight`."""
+        ...
+
+    def vault_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it can auto-resolve
+        the open warning for the same subject; see ``docs/SECURITY.md``'s *A warning still open
+        after a clean start*."""
         ...
 
     def config_changed(
@@ -973,7 +1020,9 @@ class AlertSink(Protocol):
         :meth:`leadership_acquired`. Emits **no** notification (a step-down needs no page); it exists so
         durable alert-state (ADR 0044) **auto-resolves** the matching open ``leadership_acquired`` instance
         (the open set then tracks the current leaders). ``node`` is the node id; ``role`` is ``"follower"``;
-        ``reason`` is a PHI-free cause (``"lease taken or expired"`` / ``"self-fenced"`` / ``"released"``).
+        ``reason`` is a PHI-free cause, at least ``"lease taken or expired"`` / ``"self-fenced"`` /
+        ``"released"`` / ``"lease claim returned past the fence timeout"`` (BACKLOG #5711) /
+        ``"heartbeat lapsed"`` (BACKLOG #5710).
         The default :class:`LoggingAlertSink` logs it; a state-less sink treats it as a no-op."""
         ...
 
@@ -1091,8 +1140,8 @@ class AlertSink(Protocol):
 
 
 class LoggingAlertSink:
-    """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
-    and queue shape are recorded, never a message body."""
+    """Default :class:`AlertSink`: log each event at ``WARNING``. No message-body field, but not
+    PHI-free: an event's free-text detail or reason can go into the line (docs/PHI.md row 13)."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
@@ -1150,12 +1199,11 @@ class LoggingAlertSink:
     ) -> None:
         """This line is general-log text, so it names the caller's exception class and never reads
         ``detail``, which can echo transport text (BACKLOG #3210)."""
-        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
         log.warning(
             "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
-            error_class if plain else "unnamed error",
+            shown_error_class(error_class),
         )
 
     def log_write_failed(
@@ -1515,6 +1563,21 @@ class LoggingAlertSink:
         # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
         log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
 
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # An unobservable read never judged the grant, so a "0 in the refusing class" would read clean.
+        counted = (
+            f"{refusing_count} grant(s) in the refusing class"
+            if finding == "over_granted"
+            else "the token's grants were not read"
+        )
+        log.warning("ALERT vault_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT vault_privilege_clean: %r Vault token observed clean", name)
+
     def config_changed(
         self,
         name: str,
@@ -1655,6 +1718,25 @@ def authority_seal_alert(
     return _raise
 
 
+def authority_seal_page(sink: AlertSink) -> Callable[[str, str], None]:
+    """A store's seal page hook, armed on its
+    :class:`~messagefoundry.store.row_seal.SealPager` (decision d20261109T200352805-599b24 on ADR
+    0217, item 5): each call, with a subject and a reason, raises ``integrity_drift`` on ``sink``.
+    The store builds the subject, at least ``authority-seal-transit`` for an Outage. The reason
+    names no token or Vault reply. It may name a row by its ref
+    (:func:`~messagefoundry.store.row_seal.seal_row_ref`): a session by 12 characters of its token
+    hash, any other row by its stored id, control characters scrubbed and bounded with a checksum,
+    so a short user id appears whole.
+
+    A sink failure propagates to the pager, whose ``page`` logs it and never raises, so a revoke is
+    unchanged and a capped Unverifiable subject spends no slot on a page no sink took."""
+
+    def _raise(subject: str, reason: str) -> None:
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
+
+    return _raise
+
+
 def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
     username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed
@@ -1704,16 +1786,37 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
 
     Carries the key and the action name only. Never raises: an alert failure must not change what a
     step-up return answers."""
+    return _keyed_audit_write_failed(sink, STEP_UP_RETURN_AUDIT_KEY, "step-up return")
+
+
+def _keyed_audit_write_failed(sink: AlertSink, prefix: str, source: str) -> Callable[[str], None]:
+    """A callable that raises :meth:`AlertSink.audit_write_failed` keyed ``<prefix>:<action>`` for
+    each action it is given, and logs a sink failure at WARNING, naming ``source``, rather than
+    raising it: an alert failure must never break a request."""
 
     def _raise(action: str) -> None:
         try:
-            sink.audit_write_failed(f"{STEP_UP_RETURN_AUDIT_KEY}:{action}", action=action)
+            sink.audit_write_failed(f"{prefix}:{action}", action=action)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning(
-                "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+                "the %s audit_write_failed alert could not be delivered", source, exc_info=True
             )
 
     return _raise
+
+
+#: The prefix of the ``audit_write_failed`` key for a directory sign-in's role-sync row the store
+#: refused in the role write's transaction and on its own too (BACKLOG #2221). The action follows a
+#: colon, as for the other keys of that alert.
+DIRECTORY_SIGN_IN_AUDIT_KEY = "directory-sign-in"
+
+
+def directory_sign_in_audit_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with the
+    audit action of a directory sign-in's role-sync row the store refused twice, raises
+    :meth:`AlertSink.audit_write_failed` keyed ``<DIRECTORY_SIGN_IN_AUDIT_KEY>:<action>`` (BACKLOG
+    #2221). Carries the key and the action name only. Never raises."""
+    return _keyed_audit_write_failed(sink, DIRECTORY_SIGN_IN_AUDIT_KEY, "directory sign-in")
 
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:

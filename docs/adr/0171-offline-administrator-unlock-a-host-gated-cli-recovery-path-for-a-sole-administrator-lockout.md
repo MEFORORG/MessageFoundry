@@ -3,7 +3,7 @@
 
 # ADR 0171 — Offline administrator unlock: a host-gated CLI recovery path for a sole-administrator lockout
 
-- **Status:** Accepted (2026-08-22) — built with the change; amended 2026-09-27 (`clear_lockout`, ADR 0197); amended 2026-10-06 — Amendment B, `admin-reset-totp`, by owner ruling (BACKLOG #2226), built with the change
+- **Status:** Accepted (2026-08-22) — built with the change; amended 2026-09-27 (`clear_lockout`, ADR 0197); amended 2026-10-06 — Amendment B, `admin-reset-totp`, by owner ruling (BACKLOG #2226), built with the change; amended 2026-11-14 — Amendment D, the unlock's audit row commits with the clear (BACKLOG #5633)
 - **Date:** 2026-08-22
 - **Related:** [BACKLOG #1236](../BACKLOG.md) · [`__main__.py`](../../messagefoundry/__main__.py) `_admin_unlock` · [ADR 0170](0170-constant-work-recovery-code-verification-pad-to-the-configured-slot-count-rather-than-short-circuit.md) (the neighbouring auth work) · [CLAUDE.md](../../CLAUDE.md) §0 (not-deployed beta), §9 (PHI guardrails)
 
@@ -279,9 +279,10 @@ sweep ran. It never holds the seed or a code. The notice is sent after the row c
 does not say what became of it. The row is not hidden from readers without `users:manage`. It says
 a seed was replaced, which is no password oracle.
 
-**The audit row commits WITH the swap, which is stricter than `admin-unlock`.** `admin-unlock`
-checks the append's refusal before its write (`_refuse_an_unauditable_write`) and appends the row
-after it, as a second write. A failure between the two leaves the change made and unrecorded. For
+**The audit row commits WITH the swap, which is stricter than `admin-unlock`.** (Superseded for
+`admin-unlock` by Amendment D: it now commits its row with the clear too.) `admin-unlock`
+checked the append's refusal before its write (`_refuse_an_unauditable_write`) and appended the row
+after it, as a second write. A failure between the two left the change made and unrecorded. For
 an unlock that is the narrowest change there is, and a re-run repeats it harmlessly. Here the change
 is a live credential. The first build used the unlock's ordering, and its code review confirmed the
 window with a probe that made `record_audit` raise: the new seed stayed in force with no audit row
@@ -378,3 +379,18 @@ code no longer follows the helper that prints it.
   is not a finding here. A busy store that refuses the append itself, such as a running engine holding the write
   lock, keeps exit 1. `admin-reset-totp` still exits 1 on the two open errors; this note does not
   cover it.
+
+## Amendment D (2026-11-14) -- `admin-unlock` commits its audit row with the clear (BACKLOG #5633)
+
+This amends Amendment B's *The audit row commits WITH the swap, which is stricter than
+`admin-unlock`*. That contrast no longer ships: `admin-unlock` now has the same shape.
+
+- `clear_lockout` takes the `auth.admin_unlocked` row as an `AuditAppend` and appends it in the
+  clear's own transaction on SQLite, PostgreSQL and SQL Server. A refused append rolls the clear
+  back, so an unlock never lands unrecorded. It returns whether a row was written; `False` writes
+  and audits nothing, and the command reports the account as removed or changed, exit 1.
+- The OS user is named before the store opens, and the username is stripped once, with an empty
+  one refused, exit 1. Both refusals write nothing.
+- Exit codes follow Amendment C. A refusal of the open, `StoreKeylessError`, `CipherError`, a
+  driver error or a store that cannot be reached among them, exits 2. The same classes raised by
+  the read or the write after the open are a refused write, exit 1, which names the class only.

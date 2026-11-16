@@ -10,7 +10,8 @@ them:
   **nothing** — when the IdP is inside ``[security].organization_domains`` it delegates straight to
   the POST leg instead.
 * ``POST /ui/oidc/start`` mints a server-side flow, drops an opaque flow id in a short-lived
-  ``__Host-`` cookie, and 303s the browser to the IdP.
+  ``__Host-`` cookie, and sends the browser to the IdP with a 200 page that navigates, never a
+  303 (see :func:`pages.idp_handoff`).
 * ``GET /ui/oidc/callback`` re-binds cookie + ``state``, redeems the code, and lands the session.
 
 **Registration is self-gating.** ``register`` returns before declaring any of its routes unless
@@ -20,8 +21,11 @@ at all and ``tests/golden/ui_routes.txt`` is unchanged — that unchanged golden
 Two deliberate departures a reviewer will want to check rather than "fix":
 
 * **No same-origin assertion on the CALLBACK leg**, and that carve-out is specific to it.
-  ``assert_same_origin`` rejects any request whose ``Sec-Fetch-Site`` is ``cross-site``, and the IdP's
-  redirect back here is *legitimately* a top-level cross-site navigation. Adding it there would 403
+  ``assert_same_origin`` rejects any request whose ``Sec-Fetch-Site`` is ``cross-site`` or
+  ``same-site``, and the IdP's redirect back here is *legitimately* one of them: a top-level
+  navigation that is cross-site unless the IdP is on the console's own site, where it is same-site
+  and the /ui fetch-metadata middleware demands ``Sec-Fetch-User: ?1`` of it
+  (``docs/BROWSER-SUPPORT.md``, federated sign-in). Adding it there would 403
   every real federated login while every hermetic test still passed (test clients send no
   ``Sec-Fetch`` headers). ``routes/sso.py`` does not call it either.
   ⛔ **The START legs are the opposite case and DO assert it** (ASVS 3.5.1). They are reached from our
@@ -39,7 +43,10 @@ Two deliberate departures a reviewer will want to check rather than "fix":
   :func:`.._auth.assert_same_origin`.
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
-Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
+Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter,
+except at least the session read on the interstitial GET, which can end a refused session and
+report it** (see ``AuthService.session_shows_signed_in``). The sign-in POST's session read runs
+after its limiter.
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
 The callback picks its limiter from the flow its cookie names (BACKLOG #3374): see
@@ -49,7 +56,7 @@ The callback picks its limiter from the flow its cookie names (BACKLOG #3374): s
 from __future__ import annotations
 
 import logging
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -66,10 +73,13 @@ from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp, O
 
 from .. import pages
 from .._auth import (
+    CLEAR_SITE_DATA_HEADER,
+    CLEAR_SITE_DATA_VALUE,
     allow_reauth_attempt,
     assert_same_origin,
     claim_continuation,
     clear_oidc_flow_cookie,
+    has_live_session,
     hold_claim_for_flow,
     is_unlock_action,
     login_redirect_response,
@@ -237,6 +247,9 @@ _REASON_TO_CODE = {
     # a site where every account is federated.
     "federated_subject_not_bound": "oidc_not_linked",
     "federated_subject_unbound": "oidc_not_linked",
+    # BACKLOG #5624: the bound account was deleted mid-login. Reached by the same visitor as the
+    # mid-login case above, so it keeps the code that refusal had before it was named.
+    "account_deleted": "oidc_not_linked",
 }
 
 
@@ -246,6 +259,24 @@ def _fail(request: Request, code: str, *, keep_flow: bool = False) -> Response:
     resp = RedirectResponse(f"/ui/login?e={code}", status_code=303)
     if not keep_flow:
         clear_oidc_flow_cookie(resp, request)
+    return resp
+
+
+#: The characters Starlette's ``RedirectResponse`` leaves unquoted in a Location. The hop quotes its
+#: target the same way, so it navigates to exactly what the start legs' old 303 sent.
+_LOCATION_SAFE = ":/%#?=@[]!$&'()*+,;"
+
+
+def _idp_hop(
+    request: Request, auth: AuthService, flow_id: str, authorization_url: str, *, session: bool
+) -> Response:
+    """A start leg's answer once its flow is staged: the flow cookie, on a 200 page that navigates
+    to the IdP. Never a 303: the start legs are form POSTs, and the /ui CSP's
+    ``form-action 'self'`` blocks a redirect to the IdP's origin (see :func:`pages.idp_handoff`).
+    ``session`` is whether the request carries a live session, which picks the page's chrome."""
+    target = quote(authorization_url, safe=_LOCATION_SAFE)
+    resp = HTMLResponse(pages.idp_handoff(target, session=session), status_code=200)
+    set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
     return resp
 
 
@@ -308,18 +339,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         if not _interstitial_needed():
             return await ui_oidc_start(request)
+        live = await has_live_session(request, auth)
         # The host SHOWN is the one the predicate judged, read as a browser reads the URL, so a
         # configured string that only looks internal is shown as where it goes (vault BACKLOG #2790).
-        return HTMLResponse(
+        resp = HTMLResponse(
             pages.leaving_site(
                 destination_host=display_host(idp_url) if idp_host else "(not configured)",
                 continue_action="/ui/oidc/start",
                 idn_disguised=is_idn_disguised(idp_url),
                 cancel_href="/ui/login",
                 purpose="Continuing will take you to your organization's sign-in provider.",
+                # Without a live session the page carries no watchdog, which would otherwise send
+                # the browser to the login page before Continue could be clicked.
+                session=live,
             ),
             status_code=200,
         )
+        if not live and session_token(request):
+            # ASVS 14.3.1, as on the login page: a cookie that no longer authenticates is a
+            # terminated session, so its cached pages are dropped here.
+            resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+        return resp
 
     @app.post("/ui/oidc/start")
     @public_route("the federated sign-in start; a session does not exist yet")
@@ -373,6 +413,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 "federated sign-in unavailable: [security].web_console_public_address is not set"
             )
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
+        # Asked before the flow is staged: a store fault here must not leave a staged flow that no
+        # cookie names holding a flow-cache slot until its TTL ends. A browser may start a sign-in
+        # while it holds a session it is about to replace, and then the hop keeps its Sign-out.
+        live = await has_live_session(request, auth)
         try:
             # ASVS 7.2.4: hand over the session this browser holds NOW; the engine stages its hash
             # and ends it only once the IdP proof succeeds. Why here and not at the callback: see
@@ -388,9 +432,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
-        resp = RedirectResponse(authorization_url, status_code=303)
-        set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
-        return resp
+        return _idp_hop(request, auth, flow_id, authorization_url, session=live)
 
     @app.post("/ui/reauth/oidc")
     @public_route("the federated re-authentication a step-up gate sends the browser to")
@@ -398,7 +440,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         """The federated step-up leg's START (BACKLOG #296, ADR 0142 Amendment B).
 
         An OIDC session's ``/ui/reauth`` page posts here. This stages a STEP-UP flow bound to the
-        session and 303s the browser to the IdP with ``max_age=0`` and ``prompt=login``. The IdP
+        session and sends the browser to the IdP with ``max_age=0`` and ``prompt=login``, through
+        the same navigating page as the sign-in start, never a 303. The IdP
         returns to the same ``/ui/oidc/callback``, which tells the two kinds of flow apart.
 
         Authenticated, unlike the sign-in legs, so it draws on the per-ACTOR ceremony budget that
@@ -488,9 +531,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # mints one grant.
         if action.unlock:
             hold_claim_for_flow(flow_id, claim)
-        resp = RedirectResponse(authorization_url, status_code=303)
-        set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
-        return resp
+        return _idp_hop(request, auth, flow_id, authorization_url, session=True)
 
     @app.get("/ui/oidc/callback")
     @public_route("the federated sign-in return; a session does not exist yet")
@@ -544,7 +585,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 )
             # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
             return _fail(request, "oidc_failed", keep_flow=True)
-        # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
+        # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site",
+        # or "same-site" when the IdP is on the console's site; the middleware then demands
+        # Sec-Fetch-User: ?1 (docs/BROWSER-SUPPORT.md, federated sign-in).
 
         if not flow_id:
             # AC-7: without the browser-binding cookie the request is refused even when state and

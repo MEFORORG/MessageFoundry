@@ -1127,7 +1127,7 @@ async def test_hold_f2_no_lane_start_skips_the_entry_walk(
     try:
         assert watch.threads and threading.get_ident() not in watch.threads
         assert _OUT not in cast(Any, runner)._destinations
-        failure = cast(Any, runner)._failed.get(("outbound", _OUT))
+        failure = runner.outbound_failed(_OUT)
         assert failure is not None
         assert "'sslcapath' must name a folder it can list" in str(failure)
     finally:
@@ -1253,7 +1253,7 @@ async def test_hold_f2_a_refused_entry_fails_a_database_inbound_at_its_lane_star
     try:
         assert watch.threads and threading.get_ident() not in watch.threads
         assert _IN not in cast(Any, runner)._sources
-        failure = cast(Any, runner)._failed.get(("inbound", _IN))
+        failure = runner.inbound_failed(_IN)
         assert failure is not None
         assert "'sslcapath' must name a folder it can list" in str(failure)
     finally:

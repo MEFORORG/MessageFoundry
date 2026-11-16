@@ -73,6 +73,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
 from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
+from messagefoundry.api.approval_models import (
+    ApprovalInterruptRequest,
+    ApprovalInterruptResult,
+    ExecutingApprovalInfo,
+    ExecutingApprovalList,
+)
 from messagefoundry.api.approvals import (
     DEFAULT_CLAIM_OWNER,
     ApprovalError,
@@ -226,7 +232,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.multipart import (
     MultipartError,
     MultipartTooLargeError,
-    parse_single_file_upload,
+    parse_upload_off_loop,
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
@@ -419,6 +425,7 @@ from messagefoundry.config.wiring import (
     ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
+    listener_trusted_proxy_hops,
     load_config,
     path_form_fhir_updates,
     query_credential_hops,
@@ -439,7 +446,7 @@ from messagefoundry.logging_setup import (
     level_refused_on_production,
     set_runtime_level,
 )
-from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
+from messagefoundry.parsing.sniff import attachment_mime_agrees
 from messagefoundry.pipeline import (
     ApprovedConfig,
     ConfigDigestMismatch,
@@ -461,6 +468,8 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     administrator_granted_alert,
     authority_seal_alert,
+    authority_seal_page,
+    directory_sign_in_audit_alert,
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
@@ -496,6 +505,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
@@ -508,7 +518,12 @@ from messagefoundry.remotedebug import (
     remote_debug_posture,
 )
 from messagefoundry.service_status import query_service_state
-from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
+from messagefoundry.serviceenv import (
+    ServiceEnvironmentRefused,
+    ServiceEnvPosture,
+    service_env_posture,
+    service_env_refusal,
+)
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
@@ -527,12 +542,13 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.content_search import (
     ContentSearchError,
     SearchSpec,
-    SearchTarget,
     make_spec,
+    sends_a_needle,
 )
-from messagefoundry.store.crypto import audit_body_digests
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
+from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -551,16 +567,19 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     TestNotSupportedError,
 )
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
+    UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnavailableError,
     UploadUnreadableError,
     browse_messages,
     split_uploaded,
@@ -729,11 +748,27 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     a nicety. "start it before resending" is the right instruction for an operator-paused lane and the
     WRONG one for a halted engine, where the same door the message points at is refused until the
     application log is writable again — a 409 that sends an operator to a control that cannot help is
-    the compensating-control-on-a-false-premise shape (SDS-3.7)."""
+    the compensating-control-on-a-false-premise shape (SDS-3.7).
+
+    A lane a STOP holds down (BACKLOG #5701) is named too: a start with the cause unfixed would
+    re-authenticate toward the partner lockout a credential STOP protects against. It does not say
+    the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
+    says what else re-arms it)."""
+    if not rr.running:
+        # BACKLOG #5702: the start this would point at is refused on a downed graph.
+        return (
+            f"outbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
             "is being delivered anywhere — fix the log, then start the connection, then resend"
+        )
+    if rr.outbound_stop_held(name):
+        return (
+            f"outbound {name!r} is stopped: a fault halted it, such as a credential or "
+            "configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
 
@@ -741,9 +776,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
-    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` and never
-    reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
-    demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
+    ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no
+    STOP holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers
+    "running" on a node whose graph is down -- the ADR 0157 demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
     reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
     disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
     ``/graph/edges``). The literal "draining" an edge row gives an outbound the live graph no longer
@@ -1000,7 +1035,7 @@ async def _alert_control_action(
                 target,
             )
             return
-        await rr.restart_inbound(target)
+        await _alert_restart(rr.restart_inbound, action, target)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -1013,12 +1048,27 @@ async def _alert_control_action(
             )
             return
         try:
-            await rr.restart_outbound(target)
+            await _alert_restart(rr.restart_outbound, action, target)
         except DrParkedError:
             _log.info(
                 "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
+
+
+async def _alert_restart(
+    restart: Callable[[str], Awaitable[None]], action: str, target: str
+) -> None:
+    """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
+    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
+    try:
+        await restart(target)
+    except RunnerNotRunningError:
+        _log.info(
+            "alert control_action %s for %r not run: this engine's graph is not running",
+            action,
+            target,
+        )
 
 
 def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:
@@ -1281,14 +1331,12 @@ def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
 async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
     """Run :meth:`ApprovalGate.reconcile_after_restart` and never fail the start on it.
 
-    A store that cannot answer here leaves this process's leftover rows ``executing``, which is what
-    they were before; the next start tries again. Refusing to start would cost more than that."""
+    A failure here is logged, and the start goes on. Refusing to start would cost more than that."""
     try:
         await gate.reconcile_after_restart()
     except Exception:
         _log.exception(
-            "approval gate: the startup reconcile of 'executing' releases failed; they stay "
-            "'executing' until a later start"
+            "approval gate: the startup reconcile of 'executing' releases failed; the start goes on"
         )
 
 
@@ -1310,6 +1358,9 @@ _INNER_SHARE: Final = 0.8
 #: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
 #: for it and moves on, leaving it to finish or fail on its own.
 _CUT_GRACE_SECONDS: Final = 0.1
+#: The startup unwind's alert-state drain floor (BACKLOG #5907). The unwind's notifier drain is
+#: bounded by the rest of its budget, so this is what that drain leaves the state writes.
+_UNWIND_STATE_DRAIN_FLOOR_SECONDS: Final = 0.5
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
@@ -1582,6 +1633,19 @@ def _managed_teardown_steps(
     was never built. A function of its own so a test can pin the order and count the bounded
     steps against the real list (vault BACKLOG #3740 items 15 and 16)."""
     steps: list[_TeardownStep] = []
+    if notifier is not None:
+        # BACKLOG #5909: first, before any drain, so no control_action restart begins during a
+        # drain and takes the reload lock engine.stop() then waits on. stop_control's docstring
+        # says what happens to a restart already under way. A synchronous call cannot overrun, so
+        # it is never cut and adds no cut grace to the budget.
+        steps.append(
+            _TeardownStep(
+                "the alert control callback's removal",
+                0.0,
+                _sync(lambda: notifier.stop_control()),
+                bounded=False,
+            )
+        )
     if upload_retention_runner is not None:
         # Handed part of its bound, so the runner's own wait ends, names any unaudited file and
         # cancels the sweep before the teardown cuts it. With the managed set of steps that bound
@@ -1660,6 +1724,73 @@ def _managed_teardown_steps(
     return steps
 
 
+async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None) -> None:
+    """Close what the managed lifespan opened before its startup failed, ahead of engine.start()
+    (BACKLOG #5907). The engine never started, so it is not stopped: the store is closed directly.
+    The security signals are not removed here: their install is the guarded span's last statement,
+    so no failure the guard catches comes after it. The alert control callback is not cleared
+    either: it is wired only after engine.start(), so no failure this unwinds comes after it.
+
+    Each part is a :func:`_run_teardown` step, so a cancel that arrives during the unwind, or one
+    re-delivered on every await as an anyio cancel scope does, reaches no step and the store still
+    closes. The notifier is started before it is drained, as the open_store failure path does, so
+    an alert raised before it would normally have started (the reason the start failed) is sent.
+    Its alert-state writes are then given a bounded drain, as engine.stop() gives them, so the
+    alert that explains the refusal is recorded before the store closes.
+
+    The delivery drain is bounded, so a blackholed webhook or SMTP host cannot hold the store open
+    past NSSM's stop window (#1257). Its bound is the unwind's budget less the alert-state drain's
+    floor, not the shutdown teardown's notifier floor. A crash loop pages on every attempt (#2597),
+    and a tight cut would drop the page that explains this refusal. The test that pins #2597,
+    test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
+    runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
+    A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
+    includes an alert one transport delivered while another had not finished. The cut ends only
+    the asyncio side: a send in a worker thread runs on to its socket timeout."""
+    budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
+    steps: list[_TeardownStep] = []
+    if notifier is not None:
+
+        async def _close_notifier(bound: float) -> None:
+            notifier.start()
+            wait = bound * _INNER_SHARE
+            try:
+                async with asyncio.timeout(wait) as deadline:
+                    await notifier.aclose()
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+                if not notifier.undelivered:
+                    return  # the last send ended at the deadline: nothing was lost
+                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
+                _log.error(
+                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
+                    "not confirmed delivered",
+                    wait,
+                    notifier.undelivered,
+                )
+
+        steps.append(
+            _TeardownStep(
+                "the alert notifier's close",
+                budget - _UNWIND_STATE_DRAIN_FLOOR_SECONDS,
+                _close_notifier,
+            )
+        )
+        steps.append(
+            _TeardownStep(
+                "the alert-state drain",
+                _UNWIND_STATE_DRAIN_FLOOR_SECONDS,
+                lambda b: notifier.drain_state(b * _INNER_SHARE),
+            )
+        )
+    # Never cut: a store left open keeps aiosqlite's non-daemon worker alive (#1257).
+    steps.append(_TeardownStep("the store's close", 0.0, lambda _b: store.close(), bounded=False))
+    await _run_teardown(steps, budget)
+
+
 @asynccontextmanager
 async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
@@ -1722,12 +1853,21 @@ def _build_approval_gate(
             return None  # an engine shard whose graph has not loaded yet
         return DEFAULT_CLAIM_OWNER  # no engine shard and no cluster node
 
+    async def _node_liveness(node_id: str) -> bool | None:
+        # BACKLOG #1562: the interrupt route's heartbeat tier. The same `fresh` verdict the
+        # stepdown reads (BACKLOG #1509); a node no longer in the table has no fresh heartbeat.
+        coordinator = engine.coordinator
+        if not coordinator.is_clustered():
+            return None  # this engine reads no cluster heartbeats
+        return any(m.node_id == node_id and m.fresh for m in await coordinator.cluster_members())
+
     gate = ApprovalGate(
         engine.store,
         settings,
         resolve_identity=resolve_identity,
         alert_sink=alert_sink,
         claim_owner=_claim_owner,
+        node_liveness=_node_liveness,
     )
     # A released reload runs inside the approve request, so it outlives that request's deadline the
     # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
@@ -2115,15 +2255,29 @@ def _posture_loosenings(
             if visible is None or visible(name)
         ]
     )
+    # BACKLOG #5525: an HTTP listener's trusted_proxies, read against the same values. Its note,
+    # "range" or "possibly", is kept beside the name, since the entry's text keys on it.
+    listener_proxy_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in listener_trusted_proxy_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar / HTTP listener "
+            "trusted_proxies declarations are "
             "NOT included "
-            "(see `messagefoundry check`)"
+            "(see `messagefoundry check`, which reports all but the HTTP listener "
+            "trusted_proxies; those are reported only here, on an engine with a graph)"
         )
     if visible is not None:
         # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
@@ -2170,6 +2324,7 @@ def _posture_loosenings(
             remote_debug=remote_debug,
             startup=startup,
             service_env=service_env,
+            listener_trusted_proxy_hops=listener_proxy_hops,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
@@ -2197,6 +2352,11 @@ _RELOAD_AUDIT_STEP = "audit"
 #: account to match.
 _CONVERGENCE_ACTOR = "system:cluster-convergence"
 _CONVERGENCE_INITIATOR = "cluster_convergence"
+#: The key on a convergence row's detail naming the digest the initiating node stored with the
+#: row's ``config_version``: its ``fingerprint``, ``scheme`` and any ``unreadable_files``, so a
+#: reader can compare it with the row's own ``fingerprint`` as a start compares two digests. Absent
+#: when that digest is not known (vault BACKLOG #3109).
+_INITIATOR_DIGEST = "initiator_digest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2215,8 +2375,9 @@ class _LoadedConfig:
     directory or digest at the write. What a row does read at the write includes at least the
     cluster node id, which is fixed for the life of the process, and, for the ``superseded``
     checks, which ask about the live state on purpose, the loaded fingerprint's identity (a
-    reload's row) and the live graph's identity (the start's row). The start row also reads the
-    settings the app stashed, for its loosenings; a reload changes none of them."""
+    reload's row) and the live graph's identity (the start's row). The start row and a cluster
+    convergence reload's row also read the settings the app stashed, and the store's audit-chain
+    keying, for their loosenings (vault BACKLOG #3814); a reload changes none of the settings."""
 
     directory: str | None
     shard: str | None
@@ -2458,8 +2619,13 @@ async def _record_reload_audit(
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
+    loosenings: Callable[[], Awaitable[list[str] | None]] | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
+
+    ``loosenings``, when passed, is awaited inside the write and its result recorded under the
+    ``loosenings`` key, after ``extra``. A cluster convergence reload passes it (vault BACKLOG
+    #3814), so the read waits out a cancel with the row rather than losing the row before it.
 
     The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
     action and its ``loosenings`` in ``extra``. Every row names its cluster node, and the
@@ -2486,7 +2652,9 @@ async def _record_reload_audit(
 
     A reload passes its :class:`~messagefoundry.pipeline.ReloadOutcome`, and the row names what
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
-    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
+    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. A
+    convergence reload's also carries, as :data:`_INITIATOR_DIGEST`, the initiating node's digest
+    stored with that version, when it is known (vault BACKLOG #3109). The
     row is written after the swap, and nothing holds the graph still until
     then, so a second reload can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
@@ -2526,12 +2694,27 @@ async def _record_reload_audit(
 
     async def write() -> None:
         nonlocal detail
+        listed: dict[str, object] = {}
+        if loosenings is not None:
+            # A first build before the read, so a row the read's cancel cuts off still has its
+            # detail on the lost-row line. Rebuilt below with the list.
+            detail = build(listed)
+            # Before the superseded check in the rebuild, so no await falls between it and the
+            # write.
+            listed = {"loosenings": await loosenings()}
+        detail = build(listed)
+        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
+
+    def build(listed: Mapping[str, object]) -> str:
         superseded = False
         config_version: int | None = None
+        initiator_digest: Mapping[str, object] | None = None
         state: _LoadedConfig | None
         if isinstance(loaded, ReloadOutcome):
             state = _LoadedConfig.of(loaded)
+            # Read together, as the coordinator read them (vault BACKLOG #3109).
             config_version = loaded.config_version
+            initiator_digest = loaded.initiator_digest
             # Only a COMMITTED reload rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
@@ -2551,18 +2734,23 @@ async def _record_reload_audit(
             }
         )
         digest = (state.fingerprint or {}) if state is not None else {}
-        detail = json.dumps(
+        return json.dumps(
             {
                 **named,
                 "dry_run": False,
                 **({"config_version": config_version} if config_version is not None else {}),
+                **(
+                    {_INITIATOR_DIGEST: dict(initiator_digest)}
+                    if initiator_digest is not None
+                    else {}
+                ),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
+                **listed,
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
                 **digest,
             }
         )
-        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
 
     written = await write_audit_soft(
         # A shutdown drain's cancel waits a bounded time for the row (BACKLOG #3157).
@@ -3368,6 +3556,40 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
         _log.warning("the store_restored alert could not be raised: %s", safe_exc(exc))
 
 
+async def _graph_loosenings(
+    state: Any,
+    engine: Engine,
+    graph: Registry,
+    env_values: Mapping[str, Any] | None,
+    action: str,
+) -> list[str] | None:
+    """The names of the loosenings ``graph`` runs under, as ``GET /security/posture`` lists them
+    for an unscoped reader, for an audit row's ``loosenings`` key. The start's ``config_loaded``
+    row and a cluster convergence reload's ``config_reload`` row record them (vault BACKLOG #2597,
+    #3814).
+
+    It raises no ``Exception``, a cancellation aside: both rows are written after the graph is
+    live. A list it cannot read is
+    ``None``, which says unknown, never an empty list, which would say none are active. ``action``
+    names the row in the log line for that case."""
+    try:
+        pairs, _scope = _posture_loosenings(
+            state,
+            engine,
+            None,
+            graph=graph,
+            graph_env_values=env_values,
+            remote_debug=remote_debug_posture(),
+            startup=await asyncio.to_thread(startup_posture),
+            service_env=await asyncio.to_thread(service_env_posture),
+            security=_posture_security(state),
+        )
+        return [name for name, _risk in pairs]
+    except Exception:  # noqa: BLE001 - a live graph's audit row must not fail on its list
+        _log.exception("the loosenings list could not be read; %s records None", action)
+        return None
+
+
 async def _record_start_audit(
     app: FastAPI,
     engine: Engine,
@@ -3408,25 +3630,13 @@ async def _record_start_audit(
     swap check marks the row degraded with the ``start_swap_check`` step and unchecked, and never
     ``superseded``. Either way its ``loosenings`` stand: they are read off the graph the snapshot
     took, not the live one, so a swap cannot change them (vault BACKLOG #3076, #3109)."""
-    switches: list[str] | None = None
-    if loaded is not None and loaded.registry is not None:
-        try:
-            pairs, _scope = _posture_loosenings(
-                app.state,
-                engine,
-                None,
-                graph=loaded.registry,
-                graph_env_values=loaded.env_values,
-                remote_debug=remote_debug_posture(),
-                startup=await asyncio.to_thread(startup_posture),
-                service_env=await asyncio.to_thread(service_env_posture),
-                security=_posture_security(app.state),
-            )
-            switches = [name for name, _risk in pairs]
-        except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
-            _log.exception(
-                "the start's loosenings list could not be read; config_loaded records None"
-            )
+    switches = (
+        await _graph_loosenings(
+            app.state, engine, loaded.registry, loaded.env_values, "config_loaded"
+        )
+        if loaded is not None and loaded.registry is not None
+        else None
+    )
     # Nothing awaits between here and the row's detail. A reload that swaps the graph later is
     # not caught.
     superseded = swap_unknown = False
@@ -3745,7 +3955,11 @@ def _needle_shape(needle: str) -> str:
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
     only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself."""
+    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+
+    The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
+    and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
+    needle = needle.strip()
     if needle.isdigit():
         return "digits"
     if needle.isalnum():
@@ -3812,7 +4026,10 @@ def _compose_preset_layers(
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
     ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
     :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise."""
+    ``ContentSearchError`` from a malformed field path likewise.
+
+    A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
+    compose dropping it (BACKLOG #6700)."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     needle: dict[str, Any] | None = None
@@ -3826,10 +4043,14 @@ def _compose_preset_layers(
                         400, f"layered presets conflict on {key!r}: {meta[key]!r} vs {value!r}"
                     )
                 meta[key] = value
-        has_needle = bool((crit.get("content") or "").strip()) or bool(
-            (crit.get("field_path") or "").strip()
+        # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
+        # Counted on stripped values, as before: a blank stored content or field_path on a preset
+        # that is not the needle is not a second needle.
+        content, path = (
+            v.strip() if isinstance(v, str) else v
+            for v in (crit.get("content"), crit.get("field_path"))
         )
-        if has_needle:
+        if sends_a_needle(content, path, crit.get("field_value")):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"
@@ -3845,7 +4066,7 @@ def _compose_preset_layers(
             content=(needle.get("content") or None),
             field_path=(needle.get("field_path") or None),
             field_value=(needle.get("field_value") or None),
-            target=SearchTarget(needle.get("target") or "both"),
+            target=needle.get("target") or "both",
         )
     except (ContentSearchError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -4020,8 +4241,9 @@ async def _record_refused_control_audit(
     store_fault: bool,
     client: str | None,
 ) -> None:
-    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
-    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    """:func:`_record_control_audit` for a control that was refused: at least an inbound start or
+    restart, an outbound start or restart the store stopped, and any start, stop or restart a downed
+    graph refused (BACKLOG #5702), whose row carries no ``reason``. ``role`` is the resolved role and ``running`` the lane's state
     after the refusal, which is not always stopped: at least a lane that failed at boot on a store
     fault stays unpaused through a start the store stopped.
 
@@ -4383,6 +4605,17 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 }
 
 
+def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
+    """Raise where ``serve`` would refuse to start on its own Windows service environment.
+
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, so an app built here
+    without either of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
+    ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
+    refused = service_env_refusal(service_env_posture())
+    if refused is not None:
+        raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -4429,6 +4662,7 @@ def create_app(
     # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
     # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
+    _refuse_a_secret_in_the_service_environment("create_app")
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -4973,10 +5207,21 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
+        # verified against [tls].internal_ca_file under augment or pinned and checked against
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
+        # None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
-        # context that reads the system trust store, under a lock a worker thread may hold.
+        # context that reads the system trust store, under a lock a worker thread may hold, or an
+        # opener of its own that reads the [tls] CA and CRL files.
+        tls_settings = getattr(request.app.state, "tls_settings", None)
         try:
-            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(
+                ai_broker_from_settings,
+                ai,
+                posture=_phi_read_posture,
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+            )
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -5553,8 +5798,8 @@ def create_app(
             #
             # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
             # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
-            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
-            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # ABSENT from `_outbound_paused` that no STOP holds down — it never consults the graph
+            # flag (the same trap `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
             # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
             # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
@@ -5749,6 +5994,11 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
+                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
+                # is, and audited below as every refused inbound start or restart is.
+                refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
@@ -5794,7 +6044,8 @@ def create_app(
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
-            held = False
+            out_refused: HTTPException | None = None
+            out_store_fault = False
             try:
                 if action == "start":
                     await rr.start_outbound(name, hold_on_store_fault=True)
@@ -5807,7 +6058,8 @@ def create_app(
                 # resumed. Answered below, outside this handler, as the inbound arm does.
                 if explicit_cause(exc, AnchorStoreUnavailable) is None:
                     raise
-                held = True
+                out_store_fault = True
+                out_refused = HTTPException(503, _anchor_store_detail(action))
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5821,7 +6073,11 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
-            if held:
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
+                # the engine lifecycle and a stop would record a pause a later start inherits.
+                out_refused = HTTPException(503, str(exc))
+            if out_refused is not None:
                 await _record_refused_control_audit(
                     engine,
                     identity,
@@ -5829,10 +6085,10 @@ def create_app(
                     action,
                     role="destination",
                     running=rr.outbound_running(name),
-                    store_fault=True,
+                    store_fault=out_store_fault,
                     client=client,
                 )
-                raise HTTPException(503, _anchor_store_detail(action))
+                raise out_refused
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -7155,6 +7411,51 @@ def create_app(
             raise HTTPException(exc.status, exc.detail) from exc
         return ApprovalResolveResult(**outcome)
 
+    @app.get("/approvals/executing", response_model=ExecutingApprovalList)
+    async def list_executing_approvals(
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ExecutingApprovalList:
+        """Releases still claimed as ``executing``, each with what an interrupt would judge of its
+        claim owner now (BACKLOG #1562). A release whose owner never returns stays here until an
+        operator interrupts it."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            rows = await gate.list_executing()
+        except ApprovalError as exc:  # a store read that failed: 503
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ExecutingApprovalList(approvals=[ExecutingApprovalInfo(**r) for r in rows])
+
+    @app.post("/approvals/{approval_id}/interrupt", response_model=ApprovalInterruptResult)
+    async def interrupt_stranded_approval(
+        approval_id: ResourceId,
+        request: Request,
+        body: ApprovalInterruptRequest | None = None,
+        # Owner-delegated decision d20261029T205247402-81159c: approvals:approve with a FRESH
+        # step-up, as the resolve it leads to asks.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalInterruptResult:
+        """Move a release stranded in ``executing`` to ``interrupted`` (BACKLOG #1562), so it can
+        be resolved. Refused while its owner may be live: this process runs it, or its cluster
+        node still heartbeats. An owner with no heartbeat to read needs ``attest_owner_stopped``.
+        Audited as ``approval.interrupted`` in the same write; the operation is never run."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.interrupt_stranded(
+                approval_id,
+                actor=identity.username,
+                # The requester refusal keys on the immutable id, like resolve (BACKLOG #1540).
+                actor_user_id=identity.user_id,
+                attest_owner_stopped=body is not None and body.attest_owner_stopped,
+                client=client_ip(request),
+            )
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalInterruptResult(**outcome)
+
     # --- config promote / reload ---------------------------------------------
 
     @app.post("/config/reload", response_model=ReloadResult | PendingApprovalResponse)
@@ -7317,7 +7618,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
@@ -7447,7 +7748,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -7747,7 +8048,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -8728,6 +9029,39 @@ def create_app(
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
 
+    _UPLOAD_UNAVAILABLE = (
+        "the store's key service could not complete the request, so nothing was read, stored or "
+        "removed. Try again shortly"
+    )
+
+    class _UploadUnavailable(HTTPException):
+        """BACKLOG #3734: the store cipher's key service (Vault Transit) gave no verdict on the
+        file, so nothing was read, stored or removed and a later try may succeed. 503 with the
+        ``Retry-After`` of the engine's other temporary refusals, where 423 would send an operator
+        to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
+        and no cipher detail.
+
+        Built by :func:`_upload_unavailable`, which logs the store's error TEXT and keeps it off
+        the 503, so the 503 holds no link to the Transit chain, whose request can carry a body.
+        Each raise in this module comes after its ``except`` clause has ended. ``args`` is set to
+        ``(503, detail)`` here, because Starlette's ``__init__`` leaves it as the call's own
+        arguments; a copy rebuilds it through ``cls(*args)``, which logs nothing."""
+
+        def __init__(self, *_rebuilt: object) -> None:
+            super().__init__(
+                503,
+                _UPLOAD_UNAVAILABLE,
+                headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+            )
+            self.args = (503, _UPLOAD_UNAVAILABLE)
+
+    def _upload_unavailable(cause: str, op: str) -> _UploadUnavailable:
+        """The outage 503, logged once at WARNING with the operation, so an outage that blocks
+        every upload is on the record. ``cause`` is the cipher's outage text, the key id and an
+        exception type name (``crypto_transit._transit_failure``); it goes to the log only."""
+        _log.warning("upload %s answered 503: %s", op, cause)
+        return _UploadUnavailable()
+
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
@@ -8754,22 +9088,26 @@ def create_app(
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
         invokes these handlers directly through the CoreHandlers seam and never runs their gates.
         One exception: DELETE catches :class:`_UploadSidecarRefused`, which only an override holder
-        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322)."""
+        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322). An override holder whose read
+        met a key-service outage gets the 503 instead, which DELETE does not catch (BACKLOG #3734)."""
+        override_answer: Callable[[], HTTPException] | None = None
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
+            override_answer = partial(_upload_unavailable, str(exc), op)
         except UploadUnreadableError:
-            unreadable = True
-        else:
-            unreadable = False
-        if unreadable:
+            override_answer = _UploadSidecarRefused
+        if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
-            # can act on it; the refused sidecar is not an existence oracle for anyone else. Both
-            # raises sit after the handler ends, so neither chain carries the cipher's error.
+            # can act on it; neither a refused sidecar nor an outage is an existence oracle for
+            # anyone else. Both raises sit after the handler ends, so neither chain carries the
+            # cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise _UploadSidecarRefused()
+                raise override_answer()
             raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -8818,9 +9156,10 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.txt`` / ``.xml``). A metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX) or any
-        non-text body is refused with **HTTP 415** before anything is written — so no embedded metadata
-        (EXIF/XMP/docProps) can ever be stored.
+        ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
+        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window,
+        is refused with **HTTP 415** before anything is written. What this lets through is
+        stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username
@@ -8834,28 +9173,17 @@ def create_app(
         the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
         body = await request.body()
+        # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes part by part, so
+        # it runs on the parser's own two-thread executor rather than on the event loop.
         try:
-            part = parse_single_file_upload(
+            part = await parse_upload_off_loop(
                 request.headers.get("content-type"), body, max_file_bytes=us.max_bytes
             )
         except MultipartTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
             raise HTTPException(400, str(exc)) from None
-        # ASVS 14.2.8: enforce the feature's text-only format contract at the route, BEFORE save. A binary
-        # container (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
-        # 415 + a metadata-only upload.reject audit — nothing is written, so no embedded-metadata container
-        # can reach the store (closes "no metadata stripping" without a stripping engine). Covers both
-        # POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
-        nontext = nontext_upload_reason(part.data)
-        if nontext is not None:
-            await engine.store.record_audit(
-                "upload.reject",
-                actor=identity.username,
-                detail=json.dumps({"reason": nontext}),
-                client=client_ip(request),
-            )
-            raise HTTPException(415, nontext) from None
+        outage: str | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
             # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
@@ -8867,6 +9195,18 @@ def create_app(
             )
         except UploadTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
+        except UploadNotTextError as exc:
+            # ASVS 14.2.8: the feature's text-only format contract, checked by save() before anything
+            # is written (BACKLOG #5551 moved it there from this route). docs/CONNECTIONS.md
+            # ("Permitted types") states what it refuses and what it lets through. The answer and the
+            # audit carry the reason only, never the file name or content.
+            await engine.store.record_audit(
+                "upload.reject",
+                actor=identity.username,
+                detail=json.dumps({"reason": exc.reason}),
+                client=client_ip(request),
+            )
+            raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
             # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
@@ -8889,6 +9229,13 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
+        if outage is not None:
+            # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
+            # reject, because the file was not refused. Raised after the handler, from the text
+            # alone, so no chain link reaches the Transit request (see _UploadUnavailable).
+            raise _upload_unavailable(outage, "save")
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -9029,23 +9376,29 @@ def create_app(
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
-        if content or field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than dropped (#6700).
+        if sends_a_needle(content, field_path, field_value):
             try:
                 spec = make_spec(
                     content=content,
                     field_path=field_path,
                     field_value=field_value,
-                    target=SearchTarget(target),
+                    target=target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
         meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -9196,12 +9549,17 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
         await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -9292,7 +9650,12 @@ def create_app(
                 nonlocal detail
                 try:
                     removed = await us.delete(file_id, sidecar_refused=refused)
-                except (UploadPathError, UploadNotFoundError, UploadUnreadableError) as exc:
+                except (
+                    UploadPathError,
+                    UploadNotFoundError,
+                    UploadUnavailableError,
+                    UploadUnreadableError,
+                ) as exc:
                     # Each is raised before any unlink, so no row is owed, and a cancel landing
                     # meanwhile must not log one as lost. Returned, so the route still answers it.
                     return exc
@@ -9318,12 +9681,17 @@ def create_app(
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
+        outage: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --
@@ -9368,17 +9736,21 @@ def create_app(
         needle is rejected up front (make_spec) so a bad preset can't be saved."""
         crit = body.criteria
         needle_shape: str | None = None
-        if crit.content or crit.field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than saved unread (#6700).
+        if sends_a_needle(crit.content, crit.field_path, crit.field_value):
             try:
-                make_spec(
+                spec = make_spec(
                     content=crit.content,
                     field_path=crit.field_path,
                     field_value=crit.field_value,
-                    target=SearchTarget(crit.target),
+                    target=crit.target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
+            # From the spec, not the raw criteria: an all-whitespace content is not the needle.
+            needle_shape = (
+                _needle_shape(spec.substring) if spec.substring is not None else "field_path"
+            )
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
@@ -9450,28 +9822,69 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            integrity_refused = False
+            refusal: HTTPException | None = None
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except CellTagError:
-                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
-                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
-                # never a 500.
-                integrity_refused = True
-            if integrity_refused:
-                # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`
-                # would still leave the CellTagError and the cipher's error on __context__.
-                raise HTTPException(
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
+                # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
+                # (logged); the store refused. The caller's own preset exists, so a refusal, never
+                # a 500. Caught before CipherError, which it subclasses.
+                refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
+            except CipherUnavailableError as exc:
+                # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
+                # so a later try may succeed. Its text goes to the log only, as in uploads, and as
+                # a str: the exception's traceback would reach this frame's decrypted `criterias`.
+                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                refusal = HTTPException(
+                    503,
+                    f"the store's key service could not open preset {preset_id}. Try again shortly",
+                    headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+                )
+            except CipherError as exc:
+                # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
+                # retired key that is not supplied, or a Vault Transit refusal other than the
+                # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
+                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
+                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
+                # above is a WARNING: it says nothing about the cell.
+                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
+                    " a retired key that is not supplied, or a value written outside the store,"
+                    " can cause this",
+                )
+            if refusal is not None:
+                # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
+                # None` would still leave the store's and the cipher's errors on __context__.
+                raise refusal
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
+            if not row["criteria"]:
+                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
+                # blank cell through unopened, so NULL or "" was written outside the store. Read as
+                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
+                # since only the caller would learn of it otherwise.
+                _log.warning(
+                    "layered search refused preset %s: its criteria cell is blank", preset_id
+                )
+                # Its own text: a keyless store has no integrity tag for it to fail.
+                raise HTTPException(
+                    423,
+                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
+                    " be used",
+                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
-            criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
+            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
+            # None for a NULL cell, and the blank-cell refusal above has already refused None.
+            criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
                 raise HTTPException(400, f"preset {preset_id} has malformed criteria")
             criterias.append(criteria)
@@ -9508,6 +9921,19 @@ def create_app(
             ),
             client=client_ip(request),
         )
+        # BACKLOG #5523: coalesced into summary_access after the route's own row, as
+        # /messages/search does, so a layered recall is no way round the harvest signal (review
+        # M-5). Counted post-redaction.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -9893,9 +10319,10 @@ def create_app(
             # inbound twin as failed (see wiring_runner's `Direction`).
             failed_in = [name for name in in_deployed if rr.inbound_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
-            # actually running AND the lane not operator-paused — consistent with inbound_running's
-            # actually-started semantics (outbound_status reports "running" for any non-paused lane even
-            # before start, which would over-count a built-but-not-started runner).
+            # actually running AND the lane neither operator-paused nor STOP-held (#5701) — consistent
+            # with inbound_running's actually-started semantics (outbound_status reports "running" for
+            # any non-paused, non-held lane even before start, which would over-count a
+            # built-but-not-started runner).
             out_running = sum(1 for name in out_deployed if rr.outbound_running(name))
             conn_total = total + len(out_deployed)
             conn_running = running + out_running
@@ -11087,6 +11514,7 @@ _PROVISION_ADMIN_HINT = (
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
+    auth: AuthService,
     auth_settings: AuthSettings,
     alerts_settings: AlertsSettings | None,
     security_settings: SecuritySettings | None,
@@ -11146,35 +11574,65 @@ async def _assert_security_notice_is_deliverable(
     Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
     which is a different and much larger change.
+
+    **It reads the accounts through the auth service's checked list, never the store's readers
+    (BACKLOG #5629).** The store's ``list_users`` and ``get_user_role_ids`` return rows unchecked,
+    so on a keyed store a ``notify_email``, a ``disabled`` flag or a ``user_roles`` row written
+    outside the store would have passed this gate on an Administrator no seal covers. On a keyed
+    store every field the gate weighs -- the address, the flag and the role rows -- now comes from a
+    record that passed its seal. One that fails, or that Vault transit cannot verify, is reported
+    by the service and does not count, and the refusal says how many were left out, so it does not
+    read as a store with no account at all. A keyless store has no seal, so there the rows are
+    taken as read. One pass answers both halves, from one snapshot. A Vault transit Outage leaves
+    the question unsettled: under ``enforce`` with the gate on it refuses, and otherwise it is one
+    WARNING, as the dials promise.
     """
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
     gated = auth_settings.notify_security_events and alerts.security_notifications_required
-    # Addressed accounts first, so the common start stops at the first addressed Administrator and
-    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
-    # reached, every account after it lacks one too, so the question is settled there.
-    enabled = sorted(
-        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    try:
+        listed = await auth.list_checked_users()
+    except TransitSealUnavailableError as exc:
+        detail = (
+            "the accounts could not be checked against their integrity seal because Vault transit "
+            "did not answer, so whether any security notice reaches an Administrator is unsettled. "
+            "Restore Vault transit and start again"
+        )
+        if gated and enforcement is SecurityEnforcement.ENFORCE:
+            raise RuntimeError(f"refusing to start a PHI instance: {detail}") from exc
+        _log.warning("the security-notice gate could not run: %s", detail)
+        return
+    failed = sum(1 for entry in listed if entry.user is None)
+    admins = [
+        u
+        for u in (entry.user for entry in listed)
+        if u is not None and not u.disabled and Role.ADMINISTRATOR.value in u.role_ids
+    ]
+    administrator_exists = bool(admins)
+    if administrator_exists and (not gated or any(u.notify_email for u in admins)):
+        return
+    # A record left out still exists, so the refusal must not read as a store with no account at
+    # all: it says how many were left out, and the service's seal report names each one and why.
+    left_out = (
+        f" {failed} account record(s) could not be verified against their integrity seal and were"
+        " not counted; the seal-failure warning names each one and its cause. If an Administrator"
+        " is among them, resolve that record before creating another"
+        if failed
+        else ""
     )
-    administrator_exists = False
-    for user in enabled:
-        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
-            continue
-        if user.notify_email or not gated:
-            return
-        administrator_exists = True
-        break
     if not administrator_exists:
         # A SQLite store file named absolutely, since the operator's shell may sit in another
         # directory than the service; a server backend's descriptor is server/database, names no
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            f"no enabled Administrator{' whose record passes its integrity seal' if failed else ''} "
+            "exists in this store, so no enabled account holds the role "
             "that manages users and roles, and every out-of-band security notice about the most "
             "privileged accounts would reach nobody. The engine creates no account on its own. "
-            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}.{left_out}"
         )
         if not gated:
             # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
@@ -11190,9 +11648,8 @@ async def _assert_security_notice_is_deliverable(
             "the host with `messagefoundry admin-set-notify-email --username <administrator> "
             "--email <address>`, run against this store with the engine stopped, or accept the "
             "pull-only /me/security-events feed in writing via "
-            "[alerts].security_notifications_required=false"
+            f"[alerts].security_notifications_required=false.{left_out}"
         )
-    enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
@@ -11333,7 +11790,9 @@ async def _directory_reconciler(
                 if found:
                     # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
                     # instances is dropped for this process's life, and without this line only
-                    # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    # docs/CONFIGURATION.md would say so. Keys only: the line names each instance's
+                    # event type and connection, never its stored reason, which can hold free text
+                    # (docs/PHI.md, the alert_instance.reason row).
                     # "When this process first read", not "before its first pass": a first read
                     # that failed lets this process's own early trip or hold land in the set.
                     _log.warning(
@@ -11394,8 +11853,9 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
 _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
-    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
-    "reach the directory. Check its entry, and any outage, referral or configuration alert."
+    "This account's sessions are not revoked: {probes} of up to its last {window} directory "
+    "probes, faults aside, failed to reach the directory. Check its entry, and any outage, "
+    "referral or configuration alert."
 )
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
@@ -11403,11 +11863,12 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: pass, and says so: a later rollup updates the same open instance's text, so a count that read
 #: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
 #: process can say how many stand: each counts its own, and the instance is shared. ``probes``
-#: is the shortest run among those entering, in probes, not passes, which differ under a probe
-#: budget smaller than the estate.
+#: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
+#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
+#: probes, not passes, which differ under a probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
-    "directory probes running. Check the directory and the path to it. "
+    "of up to its last {window} probes, faults aside. Check the directory. "
     "auth.ad_reconcile_unreached rows name each."
 )
 
@@ -11489,7 +11950,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
     way. A process clears only what it watched open, so a fresh process resolves no alert an
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
-    ``_mark_reconcile_clears`` states that rule once."""
+    ``_mark_reconcile_clears`` states that rule once.
+
+    A row the pass could not write pages ``audit_write_failed`` first, once per action and on
+    every shape of pass, keyed ``directory-reconciler:<action>`` (BACKLOG #3018 step 2;
+    :func:`_alert_refused_reconciler_rows`)."""
+    _alert_refused_reconciler_rows(plan, sink)
     if plan.directory_outage:
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
@@ -11568,6 +12034,26 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
 
 
+#: The prefix of the ``audit_write_failed`` key for a reconcile row the store refused (BACKLOG
+#: #3018 step 2). The action follows it, so each lost kind of row is its own instance; the colon
+#: keeps the key outside the connection-name grammar, as ``approval:<id>`` does.
+_RECONCILER_AUDIT_ALERT_PREFIX: Final = "directory-reconciler"
+
+
+def _alert_refused_reconciler_rows(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page ``audit_write_failed`` once for each action the pass could not write a row for
+    (BACKLOG #3018 step 2). The service logged each at ERROR with the account; the page carries
+    only the action, as the alert's contract says. A sink that breaks its never-raise contract
+    costs that page only, so the reconcile alerts after it still fire."""
+    for action in dict.fromkeys(plan.audit_refused):
+        try:
+            sink.audit_write_failed(f"{_RECONCILER_AUDIT_ALERT_PREFIX}:{action}", action=action)
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            _log.exception(
+                "directory reconcile: the audit_write_failed alert for %s failed to emit", action
+            )
+
+
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the paging-refused state (vault BACKLOG #3696).
 
@@ -11593,19 +12079,21 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
 
 def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
-    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). That many of
-    its probes running failed to reach the directory, so the
-    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
-    no inverse: an operator resolves it. The account name is in the source only, as for a paging
-    refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
-    those entering, naming none, and counting only them."""
+    closing step 2, #3709 closing step 6; ``AuthService._note_unreached_accounts`` says when one
+    enters). That many of up to its last ``plan.unreached_window`` probes failed to reach the
+    directory, so the reconciler has neither struck nor revoked it. Once per entry, like a paging
+    refusal, and with no inverse: an operator resolves it. The account name is in the source
+    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under
+    the bare source covers those entering, naming none, and counting only them."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
-                entering=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+                entering=len(plan.unreached),
+                probes=min(n for _u, _n, n in plan.unreached),
+                window=plan.unreached_window,
             ),
         )
         return
@@ -11614,7 +12102,7 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
             f"{_UNREACHED_ALERT_SOURCE}:{username}",
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
-            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes, window=plan.unreached_window),
         )
 
 
@@ -11937,7 +12425,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -12002,6 +12490,9 @@ def create_managed_app(
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
     marked ``unaudited``.
     """
+    # The remote-debugging guard goes in before the reading, as create_app installs it.
+    install_remote_debug_guard()
+    _refuse_a_secret_in_the_service_environment("create_managed_app")
     if store_settings is None:
         if db_path is None:
             raise ValueError("create_managed_app requires either store_settings or db_path")
@@ -12052,9 +12543,11 @@ def create_managed_app(
         # BACKLOG #2193: the alerts test send builds an EmailTransport per request, and its SMTP
         # login takes the revocation guard a live alert takes, so it reads this same posture.
         app.state.alert_hop_posture = _hop_posture
-        # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
-        # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
-        # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
+        # #200 (ADR 0092): thread the derived instance posture to the store open, for the checks that
+        # read one (the SQL Server pin's anchor checks, the PostgreSQL revocation guard). The weakened-
+        # TLS refusal reads none: it refuses at every posture (vault BACKLOG #3533 item 2). With None
+        # (no [ai]) and no ambient stamp, the pin's anchor checks enforce (vault BACKLOG #2354), but the PostgreSQL
+        # revocation guard does not run: it no-ops on an unstamped posture (see open_store).
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
@@ -12094,9 +12587,14 @@ def create_managed_app(
                 "the start. Until then a rule that sent only by email uses the other transports, "
                 "or the log when there are none."
             )
+        # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
+        # password read through the secret provider (a Vault read, under [secrets]). Nothing of
+        # this lifespan's is running yet, but a blocked loop cannot take uvicorn's stop signal.
+        # start() stays on the loop below.
         try:
             notifier = (
-                notifier_from_settings(
+                await asyncio.to_thread(
+                    notifier_from_settings,
                     notifier_alerts,
                     secret_provider=secret_provider,
                     # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
@@ -12149,117 +12647,110 @@ def create_managed_app(
                 notifier.start()
                 await notifier.aclose()
             raise
-        # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
-        # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
-        # operator opts in; every uploaded-logs route 503s when None.
-        #
-        # ASVS 11.3.4 — it MUST share the store's cipher object, not build a second one over the same
-        # DEK: the AES-GCM invocation bound is per-instance state, so a second instance would charge
-        # nothing to the key's persisted `cipher_meta` row (an under-count in the unsafe direction) and
-        # would keep encrypting under a key the store's cipher had already fail-closed on at 2**32.
-        if resolved.uploads_dir:
-            app.state.upload_store = UploadStore(
-                resolved.uploads_dir,
-                store.cipher(),
-                max_bytes=resolved.max_upload_bytes,
-                # ASVS 5.2.4: thread the operator's per-user quota + retention values into the SERVE
-                # path too. This lifespan rebuild exists to share the store's cipher (the 11.3.4 GCM
-                # bound); it must NOT drop the quota/retention knobs, or serve silently falls back to the
-                # 100/250 MiB/30 d UploadStore defaults and ignores operator [store] config (create_app
-                # wires them at build time; only this rebind was missing them).
-                max_files_per_user=resolved.max_upload_files_per_user,
-                max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
-                retention_days=resolved.uploads_retention_days,
-                # ASVS 2.3.4: bind the cross-shard quota ledger to the SAME store this lifespan just
-                # opened — this is the serve path, so it is the one that actually runs sharded.
-                store=store,
-            )
-        if notifier is not None:
-            # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
-            # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
-            # pure side observer off the emit path — never gates a disposition, never blocks a worker.
-            notifier.set_store(store)
-            notifier.start()
-            # #143 (ADR 0044 amendment): seed the sink's windowed-suspend cache from durable
-            # alert_instance.suspended_until so an operator suspend set before this process started is
-            # honored from the first emit. Best-effort (a store error is swallowed; notify path unaffected).
-            await notifier.prime_suspensions()
-        # ADR 0172 decision 6: a renewed or recovered generated API pair was replaced before the store
-        # existed, so its audit row is written here, the first moment it can be. Dormant when empty.
-        await record_generated_pair_replacements(store, api_tls_replacements)
-        # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
-        # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
-        # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
-        # the store is closed in the except below and no listener ever binds. It raises for the same
-        # reason when attestation verified NOTHING — no baseline, a RECORD stripped of its package rows,
-        # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
-        # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
-        # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
-        # It attests the web console too when create_app has imported it (serve_ui on), against the
-        # console wheel's own RECORD under the same rules (BACKLOG #1802).
-        integ = integrity_settings or IntegritySettings()
-        if integ.enabled:
-            try:
+        # BACKLOG #5907: the startup guard. ONE guard over everything from here down to the
+        # teardown's try below, so a raise or cancel anywhere in it closes the notifier and the
+        # store; left open, aiosqlite's non-daemon worker holds the process at exit (#1257). The
+        # engine has not started anywhere in this span, so the unwind never calls engine.stop().
+        try:
+            # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
+            # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
+            # operator opts in; every uploaded-logs route 503s when None.
+            #
+            # ASVS 11.3.4 — it MUST share the store's cipher object, not build a second one over the same
+            # DEK: the AES-GCM invocation bound is per-instance state, so a second instance would charge
+            # nothing to the key's persisted `cipher_meta` row (an under-count in the unsafe direction) and
+            # would keep encrypting under a key the store's cipher had already fail-closed on at 2**32.
+            if resolved.uploads_dir:
+                app.state.upload_store = UploadStore(
+                    resolved.uploads_dir,
+                    store.cipher(),
+                    max_bytes=resolved.max_upload_bytes,
+                    # ASVS 5.2.4: thread the operator's per-user quota + retention values into the SERVE
+                    # path too. This lifespan rebuild exists to share the store's cipher (the 11.3.4 GCM
+                    # bound); it must NOT drop the quota/retention knobs, or serve silently falls back to the
+                    # 100/250 MiB/30 d UploadStore defaults and ignores operator [store] config (create_app
+                    # wires them at build time; only this rebind was missing them).
+                    max_files_per_user=resolved.max_upload_files_per_user,
+                    max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
+                    retention_days=resolved.uploads_retention_days,
+                    # ASVS 2.3.4: bind the cross-shard quota ledger to the SAME store this lifespan just
+                    # opened — this is the serve path, so it is the one that actually runs sharded.
+                    store=store,
+                )
+            if notifier is not None:
+                # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
+                # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
+                # pure side observer off the emit path — never gates a disposition, never blocks a worker.
+                notifier.set_store(store)
+                notifier.start()
+                # #143 (ADR 0044 amendment): seed the sink's windowed-suspend cache from durable
+                # alert_instance.suspended_until so an operator suspend set before this process started is
+                # honored from the first emit. Best-effort (a store error is swallowed; notify path unaffected).
+                await notifier.prime_suspensions()
+            # ADR 0172 decision 6: a renewed or recovered generated API pair was replaced before the store
+            # existed, so its audit row is written here, the first moment it can be. Dormant when empty.
+            await record_generated_pair_replacements(store, api_tls_replacements)
+            # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
+            # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
+            # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
+            # the startup guard closes the store and no listener ever binds. It raises for the same
+            # reason when attestation verified NOTHING — no baseline, a RECORD stripped of its package rows,
+            # or a package loaded from outside the install root (BACKLOG #1679): a pass that compared zero
+            # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
+            # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
+            # It attests the web console too when create_app has imported it (serve_ui on), against the
+            # console wheel's own RECORD under the same rules (BACKLOG #1802).
+            integ = integrity_settings or IntegritySettings()
+            if integ.enabled:
                 await run_startup_attestation(
                     store,
                     notifier or LoggingAlertSink(),
                     fail_closed_on_drift=integ.fail_closed_on_drift,
                 )
-            except BaseException:
-                # Fail-closed drift (or an unexpected error) before the engine starts: tear down what we
-                # already brought up (the notifier task + the open store) so we don't leak them, then
-                # re-raise to abort the lifespan startup (uvicorn exits non-zero).
-                if notifier is not None:
-                    await notifier.aclose()
-                await store.close()
-                raise
-        # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
-        # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
-        # trust_anchors module item 10) and the SQL Server store pin (item 11), BEFORE any listener binds — a group/world-writable anchor refuses (at
-        # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
-        # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
-        # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
-        # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
-        early_refusal = smtp_anchor_refusal or next(iter(prestore_anchor_refusals), None)
-        if trust_anchor_specs or early_refusal is not None:
-            try:
-                if trust_anchor_specs:
-                    await run_anchor_preflight(
-                        trust_anchor_specs, store, enforcing=trust_anchors_enforcing
-                    )
-                if early_refusal is not None:
-                    # The CA passed here after it was refused before the store opened: it
-                    # changed, or a read failed once. Its hop was built without it, so the engine
-                    # does not start. No row records this refusal.
-                    early_refusal.unaudited = True
-                    raise early_refusal
-            except BaseException:
-                if notifier is not None:
-                    await notifier.aclose()
-                await store.close()
-                raise
-        # #1008 (ASVS 13.2.2): read the store principal's EFFECTIVE privileges and report them, BEFORE
-        # any listener binds — the same seam and the same teardown discipline as the two preflights
-        # above. It ALWAYS runs and always logs, audits and feeds GET /security/posture. What it refuses
-        # is store/privilege.py's preflight_outcome (ADR 0199): under [security].enforcement=enforce an
-        # OBSERVED over-grant refuses unless [security].allow_over_granted_store_principal accepts it
-        # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
-        # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
-        # server principal), so the default single-node path is a log line and nothing else.
-        # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
-        # probe check-privileges runs and a client from the provider's own constructor, in the same
-        # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
-        # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
-        # it (audited), and so does a probe failure that is not a network failure, a timeout or a
-        # 403, which the opt-out does not lift; every other finding warns and audits
-        # (vault_preflight_outcome). It names the consumers from the
-        # resolved service settings, which serve always passes; an embedding that passes none has
-        # no Vault consumer this lifespan could name.
-        _security = security_settings or SecuritySettings()
-        # The dial falls back to [security].enforcement when no explicit one was passed, so an
-        # embedder that sets only security_settings gets its own dial.
-        _enforcing = (security_enforcement or _security.enforcement) is SecurityEnforcement.ENFORCE
-        try:
+            # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
+            # api-mTLS client CA), the settings CAs a hop dials with (vault BACKLOG #3188;
+            # trust_anchors module item 10) and the SQL Server store pin (that module's
+            # store_sqlserver_pin item), BEFORE any listener binds — a group/world-writable anchor refuses (at enforce) or
+            # warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
+            # change since the last audited observation is audited (auth.trust_anchor; for the store
+            # pin, that item says where this falls short).
+            # Dormant (no store call, no audit) when no anchor is configured. On a fatal violation it
+            # raises, and the startup guard tears down.
+            # BACKLOG #3470: a CA refused before the store opened, here or by serve's forwarder gate.
+            early_refusal = smtp_anchor_refusal or next(iter(prestore_anchor_refusals), None)
+            if trust_anchor_specs:
+                await run_anchor_preflight(
+                    trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+                )
+            if early_refusal is not None:
+                # The CA passed here after it was refused before the store opened: it
+                # changed, or a read failed once. Its hop was built without it, so the engine
+                # does not start. No row records this refusal.
+                early_refusal.unaudited = True
+                raise early_refusal
+            # #1008 (ASVS 13.2.2): read the store principal's EFFECTIVE privileges and report them, BEFORE
+            # any listener binds — the same seam as the two preflights above, inside the startup guard. It ALWAYS runs and always logs, audits and feeds GET /security/posture. What it refuses
+            # is store/privilege.py's preflight_outcome (ADR 0199): under [security].enforcement=enforce an
+            # OBSERVED over-grant refuses unless [security].allow_over_granted_store_principal accepts it
+            # (audited); an UNOBSERVABLE probe only warns unless [store].require_least_privilege is declared.
+            # The dial is the only key, as for every ADR 0148 serve gate. SQLite reports NOT_APPLICABLE (no
+            # server principal), so the default single-node path is a log line and nothing else.
+            # BACKLOG #2903 (ADR 0216, ASVS 13.2.2): then probe each Vault token the engine uses, with the
+            # probe check-privileges runs and a client from the provider's own constructor, in the same
+            # try and so under the same teardown. Under [security].enforcement=enforce the root policy or any grant
+            # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
+            # it (audited), and so does a probe failure that is not a network failure, a timeout or a
+            # 403, which the opt-out does not lift; every other finding warns and audits
+            # (vault_preflight_outcome). Every finding raises vault_privilege_warning, and a clean read
+            # can resolve it (see docs/SECURITY.md). It names the consumers from the
+            # resolved service settings, which serve always passes; an embedding that passes none has
+            # no Vault consumer this lifespan could name.
+            _security = security_settings or SecuritySettings()
+            # The dial falls back to [security].enforcement when no explicit one was passed, so an
+            # embedder that sets only security_settings gets its own dial.
+            _enforcing = (
+                security_enforcement or _security.enforcement
+            ) is SecurityEnforcement.ENFORCE
             app.state.store_privilege = (
                 await run_store_privilege_preflight(
                     store,
@@ -12279,205 +12770,223 @@ def create_managed_app(
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
+                    # #2903 slice B: each hop pages, or can resolve its page, through the same sink.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
-        except BaseException:
-            if notifier is not None:
-                await notifier.aclose()
-            await store.close()
-            raise
-        # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
-        # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
-        # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
-        # in engine.start()/stop()), so the lifespan only constructs + passes it here.
-        # #145: thread the alert notifier so a leadership transition (HA failover / election) pages via
-        # leadership_acquired/lost. None → the coordinator's default LoggingAlertSink logs the transition.
-        coordinator = build_coordinator(store, cluster_settings, alert_sink=notifier)
-        engine = Engine(
-            store,
-            poll_interval=poll_interval,
-            max_correlation_depth=max_correlation_depth,
-            per_lane_wake=per_lane_wake,
-            claim_mode=claim_mode,
-            pooled_claimers_per_stage=pooled_claimers_per_stage,
-            pooled_sweep_interval=pooled_sweep_interval,
-            pooled_claim_lane_chunk=pooled_claim_lane_chunk,
-            pooled_max_processing_lanes=pooled_max_processing_lanes,
-            infra_fault_policy=infra_fault_policy,
-            infra_fault_stop_after=infra_fault_stop_after,
-            infra_fault_backoff_cap=infra_fault_backoff_cap,
-            credential_fault_policy=credential_fault_policy,
-            schedule_tick_seconds=schedule_tick_seconds,
-            fuse_thread_hops=fuse_thread_hops,
-            pooled_fusing_workers=pooled_fusing_workers,
-            batch_handoff_statements=batch_handoff_statements,
-            snapshot_on_send=snapshot_on_send,
-            connection_events=connection_events,
-            response_sent_default=response_sent_default,
-            audit_verify_on_start=integ.audit_verify_on_start,
-            # #328: the COUNT:HEAD anchor the startup walk compares against, as a PREFIX. This is the
-            # ONLY route an [integrity] key reaches the Engine, so a new field on IntegritySettings that
-            # is not named here is a configurable, documented setting nothing ever reads.
-            audit_anchor_file=integ.audit_anchor_file or None,
-            config_dir=config_dir,
-            config_reload_roots=config_reload_roots,
-            inbound_bind_host=inbound_bind_host,
-            allow_insecure_bind=allow_insecure_bind,
-            delivery_defaults=delivery_defaults,
-            ordering_default=ordering_default,
-            internal_error_default=internal_error_default,
-            buildup_default=buildup_default,
-            stall_default=stall_default,
-            saturation_default=saturation_default,
-            ack_after_default=ack_after_default,
-            stream_inflight_budget_bytes=stream_inflight_budget_bytes,
-            max_staged_depth=max_staged_depth,
-            refused_body=refused_body,
-            priority_default=priority_default,
-            alert_sink=notifier,
-            retention_settings=retention_settings,
-            # [logging].log_dir for application-log-file retention (#120) in the RetentionRunner.
-            log_dir=log_dir,
-            cert_monitor_settings=cert_monitor_settings,
-            secret_rotation_settings=secret_rotation_settings,
-            security_enforcement=security_enforcement,
-            update_check_settings=update_check_settings,
-            backup_settings=backup_settings,
-            # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
-            # dr.activate, the engine binds only connections at/above dr.priority_threshold this boot.
-            dr_settings=dr_settings,
-            # [backup] DR archive is encrypted under the store DEK (its KEY SOURCE) and bundles the
-            # config dir; pass the resolved store settings (the KeyProvider seam) + version metadata.
-            store_settings=resolved,
-            engine_version=__version__,
-            api_tls_cert_file=api_tls_cert_file,
-            api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
-            api_listener=api_listener,
-            reference_settings=reference_settings,
-            egress_settings=egress_settings,
-            # #200 (ADR 0092): the derived (PHI? production?) posture the connector-construction gate keys
-            # its posture-keyed insecure-hop refusal on. Derived from [ai] here (the one place ai_settings
-            # is in scope) so every runner this engine builds refuses/warns identically. None when the
-            # instance declares no [ai] (test/embedding) — a cell then fail-closes.
-            hop_posture=(
-                hop_posture_from_ai(
-                    ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
-                )
-                if ai_settings
-                else None
-            ),
-            # #190 (ADR 0093): the [tls] client trust-anchor policy (internal-CA fallback for internal
-            # outbound hops). None ([tls] unset) → the default system/no-op policy (byte-identical).
-            trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-            shadow_settings=shadow_settings,
-            sandbox_settings=sandbox_settings,
-            active_environment=ai_settings.environment if ai_settings else None,
-            env_values=env_values,
-            env_values_provider=env_values_provider,
-            coordinator=coordinator,
-            cluster_settings=cluster_settings,
-            registry_filter=registry_filter,
-            registry_guard=registry_guard,
-            # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
-            # directories they name (key files, CA files, spool dirs), which the `.processed`
-            # archive sweep must never reach.
-            owned_settings=(
-                auth_settings,
-                ai_settings,
-                security_settings,
-                alerts_settings,
-                secrets_settings,
-                tls_settings,
-                cluster_settings,
-                approvals_settings,
-                integrity_settings,
-                service_settings,
-                static_credential_settings,
-                egress_settings,
-            ),
-            # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
-            # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
-            # every real reload. Each listener's own build then enforces again and loads the bytes
-            # it read. Since vault BACKLOG #2371 it also checks each FhirLookup's CA; the lane
-            # CAs are the runner's, below. Module item 9 of auth/trust_anchors.py says when.
-            # Dormant when no connection names a CA: no store call, no audit row.
-            # BACKLOG #3402: the caller's own preflight runs first, beside it and never in its
-            # place, so a graph it refuses writes no anchor audit row.
-            registry_preflight=_chain_registry_preflights(
-                registry_preflight,
-                make_registry_anchor_preflight(store, enforcing=trust_anchors_enforcing),
-            ),
-            # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
-            # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
-            # reload for each lane that reload builds or keeps running.
-            lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
-            # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA, and since vault
-            # BACKLOG #3188 the dialling settings CAs), re-verified by
-            # the engine on EVERY real reload, not only the direct /config/reload route. None when
-            # no settings anchor is configured.
-            settings_preflight=make_settings_anchor_preflight(
-                trust_anchor_specs, store, enforcing=trust_anchors_enforcing
-            ),
-        )
-
-        # vault BACKLOG #3076: a convergence reload writes the same config_reload row an operator
-        # reload does, so the store's newest baseline names the graph this node now runs. It is
-        # built from the reload's own outcome, as an operator reload's is, so a reload that lands
-        # before the write cannot put its graph under this actor (vault BACKLOG #3109).
-        #
-        # A row the store refuses is logged at ERROR with its detail, and raises no alert (vault
-        # BACKLOG #3109). The inline route's post-swap row raises none either, though it names an
-        # `audit` step in its answer; this reload has no answer to name it in. The next start compares
-        # against the newest row that did land, normally the initiator's, which names the same
-        # bytes where every node shares one config directory. A change goes unreported only if
-        # that row was lost too; otherwise the cost is at most a false config_changed.
-        async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
-            failed = outcome.failed_steps
-            # A row with no digest would be the newest baseline and leave the next start nothing
-            # to compare against. Unlike an operator's row, one lands per follower per cluster
-            # reload, so it is marked and a later start passes over it to a digest-bearing row.
-            # A partial digest is a baseline: a later start compares against it and pages on a
-            # change, as it would against any digest (vault BACKLOG #3765, item 15).
-            no_digest = (
-                "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
-            )
-            # The row names the digest judged above, not the engine's at the write: a later
-            # reload marks it superseded instead (vault BACKLOG #3765, item 19).
-            await _record_reload_audit(
-                engine,
-                actor=_CONVERGENCE_ACTOR,
-                loaded=outcome,
-                failed_steps=failed,
-                extra={
-                    "initiator": _CONVERGENCE_INITIATOR,
-                    **({_BASELINE_UNCHECKED: True} if no_digest else {}),
-                },
+            # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
+            # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
+            # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
+            # in engine.start()/stop()), so the lifespan only constructs + passes it here.
+            # #145: thread the alert notifier so a leadership transition (HA failover / election) pages via
+            # leadership_acquired/lost. None → the coordinator's default LoggingAlertSink logs the transition.
+            coordinator = build_coordinator(store, cluster_settings, alert_sink=notifier)
+            engine = Engine(
+                store,
+                poll_interval=poll_interval,
+                max_correlation_depth=max_correlation_depth,
+                per_lane_wake=per_lane_wake,
+                claim_mode=claim_mode,
+                pooled_claimers_per_stage=pooled_claimers_per_stage,
+                pooled_sweep_interval=pooled_sweep_interval,
+                pooled_claim_lane_chunk=pooled_claim_lane_chunk,
+                pooled_max_processing_lanes=pooled_max_processing_lanes,
+                infra_fault_policy=infra_fault_policy,
+                infra_fault_stop_after=infra_fault_stop_after,
+                infra_fault_backoff_cap=infra_fault_backoff_cap,
+                credential_fault_policy=credential_fault_policy,
+                schedule_tick_seconds=schedule_tick_seconds,
+                fuse_thread_hops=fuse_thread_hops,
+                pooled_fusing_workers=pooled_fusing_workers,
+                batch_handoff_statements=batch_handoff_statements,
+                snapshot_on_send=snapshot_on_send,
+                connection_events=connection_events,
+                response_sent_default=response_sent_default,
+                audit_verify_on_start=integ.audit_verify_on_start,
+                # #328: the COUNT:HEAD anchor the startup walk compares against, as a PREFIX. This is the
+                # ONLY route an [integrity] key reaches the Engine, so a new field on IntegritySettings that
+                # is not named here is a configurable, documented setting nothing ever reads.
+                audit_anchor_file=integ.audit_anchor_file or None,
+                config_dir=config_dir,
+                config_reload_roots=config_reload_roots,
+                inbound_bind_host=inbound_bind_host,
+                allow_insecure_bind=allow_insecure_bind,
+                delivery_defaults=delivery_defaults,
+                ordering_default=ordering_default,
+                internal_error_default=internal_error_default,
+                buildup_default=buildup_default,
+                stall_default=stall_default,
+                saturation_default=saturation_default,
+                ack_after_default=ack_after_default,
+                stream_inflight_budget_bytes=stream_inflight_budget_bytes,
+                max_staged_depth=max_staged_depth,
+                refused_body=refused_body,
+                priority_default=priority_default,
+                alert_sink=notifier,
+                retention_settings=retention_settings,
+                # [logging].log_dir for application-log-file retention (#120) in the RetentionRunner.
+                log_dir=log_dir,
+                cert_monitor_settings=cert_monitor_settings,
+                secret_rotation_settings=secret_rotation_settings,
+                security_enforcement=security_enforcement,
+                update_check_settings=update_check_settings,
+                backup_settings=backup_settings,
+                # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
+                # dr.activate, the engine binds only connections at/above dr.priority_threshold this boot.
+                dr_settings=dr_settings,
+                # [backup] DR archive is encrypted under the store DEK (its KEY SOURCE) and bundles the
+                # config dir; pass the resolved store settings (the KeyProvider seam) + version metadata.
+                store_settings=resolved,
+                engine_version=__version__,
+                api_tls_cert_file=api_tls_cert_file,
+                api_tls_client_cert_files=api_tls_client_cert_files,
+                # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
+                settings_monitored_files=settings_monitored_files,
+                api_listener=api_listener,
+                reference_settings=reference_settings,
+                egress_settings=egress_settings,
+                # #200 (ADR 0092): the derived (PHI? production?) posture the connector-construction gate keys
+                # its posture-keyed insecure-hop refusal on. Derived from [ai] here (the one place ai_settings
+                # is in scope) so every runner this engine builds refuses/warns identically. None when the
+                # instance declares no [ai] (test/embedding) — a cell then fail-closes.
+                hop_posture=(
+                    hop_posture_from_ai(
+                        ai_settings,
+                        enforcement=(security_settings or SecuritySettings()).enforcement,
+                    )
+                    if ai_settings
+                    else None
+                ),
+                # #190 (ADR 0093): the [tls] client trust-anchor policy (internal-CA fallback for internal
+                # outbound hops). None ([tls] unset) → the default system/no-op policy (byte-identical).
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+                shadow_settings=shadow_settings,
+                sandbox_settings=sandbox_settings,
+                active_environment=ai_settings.environment if ai_settings else None,
+                env_values=env_values,
+                env_values_provider=env_values_provider,
+                coordinator=coordinator,
+                cluster_settings=cluster_settings,
+                registry_filter=registry_filter,
+                registry_guard=registry_guard,
+                # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
+                # directories they name (key files, CA files, spool dirs), which the `.processed`
+                # archive sweep must never reach.
+                owned_settings=(
+                    auth_settings,
+                    ai_settings,
+                    security_settings,
+                    alerts_settings,
+                    secrets_settings,
+                    tls_settings,
+                    cluster_settings,
+                    approvals_settings,
+                    integrity_settings,
+                    service_settings,
+                    static_credential_settings,
+                    egress_settings,
+                ),
+                # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
+                # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
+                # every real reload. Each listener's own build then enforces again and loads the bytes
+                # it read. The lane CAs and, since vault BACKLOG #3582, the FhirLookup CAs are the
+                # runner's, below. Module item 9 of auth/trust_anchors.py says when.
+                # Dormant when no connection names a CA: no store call, no audit row.
+                # BACKLOG #3402: the caller's own preflight runs first, beside it and never in its
+                # place, so a graph it refuses writes no anchor audit row.
+                registry_preflight=_chain_registry_preflights(
+                    registry_preflight,
+                    make_registry_anchor_preflight(store, enforcing=trust_anchors_enforcing),
+                ),
+                # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
+                # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
+                # reload for each lane that reload builds or keeps running. Since vault BACKLOG #3582
+                # it checks each FhirLookup the same way, so a refused one isolates that lookup.
+                lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
+                # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA, and since vault
+                # BACKLOG #3188 the dialling settings CAs), re-verified by
+                # the engine on EVERY real reload, not only the direct /config/reload route. None when
+                # no settings anchor is configured.
+                settings_preflight=make_settings_anchor_preflight(
+                    trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+                ),
             )
 
-        async def _audit_convergence_failure(
-            exc: Exception, version: int, reported: set[str]
-        ) -> None:
-            await _audit_failed_convergence(engine, exc, version, reported)
+            # vault BACKLOG #3076: a convergence reload writes the same config_reload row an operator
+            # reload does, so the store's newest baseline names the graph this node now runs. It is
+            # built from the reload's own outcome, as an operator reload's is, so a reload that lands
+            # before the write cannot put its graph under this actor (vault BACKLOG #3109).
+            #
+            # A row the store refuses is logged at ERROR with its detail, and raises no alert (vault
+            # BACKLOG #3109). The inline route's post-swap row raises none either, though it names an
+            # `audit` step in its answer; this reload has no answer to name it in. The next start compares
+            # against the newest row that did land, normally the initiator's, which names the same
+            # bytes where every node shares one config directory. A change goes unreported only if
+            # that row was lost too; otherwise the cost is at most a false config_changed.
+            posture_stashed = False  # set once the loosenings reader's settings are stashed
 
-        engine.convergence_reload_audit = _audit_convergence_reload
-        engine.convergence_reload_failed = _audit_convergence_failure
-        # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
-        start_fingerprint_failure: str | None = None
-        start_outcome: _StartOutcome | None = None
-        start_config: _StartConfigComparison | None = None
-        start_loaded: _LoadedConfig | None = None
-        if config_dir is not None:
-            # The first graph load, under the same teardown discipline as the preflights above: a
-            # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
-            # guard) happens after the store and notifier are open and before the span below that
-            # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
-            # the process from exiting (#1257).
-            try:
+            async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
+                failed = outcome.failed_steps
+                # A row with no digest would be the newest baseline and leave the next start nothing
+                # to compare against. Unlike an operator's row, one lands per follower per cluster
+                # reload, so it is marked and a later start passes over it to a digest-bearing row.
+                # A partial digest is a baseline: a later start compares against it and pages on a
+                # change, as it would against any digest (vault BACKLOG #3765, item 15).
+                no_digest = (
+                    "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
+                )
+
+                # The loosenings of the graph this reload loaded, read against the env() values it
+                # swapped in, as a start row records its own (vault BACKLOG #3814). Read inside the
+                # row's write, so a cancel waits for the row as it does for the write. A convergence
+                # before the lifespan has stashed the settings the reader needs, at least one inside
+                # engine.start(), would leave settings-scoped loosenings out, so it is recorded as
+                # unknown.
+                async def _loosenings() -> list[str] | None:
+                    if not posture_stashed:
+                        return None
+                    return await _graph_loosenings(
+                        app.state, engine, outcome.registry, outcome.env_values, "config_reload"
+                    )
+
+                # The row names the digest judged above, not the engine's at the write: a later
+                # reload marks it superseded instead (vault BACKLOG #3765, item 19).
+                await _record_reload_audit(
+                    engine,
+                    actor=_CONVERGENCE_ACTOR,
+                    loaded=outcome,
+                    failed_steps=failed,
+                    extra={
+                        "initiator": _CONVERGENCE_INITIATOR,
+                        **({_BASELINE_UNCHECKED: True} if no_digest else {}),
+                    },
+                    loosenings=_loosenings,
+                )
+
+            async def _audit_convergence_failure(
+                exc: Exception, version: int, reported: set[str]
+            ) -> None:
+                await _audit_failed_convergence(engine, exc, version, reported)
+
+            engine.convergence_reload_audit = _audit_convergence_reload
+            engine.convergence_reload_failed = _audit_convergence_failure
+            # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
+            start_fingerprint_failure: str | None = None
+            start_outcome: _StartOutcome | None = None
+            start_config: _StartConfigComparison | None = None
+            start_loaded: _LoadedConfig | None = None
+            if config_dir is not None:
+                # The first graph load. A refusal here (a bad config, the shard guard, or the BACKLOG
+                # #1182 static-credential guard) happens after the store and notifier are open, so the
+                # startup guard closes them. Left open, aiosqlite's non-daemon worker keeps the process
+                # from exiting (#1257).
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
                 loaded = load_config(config_dir)
+                # The values from the bytes the load read, as a reload parses them, so the guard,
+                # the preflight and the runner use what the config_loaded digest names (vault
+                # BACKLOG #2596, step 6). A refusal is a bad config, as the load's own is.
+                await engine.apply_start_env_values(loaded)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
                 engine.guard_registry(loaded)
@@ -12560,38 +13069,51 @@ def create_managed_app(
                     _raise_config_changed(
                         notifier or LoggingAlertSink(), engine, start_outcome, start_config
                     )
-            except BaseException:
-                if notifier is not None:
-                    await notifier.aclose()
-                await store.close()
-                raise
-        # #1257: hoisted above the try because the finally below now guards STARTUP too, and it
-        # reaches these names before it reaches engine.stop(). Left in place inside the span, a
-        # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it
-        # early -- so the store never closes and the process hangs exactly as it did before the
-        # fix, with the real startup error replaced by the UnboundLocalError. Measured by removing
-        # one of these five: the hang came straight back. They are load-bearing, not tidiness.
-        upload_retention_runner: UploadRetentionRunner | None = None
-        reaper: asyncio.Task[None] | None = None
-        reconciler: asyncio.Task[None] | None = None
-        # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
-        credential_reminder: asyncio.Task[None] | None = None
-        security_notifier = None
-        # BACKLOG #2614: hoisted for the same teardown reason. The restore record runs first in the
-        # span, so a raise from it would otherwise reach the finally before `auth` is bound.
-        auth: AuthService | None = None
-        # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
-        # adds no commit to the request path. Here, just above the span whose finally removes it,
-        # so no startup failure can leave it registered. Before the start's config_loaded row.
-        remove_security_signals = _install_security_signals(
-            engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
-        )
+            # #1257: hoisted above the teardown's try because its finally guards STARTUP too, and it
+            # reaches these names before it reaches engine.stop(). Left in place inside the span, a
+            # failure before they were bound raises UnboundLocalError IN THE TEARDOWN, which aborts it
+            # early -- so the store never closes and the process hangs exactly as it did before the
+            # fix, with the real startup error replaced by the UnboundLocalError. Measured by removing
+            # one of these five: the hang came straight back. They are load-bearing, not tidiness.
+            upload_retention_runner: UploadRetentionRunner | None = None
+            reaper: asyncio.Task[None] | None = None
+            reconciler: asyncio.Task[None] | None = None
+            # BACKLOG #1141: hoisted with the others above, for the same teardown reason.
+            credential_reminder: asyncio.Task[None] | None = None
+            security_notifier = None
+            # BACKLOG #2614: hoisted for the same teardown reason. The restore record runs first in the
+            # span, so a raise from it would otherwise reach the finally before `auth` is bound.
+            auth: AuthService | None = None
+            # vault BACKLOG #2613: the security-signal rule layer, an observer on the audit tee, so it
+            # adds no commit to the request path. Here, just above the span whose finally removes it,
+            # so no startup failure can leave it registered. Before the start's config_loaded row.
+            remove_security_signals = _install_security_signals(
+                engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
+            )
+        except BaseException:
+            await _unwind_failed_start(store, notifier)
+            raise
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
+        disarm_seal_page: Callable[[], None] | None = None
         try:
+            # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
+            # revoke that goes without an account's epoch raise, or ends its kept session, on a
+            # Vault transit outage pages authority-seal-transit on the authority-seal sink. Armed
+            # on this store's own pager (decision d20261109T200352805-599b24, item 5), first, so
+            # the restore's revoke below pages too; the teardown removes only this registration.
+            seal_pager = getattr(store, "seal_pager", None)
+            if callable(seal_pager):
+                disarm_seal_page = seal_pager().arm(
+                    authority_seal_page(notifier or LoggingAlertSink())
+                )
+            # ADR 0217 slice 1b-iii: the Transit row sealer's start probe, before the restore and
+            # the auth service read or write any authority row. A failed probe refuses the start.
+            # Engine.start runs it again, for an engine started without this lifespan.
+            await probe_row_sealer_at_start(store.row_sealer())
             # BACKLOG #2614: the first start on a restored store ends the archive's sessions and
             # records the restore, before the auth service exists and so before any request.
             await _record_a_restore(store, notifier or LoggingAlertSink())
@@ -12610,8 +13132,16 @@ def create_managed_app(
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
                 # conditions — not here. This task is owned by the lifespan (started here, drained + closed
                 # in the finally below, before engine.stop() closes the store it records in).
+                # BACKLOG #5908: this factory and the AuthService constructor below run in a worker
+                # thread, so the event loop already running the store and the alert notifier is not
+                # blocked. The factory blocks as the alert notifier's does, above. The constructor
+                # does at least these: resolves the directory secrets, loads the LDAPS and OIDC CA
+                # and CRL files, and checks a CA file's access control, which runs icacls on Windows. A raise from either reaches the teardown below, as it did when
+                # they ran inline. A cancel does too, while the thread runs on to its own end: the
+                # work was never cancellable midway, and inline it held the loop instead.
                 if auth_settings.notify_security_events and alerts_settings is not None:
-                    security_notifier = security_notifier_from_settings(
+                    security_notifier = await asyncio.to_thread(
+                        security_notifier_from_settings,
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
@@ -12619,48 +13149,61 @@ def create_managed_app(
                         # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
                         posture=_hop_posture,
                     )
-                auth = AuthService(
-                    store,
-                    auth_settings,
-                    security_notifier=security_notifier,
-                    secret_provider=secret_provider,
-                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                    # preflight already ran before any listener bound; this keeps the seam consistent.
-                    enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the hops this service builds out of the
-                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
-                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
-                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
-                    hop_posture=_hop_posture,
-                    # BACKLOG #2592: an authority row that fails its integrity seal is denied and
-                    # raises integrity_drift on the same sink the cipher refusal uses.
-                    integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
-                    # Vault BACKLOG #3229: a directory role change that leaves no enabled
-                    # Administrator is applied, and raises no_enabled_administrator here.
-                    admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
-                    # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator raises
-                    # administrator_granted here, as a directory sign-in does in its route.
-                    admin_grant_alert=administrator_granted_alert(
-                        notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
-                    ),
-                    # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
-                    # audit_write_failed here when it stops a row, at most once a window.
-                    step_up_return_audit_alert=step_up_return_audit_alert(
-                        notifier or LoggingAlertSink()
-                    ),
-                    # BACKLOG #3937: the relying party a passkey must be under to count as a way
-                    # past the sign-in lock at the factor-drop gates; None counts none.
-                    way_past_rp_id=configured_rp_id(public_origin),
+                # A lambda rather than to_thread(AuthService, ...), so the call stays an AuthService
+                # call the census tests find, with its keywords. EVERY ARGUMENT BELOW IS EVALUATED IN
+                # THE WORKER THREAD: anything that needs the running loop (get_running_loop,
+                # create_task) is bound above, on the loop, and passed in by name.
+                alert_sink = notifier or LoggingAlertSink()
+                auth = await asyncio.to_thread(
+                    lambda: AuthService(
+                        store,
+                        auth_settings,
+                        security_notifier=security_notifier,
+                        secret_provider=secret_provider,
+                        # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's
+                        # construction-site preflight in build_idp_opener honors
+                        # [security].enforcement — warn+audit (via the central run_anchor_preflight
+                        # above) rather than refusing at enforce-only. Central preflight already ran
+                        # before any listener bound; this keeps the seam consistent.
+                        enforcing=trust_anchors_enforcing,
+                        # Thread the derived instance posture to the hops this service builds out of
+                        # the connector-construction gate: the OIDC legs' revocation guard (BACKLOG
+                        # #1887) and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this
+                        # said the plain ldap:// refusal read it; that refusal holds at every
+                        # posture (#3533).
+                        hop_posture=_hop_posture,
+                        # BACKLOG #2592: an authority row that fails its integrity seal is denied
+                        # and raises integrity_drift on the same sink the cipher refusal uses.
+                        integrity_alert=authority_seal_alert(alert_sink),
+                        # Vault BACKLOG #3229: a directory role change that leaves no enabled
+                        # Administrator is applied, and raises no_enabled_administrator here.
+                        admin_loss_alert=no_enabled_administrator_alert(alert_sink),
+                        # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator
+                        # raises administrator_granted here, as a directory sign-in does in its
+                        # route.
+                        admin_grant_alert=administrator_granted_alert(
+                            alert_sink, granted_by=DIRECTORY_GRANTED_BY
+                        ),
+                        # BACKLOG #3965: the step-up return audit budget's all-callers backstop
+                        # pages audit_write_failed here when it stops a row, at most once a window.
+                        step_up_return_audit_alert=step_up_return_audit_alert(alert_sink),
+                        # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
+                        # audit_write_failed here.
+                        sign_in_audit_alert=directory_sign_in_audit_alert(alert_sink),
+                        # BACKLOG #3937: the relying party a passkey must be under to count as a way
+                        # past the sign-in lock at the factor-drop gates; None counts none.
+                        way_past_rp_id=configured_rp_id(public_origin),
+                    )
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
                     security_notifier.start()
                 # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
                 # enabled Administrator exists yet, and the gate's refusal must stop startup before
-                # any connection starts rather than after. Both touch only the store: initialize()
-                # seeds the built-in roles and the gate reads the users. A refusal here also comes
+                # any connection starts rather than after. initialize() seeds the built-in roles;
+                # the gate reads the users through the service's checked list, which on a keyed
+                # store verifies each seal (a Vault transit call each under vault_transit) and can
+                # write a seal-failure audit row and raise its alert. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
                 # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
                 # and moving it ahead of this gate reorders the start whose failure paging
@@ -12670,6 +13213,7 @@ def create_managed_app(
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
                     store,
+                    auth=auth,
                     auth_settings=auth_settings,
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
@@ -12762,6 +13306,8 @@ def create_managed_app(
             # fallback for an app that sets the stash with no service attached.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
+            # A convergence row reads the same stashes for its loosenings (vault BACKLOG #3814).
+            posture_stashed = True
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
             # last stash the loosenings reader needs is the one above, and the graph is already
             # serving, so a later startup step that aborts must not leave the start unrecorded.
@@ -12894,6 +13440,10 @@ def create_managed_app(
                     )
             yield
         finally:
+            # This lifespan's own seal page registration, and no other (ADR 0217, decision
+            # d20261109T200352805-599b24 item 5).
+            if disarm_seal_page is not None:
+                disarm_seal_page()
             # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
             # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
             # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and

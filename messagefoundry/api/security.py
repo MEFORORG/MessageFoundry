@@ -41,6 +41,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
+    parse_trusted_proxies,
+    peer_is_trusted_proxy,
     peercert_from_ssl_object,
 )
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -57,7 +59,7 @@ from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
-from messagefoundry.store.base import store_call_errors
+from messagefoundry.store.base import sealed_read_errors, store_call_errors
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -76,8 +78,9 @@ def alert_sink_for(state: Any) -> AlertSink:
 
 #: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
 #: #2610): no administrator acted, the directory's group membership did. It is a fixed marker, styled
-#: like the ``<kerberos>`` audit actor. No username check reserves it, so an account literally named
-#: ``<directory>`` would read the same in this field; the alert's ``via`` names the route either way.
+#: like the ``<kerberos>`` audit actor. ``POST /users`` refuses the name (``auth/usernames.py``), but
+#: provision-admin and the directory create paths do not, so an account literally named
+#: ``<directory>`` could read the same in this field; the alert's ``via`` names the route either way.
 DIRECTORY_GRANTED_BY = "<directory>"
 
 
@@ -348,6 +351,15 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
     return None if deadline is None else deadline / 3600.0
 
 
+def account_read_errors() -> tuple[type[Exception], ...]:
+    """The refusals the checked account read the console makes through ``AdminHandlers.checked_user``
+    can raise past the 404, 423 and 503 its handler answers (BACKLOG #5559):
+    :func:`~messagefoundry.store.base.sealed_read_errors`, a refused store call or a record that
+    cannot be decrypted. As that function says, a caller that must not read a bug as a refusal
+    re-raises :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return sealed_read_errors()
+
+
 #: The 503 detail a route gives when it needs an auth service and none is attached. The gates give
 #: it only when the app did not opt in to the open mode. The sign-in routes give it in the open
 #: mode too: they have no service to sign in with. One text (vault BACKLOG #3216): those routes
@@ -547,8 +559,9 @@ def client_ip(conn: HTTPConnection) -> str | None:
 
     **It parses no forwarding header, ever, and must not start.** The
     ``[security].allowed_client_networks`` gate decides on this value (``api/client_networks.py``),
-    so a header read here would let any caller spoof its way past that gate. uvicorn is the one
-    ``X-Forwarded-For`` trust point (ADR 0151, D-1).
+    so a header read here would let any caller spoof its way past that gate. uvicorn is the API's one
+    ``X-Forwarded-For`` trust point (ADR 0151, D-1); the inbound HTTP listener's own, for its
+    failed-attempt budget only, never reaches this value (BACKLOG #5525).
 
     It reads ``scope["client"][0]`` itself, the item the gate judged before BACKLOG #2289, rather
     than starlette's ``conn.client``: that builds ``Address(*scope["client"])`` and raises
@@ -1634,13 +1647,24 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
         if isinstance(stashed, Mapping) and stashed:
             return stashed
     # Fallback: a server/shim that puts the transport directly in scope['transport'].
-    transport = request.scope.get("transport")
+    transport: Any = request.scope.get("transport")
     get_extra_info = getattr(transport, "get_extra_info", None)
     if get_extra_info is None:
         return None
     ssl_object = get_extra_info("ssl_object")
     if ssl_object is None:
         return None
+    # Vault BACKLOG #5628: the shim's proxy rule holds here too. A declared proxy forwards other
+    # callers, so its certificate names none of them.
+    app = request.scope.get("app")
+    proxies = getattr(getattr(app, "state", None), "trusted_proxies", ())
+    if proxies:
+        try:
+            parsed = parse_trusted_proxies(proxies)
+        except ValueError:
+            return None  # a list that cannot be read: deny rather than fail the request
+        if peer_is_trusted_proxy(transport, parsed):
+            return None
     # The same read the shim makes, verified issuer included (BACKLOG #2237).
     return peercert_from_ssl_object(ssl_object)
 

@@ -660,10 +660,10 @@ async def test_a_row_checked_inside_the_write_to_revoke_window_stops_on_the_scop
     written = asyncio.Event()
     release = asyncio.Event()
 
-    async def held_revoke(user_id: str) -> RevokeResult:
+    async def held_revoke(user_id: str, **kwargs: Any) -> RevokeResult:
         written.set()  # set_channel_scope has written the scope and is about to revoke
         await release.wait()
-        return await real_revoke(user_id)
+        return await real_revoke(user_id, **kwargs)
 
     pending: list[asyncio.Task[None]] = []
 

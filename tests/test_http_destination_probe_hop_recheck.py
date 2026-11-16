@@ -37,8 +37,8 @@ _CELLS: dict[str, tuple[Any, Any, str]] = {
     "FHIR": (ConnectorType.FHIR, FHIR, "http://fhir.example.org/fhir"),
     "DICOMweb": (ConnectorType.DICOMWEB, DICOMweb, "http://pacs.example.org/dicom-web"),
 }
-# The two probes that mint a bearer before they send.
-_MINTING = ["REST", "FHIR"]
+# The probes that mint a bearer before they send (SOAP since BACKLOG #5526).
+_MINTING = ["REST", "SOAP", "FHIR"]
 
 
 class _Resp:

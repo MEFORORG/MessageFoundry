@@ -57,22 +57,27 @@ from messagefoundry.store.store import ClaimAbortPhase, ClaimedHeads, ClaimLockT
 # marker rows (` UNION ALL SELECT NULL, ... FROM @heads h WHERE h.rn = 1 AND NOT EXISTS (...)` plus
 # the epoch guard). Measured strictly additive: cutting that one clause out of each new text
 # reproduced all 12 previous hashes, so nothing else in the batch moved.
+# RE-PINNED for BACKLOG #5721, a reviewed change to the lane comparisons only: every lane
+# comparison pins a binary collation (the @heads lane column, the ROW_NUMBER partition, a binary
+# conjunct beside the discovery and probe equalities, and a DATABASE_DEFAULT label on the marker
+# arm's lane). Measured substitution-only: reverting exactly those clauses in each new text
+# reproduced all 12 previous hashes.
 # ingress/routed/response share one text (the channel_id lane family); outbound is the
 # destination_name family. The text does not depend on `now` (a parameter), only on N and epoch.
 _GOLDEN_SQL_SHA256 = {
     # (lane_family, n_lanes, epoch_on): sha256(batch_text)
-    ("cid", 1, False): "0d85a3ace5377e730c8ae9376968a69addd001f948b3b5a67ca1e30fbba19d14",
-    ("cid", 1, True): "6d29ccd386a0dffc869e432f1b50686cd172580895a6860f404a0447556e1ebf",
-    ("cid", 4, False): "4b19b7ccead2dd7ce9baa7c5682581a653b727d7b372ab9c2f903f646b43878f",
-    ("cid", 4, True): "c73bcd474a50f671eca4145d45e853e7fc126df3ae9c76648ab04f5974b44856",
-    ("cid", 64, False): "3fdb3e56556244cfc02771a6c8e09b2610c7274f8ceba7a96b3d9bb3fcaf5143",
-    ("cid", 64, True): "ca067e871afa2f97accdd81fd885e40248a94e5d8fa3cde98e494e216ec0e839",
-    ("dst", 1, False): "1c237fc7b238cfa225febfe15e6850c6d1151fb33f62f8df11b332651c0b9741",
-    ("dst", 1, True): "df4af4c5e6356847db8382e122309e4cc53d3436d718508093895bd2c1759967",
-    ("dst", 4, False): "210e6d1176f9199fcde04d145fafbd4114888c7a9e0f30b403123673b6599006",
-    ("dst", 4, True): "5346513b387150ad5c13beee2eb6d87dd0f9f02da6528f77f0a78be5dc11fd19",
-    ("dst", 64, False): "27241ac2568458c87bd78ad28ad787c7502e486c5d6f0f1c4437ec26045fa122",
-    ("dst", 64, True): "5123b5188d5c145b303f4966315182efd21e90fa1d5be36300a7c53a692cf3f1",
+    ("cid", 1, False): "4715d6c4af1d339c7b8e794fc35a3346c53fc5de6b532bf046a2716f21ebe444",
+    ("cid", 1, True): "41b9e63b7a6a5e959507ee2c1f5eef2ae8cda227e7a788f6e92b060ff2255ebc",
+    ("cid", 4, False): "6c9145dd2ec28b2c247aac7925f5434f4d5a09498fb008b51d3df37487e2fee6",
+    ("cid", 4, True): "ba40fa3bbfcdb245dec3c81a82b8ea49b1421af8e905dae51d25d7bcc870c581",
+    ("cid", 64, False): "4bef1c1c0a16c776141641dba4f802e88cdac46083a5770918e18e47dc9c5a8e",
+    ("cid", 64, True): "d8072172db5de53937c7c3cfba9091df395573c954f3fbb5c81d0ffb6b956914",
+    ("dst", 1, False): "e82d039517db4b69e6033fa4871051526569ba5ef0f544b9938d48529286ad8b",
+    ("dst", 1, True): "04533518bb04d7ab854a8c06560864bf18ed0ef586d7bd92151b85376c1722d2",
+    ("dst", 4, False): "e4d023a83d6b04429426f727ffee604b8c5eac6c3e406fcbb6c6e84e661fd0dc",
+    ("dst", 4, True): "b434c5778cdfcc05706948bface22779219444f4d7897579a0ed5eb324ff8e77",
+    ("dst", 64, False): "03b75e2d6f7884889c44a1272faed141ba25b9bafc0d802f54932199990d6cb3",
+    ("dst", 64, True): "d63dcae850eef4fd232dea44283dc760d87c0eb658de00285119c1a9dc823bb2",
 }
 _FAMILY = {"ingress": "cid", "routed": "cid", "response": "cid", "outbound": "dst"}
 _TRAILING_RESET = " SET LOCK_TIMEOUT -1;"
@@ -1008,7 +1013,9 @@ def test_the_batch_text_carries_the_head_skip_marker_arm() -> None:
         assert arm.endswith(" AND G=1;"), "a fenced ex-leader would report its whole chunk"
         cols = arm.split(" FROM @heads h")[0].removeprefix(" UNION ALL SELECT ").split(", ")
         assert len(cols) == len(_COLS), "the marker arm must match the sole result set's width"
-        assert cols[_COLS.index(lane_col)] == "h.lane", "the lane must sit in its own lane column"
+        assert cols[_COLS.index(lane_col)] == "h.lane COLLATE DATABASE_DEFAULT", (
+            "the lane must sit in its own lane column, labelled UNION-compatible (BACKLOG #5721)"
+        )
 
 
 @pytest.mark.parametrize(

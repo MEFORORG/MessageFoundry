@@ -64,9 +64,14 @@ def test_every_committed_lock_strips_to_marker_free_pins(lock: str) -> None:
 
 
 def test_the_windows_only_pins_are_in_the_audited_set() -> None:
-    """Non-vacuity: the gap this closes is live in the tree, so the strip has something to do."""
+    """Non-vacuity: the gap this closes is live in the tree, so the strip has something to do.
+
+    Every exported pin carries the ``[tool.uv] environments`` marker, which names win32 on its
+    Linux side too, so the pins that matter are the ones whose marker names no Linux at all.
+    """
     stripped = strip_markers((ROOT / "requirements.lock").read_text(encoding="utf-8"))[1]
-    assert any("sys_platform == 'win32'" in entry for entry in stripped)
+    windows_only = {e.split("==", 1)[0] for e in stripped if "win32" in e and "linux" not in e}
+    assert {"colorama", "sspilib"} <= windows_only, sorted(windows_only)
 
 
 def _pins(lock: str) -> set[str]:

@@ -5,11 +5,12 @@ review-driven regressions."""
 
 from __future__ import annotations
 
+import inspect
 import time
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen
 from _webui_support import (
     PW,
     _add,
@@ -21,11 +22,13 @@ from _webui_support import (
 )
 
 from messagefoundry.api import create_app
+from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes import account as account_routes
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle), #75 phase 4 -----------------
 #
@@ -35,6 +38,8 @@ from messagefoundry.pipeline import Engine
 # POST (/verify) is body-carrying with a standalone GET form (/confirm) as its unlock re-entry point.
 
 NEW_PW = "another-strong-test-passphrase"
+#: Sent as a program would: no Sec-Fetch-Site, no Origin, so the origin check refuses it.
+HEADERLESS = {HEADERLESS_UI_REQUEST: True}
 
 
 async def test_account_page_renders(engine: Engine) -> None:
@@ -178,11 +183,13 @@ async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
             await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         ).status_code == 303
         await _mint_action(c, "/ui/account/mfa/enroll")
-        # Enroll: stages a secret, renders it once with the confirm form.
+        # Enroll: stages a secret and renders it once. The enroll proof is spent, so the page posts
+        # a code-less Continue to the confirm gate in place of a code form that would drop the code
+        # (BACKLOG #5931).
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
         assert "Secret:" in r.text and "otpauth://" in r.text
-        assert 'action="/ui/account/mfa/verify"' in r.text
+        assert 'action="/ui/account/mfa/verify"' in r.text and 'name="code"' not in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         # The staged secret is what the page shows: the bare key, without the parameters the cell
@@ -269,6 +276,296 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
         assert r.status_code == 200
         assert secret is not None and secret not in r.text  # the secret is never re-shown
         assert 'action="/ui/account/mfa/verify"' in r.text
+
+
+async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine: Engine) -> None:
+    """BACKLOG #5931: the operator's FIRST code turns TOTP on, after the confirm re-auth the enroll
+    page sends them to.
+
+    RED when: the enroll page renders the code form while the session holds no MFA_CONFIRM grant,
+    so the code posts into the confirm gate, which 303s to re-auth and drops it. Driven through the
+    page's own Continue button, with no test-side continuation, so the gate's refusal of that
+    code-less post is what issued it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and "Secret:" in r.text
+        assert 'name="code"' not in r.text  # nowhere to type a code the gate would drop
+        assert 'action="/ui/account/mfa/verify"' in r.text and ">Continue<" in r.text
+        r = await c.post("/ui/account/mfa/verify", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        # The re-auth page continues (a password form, not the open-it-from-the-console page).
+        r = await c.get("/ui/reauth", params={"next": "/ui/account/mfa/confirm"})
+        assert r.status_code == 200 and 'name="password"' in r.text
+        r = await c.post(
+            "/ui/reauth",
+            data={"next": "/ui/account/mfa/confirm", "password": PW},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303 and r.headers["location"] == "/ui/account/mfa/confirm"
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200 and 'action="/ui/account/mfa/verify"' in r.text
+        uid = await _uid(service, "op")
+        secret = await service.store.get_totp_secret(uid)
+        assert secret is not None
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200 and "shown once" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.totp_enabled
+
+
+async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engine) -> None:
+    """BACKLOG #5931 keeps ADR 0077's two proofs: one for enroll, one for confirm, each spent once.
+
+    RED when: either proof is skipped. Enroll without its grant must re-auth; a valid code after
+    only the ENROLL proof must re-auth, so the enroll proof never covers the confirm; and a confirm
+    proof a refused code spent must not carry a second code."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    uid = await _uid(service, "op")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        # Proof 1 is required: no enroll grant, no staged secret.
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        secret = await service.store.get_totp_secret(uid)
+        assert secret is not None
+        # Proof 2 is required: a valid code with only the enroll proof spent is refused at the gate.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        user = await service.store.get_user(uid)
+        assert user is not None and not user.totp_enabled
+        # Proof 2 is single-use: a refused code spends it, and the re-rendered page offers the
+        # Continue to a fresh re-auth rather than taking a code the gate would drop.
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "badcod"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400 and "Invalid code." in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        user = await service.store.get_user(uid)
+        assert user is not None and not user.totp_enabled
+
+
+async def test_empty_code_continue_with_a_held_grant_spends_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5931 (Lander hold on PR 2933): the code-less Continue posted while the confirm grant
+    is already held, from another tab or after Back, goes to the re-auth. It spends no grant, checks
+    no code, writes no ``auth.mfa_failed`` row and draws no ``allow_reauth_attempt``.
+
+    RED when: the empty code reaches the confirm gate or ``confirm_mfa_enrollment``. The gate would
+    spend the held grant, the check of ``""`` would write a false ``auth.mfa_failed`` row and draw
+    the per-actor attempt budget. A real code posted after the empty ones still finds the grant."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    uid = await _uid(service, "op")
+    charged: list[str] = []
+    allow = service.allow_reauth_attempt
+
+    def counting_allow(actor: str) -> bool:
+        charged.append(actor)
+        return allow(actor)
+
+    monkeypatch.setattr(service, "allow_reauth_attempt", counting_allow)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and ">Continue<" in r.text
+        secret = await service.store.get_totp_secret(uid)
+        assert secret is not None
+        await _mint_action(c, "/ui/account/mfa/confirm")  # the grant is now held
+        charged.clear()
+        for data in ({}, {"code": ""}, {"code": "   "}):
+            r = await c.post(
+                "/ui/account/mfa/verify", data=data, headers={"Sec-Fetch-Site": "same-origin"}
+            )
+            assert r.status_code == 303
+            assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        assert await engine.store.list_audit(action="auth.mfa_failed", limit=50) == []
+        assert charged == []
+        # The grant was not spent: the first real code still turns TOTP on with no new re-auth.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200 and "shown once" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.totp_enabled
+
+
+def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> None:
+    """RED when: the copy of the verify gate's base the empty-code check runs drifts from the base
+    ``require_ui_reauth_only_action`` builds for the gate (BACKLOG #5931). The seam digest hashes
+    source, not the values a gate closes over, so this compares those values directly."""
+    app = create_app(engine, auth=None, serve_ui=True, webauthn_rp_from_request=True)
+    route = next(
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == "/ui/account/mfa/verify"
+        and "POST" in getattr(r, "methods", ())
+    )
+    calls = [d.call for d in route.dependant.dependencies]  # type: ignore[attr-defined]
+    gate = next(c for c in calls if is_route_gate(c))
+    assert calls.index(account_routes._empty_code_goes_to_reauth) < calls.index(gate)
+    gate_vars = inspect.getclosurevars(gate).nonlocals
+    real = inspect.getclosurevars(gate_vars["base"]).nonlocals
+    copy = inspect.getclosurevars(account_routes._confirm_gate_base()).nonlocals
+    assert real.keys() == copy.keys()
+    assert {k: v for k, v in real.items() if k != "pending_refusal"} == {
+        k: v for k, v in copy.items() if k != "pending_refusal"
+    }
+    real_pending = inspect.getclosurevars(real["pending_refusal"]).nonlocals
+    assert gate_vars["action"] == STEP_UP_ACTION_MFA_CONFIRM
+    assert real_pending["action"] == STEP_UP_ACTION_MFA_CONFIRM
+    assert real_pending["reauth_next"](None) == "/ui/account/mfa/confirm"
+    assert copy["pending_refusal"] is account_routes._refuse_pending_confirm
+
+
+async def test_an_empty_code_from_a_dead_cookie_gets_the_gates_login_redirect(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cookie that signs nothing in gets the gate's login redirect for an empty code exactly as
+    for a real one, never the origin 403, and the check reads no body for it: the session is
+    resolved before the body or the origin (the console's sign-in-before-body order, BACKLOG
+    #5931).
+
+    RED when: the empty-code check checks the origin before the session (a 403), or reads the body
+    before it (the form parser is called)."""
+    service = await _service(engine)
+    parsed: list[str] = []
+    form_pairs = account_routes._form_pairs
+
+    async def counting_form_pairs(request: object) -> list[tuple[str, str]]:
+        parsed.append("body")
+        return await form_pairs(request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(account_routes, "_form_pairs", counting_form_pairs)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", "not-a-session-token")
+        for data in ({"code": "123456"}, {"code": ""}, {}):
+            r = await c.post("/ui/account/mfa/verify", data=data, extensions=HEADERLESS)
+            assert r.status_code == 303, data
+            # "expired" names a presented cookie that resolved to nothing, not an absent one.
+            assert r.headers["location"] == "/ui/login?e=expired", data
+    assert parsed == []
+
+
+async def test_an_empty_code_from_a_must_change_session_gets_its_confinement(
+    engine: Engine,
+) -> None:
+    """A must-change session posting an empty code with no Origin is sent to its change-password
+    page, as the gate sends it for a real code, not refused by the origin check first (BACKLOG
+    #5931).
+
+    RED when: the empty-code check runs the origin check before the gate's base."""
+    service = await _service(engine)
+    await create_local_user_chosen(
+        service,
+        username="fresh",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )  # create_local_user leaves must_change_password=True
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "fresh")
+        assert r.headers["location"] == "/ui/account/password"
+        for data in ({"code": "123456"}, {"code": ""}, {}):
+            r = await c.post("/ui/account/mfa/verify", data=data, extensions=HEADERLESS)
+            assert r.status_code == 303, data
+            assert r.headers["location"] == "/ui/account/password", data
+
+
+async def test_an_empty_code_under_the_opt_out_is_checked_as_before(engine: Engine) -> None:
+    """Under ``[auth].require_action_step_up = false`` there is no grant to spend, so an empty code
+    is not sent to the re-auth: the route checks it and answers "Invalid code." as main does
+    (BACKLOG #5931)."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and 'name="code"' in r.text
+        r = await c.post(
+            "/ui/account/mfa/verify", data={"code": ""}, headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 400 and "Invalid code." in r.text and 'name="code"' in r.text
+
+
+async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine) -> None:
+    """Under ``[auth].require_action_step_up = false`` the confirm gate is the session window, which
+    the enroll re-auth left fresh, so the enroll page keeps its code form and the first code turns
+    TOTP on with no second re-auth (BACKLOG #5931)."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and 'name="code"' in r.text
+        uid = await _uid(service, "op")
+        secret = await service.store.get_totp_secret(uid)
+        assert secret is not None
+        # A wrong code keeps the form too: the window still holds, so no re-auth is owed.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "badcod"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400 and 'name="code"' in r.text
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200 and "shown once" in r.text
 
 
 async def test_stale_reauth_only_bounces_to_reauth(engine: Engine) -> None:

@@ -252,8 +252,8 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert _FIELD in out and _MESSAGE in out, out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
-        # The post-write check refused, not an earlier read (`security set` also loads the file to
-        # report loosenings), and the edit was rolled back.
+        # The post-write check refused, and the edit was rolled back. `security set` reports its
+        # loosenings from the load that check made, so no other load ran to refuse it first.
         assert "the edit was not saved" in out, out
         assert cfg.read_text(encoding="utf-8") == body
 

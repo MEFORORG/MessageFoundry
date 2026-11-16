@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
@@ -140,7 +140,8 @@ class MessageSearchRequest(RequestModel):
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
     limit: int = Field(default=50, ge=1, le=500)
-    scan_limit: int | None = Field(default=None, ge=1)
+    # StrictInt: a lax int would take JSON ``true`` as 1 and ``"7"`` as 7 (BACKLOG #6700).
+    scan_limit: StrictInt | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):
@@ -535,8 +536,8 @@ ReleaseBlocked = Literal[
 
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
-    or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
-    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off.
+    or ``interrupted`` (released, effects unknown, awaiting a resolve; BACKLOG #1562). For an
+    interrupted row, ``approver`` released it.
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
@@ -739,7 +740,7 @@ class ConnectionRow(PhiGatedModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced, OR the graph is not running at all, #1568/#1814 — so purge-eligibility is the separate ``paused`` field, never this word) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced, OR the graph is not running at all, #1568/#1814, OR held down by a recorded STOP, such as a credential fault, until something re-arms the lane, not only an operator (RegistryRunner.outbound_stop_held), #5701 — so purge-eligibility is the separate ``paused`` field, never this word) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running) | "log_halted" (outbound: the engine cannot write its application log and has fail-closed, so NO lane delivers, #122 ADR 0189 — process-wide and NOT an operator pause; the fix is the disk, not this row's start button)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -1089,9 +1090,12 @@ class LogSinkInfo(BaseModel):
     land, and an engine with no notifier configured sends no page — but ``/status`` answers over HTTP
     from process memory, which an application-log failure does not touch. ``state`` is ``healthy`` /
     ``rolled`` (stage 1 absorbed a write failure and healed) / ``unwritable`` (stage 2 — the
-    replacement failed too, and under ``[logging].on_write_failure="stop"`` this process's connections
-    were stopped). **Metadata only — never any log content** (no PHI): a sink label, a state, a count,
-    a scrubbed reason and a path."""
+    replacement failed too, or the sink keeps needing rolls; ADR 0162 section 1 and its amendment B
+    say when). The published ``state`` may include the flap latch of amendment B, so a sink can
+    read ``unwritable`` here while its own state is ``rolled``. The stop decision does not read
+    this published state: it reads each sink's own state, under ``[logging].on_write_failure``,
+    so ``unwritable`` here does not by itself mean connections were stopped. **Metadata only —
+    never any log content** (no PHI): a sink label, a state, a count, a scrubbed reason and a path."""
 
     sink: str  # "stdout" | "file"
     state: str  # "healthy" | "rolled" | "unwritable"
@@ -1113,22 +1117,27 @@ class LogForwarderInfo(BaseModel):
     :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
     its own forwarder, and this is the one that answered.
 
-    **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
-    a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
-    seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
+    **A UDP forwarder is never ``healthy``.** Over UDP a send is counted as failed only when it
+    raises an error on this host (BACKLOG #5923), so the engine cannot see a record lost on the
+    wire. ``delivery_confirmed`` is then ``False``, and a forwarder with no fault seen reads
+    ``unconfirmed``. A send that raises a network error, such as ``ENETUNREACH``, sets
+    ``send_failing``. It reaches ``lost`` at least as ``unsent`` with no spool, or as
+    ``spool_dropped`` when the spool refused it; a spool that took the record holds it unsent.
+    A datagram too large to send (``EMSGSIZE``) never sets ``send_failing``: it is dropped as
+    undeliverable, is not kept for a retry, and is counted in ``undeliverable``, so in ``lost``.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 
     state: str  # "healthy" | "unconfirmed" | "degraded" | "not_installed"
     installed: bool
-    delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
+    delivery_confirmed: bool = True  # False over UDP: a datagram lost on the wire is not visible
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor
     queued: int = 0  # on the hand-off queue now, both lanes, capped at the smaller lane bound
     queue_dropped: int = 0  # dropped because their lane of the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
-    undeliverable: int = 0  # dropped for a send error that was not a network error
+    undeliverable: int = 0  # dropped: a datagram too large to send, or not a network error
     spool_dropped: int = 0  # the on-disk spool was full or refused the write
     spool_skipped: int = 0  # spooled records found torn, malformed or gone
     spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost
@@ -1681,7 +1690,9 @@ class SecurityPosture(BaseModel):
     environment: str | None = None  # the active-environment NAME (ADR 0017)
     backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
     encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
-    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_source: (
+        str  # [store].key_provider name (store.keyprovider.KNOWN_PROVIDERS); NOT key material
+    )
     key_id: str | None = (
         None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
     )

@@ -176,6 +176,7 @@ require_mfa = true                            # the default; off on an exposed i
 port = 8443
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"     # tls_key_password via MEFOR_API_TLS_KEY_PASSWORD if encrypted
+# (the shipped k8s manifests put the pair in /etc/mefor/tls/engine/ and set these through MEFOR_API_TLS_*)
 # tls_client_ca_file = "/etc/mefor/tls/console-ca.crt"  # opt-in mTLS for the console
 # Off loopback this bind also needs MEFOR_TLS_REVOCATION_ATTESTED=1 in the container's environment;
 # docs/SECURITY.md, "API revocation gate", says what setting it attests.
@@ -250,6 +251,8 @@ lists the shapes and rules.
 
 ```python
 # MLLP inbound in a container (data plane) — required when bind_host is off-loopback
+# These paths fit docker/compose.yaml's /etc/mefor/tls bind mount. Under the shipped k8s manifests,
+# copy-tls installs into /etc/mefor/tls/engine/, so name a copied key there (the API pair too).
 inbound("IB_ACME_ADT", MLLP(
     port=2575,
     tls=True,
@@ -299,7 +302,7 @@ So: **server TLS required** (the gate enforces it), **mTLS opt-in per partner**,
 
 | Item | Type | How into the container | Notes |
 |---|---|---|---|
-| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret: the API pair as shipped, and a connection's files once added to the Secret's items and the `copy-tls` command) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`. A Swarm secret or config surfaces at `0444` unless its long syntax sets `uid: "10001"` and `mode: 0400`. A k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
+| `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (a bind mount, Docker config/secret-as-file, or on k8s a copy the shipped manifests' `copy-tls` initContainer makes from the Secret: the API pair as shipped, and a connection's files once added to the Secret's items and the `copy-tls` command) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, never bake into an image layer. Under the default `enforce` the engine refuses a group-readable key file, so a bind-mounted key must be owned by uid 10001 at mode `0600`, as a file rather than a link, in a directory owned by uid 10001 or root that no group or other account may write. A Swarm secret or config surfaces at `0444` unless its long syntax sets `uid: "10001"` and `mode: 0400`. A k8s Secret volume is never mounted on the engine itself ([PHI.md](PHI.md) §2, *Key files*). |
 | `tls_key_password` (API + MLLP) | secret | API: env `MEFOR_API_TLS_KEY_PASSWORD`. MLLP: per-connection `tls_key_password=env(...)` | Decrypts an encrypted private key. The API key uses the env var; an encrypted **MLLP** key uses the per-connection `tls_key_password` (env-sourced) — see §7. |
 | Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either ([PHI.md](PHI.md) §3). Mint with `messagefoundry gen-key`. |
 | DB password / `tls_client_ca_file` etc. | secret / file | env (`MEFOR_STORE_PASSWORD`) / mounted file | Prefer the orchestrator's secret store over plain `-e` where possible. |
@@ -364,12 +367,13 @@ The console stays a **host-side process**; only its target URL changes.
   PHI-at-rest store.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
-  must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and
-  MLLP-outbound verify, REST/SOAP verify, SFTP host-key) to best-effort. On most hops it no longer
-  releases a credential; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
-  says which, and the store login is not among them. Note CI sets
-  it deliberately for the self-signed SQL Server container; that is a **CI-only** posture and must
-  never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
+  must NOT be set in a real deployment**; it no longer reaches the store hop, which refuses a weakened
+  setting at every posture, and [the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch)
+  says what it means. CORRECTED 2026-11-14 (vault BACKLOG #3533 item 2): this called it the single
+  switch that downgrades store TLS, and said CI set it for the self-signed SQL Server container. CI
+  now serves a generated certificate and verifies it. CHANGED 2026-11-15 (owner ruling): this said
+  CI pins it, which now holds on the SQL Server 2025 legs only; the SQL Server 2022 legs verify it
+  through the runner's trust store. Give the production DB a CA-trusted cert.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
   per the PHI rules). **Off-box log + audit forwarding is built** (`[logging].forward_*` → syslog/SIEM);
   enable it so a container's logs + audit rows reach the org pipeline, both with only best-effort

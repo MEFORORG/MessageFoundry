@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178), 2026-11-11 (Amendment C, at the end: two DEAD writes leave a resolved row as it is, vault BACKLOG #4607 step 6)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was
@@ -16,8 +16,9 @@
 > these residuals stay open: the same-process re-promotion case (Consequence 1c); on SQL Server, a
 > renew that can land up to about twice the clamp after it is issued, because its borrow and its
 > statement each get the full clamp while the margin check compares the clamp alone; the SQL Server
-> claim's COMMIT, which the clamp does not bound; and the SQL Server heartbeat, config-version refresh
-> and stepdown release, which still run under `[store].command_timeout`.
+> claim's COMMIT, which the clamp does not bound. **CORRECTED 2026-11-09 (BACKLOG #5064):** this
+> list also named the SQL Server heartbeat, config-version refresh and stepdown release as running
+> under `[store].command_timeout`; they now run under the clamp, as the claim does.
 >
 > **Inc 3 is BUILT (2026-09-26, BACKLOG #1497), on a measured premise.** Its gate asked whether a
 > coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. Hosted CI
@@ -198,7 +199,9 @@ firing, and firing is worse.
 
 > *Scoped by Amendment A (2026-09-28).* This paragraph binds the TERMINAL resolves, and they still
 > carry no status conjunct. `mark_failed`'s retry branch, which C1 leaves unfenced, now carries one.
-> The amendment says why the argument above does not reach it.
+> The amendment says why the argument above does not reach it. *Amendment C (2026-11-11)* makes
+> `mark_failed`'s DEAD branch and `record_worker_death`'s dead-letter decline an already-resolved row,
+> never an INFLIGHT or PENDING one, so neither is this conjunct; it says why.
 
 **C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
 Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
@@ -392,16 +395,23 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
 >    value `_renew_fits_the_margin` checked, and never below 1, and
 >    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
->    backend. Second, it binds the claim call only: its borrow waits at most the clamp too, but
+>    backend. Second, it binds each call on its own, never a shared deadline: the claim, and since
+>    BACKLOG #5064 the loop's other statements and the stepdown release. Each call's borrow waits at
+>    most the clamp too, but
 >    unlike Postgres the borrow and the statement do not share one deadline (a whole-second timeout
 >    cannot carry what a borrow leaves of a 1 s clamp), so a renew can land up to about twice the
 >    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
->    statement is not bounded by it, and the heartbeat, config-version refresh and stepdown release
->    still run under `command_timeout`. The first difference is on purpose; the second is a kept
+>    statement is not bounded by it. Since BACKLOG #5064 the heartbeat, config-version refresh and
+>    stepdown release run under the clamp the same way, each with the same twice-the-clamp bound, three
+>    times when its rollback runs (`SqlServerStore._execute_clamped` for the two writes,
+>    `_fetchone_clamped` for the refresh); until then they ran under `command_timeout`, as this
+>    sentence said. Whether msodbcsql bounds the COMMIT (`SQLEndTran`) needs a live server; BACKLOG
+>    #6621 measures it. The first difference is on purpose; the second is a kept
 >    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
 >    `serve` logs `ServiceSettings.sqlserver_renew_bound_warning` at start-up, without refusing, when
 >    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
->    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
+>    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
+>    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
 >    increment, before merge.** The first cut shipped a constant 5.0 and it refused **this
@@ -734,9 +744,11 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   connection rather than recycling it (BACKLOG #5066). That bound frees the caller, not the
   server: the discarded session keeps its open transaction and its locks until its close lands or
   the server ends it, and the rollback keeps its executor thread until the driver returns.
-  At least these are not clamped either: the start-up
-  `_register` and `_ensure_tables`, and the heartbeat, config-version and release statements. The
-  claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
+  At least these are not clamped either: the start-up `_register`, `_ensure_tables` and
+  config-version seed. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named the
+  heartbeat, config-version and release statements. The heartbeat, the config-version refresh and
+  a stepdown's release now run under the clamp; `stop()`'s release and `left` write run under its
+  own shutdown bound (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
   leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
@@ -1415,3 +1427,32 @@ for clearing it under a still-live listener.)
 Two findings from review of this amendment are closed in it, not left open: the cleared drain side
 under a still-live listener (fixed above, *Joined is not stopped*), and a third cancel leaving cut
 stops unjoined (it cannot happen, step 4 of *What an outer cancel does now*).
+
+## Amendment C (2026-11-11): two DEAD writes leave a resolved row as it is (vault BACKLOG #4607 step 6)
+
+**What changed.** Two terminal writes now decline a row that is already DONE, DEAD or CANCELLED:
+`mark_failed`'s DEAD branch on all three backends, and the dead-letter in the new
+`record_worker_death`, which counts a row that killed its stage worker and dead-letters it at its
+cap (owner ruling 2026-11-04, "Yes, dead-letter it"). The case is a worker that dies after its row
+was marked DONE: without this, the death's dead-letter at the cap turned a delivered row DEAD and
+its message ERROR.
+
+**Why C2 does not forbid it.** C2 keeps a `status='inflight'` conjunct off the terminal resolves,
+because the owner-blind lease sweep can re-pend the current leader's own row and that row's
+terminal write must still land. Neither write declines an INFLIGHT or PENDING row, so that write
+still lands. Each declines only a row some other writer already resolved, as Amendment A's widened
+retry term does. C1 is unchanged: both writes keep the fail-open resolve fence.
+
+**Neither UPDATE carries a status term, so a miss stays the fence's alone.** On Postgres and SQL
+Server a fenced write is told apart by its empty result (C3), so the status must not be a second
+reason for one. `mark_failed` now takes its first read under a row lock (`FOR UPDATE`, `UPDLOCK`),
+and its DEAD branch returns the empty outcome before its UPDATE for a resolved row. The increment
+in `record_worker_death` matches only an INFLIGHT or PENDING row and holds its lock until the
+commit, so its dead-letter cannot find the row resolved. SQLite does both under its single writer.
+`mark_batch_failed`'s DEAD branch is unchanged.
+
+**The increment is not fenced.** It neither resolves the row nor returns it to PENDING. A fenced
+dead-letter rolls it back with the rest of the transaction and re-pends a row still in flight
+(C3). The count loses that death and nothing raises it again, though the runner's ERROR line and
+the store's fence WARNING and counter still record it. So a row whose dead-letter is fenced needs
+more deaths than the cap before a dead-letter lands.

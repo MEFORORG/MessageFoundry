@@ -25,7 +25,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import PW, provision
+from _ui_clients import PW, idp_url, provision
 from _ui_clients import SAME_ORIGIN as _SAME
 
 from messagefoundry.api import create_app
@@ -251,8 +251,7 @@ async def _oidc_round_trip(
 
     monkeypatch.setattr(service, "_exchange_and_validate", _exchange)
     start = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
-    assert start.status_code == 303, start.headers
-    state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+    state = dict(parse_qsl(urlsplit(idp_url(start)).query))["state"]
     c.cookies.delete("mf_session")
     return await c.get(
         "/ui/oidc/callback",

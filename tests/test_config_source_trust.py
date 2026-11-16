@@ -174,8 +174,9 @@ def test_builtin_users_modify_refused() -> None:
 def test_foreign_nonadmin_write_refused() -> None:
     aces = [(_ALLOW, _WRITE, _FOREIGN)]
     reason = _evaluate_config_dacl(_OWNER, aces, _SELF, _never_admin)
-    assert reason is not None
-    assert _FOREIGN in reason  # again the ACE finding, reported ahead of the owner verdict
+    # Again the ACE finding, reported ahead of the owner verdict. The full text is pinned here so
+    # that a platform-independent leg covers it.
+    assert reason == f"a non-owner, non-admin principal ({_FOREIGN}) has write access"
 
 
 def test_everyone_generic_all_refused() -> None:
@@ -268,6 +269,184 @@ def test_bad_ace_is_reported_ahead_of_a_bad_owner() -> None:
     assert reason is not None
     assert _EVERYONE in reason
     assert "the owner (" not in reason
+
+
+# ---- Tier 1c: granting ACE forms, shared service identities, servicing trustees (BACKLOG #5622) --
+
+_LOCAL_SERVICE = "S-1-5-19"
+_NETWORK_SERVICE = "S-1-5-20"
+_TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+
+@pytest.mark.parametrize(
+    "ace_type",
+    [
+        0x04,  # ACCESS_ALLOWED_COMPOUND_ACE
+        0x05,  # ACCESS_ALLOWED_OBJECT_ACE
+        0x09,  # ACCESS_ALLOWED_CALLBACK_ACE
+        0x0B,  # ACCESS_ALLOWED_CALLBACK_OBJECT_ACE
+    ],
+)
+def test_write_granting_conditional_or_object_ace_refused(ace_type: int) -> None:
+    """An allow entry the policy cannot attribute still grants: it refuses rather than passes.
+
+    The reader parses a trustee only for type 0x00, so these arrive with an empty SID. Skipping them
+    as non-granting would let a callback ACE granting write to anyone pass a clean-looking DACL."""
+    aces = [(_ALLOW, _FULL, _SELF), (ace_type, _MODIFY, "")]
+    reason = _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin)
+    assert reason is not None
+    assert f"type 0x{ace_type:02x}" in reason
+
+
+def test_config_guard_sets_match_the_anchor_path_rule() -> None:
+    """Pins the constants the config guard and the anchor-path rule share, so a SID or ACE type added
+    to one is not missed in the other. It pins constants only: the two grantee rules differ (the
+    anchor-path rule trusts any resolved Administrators member), which this does not test."""
+    from messagefoundry.auth import anchor_path
+    from messagefoundry.config import wiring
+
+    assert wiring._WIN_GRANTING_ACE_TYPES == anchor_path._GRANTING_ACE_TYPES
+    assert wiring._WIN_SHARED_SERVICE_SIDS == anchor_path._SHARED_SERVICE_SIDS
+    assert wiring._WIN_TRUSTED_INSTALLER_SID == anchor_path.TRUSTED_INSTALLER_SID
+
+
+def test_read_only_callback_ace_passes() -> None:
+    # A conditional entry with no write-class bit grants nothing this check cares about.
+    aces = [(_ALLOW, _FULL, _SELF), (0x09, _READ_EXEC, "")]
+    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
+
+
+@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
+def test_shared_service_identity_is_not_self_trusted_as_grantee(shared: str) -> None:
+    """LocalService and NetworkService run many services, so the engine running as one of them does
+    not make a write grant to that SID the engine's alone."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, shared)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, shared, _never_admin)
+    assert reason is not None
+    assert shared in reason
+    assert "other services share that identity" in reason
+
+
+@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
+def test_shared_service_identity_is_not_self_trusted_as_owner(shared: str) -> None:
+    reason = _evaluate_config_dacl(shared, [(_ALLOW, _READ_EXEC, _USERS)], shared, _never_admin)
+    assert reason is not None
+    assert "so it can rewrite the code this loader executes" in reason
+    assert "other services share that identity" in reason
+
+
+def test_shared_service_owner_with_unresolvable_membership_names_the_shared_identity() -> None:
+    aces = [(_ALLOW, _READ_EXEC, _USERS)]
+    reason = _evaluate_config_dacl(_LOCAL_SERVICE, aces, _LOCAL_SERVICE, _unresolvable)
+    assert reason is not None
+    assert "other services share that identity" in reason
+    assert "could not be resolved" in reason
+
+
+def test_trusted_installer_grantee_passes() -> None:
+    # TrustedInstaller is the servicing identity; it can replace any system file already.
+    aces = [(_ALLOW, _FULL, _SELF), (_ALLOW, _FULL, _TRUSTED_INSTALLER)]
+    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
+
+
+def test_trusted_installer_owner_passes() -> None:
+    aces = [(_ALLOW, _FULL, _TRUSTED_INSTALLER)]
+    assert _evaluate_config_dacl(_TRUSTED_INSTALLER, aces, _SELF, _never_admin) is None
+
+
+def test_domain_admins_grantee_passes_when_a_member_of_administrators() -> None:
+    """Domain Admins holding write on a SYSTEM-owned dir passes once the local Administrators lookup
+    finds it. As a grantee the lookup decides, never the RID arm (that is for owners only)."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    looked_up: list[str] = []
+
+    def _member(sid: str) -> bool:
+        looked_up.append(sid)
+        return sid == _DOMAIN_ADMINS
+
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _member) is None
+    assert looked_up == [_DOMAIN_ADMINS]
+
+
+def test_domain_admins_grantee_refused_when_not_a_member() -> None:
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _never_admin) is not None
+
+
+def test_grantee_with_unresolvable_membership_refused() -> None:
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, _SELF, _unresolvable)
+    assert reason is not None
+    assert "could not be resolved" in reason
+
+
+@pytest.mark.parametrize(
+    "grantee",
+    [
+        _FOREIGN,  # an ordinary account, even one listed in Administrators: usable unelevated
+        "S-1-5-21-1-2-3-500",  # the built-in Administrator ACCOUNT, not a group
+        "S-1-5-14",  # REMOTE INTERACTIVE LOGON: a well-known group outside the broad set
+        "S-1-2-0",  # LOCAL
+        "S-1-5-15",  # This Organization
+    ],
+)
+def test_only_admin_groups_earn_grantee_trust_from_the_lookup(grantee: str) -> None:
+    """The lookup widens grantee trust for Domain/Schema/Enterprise Admins GROUPS only. A write grant
+    to an administrator's own user SID works from its unelevated session, so a "member of
+    Administrators" answer for it, or for any other well-known group, must not pass."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, grantee)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is not None
+
+
+@pytest.mark.parametrize("rid", ["518", "519"])
+def test_schema_and_enterprise_admins_grantee_pass_when_resolved(rid: str) -> None:
+    sid = f"S-1-5-21-1-2-3-{rid}"
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, sid)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is None
+
+
+@pytest.mark.parametrize(
+    "unjudged",
+    [
+        [(0x09, _MODIFY, "")],
+        [(_ALLOW, _MODIFY, _DOMAIN_ADMINS)],  # with an unresolvable lookup
+    ],
+)
+def test_definite_bad_ace_reported_ahead_of_an_unjudged_one(
+    unjudged: list[tuple[int, int, str]],
+) -> None:
+    # The scan runs past an entry it cannot judge, so the Everyone grant after it is what is named.
+    aces = [*unjudged, (_ALLOW, _MODIFY, _EVERYONE)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, _SELF, _unresolvable)
+    assert reason is not None
+    assert _EVERYONE in reason
+
+
+def test_bad_owner_reported_ahead_of_an_unjudged_ace() -> None:
+    # Definite ahead of indefinite: the low-privilege owner is named, not the callback entry.
+    reason = _evaluate_config_dacl(_OWNER, [(0x09, _MODIFY, "")], _SELF, _never_admin)
+    assert reason is not None
+    assert "so it can rewrite the code this loader executes" in reason
+
+
+@pytest.mark.parametrize(
+    "broad",
+    [
+        _EVERYONE,
+        _AUTH_USERS,
+        _USERS,
+        "S-1-5-2",  # NETWORK
+        "S-1-5-3",  # BATCH
+        "S-1-5-4",  # INTERACTIVE
+        "S-1-5-6",  # SERVICE
+        "S-1-5-113",  # Local account
+        "S-1-5-32-546",  # BUILTIN\\Guests
+    ],
+)
+def test_broad_grantee_refused_even_if_listed_in_administrators(broad: str) -> None:
+    # A well-known group can be added to Administrators; the lookup must not soften a broad grant.
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, broad)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is not None
 
 
 @pytest.mark.parametrize(
@@ -726,6 +905,53 @@ def test_world_writable_config_dir_warns_with_escape_windows(
     assert any("dev/test override" in r.message for r in caplog.records)
 
 
+def _set_dacl_sddl(path: Path, sddl: str) -> None:
+    """Replace ``path``'s DACL with the one ``sddl`` describes (a conditional ACE cannot be written
+    with icacls)."""
+    import ctypes
+    from ctypes import wintypes
+
+    if sys.platform != "win32":  # also what narrows the ctypes names below for mypy
+        raise RuntimeError("a DACL is set through Win32; this host is not Windows")
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    sd = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        ctypes.c_wchar_p(sddl), 1, ctypes.byref(sd), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        set_file_security = advapi32.SetFileSecurityW
+        set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+        set_file_security.restype = wintypes.BOOL
+        if not set_file_security(str(path), 0x4, sd):  # DACL_SECURITY_INFORMATION
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(sd)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL read needs Windows")
+def test_reader_records_the_mask_of_a_callback_ace_windows(tmp_path: Path) -> None:
+    """BACKLOG #5622: the reader used to record every non-0x00 entry with a zero mask, so the policy
+    could not see a callback entry granting write. Through the real reader, a write-granting
+    callback ACE now reaches the policy with its mask, and the policy refuses it."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    target = tmp_path / "cfg.py"
+    target.write_text("", encoding="utf-8")
+    _set_dacl_sddl(target, "D:P(A;;FA;;;SY)(XA;;FA;;;WD;(Member_of {SID(BA)}))")
+    sec = _win32_config_source_probes().read_path(target)
+    assert sec.aces is not None
+    callback = [ace for ace in sec.aces if ace[0] == 0x09]
+    assert len(callback) == 1
+    assert callback[0][1] & 0x10000000 or callback[0][1] & 0x2  # write-class bits survive
+    assert sec.owner_sid is not None
+    reason = _evaluate_config_dacl(sec.owner_sid, sec.aces, sec.owner_sid, _never_admin)
+    assert reason is not None
+    assert "type 0x09" in reason
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL check needs Windows")
 @pytest.mark.usefixtures("real_config_source_readers")
 def test_owner_only_config_dir_loads_windows(
@@ -1082,8 +1308,9 @@ def _worker_session(config_dir: Path) -> SandboxSession:
 
 @pytest.mark.usefixtures("escape_under_enforce")
 def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
-    """The worker loads config in its own process at boot. With the escape set under ``enforce`` it
-    refuses a writable source, and the parent sees the refusal instead of a running worker."""
+    """A session given no snapshot reads its directory, with the trust check, before it starts a
+    worker. With the escape set under ``enforce`` that read refuses a writable source, and the
+    caller sees the refusal instead of a running worker."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
     session = _worker_session(tmp_path)
@@ -1097,10 +1324,10 @@ def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
 
 @pytest.mark.usefixtures("escape_honoured")
 def test_the_sandbox_worker_decides_as_the_engine_did_at_warn(tmp_path: Path) -> None:
-    """The worker's environment is an allowlist. The escape crosses it, and so must the dial that
-    unlocks it, or the worker would refuse a directory the engine loaded at ``warn``. Through the
-    real spawn: with both set, the worker boots over a really-writable directory. The test above is
-    the other arm, and it would pass whether or not the dial crossed."""
+    """The parent reads the directory, with the clamp, and the worker loads those bytes, so a
+    worker boots over a really-writable directory the parent accepted at ``warn``. Through the real
+    spawn. The test above is the other arm, and the dial-spelling test below shows neither variable
+    reaches the worker (vault BACKLOG #2587)."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
     session = _worker_session(tmp_path)
@@ -1123,13 +1350,14 @@ def test_the_engine_refuses_the_same_directory_with_the_escape_alone(tmp_path: P
     assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV in str(excinfo.value)
 
 
-@pytest.mark.parametrize("spelling", ["MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"])
-def test_every_spelling_of_the_dial_reaches_the_worker_environment(
-    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_no_spelling_of_the_dial_reaches_the_worker_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The engine's check reads every spelling of the dial the settings loader would. The worker's
-    environment carries each one that is set, read off the real spawn call, and nothing else of
-    the engine's but the escape."""
+    """The parent decides the config-source gate when it reads the snapshot the boot frame carries,
+    and the worker runs no trust check of its own (vault BACKLOG #2596). So neither the escape nor
+    any spelling of the dial is in the worker's environment (vault BACKLOG #2587), read off the
+    real spawn call. ``test_the_sandbox_worker_decides_as_the_engine_did_at_warn`` is the control
+    that a worker still boots over a directory the parent accepted at ``warn``."""
     captured: dict[str, dict[str, str]] = {}
 
     class _Stop(Exception):
@@ -1141,15 +1369,17 @@ def test_every_spelling_of_the_dial_reaches_the_worker_environment(
 
     monkeypatch.delenv(SECURITY_ENFORCEMENT_ENV, raising=False)
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
-    monkeypatch.setenv(spelling, "warn")
+    # Both spellings at once: two variables on POSIX, one on Windows.
+    for spelling in ("MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"):
+        monkeypatch.setenv(spelling, "warn")
     monkeypatch.setenv("MEFOR_STORE_POOL_SIZE", "7")  # any other engine variable: must not cross
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(_Stop):
         _worker_session(tmp_path)._spawn()
-    crossed = {name: value for name, value in captured["env"].items() if name.startswith("MEFOR_")}
-    # Windows holds one variable under an upper-cased name, whichever spelling set it.
-    as_stored = spelling.upper() if sys.platform == "win32" else spelling
-    assert crossed == {INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1", as_stored: "warn"}
+    # The control: the env read holds the worker's start-up names, so the absence below is not an
+    # empty read.
+    assert any(name.upper() == "PATH" for name in captured["env"])
+    assert [name for name in captured["env"] if name.upper().startswith("MEFOR_")] == []
 
 
 def test_the_loosening_page_lists_the_escape() -> None:

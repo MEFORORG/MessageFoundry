@@ -18,6 +18,7 @@ guard patched in: it left no administrator). Synthetic accounts only.
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import Any
 
 from messagefoundry.auth.permissions import Role
@@ -40,7 +41,7 @@ async def seed(store: Any, admins: tuple[str, ...], others: tuple[str, ...] = ()
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles(user_id, [ADMIN if user_id in admins else VIEWER])
+        await store.set_user_roles(user_id, [ADMIN if user_id in admins else VIEWER], audits=())
 
 
 async def enabled_admins(store: Any) -> set[str]:
@@ -53,7 +54,7 @@ async def enabled_admins(store: Any) -> set[str]:
 
 async def assert_last_admin_contract(store: Any) -> None:
     """Each removal is refused, writing nothing, exactly when it would empty the set."""
-    guard = store.remove_unless_last_admin
+    guard = functools.partial(store.remove_unless_last_admin, audits=())
     await seed(store, ("a", "b"), ("c",))
     assert await guard("b", AdminRemoval.DISABLE, admin_role_id=ADMIN) is True
     assert await enabled_admins(store) == {"a"}
@@ -87,9 +88,9 @@ async def assert_concurrent_removals_leave_one(store: Any) -> None:
     await seed(store, ("a", "b"))
     results = await asyncio.gather(
         store.remove_unless_last_admin(
-            "a", AdminRemoval.SET_ROLES, admin_role_id=ADMIN, role_ids=[VIEWER]
+            "a", AdminRemoval.SET_ROLES, admin_role_id=ADMIN, role_ids=[VIEWER], audits=()
         ),
-        store.remove_unless_last_admin("b", AdminRemoval.DISABLE, admin_role_id=ADMIN),
+        store.remove_unless_last_admin("b", AdminRemoval.DISABLE, admin_role_id=ADMIN, audits=()),
     )
     assert sorted(results) == [False, True]
     assert len(await enabled_admins(store)) == 1

@@ -16,6 +16,8 @@ a test that measures input validation and one that measures an RBAC denial.
 from __future__ import annotations
 
 import asyncio
+import html
+import re
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -25,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 from starlette.datastructures import Headers
+from starlette.responses import RedirectResponse
 from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api import create_app
@@ -35,7 +38,8 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService, EnrolmentCodeIssueRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
+from messagefoundry_webconsole._auth import UI_CSP
+from messagefoundry_webconsole._security import UiFetchMetadataMiddleware, build_ui_csp
 
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms: satisfies the ASVS policy (WP-3)
@@ -50,6 +54,49 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 
 #: The same-origin header the console's CSRF guard requires on a /ui POST.
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+_IDP_HOP_REFRESH = re.compile(r'<meta http-equiv="refresh" content="0;url=([^"]*)">')
+_IDP_HOP_LINK = re.compile(r'<a href="([^"]*)">Continue</a>')
+
+
+def idp_url(resp: httpx.Response) -> str:
+    """The URL a federated START leg sends the browser to, read from its navigating page.
+
+    ``POST /ui/oidc/start`` and ``POST /ui/reauth/oidc`` answer 200 with ``pages.idp_handoff``,
+    never a 303, because the console's ``form-action 'self'`` would block a redirect to the IdP.
+    Fails unless the response is that page and its refresh and its fallback link name one URL.
+    """
+    assert resp.status_code == 200, (resp.status_code, resp.headers.get("location"))
+    assert "location" not in resp.headers
+    refresh = _IDP_HOP_REFRESH.findall(resp.text)
+    link = _IDP_HOP_LINK.findall(resp.text)
+    assert len(refresh) == 1 and len(link) == 1, resp.text
+    url = html.unescape(refresh[0])
+    assert html.unescape(link[0]) == url
+    return url
+
+
+#: An authorization URL standing in for the one the engine builds, with characters the old 303's
+#: Location percent-quoted (a double quote, angle brackets, a backslash) and characters it left
+#: alone that the hop's markup must still escape (an ampersand, a single quote).
+HOSTILE_IDP_URL = "https://idp.example/authorize?client_id=c&state=a\"b<c>'d&p=e\\f&x=1"
+
+_NONCE_IN_CSP = re.compile(r"'nonce-([A-Za-z0-9_-]+)'")
+
+
+def assert_idp_hop(resp: httpx.Response, url: str) -> None:
+    """``resp`` is a start leg's navigating page to the very target the old 303 sent for ``url``
+    (Starlette's ``RedirectResponse`` Location), escaped where it sits in the markup, under the
+    console's own /ui CSP, unchanged: ``build_ui_csp`` where a nonce is bound, else the static
+    ``UI_CSP``. Both carry ``form-action 'self'`` and name no IdP origin."""
+    old_location = RedirectResponse(url, status_code=303).headers["location"]
+    assert idp_url(resp) == old_location
+    escaped = html.escape(old_location, quote=True)
+    assert resp.text.count(escaped) == 2, resp.text  # the refresh and the fallback link
+    policies = resp.headers.get_list("content-security-policy")
+    assert len(policies) == 1, policies
+    nonce = _NONCE_IN_CSP.search(policies[0])
+    assert policies[0] == (build_ui_csp(nonce.group(1)) if nonce else UI_CSP)
 
 
 def origin_check_request(

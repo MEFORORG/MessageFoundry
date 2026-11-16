@@ -550,7 +550,14 @@ class _RecordingTransit:
 
     def generate_hmac(self, *, name: str, mount_point: str = "transit", **_: Any) -> dict[str, Any]:
         self.paths.add(f"{mount_point}/hmac/{name}")
-        return {"data": {"hmac": "vault:v1:synthetic-mac"}}
+        # Well-formed, since the audit append refuses a MAC its own check would reject.
+        return {"data": {"hmac": "vault:v1:" + base64.b64encode(b"\x00" * 32).decode("ascii")}}
+
+    def verify_signed_data(
+        self, *, name: str, mount_point: str = "transit", **_: Any
+    ) -> dict[str, Any]:
+        self.paths.add(f"{mount_point}/verify/{name}")
+        return {"data": {"valid": True}}
 
 
 class _TransitClient:
@@ -588,6 +595,8 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
     aad = cell_aad("messages", "raw", 1)
     cipher.decrypt(cipher.encrypt("synthetic", aad=aad), aad=aad)
     cipher.audit_hmac(b"synthetic row")
+    # The row seal check (ADR 0217): the one path a seal adds beyond the audit chain's hmac.
+    cipher.verify_seal_hmac(cipher.seal_key_name, b"\x00" * 32, "vault:v1:synthetic-mac")
     assert transit.paths == set(crypto_transit.transit_cipher_required_capabilities())
 
 

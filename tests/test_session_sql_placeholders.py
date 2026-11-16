@@ -26,7 +26,8 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
-from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL
+from messagefoundry.store.row_seal import SealPager
+from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL, no_audit_row
 
 _HASH = "a" * 64
 _OTHER = "b" * 64
@@ -62,9 +63,9 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "supersede_session_lineage": lambda s: s.supersede_session(
         _HASH, now=_NOW, lineage_since=_NOW - 360
     ),
-    "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW),
+    "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW, audit=no_audit_row),
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(
-        "u", except_token_hash=_HASH, now=_NOW
+        "u", except_token_hash=_HASH, now=_NOW, audit=no_audit_row
     ),
     # BACKLOG #3393: the revoke's clause, counted. Postgres renumbers it rather than sharing it.
     "count_user_sessions": lambda s: s.count_user_sessions("u"),
@@ -125,6 +126,12 @@ _LIVE_SESSION = (
 
 #: The global session epoch read (BACKLOG #5091), which the fakes answer with epoch 0.
 _GLOBAL_EPOCH_READ = f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"
+#: ``create_session``'s account read, which the fakes answer with an unbound account at epoch 0: a
+#: missing account is refused before the INSERT (BACKLOG #2733), which would leave it unchecked.
+_ACCOUNT_COLUMNS = ("oidc_issuer", "oidc_subject", "session_epoch")
+_ACCOUNT_READ = f"SELECT {', '.join(_ACCOUNT_COLUMNS)} FROM users"
+#: The account row the fakes answer that read with; ``None`` answers it with no row.
+_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0)
 
 
 def _reads_session_row(sql: str) -> bool:
@@ -152,6 +159,8 @@ class _MssqlCursor:
             return [_LIVE_SESSION]
         if self._last.startswith(_GLOBAL_EPOCH_READ):
             return [(0,)]
+        if self._last.startswith(_ACCOUNT_READ):
+            return [] if _ACCOUNT_ROW is None else [_ACCOUNT_ROW]
         return self._other_rows()
 
     def _other_rows(self) -> list[Any]:
@@ -183,6 +192,7 @@ def _mssql_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
 
     @asynccontextmanager
     async def _acquire() -> AsyncIterator[_MssqlConn]:
@@ -254,16 +264,26 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
 
 _OWNER_READ = "SELECT user_id FROM sessions WHERE token_hash=?"
 _ACCOUNT_LOCK = "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_SHARE = "SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_DELETE_LOCK = "SELECT id FROM users WITH (XLOCK, ROWLOCK) WHERE id=?"
+
+
+#: Each session write that rewrites the whole row, ``user_id`` included, through
+#: ``_write_session_txn``.
+_SESSION_REWRITES = ("rotate_session", "mark_session_reauthed", "mark_session_mfa_verified")
 
 
 @pytest.mark.parametrize("owner", [None, "u"])
-async def test_sqlserver_rotate_locks_the_account_row_before_the_session_row(
-    owner: str | None,
+@pytest.mark.parametrize("call", _SESSION_REWRITES)
+async def test_sqlserver_session_rewrites_lock_the_account_row_before_the_session_row(
+    owner: str | None, call: str
 ) -> None:
-    """BACKLOG #4974: the re-key takes its account's ``users`` row under ``UPDLOCK, ROWLOCK``
-    before it reads its session row under the same hint, the order every whole-account sweep
-    takes them in, so a sweep cannot meet the row mid-move. Where the session has no row, there is
-    no account to lock, and nothing is locked: the control."""
+    """BACKLOG #4974 and #2733: each rewrite takes its account's ``users`` row under ``UPDLOCK,
+    ROWLOCK`` before it reads its session row under the same hint, the order every whole-account
+    sweep and the user delete take them in. The rewrite sets ``user_id``, so the session key's
+    check reads the account row, and a rewrite holding its session row while a sweep or a delete
+    held the account row would deadlock with it; a re-key could also be met mid-move. Where the
+    session has no row, there is no account to lock, and nothing is locked: the control."""
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _mssql_store(seen)
 
@@ -279,16 +299,46 @@ async def test_sqlserver_rotate_locks_the_account_row_before_the_session_row(
     async def _acquire() -> AsyncIterator[_MssqlConn]:
         yield _OwnerConn(seen)
 
+    store._acquire = _acquire
     store._acquire_after_commit = _acquire
-    await store.rotate_session(_HASH, new_token_hash=_OTHER)
+    await _CALLS[call](store)
     statements = [sql for sql, _ in seen]
     assert seen[0] == (_OWNER_READ, (_HASH,))
     if owner is None:
-        assert _ACCOUNT_LOCK not in statements
+        assert not [sql for sql in statements if sql.startswith("SELECT id FROM users")]
         assert _reads_session_row(statements[1])
     else:
         assert seen[1] == (_ACCOUNT_LOCK, (owner,))
         assert statements[2].startswith("SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK)")
+
+
+@pytest.mark.parametrize(
+    ("call", "lock"),
+    [
+        (lambda s: s.delete_user("u"), _ACCOUNT_DELETE_LOCK),
+        (
+            lambda s: s.remember_login_address("u", "10.0.0.1", now=_NOW),
+            _ACCOUNT_SHARE,
+        ),
+        (
+            lambda s: s.reset_login_addresses("u"),
+            _ACCOUNT_SHARE,
+        ),
+    ],
+    ids=["delete_user", "remember_login_address", "reset_login_addresses"],
+)
+async def test_sqlserver_account_row_is_held_before_any_row_keyed_to_it(
+    call: Callable[[Any], Awaitable[Any]], lock: str
+) -> None:
+    """BACKLOG #2733: the user delete holds the account row under ``XLOCK``, which a sign-in's
+    ``HOLDLOCK`` read cannot share, so a sign-in inside a delete waits and is then refused for the
+    missing account rather than commit a session that fails the delete with error 547. Each write
+    of a sign-in address row holds the account row first, so it cannot hold its address row while
+    its key check waits on a delete that waits on that row. The first statement each runs is the
+    lock; the live interleavings run on the SQL Server leg (``tests/test_sqlserver_store.py``)."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    await call(_mssql_store(seen))
+    assert seen[0] == (lock, ("u",)), seen[0]
 
 
 @pytest.mark.parametrize("revoked", [0, 3])
@@ -298,13 +348,15 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
 
-    async def bump(cur: Any, user_id: str) -> None:
+    async def bump(cur: Any, user_id: str, _outcome: Any) -> None:
         # The epoch is raised through the sealed user write helper, which this fake driver cannot
         # read a users row for; its own contract runs against a real server (BACKLOG #2592).
         seen.append(("raise the epoch", (user_id,)))
 
     store._bump_session_epoch = bump
-    result = await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW)
+    result = await store.revoke_user_sessions(
+        "u", except_token_hash=_HASH, now=_NOW, audit=no_audit_row
+    )
     assert result.count == revoked
     # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
     assert seen[0][0] == "raise the epoch"
@@ -398,6 +450,8 @@ class _PgConn:
         self._seen.append((sql, args))
         if _reads_session_row(sql):
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
+        if sql.startswith(_ACCOUNT_READ) and _ACCOUNT_ROW is not None:
+            return dict(zip(_ACCOUNT_COLUMNS, _ACCOUNT_ROW, strict=True))
         return None
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
@@ -429,6 +483,7 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store._settings = StoreSettings()
     store._acquire_wait = AcquireWaitHistogram()
     store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
 
     @asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[_PgConn]:
@@ -483,3 +538,20 @@ async def test_the_checks_catch_a_miscount(monkeypatch: pytest.MonkeyPatch) -> N
         {int(n) for n in _PG_PLACEHOLDER.findall(sql)} != set(range(1, len(args) + 1))
         for sql, args in seen
     )
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("account_found", [True, False])
+async def test_create_session_inserts_only_for_an_account_it_found(
+    monkeypatch: pytest.MonkeyPatch, backend: str, account_found: bool
+) -> None:
+    """BACKLOG #2733: ``create_session`` reaches its INSERT, so the placeholder checks above cover
+    it, only when its account read found the row. A missing account (one deleted under the sign-in)
+    is refused with ``False`` and no INSERT, rather than left to the session key's error."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    if not account_found:
+        monkeypatch.setitem(globals(), "_ACCOUNT_ROW", None)
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    assert await _CALLS["create_session"](store) is account_found
+    inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert len(inserts) == (1 if account_found else 0), seen

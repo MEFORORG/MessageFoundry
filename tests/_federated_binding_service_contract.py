@@ -39,7 +39,7 @@ async def _audit(store: Any, action: str) -> list[Any]:
 
 async def _assert_federated_binding_service_contract(store: Any) -> None:
     service = AuthService(store, AuthSettings(require_mfa=False, oidc_issuer=ISSUER))
-    for uid in ("bind-a", "bind-b", "bind-c"):
+    for uid in ("bind-a", "bind-b", "bind-c", "bind-d"):
         # Each carries its immutable directory id: a row without one cannot take a binding
         # (BACKLOG #1143 slice C).
         await store.create_user(
@@ -140,6 +140,20 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
             expected_subject=REBOUND_SUB,
             actor="admin",
         )
+
+    # 6. BACKLOG #5613 / #5625: a subject differing from a held one ONLY IN CASE is another
+    #    principal, on every backend. Under SQL Server's case-insensitive default the lookup found
+    #    bind-a's row and the unique index refused the write, so bind-d could never be bound.
+    variant = REBOUND_SUB.upper()
+    assert variant != REBOUND_SUB
+    case = await service.bind_federated_subject(
+        "bind-d", variant, expected_issuer=None, expected_subject=None, actor="admin"
+    )
+    assert case.sessions_revoked == 0
+    by_variant = await store.get_user_by_federated_subject(ISSUER, variant)
+    by_original = await store.get_user_by_federated_subject(ISSUER, REBOUND_SUB)
+    assert by_variant is not None and by_variant.id == "bind-d"
+    assert by_original is not None and by_original.id == "bind-a"
 
 
 #: The account the factor-state contract below binds, rebinds and unbinds, and its control.

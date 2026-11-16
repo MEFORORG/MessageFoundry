@@ -28,6 +28,7 @@ from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthServic
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     PASSKEY_DIGEST_EXCLUDED,
     USER_SEAL_EXCLUDED,
@@ -84,6 +85,11 @@ async def _user(store: MessageStore, user_id: str) -> None:
     )
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_user_seal_contract_holds_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     store, path = keyed
     await assert_user_seal_contract(store, _raw_for(path))
@@ -97,7 +103,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "user_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "user_seal_ok_async", _holds)
     with pytest.raises(AssertionError):
         await assert_user_seal_contract(store, _raw_for(path))
 
@@ -218,7 +224,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
     try:
         await AuthService(store, AuthSettings()).initialize()  # the built-in roles
         await _user(store, "u")
-        await store.set_user_roles("u", [Role.VIEWER.value])
+        await store.set_user_roles("u", [Role.VIEWER.value], audits=())
         await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXP")
     finally:
         await store.close()
@@ -266,7 +272,7 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
     await AuthService(store, AuthSettings()).initialize()
     for name in ("a", "b"):
         await _user(store, name)
-        await store.set_user_roles(name, [Role.ADMINISTRATOR.value])
+        await store.set_user_roles(name, [Role.ADMINISTRATOR.value], audits=())
 
     async def removable(target: str) -> bool:
         return await store.remove_unless_last_admin(
@@ -274,12 +280,13 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
             AdminRemoval.SET_ROLES,
             admin_role_id=Role.ADMINISTRATOR.value,
             role_ids=[Role.VIEWER.value],
+            audits=(),
         )
 
     await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "b"))
     assert not await removable("a")  # b is refused, so a is the last usable administrator
     await _user(store, "c")
-    await store.set_user_roles("c", [Role.ADMINISTRATOR.value])
+    await store.set_user_roles("c", [Role.ADMINISTRATOR.value], audits=())
     assert await removable("a")  # control: c is a sealed administrator
 
 
@@ -323,7 +330,7 @@ async def test_a_session_resolves_with_one_role_read(keyed: tuple[MessageStore, 
     service = AuthService(store, AuthSettings())
     await service.initialize()
     await _user(store, "u")
-    await store.set_user_roles("u", [Role.VIEWER.value])
+    await store.set_user_roles("u", [Role.VIEWER.value], audits=())
     token = mint_token()
     await store.create_session(
         token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
@@ -366,7 +373,11 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_lookup_by_username": frozenset({"get_user_by_username"}),
     "_lookup_by_directory_object_id": frozenset({"get_user_by_directory_object_id"}),
     "_load_user_by_federated_subject": frozenset({"get_user_by_federated_subject"}),
-    "_load_users": frozenset({"list_users"}),
+    # BACKLOG #5520: the public list, which checks each row through `_checked_by_id`; the scans'
+    # `_load_users` reads through it, so the two agree on every row.
+    "list_checked_users": frozenset({"list_users"}),
+    # The re-read by id after a check that raced a delete or a re-key (BACKLOG #5520).
+    "_checked_by_id": frozenset({"get_user"}),
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
     "_verified_passkeys": frozenset({"list_webauthn_credentials"}),
@@ -374,14 +385,43 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),
     "_user_id_held": frozenset({"get_user"}),
+    # The bind's holder check, which must see a holder whose seal fails (BACKLOG #5625).
+    "_federated_subject_held_elsewhere": frozenset({"get_user_by_federated_subject"}),
     # A count for the holder's notice after a code is spent; it decides nothing.
     "_verify_second_factor": frozenset({"get_recovery_code_hashes"}),
 }
 
 
-def _service_reader_calls() -> list[tuple[str, str]]:
-    tree = ast.parse(_SERVICE.read_text("utf-8"))
-    found: list[tuple[str, str]] = []
+_ROUTES = _ROOT / "messagefoundry" / "api" / "auth_routes.py"
+
+#: BACKLOG #5520: the auth routes allowed to call a raw user reader through ``service.store``, and
+#: why. Every read that SHOWS an account goes through ``AuthService.checked_user`` or
+#: ``list_checked_users`` instead. Function names, so a nested handler is named by its own name.
+_ROUTE_READS: dict[str, frozenset[str]] = {
+    # An id question: only whether the target is the caller's own account leaves it.
+    "_refuse_if_self": frozenset({"get_user"}),
+    # The duplicate-name check before the create (a name question), and the read-back of the row
+    # this request just wrote, for its reply.
+    "create_user": frozenset({"get_user_by_username", "get_user"}),
+    "create_directory_user": frozenset({"get_user"}),
+    # The write routes the row left alone, each acting by id; the store's own write refuses a row
+    # that fails its seal. Their replies carry no field of the row, but ``set_user_roles`` decides
+    # its AD refusal on the unchecked ``auth_provider`` and names the unchecked ``username`` in its
+    # administrator-granted alert. Left for a later item, not covered by this row.
+    # The scan sees only ``<x>.store.<reader>`` chains in this one file: an alias, a ``getattr`` or
+    # a read in another module is not seen.
+    "delete_user": frozenset({"get_user"}),
+    "admin_revoke_user_sessions": frozenset({"get_user"}),
+    "set_user_roles": frozenset({"get_user", "get_user_role_ids"}),
+}
+
+
+def _reader_calls(source: str, receiver: str) -> list[tuple[str, str]]:
+    """Every ``<x>.<receiver>.<reader>`` in ``source``, named by the innermost function holding it."""
+    tree = ast.parse(source)
+    found: dict[int, tuple[str, str]] = {}
+    # ast.walk is breadth-first, so an inner function is reached after the one holding it, and
+    # its name overwrites the outer one for the reads inside it.
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -390,22 +430,50 @@ def _service_reader_calls() -> list[tuple[str, str]]:
                 isinstance(node, ast.Attribute)
                 and node.attr in _USER_READERS
                 and isinstance(node.value, ast.Attribute)
-                and node.value.attr == "_store"
+                and node.value.attr == receiver
             ):
-                found.append((func.name, node.attr))
-    return found
+                found[id(node)] = (func.name, node.attr)
+    return list(found.values())
+
+
+def _assert_reads_only_where_listed(
+    calls: list[tuple[str, str]], allowed: dict[str, frozenset[str]]
+) -> None:
+    # Liveness, before the absence check: the walk finds every listed function's own read, so it is
+    # reading the file, and an empty walk cannot pass for a clean one. A subset rather than an
+    # equality, so a stray read in a new function still reaches the stray check below.
+    assert len(calls) >= len(allowed), calls
+    assert set(allowed) <= {f for f, _ in calls}, set(allowed) - {f for f, _ in calls}
+    stray = [(f, r) for f, r in calls if r not in allowed.get(f, frozenset())]
+    assert not stray, stray
 
 
 def test_the_service_reads_users_through_its_loaders() -> None:
     """A raw user read outside the loaders would act on a record nobody checked."""
-    calls = _service_reader_calls()
-    # Liveness, before the absence check: the walk finds every loader's own read, so it is reading
-    # this file, and an empty walk cannot pass for a clean one. A subset rather than an equality, so
-    # a stray read in a new function still reaches the stray check below and is named there.
-    assert len(calls) >= len(_LOADERS), calls
-    assert set(_LOADERS) <= {f for f, _ in calls}, set(_LOADERS) - {f for f, _ in calls}
-    stray = [(f, r) for f, r in calls if r not in _LOADERS.get(f, frozenset())]
-    assert not stray, stray
+    _assert_reads_only_where_listed(_reader_calls(_SERVICE.read_text("utf-8"), "_store"), _LOADERS)
+
+
+def test_the_auth_routes_read_users_through_the_checked_readers() -> None:
+    """BACKLOG #5520: a route that serves a raw user row, or its raw role rows, serves a record
+    nobody checked, with a 200 and no seal-failure row. Only the existence questions and the write
+    routes listed above may read the store directly."""
+    _assert_reads_only_where_listed(
+        _reader_calls(_ROUTES.read_text("utf-8"), "store"), _ROUTE_READS
+    )
+
+
+def test_the_route_scan_names_a_raw_read_it_was_not_told_of() -> None:
+    """The control for the scan above: the shape GET /users had before BACKLOG #5520 is caught."""
+    source = (
+        "def add(app):\n"
+        "    async def list_users(service):\n"
+        "        for user in await service.store.list_users():\n"
+        "            await service.store.get_user_role_ids(user.id)\n"
+    )
+    calls = _reader_calls(source, "store")
+    assert sorted(calls) == [("list_users", "get_user_role_ids"), ("list_users", "list_users")]
+    with pytest.raises(AssertionError):
+        _assert_reads_only_where_listed(calls, {"list_users": frozenset({"list_users"})})
 
 
 def test_only_the_loader_builds_a_checked_user() -> None:
@@ -582,7 +650,7 @@ async def test_a_record_that_fails_is_not_resealed_by_a_check(
     """``user_seal_ok`` is a pure check: a record whose seal fails stays failing after it."""
     store, _ = keyed
     sealer = store.row_sealer()
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)  # a local key: the sync check is the one under test
     row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
     record = UserAuthzRecord(row=row)
     assert not user_seal_ok(sealer, record)

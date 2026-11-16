@@ -23,16 +23,19 @@ same cell see the same stable AAD, so binding is symmetric by construction.
 **Audit chain (keyed IN Transit).** :meth:`audit_mac_key` returns ``None`` — there is no in-heap DEK to
 HKDF a raw HMAC key from — but the chain is **not** keyless: :meth:`audit_mac_fn` hands the store a
 Transit-backed MAC (:meth:`audit_hmac` → Transit ``generate_hmac``), so every audit row's MAC is computed
-INSIDE the isolated module and the key never enters heap. This lifts the audit chain from keyless SHA-256
-(tamper-evident) to forgery-**resistant** (ADR 0138 §To-resolve, closing the ASVS 16.4.2 residual for this
-mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
+INSIDE the isolated module and the key never enters heap. The walk checks each stored row MAC with
+Transit ``verify`` (:meth:`verify_audit_hmac`), never by regenerating it. This lifts the audit chain
+from keyless SHA-256 (tamper-evident) to forgery-**resistant** (ADR 0138 §To-resolve, closing the
+ASVS 16.4.2 residual for this mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
 ``MEFOR_STORE_TRANSIT_AUDIT_KEY`` for domain separation.
 
 **Fail-closed (ADR 0138).** Missing config, an unreachable/unknown Transit key, or a key whose TYPE
 cannot run the operation asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
 → ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
-store's existing at-rest error discipline. **No plaintext/PHI is EVER placed in a message** (only the
+store's existing at-rest error discipline. On ``encrypt`` and ``decrypt``, a failure that gave no verdict
+on the value (Transit unreachable, or answering that it cannot serve now) raises its subclass
+:class:`~messagefoundry.store.crypto.CipherUnavailableError` instead (BACKLOG #3734). **No plaintext/PHI is EVER placed in a message** (only the
 exception TYPE): the base64 plaintext handed to Transit is the message body. The one exception is a
 refusal of the Vault hop or its reply, whose text is fixed and is kept whole (BACKLOG #2318; see
 :func:`~messagefoundry.store.keyprovider_vault.vault_failure_text`).
@@ -48,17 +51,33 @@ import base64
 import contextlib
 import logging
 import os
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
     AUDIT_TRANSIT_HASH_ALGO,
+    BATCH_MAX_CHARS,
+    BATCH_MAX_ITEMS,
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
-    AuditMacFn,
+    AuditKeyVersionUnverifiedError,
+    AuditMacMalformedError,
+    AuditMacVerifier,
+    AuditVerifyTimedOutError,
     CipherError,
+    CipherItem,
+    CipherUnavailableError,
+    TransitSealRefused,
+    UnauthenticatedCipherError,
     _UnmarkedPolicy,
+    b64_chars,
+    batch_chars,
+    decrypt_or_error,
+    gave_no_verdict,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.keyprovider_vault import (
@@ -67,11 +86,16 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    checked_transit_key_name,
     is_vault_bad_request,
+    is_vault_forbidden,
+    is_vault_timeout_reply,
+    is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
     vault_failure_text,
 )
+from messagefoundry.store.row_seal import transit_mac_version
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -97,15 +121,267 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
+#: Texts Transit's ``hmac`` and ``verify`` endpoints answer a refused key VERSION with, lower-cased
+#: (BACKLOG #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
+#: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. ``version is too new`` was
+#: read on 2026-11-11 from Vault's ``pathHMACVerify`` at cbc874e2358f only (BACKLOG #2720); OpenBao
+#: was not read for it. They never decide whether
+#: the row is a break, and are read only inside an ``errors`` value that is a list
+#: (:func:`_names_no_version_reason`): a list entry holding one keeps the refused-version label,
+#: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
+#: list or a string ``errors`` value, is not read.
+_VERSION_REFUSAL_TEXTS = (
+    "key version does not exist",
+    "no such key version",
+    "version is too old (disallowed by policy)",
+    "no hmac key exists for that key version",
+    "version is too new",
+)
+#: Whole Vault error texts, lower-cased, that say an audit-MAC 400 is NOT about the version
+#: (BACKLOG #6707), from the same Vault source. Matched whole once stripped and lower-cased, never
+#: as a substring. Kept short on purpose: :meth:`TransitCipher.verify_audit_hmac` sends base64 it
+#: encoded, a fixed algorithm and only a MAC that :func:`transit_mac_version` accepts, so at least
+#: the input-encoding, MAC-shape and algorithm 400s are not reachable from it.
+_NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
+#: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
+#: (BACKLOG #6707). Vault's own refusal is far shorter. It bounds both readers of a 400: the audit
+#: walk's version check, where a MemoryError would turn a row's break into a walk that could not run
+#: and a longer body is not read as a version refusal, and the data-key decrypt's AEAD check
+#: (BACKLOG #5650), where a longer body is not read as a tag refusal. A change here changes both.
+_REPARSED_BODY_MAX_CHARS = 64 * 1024
+#: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
+#: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
+#: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
+#: ``chacha20poly1305`` for both ChaCha key types, the three
+#: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_DATA` admits. Transit returns
+#: the error's text as the 400's one reason. Matched whole, never as a substring. The two texts are
+#: the Go libraries' own; that Transit returns them unwrapped was not read from the Vault or OpenBao
+#: source here, so a release that wraps them would leave a refused tag plain CipherError, as before.
+_AEAD_FAILURE_TEXTS = frozenset(
+    {"cipher: message authentication failed", "chacha20poly1305: message authentication failed"}
+)
+
+
+def _reply_errors(exc: Exception) -> tuple[object, int | None]:
+    """A Vault error's ``errors`` value, and, when it went unread because the body is too long,
+    that body's length. hvac fills ``exc.errors`` only when the reply's Content-Type is exactly
+    ``application/json``, so a proxy that adds a charset leaves the same JSON in ``exc.text``;
+    that is parsed when hvac parsed no JSON (``exc.json`` is None) and the body is at most
+    :data:`_REPARSED_BODY_MAX_CHARS` long. Callers read only a list."""
+    errors: object = getattr(exc, "errors", None)
+    body: object = getattr(exc, "text", None)
+    if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
+        if len(body) > _REPARSED_BODY_MAX_CHARS:
+            return None, len(body)
+        parsed, refused = json_loads_or_refusal(body)
+        if refused is None and isinstance(parsed, dict):
+            errors = parsed.get("errors")
+    return errors, None
+
+
+def _names_no_version_reason(exc: Exception) -> bool:
+    """Whether an audit-MAC ``verify`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
+    ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
+    least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
+    ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
+    value, stripped and lower-cased, is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a
+    :data:`_VERSION_REFUSAL_TEXTS` text; any other list, an empty one, one with a non-text entry
+    and unknown Vault wording included, is False. A True 400 may still be a refusal of the version, so this chooses only the
+    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
+    its parent.
+
+    The list is read by :func:`_reply_errors`, which says when a body hvac did not parse is read. A
+    body too long for it is True, unparsed."""
+    errors, oversize = _reply_errors(exc)
+    if oversize is not None:
+        # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
+        log.warning(
+            "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
+            "bound; not read as a version refusal",
+            oversize,
+            _REPARSED_BODY_MAX_CHARS,
+        )
+        return True
+    if not isinstance(errors, list):
+        return True  # no errors list, so nothing in the reply is read
+    texts = [text.strip().lower() for text in errors if isinstance(text, str)]
+    if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
+        return False
+    return (
+        bool(errors) and len(texts) == len(errors) and all(t in _NOT_VERSION_TEXTS for t in texts)
+    )
+
+
+def _batches(costs: Sequence[int]) -> list[list[int]]:
+    """The item indexes, in order, cut into runs under
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_ITEMS` and
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_CHARS`; an item over the character bound is a
+    run of its own (BACKLOG #6706)."""
+    runs: list[list[int]] = []
+    run: list[int] = []
+    size = 0
+    for index, cost in enumerate(costs):
+        if run and (len(run) >= BATCH_MAX_ITEMS or size + cost > BATCH_MAX_CHARS):
+            runs.append(run)
+            run, size = [], 0
+        run.append(index)
+        size += cost
+    if run:
+        runs.append(run)
+    return runs
+
+
+#: :func:`_batch_replies`' answer for a reply of the right length, every result an object, none
+#: of which carries a ``reference`` other than an empty one: a Transit that does not echo it. Its
+#: order cannot be checked, so it is not used, and the batch's values are asked for alone, as
+#: before batching.
+UNECHOED = "unechoed"
+
+
+def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | str | None:
+    """Transit's ``batch_results``, when it is a list of ``sent`` objects whose ``reference`` is
+    each one's own place in the request, as sent (BACKLOG #6706). :data:`UNECHOED` when it is
+    ``sent`` objects none of which carries a non-empty ``reference``. ``None`` for any other
+    reply, which
+    the caller reads as no verdict on any value of the batch. So a reply that drops, adds or
+    reorders a result is never zipped onto the request."""
+    data = response.get("data") if isinstance(response, dict) else None
+    replies = data.get("batch_results") if isinstance(data, dict) else None
+    if not isinstance(replies, list) or len(replies) != sent:
+        return None
+    if not all(isinstance(reply, dict) for reply in replies):
+        return None
+    if not any(reply.get("reference") for reply in replies):
+        return UNECHOED
+    if not all(reply.get("reference") == str(place) for place, reply in enumerate(replies)):
+        return None
+    return replies
+
+
+def _unasked(failure: CipherError, count: int) -> list[str | CipherError]:
+    """``count`` :class:`CipherUnavailableError` copies of a failure that gave no verdict, for
+    values of a batch Transit was not asked for, or not answered for, alone. Each carries
+    ``failure``'s cause, as ``raise ... from`` sets it, which is what a reader that tells an
+    outage from a refusal reads."""
+    copies: list[str | CipherError] = []
+    for _ in range(count):
+        error = CipherUnavailableError(str(failure))
+        error.__cause__ = failure.__cause__
+        copies.append(error)
+    return copies
+
+
+def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
+    """Whether a batch request's ``exc`` is Transit giving no verdict
+    (:func:`is_vault_unavailable`), and whether it is Vault's HTTP 400 (BACKLOG #6706). Flags
+    only: Vault's 400 and 500 bodies to a batch are its whole ``batch_results``, other values'
+    plaintext included, and hvac makes that body the error's message (BACKLOG #2085), so the
+    caller keeps nothing of ``exc``. Runs inside the caller's handler, so a classifier that
+    raises is caught here and logged by type alone. It then reads as a 400: the batch's values are
+    asked for alone, and an unknown failure never turns batching off for the cipher."""
+    try:
+        return is_vault_unavailable(exc), is_vault_bad_request(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring
+        log.warning("Transit failure classifier raised %s; read as a 400", type(fault).__name__)
+        return False, True
+
+
+def _plaintext(value: object) -> str | None:
+    """Transit's base64 ``plaintext`` as text, or ``None`` when it is not base64 of UTF-8. Never
+    raises, so no error carries the decrypted bytes (BACKLOG #2085)."""
+    # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
+    with contextlib.suppress(ValueError, TypeError):
+        return base64.b64decode(value).decode("utf-8")  # type: ignore[arg-type]
+    return None
+
+
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
-#: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
-_VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
+#: It carries no row data, so no row can decide the probe's answer.
+_VERSION_PROBE_BYTES = b"messagefoundry audit key version probe"
+#: :data:`_VERSION_PROBE_BYTES` in base64, as Transit takes it.
+_VERSION_PROBE_INPUT = base64.b64encode(_VERSION_PROBE_BYTES).decode("ascii")
+
+
+def _is_aead_failure_text(text: object) -> bool:
+    """Whether ``text`` is, whole once stripped and lower-cased, one of
+    :data:`_AEAD_FAILURE_TEXTS`."""
+    return isinstance(text, str) and text.strip().lower() in _AEAD_FAILURE_TEXTS
+
+
+def _names_aead_failure(exc: Exception) -> bool:
+    """Whether a data-key ``decrypt`` failure is Vault's HTTP 400 whose every reason is the AEAD's
+    own authentication failure (BACKLOG #5650): the value's tag did not verify under its
+    associated data. Only an ``errors`` list is read (:func:`_reply_errors`). Any other 400, a
+    key-version refusal or a malformed ciphertext among them, and any other status, is False."""
+    if not is_vault_bad_request(exc):
+        return False
+    errors, oversize = _reply_errors(exc)
+    if oversize is not None:
+        _log_unread_decrypt_body(oversize)
+        return False
+    return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
+
+
+#: How long a decrypt 400 whose body went unread is logged once per process (BACKLOG #5650).
+_UNREAD_BODY_LOG_INTERVAL_S = 3600.0
+_unread_body_logged_at: float | None = None
+_unread_body_lock = threading.Lock()
+
+
+def _log_unread_decrypt_body(length: int) -> None:
+    """Log, once per :data:`_UNREAD_BODY_LOG_INTERVAL_S`, that a data-key decrypt 400 was not read
+    for its AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal
+    stays the cipher's plain error. A proxy can cause it on every read; once is the signal."""
+    global _unread_body_logged_at
+    now = time.monotonic()
+    with _unread_body_lock:
+        last = _unread_body_logged_at
+        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
+            return
+        _unread_body_logged_at = now
+    log.warning(
+        "a Transit data-key decrypt got a 400 whose %d-character body is past the %d-character "
+        "bound; not read as a tag refusal, so the value keeps the cipher's plain error",
+        length,
+        _REPARSED_BODY_MAX_CHARS,
+    )
+
+
+def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
+    where Transit gave no verdict on the value (BACKLOG #3734); for a ``decrypt``,
+    :class:`UnauthenticatedCipherError` where Vault refused the value's AEAD tag
+    (:func:`_names_aead_failure`, BACKLOG #5650); else plain :class:`CipherError`. The audit HMAC
+    keeps plain :class:`CipherError`; this split is for the data key alone, and the tag refusal for
+    its decrypt alone.
+
+    The outage's text is the key id and ``exc``'s type name only, a reply refusal's fixed text
+    left out, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
+
+    Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
+    error: anything it raises reads as a plain refusal, the side the split keeps when it cannot
+    tell."""
+    try:
+        unavailable = is_vault_unavailable(exc)
+        unauthenticated = op == "decrypt" and not unavailable and _names_aead_failure(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
+        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        unavailable = unauthenticated = False
+    if unavailable:
+        return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
+    refused = f"Transit {op} failed (key={key!r}): {vault_failure_text(exc)}"
+    return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
 class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
     encrypts = True
+    #: This cipher cannot name the keys it holds, and its UnauthenticatedCipherError is Vault's
+    #: AEAD refusal of the value itself, never a key it lacks, so
+    #: :func:`~messagefoundry.store.cell_tag.open_tagged_cell` reads it as tag drift (BACKLOG #5650).
+    names_no_keys = True
 
     def __init__(
         self,
@@ -122,6 +398,9 @@ class TransitCipher(_UnmarkedPolicy):
         # The Transit key the audit-chain HMAC runs under. Defaults to the data key (Transit HMAC works
         # on any key type) so the chain is keyed-in-Transit by default; a dedicated key domain-separates.
         self._audit_key = audit_key or key_name
+        # Set once Transit refused a batch, or answered one without a `reference`, and then
+        # served its values alone: every later value goes alone too (BACKLOG #6706).
+        self._batch_alone = False
 
     @property
     def transit_key_name(self) -> str:
@@ -144,9 +423,11 @@ class TransitCipher(_UnmarkedPolicy):
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
-            raise CipherError(
-                f"Transit encrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            raise _transit_failure("encrypt", self._key, exc) from exc
+        return self._stored(ciphertext)
+
+    def _stored(self, ciphertext: object) -> str:
+        """Transit's ciphertext as the store keeps it, refused when it is not non-empty text."""
         if not isinstance(ciphertext, str) or not ciphertext:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
         return f"{_V3_PREFIX}{ciphertext}"
@@ -176,16 +457,209 @@ class TransitCipher(_UnmarkedPolicy):
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
-            # closed. Type-only: a Transit error can echo ciphertext, and we never surface key material.
-            raise CipherError(
-                f"Transit decrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            # closed: the first is UnauthenticatedCipherError (BACKLOG #5650), the second
+            # CipherUnavailableError (BACKLOG #3734). Type-only: a Transit error can echo
+            # ciphertext, and we never surface key material.
+            raise _transit_failure("decrypt", self._key, exc) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
-        # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a non-str plaintext.
-        with contextlib.suppress(ValueError, TypeError):
-            return base64.b64decode(plaintext_b64).decode("utf-8")
-        raise CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
+        plaintext = _plaintext(plaintext_b64)
+        if plaintext is None:
+            raise self._malformed_plaintext()
+        return plaintext
+
+    def _malformed_plaintext(self) -> CipherError:
+        return CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
+
+    def _batch_input(self, field: str, values: Sequence[CipherItem]) -> list[dict[str, str]]:
+        """Transit's ``batch_input``: each value under ``field``, its AAD as ``associated_data``
+        when it has one, and its place in the request as ``reference`` (BACKLOG #6706)."""
+        batch_input: list[dict[str, str]] = []
+        for place, (value, aad) in enumerate(values):
+            item = {field: value, "reference": str(place)}
+            assoc = self._associated_data(aad)
+            if assoc is not None:
+                item["associated_data"] = assoc
+            batch_input.append(item)
+        return batch_input
+
+    def _send_alone_from_now(self, op: str, why: str) -> None:
+        if not self._batch_alone:
+            log.warning(
+                "Transit %s a batch %s (key=%r); sending each value alone from now on",
+                why,
+                op,
+                self._key,
+            )
+        self._batch_alone = True
+
+    def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]:
+        """Each ``(stored, aad)`` of ``items`` opened, in order, in as few Transit ``decrypt``
+        requests as the batch bounds allow (BACKLOG #6706). Each result is the plaintext or a
+        :class:`CipherError` for that value; one value's failure is never another's result.
+
+        A value that is not ``mfenc:v3`` goes to :meth:`decrypt`, which answers it without Transit.
+        A batch request Transit could not serve fails every value not yet answered with a
+        :class:`CipherUnavailableError`, and no later request is sent. Any other failure of a batch
+        request, Vault's HTTP 400 when one value in it fails or a proxy's size refusal among them,
+        asks for each value of that batch alone, so each gets the verdict :meth:`decrypt` gives it.
+        So does a reply with no ``reference`` echo (:data:`UNECHOED`). Asking alone stops at the
+        first value that gives no verdict (:func:`~messagefoundry.store.crypto.gave_no_verdict`),
+        and every value not yet answered then fails, unasked, with a
+        :class:`CipherUnavailableError`. When a refusal other than a 400, or an unechoed reply, is
+        followed by single requests Transit serves, this cipher sends every later value alone. Any
+        other reply :func:`_batch_replies` refuses is no verdict on any value of the batch. A batch
+        of one is a single request."""
+        results: dict[int, str | CipherError] = {}
+        sealed: list[int] = []
+        for index, (stored, aad) in enumerate(items):
+            if stored.startswith(_V3_PREFIX):
+                sealed.append(index)
+            else:
+                results[index] = decrypt_or_error(self, stored, aad)
+        down: CipherError | None = None
+        for run in _batches([batch_chars(*items[i]) for i in sealed]):
+            picked = [sealed[i] for i in run]
+            batch = [items[i] for i in picked]
+            if down is not None:
+                opened = _unasked(down, len(picked))
+            elif self._batch_alone or len(batch) == 1:
+                opened = self._decrypt_alone(batch)
+            else:
+                opened = self._decrypt_batch(batch)
+            down = next(
+                (r for r in opened if isinstance(r, CipherError) and gave_no_verdict(r)), None
+            )
+            for index, result in zip(picked, opened, strict=True):
+                results[index] = result
+        return [results[index] for index in range(len(items))]
+
+    def _decrypt_alone(self, batch: list[CipherItem]) -> list[str | CipherError]:
+        """Each value of ``batch`` in its own request, until one gives no verdict
+        (:func:`~messagefoundry.store.crypto.gave_no_verdict`); the values after it fail, unasked,
+        with a :class:`CipherUnavailableError`."""
+        opened: list[str | CipherError] = []
+        for stored, aad in batch:
+            result = decrypt_or_error(self, stored, aad)
+            opened.append(result)
+            if isinstance(result, CipherError) and gave_no_verdict(result):
+                opened.extend(_unasked(result, len(batch) - len(opened)))
+                break
+        return opened
+
+    def _decrypt_batch(self, batch: list[CipherItem]) -> list[str | CipherError]:
+        """One batch request of :meth:`decrypt_many`, every value ``mfenc:v3``: the results in
+        its order."""
+        sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
+        response: Any = None
+        failed = unavailable = bad_request = False
+        failure_type = ""
+        try:
+            response = self._client.secrets.transit.decrypt_data(
+                name=self._key, batch_input=self._batch_input("ciphertext", sent)
+            )
+        except Exception as exc:
+            # Only flags and a type name leave this handler (see _classify_batch_failure).
+            failed, failure_type = True, type(exc).__name__
+            unavailable, bad_request = _classify_batch_failure(exc)
+        if unavailable:
+            down = CipherUnavailableError(
+                f"Transit decrypt failed (key={self._key!r}): {failure_type}"
+            )
+            return _unasked(down, len(batch))
+        replies = None if failed else _batch_replies(response, len(batch))
+        if failed or replies == UNECHOED:
+            opened = self._decrypt_alone(batch)
+            served = not any(isinstance(r, CipherError) and gave_no_verdict(r) for r in opened)
+            if served and not bad_request:
+                why = "refused" if failed else "did not echo the reference of"
+                self._send_alone_from_now("decrypt", why)
+            return opened
+        if not isinstance(replies, list):
+            mismatch = CipherUnavailableError(
+                f"Transit's batch decrypt reply does not match the request (key={self._key!r})"
+            )
+            return _unasked(mismatch, len(batch))
+        opened = []
+        for reply in replies:
+            if error := reply.get("error"):
+                # Vault's own text is not quoted: it is a reply this process did not write. It is
+                # read only to give the value the class decrypt gives it (BACKLOG #5650).
+                kind = UnauthenticatedCipherError if _is_aead_failure_text(error) else CipherError
+                opened.append(kind(f"Transit refused the value (key={self._key!r})"))
+                continue
+            plaintext = _plaintext(reply.get("plaintext"))
+            opened.append(plaintext if plaintext is not None else self._malformed_plaintext())
+        return opened
+
+    def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]:
+        """Each ``(plaintext, aad)`` of ``items`` sealed, in order, in as few Transit ``encrypt``
+        requests as the batch bounds allow (BACKLOG #6706). Any failure raises as :meth:`encrypt`
+        does, so no value is returned unless all sealed. A batch request Transit could not serve
+        raises :class:`CipherUnavailableError`, and so does a reply :func:`_batch_replies` refuses,
+        except one with no ``reference`` echo (:data:`UNECHOED`). That reply, or a batch Transit
+        refused, a proxy's request-size bound among them, seals each value of the batch alone, and
+        this cipher then sends every later value alone. Vault's 400 to a batch, or a failure the
+        classifier could not read (:func:`_classify_batch_failure`), seals that batch alone and
+        leaves batching on. A batch of one is a single request."""
+        costs = [
+            b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+            for plaintext, aad in items
+        ]
+        sealed: list[str] = []
+        for run in _batches(costs):
+            batch = [items[i] for i in run]
+            if self._batch_alone or len(batch) == 1:
+                sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
+                continue
+            outcome = self._encrypt_batch(batch)
+            if isinstance(outcome, list):
+                sealed.extend(outcome)
+                continue
+            sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
+            if outcome is not None:
+                self._send_alone_from_now("encrypt", outcome)
+        return sealed
+
+    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | str | None:
+        """One batch request of :meth:`encrypt_many`: the sealed values in its order; else why the
+        values must be sealed alone and later ones too, ``"refused"`` or ``"did not echo the
+        reference of"``; else ``None``, for Vault's 400 or an unread failure, sealed alone with
+        batching left on."""
+        sent = [
+            (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
+            for plaintext, aad in batch
+        ]
+        response: Any = None
+        failed = unavailable = bad_request = False
+        failure_type = ""
+        try:
+            response = self._client.secrets.transit.encrypt_data(
+                name=self._key, batch_input=self._batch_input("plaintext", sent)
+            )
+        except Exception as exc:
+            # Type-only message: the plaintext going in is PHI; never surface it or the key material.
+            failed, failure_type = True, type(exc).__name__
+            unavailable, bad_request = _classify_batch_failure(exc)
+        if unavailable:
+            raise CipherUnavailableError(
+                f"Transit encrypt failed (key={self._key!r}): {failure_type}"
+            )
+        if failed:
+            return None if bad_request else "refused"
+        replies = _batch_replies(response, len(batch))
+        if replies == UNECHOED:
+            return "did not echo the reference of"
+        if not isinstance(replies, list):
+            raise CipherUnavailableError(
+                f"Transit's batch encrypt reply does not match the request (key={self._key!r})"
+            )
+        out: list[str] = []
+        for reply in replies:
+            if reply.get("error"):
+                raise CipherError(f"Transit refused a value (key={self._key!r})")
+            out.append(self._stored(reply.get("ciphertext")))
+        return out
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
@@ -202,71 +676,273 @@ class TransitCipher(_UnmarkedPolicy):
 
     def authz_root(self) -> None:
         """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
-        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
-        and checks no row seals."""
+        provider are Transit's own HMAC under the audit key: the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217 slice 1b-iii), which
+        ``row_sealer_for_cipher`` builds for this cipher, not a sealer keyed from this root."""
         return None
+
+    def row_seal_backend(self) -> TransitCipher:
+        """This cipher: it makes the Transit ``hmac`` and ``verify`` calls the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` seals authority rows through, under
+        the audit key (ADR 0217 slice 1b-iii, item 3.7)."""
+        return self
 
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
         return ()
 
-    def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
+    def audit_hmac(self, data: bytes) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
 
-        Returns Transit's own ``vault:v1:…`` HMAC string (deterministic for a given input+key+version, so
-        the chain round-trips at :meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`; a
-        different input yields a different MAC → tamper/forgery is detected). ADR 0138 §To-resolve: this
-        moves the audit chain from keyless SHA-256 to forgery-**resistant** without an in-heap key,
-        closing the ASVS 16.4.2 residual for ``vault_transit`` mode. Fail-closed: any Transit error raises
-        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced).
-
-        ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
-        stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
-        an older row read as forged. A pinned call Transit refuses for its version alone raises
-        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`)."""
+        Returns Transit's own ``vault:v<N>:…`` HMAC string under the key's latest version; the
+        string names that version, which is what :meth:`verify_audit_hmac` later checks the row at.
+        ADR 0138 §To-resolve: this moves the audit chain from keyless SHA-256 to
+        forgery-**resistant** without an in-heap key, closing the ASVS 16.4.2 residual for
+        ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
+        (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
+        :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
+        :class:`CipherError` too, so no malformed MAC is written; for a non-empty string it is the
+        subclass :class:`~messagefoundry.store.crypto.AuditMacMalformedError`. A well-formed MAC can still read
+        as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
-        kwargs: dict[str, Any] = {
-            "name": self._audit_key,
-            "hash_input": inp,
-            "algorithm": AUDIT_TRANSIT_HASH_ALGO,
-        }
-        if key_version is not None:
-            kwargs["key_version"] = key_version
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(**kwargs)
+            response: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=inp, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            )
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
-            if key_version is not None and self._refuses_only_version(exc, key_version):
-                raise AuditKeyVersionRefusedError(key_version) from exc
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
             ) from exc
-        if not isinstance(mac, str) or not mac:
-            raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
+        # The writer refuses what the reader is certain to reject: a reply ``transit_mac_version``
+        # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
+        # (BACKLOG #2720), so the append fails loudly here instead.
+        if not isinstance(mac, str) or transit_mac_version(mac) is None:
+            # A non-empty string is its own subclass, which the chain walk's handover-tag check
+            # reads as a mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
+            error = AuditMacMalformedError if isinstance(mac, str) and mac else CipherError
+            raise error(
+                f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
+                f"(key={self._audit_key!r})"
+            )
         return mac
 
-    def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
-        """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that
-        version rather than an outage (BACKLOG #2337).
+    def verify_audit_hmac(self, data: bytes, stored: str) -> bool:
+        """Whether ``stored`` is Transit's HMAC of ``data`` under the audit key: Transit's own
+        ``verify`` call, at the version ``stored`` names (BACKLOG #2720). It never regenerates and
+        compares. Transit verifies an HMAC at a version from the key's ``min_decryption_version``
+        up to its latest that the key still holds with an HMAC key, so a row made under a version
+        below ``min_encryption_version`` still verifies. A version trimmed below
+        ``min_available_version`` is never inside that span: Vault keeps ``min_available_version``
+        at or below ``min_decryption_version``, both in its ``trim`` call and in its key config
+        write, so a trimmed version is refused as below ``min_decryption_version``. Read on
+        2026-11-11 from Vault ``pathHMACVerify``, ``path_trim.go``, ``path_keys_config.go`` and
+        ``keysutil.Policy.HMACKey`` at cbc874e2358f; OpenBao was not read for it.
 
-        Transit answers a version above the latest, or below the policy minimum, with HTTP 400,
-        which hvac raises as ``InvalidRequest``. A dropped connection, a rate limit or a sealed node
-        raises another class, so none of those reads as a refused version. A 400 can also mean the
+        ``stored`` that :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept
+        is ``False`` with no ``verify`` call, so no malformed value reaches Transit to draw a 400.
+        It still costs one round trip, an :meth:`audit_hmac` of ``data`` whose answer is
+        discarded, so a malformed row is no cheaper to check than a clean one; a failure of that
+        call is logged, and the answer stays ``False``. ``False`` is also
+        Transit's ``valid: false``.
+
+        A 400 that hvac raises as ``InvalidRequest``, while a probe under the latest version
+        answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
+        names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
+        Transit refusing the version is one cause, not the only one. It raises the subclass
+        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
+        the 400 as Vault's own refusal, for example a proxy's page, or when reading it runs out of
+        memory or stack (BACKLOG #6707).
+
+        A 400 on which hvac raises an exception other than ``InvalidRequest`` raises neither of
+        those (BACKLOG #6707). For example, these
+        exact 400 bodies with the Content-Type exactly ``application/json``: ``[]``, ``null``,
+        ``{"errors":[{"message":"x"}]}``, ``{"errors":[1]}``, ``{"errors":5}`` and
+        ``{"errors":true}``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in
+        place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
+        ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
+
+        A failure of the verify call not read as a refused version, and not an outage
+        (:meth:`_is_outage`), is checked once the handler has let go
+        of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
+        (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
+        (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
+        the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
+        Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
+        such case. Both asks failing with an HTTP 408 or 504, when the fixed input verifies after
+        the second, raises :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` instead,
+        which only the chain walk reads as could not run (BACKLOG #8222). Every other
+        failure, a failed fixed-input verify among them, and a reply of an
+        unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
+        tamper alert fires. Blocking."""
+        version = transit_mac_version(stored)
+        if version is None:
+            # Still one round trip, as a clean row costs, so a malformed row is not cheaper to
+            # check (``verify_audit_chain``, ASVS 11.2.4). Its answer cannot match ``stored``, and
+            # its failure must not turn this row's break into a walk that could not run.
+            try:
+                self.audit_hmac(data)
+            except CipherError as exc:
+                log.warning(
+                    "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
+                )
+            return False
+        failed: Exception | None = None
+        try:
+            response: Any = self._transit_verify_call(self._audit_key, data, stored)
+        except Exception as exc:
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
+            # Checked below, once this handler has let go of the failed request, which for a
+            # planted oversize row holds the whole upload (BACKLOG #2720). The traceback goes
+            # with it; the error itself stays as the cause of whatever is raised.
+            failed = exc.with_traceback(None)
+        if failed is not None:
+            return self._recheck_refused_row(data, stored, version, failed)
+        return self._verify_answer(response)
+
+    def _settled_verify_failure(self, exc: Exception, version: int) -> CipherError | None:
+        """The error an audit-MAC verify failure at ``version`` raises at once, or ``None`` for one
+        :meth:`_recheck_refused_row` must check: a refused version (:meth:`_refuses_only_version`)
+        is :class:`AuditKeyVersionRefusedError` or :class:`AuditKeyVersionUnverifiedError`, and an
+        outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
+        handler. Blocking."""
+        if self._refuses_only_version(exc, version):
+            # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
+            # stack while it is read, such as a huge errors list, is not read as a refusal:
+            # escaping here, the error would make the walk "could not run" and drop the row's
+            # break and its alert.
+            unreadable: str | None = None
+            try:
+                unverified = _names_no_version_reason(exc)
+            except (MemoryError, RecursionError) as read_exc:
+                unverified, unreadable = True, type(read_exc).__name__
+            if unreadable is not None:
+                log.warning(
+                    "could not read the 400 for audit key version %d (%s); labelled "
+                    "unconfirmed (key=%r)",
+                    version,
+                    unreadable,
+                    self._audit_key,
+                )
+            if unverified:
+                return AuditKeyVersionUnverifiedError(version)
+            return AuditKeyVersionRefusedError(version)
+        if self._is_outage(exc):
+            return self._verify_failed(exc)
+        return None
+
+    def _verify_failed(self, exc: Exception) -> CipherError:
+        """The could-not-run error for an audit-MAC verify that failed with ``exc``; the caller
+        raises it ``from exc``, so a reader of the cause's class still tells an outage from a
+        refusal."""
+        return CipherError(
+            f"Transit audit HMAC verify failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+        )
+
+    def _recheck_refused_row(
+        self, data: bytes, stored: str, version: int, failed: Exception
+    ) -> bool:
+        """:meth:`verify_audit_hmac` for a row whose verify at ``version`` failed with ``failed``,
+        which :meth:`_settled_verify_failure` left to this (BACKLOG #2720). Raises
+        :class:`CipherError` from ``failed`` unless a verify over fixed input succeeds. Then asks
+        the row's own verify once more, so a failure that cleared is not read as the row's: an
+        answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
+        A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
+        succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
+        failed between the asks. When that fixed-input verify succeeds and both asks failed with an
+        HTTP 408 or 504 (:func:`is_vault_timeout_reply`), it raises
+        :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` in place of ``False``
+        (BACKLOG #8222: owner ruling 2026-11-13 on a row's timeout, read as both asks by a Manager
+        decision, and in the chain walk only). Blocking."""
+        if not self._fixed_input_verifies():
+            raise self._verify_failed(failed) from failed
+        again: Exception | None = None
+        try:
+            response: Any = self._transit_verify_call(self._audit_key, data, stored)
+        except Exception as exc:
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
+            again = exc.with_traceback(None)
+        if again is None:
+            return self._verify_answer(response)
+        if not self._fixed_input_verifies():
+            raise self._verify_failed(again) from again
+        if is_vault_timeout_reply(failed) and is_vault_timeout_reply(again):
+            raise AuditVerifyTimedOutError(
+                f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
+                f"{vault_failure_text(again)}"
+            ) from again
+        log.warning(
+            "Transit refused the audit MAC verify of one row twice while a verify over fixed "
+            "input succeeded before and after (key=%r): %s; read as a break at that row",
+            self._audit_key,
+            vault_failure_text(again),
+        )
+        return False
+
+    def _verify_answer(self, response: Any) -> bool:
+        """Transit's ``valid`` from a ``verify`` reply; :class:`CipherError` for a reply of an
+        unexpected shape, a ``valid`` that is not a bool among them."""
+        try:
+            valid = response["data"]["valid"]
+        except (KeyError, TypeError, IndexError):
+            valid = None
+        if not isinstance(valid, bool):
+            raise CipherError(
+                f"Transit returned an audit HMAC verify reply of an unexpected shape "
+                f"(key={self._audit_key!r})"
+            )
+        return valid
+
+    def _transit_verify_call(self, key_name: str, data: bytes, mac: str) -> object:
+        """Transit's ``verify`` of ``mac`` over ``data`` under ``key_name``: the raw reply. Any
+        failure of the call propagates as raised, for the caller to classify. Blocking."""
+        response: object = self._client.secrets.transit.verify_signed_data(
+            name=key_name,
+            hash_input=base64.b64encode(data).decode("ascii"),
+            hmac=mac,
+            hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        )
+        return response
+
+    def _transit_verify(self, key_name: str, data: bytes, mac: str) -> object:
+        """Transit's raw ``valid`` from :meth:`_transit_verify_call`. Any failure, a reply of an
+        unexpected shape included, propagates as raised. Blocking."""
+        response: Any = self._transit_verify_call(key_name, data, mac)
+        return response["data"]["valid"]
+
+    def _probe_mac(self) -> object:
+        """Transit's ``hmac`` over FIXED input under the audit key's latest version, raw. Fixed
+        input keeps a row's own content from deciding a probe. Any failure propagates. Blocking."""
+        probe: Any = self._client.secrets.transit.generate_hmac(
+            name=self._audit_key,
+            hash_input=_VERSION_PROBE_INPUT,
+            algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        )
+        return probe["data"]["hmac"]
+
+    def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
+        """Whether ``exc``, raised by an audit-MAC verify at ``key_version``, is Transit refusing
+        that version rather than an outage (BACKLOG #2337).
+
+        Transit's ``verify`` answers a version above the latest, or below the key's
+        ``min_decryption_version``, with HTTP 400, which hvac raises as ``InvalidRequest``. A
+        dropped connection, a rate limit or a sealed node raises another class, so none of those
+        reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        name a different version, or the refusal was not about the version.
+        answer with a string that does not start ``vault:v<key_version>:``; an empty string or one
+        naming no version passes too.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
         if not is_vault_bad_request(exc):
             return False
         try:
-            probe: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            answered = probe["data"]["hmac"]
+            answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
             log.warning(
                 "Transit refused audit key version %d, and the probe under the latest version failed "
@@ -278,26 +954,152 @@ class TransitCipher(_UnmarkedPolicy):
             return False
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
 
-    def audit_mac_fn(self) -> AuditMacFn:
-        """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`). The
-        store uses this INSTEAD of an in-heap ``hmac.new(key, …)`` when present, so the audit chain is
+    def _is_outage(self, exc: Exception) -> bool:
+        """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's
+        handler, so a classifier that raises is logged by type alone and read as an outage, the
+        reading that keeps a failure a walk that could not run."""
+        try:
+            return is_vault_unavailable(exc)
+        except Exception as fault:  # noqa: BLE001 -- see the docstring
+            log.warning(
+                "Transit failure classifier raised %s; read as an outage", type(fault).__name__
+            )
+            return True
+
+    def _fixed_input_verifies(self) -> bool:
+        """Whether Transit's ``verify`` works over FIXED input: :meth:`_probe_mac` under the latest
+        version, then a ``verify`` of that MAC answering ``valid: true`` (BACKLOG #2720). A token
+        refused the ``verify`` path, a missing key or a gateway that is down fails it, so such a
+        failure on a row stays a walk that could not run. Any failure is ``False``, logged.
+        Blocking."""
+        try:
+            mac = self._probe_mac()
+            if not isinstance(mac, str) or transit_mac_version(mac) is None:
+                log.warning(
+                    "an audit MAC verify failed, and the fixed-input probe answered no "
+                    "well-formed MAC (key=%r)",
+                    self._audit_key,
+                )
+                return False
+            valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
+        except Exception as probe_exc:  # the fixed input fails too: the service, not the row
+            log.warning(
+                "an audit MAC verify failed, and a verify over fixed input failed too (key=%r): %s",
+                self._audit_key,
+                vault_failure_text(probe_exc),
+            )
+            return False
+        if valid is not True:
+            log.warning(
+                "an audit MAC verify failed, and a verify over fixed input did not answer valid "
+                "(key=%r)",
+                self._audit_key,
+            )
+            return False
+        return True
+
+    # --- The row seal backend (ADR 0217; TransitSealBackend in store/row_seal.py) -----------------
+
+    @property
+    def seal_key_name(self) -> str:
+        """The Transit key row seals are made under: the audit key, which is the data key when no
+        audit key is set. Transit receives only a 32-byte digest per seal, so a seal stays apart from
+        the key's other MACs only while no other caller MACs a bare 32-byte value under it; the
+        seal's label sits inside the digest's preimage and plays no part in that (ADR 0217)."""
+        return self._audit_key
+
+    @property
+    def seal_mount(self) -> str:
+        """The Transit mount every call here reaches (hvac's default)."""
+        return TRANSIT_MOUNT
+
+    def _seal_generate(self, hash_input: str, what: str) -> object:
+        """One Transit ``hmac`` under the active audit key's latest version, for a row seal or its
+        probe. Returns Transit's raw value; the sealer checks its shape. Any failure raises
+        :class:`CipherError` naming the key and Vault's failure text, never the input."""
+        try:
+            response: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            )
+            return response["data"]["hmac"]
+        except Exception as exc:
+            raise CipherError(
+                f"Transit row seal {what} failed (key={self._audit_key!r}): "
+                f"{vault_failure_text(exc)}"
+            ) from exc
+
+    def seal_hmac(self, digest: bytes) -> object:
+        """Transit's ``hmac`` of a row seal input's 32-byte ``digest`` under the latest version.
+        Blocking."""
+        return self._seal_generate(base64.b64encode(digest).decode("ascii"), "HMAC")
+
+    def seal_probe(self) -> object:
+        """Transit's ``hmac`` over fixed input under the active audit key's latest version: the
+        probe that tells an unverifiable seal from an outage. Fixed input, so no row decides it.
+        Blocking."""
+        return self._seal_generate(_VERSION_PROBE_INPUT, "probe")
+
+    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> object:
+        """Transit's ``verify`` of ``mac`` over ``digest`` under ``key_name``, at the version ``mac``
+        names; it never regenerates and compares, since a MAC under a newer version differs from
+        every stored one. Returns Transit's raw ``valid`` (``False`` is ``valid: false``); the sealer
+        checks its shape. An HTTP 400 or 403 raises
+        :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
+        handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
+        Blocking."""
+        refused = 0
+        try:
+            return self._transit_verify(key_name, digest, mac)
+        except Exception as exc:
+            refused = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
+            if not refused:
+                raise CipherError(
+                    f"Transit row seal verify failed (key={key_name!r}): {vault_failure_text(exc)}"
+                ) from exc
+        raise TransitSealRefused(refused)
+
+    def audit_mac_fn(self) -> AuditMacVerifier:
+        """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`),
+        and check each stored one with Transit's ``verify`` (:meth:`verify_audit_hmac`). The store
+        uses this INSTEAD of an in-heap ``hmac.new(key, …)`` when present, so the audit chain is
         keyed even though :meth:`audit_mac_key` is ``None`` (the key stays inside the isolated module)."""
-        return self.audit_hmac
+        return _TransitAuditMac(self)
+
+
+class _TransitAuditMac:
+    """:meth:`TransitCipher.audit_mac_fn`'s provider: an
+    :class:`~messagefoundry.store.crypto.AuditMacVerifier` over one cipher (BACKLOG #2720)."""
+
+    __slots__ = ("_cipher",)
+
+    def __init__(self, cipher: TransitCipher) -> None:
+        self._cipher = cipher
+
+    def __call__(self, data: bytes, /) -> str:
+        return self._cipher.audit_hmac(data)
+
+    def verify(self, data: bytes, stored: str, /) -> bool:
+        return self._cipher.verify_audit_hmac(data, stored)
 
 
 def _key_names() -> tuple[str, str]:
     """The Transit data key and audit key from the environment, read in one place for the cipher
     and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
-    data-key name is not set."""
+    data-key name is not set, and when either name is not a Transit key name (BACKLOG #6010): both
+    go into Transit request paths, so each is checked here, before any client is built."""
     key_name = os.environ.get(_ENV_TRANSIT_KEY)
     if not key_name:
         raise KeyProviderError(
             f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is not set — "
             f"supply the Transit data-key name via the environment."
         )
+    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
     # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    return key_name, os.environ.get(_ENV_AUDIT_KEY) or key_name
+    audit_key = os.environ.get(_ENV_AUDIT_KEY)
+    return key_name, (
+        checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY) if audit_key else key_name
+    )
 
 
 def build_transit_cipher(
@@ -386,7 +1188,9 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     metadata (``transit/keys/<key>``, read); :meth:`TransitCipher.encrypt` and
     :meth:`TransitCipher.decrypt` update ``transit/encrypt/<data key>`` and
     ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
-    ``transit/hmac/<audit key>``, which is the data key when no audit key is set. Raises
+    ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the audit
+    walk's check (:meth:`TransitCipher.verify_audit_hmac`, BACKLOG #2720) and the row seal check
+    (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) update ``transit/verify/<audit key>``. Raises
     :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
@@ -396,4 +1200,5 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
         f"{TRANSIT_MOUNT}/decrypt/{key_name}": update,
         f"{TRANSIT_MOUNT}/keys/{audit_key}": read,
         f"{TRANSIT_MOUNT}/hmac/{audit_key}": update,
+        f"{TRANSIT_MOUNT}/verify/{audit_key}": update,
     }

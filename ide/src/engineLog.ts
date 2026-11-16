@@ -14,19 +14,86 @@
 // inside the shared engineClient: there, it would silently capture whatever every future caller sends.
 import * as vscode from "vscode";
 
+import { writeStamped } from "./checksLog";
 import { PROBE_ENDPOINTS, type EngineLink, type ProbeOutcome } from "./engineStatusModel";
 
-let channel: vscode.LogOutputChannel | undefined;
+/** What a caller may do with the Engine channel: write one message at a level, or reveal it.
+ *
+ *  The method names are the ones the editor's LogOutputChannel had, so the call sites did not
+ *  change when the channel stopped being one (vault BACKLOG #2349). */
+export interface EngineLog {
+  info(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+  show(preserveFocus?: boolean): void;
+}
 
-/** The singleton channel. Created lazily so merely importing this module costs nothing. */
-export function engineLog(): vscode.LogOutputChannel {
-  if (!channel) {
-    // A LogOutputChannel: the EDITOR stamps each line, in a format the extension cannot set. Do not
-    // add a stamp of our own here, or every line carries two. The plain Checks channel is the one
-    // this extension stamps itself (checksLog.ts).
-    channel = vscode.window.createOutputChannel("MessageFoundry Engine", { log: true });
+// The channel is created lazily, on the first write or reveal, so merely importing this module
+// costs nothing.
+//
+// It is a PLAIN output channel, stamped by this extension, not a LogOutputChannel. That one is
+// stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every record
+// goes through `writeStamped`, so it starts with an ISO 8601 UTC instant and then its level word,
+// `INFO`, `WARNING` or `ERROR`, the engine log's own words. The editor's per-level filter on this
+// channel is gone with it. The "log" language id keeps the Output view's highlighting of both.
+let channel: vscode.OutputChannel | undefined;
+const out = (): vscode.OutputChannel =>
+  (channel ??= vscode.window.createOutputChannel("MessageFoundry Engine", "log"));
+
+/** One record is one line. A message can carry text this extension did not write, such as an
+ *  error's message, so a line break in it is written as an escape. Left raw, it would start a line
+ *  that carries a real stamp and level word, and reads as a record of its own (CWE-117).
+ *
+ *  Tab is kept. CR and LF are written as `\r` and `\n`. Every other C0 and C1 control, DEL, U+2028,
+ *  U+2029 and the Unicode bidi controls (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069)
+ *  are written as `\uXXXX`: a reader of the editor's copy may split lines on VT, FF or FS to RS
+ *  (Python's `splitlines` does), and a bidi control can reorder the rest of the line as shown. A
+ *  backslash is not escaped, so a literal `\n` in a message, such as in a Windows path, reads the
+ *  same as an escaped line break. The regex and the map are both built from ESCAPED_RANGES, so every
+ *  character the regex matches has an entry. */
+const ESCAPED_RANGES: readonly (readonly [number, number])[] = [
+  [0x00, 0x08],
+  [0x0a, 0x1f],
+  [0x7f, 0x9f],
+  [0x061c, 0x061c],
+  [0x200e, 0x200f],
+  [0x2028, 0x202e],
+  [0x2066, 0x2069],
+];
+const hex4 = (code: number): string => code.toString(16).padStart(4, "0");
+const ESCAPED = new RegExp(
+  `[${ESCAPED_RANGES.map(([first, last]) => `\\u${hex4(first)}-\\u${hex4(last)}`).join("")}]`,
+  "g",
+);
+const ESCAPES = new Map<string, string>([
+  ["\r", "\\r"],
+  ["\n", "\\n"],
+]);
+for (const [first, last] of ESCAPED_RANGES) {
+  for (let code = first; code <= last; code++) {
+    const c = String.fromCharCode(code);
+    if (!ESCAPES.has(c)) {
+      ESCAPES.set(c, `\\u${hex4(code)}`);
+    }
   }
-  return channel;
+}
+function oneLine(message: string): string {
+  return message.replace(ESCAPED, (c) => ESCAPES.get(c) as string);
+}
+
+const write = (level: string, message: string): void =>
+  writeStamped(out(), `${level} ${oneLine(message)}`);
+
+const log: EngineLog = {
+  info: (message) => write("INFO", message),
+  warn: (message) => write("WARNING", message),
+  error: (message) => write("ERROR", message),
+  show: (preserveFocus) => out().show(preserveFocus),
+};
+
+/** The Engine channel's writer. */
+export function engineLog(): EngineLog {
+  return log;
 }
 
 export function disposeEngineLog(): void {
@@ -50,7 +117,6 @@ export function logProbe(
   elapsedMs: number,
   verdict: string,
 ): void {
-  const log = engineLog();
   if (!(PROBE_ENDPOINTS as readonly string[]).includes(route)) {
     // Loud, because this means someone widened the probe surface past the boundary the ADR froze.
     log.error(`probe route ${route} is not in the allowed probe set — refusing to log it`);

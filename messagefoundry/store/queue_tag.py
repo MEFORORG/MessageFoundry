@@ -35,7 +35,12 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from messagefoundry.store.crypto import NO_STORE_ID, CipherError, cell_aad
+from messagefoundry.store.crypto import (
+    NO_STORE_ID,
+    CipherError,
+    UnauthenticatedCipherError,
+    cell_aad,
+)
 from messagefoundry.store.row_seal import seal_bytes
 
 if TYPE_CHECKING:
@@ -55,6 +60,7 @@ __all__ = [
     "queue_payload_aad",
     "queue_row_aad",
     "report_queue_tag_failure",
+    "reseal_unless_tag_failure",
 ]
 
 _log = logging.getLogger(__name__)
@@ -167,6 +173,25 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
         return False
     holds = getattr(cipher, "holds_key_for", None)
     return bool(holds(stored)) if callable(holds) else True
+
+
+def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | None:
+    """Re-seal ``stored`` under the active key with the same ``aad``, or ``None`` for a tag failure.
+
+    The one seam the rotation's tagged-cell loops step over a cell with (BACKLOG #2593, #5610). Only
+    the DECRYPT may be skipped, and only for :class:`UnauthenticatedCipherError` on a cell
+    :func:`is_tag_failure` names: a marked value whose AEAD tag fails under a key this process holds.
+    Every other failure raises and stops the rotation, at least: a malformed envelope (bad base64,
+    too short), a verified plaintext that is not UTF-8, and anything the ENCRYPT raises, the active
+    key's invocation ceiling above all. Counting those as tag failures would leave rows under a
+    retired key while the rotation reports success."""
+    try:
+        plaintext = cipher.decrypt(stored, aad=aad)
+    except UnauthenticatedCipherError:
+        if not is_tag_failure(cipher, stored):
+            raise
+        return None
+    return cipher.encrypt(plaintext, aad=aad)
 
 
 def open_queue_cell(cipher: Cipher, row: Any) -> str:

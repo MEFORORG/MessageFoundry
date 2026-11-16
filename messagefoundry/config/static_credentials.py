@@ -73,8 +73,9 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
-arguments and touches nothing else.
+Pure apart from :func:`apply_static_credential_gate`, which also logs, and ``_digest``, which logs
+at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529): every function reads its arguments
+and touches nothing else.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -167,14 +168,28 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
     return oauth2_auth_configured(settings)
 
 
+def _digest(settings: Mapping[str, Any]) -> bool:
+    from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
+
+    try:
+        return http_digest_selected(settings)
+    except HttpAuthError as exc:
+        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses. The
+        # message names the connection and never the value; the connector's build reports it loudly.
+        logging.getLogger(__name__).debug("static-credential census: %s", exc)
+        return False
+
+
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
-    Basic credential configured beside it never leaves the engine. Basic needs both halves (the
-    connector sends nothing on one). A WS-Security UsernameToken rides in the SOAP body, so token auth
-    does not displace it, but it is stamped only with ``ws_security`` on; its user and password fall
-    back to the Basic pair. ``Soap()`` hoists ``body_secrets`` into ``body_secret_tokens``."""
+    Basic credential configured beside it never leaves the engine. Basic needs both halves: SOAP
+    refuses to build on one, and REST, FHIR and DICOMweb send nothing on one. A WS-Security
+    UsernameToken rides in the SOAP body, so token auth does not displace it, but it is stamped only
+    with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
+    stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
+    ``body_secret_tokens``."""
     out: list[str] = []
     if not token:
         if settings.get("bearer_token"):
@@ -183,13 +198,16 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
             out.append("HTTP Basic")
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
-    if str(settings.get("http_auth") or "").lower() == "digest":
+    if _digest(settings):
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
-        ws_user = settings.get("ws_username") or settings.get("basic_user")
-        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``); a
-        # password with no user puts nothing on the wire.
-        if settings.get("ws_security") and ws_user:
+        # With ws_security on the connector refuses to build on one half of the pair (#5526), so
+        # only a whole pair is a hop that runs; a refused build is not listed (as for proxy_url).
+        if (
+            settings.get("ws_security")
+            and settings.get("ws_username")
+            and settings.get("ws_password")
+        ):
             out.append("WS-Security UsernameToken")
         if settings.get("body_secret_tokens"):
             out.append("body secrets")

@@ -910,3 +910,298 @@ async def test_completion_fault_repends_every_member_pooled(
     assert depth == 3
     assert await store.count_dead(allowed_channels=None) == 0
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
+
+
+# --- BACKLOG #5706: the coalescing window honours a pause and the #122 halt, and parses off the loop -
+
+
+async def _attempts(store: Any, mids: Sequence[str]) -> list[int]:
+    return [int(r["attempts"]) for mid in mids for r in await store.outbox_for(mid)]
+
+
+async def test_a_paused_lane_claims_no_window_and_sends_nothing(store: Any) -> None:
+    """A head handed to the batch body of a lane already paused coalesces nothing and sends
+    nothing. Before the fix the window asked only the stop event, so it claimed the lane's tail and
+    sent the envelope past the pause."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    head = await store.claim_next_fifo(DEST)
+    runner._outbound_paused.add(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []  # no egress past the pause
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3  # the head released, the tail never claimed
+    assert await _attempts(store, mids) == [0, 0, 0]  # no attempt spent on any of them
+
+
+async def test_a_pause_mid_window_stops_claiming_and_hands_every_member_back(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause lands after the window has claimed one extra row. The window claims no further row
+    and the body hands the head and that extra back unsent. The control is the claim count: the
+    window really was coalescing when the pause landed."""
+    mids = await _enqueue(store, 4)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+    window_claims = 0
+
+    async def _claim_then_pause(name: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal window_claims
+        window_claims += 1
+        got = await real_claim(name, *args, **kwargs)
+        runner._outbound_paused.add(DEST)  # the operator pause lands inside the window
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_pause)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert window_claims == 1  # the window claimed one extra, then stopped claiming
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 4
+    assert await _attempts(store, mids) == [0, 0, 0, 0]
+
+
+async def test_a_halt_mid_window_reschedules_every_member_unsent(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #122 log-write halt lands inside the window. Nothing is sent unlogged, and the claimed
+    members are rescheduled into the future rather than released past due, as the pooled claim gate
+    does under the halt."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+
+    async def _claim_then_halt(name: str, *args: Any, **kwargs: Any) -> Any:
+        got = await real_claim(name, *args, **kwargs)
+        runner._log_write_stopped = True  # what both halt sites set
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_halt)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []  # no unlogged egress
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]
+    assert await real_claim(DEST) is None  # rescheduled: the head is not due yet
+
+
+async def test_the_batch_head_is_parsed_off_the_event_loop(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head member's parse for the BHS control id runs in a worker thread, not on the event
+    loop, so a large member cannot stall every other lane while it parses."""
+    import threading
+
+    await _enqueue(store, 2)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    loop_thread = threading.get_ident()
+    parse_threads: list[int] = []
+    real_parse = wiring_runner.Message.parse
+
+    def _recording_parse(raw: str | bytes) -> Any:
+        parse_threads.append(threading.get_ident())
+        return real_parse(raw)
+
+    monkeypatch.setattr(wiring_runner.Message, "parse", _recording_parse)
+    head = await store.claim_next_fifo(DEST)
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert len(rec.sent) == 1  # the control: the batch did go out, so the head was parsed
+    assert parse_threads and loop_thread not in parse_threads
+
+
+async def test_a_pause_that_lands_while_the_envelope_is_framed_sends_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause lands after the window has closed, while the envelope is being framed, which is an
+    await in a thread. The gate right before the send stops it, and every member goes back unsent."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+    framed: list[int] = []
+
+    def _encode_then_pause(*args: Any, **kwargs: Any) -> str:
+        framed.append(1)
+        runner._outbound_paused.add(DEST)  # the operator pause lands mid-framing
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_pause)
+    head = await store.claim_next_fifo(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert framed == [1]  # the control: the window closed and framing really ran
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_pause_that_lands_before_every_member_is_refused_writes_no_refusal(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every member holds a frame byte, so none survives to an envelope, and the pause lands while
+    they hydrate. The members go back for a re-run to refuse rather than being dead-lettered under
+    the pause, as they would be had one member survived. The control is the frame-byte test above:
+    unpaused, the same bodies are dead-lettered."""
+    bodies = [_msg(n).replace("DOE", "DOE" + chr(0x0B)) for n in (1, 2)]
+    mids = await _enqueue_bodies(store, bodies)
+    runner = _runner(store)
+    rec = MllpRecorder(DEST)
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_hydrate = runner._hydrate_payload
+
+    async def _hydrate_then_pause(payload: str, message_id: str) -> str:
+        runner._outbound_paused.add(DEST)  # the operator pause lands while the members hydrate
+        return await real_hydrate(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate_then_pause)
+    await run_one_batch(runner, DEST)
+    assert rec.sent == []
+    assert await _states(store, mids) == [QUEUED, QUEUED]  # handed back, not dead-lettered
+
+
+# --- the pre-send gate on a demoted node: release and STOP, never send or dead-letter -------------
+
+
+def _demote(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+
+
+async def test_a_demotion_and_a_pause_while_the_envelope_is_framed_send_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leadership is lost and a pause lands while the envelope is framed, after the leadership
+    check. The gate right before the send refuses on the pause whoever leads: the demoted node
+    releases every member and STOPs the lane for the new leader, as its leadership check does.
+    Before the repair that gate also asked for leadership, so a demoted node sent the envelope
+    past the pause."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+    framed: list[int] = []
+
+    def _encode_then_demote_and_pause(*args: Any, **kwargs: Any) -> str:
+        framed.append(1)
+        runner._outbound_paused.add(DEST)
+        _demote(runner, monkeypatch)
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_demote_and_pause)
+    head = await store.claim_next_fifo(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert framed == [1]  # the control: the leadership check passed and framing really ran
+    assert rec.sent == []  # no egress from a demoted node past the pause
+    assert outcome is wiring_runner._ItemOutcome.STOPPED and park_until is None
+    assert await _states(store, mids) == [QUEUED] * 3  # released for the new leader
+    assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_demotion_alone_while_the_envelope_is_framed_sends_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leadership is lost while the envelope is framed, with no pause and no halt. The gate right
+    before the send asks for leadership too, so a stale ex-leader sends nothing and releases every
+    member for the new leader."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+
+    def _encode_then_demote(*args: Any, **kwargs: Any) -> str:
+        _demote(runner, monkeypatch)
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_demote)
+    head = await store.claim_next_fifo(DEST)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_demoted_node_with_no_connector_spends_no_attempt_on_a_batch(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A demoted node whose lane has no connector, with no pause and no halt. The leadership check
+    comes before the missing-connector arm, so the members are released and the lane STOPs rather
+    than every member being charged a failed attempt."""
+    mids = await _enqueue(store, 2)
+    runner = _runner(store)
+    _wire_batch(runner, _Recorder(), BatchConfig(max_count=5, max_wait_ms=1))
+    del runner._destinations[DEST]
+    _demote(runner, monkeypatch)
+    head = await store.claim_next_fifo(DEST)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _attempts(store, mids) == [0, 0]
+
+
+async def test_a_demotion_and_a_pause_before_every_member_is_refused_writes_no_refusal(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every member holds a frame byte, and leadership is lost with a pause while they hydrate.
+    No refusal is written under the pause: the members are released for the new leader and the
+    lane STOPs. Before the repair a demoted node dead-lettered them."""
+    bodies = [_msg(n).replace("DOE", "DOE" + chr(0x0B)) for n in (1, 2)]
+    mids = await _enqueue_bodies(store, bodies)
+    runner = _runner(store)
+    rec = MllpRecorder(DEST)
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_hydrate = runner._hydrate_payload
+
+    async def _hydrate_then_demote_and_pause(payload: str, message_id: str) -> str:
+        runner._outbound_paused.add(DEST)
+        _demote(runner, monkeypatch)
+        return await real_hydrate(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate_then_demote_and_pause)
+    head = await store.claim_next_fifo(DEST)
+    try:
+        outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    finally:
+        await rec.aclose()
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED, QUEUED]  # released, not dead-lettered
+    assert await _attempts(store, mids) == [0, 0]
+
+
+async def test_a_halt_mid_window_on_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt and a demotion land inside the window of a lane with no connector. The gate after
+    the window releases every member and STOPs the lane. Before the repair it let a demoted node
+    through to the missing-connector arm, which charged each member a failed attempt."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    del runner._destinations[DEST]
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+
+    async def _claim_then_halt_and_demote(name: str, *args: Any, **kwargs: Any) -> Any:
+        got = await real_claim(name, *args, **kwargs)
+        runner._log_write_stopped = True
+        _demote(runner, monkeypatch)
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_halt_and_demote)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]

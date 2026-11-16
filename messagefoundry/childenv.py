@@ -23,14 +23,11 @@ process start whose environment does not come from one of them.
   operator listed in ``[dr].pass_environment``. A variable nobody listed does not cross, so no
   secret is in the hook's own environment by default, whatever name it is kept under. Settings
   load refuses the engine's own names in that setting.
-* :func:`non_engine_environment` is **everything except the engine's own namespace**: the whole
-  ``MEFOR_*`` prefix, and the few names outside it in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
-  It is a deny-list, so **a secret kept under any other name still crosses**: a
-  ``[secrets].provider = "env"`` reference may name any variable, and a library may read one this
-  module does not know. Only for a fixed tool the engine's own code names, run on a build or CI
-  runner rather than by the service, that reads settings the engine cannot list in advance: the
-  dependency auditor's ``pip`` and ``pip-audit``, which read their index, proxy and certificate
-  settings from the environment. ``tests/test_child_process_environment.py`` fails another caller.
+* :func:`auditor_environment` is an **allowlist** too, for the dependency auditor's ``pip`` and
+  ``pip-audit``, run on a build or CI runner rather than by the service: what a Python child needs
+  to start, as for the worker, plus what those two read to reach an index (:data:`_AUDITOR_NAMES`,
+  and pip's own ``PIP_*`` namespace). A variable nobody listed does not cross, so a CI token or a
+  secret kept under any other name stays out of their environment.
 * :func:`engine_environment` is the **whole** environment, for a Python child started through the
   bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
   builds connections and so needs the secrets, and other such children, the tray's relaunch among
@@ -56,11 +53,12 @@ __all__ = [
     "CHILD_INTERPRETER_FLAGS",
     "ENGINE_ENV_PREFIX",
     "ENGINE_SECRETS_OUTSIDE_THE_PREFIX",
+    "auditor_environment",
     "engine_environment",
     "hook_environment",
     "inherited_interpreter_flags",
-    "non_engine_environment",
     "outside_engine_namespace",
+    "pass_environment_refusal",
     "python_child_argv",
     "python_module_argv",
     "system_tool_environment",
@@ -76,8 +74,9 @@ ENGINE_ENV_PREFIX: Final = "MEFOR_"
 #: :data:`_BOOTSTRAP`, and a script start puts the script's own directory first on the import path
 #: and never the working directory. ``-P`` drops that directory, which is this package's own, so
 #: a module in it cannot stand in for a top-level module the child imports. For ``-m`` and ``-c``
-#: starts, ``-P`` drops the working directory instead. The engine starts no child that way; the
-#: tray's short login command, from :func:`python_module_argv`, is a ``-m`` start.
+#: starts, ``-P`` drops the working directory instead. :func:`python_module_argv` builds the ``-m``
+#: starts: at least the tray's short login command, and the ``pip`` and ``pip_audit`` children of
+#: ``messagefoundry.security.audit_all_platforms``, which run in a checked-out tree.
 #: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
 #: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
 #: why ``tests/test_child_process_environment.py`` reads the result off a real child.
@@ -92,9 +91,10 @@ _BOOTSTRAP: Final = str(Path(__file__).resolve().parent / "_child_bootstrap.py")
 #: starts, where it imports from, or how the same code behaves (encoding, hash seed, warnings), so
 #: a child started without one the parent has would run the same Handler differently from
 #: ``[sandbox].mode = "off"``. Named one by one, not by the ``PYTHON`` prefix: an operator's own
-#: variable can start with those letters. The ones that hand control to a console or a debugger
-#: (``PYTHONSTARTUP``, ``PYTHONINSPECT``, ``PYTHONBREAKPOINT``) are left out on purpose. A variable
-#: a later interpreter adds is not here until somebody adds it.
+#: variable can start with those letters. ``PYTHONSTARTUP``, ``PYTHONINSPECT`` and
+#: ``PYTHONBREAKPOINT`` are left out on purpose; :data:`_INTERPRETER_CONTROL_NAMES` says which of
+#: them may still be named, and why. A variable a later interpreter adds is not here until somebody
+#: adds it.
 _INTERPRETER_NAMES: Final = frozenset(
     {
         "PYTHONHOME",
@@ -205,6 +205,34 @@ _WINDOWS_SHELL_NAMES: Final = frozenset(
     }
 )
 
+#: What ``pip`` and ``pip-audit`` read to reach an index, beyond a Python child's start-up names,
+#: for :func:`auditor_environment`: the proxy variables, in both cases since ``urllib`` reads both
+#: on POSIX; the certificate bundle and folder ``requests`` and OpenSSL read; ``NETRC``, where
+#: ``requests`` finds index credentials; and the XDG folders that hold pip's and pip-audit's
+#: configuration and caches on Linux. pip's own settings are :data:`_PIP_PREFIX` names. A variable
+#: a later pip reads is not here until somebody adds it, and the auditor's run then fails, or
+#: reaches the index without it.
+_PROXY_NAMES: Final = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+_AUDITOR_NAMES: Final = frozenset(
+    {
+        *_PROXY_NAMES,
+        *(name.lower() for name in _PROXY_NAMES),
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NETRC",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
+        "XDG_CACHE_HOME",
+    }
+)
+
+#: pip reads each of its options from an upper-case variable with this prefix (``PIP_INDEX_URL``,
+#: ``PIP_CERT``, ``PIP_CONFIG_FILE``), so the auditor lets the namespace in rather than a list of
+#: today's options. It is pip's: no engine setting or secret is named with it.
+_PIP_PREFIX: Final = "PIP_"
+
 #: Secrets outside the ``MEFOR_*`` prefix that are kept from every child process and refused in
 #: ``pass_environment``. At least these two. asyncpg falls back to ``PGPASSWORD`` when
 #: ``[store].password`` is unset. ``VAULT_TOKEN`` is no longer read by the engine, whose Vault
@@ -238,6 +266,32 @@ def outside_engine_namespace(name: str) -> bool:
     return (
         not upper.startswith(ENGINE_ENV_PREFIX) and upper not in ENGINE_SECRETS_OUTSIDE_THE_PREFIX
     )
+
+
+#: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out that
+#: :func:`pass_environment_refusal` refuses: a child started with ``PYTHONINSPECT`` set waits at a
+#: prompt instead of exiting. The other two may be named. ``PYTHONSTARTUP`` does not make an
+#: interpreter interactive; it runs a file the operator names when one already is.
+#: ``PYTHONBREAKPOINT=0`` turns
+#: ``breakpoint()`` into a no-op, and unset it calls ``pdb.set_trace`` anyway, so refusing it would
+#: only block the protective value.
+_INTERPRETER_CONTROL_NAMES: Final = frozenset({"PYTHONINSPECT"})
+
+
+def pass_environment_refusal(name: str) -> str | None:
+    """Why ``name`` may not be named as an extra variable for a child, or ``None``: the rule for the
+    dependency auditor's ``--pass-environment`` and for the ``[sandbox]`` and ``[dr]``
+    ``pass_environment`` settings. Refused: an entry that is not a variable name, a name of the
+    engine's namespace (:func:`outside_engine_namespace`), and a name in
+    :data:`_INTERPRETER_CONTROL_NAMES`. The text never echoes an entry that is not a name, since
+    ``NAME=value`` typed by mistake would carry the value (vault BACKLOG #2600)."""
+    if not (name.isascii() and name.isidentifier()):
+        return "an entry is not an environment variable name; list names only, never NAME=value"
+    if not outside_engine_namespace(name):
+        return f"{name} is one of the engine's own variables"
+    if name.upper() in _INTERPRETER_CONTROL_NAMES:
+        return f"{name} hands the interpreter to a console"
+    return None
 
 
 def inherited_interpreter_flags() -> tuple[str, ...]:
@@ -367,10 +421,11 @@ def worker_environment(
     interpreter's own variables, and ``extra_names``. Code in the child that reads any other
     variable finds it unset, which is a difference from running in the engine process.
 
-    ``extra_names`` is what the caller adds: an engine switch the child's own code reads to make a
-    decision its parent already made, and the names an operator listed in
-    ``[sandbox].pass_environment``. Never a secret: whatever is named here is in the environment of
-    the code this builder exists to keep secrets from. Settings load refuses the engine's own.
+    ``extra_names`` is what the caller adds: for the sandbox worker, the names an operator listed in
+    ``[sandbox].pass_environment``. Never a secret there: whatever is named here is in the
+    environment of the code this builder exists to keep secrets from. Settings load refuses
+    what :func:`pass_environment_refusal` refuses, the engine's own names among them, and so does
+    this builder, raising :class:`ValueError` as :func:`hook_environment` does.
 
     ``defaults`` are values for names the result does not already hold, so a value the operator
     passed through ``extra_names`` wins. They are set here, not on the returned dict, because
@@ -378,7 +433,7 @@ def worker_environment(
     writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
     ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
-    extras = _extra_keys(extra_names)
+    extras = _passable_keys(extra_names)
     env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
@@ -390,6 +445,19 @@ def worker_environment(
         if key not in present:
             env[name] = value
     return env
+
+
+def _passable_keys(extra_names: Collection[str]) -> frozenset[str]:
+    """:func:`_extra_keys`, refusing with :class:`ValueError` a name
+    :func:`pass_environment_refusal` refuses, so a builder called with a policy no settings load
+    checked applies the same rule. It checks the keys it returns, so a one-shot iterable cannot
+    slip a name past it."""
+    extras = _extra_keys(extra_names)
+    for key in extras:
+        refusal = pass_environment_refusal(key)
+        if refusal:
+            raise ValueError(f"extra_names: {refusal}")
+    return extras
 
 
 def _ordinary_key(name: str, argument: str) -> str:
@@ -441,24 +509,44 @@ def hook_environment(
 
     No interpreter variable crosses unless listed: the hook is a shell command, not this
     interpreter's child. ``LD_LIBRARY_PATH`` does, with the other POSIX start-up names, so a hook
-    that starts an interpreter needing it still starts. An extra in the engine's own namespace
-    raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
-    the first."""
-    extras = _extra_keys(extra_names)
-    for key in extras:
-        if not outside_engine_namespace(key):
-            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
-    names = _platform_names() | extras
+    that starts an interpreter needing it still starts. An extra
+    :func:`pass_environment_refusal` refuses, one in the engine's own namespace among them, raises
+    :class:`ValueError`. Settings load refuses one first, so this is the last check, not the
+    first."""
+    names = _platform_names() | _passable_keys(extra_names)
     if sys.platform == "win32":
         names |= _WINDOWS_SHELL_NAMES
     return {n: v for n, v in _source(environ).items() if _key(n) in names}
 
 
-def non_engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Everything in ``environ`` (default :data:`os.environ`) outside the engine's own ``MEFOR_*``
-    namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`: the deny-list the module docstring
-    says is only for the dependency auditor. ``PYTHONPATH`` crosses as ``environ`` has it."""
-    return {n: v for n, v in _source(environ).items() if outside_engine_namespace(n)}
+def auditor_environment(
+    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
+) -> dict[str, str]:
+    """The environment for the dependency auditor's ``pip`` and ``pip-audit``: an allowlist over
+    ``environ`` (default :data:`os.environ`).
+
+    It holds what :func:`worker_environment` gives a Python child with no extra names, which is the
+    platform's start-up names and the interpreter's own variables with any empty or relative
+    ``PYTHONPATH`` entry dropped. On top of that come :data:`_AUDITOR_NAMES` and every
+    :data:`_PIP_PREFIX` name, so an index, a proxy or a certificate the runner configures still
+    reaches them. Nothing else crosses: no ``MEFOR_*`` variable, no name in
+    :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`, and no CI token. A variable a pip setup needs beyond
+    these, such as a keyring backend's, crosses only when the caller names it in ``extra_names``,
+    which is the auditor's ``--pass-environment``. An extra :func:`pass_environment_refusal`
+    refuses raises :class:`ValueError`.
+
+    Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
+    "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
+    names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
+    extras = _passable_keys(extra_names)
+    source = _source(environ)
+    # A PIP_ name the builder would refuse, one that is not a variable name, is no pip option.
+    pip_names = {
+        name
+        for name in source
+        if _key(name).startswith(_PIP_PREFIX) and pass_environment_refusal(name) is None
+    }
+    return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names | extras)
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:

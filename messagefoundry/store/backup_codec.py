@@ -202,8 +202,9 @@ def encrypt_stream(
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
-    caller). Streaming: at most ``chunk_size`` plaintext bytes are in memory at once — never the whole
-    archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
+    caller). Streaming: two chunks of plaintext are held between reads (the one-ahead read below),
+    plus a transient copy while a short-reading source fills one — never the whole archive.
+    Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
     drawing its own 96-bit nonce under the SAME key the store cipher seals with (the store's data
@@ -221,7 +222,11 @@ def encrypt_stream(
     _validate_key(key)
     if salt is not None and len(salt) != STORE_SALT_BYTES:
         raise BackupCodecError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
-    size = chunk_size or DEFAULT_CHUNK_SIZE
+    # `is None`, not truthiness: 0 must reach the guard below rather than silently become 1 MiB.
+    size = DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
+    # A bool is an int to Python but never a chunk size, so True does not pass as 1.
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise BackupCodecError(f"chunk_size must be an int (got {type(size).__name__})")
     # The upper half is not defensive, it is a closure check: read_header refuses a chunk_size over
     # MAX_CHUNK_SIZE, so a writer allowed to exceed it would produce an archive THIS BUILD'S OWN
     # READER rejects -- an unreadable backup discovered at restore time, which is the worst moment.
@@ -250,10 +255,11 @@ def encrypt_stream(
     # Counted separately from frame_index and incremented only AFTER a successful aes.encrypt, so the
     # figure is the invocations actually performed rather than the frames intended.
     performed = 0
-    current = src.read(size)
+    current = _read_up_to(src, size)
     try:
         while True:
-            nxt = src.read(size)
+            # A short chunk means _read_up_to already saw EOF; do not read the source past it again.
+            nxt = _read_up_to(src, size) if len(current) == size else b""
             final = not nxt  # this is the last frame iff there is no more plaintext after it
             nonce = os.urandom(_NONCE_BYTES)
             ct = aes.encrypt(nonce, current, _aad(header_digest, frame_index, final=final))
@@ -309,9 +315,45 @@ def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
         raise ValueError(str(exc)) from exc
 
 
+def _read_once(src: BinaryIO, n: int) -> bytes:
+    """One ``src.read(n)``, refused where it breaks the stream contract the codec relies on.
+
+    ``None`` is a non-blocking source with no data ready: refused rather than read as EOF, which on
+    the write side would seal a silently truncated backup as a complete one. More than ``n`` bytes
+    would let a frame outgrow the ``chunk_size`` its header declares, and so would let the writer
+    produce an archive its own reader rejects."""
+    chunk = src.read(n)
+    if chunk is None:
+        raise BackupCodecError("the source stream had no data ready (non-blocking source)")
+    if len(chunk) > n:
+        raise BackupCodecError(f"the source stream returned {len(chunk)} bytes for a {n}-byte read")
+    return chunk
+
+
+def _read_up_to(src: BinaryIO, n: int) -> bytes:
+    """Read ``n`` bytes, or fewer only at end of stream.
+
+    One ``read(n)`` may legally return fewer bytes without being at EOF (a raw pipe or socket), so
+    this keeps reading until ``n`` bytes or an empty read. Each request asks for no more than what is
+    still missing, so a bound checked before the call bounds every read it makes. A buffered file
+    returns all ``n`` at once, so the common case is one read and no copy; a short-reading source
+    fills one ``bytearray`` rather than a list of fragments."""
+    first = _read_once(src, n)
+    if len(first) == n or not first:
+        return first
+    buf = bytearray(first)
+    while len(buf) < n:
+        chunk = _read_once(src, n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
 def _read_exact(src: BinaryIO, n: int, what: str) -> bytes:
-    """Read exactly ``n`` bytes or raise — a short read means a truncated/corrupt archive."""
-    data = src.read(n)
+    """Read exactly ``n`` bytes or raise — only a true end of stream short of ``n`` is a
+    truncated/corrupt archive."""
+    data = _read_up_to(src, n)
     if len(data) != n:
         raise BackupCodecError(f"truncated .mfbak archive (short read on {what})")
     return data
@@ -477,6 +519,6 @@ def decrypt_stream(
     if not saw_final:  # defensive — the loop only exits on a final frame or a raise
         raise BackupCodecError("truncated .mfbak archive (no final frame)")
     # A trailing byte after the authenticated final frame is an append-tampering attempt — reject it.
-    if src.read(1):
+    if _read_up_to(src, 1):
         raise BackupCodecError("trailing bytes after the final .mfbak frame (tampered archive)")
     return header

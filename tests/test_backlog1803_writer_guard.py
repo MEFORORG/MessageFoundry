@@ -376,7 +376,7 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
             )
         # The double-submit shape: the WINNER's own next step opens a transaction of its own. With
         # the loser's refusal left open, that BEGIN failed and the winner got a 500.
-        await store.set_user_roles("alice", [])
+        await store.set_user_roles("alice", [], audits=())
         await _assert_writer_clean(store, "bystander")
         assert await store.get_user("alice-2") is None
     finally:
@@ -397,8 +397,11 @@ async def test_a_session_for_a_deleted_user_leaves_no_open_transaction(tmp_path:
                 audits=(),
             )
         await store.delete_user("alice")
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        # BACKLOG #2733: refused before the INSERT, through the refusal's own rollback.
+        assert (
             await store.create_session(token_hash="t" * 64, user_id="alice", expires_at=9e9)
+            is False
+        )
         await _assert_writer_clean(store, "bystander")
     finally:
         await store.close()

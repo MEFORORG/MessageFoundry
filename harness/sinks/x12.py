@@ -16,11 +16,13 @@ and records each interchange verbatim, capped at the engine's per-interchange ca
 
 The TA1 names the received ISA13 in TA101 and carries a fresh ISA13 of its own. When the received
 interchange has no readable ISA13 the sink answers nothing rather than invent one, and the same holds
-for an ISA13 that is not nine digits. ISA13 is read by fixed offset, so it can hold the element or
-segment separator; echoed into a reply written with fixed separators, ``1*0*0*R~Z`` would make an
-accepting TA1 parse as TA1-04 ``R``, which the engine dead-letters (ASVS 1.1.2). A TA1 with a made-up
-TA101 would acknowledge an interchange nobody sent, so silence is the answer. The interchange is
-still recorded, with the value read, as everything received is.
+for an ISA13 that is not nine digits. Echoed into a reply written with fixed separators, an ISA13 of
+``1*0*0*R~Z`` would make an accepting TA1 parse as TA1-04 ``R``, which the engine dead-letters (ASVS
+1.1.2). The engine's codec refuses an ISA whose element data holds the element separator or segment
+terminator (BACKLOG #5536), so that value does not peek and takes the no-readable-ISA13 arm; the
+nine-digit check still guards a value that peeks. A TA1 with a made-up TA101 would acknowledge an
+interchange nobody sent, so silence is the answer. The interchange is still recorded, with the value
+read when it peeks, as everything received is.
 """
 
 from __future__ import annotations

@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 22 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 23 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -118,7 +118,9 @@ inert.
   a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
-- The VS Code extension's new-route command writes a new module into your config directory.
+- The VS Code extension's new-route command writes a new module into your config directory. It
+  writes only in a trusted workspace, and refuses a `messagefoundry.configDir` that resolves
+  outside the workspace folder, through a link included.
 
 Each writes code that runs with the engine's rights on its next start. Review what they wrote
 before you point the engine at it.
@@ -407,8 +409,8 @@ and the builders, and a test checks that each module named calls each builder na
   through either.
   No other variable reaches these starts.
 - The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
-  platform's start-up names, the interpreter's own variables, the engine switches its own code
-  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  platform's start-up names, the interpreter's own variables, and the names
+  `[sandbox].pass_environment` lists. No other inherited variable crosses, and no `MEFOR_*` one. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
 - The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which
@@ -424,11 +426,12 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
-  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
-  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
-  they keep the index, proxy and certificate settings they read from the environment, and any
-  other variable the runner set, a CI token among them, reaches them too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get an allowlist
+  (`auditor_environment`): what a Python child needs to start, as the sandbox worker gets it, less
+  any empty or relative `PYTHONPATH` entry; pip's own `PIP_*` variables; and the proxy,
+  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index;
+  and each name the auditor's `--pass-environment` lists, which refuses an engine variable. No
+  other variable is in their environment, a CI token or an engine secret among them.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
@@ -497,12 +500,14 @@ reach one:
 
 ## 5. Native library calls
 
-22 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+23 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Config edit owner check: `config/atomic_edit.py`, which calls at least `advapi32`'s
+  `ConvertStringSidToSidW`, on a SID string
 - Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
   a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
   `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own
@@ -537,13 +542,11 @@ pure-Python equivalent:
   `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
   deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
   semantics first and the classic disposition where the volume has none
-  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
-  these yet. On Linux it opens the file with
-  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. It asks for that descriptor's file system through
-  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
-  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
-  POSIX host opens none of these files
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. On Linux it
+  opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list
+  from the open descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (below), and refuses any file system not on the
+  allowlist for that kind of file. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -551,7 +554,8 @@ pure-Python equivalent:
   best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
-  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
+  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
+  the disaster-recovery takeover hook use it. On Windows it puts
   the child in a `kernel32` job object that ends the whole tree. The takeover hook starts
   suspended, so it joins the job before it can start anything, and `ntdll`'s `NtResumeProcess`
   then lets it run (vault BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its
@@ -561,8 +565,8 @@ pure-Python equivalent:
   link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
-  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path
+  part with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
   these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
   file as itself, and refuses a link or junction. It confirms that file lies under the staging
@@ -671,8 +675,10 @@ these:
 A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
 Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
 the modules where any code reads input from outside the engine, whichever call the scan matched.
-The second holds the ones that read only what the engine wrote itself or an operator supplied. The
-third table lists hand-written parsers the patterns cannot see, found by reading the code.
+The second holds the ones that read only what the engine wrote itself, what an operator supplied,
+or, for the dependency audit, a requirements lock from the repository being checked. On a pull
+request run that lock comes from whoever opened the pull request. The third table lists
+hand-written parsers the patterns cannot see, found by reading the code.
 
 **One rule decides a hand-over.** Some modules only hand outside input to other code. Such a module
 is in the first table when it hands the input to a parser. A parser here is a format library, a
@@ -737,6 +743,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
 | Replies from an engine address | Whatever answers at the address a client is given. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
 | Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
+| An HTTP 400 on the Transit audit MAC hop | The body of an HTTP 400 answering the audit chain's check of a stored row MAC (Transit `verify`, BACKLOG #2720), from whatever answers on that hop: at least Vault or OpenBao at `MEFOR_STORE_VAULT_ADDR`, or a proxy or firewall in front of it. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. What is read, and which error each outcome raises, is in at least `verify_audit_hmac`, `_refuses_only_version`, `_names_no_version_reason` and `_reply_errors`, which parses the body and holds the size bound it shares with the data-key decrypt (vault BACKLOG #6707). | `store/crypto_transit.py` |
+| An HTTP 400 on the Transit data-key decrypt | The `errors` list of an HTTP 400 answering a decrypt of the store's data key, and the per-value `error` text of a 2xx batch reply (a batch Vault refuses is asked for value by value, and its body is not read), from whatever answers at `MEFOR_STORE_VAULT_ADDR`, a proxy or firewall in front of Vault included. Every entry of that list is read and compared, and the refusal counts as a tag refusal only when every entry is an AEAD authentication failure text. For a single decrypt, that reading decides at least whether the refusal is a cell tag failure or the cipher's plain refusal, and so whether the cell is audited and alerted, its row withheld from a list and its in-flight handoff dead-lettered rather than re-pended. So whatever answers on that hop can dead-letter the messages it is asked about. A batch result's per-value `error` changes only the class of the error the cipher-cell walk records, and so the class name its reason line shows, never containment, audit or alert. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`, so the engine holds a body up to that bound; for a body hvac did not parse, only the JSON parse is skipped past `_REPARSED_BODY_MAX_CHARS`. The read is in at least `_reply_errors`, `_names_aead_failure`, `_is_aead_failure_text` and `TransitCipher._decrypt_batch` (BACKLOG #5650). | `store/crypto_transit.py` |
+| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of the store's data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
 | A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
 | A Kerberos sign-in token | The token a browser sends for Windows single sign-on, in its `Authorization: Negotiate` header. The API route decodes its base64, as the web console's `routes/sso.py` does, and pyspnego decodes the token. Kerberos sign-in is off unless configured. | `api/auth_routes.py`, `auth/ldap.py` |
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
@@ -744,15 +753,17 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
+| A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
 
 **Parse sites left out, and why.**
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/audit_visibility.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It decodes an audit record's `detail`, which engine code wrote, to test whether it parses as JSON before the off-box tee scrubs the record's fields (vault BACKLOG #3045). The first test reads at most the log filters' bounded window and catches a deep nest. A second test parses the scrubbed text after it is encoded again, which can be longer than that window. It also decodes each JSON escape it matched that spells a C0 control, and that decoded text is scrubbed, encoded again and shipped. The detail can carry outside text, such as an exception or a typed sign-in name. A parse result only chooses how the field is scrubbed, and the shipped line still passes the log filters | `store/audit_tee.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
+| It reads a hashed requirements lock from the repository being checked, never a received message: the engine's own locks in `security.yml`, a released line's lock at the tag a release names, an adopter's `requirements.lock` in the `audit-pin` job `messagefoundry-toolkit init` generates, or a lock a person names when running it by hand. On a pull request run the lock comes from whoever opened the pull request, and so do the workflow and the script that read it. It decodes the file as pip does, so a coding declaration in the lock picks the codec, which can be any text codec this Python knows; a declaration naming a codec that is not a text codec, such as `zlib`, `hex` or `rot13`, is refused. It splits each requirement line into its pin, marker, options and comment, to write a copy with the markers removed for `pip-audit`. It is a command run in CI or by hand; the engine never calls it. | `security/audit_all_platforms.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `messagefoundry_toolkit/generators/_core.py`, `messagefoundry_toolkit/generators/siu.py`, `messagefoundry_toolkit/hl7schema.py`, `messagefoundry_toolkit/hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
@@ -823,6 +834,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| Its page script reads, as JSON, the text in a connection editor field that is a table or held a table or array. That text is at least the recorded value from your config, what you typed over it, and a choice the schema offered. Text that does not parse is posted trimmed, for the engine's validator to judge. | `connectionEditorWebview.ts` |
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
@@ -849,11 +861,16 @@ or compression library:
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
   A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
-  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
-  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  A zip is refused whole for at least too many members, duplicate or overlapped members, bytes
+  before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
+  ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
+  read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
+- `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
+  that the DICOM parsers turn into a `DicomError` (BACKLOG #5803). It calls nothing in `zlib`,
+  decompresses nothing and opens no archive, so it has nothing to bound.
 - `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
   `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
   as a path: it streams the store member into one fixed file name. The reader accepts only an
@@ -891,11 +908,11 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
-| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy, made in a new administrator-only folder under the Windows folder's `Temp`. Rewrites the permissions and owner of the data directory, and grants read on the config directory. With `-LockConfigDir`, instead rewrites the permissions and owner of the config directory and the folders it locks with it, and of the files and folders in them (see below). Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
+| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back, working in a new administrator-only folder under the Windows folder's `Temp`. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
-| `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
+| `import-db-ca.ps1` | Adds the CA certificates in one file to the machine stores `Cert:\LocalMachine\Root` and `Cert:\LocalMachine\CA`. Which CA goes where, and what each store is a trust anchor for, is in [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.2. Refuses the whole file if, at least, any certificate in it is not a CA or carries a private key, or the file holds no self-signed root. With `-WhatIf` it only shows what it would add, and runs without administrator rights. |
 | `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope. [`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 puts this folder in by its scope sentence, and names this script in by owner ruling of 2026-10-05. It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. Unless `-AppExe` names another, it also takes the `messagefoundry` command from `PATH` (`Get-Command messagefoundry`) and runs it while elevated, at least for `gen-key`, which mints the run's store key, and `protect-key`, which writes the service's key file. The `python` probe starts import the engine's own code from whatever install that `python` finds, whatever `-AppExe` says. In the CI job `windows-service-smoke`, whose install step installs the engine editable, both are the checkout's. The installer's check of the engine install ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*) never covers the `python` starts, and covers `protect-key` only when `-AppExe` names the launcher it checks; `gen-key` runs before the installer does. So whoever could write a folder on `PATH`, or the install those commands load, would run code as administrator and would see the store key. The `protect-key` start is handed that store key in its environment, as `MEFOR_STORE_ENCRYPTION_KEY`, which is cleared after it exits. So are at least the `python` probe starts that screen the password and provision the administrator. Those starts and the probe start that signs in are also handed, as `MEFOR_W0_ADMIN_PASSWORD`, the synthetic administrator password, or for the screen each candidate it tries. Without `-AppExe`, the service itself runs the engine in the installer's default install root, not the `PATH` `messagefoundry`. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
@@ -919,8 +936,11 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. It does the same to the value file's folder, and to the
-  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  directory and of each file and folder in it that it does not skip, and resets each one's
+  permissions to inherit from the directory, discarding the entries it carried itself; nothing
+  records them. [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2) says which items
+  it skips. The switch does the same to the value file's folder, and to the settings file's folder
+  when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
   Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the

@@ -140,8 +140,8 @@ MAX_FRAME: Final = 64 * 1024 * 1024
 #: it has no business judging: a request header carries the whole ``reference_view`` (an ADR 0006
 #: snapshot), so a 16 MiB header cap silently became a ~700k-entry ceiling on reference tables —
 #: every message on a bigger graph dead-lettered forever, where ``mode=off`` served them fine. Since
-#: :func:`sandbox._read_frame_bytes` already refuses a frame over :data:`MAX_FRAME` before a byte is
-#: parsed, a separate lower bound buys no protection; it only buys a mode-dependent outage.
+#: :func:`sandbox._read_frame_or_oversize` (the parent's reader) and ``_read_frame_bytes`` (the
+#: child's) already refuse a frame over :data:`MAX_FRAME` before a byte is parsed, a separate lower bound buys no protection; it only buys a mode-dependent outage.
 _MAX_HEADER: Final = MAX_FRAME
 _MAX_BLOBS: Final = 65536
 #: Own nesting counter for the value grammar, independent of (and below) ``RecursionError``. Each level

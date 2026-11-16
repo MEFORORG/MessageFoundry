@@ -24,6 +24,7 @@ from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
     has_lone_surrogate,
+    log_field_token,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
@@ -438,3 +439,81 @@ def test_escape_lone_surrogates_escapes_only_surrogates() -> None:
     escaped.encode("utf-8")  # strict UTF-8 accepts it now
     # The same spelling the full log scrub gives a surrogate.
     assert scrub_control_chars(chr(0xDC80)) == escape_lone_surrogates(chr(0xDC80))
+
+
+# --- log_field_token: one key=value value that no content can close (BACKLOG #3770) -----------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/a b", 'x"y', "x'y", "a\\b", "50%", "tab\there", "line\nbreak", "\u00e9\u202e", "\ud800", ""],
+)
+def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
+    """RED when: the token holds a space, a quote or a backslash, which the credential scrub
+    filters read as a value's edges, or does not decode back to the text."""
+    token = log_field_token(text, 256)
+    body = token[1:-1]
+    assert token == f'"{body}"'
+    assert body.isascii() and body.isprintable()
+    assert re.fullmatch(r"(?:[A-Za-z0-9./-]|_u[0-9A-F]{4}_)*", body)
+    assert _unit_unescape(body) == text
+
+
+def _unit_unescape(body: str) -> str:
+    """The ``_uXXXX_`` decode."""
+    units = re.sub(r"_u([0-9A-F]{4})_", lambda m: chr(int(m.group(1), 16)), body)
+    return units.encode("utf-16-be", "surrogatepass").decode("utf-16-be", "surrogatepass")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/x token=", "/x password:", "/PID|x", "/x<g>", "/x;pwd={a", "/a~b^c&d", "a|b c|d", "%7C%20"],
+)
+def test_log_field_token_escapes_every_mark_a_filter_anchors_on(text: str) -> None:
+    """RED when: a token keeps ``=``, ``:``, ``|``, ``<``, ``{``, ``;``, ``~``, ``^``, ``&`` or a
+    space, so a handler filter pattern can complete inside the field and run past its closing quote;
+    or it writes a ``%`` and two hex digits, where the credential scrub starts a label and the HL7
+    pass reads an encoded separator (BACKLOG #3770)."""
+    body = log_field_token(text, 256)[1:-1]
+    assert not set(body) & set("=:|<{;~^& ")
+    assert not re.search(r"%[0-9A-Fa-f]{2}", body)
+    assert _unit_unescape(body) == text
+
+
+def test_log_field_token_keeps_a_literal_whole_and_refuses_an_unsafe_one() -> None:
+    """RED when: a placeholder comes out escaped, so a search for ``<redacted>`` misses the line,
+    or a cut splits one; or a literal holding a quote or a space is accepted (BACKLOG #3770)."""
+    literals = ("<redacted>", "[redacted]")
+    assert log_field_token("/a b<redacted>[redacted]", 256, literals=literals) == (
+        '"/a_u0020_b<redacted>[redacted]"'
+    )
+    cut = log_field_token("x" * 230 + "<redacted>" * 3, 256, literals=literals)[1:-1]
+    assert len(cut) <= 256
+    assert cut.partition("_%crc32x")[0] == "x" * 230 + "<redacted>"
+    for bad in ('"', "a b", "a:b", ""):
+        with pytest.raises(ValueError):
+            log_field_token("x", 256, literals=(bad,))
+
+
+@pytest.mark.parametrize("text", ["/u" + "\U0001f600" * 300, "x" * 5000, "%" * 300])
+def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
+    """RED when: the bound counts characters before the escape, so an astral path logs about
+    twelve times the limit, or a cut lands inside an escape."""
+    body = log_field_token(text, 256)[1:-1]
+    assert len(body) <= 256
+    head, _, checksum = body.partition("_%crc32x")
+    assert re.fullmatch(r"[0-9a-f]{8}", checksum)
+    assert re.fullmatch(r"(?:[^_%]|_u[0-9A-F]{4}_)*", head)
+    # Whole characters only, so the head holds no half of a surrogate pair.
+    _unit_unescape(head).encode("utf-8", "strict")
+    assert len(log_field_token("a" * 255 + "=", 256)) - 2 <= 256
+
+
+def test_log_field_token_keeps_two_long_texts_with_one_head_apart() -> None:
+    assert log_field_token("a" * 300 + "1", 256) != log_field_token("a" * 300 + "2", 256)
+    assert "_%" not in log_field_token("a" * 256, 256)
+
+
+def test_log_field_token_refuses_a_limit_with_no_room_for_its_mark() -> None:
+    with pytest.raises(ValueError):
+        log_field_token("x", 15)

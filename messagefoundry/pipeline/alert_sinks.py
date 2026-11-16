@@ -10,7 +10,9 @@ a bounded in-memory queue, and a **background task** drains the queue and perfor
 the other transports still run — alerting is best-effort and never breaks delivery.
 
 Transports use only the **standard library** (``urllib.request`` / ``smtplib``), so wiring real
-notifications adds no dependency. Payloads carry the connection name + queue shape only — **no PHI**.
+notifications adds no dependency. Payloads have no message-body field, but they are **not**
+PHI-free: some events still send free-text ``detail``/``reason`` off the box. docs/PHI.md row
+10 names at least some of them, and is not a complete list.
 
 Construction is config-driven: :func:`notifier_from_settings` turns an
 :class:`~messagefoundry.config.settings.AlertsSettings` into a :class:`NotifierAlertSink`, or ``None``
@@ -32,10 +34,11 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
@@ -65,15 +68,16 @@ from messagefoundry.pipeline.alerts import (
     intake_pause_detail,
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
+    shown_error_class,
 )
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import DeliveryError
 
 # Not lazy, unlike the two transports imports below: _NoRedirectHandler subclasses one at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
-from messagefoundry.transports.email import checked_envelope, partial_refusal_under
+from messagefoundry.transports.email import checked_envelope, envelope_refusal_under
 
 __all__ = [
     "AlertTransport",
@@ -105,6 +109,14 @@ class ControlCallback(Protocol):
 # excess events are dropped with a warning rather than stalling the worker that enqueues them.
 _MAX_QUEUE = 1000
 
+# How long a cancelled drain waits for its alert sends to end their cancel cleanup (BACKLOG #5907).
+# Short and fixed, so a send that swallows the cancel or cleans up slowly cannot hold the drain,
+# and with it aclose(), much past its caller's timeout; a send still running then is left and
+# logged. It stays under the API teardown's cut grace (api/app.py _CUT_GRACE_SECONDS, 0.1 s), so the
+# drain's part of a close the teardown cuts ends inside that grace; test_alert_sinks pins the order.
+# It bounds only the sends: aclose()'s wait for control tasks is not bounded by it.
+_DRAIN_CANCEL_GRACE_SECONDS = 0.05
+
 
 class _AlertStateStore(Protocol):
     """The narrow alert-state slice (ADR 0044, #56) the sink uses — a structural subset of the store's
@@ -131,6 +143,152 @@ class _AlertStateStore(Protocol):
     ) -> Sequence[Any]: ...
 
 
+class _Generation(Protocol):
+    """A live instance's generation (``store.AlertGeneration``)."""
+
+    @property
+    def id(self) -> int: ...
+    @property
+    def count(self) -> int: ...
+
+
+class _FencedStore(_AlertStateStore, Protocol):
+    """The read and the write a fenced resolve needs (BACKLOG #4916). Every shipped store has
+    them; a store without them resolves unfenced, as before."""
+
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = ...,
+        escalation_tier: int = ...,
+        now: float | None = ...,
+        raised_by: str | None = ...,
+    ) -> None: ...
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = ...
+    ) -> Sequence[_Generation]: ...
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: Any,
+        now: float | None = ...,
+    ) -> int: ...
+
+
+def _fences(store: object) -> bool:
+    return hasattr(store, "open_alert_generations") and hasattr(
+        store, "resolve_alert_instances_fenced"
+    )
+
+
+class _ResolveFence:
+    """Bound an auto-resolve to the raises it speaks for, with no clock (BACKLOG #4916).
+
+    A resolve waits behind its key's FIFO lock, and its retries wait too, while another engine
+    shard or node on the same store may raise the same key. Unfenced, the resolve then closes that
+    newer raise. A ``last_seen <= now`` guard was refuted (decision d20261030T211551515-1de84e):
+    under cross-node clock skew it leaves an alert open for good. The fence compares no clock.
+
+    Each raise stamps the instance with its writer's random id (``raised_by``), and the resolve
+    closes only what that id and a snapshot of the key allow. ``docs/adr/0044-operator-alert-state.md``,
+    the BACKLOG #4916 amendment, states the rule. Only a store without the fence methods resolves
+    unfenced."""
+
+    def __init__(
+        self,
+        store: _FencedStore,
+        *,
+        event_type: str,
+        connection: str,
+        writer_id: str,
+        verdict: bool,
+    ) -> None:
+        self._store = store
+        self._verdict = verdict
+        self._event_type = event_type
+        self._connection = connection
+        self._writer_id = writer_id
+        self._snapshot: asyncio.Future[Sequence[_Generation]] | None = None
+        self.superseded = False
+
+    def begin(self) -> None:
+        self._snapshot = self._read()
+
+    def _read(self) -> asyncio.Future[Sequence[_Generation]]:
+        return asyncio.ensure_future(
+            self._store.open_alert_generations(
+                event_type=self._event_type, connection=self._connection
+            )
+        )
+
+    def end(self) -> None:
+        snapshot = self._snapshot
+        if snapshot is None:
+            return
+        if not snapshot.done():
+            snapshot.cancel()
+        elif not snapshot.cancelled():
+            snapshot.exception()  # retrieved, so asyncio does not report a failed read again
+
+    async def resolve(self, now: float) -> int:
+        assert self._snapshot is not None  # begin ran
+        self.superseded = False
+        try:
+            seen = await self._snapshot
+        except Exception:
+            # The attempt fails, so the retry loop logs it and tries again, and the next attempt
+            # reads afresh: re-awaiting this failed read would fail every retry, and closing only
+            # this writer's own raise would miss one an earlier run of this process left
+            # (BACKLOG #4916, review round-c69a5607).
+            self._snapshot = self._read()
+            raise
+        closed = await self._store.resolve_alert_instances_fenced(
+            event_type=self._event_type,
+            connection=self._connection,
+            raised_by=self._writer_id,
+            seen=seen[0] if seen else None,
+            now=now,
+        )
+        if not closed and self._verdict:
+            # The UPDATE has committed, so a fault here must not reach the retry loop: a retry
+            # would run the resolve again and end in a false "gave up" ERROR. Not knowing, keep
+            # what the clear dropped (superseded), which is the safe side.
+            try:
+                live = bool(
+                    await self._store.open_alert_generations(
+                        event_type=self._event_type, connection=self._connection
+                    )
+                )
+            except Exception as exc:
+                # Assumed, not observed: its own line, so the log never states a cause it did not see.
+                self.superseded = True
+                log.warning(
+                    "alert-instance resolve for %s %r closed nothing and the re-read failed (%s); "
+                    "assuming the instance is still open and keeping its in-memory alert state",
+                    self._event_type,
+                    self._connection,
+                    type(exc).__name__,
+                )
+                return closed
+            if live:
+                self.superseded = True
+                log.info(
+                    "alert-instance resolve for %s %r closed nothing: a live instance remains "
+                    "whose newest raise this clear does not speak for, so it stays open",
+                    self._event_type,
+                    self._connection,
+                )
+        return closed
+
+
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
 #: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
@@ -145,6 +303,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
+    # #2903 (ADR 0216): a start that read a Vault token and found it clean can resolve the open
+    # warning for the same hop, fenced as the ADR 0044 BACKLOG #4916 amendment states.
+    "vault_privilege_clean": "vault_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",
     # #2136: a reconcile pass that is evidence the breaker is not tripped, or that no hold stands,
@@ -173,12 +334,18 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     Subclasses implement :meth:`_handle` for the per-item work. It runs inside the background task,
     must push any blocking I/O off the loop (``asyncio.to_thread``), and must be **best-effort** — it
     swallows its own errors and never raises, since an exception out of ``_handle`` would kill the
-    drain loop. Lifecycle: :meth:`start` once an event loop is running (the ASGI lifespan does this),
+    drain loop. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
+    concurrently inside its :meth:`_handle` (BACKLOG #5907), and a cancel of the drain task is
+    bounded as :meth:`NotifierAlertSink._cut_sends` says. A cancel does not stop a worker thread a
+    send started with ``asyncio.to_thread``, so that runs on to its own timeout.
+    Lifecycle: :meth:`start` once an event loop is running (the ASGI lifespan does this),
     :meth:`aclose` on shutdown (enqueues a ``None`` sentinel, drains what's queued, then stops)."""
 
     def __init__(self, *, max_queue: int = _MAX_QUEUE) -> None:
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
+        # Queued or in flight, so a drain that is cut can say how many items it never delivered.
+        self._undelivered = 0
 
     def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
         """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
@@ -192,7 +359,14 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             if dropped is not None:
                 log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
             return False
+        self._undelivered += 1
         return True
+
+    @property
+    def undelivered(self) -> int:
+        """How many items are queued or being handled, a count only (BACKLOG #5907). An item whose
+        handling was cancelled stays counted."""
+        return self._undelivered
 
     def start(self) -> None:
         if self._task is None:
@@ -213,6 +387,7 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             if item is None:
                 return
             await self._handle(item)
+            self._undelivered -= 1
 
     @abc.abstractmethod
     async def _handle(self, item: _T) -> None:
@@ -222,11 +397,18 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
 class AlertTransport(Protocol):
     """One delivery channel for an alert event. ``send`` does the actual (blocking) I/O — the
     :class:`NotifierAlertSink` always calls it from a background task, never inline on a worker.
+    Each event's sends run concurrently, one child task per transport the rule selected (BACKLOG
+    #5907), so a send must not rely on a sibling's having run first; each gets its own shallow copy
+    of the event.
+    A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
+    alert, logged, and the siblings go on. A send must end promptly once cancelled: on a drain
+    cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
+    ``aclose()``.
 
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
     the transport's own default); ``context`` (#138) carries the extra non-PHI template values the
     notifier popped off the event (rule label + effective cooldown). Both are meaningful only to
-    :class:`EmailTransport`; other transports (the webhook) accept and ignore them so the fan-out loop
+    :class:`EmailTransport`; other transports (the webhook) accept and ignore them so the fan-out
     can call every transport uniformly."""
 
     name: str
@@ -567,9 +749,11 @@ def _refuse_alert_smtp_revocation(
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
-    credential, and an alert body carries no PHI. A hop with ``use_tls`` or ``tls_verify`` off
-    builds no verifying context, and a login over one is refused at load and again at each send,
-    so there is nothing for this guard to judge.
+    credential. The decline does not rest on what the body holds, and an alert body is not PHI-free
+    in the shipped code: the docs/PHI.md logging-inventory rows 11 and 12 say what crosses, and
+    ADR 0173's note of 2026-11-10 records the owner ruling that this decline stands. A hop with
+    ``use_tls`` or ``tls_verify`` off builds no verifying context, and a login over one is refused
+    at load and again at each send, so there is nothing for this guard to judge.
 
     It reads no allowlist. Both callers refuse a relay off ``[alerts].smtp_allowed_hosts`` before
     they call this (BACKLOG #5088), with or without a login, so every relay judged here is one the
@@ -679,7 +863,7 @@ class WebhookTransport:
         context: Mapping[str, Any] | None = None,
     ) -> None:
         # recipients (#146) + context (#138) are EMAIL-only; a webhook has neither a per-rule recipient nor
-        # an email template — accept and ignore them so the notifier's fan-out loop is uniform.
+        # an email template — accept and ignore them so the notifier's fan-out is uniform.
         await asyncio.to_thread(self._post, event)
 
     def _post(self, event: dict[str, Any]) -> None:
@@ -692,7 +876,7 @@ class WebhookTransport:
             raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
         _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
-        # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
+        # onto the wire — the fan-out pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
@@ -843,7 +1027,7 @@ def send_plain_email(
         failure = type(exc).__name__
     if failure:
         raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
-    partial: NegativeAckError | None = None
+    refusal: DeliveryError | None = None
     try:
         with smtplib.SMTP(host, port, timeout=timeout) as smtp:
             if use_tls:
@@ -862,18 +1046,17 @@ def send_plain_email(
                     channel_encrypted=use_tls,
                     cell=ALERTS_SMTP_CELL,
                 )
-            # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts,
-            # never an address (vault BACKLOG #2924). A refusal of EVERY recipient is still
-            # smtplib's own SMTPRecipientsRefused, whose args hold each address and the reply.
+            # A recipient refusal raises what CheckedEnvelope.send says: an error that names the
+            # cell and counts, never an address or a reply text (vault BACKLOG #2924, #2884).
             envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
     except smtplib.SMTPException as exc:
-        # A QUIT refused after a partial refusal must not hide it; raised below, outside this
+        # A QUIT refused after a permanent refusal must not hide it; raised below, outside this
         # handler. Any other SMTP failure propagates unchanged.
-        partial = partial_refusal_under(exc)
-        if partial is None:
+        refusal = envelope_refusal_under(exc)
+        if refusal is None:
             raise
-    if partial is not None:
-        raise partial
+    if refusal is not None:
+        raise refusal
 
 
 class EmailTransport:
@@ -937,7 +1120,8 @@ class EmailTransport:
         self.tls_ca_file = tls_ca_file
         self.trust_anchor_policy = trust_anchor_policy
         # Optional egress allowlist (lower-cased) for the SMTP host; empty = any (WP-11c, parity with
-        # the webhook allowlist). The alert payload carries no PHI, so this is general egress control.
+        # the webhook allowlist). The alert payload has no message-body field, but it can carry
+        # free-text detail (docs/PHI.md row 11); this allowlist is the egress control for that hop.
         self.allowed_hosts = tuple(h.lower() for h in allowed_hosts)
         # #138: operator-editable templates (None = fixed subject/body). Validated at config-load.
         self.subject_template = subject_template
@@ -1097,8 +1281,9 @@ class AlertRuleSet:
 
 @dataclass
 class _ClearedState:
-    """The in-memory alert state one ``connection_started`` cleared for a key, held until its
-    durable resolve settles (BACKLOG #1741, :meth:`NotifierAlertSink._resolve_settled`)."""
+    """The in-memory alert state one clear dropped for a key, held until its durable resolve
+    settles (:meth:`NotifierAlertSink._resolve_settled`): a ``connection_started``'s (BACKLOG
+    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` is always None."""
 
     last: float | None
     occurrences: int | None
@@ -1120,6 +1305,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     background task, with a per-(event, connection) re-alert throttle. An optional :class:`AlertRuleSet`
     (ADR 0014) refines each event's severity, which transports fire, the cooldown, and suppression;
     with no rules the behaviour is byte-identical (every event → every transport, global throttle).
+
+    Each event goes to its transports concurrently (BACKLOG #5907), so a slow transport does not
+    hold the event being handled from a healthy one. Events are still handled one at a time, so an
+    event queued behind a slow transport waits for it, and a drain cut while it waits loses those.
 
     The emit methods are synchronous and return immediately (enqueue only). Call :meth:`start` once a
     loop is running (the ASGI lifespan does this) and :meth:`aclose` on shutdown."""
@@ -1151,6 +1340,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
         # stay concurrent. An entry is dropped once no write holds or awaits it.
         self._state_locks: dict[str, KeyedLock] = {}
+        # BACKLOG #4916: this sink's raises carry this random id, so its own clears can close them
+        # and no other process's clear can close a newer one (_ResolveFence). Per process.
+        self._writer_id = uuid.uuid4().hex
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -1169,6 +1361,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #5907: send tasks a cut drain left still running past its grace.
+        self._left_sends: set[asyncio.Task[None]] = set()
+        # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
+        self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
         # raising. None, as `serve` leaves it, changes nothing.
         self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
@@ -1232,9 +1428,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         detail: str | None = None,
         error_class: str | None = None,
     ) -> None:
-        # #46: an outbound lane went down. error_class is not sent: the event is unchanged. The shared _emit throttle keys on (type, connection), so a
-        # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
-        self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
+        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+        # retry storm on one lane collapses to one notification per cooldown. detail can echo a
+        # partner's reply, so it rides under _detail: stored as the alert reason, popped in _handle
+        # before any transport sees the event (BACKLOG #5021). Off-box carries the class instead.
+        self._emit(
+            {
+                "type": "connection_error",
+                "connection": name,
+                "kind": kind,
+                "error_class": shown_error_class(error_class),
+                "_detail": detail,
+            }
+        )
 
     def log_write_failed(
         self, name: str, *, stage: str, reason: str, stopped: int | None = None
@@ -1500,7 +1706,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # queue listing's lost row uses `approval:listing` (vault BACKLOG #3747). An
         # inline config reload uses `config_reload:inline` (vault BACKLOG #2254), and the IdP
         # step-up return audit budget's backstop `step_up_return:audit_budget:<action>` (BACKLOG
-        # #3965). The
+        # #3965). The directory reconciler uses `directory-reconciler:<action>` for a row a
+        # completed pass could not write (BACKLOG #3018 step 2), and a directory sign-in
+        # `directory-sign-in:<action>` for a role-sync row refused twice (BACKLOG #2221). The
         # action name lands in the reason column.
         # The ERROR log line beside it carries the row's detail on some paths and only the exception
         # on others (docs/SECURITY.md). No PHI.
@@ -1684,6 +1892,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
         self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
 
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # #2903 (ADR 0216): the Vault privilege preflight's non-clean arm. The subject
+        # ("vault:<hop>") stands in for "connection", as the store preflight's does; the payload is
+        # the finding, a count and the hop's judgment (policy names and paths, never a token).
+        event: dict[str, Any] = {
+            "type": "vault_privilege_warning",
+            "connection": name,
+            "finding": finding,
+            "detail": detail,
+        }
+        if finding == "over_granted":
+            # An unobservable read judged nothing; a 0 here would read as a clean result.
+            event["refusing_count"] = refusing_count
+        self._emit(event)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # #2903: the INVERSE -- no page; auto-resolves the open vault_privilege_warning.
+        self._record_state({"type": "vault_privilege_clean", "connection": name}, "info")
+
     def config_changed(
         self,
         name: str,
@@ -1826,15 +2055,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Wire (or clear) the #144 (ADR 0128) connection-control callback. The ``api/app.py`` lifespan
         calls this once the engine/runner exist, since :func:`notifier_from_settings` builds the sink
         before them. The sink NEVER imports :class:`RegistryRunner` — the callback is injected DOWN.
-        None disables control actions (a ``control_action`` rule then no-ops, logged)."""
+        None disables control actions (a ``control_action`` rule then no-ops, logged). Wiring a
+        callback ends a :meth:`stop_control`, so a later clear logs as a wiring fault again."""
         self._control_cb = cb
+        if cb is not None:
+            self._control_stopped = False
 
     def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
         """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
         returns without raising: the relay accepted every recipient, or the webhook answered 2xx
         (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
-        from one the notifier only accepted. Called on the drain task; an observer that raises is
-        logged and never stops the drain."""
+        from one the notifier only accepted. Called on the event loop as each send returns, in no
+        set order across transports; an observer that raises is logged and never stops the drain."""
         self._delivery_observer = observer
 
     # --- #143 (ADR 0044 amendment) windowed suspend / mute (notification-only) ---
@@ -1924,8 +2156,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             raise
 
     def _resolve_settled(self, key: str, cleared: _ClearedState, *, landed: bool) -> None:
-        """Settle the in-memory state :meth:`connection_started` cleared, once its durable resolve
-        has landed or failed (BACKLOG #1741). A landed resolve closed the row, so the state stays
+        """Settle the in-memory state a clear dropped, once its durable resolve has landed or
+        failed: :meth:`connection_started`'s (BACKLOG #1741), or any other inverse's (BACKLOG
+        #4916). A landed resolve closed the row, so the state stays
         cleared, every earlier clear still waiting is settled with it, and a suspend set while it was
         in flight muted the row it closed and goes too. A failed one left the row open: a later
         start's resolve still queued behind it then takes the state over and decides in its turn, or,
@@ -2102,29 +2335,73 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(key, None)
-            self._occurrences.pop(key, None)
+            # BACKLOG #4916: the drop is provisional, as connection_started's is (BACKLOG #1741). A
+            # fenced resolve can leave the row open on purpose, so what it dropped goes back if it
+            # does not land (_resolve_settled). connection_started passes its own on_settled and
+            # has already taken both entries, so nothing is queued for it here.
+            suspended = self._suspended.pop(key, None)
+            occurrences = self._occurrences.pop(key, None)
+            # Queued even when it dropped nothing: a later clear's entry is what takes an earlier
+            # failed one's state over in _resolve_settled, rather than that state going back.
+            if on_settled is None:
+                cleared = _ClearedState(None, occurrences, suspended)
+                self._pending_clears.setdefault(key, []).append(cleared)
+
+                def settle_cleared(landed: bool) -> None:
+                    self._resolve_settled(key, cleared, landed=landed)
+
+                on_settled = settle_cleared
+
+            # Only a settle callback reads the superseded verdict, so only then is it paid for.
+            fence = (
+                _ResolveFence(
+                    cast(_FencedStore, store),
+                    event_type=inverse_of,
+                    connection=connection,
+                    writer_id=self._writer_id,
+                    verdict=on_settled is not None,
+                )
+                if _fences(store)
+                else None
+            )
 
             # A factory, not a built coroutine: a coroutine can be awaited only once, and a retry
             # needs a fresh one. Nothing is built until the background task runs.
             def write() -> Awaitable[Any]:
+                if fence is not None:
+                    return fence.resolve(now)
                 return store.resolve_alert_instances_for(
                     event_type=inverse_of, connection=connection, now=now
                 )
 
         else:
-            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
-            raw_reason = event.get("detail") or event.get("reason")
+            fence = None
+            # reason: the diagnostic the event carries. _detail is a reason kept off the wire
+            # (connection_error, BACKLOG #5021); the stored copy is masked until revealed (#2443).
+            raw_reason = event.get("_detail") or event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
 
+            # Only a store that fences takes the writer id; a test double without it still works.
+            raised_by = self._writer_id if _fences(store) else None
+
             def write() -> Awaitable[Any]:
-                return store.upsert_alert_instance(
+                if raised_by is None:
+                    return store.upsert_alert_instance(
+                        event_type=etype,
+                        connection=connection,
+                        severity=severity,
+                        reason=reason,
+                        escalation_tier=escalation_tier,
+                        now=now,
+                    )
+                return cast(_FencedStore, store).upsert_alert_instance(
                     event_type=etype,
                     connection=connection,
                     severity=severity,
                     reason=reason,
                     escalation_tier=escalation_tier,
                     now=now,
+                    raised_by=raised_by,
                 )
 
         settle: Callable[[bool], None] | None = None
@@ -2140,7 +2417,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     except Exception:
                         log.exception("alert-instance settle callback failed")
 
-        wrapper = self._run_state(write, key, settle, resolves=inverse_of, connection=connection)
+        wrapper = self._run_state(
+            write, key, settle, resolves=inverse_of, connection=connection, fence=fence
+        )
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
@@ -2170,9 +2449,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         *,
         resolves: str | None = None,
         connection: str = "",
+        fence: _ResolveFence | None = None,
     ) -> None:
         """Run one alert-instance write under its key's lock. ``resolves`` names the alert type an
-        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not."""
+        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not.
+        ``fence`` bounds a resolve to the raises it speaks for (BACKLOG #4916); it begins here,
+        at the task's first step, before the task queues on the lock. A fenced resolve another
+        process's newer raise superseded settles as not landed, with no retry."""
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
@@ -2185,6 +2468,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         tried = 0
         task = asyncio.current_task()
         try:
+            if fence is not None:
+                fence.begin()
             async with hold_keyed_lock(self._state_locks, key):
                 for tried in range(1, attempts + 1):
                     try:
@@ -2209,9 +2494,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                         finally:
                             self._retrying.discard(task)
                     else:
-                        landed = True
+                        landed = fence is None or not fence.superseded
                         break
-            if resolves is not None and not landed:
+            if resolves is not None and not landed and not (fence and fence.superseded):
                 log.error(
                     "alert-instance resolve gave up after %d attempt(s): any open %s alert for %r "
                     "stays open",
@@ -2232,6 +2517,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # Outside the write itself (the key lock's bookkeeping): still never raise.
             log.warning("alert-instance state write failed", exc_info=True)
         finally:
+            if fence is not None:
+                fence.end()
             # A cancel, too, is settled as not landed: the row is most likely still open.
             if on_settled is not None:
                 on_settled(landed)
@@ -2263,12 +2550,53 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
+    def stop_control(self) -> None:
+        """Clear the control callback for shutdown (BACKLOG #5909), so no rule fires a restart
+        from here on, and a rule that would have logs that the engine is shutting down rather
+        than a wiring fault. A control task dispatched before this keeps running: cancelling a
+        restart partway could leave a listener the runner no longer tracks, so it is left to
+        finish, and the runner's stop waits for it on the reload lock. :meth:`aclose` cancels any
+        still running once the engine has stopped."""
+        self._control_cb = None
+        self._control_stopped = True
+
+    async def aclose(self) -> None:
+        """Drain and stop the delivery task, then cancel every control task still running and wait
+        for it to end (BACKLOG #5909), so none outlives the sink. The lifespan closes this sink
+        after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
+        was never started. A close cancelled while its sentinel waits on a full queue cancels the
+        delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
+        leave the drain running after the store closed; a send that outlives the drain's grace is
+        still left running (:meth:`_cut_sends`). Only this sink does that: an undelivered alert is
+        counted by :attr:`undelivered`, while a security notice's loss must reach its audit row."""
+        drain = self._task
+        try:
+            await super().aclose()
+        finally:
+            if drain is not None and not drain.done():
+                drain.cancel()
+                self._task = None
+                await asyncio.gather(drain, return_exceptions=True)
+            pending = [task for task in self._control_tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                log.warning(
+                    "%d alert control_action task(s) still running at shutdown were cancelled",
+                    len(pending),
+                )
+                await asyncio.gather(*pending, return_exceptions=True)
+
     def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
         alert. A no-op when no callback is wired (logged once at emit)."""
         cb = self._control_cb
+        if cb is None and self._control_stopped:
+            # Shutdown cleared it on purpose (stop_control), so this is not a wiring fault.
+            log.info("alert control_action %s for %r not run: shutting down", action, target)
+            return
         if cb is None:
             log.warning(
                 "alert control_action %s for %r requested but no control callback is wired",
@@ -2300,23 +2628,54 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
-        # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out loop so it never reaches the
+        # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
         recipients = event.pop("_recipients", None)
+        # #5021: a reason kept off the wire. _record_state already read it in _emit.
+        event.pop("_detail", None)
         # #138: pop the email-template context (rule label + effective cooldown) into a side mapping so the
         # event delivered to every transport is clean (no internal ``_``-keys); only the email uses it.
         context = {
             "rule_id": event.pop("_rule_id", ""),
             "cooldown_seconds": event.pop("_cooldown_seconds", None),
         }
-        for transport in self._transports:
-            if targets is not None and transport.name not in targets:
-                continue  # this transport isn't in the matching rule's routing
+
+        # The task handling this event, and its cancel count on entry. Each send runs in a child
+        # task made below, and a transport can cancel that child itself with
+        # current_task().cancel(), so only a rise in the drain's own count marks the drain's cancel.
+        drain = asyncio.current_task()
+        assert drain is not None  # _handle runs only on the drain task
+        baseline = drain.cancelling()
+
+        def drain_cancelled() -> bool:
+            return drain.cancelling() > baseline
+
+        async def deliver(transport: AlertTransport) -> None:
+            # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
+            # key a transport or the observer adds or drops cannot break a sibling iterating its own.
+            # The values, recipients and context stay shared, and every transport only reads them.
+            sent = dict(event)
             try:
-                await transport.send(event, recipients=recipients, context=context)
+                await transport.send(sent, recipients=recipients, context=context)
+            except asyncio.CancelledError:
+                if drain_cancelled():
+                    raise  # the drain's own cancel, which must reach every send
+                # The send ended cancelled on its own: that transport lost the alert, so say so at
+                # once, and leave the siblings and the drain running. No exc_info: a cancel's
+                # message is whatever its caller passed, and the traceback prints the chain it was
+                # raised in, so either can carry alert text this line keeps out (CLAUDE.md
+                # section 9).
+                log.warning(
+                    "alert transport %s was cancelled for %s/%r",
+                    transport.name,
+                    event.get("type"),
+                    event.get("connection"),
+                )
+                return
             except Exception:
                 # Best-effort: a failing transport must not drop the event for the others, nor
-                # ever propagate into the engine. Detail (not PHI) is in the event itself.
+                # ever propagate into the engine. The line names the event's type and connection,
+                # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
                 log.warning(
                     "alert transport %s failed for %s/%r",
                     transport.name,
@@ -2324,13 +2683,86 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("connection"),
                     exc_info=True,
                 )
-                continue
+                return
             observer = self._delivery_observer
             if observer is not None:
                 try:
-                    observer(transport.name, event)
+                    observer(transport.name, sent)
                 except Exception:
                     log.warning("alert delivery observer failed", exc_info=True)
+
+        # BACKLOG #5907: concurrently, one child task per transport the rule selected, waiting for
+        # every send to end. A drain cancel is the one case bounded by _DRAIN_CANCEL_GRACE_SECONDS,
+        # whose comment says why. (The _BackgroundDispatcher docstring says what a cancel does not
+        # stop.)
+        chosen = [t for t in self._transports if targets is None or t.name in targets]
+        if not chosen:
+            return
+        sends = [asyncio.create_task(deliver(t)) for t in chosen]
+        try:
+            await asyncio.wait(sends)
+        except asyncio.CancelledError:
+            await self._cut_sends(sends)
+            raise
+        escaped: list[BaseException] = []
+        for transport, task in zip(chosen, sends, strict=True):
+            if task.cancelled():
+                # The drain was not cancelled, so this is a child that ended cancelled outside the
+                # send's own handler: at least a send that cancelled its own task and returned
+                # before the cancel landed, or an observer that raised CancelledError. Say so
+                # rather than drop it; the drain goes on.
+                log.warning(
+                    "alert transport %s ended cancelled after its send for %s/%r",
+                    transport.name,
+                    event.get("type"),
+                    event.get("connection"),
+                )
+            elif (exc := task.exception()) is not None:
+                escaped.append(exc)  # read for every send, so the loop reports none unretrieved
+        if escaped:
+            raise escaped[0]  # what deliver let out, raised once every send has ended
+
+    async def _cut_sends(self, sends: list[asyncio.Task[None]]) -> None:
+        """The drain was cancelled during an event's sends (BACKLOG #5907): pass the cancel on to
+        each, every repeat of it too, and wait at most :data:`_DRAIN_CANCEL_GRACE_SECONDS` for
+        them to end. A send still running then is left, held and counted in one WARNING."""
+        for task in sends:
+            task.cancel()
+            task.add_done_callback(self._settle_cut_send)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DRAIN_CANCEL_GRACE_SECONDS
+        pending = {task for task in sends if not task.done()}
+        repeated = False
+        while pending and (remaining := deadline - loop.time()) > 0:
+            try:
+                _, pending = await asyncio.wait(pending, timeout=remaining)
+            except asyncio.CancelledError:
+                # A repeat of the drain's cancel: it reaches the sends as the first did, and the
+                # grace, not the repeat, still ends this wait. Noted once, as a source that
+                # re-delivers a cancel on every await would otherwise log a line per pass.
+                if not repeated:
+                    repeated = True
+                    log.info("alert drain cancelled again while its sends end; passed on to them")
+                for task in pending:
+                    task.cancel()
+                pending = {task for task in pending if not task.done()}
+        if pending:
+            # A count only: no event content, since a send left here is named by nothing an
+            # operator could act on.
+            log.warning(
+                "%d alert send task(s) still running %.2fs after the drain was cancelled were left",
+                len(pending),
+                _DRAIN_CANCEL_GRACE_SECONDS,
+            )
+            self._left_sends.update(pending)  # held, so the loop does not drop a running task
+
+    def _settle_cut_send(self, task: asyncio.Task[None]) -> None:
+        """Done callback of a send the drain's cancel reached: release it, and read its outcome so
+        the loop never reports it unretrieved. Only the exception's type is logged, since its text
+        or chain can carry alert content (CLAUDE.md section 9)."""
+        self._left_sends.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            log.warning("alert send cut with the drain ended with %s", type(exc).__name__)
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:

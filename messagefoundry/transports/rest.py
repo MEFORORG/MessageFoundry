@@ -89,6 +89,7 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     encode_wire_body,
     float_setting,
+    insecure_hop_refused,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -269,8 +270,8 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     and follows :func:`enforce_send_time_length_limits`'s message-derived arm instead. At send time the
     NAME is as message-derived as the value — it is a metadata key suffix, and ``_HEADER_NAME_TOKEN``
     bounds its charset, not its content, so ``X-Patient-MRN-12345`` is a well-formed token. This string
-    travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on a
-    ``DeliveryError`` arm off-box to the webhook AlertSink. RFC 8187 percent-encoding was considered and
+    travels through ``safe_exc`` into at least ``last_error`` and ``message_events.detail``, and on a
+    ``DeliveryError`` arm into the stored alert reason. RFC 8187 percent-encoding was considered and
     rejected: its ext-value form is opt-in per field definition, so applying it to an arbitrary
     Handler-named header would silently send a partner a wire format it never agreed to parse."""
     if not metadata:
@@ -339,9 +340,6 @@ class HttpAuthError(ValueError):
 #: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
 AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
 
-#: ``NegativeAckError.code`` of a send refused by :meth:`InsecureHopGuard.assert_delivery_url`.
-INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
-
 #: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
 #: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's
 #: algorithm token and scheme word, so it stays on the cause and never reaches ``queue.last_error``
@@ -363,48 +361,12 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak. The token hop also
-    raises it for the case :func:`is_refused_proxy_digest_tunnel` names (BACKLOG #2989)."""
+    why a stop was chosen over a retry, and for where that reasoning is weak."""
     return NegativeAckError(
         f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,
         permanent=True,
         config_fault=True,
-    )
-
-
-#: The text of the bare ``OSError`` ``http.client.HTTPConnection._tunnel`` raises when a web
-#: proxy answers the ``CONNECT`` for an ``https`` target with a 407.
-_TUNNEL_407_PREFIX = "Tunnel connection failed: 407 "
-
-
-def is_refused_proxy_digest_tunnel(
-    opener: urllib.request.OpenerDirector, exc: urllib.error.URLError
-) -> bool:
-    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on an
-    ``opener`` whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1).
-
-    That is the refusal :func:`auth_challenge_refused` names, met where no handler can raise it.
-    The proxy Digest handler answers only a 407 that reaches it as a status, and ``_tunnel``
-    raises a ``CONNECT`` 407 before any handler runs, as a bare ``OSError`` that ``do_open`` wraps
-    in a ``URLError``. So a retry sends the same unanswered ``CONNECT``. Without a Digest handler
-    on the opener, the 407 stays the plain status Amendment B keeps for a Basic challenge: a
-    refused pre-emptive Basic credential, or a proxy the connection has no credential for.
-
-    Matched on the exact class and the one-argument text ``_tunnel`` builds from the int status,
-    so a socket error, which carries an errno, never matches, and the proxy's bytes can only
-    follow the prefix. ``tests/test_digest_refusal_classification.py`` pins the text on a real
-    socket, so a CPython that rewords it fails that test instead of retrying again unseen."""
-    reason = exc.reason
-    return (
-        type(reason) is OSError
-        and len(reason.args) == 1
-        and isinstance(reason.args[0], str)
-        and reason.args[0].startswith(_TUNNEL_407_PREFIX)
-        and any(
-            isinstance(handler, _ApprovedProxyDigestAuthHandler)
-            for handler in getattr(opener, "handlers", ())
-        )
     )
 
 
@@ -929,20 +891,13 @@ class InsecureHopGuard:
         :class:`InsecureHopRefused`, a ``ValueError``, left the send unclassified, and the delivery
         worker filed it as an internal error. :func:`assert_probe_hop` is the probe's twin.
 
-        A permanent configuration fault, as :func:`auth_challenge_refused` is. The guard keys on the
-        connection's own URL and the posture captured when it was built, so every queued row would
-        meet the same refusal until an operator changes the connection and reloads. Under the
-        default ``credential_fault_policy`` the lane stops and the queue stays. The text names the
-        connection, the cell, the host and the redacted URL, and no message content."""
+        A permanent configuration fault, as :func:`auth_challenge_refused` is; :func:`insecure_hop_refused`
+        says why. The text names the connection, the cell, the host and the redacted URL, and no
+        message content."""
         try:
             self.assert_send_url(url)
         except InsecureHopRefused as exc:
-            raise NegativeAckError(
-                f"{connector} send refused: {exc}",
-                code=INSECURE_HOP_REFUSED_CODE,
-                permanent=True,
-                config_fault=True,
-            ) from exc
+            raise insecure_hop_refused(exc, connector=connector) from exc
 
 
 def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
@@ -1438,6 +1393,10 @@ def refuse_verify_off(
     docs/CONNECTIONS.md, :func:`_shipped_strict_disposition` and the ``verify_tls`` parameter
     comments in ``config/wiring.py`` still restate parts of it; change them with it.
 
+    A REST destination that sets ``ech_egress`` never reaches this gate with ``verify_tls=false``:
+    ``RestDestination.__init__`` refuses that pair first, in every posture and whatever the
+    connection attests (vault BACKLOG #2977).
+
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
     global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn``
@@ -1801,10 +1760,10 @@ def enforce_send_time_length_limits(
     **The message-derived arm must not name the offending header.** At construction a header name is
     operator-static; at send time ``outbound_headers_from_metadata`` derives it from a message-
     metadata key suffix (``_HEADER_NAME_TOKEN`` bounds the charset, not the content). This message
-    travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on the
-    ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` → the webhook
-    AlertSink, i.e. **off-box**. ``redaction.py`` concedes single-token identifiers are its
-    acknowledged residual, so only the class and the length may leave.
+    travels through ``safe_exc`` into at least ``last_error`` and ``message_events.detail``, and on the
+    ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` into the stored
+    alert reason, which an operator can reveal. ``redaction.py`` concedes single-token
+    identifiers are its acknowledged residual, so only the class and the length may appear there.
     """
     violation = find_outbound_length_violation(url, headers)
     if violation is None:
@@ -2254,9 +2213,17 @@ class _HostProxy:
         if not self.credentialed:
             return (self.config._build_proxy_handler(admitted=False),)
         handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
-        if self.config.digest is not None:
-            handlers.append(self.config.digest.build())
+        digest = self.config.digest if self.answers_digest else None
+        if digest is not None:
+            handlers.append(digest.build())
         return tuple(handlers)
+
+    @property
+    def answers_digest(self) -> bool:
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
+        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
+        decide from one rule (BACKLOG #2989)."""
+        return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
         """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""
@@ -2519,7 +2486,8 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal).
+    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
+    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
@@ -2598,6 +2566,16 @@ def proxy_config_from_settings(
 
 # --- ECH egress route (ADR 0139, ASVS 12.1.5) ---------------------------------------------------------
 
+#: Where a refused ``ech_sidecar`` value is told to put a credential instead (BACKLOG #5528). Not
+#: the connection's ``basic_user`` or ``bearer_token``: the general remedy would send a credential
+#: meant for the sidecar on through it to the partner. The one text for the resolver below and,
+#: through it, the egress gate.
+_ECH_SIDECAR_CREDENTIAL_USE = (
+    "the sidecar's own configuration (the engine has no setting for a credential meant for the "
+    "sidecar; this connection's own Authorization header and any token-endpoint request reach "
+    "the sidecar too, on their way upstream)"
+)
+
 
 def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     """The loopback ECH-sidecar base URL for this connection (ADR 0139), or ``None`` when ``ech_egress``
@@ -2624,6 +2602,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     this accepts is a host no opener sends through a proxy. That covers the token-endpoint hop too,
     which is re-addressed to the sidecar on the token provider's opener.
 
+    A credential in the URL is refused too, by :func:`refuse_url_credentials` with the remedy
+    :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
+    host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
+    So, in fixed words that quote no part of the value, are at least a space or control character,
+    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
+
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
     if not s.get("ech_egress"):
@@ -2635,15 +2619,39 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
+    # urlsplit deletes a tab, CR or LF inside a URL and urllib does not, so the egress gate would
+    # judge `127.0.0.1\t:8123` as port 8123 while the dial fails on every message (BACKLOG #5528).
+    if any(c.isspace() or not c.isprintable() for c in sidecar):
+        raise ValueError(
+            "ech_sidecar holds a space or a control character; write the URL without one (ADR 0139)"
+        )
     # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
     # (BACKLOG #2686).
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    refuse_url_credentials(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
+    # Each request is this URL with the upstream path appended, so a query would carry the real
+    # path inside it and its own text to the sidecar every time, and a fragment would send every
+    # request to '/' (BACKLOG #5528). Refused anywhere, empty included, as parse_proxy_url does.
+    if "?" in sidecar or "#" in sidecar:
         raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
-            "(ADR 0139)"
+            "ech_sidecar must not hold a query or a fragment ('?' or '#'); write the sidecar's "
+            "base URL alone (ADR 0139)"
         )
-    if not is_never_proxied_host(parsed.hostname):
+    # http.client encodes the request line as ASCII, so a non-ASCII path would fail every send
+    # the gate admitted. After the credential screen, which gives its own remedy for one.
+    if not sidecar.isascii():
+        raise ValueError(
+            "ech_sidecar holds a non-ASCII character; write the URL in ASCII (ADR 0139)"
+        )
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("ech_sidecar must be an http(s):// loopback URL with a host (ADR 0139)")
+    # A '%' in the host is refused with it (BACKLOG #5528): urlsplit keeps an IPv6 zone ID encoded
+    # and urllib decodes it before it dials, so `[::1%31]` reads as loopback here and dials `::11`.
+    if "%" in parsed.hostname or not is_never_proxied_host(parsed.hostname):
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
@@ -2659,7 +2667,9 @@ def ech_sidecar_is_cleartext(sidecar: str) -> bool:
     resolver used, never a string prefix, so the two cannot read one value differently. What such
     a hop carries, and why it is listed although it is loopback, is in
     ``docs/SECURITY-LOOSENING.md``."""
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
     return parsed.scheme == "http"
 
 
@@ -2766,6 +2776,14 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
+        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
+
+        digest_selected = refuse_http_digest_conflicts(s)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
@@ -2774,6 +2792,26 @@ class RestDestination(DestinationConnector):
             raise ValueError(
                 "ech_egress and proxy_url are mutually exclusive — the ECH sidecar IS this connection's "
                 "egress path (ADR 0139)"
+            )
+        # Vault BACKLOG #2977 item 8: the sidecar, not the engine, makes the TLS connection to the
+        # destination, so verify_tls=false turns off no verification the engine does. It used to skip
+        # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
+        # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
+        # connection that never builds. No attestation crosses it, as with proxy_url above.
+        verify = bool_setting(s, "verify_tls", default=True)
+        if self._ech_sidecar is not None and not verify:
+            raise ValueError(
+                "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
+                "engine, makes this connection's TLS connection to the destination (ADR 0139)"
+            )
+        # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
+        # Digest handler is folded into, so the connection used to build and deliver with no Digest
+        # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
+        # on self.url, and the ECH request goes to the sidecar URL, so no challenge would match.
+        if self._ech_sidecar is not None and digest_selected:
+            raise HttpAuthError(
+                f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
+                "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
@@ -2822,6 +2860,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="REST destination")
@@ -2860,7 +2903,6 @@ class RestDestination(DestinationConnector):
                 credentials=(),
                 connection=config.name,
             )
-        verify = bool_setting(s, "verify_tls", default=True)
         if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
@@ -2911,11 +2953,7 @@ class RestDestination(DestinationConnector):
 
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
@@ -3064,7 +3102,7 @@ class RestDestination(DestinationConnector):
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
         # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        # mints and gates the same way (BACKLOG #5526).
         try:
             enforce_send_time_length_limits(
                 req.full_url,

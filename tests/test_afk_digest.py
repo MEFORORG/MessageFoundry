@@ -21,6 +21,7 @@ import pytest
 from tests._fake_gh import (
     COORD,
     GUARDED_TIMEOUT_S,
+    ROOT,
     Sandbox,
     id_day,
     make_sandbox,
@@ -56,6 +57,10 @@ def sb(tmp_path: Path) -> Sandbox:
     s.set_state(variables={"MEFOR_AFK_KILL": "off"})
     # The cost rung reads this, never the host account's own usage files.
     write_fake_usage(tmp_path / "usage.ps1", {"state": "UNKNOWN", "reason": "test"}, code=20)
+    # The digest joins seat aliases through the roster and flags it missing, as a checkout has it.
+    roster = s.repo / "docs" / "roles"
+    roster.mkdir(parents=True)
+    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
     return s
 
 

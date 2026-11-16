@@ -142,8 +142,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   the Python CLI absent.
 - **Security settings editor** (*MessageFoundry: Edit Security Settings*) — a form over the service
   TOML's `[security]` posture switches via `messagefoundry security show|set`. Every switch defaults to
-  its secure position, and moving one to its insecure value shows a plain-language loosening warning in
-  place; changes take effect on the next engine restart.
+  its secure position, and moving one to its insecure value, or a session limit above its default,
+  shows a plain-language loosening warning in place; changes take effect on the next engine restart.
 - **Getting-started walkthrough** — VS Code's *Get Started with MessageFoundry*: nine cards from
   pointing at an engine and opening the config dir, through Connection → Route → Insert Element → Test
   Bench → Live Debug → Cookbook, to Stage → Promote.
@@ -194,16 +194,28 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   checkout the toolkit imports from the source tree, so nothing extra is installed.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
-  loads; the Alert Wizard and the security editor read/write their sections of it. Connection edits
+  loads; the Alert Wizard and the security editor read/write their sections of it. The security
+  editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
+  that passes through a link it can detect; set an outside file in user settings. The workspace
+  folder itself is taken as given, a link included: it is the first folder the workspace opens,
+  which a repository's `.code-workspace` file can set to any folder, the repository's own or not,
+  so a value that file sets can name a file outside the repository. It does not catch a user-set
+  alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
+  the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
-  user or workspace settings (a folder value is ignored), every connection edit passes it as
-  `--service-config`, whether or not the file exists, so a missing file fails the edit with
+  user or workspace settings (a folder value is ignored), every connection edit passes it, unless
+  it is blank, as `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
-  setting is passed too, and `connection` refuses it as blank. Setting it to the default name, in
+  setting leaves the flag off for connection edits, as it does for Start and Restart. A blank
+  workspace value still hides a user value, so the default file applies, not the user's. Setting it to the default name, in
   user settings too, counts as set, so a workspace without that file cannot save a connection edit
   until the file exists or the setting is cleared. The flag is left off at least when
-  the setting is unset; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
-  one, the file this setting's default names, and no file if not.
+  the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
+  one, the file this setting's default names, and no file if not. The status bar's Start and
+  Restart pass the same value as `--service-config`, and refuse one that names no existing file
+  before they start or stop anything. A relative value is read from the workspace folder. A value set to the default name counts too, so in
+  a workspace without that file they refuse rather than offer to create a new engine; clear the
+  setting to get that offer back.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
   cannot retarget a promote, and with it your credentials, at another host). https by default

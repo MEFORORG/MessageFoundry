@@ -75,6 +75,7 @@ def _clean_record(*, fuse_mode: bool, mode: str, count: int) -> ConnScaleRecord:
         batch_mode=False,
         mode=mode,
         count=count,
+        trial=0,
         aggregate_rate=5.0,
         metrics_counters=Counters(sent=4, acked=4, sink_received=4),
         ack_hist=Histogram(),

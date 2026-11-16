@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -32,6 +33,7 @@ _EXPECTED = {
     "README.md",
     "requirements.txt",
     "requirements-dev.txt",
+    "requirements-audit.lock",
     ".gitignore",
     ".gitattributes",
     ".vscode/settings.json",
@@ -335,8 +337,9 @@ from messagefoundry.security.audit_all_platforms import main
 
 def run(cmd):
     if "pip_audit" in cmd:
-        audited = Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")
-        Path(os.environ["AUDITED"]).write_text(audited, encoding="utf-8")
+        # Bytes, since the auditor writes its copy in the lock's declared encoding.
+        audited = Path(cmd[cmd.index("-r") + 1]).read_bytes()
+        Path(os.environ["AUDITED"]).write_bytes(audited)
     return 0
 
 sys.exit(main(sys.argv[1:], run=run))
@@ -366,22 +369,35 @@ _STEP_RUNS: dict[str | None, Callable[[bool, bool, dict[str, str]], bool]] = {
     "${{ !cancelled() }}": lambda failed, lock, outcome: True,
     f"${{{{ !cancelled() && {_LOCK_PRESENT} }}}}": lambda failed, lock, outcome: lock,
     f"${{{{ !cancelled() && {_NO_LOCK} }}}}": lambda failed, lock, outcome: not lock,
-    "${{ !cancelled() && steps.engine.outcome == 'success' }}": lambda failed, lock, outcome: (
-        outcome.get("engine") == "success"
+    "${{ !cancelled() && steps.auditor.outcome == 'success' }}": lambda failed, lock, outcome: (
+        outcome.get("auditor") == "success"
+    ),
+    f"${{{{ !cancelled() && steps.auditor.outcome == 'success' && {_NO_LOCK} }}}}": lambda failed, lock, outcome: (
+        outcome.get("auditor") == "success" and not lock
+    ),
+    f"${{{{ !cancelled() && steps.auditor.outcome == 'success' && {_LOCK_PRESENT} }}}}": lambda failed, lock, outcome: (
+        outcome.get("auditor") == "success" and lock
+    ),
+    "${{ !cancelled() && steps.engine.outcome == 'success' && steps.auditor.outcome == 'success' }}": (
+        lambda failed, lock, outcome: outcome.get("engine") == outcome.get("auditor") == "success"
     ),
 }
 
 _INSTALL_ENGINE = "Install the engine alone, from its locked hashes, for its auditor"
+_STALE = "Check requirements.lock is not stale against requirements.txt"
+_INSTALL_AUDITOR = "Install pip-audit from its locked hashes"
+_AUDIT_TOOLS = "Audit pip-audit's own locked pins"
 _AUDIT_TXT = "Audit requirements.txt as Windows resolves it"
 _AUDIT_TXT_PINS = "Audit the pins of requirements.txt as written"
 _AUDIT_LOCK = "Audit every pin of requirements.lock, whatever its marker"
-_PIP_AUDIT = "pip-audit==2.10.1"
+_INSTALL_AUDITOR_RUN = "python -m pip install --require-hashes -r requirements-audit.lock"
+_AUDIT_TOOLS_RUN = "pip-audit -r requirements-audit.lock --desc --disable-pip --strict"
 
 
 def _run_audit_job(
     scaffolded_ci: tuple[str, Path, dict[str, Any]],
     tmp_path: Path,
-    lock: str | None,
+    lock: str | bytes | None,
     fail_env: dict[str, str] | None = None,
     requirements: str = "messagefoundry==0.5.1\n",
     lock_encoding: str = "utf-8",
@@ -389,13 +405,18 @@ def _run_audit_job(
     """Run the audit job's ``run`` steps in order, as GitHub decides which run.
 
     Returns the stub log, the copy pip-audit was handed, the output, and the steps that failed.
-    ``$RUNNER_TEMP`` is ``tmp_path / "runner-temp"``.
+    ``$RUNNER_TEMP`` is ``tmp_path / "runner-temp"``. ``lock`` as bytes is written as given.
     """
     bash, root, jobs = scaffolded_ci
     work = tmp_path / "work"
     work.mkdir()
     (work / "requirements.txt").write_text(requirements, encoding="utf-8")
-    if lock is not None:
+    # The scaffolded repo's own file, as the job's checkout has it.
+    audit_lock = (root / "repo" / "requirements-audit.lock").read_bytes()
+    (work / "requirements-audit.lock").write_bytes(audit_lock)
+    if isinstance(lock, bytes):
+        (work / "requirements.lock").write_bytes(lock)
+    elif lock is not None:
         (work / "requirements.lock").write_text(lock, encoding=lock_encoding)
     recorder = tmp_path / "recorder.py"
     recorder.write_text(_AUDIT_RECORDER, encoding="utf-8")
@@ -438,7 +459,9 @@ def _lock_calls(tmp_path: Path) -> list[str]:
     return [
         "python -I -",
         f"python -m pip install --no-deps --require-hashes -r {pin}",
-        f"python -m pip install {_PIP_AUDIT}",
+        "python -I -",  # the stale-lock check
+        _INSTALL_AUDITOR_RUN,
+        _AUDIT_TOOLS_RUN,
         "pip-audit -r requirements.txt --desc --disable-pip --no-deps",
         "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",
     ]
@@ -464,7 +487,12 @@ def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
     assert runs[_INSTALL_ENGINE].endswith(
         '\npython -m pip install --no-deps --require-hashes -r "$RUNNER_TEMP/engine-pin.txt"\n'
     )
-    assert runs["Install pip-audit"] == f"python -m pip install {_PIP_AUDIT}"
+    # Vault BACKLOG #3786: the auditor's own closure is hash-pinned, not `pip install
+    # pip-audit==2.10.1` resolving its dependencies live; and, pinned, it is audited too.
+    assert runs[_INSTALL_AUDITOR] == _INSTALL_AUDITOR_RUN
+    assert runs[_AUDIT_TOOLS] == _AUDIT_TOOLS_RUN
+    assert not [r for r in runs.values() if "pip install pip-audit" in r]
+    assert runs[_STALE].startswith("python -I - <<'PY'\n")
     assert runs[_AUDIT_TXT] == "pip-audit -r requirements.txt --desc"
     assert runs[_AUDIT_TXT_PINS].endswith(
         "\npip-audit -r requirements.txt --desc --disable-pip --no-deps\n"
@@ -536,14 +564,19 @@ def test_with_a_lock_nothing_is_resolved_and_only_the_engine_pin_is_installed(
     live and unhashed; requirements.txt is now audited as written, with ``--disable-pip
     --no-deps``. Finding 2: installing the whole lock into the interpreter that then runs pip and
     pip-audit ran each locked package's ``.pth`` hook inside the auditor, so only the engine's own
-    hashed pin is installed there. pip-audit's own dependencies still resolve live; that is not
-    this test's subject.
+    hashed pin is installed there. pip-audit's own closure is installed and audited from
+    requirements-audit.lock, which is not this test's subject.
     """
     calls, _, _, failed = _run_audit_job(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
     assert not failed
     audits = [c for c in calls if c.startswith("pip-audit ")]
-    assert audits == ["pip-audit -r requirements.txt --desc --disable-pip --no-deps"]
-    installs = [c for c in calls if c.startswith("python -m pip install")]
+    assert audits == [
+        _AUDIT_TOOLS_RUN,
+        "pip-audit -r requirements.txt --desc --disable-pip --no-deps",
+    ]
+    installs = [
+        c for c in calls if c.startswith("python -m pip install") and c != _INSTALL_AUDITOR_RUN
+    ]
     assert not [c for c in installs if "requirements" in c], installs
     pin = (tmp_path / "runner-temp" / "engine-pin.txt").read_text(encoding="utf-8")
     assert pin == "messagefoundry==0.5.1 \\\n    --hash=sha256:aaaa\n"
@@ -572,9 +605,13 @@ def test_an_included_requirements_file_is_refused_and_the_lock_still_audited(
         _ADOPTER_LOCK,
         requirements="messagefoundry==0.5.1\n-r handlers.txt\n",
     )
-    assert failed == [_AUDIT_TXT_PINS]
+    # The stale-lock check reads no included file either, so it fails too.
+    assert failed == [_STALE, _AUDIT_TXT_PINS]
+    assert "::error::-r handlers.txt includes another requirements file" in output
     assert "::error::requirements.txt includes another file" in output
-    assert calls == [c for c in _lock_calls(tmp_path) if not c.startswith("pip-audit ")]
+    assert calls == [
+        c for c in _lock_calls(tmp_path) if not c.startswith("pip-audit -r requirements.txt")
+    ]
     assert audited.exists()
 
 
@@ -596,8 +633,10 @@ def test_a_lock_without_one_engine_pin_is_refused_by_name(
     assert (
         f"::error::requirements.lock must pin messagefoundry once; it pins it {times} times"
     ) in output
-    assert failed == [_INSTALL_ENGINE] and not audited.exists()
-    assert calls[:2] == ["python -I -", f"python -m pip install {_PIP_AUDIT}"]
+    # A lock with no engine pin is also stale against a requirements.txt that pins the engine.
+    assert failed == [_INSTALL_ENGINE, *([_STALE] if times == 0 else [])]
+    assert not audited.exists()
+    assert calls[:3] == ["python -I -", "python -I -", _INSTALL_AUDITOR_RUN]
     assert not (tmp_path / "runner-temp" / "engine-pin.txt").exists()
 
 
@@ -609,7 +648,7 @@ def test_a_failed_engine_install_skips_only_the_lock_audit(
     calls, audited, _, failed = _run_audit_job(
         scaffolded_ci, tmp_path, _ADOPTER_LOCK, {"FAIL_ON": install}
     )
-    assert calls == _lock_calls(tmp_path)[:4]
+    assert calls == _lock_calls(tmp_path)[:-1]
     assert failed == [_INSTALL_ENGINE] and not audited.exists()
 
 
@@ -620,7 +659,259 @@ def test_a_requirements_txt_finding_does_not_hide_the_lock_audit(
         scaffolded_ci, tmp_path, _ADOPTER_LOCK, {"PIP_AUDIT_FINDS": "1"}
     )
     assert calls == _lock_calls(tmp_path)
-    assert failed == [_AUDIT_TXT_PINS] and audited.exists()
+    # The stub finds an advisory in every file it audits, the auditor's own lock included.
+    assert failed == [_AUDIT_TOOLS, _AUDIT_TXT_PINS] and audited.exists()
+
+
+@pytest.mark.parametrize("lock", [_ADOPTER_LOCK, None], ids=["lock", "no-lock"])
+def test_a_failed_auditor_install_is_the_one_failure_named(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path, lock: str | None
+) -> None:
+    """Every pip-audit step waits on the install, so none fails again with no auditor to run."""
+    calls, audited, _, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, lock, {"FAIL_ON": _INSTALL_AUDITOR_RUN[len("python ") :]}
+    )
+    assert calls[-1] == _INSTALL_AUDITOR_RUN
+    assert not [c for c in calls if "pip-audit " in c or "audit_all_platforms" in c], calls
+    assert failed == [_INSTALL_AUDITOR] and not audited.exists()
+
+
+#: The adopter lock, plus a pin under a marker that holds on every host, for the range cases.
+_STALE_LOCK = _ADOPTER_LOCK + "pyyaml==6.0.3 ; python_version >= '3' \\\n    --hash=sha256:eeee\n"
+
+#: (requirements.txt, the ::error:: it must raise or None for a clean pass, a ::notice:: or None).
+#: The markers hold, or fail, on every host this suite runs on, as on the job's Windows runner.
+_STALE_CASES = [
+    ("messagefoundry==0.5.1\n", None, None),
+    # Versions compare as pip compares them, and the spelling and comment around a pin do not count.
+    ("MessageFoundry == 0.5.1.0  # the engine\n", None, None),
+    # A version or marker pip joins in from a continuation line is read, joined as pip joins it.
+    ("messagefoundry \\\n    ==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    ("messagefoundry==0.\\\n6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    # pip strips the backslash from a file's last line too, with or without a final newline.
+    ("messagefoundry==0.6.0 \\\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    ("messagefoundry==0.6.0 \\", "requirements.txt asks for messagefoundry==0.6.0", None),
+    # A comment that ends a continued line is joined after a space, so it is stripped as a comment.
+    (
+        "messagefoundry==0.6.0\\\n# see https://host.invalid/notes\n",
+        "requirements.txt asks for messagefoundry==0.6.0",
+        None,
+    ),
+    # pip expands ${VAR}; an unset one is left as written, which no parser reads.
+    (
+        "messagefoundry==${MF_UNSET_3786}\n",
+        "messagefoundry==${MF_UNSET_3786} is not a requirement",
+        None,
+    ),
+    ("messagefoundry==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    (
+        "messagefoundry==0.5.1\nacme-hl7-utils==1.2\n",
+        "acme-hl7-utils is in requirements.txt but not in requirements.lock",
+        None,
+    ),
+    # A range must be met by the locked version. pyyaml's lock pin is marked, under a marker that
+    # holds on every host, so a marked pin whose marker holds is counted wherever this runs.
+    ("messagefoundry==0.5.1\npyyaml>=6.0\n", None, None),
+    ("messagefoundry==0.5.1\npyyaml>=6.1\n", "requirements.txt asks for pyyaml>=6.1", None),
+    # A marker that holds here is checked like any other requirement.
+    (
+        "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version >= '3'\n",
+        "uvloop is in requirements.txt but not in requirements.lock",
+        None,
+    ),
+    (
+        "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version < '3'\n",
+        None,
+        "uvloop's marker is false on this runner, so it is not checked",
+    ),
+    (
+        "messagefoundry[fhir]==0.5.1\n",
+        None,
+        "messagefoundry's extras are not checked: requirements.lock records none",
+    ),
+    (
+        "messagefoundry==0.5.1\nhttps://host.invalid/acme-1.0-py3-none-any.whl\n",
+        None,
+        "https://host.invalid/acme-1.0-py3-none-any.whl names no package",
+    ),
+    # An editable line installs a source tree or a checkout, which no lock pin holds.
+    (
+        "messagefoundry==0.5.1\n-e git+https://host.invalid/acme.git#egg=acme\n",
+        None,
+        "-e git+https://host.invalid/acme.git#egg=acme is editable, so it is not checked",
+    ),
+    (
+        "messagefoundry==0.5.1\n--editable ./acme\n",
+        None,
+        "--editable ./acme is editable, so it is not checked",
+    ),
+    # pip's own parser reads the options: a cut long name and a tab, and no other option is one.
+    ("messagefoundry==0.5.1\n--ed\t./acme\n", None, "--ed\t./acme is editable"),
+    # pip takes the editable as the line's requirement and follows no file named beside it.
+    ("messagefoundry==0.5.1\n-e ./acme -r extra.txt\n", None, "-e ./acme -r extra.txt is editable"),
+    ("messagefoundry==0.5.1\n-e ./acme -c extra.txt\n", None, "-e ./acme -c extra.txt is editable"),
+    ("messagefoundry==0.5.1\n--extra-index-url https://host.invalid/simple\n", None, None),
+    # A line is printed as written, before ${VAR} expansion, and in any script the runner's
+    # console cannot encode.
+    (
+        "messagefoundry==0.5.1\n-e git+https://${MF_SET_8171}@host.invalid/acme.git#egg=acme\n",
+        None,
+        "-e git+https://${MF_SET_8171}@host.invalid/acme.git#egg=acme is editable",
+    ),
+    (
+        "messagefoundry==0.5.1\nhttps://${MF_SET_8171}@host.invalid/acme-1.0-py3-none-any.whl\n",
+        None,
+        "https://${MF_SET_8171}@host.invalid/acme-1.0-py3-none-any.whl names no package",
+    ),
+    ("messagefoundry==0.5.1\n-e ./caf中\n", None, "-e ./caf"),
+    ("messagefoundry==0.5.1\n-acme==1.0\n", "-acme==1.0 is not a line pip can read", None),
+    # pip's own option checks raise their own error, which reads the same.
+    ("messagefoundry==0.5.1\n--no-binary -x\n", "--no-binary -x is not a line pip can read", None),
+    # pip leaves an empty variable as written.
+    (
+        "messagefoundry==${MF_EMPTY_8171}0.5.1\n",
+        "messagefoundry==${MF_EMPTY_8171}0.5.1 is not a requirement",
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(("requirements", "error", "notice"), _STALE_CASES)
+def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]],
+    tmp_path: Path,
+    requirements: str,
+    error: str | None,
+    notice: str | None,
+) -> None:
+    """Vault BACKLOG #3786 (R2-1): with a lock, nothing resolves requirements.txt, so a lock left
+    behind by a change to it audited the old closure and nothing said so."""
+    calls, audited, output, failed = _run_audit_job(
+        scaffolded_ci,
+        tmp_path,
+        _STALE_LOCK,
+        {"MF_SET_8171": "s3cr3t-8171", "MF_EMPTY_8171": ""},
+        requirements,
+    )
+    assert "s3cr3t-8171" not in output
+    assert failed == ([_STALE] if error else []), output
+    if error:
+        assert f"::error::{error}" in output and "; regenerate requirements.lock" in output
+    assert (f"::notice::{notice}" in output) if notice else ("::notice::" not in output)
+    assert calls == _lock_calls(tmp_path) and audited.exists()
+
+
+_INCLUDE = (
+    "includes another requirements file, which this check does not follow;"
+    " move that file's lines into requirements.txt"
+)
+_CONSTRAINT = (
+    "names a constraints file, which this check does not follow;"
+    " remove the line only once its limits apply elsewhere, as the engine's docs/ADOPTER-CI.md,"
+    " Job 3, says: for a file other than requirements.lock, pass `-c FILE` to every command that"
+    " writes requirements.lock and keep it in the README's, and for any file, make every install"
+    " of requirements.txt apply"
+    " the lock (Job 3 says what the VS Code extension's setup needs), with"
+    " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
+    " --require-hashes -r requirements.lock in its place, using a lock that covers that install's"
+    " platform"
+)
+
+#: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
+#: pip's own parser reads each as an include or a constraint, abbreviated or attached as pip allows.
+#: Not every spelling: pip can also read a line as one when a ${VAR} nested in another variable's
+#: value expands to the option, and this step, which expands each ${VAR} once, does not.
+_INCLUDE_CASES = [
+    ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
+    ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),
+    ("--constr extra.txt", f"--constr extra.txt {_CONSTRAINT}", False),
+    ("-r extra.txt", f"-r extra.txt {_INCLUDE}", True),
+    ("--requirement=extra.txt", f"--requirement=extra.txt {_INCLUDE}", True),
+    ("-c extra.txt", f"-c extra.txt {_CONSTRAINT}", False),
+    ("--constraint=extra.txt", f"--constraint=extra.txt {_CONSTRAINT}", False),
+    ("-rextra.txt", f"-rextra.txt {_INCLUDE}", True),
+    ("-cextra.txt", f"-cextra.txt {_CONSTRAINT}", False),
+    # Lander hold 11 on PR 2840: refusing it fails closed, and while it is there the old lock
+    # constrains its own regeneration. Hold 12: an install that does not apply the lock resolves
+    # live once it is gone, so the remedy says to remove it only once every install applies the lock.
+    ("-c requirements.lock", f"-c requirements.lock {_CONSTRAINT}", False),
+    # pip follows the include when a line names both.
+    ("-c other.txt -r extra.txt", f"-c other.txt -r extra.txt {_INCLUDE}", False),
+    # Printed as written, before ${VAR} expansion.
+    (
+        "--constr ${MF_SET_8171}/extra.txt",
+        f"--constr ${{MF_SET_8171}}/extra.txt {_CONSTRAINT}",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(("line", "error", "grepped"), _INCLUDE_CASES)
+def test_an_include_or_constraint_line_fails_the_stale_check(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]],
+    tmp_path: Path,
+    line: str,
+    error: str,
+    grepped: bool,
+) -> None:
+    """Vault BACKLOG #8171: the check opens no file a line names. An included file's pins reach
+    the install and a constraints file limits the versions pip picks, so neither can be checked
+    against the lock, and the line fails with a remedy of its own: no new lock would clear it."""
+    lock = _STALE_LOCK + "foo==1.0 \\\n    --hash=sha256:ffff\n"
+    calls, audited, output, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, lock, {"MF_SET_8171": "s3cr3t-8171"}, f"foo==1.0\n{line}\n"
+    )
+    assert "s3cr3t-8171" not in output
+    assert failed == [_STALE, *([_AUDIT_TXT_PINS] if grepped else [])], output
+    assert f"::error::{error}" in output and "regenerate requirements.lock" not in output
+    assert calls == [
+        c
+        for c in _lock_calls(tmp_path)
+        if not (grepped and c.startswith("pip-audit -r requirements.txt"))
+    ]
+    assert audited.exists()
+
+
+def test_each_error_keeps_its_own_remedy_in_file_order(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """A stale pin and a constraint line in one file: each error names its own remedy."""
+    _, _, output, failed = _run_audit_job(
+        scaffolded_ci,
+        tmp_path,
+        _STALE_LOCK,
+        requirements="messagefoundry==0.5.1\n-c extra.txt\nacme-hl7-utils==1.2\n",
+    )
+    assert failed == [_STALE], output
+    errors = [ln for ln in output.splitlines() if ln.startswith("::error::")]
+    assert errors == [
+        f"::error::-c extra.txt {_CONSTRAINT}",
+        "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock;"
+        " regenerate requirements.lock from requirements.txt, keeping any `-c FILE` in the lock command",
+    ]
+
+
+def test_a_lock_pin_whose_marker_is_false_here_covers_nothing(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """The runner's install skips such a pin, so the requirement is not in the lock it installs."""
+    lock = _ADOPTER_LOCK + "acme-hl7-utils==1.2 ; python_version < '3' \\\n    --hash=sha256:dddd\n"
+    _, _, output, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, lock, requirements="messagefoundry==0.5.1\nacme-hl7-utils==1.2\n"
+    )
+    assert failed == [_STALE], output
+    assert "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock" in output
+
+
+def test_an_engine_pin_is_taken_from_a_lock_with_a_pep_263_declaration(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3786 L3: pip decodes by the declaration, so the job's reader does too."""
+    lock = b"# -*- coding: latin-1 -*-\n# note: caf\xe9\n" + _ADOPTER_LOCK.encode("ascii")
+    calls, _, output, failed = _run_audit_job(scaffolded_ci, tmp_path, lock)
+    assert (calls, failed) == (_lock_calls(tmp_path), []), output
+    pin = (tmp_path / "runner-temp" / "engine-pin.txt").read_text(encoding="utf-8")
+    assert pin == "messagefoundry==0.5.1 \\\n    --hash=sha256:aaaa\n"
 
 
 def test_the_scaffolded_audit_job_without_a_lock_audits_requirements_txt(
@@ -628,10 +919,7 @@ def test_the_scaffolded_audit_job_without_a_lock_audits_requirements_txt(
 ) -> None:
     """The control: the engine-only default is resolved and audited by pip-audit on the runner."""
     calls, audited, output, failed = _run_audit_job(scaffolded_ci, tmp_path, None)
-    assert calls == [
-        f"python -m pip install {_PIP_AUDIT}",
-        "pip-audit -r requirements.txt --desc",
-    ]
+    assert calls == [_INSTALL_AUDITOR_RUN, _AUDIT_TOOLS_RUN, "pip-audit -r requirements.txt --desc"]
     assert not audited.exists() and not failed
     # SEC-021: the unhashed default warns that the closure resolves live.
     assert "::warning::No requirements.lock" in output
@@ -642,7 +930,75 @@ def test_without_a_lock_a_finding_fails_the_job(
 ) -> None:
     calls, _, _, failed = _run_audit_job(scaffolded_ci, tmp_path, None, {"PIP_AUDIT_FINDS": "1"})
     assert calls[-1] == "pip-audit -r requirements.txt --desc"
-    assert failed == [_AUDIT_TXT]
+    assert failed == [_AUDIT_TOOLS, _AUDIT_TXT]
+
+
+def _closure_blocks(lock: str, root: str) -> dict[str, str]:
+    """Each package ``root`` needs in a uv export, by its ``# via`` notes, as its pin and hash lines.
+
+    The oracle for the shipped auditor lock, and the way to rebuild it: written here rather than
+    in the toolkit, which never needs it at run time.
+    """
+
+    def canonical(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    blocks: dict[str, list[str]] = {}
+    needed_by: dict[str, set[str]] = {}
+    name, in_via = "", False
+    for line in lock.splitlines(keepends=True):
+        if line[:1].isalnum():
+            name, in_via = canonical(re.split(r"[=\s;\[]", line, maxsplit=1)[0]), False
+            blocks[name], needed_by[name] = [line], set()
+        elif name and line.strip().startswith("--hash="):
+            blocks[name].append(line)
+        elif name and (via := re.fullmatch(r"\s*# via\s*(\S*)\s*", line)):
+            in_via = True
+            needed_by[name] |= {canonical(via[1])} if via[1] else set()
+        elif name and in_via and (more := re.fullmatch(r"\s*#\s+(\S+)\s*", line)):
+            needed_by[name].add(canonical(more[1]))
+    closure = {canonical(root)}
+    while grown := {n for n, by in needed_by.items() if by & closure} - closure:
+        closure |= grown
+    return {n: "".join(blocks[n]) for n in closure}
+
+
+_SCANNER_LOCK = Path(__file__).resolve().parents[1] / "ci" / "locks" / "ci-scanners.lock"
+_TOOL_LOCK = (
+    Path(__file__).resolve().parents[1] / "messagefoundry_toolkit" / "requirements-audit.lock"
+)
+_GENERATED_BELOW = "# --- the pins below are generated;"
+
+
+def _blocks_of(text: str) -> dict[str, str]:
+    """The shipped lock's pin blocks after its header, by canonical name."""
+    body = text.split(_GENERATED_BELOW, 1)[1].split("\n", 1)[1]
+    blocks = [b for b in re.split(r"(?m)^(?=[A-Za-z0-9])", body) if b.strip()]
+    return {
+        re.sub(r"[-_.]+", "-", re.split(r"[=\s;\[]", b, maxsplit=1)[0]).lower(): b for b in blocks
+    }
+
+
+def test_the_shipped_auditor_lock_is_pip_audits_closure_with_hashes() -> None:
+    """Vault BACKLOG #3786: the scaffolded job's pip-audit closure is hash-pinned.
+
+    The names must be what the engine's own scanner lock says pip-audit needs, and pip-audit's
+    version the one that lock pins, the contract version of the engine's own gate. The other
+    versions may lag that lock, which Dependabot moves weekly: the adopter's job audits this file,
+    so a lagging pin with an advisory fails there. A pin at the version that lock pins must carry
+    exactly its hashes. To rebuild it, write the header and then
+    ``"".join(block for _, block in sorted(_closure_blocks(scanner_lock, "pip-audit").items()))``.
+    """
+    scanner = _closure_blocks(_SCANNER_LOCK.read_text(encoding="utf-8"), "pip-audit")
+    shipped = _blocks_of(_TOOL_LOCK.read_text(encoding="utf-8"))
+    assert len(scanner) >= 10, sorted(scanner)  # the via-graph walk found a closure
+    assert "bandit" not in scanner and "pip" in scanner  # and only pip-audit's
+    assert sorted(shipped) == sorted(scanner)
+    assert shipped["pip-audit"].split(" ", 1)[0] == scanner["pip-audit"].split(" ", 1)[0]
+    for name, block in shipped.items():
+        assert re.search(r"(?m)^\s+--hash=sha256:[0-9a-f]{64}", block), name
+        if block.split(" ", 1)[0] == scanner[name].split(" ", 1)[0]:
+            assert block.strip() == scanner[name].strip(), name
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

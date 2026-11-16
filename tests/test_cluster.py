@@ -17,11 +17,18 @@ import re
 import textwrap
 import time
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from messagefoundry.config.fingerprint import (
+    FINGERPRINT_SCHEME,
+    config_fingerprint,
+    shared_digest_of,
+    shared_digest_text,
+)
 from messagefoundry.config.settings import ClusterSettings, EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, WiringError, load_config
 from messagefoundry.pipeline import wiring_runner
@@ -36,6 +43,7 @@ from messagefoundry.pipeline.cluster import (
     has_promotable_sibling,
     heartbeat_is_fresh,
     members_from_node_rows,
+    stamped_config_digest,
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.engine import Engine, ReloadOutcome
@@ -88,7 +96,10 @@ class _NotLeaderCoordinator:
     def config_version_cached(self) -> int:
         return 0
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        return None
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         return 0
 
     async def cluster_members(self) -> list[ClusterMember]:
@@ -842,8 +853,10 @@ async def test_null_coordinator_config_version_is_zero_and_bump_noop() -> None:
     coord = NullCoordinator()
     assert await coord.config_version() == 0
     assert coord.config_version_cached() == 0
-    assert await coord.bump_config_version() == 0  # no-op, still 0 (nothing to coordinate)
+    # no-op, still 0 (nothing to coordinate), and no digest is kept beside it (vault BACKLOG #3109)
+    assert await coord.bump_config_version(digest="d") == 0
     assert coord.config_version_cached() == 0
+    assert coord.config_digest_cached(0) is None
 
 
 def test_db_coordinator_is_clustered() -> None:
@@ -1136,13 +1149,19 @@ class _BumpRecordingCoordinator(_NotLeaderCoordinator):
         super().__init__()
         self.bumps = 0
         self._version = 0
+        # The digest stored with _version, as the shared row holds the pair (vault BACKLOG #3109).
+        self._digest: str | None = None
 
     async def config_version(self) -> int:
         return self._version
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        return self._digest if version == self._version else None
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         self.bumps += 1
         self._version += 1
+        self._digest = digest
         return self._version
 
 
@@ -1294,6 +1313,270 @@ class _SiblingBumpCoordinator(_BumpRecordingCoordinator):
 
     def config_version_cached(self) -> int:
         return self._version
+
+
+async def test_the_initiators_digest_rides_the_bump_to_a_followers_convergence_outcome(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109 step 1: an operator reload stores its own digest with the version it
+    bumps, and a follower converging on that version hands its audit hook that digest beside its
+    own. The two nodes share one coordinator, as two nodes share the ``cluster_config`` row, and
+    load different bytes, so the pair is visibly two digests.
+
+    The digest is read with the version: once the shared row has moved on to a later bump, a
+    convergence on the earlier version names no initiator's digest rather than the later one's.
+    What is stored but is not a digest names none either, and is logged."""
+    coord = _SiblingBumpCoordinator()
+    engines: list[Engine] = []
+    for name in ("initiator", "follower"):
+        cfgdir = tmp_path / name
+        _minimal_config(cfgdir, tmp_path)
+        eng = await Engine.create(
+            tmp_path / f"{name}.db",
+            poll_interval=0.05,
+            config_dir=cfgdir,
+            coordinator=coord,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        eng.add_registry(load_config(cfgdir))
+        await eng.start()
+        engines.append(eng)
+        # The test drives each convergence itself; a live runner would add its own outcomes
+        # once its interval passed, as it can on a loaded machine.
+        assert eng._config_convergence is not None
+        await eng._config_convergence.stop()
+    initiator, follower = engines
+    outcomes: list[ReloadOutcome] = []
+
+    async def _audit(outcome: ReloadOutcome) -> None:
+        outcomes.append(outcome)
+
+    follower.convergence_reload_audit = _audit
+    try:
+        bumped = await initiator.reload_detail(propagate=True)
+        assert bumped.config_version == 1 and bumped.initiator_digest is None
+        stored = coord.config_digest_cached(1)
+        assert stored == shared_digest_text(initiator.loaded_config_fingerprint)
+        initiator_digest = shared_digest_of(stored)
+        assert initiator_digest is not None
+        assert initiator_digest["fingerprint"] == config_fingerprint(tmp_path / "initiator")
+        assert initiator_digest["scheme"] == FINGERPRINT_SCHEME
+        assert set(initiator_digest) == {"fingerprint", "scheme"}, "no files count, no git head"
+
+        await follower._converge_reload(coord.config_version_cached())
+        (converged,) = outcomes
+        assert converged.config_version == 1
+        assert converged.initiator_digest == initiator_digest
+        own = (converged.fingerprint or {}).get("fingerprint")
+        assert own == config_fingerprint(tmp_path / "follower") != initiator_digest["fingerprint"]
+
+        # The row has moved on to version 2 before a convergence on 1 reads it: no digest, since
+        # the one stored now is version 2's.
+        await initiator.reload_detail(propagate=True)
+        assert coord.config_version_cached() == 2 and coord.config_digest_cached(2) is not None
+        await follower._converge_reload(1)
+        assert outcomes[-1].config_version == 1 and outcomes[-1].initiator_digest is None
+
+        coord._digest = '{"fingerprint": 7}'  # stored, but not a digest
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await follower._converge_reload(2)
+            await follower._converge_reload(2)  # a retry of the same version
+        assert outcomes[-1].initiator_digest is None
+        assert caplog.text.count("is not a digest") == 1, "logged once per version"
+
+        # A coordinator that raises reading the digest costs the row its digest, never the reload.
+        def _raises(version: int) -> str | None:
+            raise RuntimeError("cache unreadable")
+
+        coord.config_digest_cached = _raises  # type: ignore[method-assign]
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await follower._converge_reload(3)
+        assert outcomes[-1].config_version == 3 and outcomes[-1].initiator_digest is None
+        assert "could not be read (RuntimeError)" in caplog.text
+    finally:
+        for eng in engines:
+            await eng.stop()
+
+
+def test_a_shared_digest_reads_back_only_as_a_digest() -> None:
+    """vault BACKLOG #3109: the text a bump stores keeps what a comparison needs and reads back as
+    that; another node wrote it, so anything else reads as no digest at all."""
+    detail: dict[str, object] = {
+        "fingerprint": "a" * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        "files": 3,
+        "git_head": "b" * 40,
+        "unreadable_files": ["x.py"],
+    }
+    text = shared_digest_text(detail)
+    assert shared_digest_of(text) == {
+        "fingerprint": "a" * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        "unreadable_files": ["x.py"],
+    }
+    assert shared_digest_text(None) is None
+    assert shared_digest_text({"scheme": FINGERPRINT_SCHEME, "files": 0}) is None, "no fold"
+    assert shared_digest_text({"fingerprint": "a" * 64}) is None, "no scheme: not comparable"
+    assert shared_digest_text({"fingerprint": "a" * 64, "scheme": ""}) is None, "empty scheme"
+    long_list = {"fingerprint": "a" * 64, "scheme": "s", "unreadable_files": ["x" * 70_000]}
+    assert shared_digest_text(long_list) is None, "over the bound: stored as unknown"
+    assert shared_digest_of(None) is None
+    assert shared_digest_of(7) is None, "not text"
+    fold = '"fingerprint": "' + "a" * 64 + '"'
+    assert shared_digest_of("{" + fold + ', "scheme": "s"}') is not None, "control: a digest"
+    for bad in (
+        "not json",
+        "[1]",
+        "{" + fold + "}",  # no scheme
+        "{" + fold + ', "scheme": ""}',  # an empty scheme
+        '{"fingerprint": "", "scheme": "s"}',  # no fold
+        '{"fingerprint": "f", "scheme": "s"}',  # a fold that is not a SHA-256 in hex
+        '{"fingerprint": "' + "A" * 64 + '", "scheme": "s"}',  # nor upper-case hex
+        "{" + fold + ', "scheme": "s", "unreadable_files": "x.py"}',  # not a list
+        "{" + fold + ', "scheme": "s", "unreadable_files": null}',  # a value it never writes
+        "{" + fold + ', "scheme": "s", "unreadable_files": []}',  # nor an empty list
+        "{" + fold + ', "scheme": "s", "files": 1}',  # a key it never writes
+        "{" + fold + ', "scheme": "s", "scheme": "t"}',  # a repeated key, read two ways
+        "{" + fold + ', "scheme": "' + "s" * 70_000 + '"}',  # over the bound
+        "[" * 5_000,  # json's depth limit, which is no ValueError, inside the length bound
+    ):
+        assert shared_digest_of(bad) is None, bad[:80]
+
+
+async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109: a digest the shared text cannot carry, such as one over the length
+    bound, is stored as unknown. The initiator logs it, since a follower reads the stored NULL as
+    a digest that was never taken."""
+    import messagefoundry.config.fingerprint as fingerprint_module
+
+    coord = _BumpRecordingCoordinator()
+    cfgdir = tmp_path / "cfg"
+    _minimal_config(cfgdir, tmp_path)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(load_config(cfgdir))
+    await eng.start()
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert coord.bumps == 1 and coord.config_digest_cached(1) is not None, "control"
+        assert "stored it as unknown" not in caplog.text
+        monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert coord.bumps == 2 and coord.config_digest_cached(2) is None
+        assert "stored it as unknown" in caplog.text
+
+        # A bump that fails stores nothing, so nothing is said to be stored.
+        async def _fails(*, digest: str | None) -> int:
+            raise RuntimeError("cluster_config is unreachable")
+
+        monkeypatch.setattr(coord, "bump_config_version", _fails)
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert "bump after reload failed" in caplog.text, "control: the bump was tried"
+        assert "stored it as unknown" not in caplog.text
+
+        # Past the swap, a fault preparing the digest fails nothing: the bump still runs, with
+        # the digest as unknown, whichever of the two reads raised.
+        def _raises(detail: object) -> None:
+            raise TypeError("not a digest mapping")
+
+        for name in ("shared_digest_text", "digest_coverage"):
+            monkeypatch.undo()
+            if name == "digest_coverage":
+                monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
+            monkeypatch.setattr(fingerprint_module, name, _raises)
+            bumps = coord.bumps
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+                outcome = await eng.reload_detail(propagate=True)
+            assert outcome.failures == () and coord.bumps == bumps + 1, name
+            assert outcome.config_version == coord.bumps
+            assert coord.config_digest_cached(coord.bumps) is None
+            assert "could not be prepared to share (TypeError)" in caplog.text, name
+            (record,) = [r for r in caplog.records if "prepared to share" in r.getMessage()]
+            assert record.levelname == "WARNING" and record.exc_info is not None
+    finally:
+        await eng.stop()
+
+
+@pytest.mark.parametrize("backend", ["DbCoordinator", "SqlServerCoordinator"])
+def test_a_bad_stamp_caches_the_new_version_with_no_digest(backend: str) -> None:
+    """vault BACKLOG #3109: the digest is advisory, so a row whose stamp cannot be read still moves
+    the cached version, beside no digest rather than the previous one."""
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    coord: DbCoordinator | SqlServerCoordinator = (
+        DbCoordinator(None, "n") if backend == "DbCoordinator" else SqlServerCoordinator(None, "n")
+    )
+    good = {"config_version": 4, "config_digest": "d4", "config_digest_version": 4}
+    assert coord._cache_config_row(good) == 4, "control"
+    assert coord.config_digest_cached(4) == "d4"
+    rows: tuple[dict[str, object], ...] = (
+        {"config_version": 5, "config_digest": "d5"},  # no stamp column
+        {"config_version": 6, "config_digest": "d6", "config_digest_version": "6"},
+        {"config_version": 7, "config_digest": "d7", "config_digest_version": 6},
+        {"config_version": 8, "config_digest": 8, "config_digest_version": 8},
+    )
+    for version, bad in enumerate(rows, start=5):
+        assert coord._cache_config_row(bad) == version
+        assert coord.config_version_cached() == version
+        assert coord.config_digest_cached(version) is None, bad
+
+
+@pytest.mark.parametrize("backend", ["DbCoordinator", "SqlServerCoordinator"])
+def test_a_stamp_fault_is_logged_once_per_version(
+    backend: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109: a fault that voids the digest is logged, once per version however
+    often the tick refreshes, and a stamp naming an older version is no fault."""
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    coord: DbCoordinator | SqlServerCoordinator = (
+        DbCoordinator(None, "n") if backend == "DbCoordinator" else SqlServerCoordinator(None, "n")
+    )
+    bad = {"config_version": 5, "config_digest": "d5", "config_digest_version": "5"}
+    with caplog.at_level("WARNING"):
+        coord._cache_config_row({**bad, "config_digest_version": 4})  # an older stamp: no fault
+        assert "reads as unknown" not in caplog.text, "control"
+        coord._cache_config_row(bad)
+        coord._cache_config_row(bad)  # the next tick's refresh
+        coord._cache_config_row({**bad, "config_version": 6})
+    assert caplog.text.count("reads as unknown") == 2
+    assert "version 5 has a stamp that is not an integer (str)" in caplog.text
+
+
+def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:
+    """vault BACKLOG #3109: a bump stamps the digest with the version it writes. A bump by an
+    engine that writes no digest moves the version and leaves the previous stamp, so the digest
+    left behind is not set beside the new version."""
+    row: dict[str, object] = {
+        "config_version": 4,
+        "config_digest": "d",
+        "config_digest_version": 4,
+    }
+    assert stamped_config_digest(row, 4) == ("d", None), "control: stamped with its own version"
+    assert stamped_config_digest(row, 5) == (None, None), "a later, unstamped bump: no fault"
+    assert stamped_config_digest({**row, "config_digest_version": None}, 4) == (None, None)
+    assert stamped_config_digest({**row, "config_digest": None}, 4) == (None, None)
+    # The stamp is read as the store reads its audit seq: an int that is not a bool.
+    for bad in (True, 4.0, Decimal("4"), "4", "1e3000000", b"4"):
+        digest, fault = stamped_config_digest({**row, "config_digest_version": bad}, 4)
+        assert digest is None and fault is not None, bad
+    # A stamp newer than the version no bump writes, so it is a fault; an older one is not.
+    assert stamped_config_digest(row, 3) == (None, "has a stamp (4) newer than its version")
+    assert stamped_config_digest({**row, "config_digest": 7}, 4)[1] is not None, "not text"
+    assert stamped_config_digest({"config_version": 4}, 4)[1] is not None, "no digest columns"
 
 
 @pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])
@@ -1458,7 +1741,8 @@ async def test_sqlserver_non_promotable_claim_touches_no_db() -> None:
         async def _fetchone(self, *a: object, **k: object) -> object:
             raise AssertionError("non-promotable node must not query the store to claim")
 
-        _fetchone_clamped = _fetchone  # the claim's own entry point (ADR 0157 Inc 0)
+        # The claim's and the paused owner read's entry point (ADR 0157 Inc 0, BACKLOG #5064).
+        _fetchone_clamped = _fetchone
 
     coord = SqlServerCoordinator(_Store(), "N", promotable=False)
     # Even if it were somehow already leader, the tick demotes it without a DB round-trip.
@@ -1505,6 +1789,9 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
             self.executed.append(sql)
             return 1  # the owner-scoped release matched this node's row
 
+        async def _execute_clamped(self, sql: str, params: object, **k: object) -> int:
+            return await self._execute(sql, params)  # the release's entry point (BACKLOG #5064)
+
         async def _fetchone(self, sql: str, *a: object, **k: object) -> object:
             # Since BACKLOG #1986 a paused node READS the lease owner, to lift the pause once a
             # successor holds the row. It must still never send the claim.
@@ -1512,7 +1799,8 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
                 return {"owner": "N"}  # the row this node released still names it
             raise AssertionError("a paused node must not send the claim")
 
-        _fetchone_clamped = _fetchone  # the claim's own entry point (ADR 0157 Inc 0)
+        # The claim's and the paused owner read's entry point (ADR 0157 Inc 0, BACKLOG #5064).
+        _fetchone_clamped = _fetchone
 
     store = _Store()
     coord = SqlServerCoordinator(store, "N", heartbeat_seconds=10.0, monotonic=lambda: 0.0)

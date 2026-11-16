@@ -545,9 +545,9 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     alarm a missed session's ending raises. The bind claim must keep its pointer to that bullet.
     BACKLOG #4974 closed the first limit, the rotation miss, so the claim no longer names a SQL
     Server limit and the bullet names that row rather than a follow-up not yet filed.
-    The bullet's count claim must not assert an exact figure: on
-    SQL Server the bind's and the unbind's counts come from ``cursor.rowcount``, which a leaked
-    ``SET NOCOUNT ON`` turns into -1 (BACKLOG #2283)."""
+    BACKLOG #5625 moved SQL Server's bind and unbind counts from ``cursor.rowcount``, which a
+    leaked ``SET NOCOUNT ON`` turns into -1 (BACKLOG #2283), to an ``OUTPUT`` rowset, so the
+    bullet must no longer say they report -1."""
     text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
         encoding="utf-8"
     )
@@ -569,7 +569,8 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     assert "BACKLOG #4974" in sweep
     assert "not yet filed, is to carry the fix for the missed session" not in sweep
     assert "is short by one for each session it missed" not in sweep
-    assert "they report -1 instead (BACKLOG #2283)" in sweep
+    assert "they report -1 instead" not in sweep
+    assert "counted from an `OUTPUT` rowset on SQL Server since BACKLOG #5625" in sweep
 
 
 def test_the_security_doc_says_a_bound_administrator_does_not_block_provision_admin() -> None:

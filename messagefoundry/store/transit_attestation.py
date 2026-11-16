@@ -25,8 +25,9 @@ sequence number and chain hash of the audit row its write appended. Every read c
 it must be in the log, be the newest attest or withdraw row, say the same key name, reason, actor and
 time, carry the recorded hash, and verify under the audit key of its own range. A row that fails any of
 these reads as UNATTESTED, with the reason in ``audit_gap``. A forger would need the audit key, which on
-``vault_transit`` lives inside Transit. The MAC is recomputed under the Transit key VERSION the audit
-row names, so the key rotation the operator attests to does not void the attestation.
+``vault_transit`` lives inside Transit. The MAC is checked by Transit's own verify call, at the key
+VERSION the audit row names, so the key rotation the operator attests to does not void the
+attestation (BACKLOG #2720).
 
 What this check does NOT catch: a writer who deletes a later withdraw row and re-inserts the old
 attestation row. If rows follow the deleted one, the chain breaks, and ``audit-verify`` reports it,

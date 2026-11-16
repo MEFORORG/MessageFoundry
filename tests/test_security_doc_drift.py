@@ -112,9 +112,12 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #2614 added one JSON route: DELETE /sessions, users:manage.
 # ADR 0207 (vault BACKLOG #2609) added two JSON routes, POST and DELETE
 # /users/{user_id}/enrolment-code (users:manage), and their two /ui twins.
-_ROUTES_DEFAULT = 119
-_ROUTES_WITH_DOCS = 123
-_ROUTES_WITH_UI = 249
+# BACKLOG #1562 added two JSON routes and no /ui route: GET /approvals/executing and POST
+# /approvals/{approval_id}/interrupt, approvals:approve, the operator's way out for a release
+# stranded in 'executing'.
+_ROUTES_DEFAULT = 121
+_ROUTES_WITH_DOCS = 125
+_ROUTES_WITH_UI = 251
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
 #: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1326,6 +1329,9 @@ _JSON_STEP_UP_WITHOUT_CONSOLE = frozenset(
         # Ending every account's sessions is a JSON and host-CLI act; no console page offers it yet
         # (BACKLOG #2614).
         ("DELETE", "/sessions"),
+        # Interrupting a release stranded in 'executing' is a JSON act; the ruling that built it
+        # (decision d20261029T205247402-81159c) asks for no console page (BACKLOG #1562).
+        ("POST", "/approvals/{approval_id}/interrupt"),
     }
 )
 
@@ -1776,7 +1782,7 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "cases, at least the breaker case is pinned by calling it in "
         "tests/test_directory_last_admin_alert.py and the recheck-0 case in "
         "tests/test_ad_session_reconcile.py; no code test pins that a sign-in failing after the "
-        "role write raises nothing, and the no-live-session case was not traced"
+        "role sync raises nothing, and the no-live-session case was not traced"
     ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
@@ -2186,8 +2192,10 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 96 -> 97: BACKLOG #2331's GET /users/{user_id}/federated-identity, users:manage.
     # 97 -> 98: BACKLOG #2614's DELETE /sessions, users:manage.
     # 98 -> 100: ADR 0207's POST and DELETE /users/{user_id}/enrolment-code, users:manage.
-    assert len(gated) == 100, (
-        f"{len(gated)} permission-gated routes, not 100 — update the doc's totals."
+    # 100 -> 102: BACKLOG #1562's GET /approvals/executing and POST /approvals/{approval_id}/interrupt,
+    # approvals:approve.
+    assert len(gated) == 102, (
+        f"{len(gated)} permission-gated routes, not 102 — update the doc's totals."
     )
 
 
@@ -4462,7 +4470,7 @@ def test_the_changelog_states_the_directory_grant_limits() -> None:
     cases is pinned elsewhere, if at all (see ``_REVIEWED_TEXT_CHECKS``)."""
     cases = (
         "at least these cases raise none",
-        "fails with a server error after the role write",
+        "a server error after the revoke and the notice",
         "mass-revoke breaker aborts writes no roles",
         "holds no live session",
         "`[auth].ad_session_recheck_seconds` is 0",

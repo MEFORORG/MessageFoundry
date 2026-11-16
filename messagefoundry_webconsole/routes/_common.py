@@ -29,6 +29,8 @@ from messagefoundry.api.validation import (
     StatusFilter,
 )
 
+from ..pages._common import REFILLED_FIELD_VALUE
+
 _log = logging.getLogger(__name__)
 
 #: How many active alert instances the /ui alerts page asks for. Shared because TWO modules render
@@ -210,6 +212,28 @@ def blank_to_none(value: str | None) -> str | None:
     what the JSON twin's ``Query(None)`` default means.
     """
     return value or None
+
+
+def posted_field_value(form: Mapping[str, str]) -> str | None:
+    """The Field value a needle form POST carries as a criterion, or ``None`` (BACKLOG #6700).
+
+    The search and uploaded-log filter pages refill their boxes after a run, so an operator who ran a
+    field-path search and then clears Field path to search on a substring posts the old Field value
+    beside the new substring. The engine refuses that pair, so that leftover is not sent: it is the
+    case where Field path is blank, a substring is given, and the Field value is unchanged from the
+    one the page rendered beside a Field path, whether that page showed results or a refusal. A
+    value the operator typed or changed, or one a refusal page echoed back with no Field path, is
+    sent as posted, so the engine's refusal of it reaches the page rather than the value being
+    dropped."""
+    value = form.get("field_value") or None
+    if (
+        value is not None
+        and value == form.get(REFILLED_FIELD_VALUE)
+        and not form.get("field_path", "").strip()
+        and form.get("content", "").strip()
+    ):
+        return None
+    return value
 
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:

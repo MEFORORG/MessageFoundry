@@ -612,6 +612,7 @@ def _install_coordinator_fakes(
             *,
             origin: Any = None,
             allow_insecure: bool = False,
+            cacert: str | None = None,
         ) -> None:
             if insecure_seen is not None:
                 insecure_seen.append(allow_insecure)
@@ -1096,6 +1097,100 @@ async def test_coordinator_threads_allow_insecure_to_remote_poller(
             allow_insecure=want,
         )
         assert seen == [want], f"poller allow_insecure should be {want}, got {seen}"
+
+
+@pytest.mark.parametrize("gated", [False, True])
+async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gated: bool
+) -> None:
+    """BACKLOG #5640 / #5977: the drive polls the engine box over https with the remote rig
+    session and ``cacert``. The poll's drain wait is the barrier before the sinks tally. So without
+    the ENGINE_DRAINED gate a refused sign-in is a setup error, raised before any child is spawned.
+    With the gate armed, the poll is advisory: the refusal is a note and the run goes on.
+
+    Mutation: note the refusal on the ungated path. Red: the drive spawns and reports."""
+    import types
+
+    from harness.load.rigadmin import REMOTE_RIG_SESSION, RigSignInRefused
+
+    worker_tally = {
+        0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+    }
+    sink_tally = {
+        0: {
+            "sink_received": 40,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 2,
+            "ports": [3700],
+        }
+    }
+    spawned = _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally=sink_tally,
+        worker_tally=worker_tally,
+        engine_final=types.SimpleNamespace(done=40, dead=0, in_pipeline=0),
+    )
+    built: list[dict[str, Any]] = []
+
+    class RefusingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append({"urls": list(urls), "token": token, **kw})
+
+        async def open(self) -> None:
+            raise RigSignInRefused("the engine refused the rig's sign-in")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", RefusingPoller)
+    coord = FileDropCoord(tmp_path, run_id=f"tlsdrive{gated}")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": "broadcast",
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    kwargs: dict[str, Any] = {
+        "engine_host": "10.0.0.5",
+        "aggregate_rate": 20.0,
+        "hold_seconds": 1.0,
+        "driver_count": 1,
+        "sink_count": 1,
+        "sink_host": "10.0.0.9",
+        "coord": coord,
+        "cacert": "engine-box.pem",
+    }
+    if not gated:
+        with pytest.raises(sc.RemoteEngineSignInError, match="refused"):
+            await sc.run_shardcert_drive(**kwargs)
+        assert spawned == [], "a child was spawned with no drain barrier"
+        return
+    report = await sc.run_shardcert_drive(
+        **kwargs, await_engine_drained=True, engine_drained_timeout=0.2
+    )
+    assert built == [
+        {
+            "urls": ["https://10.0.0.5:9001"],
+            "token": REMOTE_RIG_SESSION,
+            "origin": built[0]["origin"],
+            "cacert": "engine-box.pem",
+        }
+    ]
+    assert len(spawned) == 2, "the drive should have spawned its sink and sender children"
+    assert report.no_loss
+    assert report.drained is False  # the advisory drain went unread, and says so
+    assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(

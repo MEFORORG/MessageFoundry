@@ -38,7 +38,7 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from messagefoundry.store.store import DiskFreeStatus, UnknownRoleError, load_audit_chain
 from tests._claim_lock_helpers import claim_past_empty_yield
 from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
 from tests._keyed_reopen_contract import (
@@ -50,6 +50,7 @@ from tests._keyed_reopen_contract import (
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._keyless_blank_contract import keyed_cipher
+from tests._passthrough_marker_scope_contract import CASES as PT_MARKER_SCOPE_CASES
 from tests._reingress_refused_body_contract import CASES as REINGRESS_REFUSED_BODY_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
@@ -134,6 +135,8 @@ async def store() -> AsyncIterator[object]:
                 "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
+                "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+                #                     key would stop every key rotation in a later test
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
@@ -229,7 +232,6 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
 
 RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
@@ -267,7 +269,7 @@ def check(ok, message):
 
 async def main() -> None:
     store = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     quarantined = []
     real_release_dirty = store._release_dirty
@@ -788,16 +790,17 @@ async def test_auth_users_roles_sessions(store) -> None:
     user = await store.get_user_by_username("alice")
     assert user is not None and user.id == "u1" and user.password_hash == "hash"
 
-    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0)
+    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0, audits=())
     assert await store.get_user_role_ids("u1") == ["operator"]
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
     assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
-    # BACKLOG #2592: this map has no role foreign key, so it can name a deleted role. That id is
-    # not handed to a sign-in, whose role write would refuse it; the live role still is.
-    await store.set_ad_group_role_map(
-        [("CN=Ops,DC=x", "operator"), ("CN=Ops,DC=x", "custom:no-such-role")]
-    )
+    # BACKLOG #5725: a role id that names no role is refused, exactly, and nothing is written; the
+    # live role still maps. tests/_role_seal_contract.py holds the case and padding variants.
+    with pytest.raises(UnknownRoleError):
+        await store.set_ad_group_role_map(
+            [("CN=Ops,DC=x", "operator"), ("CN=Ops,DC=x", "custom:no-such-role")]
+        )
     assert await store.roles_for_ad_groups(["cn=ops,dc=x"]) == {"operator"}
 
     await store.record_login_failure("u1", failed_attempts=2, locked_until=500.0, now=10.0)
@@ -838,6 +841,14 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
 
     await assert_concurrent_removals_leave_one(store)
+
+
+async def test_account_write_audit_contract(store) -> None:
+    """BACKLOG #2221 and #3018 step 4 on SQL Server: each audited account write commits its row in
+    its own transaction, or neither lands. The contract is ``tests/_account_write_audit_contract.py``."""
+    from tests._account_write_audit_contract import assert_account_write_audit_contract
+
+    await assert_account_write_audit_contract(store)
 
 
 async def test_role_write_if_held_contract(store) -> None:
@@ -1186,8 +1197,8 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
 
 async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
     """BACKLOG #2738 on the real SQL Server backend: ``delete_user`` takes the account's ``users``
-    row with ``UPDLOCK, ROWLOCK`` before its sessions (#2733), as the bind does, so the two cannot
-    deadlock.
+    row before its sessions (#2733), under ``XLOCK, ROWLOCK``, as the bind takes it first, so the
+    two cannot deadlock.
 
     The shared body is the one the Postgres suite runs. The probe reads ``sys.dm_exec_requests``: a
     request whose ``blocking_session_id`` is the bind's session."""
@@ -1235,7 +1246,9 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
     await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
 
 
-async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(store) -> None:
+async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(
+    store, caplog: pytest.LogCaptureFixture
+) -> None:
     """BACKLOG #2733 on the real SQL Server backend: the three ``users(id)`` keys are trusted, and a
     store an earlier batch left with untrusted keys over orphaned rows is repaired by the next full
     run. The plant is what that batch could leave: each key dropped and re-added ``WITH NOCHECK``,
@@ -1305,10 +1318,19 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
     for table in keys:
         assert await _rows(table) == {"kept", "ghost"}, table
 
-    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
     assert await _untrusted() == dict.fromkeys(keys.values(), False)
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    # One line per table, with its count and no account id (BACKLOG #2733).
+    swept = [r.getMessage() for r in caplog.records if "naming an account" in r.getMessage()]
+    assert sorted(swept) == sorted(
+        f"sqlserver: deleted 1 {table} row(s) naming an account that does not exist, before"
+        " trusting the table's user key"
+        for table in keys
+    ), swept
+    caplog.clear()
     # Trusted keys refuse every later orphan, here a session and a role grant.
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
@@ -1328,17 +1350,128 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
         await cur.execute("DELETE FROM schema_meta")
         await conn.commit()
         await cur.close()
-    assert await store._ensure_schema() is True
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    assert not [r for r in caplog.records if "naming an account" in r.getMessage()]
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
     """BACKLOG #2733: SQL Server's sign-in wrote an orphaned session for an account that does not
-    exist, where SQLite and Postgres refused it on their key. The shared body is the one they run."""
+    exist. The shared body, which SQLite and Postgres run too, now meets ``create_session``'s own
+    missing-account refusal, not the key; the trust test above checks the key."""
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def _race_a_held_user_delete(
+    store: Any,
+    account: str,
+    step: Callable[[], Awaitable[Any]],
+    seed: Callable[[], Awaitable[Any]] | None = None,
+) -> Any:
+    """Create ``account`` and run ``seed``; hold ``delete_user(account)`` right after it takes the
+    account row, before it deletes any row keyed to it; start ``step``; require that ``step``
+    really queues behind the delete's server session; release the delete, which must complete;
+    return ``step``'s result, or the exception it raised (BACKLOG #2733). ``_hold_then_race``
+    hooks and probes the race, as the lock-order tests above use it."""
+    from tests._federated_unbind_store_contract import _hold_then_race
+
+    async def _step_or_its_refusal() -> Any:
+        try:
+            return await step()
+        except Exception as exc:  # noqa: BLE001 - returned for the caller to classify
+            return exc
+
+    await store.create_user(
+        user_id=account,
+        username=account,
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    if seed is not None:
+        await seed()
+    _, outcome = await _hold_then_race(
+        store,
+        attr="_delete_user_rows",
+        key=account,
+        first=("delete_user", lambda: store.delete_user(account)),  # completes, no 547
+        second=("the step", _step_or_its_refusal),
+        pause_before="DELETE FROM user_roles",
+        **_lock_wait_probes(store),
+    )
+    assert await store.get_user(account) is None
+    return outcome
+
+
+async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> None:
+    """BACKLOG #2733: a sign-in started while ``delete_user`` holds the account row waits for the
+    delete, then finds the account gone and returns ``False`` with no INSERT, and the delete
+    completes. The delete took the row under ``UPDLOCK``, which the sign-in's ``HOLDLOCK`` read
+    shares, so a session could commit inside the delete, and one that committed after the delete's
+    sessions delete failed its last statement with error 547. On that code the sign-in here
+    finishes while the delete is held, and this test fails on the probe. Before the refusal, the
+    sign-in's own INSERT failed with 547 instead, which the service did not map."""
+    account = "del-sign-in"
+    outcome = await _race_a_held_user_delete(
+        store,
+        account,
+        lambda: store.create_session(token_hash="d" * 64, user_id=account, expires_at=9e9, now=2.0),
+    )
+    assert outcome is False, outcome
+    assert await store.get_session("d" * 64) is None
+
+
+@pytest.mark.parametrize(
+    "write", ["remember_login_address", "reset_login_addresses", "mark_session_mfa_verified"]
+)
+async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: str) -> None:
+    """BACKLOG #2733: the delete holds the account row under ``XLOCK`` before any row keyed to it,
+    so each write of such a row must take the account row first, or it can hold its own row while
+    its key check waits on the delete, which waits on that row: a deadlock the server ends. The
+    sign-in address writes and the session stamps take the account row first; each here queues
+    behind a held delete and then finds the account gone, and the delete completes."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    account = f"del-{write}"
+    token = "s" * 64
+    steps: dict[str, Callable[[], Awaitable[Any]]] = {
+        "remember_login_address": lambda: store.remember_login_address(
+            account, "10.0.0.2", now=3.0
+        ),
+        "reset_login_addresses": lambda: store.reset_login_addresses(account),
+        "mark_session_mfa_verified": lambda: store.mark_session_mfa_verified(token, now=3.0),
+    }
+
+    async def _seed() -> None:
+        await store.remember_login_address(account, "10.0.0.1", now=2.0)
+        await store.create_session(token_hash=token, user_id=account, expires_at=9e9, now=2.0)
+
+    real_write = store._write_session
+    written: list[Any] = []
+
+    async def _spy(cur: Any, token_hash: str, change: Any) -> Any:
+        written.append(await real_write(cur, token_hash, change))
+        return written[-1]
+
+    store._write_session = _spy
+    try:
+        outcome = await _race_a_held_user_delete(store, account, steps[write], seed=_seed)
+    finally:
+        del store._write_session
+    if write == "mark_session_mfa_verified":
+        # The session went with the account, so the stamp found no row and wrote nothing.
+        # It answers False, the "no anchor applied" answer (vault BACKLOG #2964 item 14).
+        assert outcome is False and written == [None], (outcome, written)
+    else:
+        assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    assert await store.list_known_login_addresses(account, since=0.0) == []
+    assert await store.get_session(token) is None
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
@@ -3074,6 +3207,13 @@ async def test_reingress_peek_failed_errors_child_and_skips_ingress(store) -> No
 async def test_reingress_refused_body_contract(store, case) -> None:
     """Vault BACKLOG #4796: a refused loopback re-ingress is charged to the refused-body allowance,
     the same contract the SQLite suite runs: past it only the head is stored, inside it the whole."""
+    await case(store)
+
+
+@pytest.mark.parametrize("case", PT_MARKER_SCOPE_CASES)
+async def test_passthrough_marker_scope_contract(store, case) -> None:
+    """BACKLOG #5614: a pass-through marker is scoped to its parent's channel, the same contract the
+    SQLite suite runs, so a dead one is listed under the parent's channel, not the pass-through's."""
     await case(store)
 
 
@@ -5544,6 +5684,17 @@ async def test_summary_access_census_survives_and_coalesces_ss(store) -> None:
 # --- ALERT-19: alert_instance CRUD lifecycle + reason cipher-at-rest, on real SQL Server ------------
 
 
+async def test_alert_generation_bounds_the_resolve_ss(store) -> None:
+    """BACKLOG #3269, #4916: the generation-bounded resolves, the shared contract."""
+    from tests._alert_generation_contract import (
+        check_alert_generation_contract,
+        check_fenced_resolve_contract,
+    )
+
+    await check_alert_generation_contract(store)
+    await check_fenced_resolve_contract(store)
+
+
 async def test_alert_instance_lifecycle_ss(store) -> None:
     from messagefoundry.store.store import AlertSummary
 
@@ -5896,6 +6047,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
             audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
+        # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
+        # would stop this run. The fixture does not clear this table, so this test does.
+        async with seed._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM pending_approvals")
+            await conn.commit()
     finally:
         await seed.close()
 
@@ -6402,6 +6559,30 @@ async def test_user_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_notice_gate_seal_contract(store) -> None:
+    """BACKLOG #5629: the startup security-notice gate weighs only sealed records, the same
+    contract the SQLite suite runs, on a keyed handle. The fixture clears the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._notice_gate_seal_contract import assert_notice_gate_reads_sealed_rows
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        await assert_notice_gate_reads_sealed_rows(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_role_seal_contract(store) -> None:
     """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
     contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
@@ -6431,6 +6612,30 @@ async def test_role_seal_contract(store) -> None:
             columns = {str(r[0]) for r in await cur.fetchall()}
         assert columns == {f.name for f in fields(RoleRow)}
         await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_reseal_outcome_contract(store) -> None:
+    """Vault BACKLOG #5635: ``reencrypt_to_active`` records what its re-seal passes left under a
+    key it does not hold, for ``rotate-key`` to read, on a keyed handle. ``raw`` runs each
+    statement outside the store's helpers. The fixture clears the tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._reseal_outcome_contract import assert_reseal_outcome_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        await assert_reseal_outcome_contract(keyed, raw)
     finally:
         await keyed.close()
 
@@ -7388,6 +7593,124 @@ async def test_webauthn_rehash_contract(store) -> None:
     await _assert_webauthn_rehash_contract(store)
 
 
+async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
+    """BACKLOG #2705 limb 1: Microsoft's ODBC Driver 18 reads the ``}}`` escape in a braced
+    password, so a password holding ``};``, ``}=``, a trailing ``}}``, ``{``, ``;`` and ``=`` logs
+    in as written and adds no keyword.
+
+    Measures ODBC Driver 18 for SQL Server on Linux (``msodbcsql18`` under unixODBC), on the hosted
+    ``sql server (store + connector)`` leg. The comment above ``_DRIVER_FAMILIES`` in
+    ``messagefoundry/transports/database.py`` holds what stays unmeasured, Windows
+    ``msodbcsql18.dll`` among it.
+
+    Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
+    builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
+    ``msodbc`` family) names the host alone, so it reaches the default port; every string
+    verifies the server's certificate, which the leg's runner trusts (vault BACKLOG #3533 item 2).
+    The store's (:func:`connection_string`) takes its TLS from the leg's settings; where two strings
+    match byte for byte one login covers both. They go through
+    aioodbc and pyodbc.
+
+    A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
+    ``}}`` into ``}``, would send another password or a malformed string, and would not log in.
+    The control shows a refusal is what a wrong password gets here: the same escaped shape with
+    only its head changed is refused with SQLSTATE 28000. No assertion expression or message holds
+    the password, since pytest prints the parts of a failed assert, and only a refusal's SQLSTATE
+    is kept, never the driver's message."""
+    import secrets
+
+    import aioodbc
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.odbc_dsn import odbc_brace
+    from messagefoundry.odbc_env import disable_driver_manager_pooling
+    from messagefoundry.store.sqlserver import connection_string
+    from messagefoundry.transports.database import _build_dsn, _build_odbc_dsn
+    from tests._live_scratch import scratch_name, sqlserver_admin
+
+    # BACKLOG #2049. Effective only if no earlier test has touched ODBC in this process; teardown's
+    # KILL ends any probe session pooling keeps alive either way.
+    disable_driver_manager_pooling()
+    base = load_settings(environ=os.environ).store
+    on_default_port = base.port == 1433
+    assert on_default_port, (
+        "this test sends the generic string, which names the host alone, to the default port"
+    )
+    login = scratch_name("mefor_brace")
+    tail = secrets.token_hex(8)
+
+    def shaped(head: str) -> str:
+        """A password of the measured shape. No quote character, so the CREATE LOGIN literal below
+        needs no escaping, as the other live tests here and tests/_live_scratch.py write it."""
+        return f"T}};{head}}}=s=t{{{tail}}}}}"
+
+    password = shaped(secrets.token_hex(8))
+    escaped = odbc_brace(password)
+    has_escape = "}};" in escaped and "}}=" in escaped and escaped.endswith("}}}}}")
+    assert has_escape, "the premise: the escaped password holds }}; and }}= and closes on }}}}}"
+
+    async def login_outcome(dsn: str) -> tuple[str | None, str]:
+        """``(login, "")`` with the login the server names, or ``(None, SQLSTATE)`` when the connect
+        is refused."""
+        try:
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=5)
+        except pyodbc.Error as exc:
+            return None, str(exc.args[0]) if exc.args else type(exc).__name__
+        try:
+            cur = await conn.cursor()
+            try:  # the cursor closes before its connection (tests/_live_scratch.py says why)
+                await cur.execute("SELECT SUSER_SNAME()")
+                row = await cur.fetchone()
+            finally:
+                await cur.close()
+        finally:
+            await conn.close()
+        return (None if row is None else str(row[0])), ""
+
+    generic = _build_odbc_dsn(
+        {
+            "odbc_driver": "ODBC Driver 18 for SQL Server",
+            "server": base.server or "localhost",
+            "database": "master",
+            "username": login,
+            "password": password,
+            "odbc_params": {"Encrypt": "yes"},
+        }
+    )
+    preset = _build_dsn(
+        {
+            "server": base.server or "localhost",
+            "port": base.port,
+            "database": "master",
+            "username": login,
+            "password": password,
+            # Verifying: CI trusts the server's generated certificate (vault BACKLOG #3533 item 2).
+        }
+    )
+    store = connection_string(
+        base.model_copy(update={"database": "master", "username": login, "password": password})
+    )
+    strings = {"generic": generic, "preset": preset, "store": store}
+    for label, dsn in strings.items():
+        sent_escaped = _odbc_value(dsn, "PWD") == escaped
+        assert sent_escaped, f"the {label} string did not send the password braced with the escape"
+    distinct = {dsn: label for label, dsn in reversed(strings.items())}  # first label wins
+    async with sqlserver_admin(base.model_copy(update={"database": "master"})) as admin:
+        try:
+            await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
+            for dsn, label in distinct.items():
+                who, state = await login_outcome(dsn)
+                assert who == login, f"the {label} string did not log in (SQLSTATE {state!r})"
+            wrong = odbc_brace(shaped(secrets.token_hex(8)))
+            who, state = await login_outcome(_odbc_with(generic, "PWD", wrong))
+            assert who is None and state == "28000", (
+                f"another password of the same shape was not refused as a login (SQLSTATE {state!r})"
+            )
+        finally:
+            await admin.teardown(logins=[login])
+
+
 async def _empty_every_census_table(store) -> None:
     """Every table the census lists, emptied but for ``schema_meta``, and the epoch back at its
     seed, so the census reads a store nothing has used. The fixture leaves at least store_salt,
@@ -7504,3 +7827,78 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     finally:
         # Leave no chain under a key nobody holds for a later module on this database.
         await empty_audit_log()
+
+
+# --- vault BACKLOG #4607 step 6: a row that keeps killing its worker is dead-lettered ------------
+
+
+async def _ss_death_row(store, row_id: str) -> tuple[str, int, int]:
+    r = await store._fetchone(
+        "SELECT status, attempts, worker_deaths FROM queue WHERE id=?", (row_id,)
+    )
+    assert r is not None
+    return str(r["status"]), int(r["attempts"]), int(r["worker_deaths"])
+
+
+async def test_record_worker_death_counts_then_dead_letters_at_the_cap(store) -> None:
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    for death in (1, 2, 3):
+        # Past the recovery below, which re-pends the row due at its own now (300).
+        item = await store.claim_next_fifo("IB", now=400.0, stage=Stage.INGRESS.value)
+        assert item is not None and item.message_id == mid
+        counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+        assert (counted.deaths, counted.dead) == (death, death == 3)
+        if death < 3:
+            assert await _ss_death_row(store, item.id) == ("inflight", death, death)
+            await store.reset_stale_inflight(now=300.0)
+    assert await _ss_death_row(store, item.id) == ("dead", 3, 3)
+    msg = await store.get_message(mid)
+    assert msg is not None and msg["status"] == MessageStatus.ERROR.value
+
+
+async def test_record_worker_death_counts_a_re_pended_row_and_skips_a_resolved_one(store) -> None:
+    """A lease sweep may re-pend the row before the death is recorded; it still counts. A row
+    already resolved is never counted."""
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    await store.reset_stale_inflight(now=300.0)
+    counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (1, False)
+    assert await _ss_death_row(store, item.id) == ("pending", 1, 1)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    sent = await store.claim_next_fifo("OB1", now=200.0)
+    assert sent is not None
+    assert await store.mark_done(sent.id, now=201.0)
+    counted = await store.record_worker_death(sent.id, 1, "delivery worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    assert await _ss_death_row(store, sent.id) == ("done", 1, 0)
+
+
+async def test_record_worker_death_fenced_rolls_back_whole_and_re_pends(store) -> None:
+    """ADR 0157 C3: a fenced dead-letter rolls the increment back with it and re-pends the row."""
+    await _seed_lease_epoch(store, _LEASE_KEY, 5)
+    store.set_leader_epoch(5, lease_key=_LEASE_KEY)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    store.set_leader_epoch(3, lease_key=_LEASE_KEY)  # demoted after the claim
+    counted = await store.record_worker_death(item.id, 1, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    # C3 re-pends through release_claimed, which also returns the claim's attempt.
+    assert await _ss_death_row(store, item.id) == ("pending", 0, 0)
+    assert store.fenced_writes == 1
+
+
+async def test_mark_failed_at_its_cap_leaves_a_done_row_done(store) -> None:
+    """A late death after the send was marked done must not turn a delivered row DEAD."""
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    assert await store.mark_done(item.id, now=201.0)
+    outcome = await store.mark_failed(item.id, "late death", RetryPolicy(max_attempts=1))
+    assert outcome == FailOutcome()
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value

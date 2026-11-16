@@ -175,7 +175,8 @@ def load_protected_key(path: str | Path) -> str:
         if problem is not None:
             _log.warning(
                 "the store key file named by [store].encryption_key_file is not restricted: %s. "
-                "Restrict it to the account the engine runs as, SYSTEM and Administrators.",
+                "Restrict it to the account the engine runs as, SYSTEM and Administrators, in a "
+                "folder no broad group may delete a file in, with no junction or link on its path that another account can change.",
                 problem,
             )
     return key

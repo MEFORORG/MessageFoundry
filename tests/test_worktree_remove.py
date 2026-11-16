@@ -44,7 +44,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
-from tests.test_worktree_remove_path import copy_real_scripts, settle_worktrees
+from tests.test_worktree_remove_path import _ENV, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
 SCRIPT = _REPO / "scripts" / "worktree" / "remove.ps1"
@@ -132,9 +132,15 @@ def run(
     *args: str,
     script: Path | None = None,
     repo_root: Path | str | None = None,
+    cwd: Path | None = None,
+    extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the real script. ``repo_root`` defaults to the fixture primary and is NEVER omitted
     unless a test is deliberately exercising the ``$PSScriptRoot`` default against a copied script.
+
+    The environment is the shared ``_ENV``: no inherited GIT_* variable, CLAUDE_CONFIG_DIR or
+    MEFOR_COORD_ROOT, so git answers for the fixture and the claim and allocation reads resolve to
+    the fixture's own coordination root, never the shared real one. ``extra`` adds to it.
     """
     # Both removal routes refuse a tree written to inside its quiet period (vault BACKLOG #2988), and
     # every fixture tree is seconds old. The quiet period itself is driven in
@@ -144,7 +150,15 @@ def run(
     root = fx.primary if repo_root is None else repo_root
     if root != "":
         argv += ["-RepoRoot", str(root)]
-    return subprocess.run([*argv, *args], capture_output=True, text=True, timeout=180, check=False)
+    return subprocess.run(
+        [*argv, *args],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        cwd=str(cwd or fx.root),
+        env={**_ENV, **(extra or {})},
+    )
 
 
 def test_removes_a_clean_worktree(fx: Fixture) -> None:
@@ -350,6 +364,138 @@ def test_a_git_status_that_FAILS_refuses_instead_of_reading_as_clean(fx: Fixture
     assert proc.returncode != 0
     assert "git status failed" in proc.stderr
     assert (wt / "seed.txt").read_text(encoding="utf-8") == "an edit nobody committed\n"
+
+
+# --- BACKLOG #5648: the gates -Name used to skip ---------------------------------------------------
+#
+# -Path refused each of these, and a bare -Name went past them to `worktree remove --force` and a
+# blanket `worktree prune`. Each refusal below is paired with the run that is supposed to succeed.
+
+
+@pytest.mark.parametrize("var", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"])
+def test_name_refuses_an_inherited_git_redirect(fx: Fixture, var: str) -> None:
+    """Red before the fix: -Name checked these only under -Discard. GIT_DIR pointed at another
+    repository makes every read below describe that repository, not the target."""
+    other = fx.root / "other"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    wt = fx.add("redirected")
+
+    proc = run(fx, "-Name", "redirected", extra={var: str(other / ".git")})
+
+    assert proc.returncode != 0
+    assert f"{var} is set" in proc.stderr, proc.stdout + proc.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    control = run(fx, "-Name", "redirected")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
+
+
+def test_name_refuses_when_the_caller_stands_inside_the_target(fx: Fixture) -> None:
+    """Red before the fix: git's removal from inside the tree fails part-way, after deleting what it
+    could. The refusal has to come before anything is removed."""
+    wt = fx.add("standing")
+    (wt / "deep").mkdir()
+    (wt / "deep" / "kept.txt").write_text("untracked, older than six hours\n", encoding="utf-8")
+
+    proc = run(fx, "-Name", "standing", "-Force", cwd=wt / "deep")
+
+    assert proc.returncode != 0
+    assert "standing inside" in proc.stderr, proc.stdout + proc.stderr
+    assert (wt / "deep" / "kept.txt").is_file()
+    assert (wt / "seed.txt").is_file()
+    assert fx.is_registered(wt)
+
+    control = run(fx, "-Name", "standing", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
+
+
+def test_name_refuses_when_the_copy_being_run_lives_inside_the_target(fx: Fixture) -> None:
+    """Red before the fix: the copy in the target removed its own tree from under itself."""
+    wt = fx.add("selfhost")
+    copy_real_scripts(wt)
+    inside = wt / "scripts" / "worktree" / "remove.ps1"
+
+    proc = run(fx, "-Name", "selfhost", "-Force", script=inside)
+
+    assert proc.returncode != 0
+    assert "lives inside" in proc.stderr, proc.stdout + proc.stderr
+    assert inside.is_file() and fx.is_registered(wt)
+
+    control = run(fx, "-Name", "selfhost", "-Force")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_name_refuses_a_flagged_file_and_force_overrides_it_by_name(fx: Fixture, flag: str) -> None:
+    """Red before the fix: git status does not read a flagged file, so an edit to one read as a clean
+    tree and was force-removed without -Force."""
+    wt = fx.add("flagged")
+    _git(wt, "update-index", flag, "seed.txt")
+    (wt / "seed.txt").write_text("an edit git status cannot see\n", encoding="utf-8")
+    assert _git(wt, "status", "--porcelain").strip() == "", "PRECONDITION: status must read clean"
+
+    refused = run(fx, "-Name", "flagged")
+
+    assert refused.returncode != 0
+    assert "flagged seed.txt" in refused.stdout, refused.stdout + refused.stderr
+    assert "skip-worktree or assume-unchanged" in refused.stderr
+    assert (wt / "seed.txt").read_text(encoding="utf-8") == "an edit git status cannot see\n"
+    assert fx.is_registered(wt)
+
+    # -Force overrides it, and the override names what it discarded.
+    forced = run(fx, "-Name", "flagged", "-Force")
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    assert "-Force: not refusing 1 file(s) flagged" in forced.stdout, forced.stdout
+    assert "flagged seed.txt" in forced.stdout
+    assert not wt.exists()
+
+
+def test_name_names_flagged_files_in_the_tracked_change_refusal(fx: Fixture) -> None:
+    """The refusal that tells the operator to re-run with -Force must show every flagged file that
+    -Force would also take, not only the tracked change."""
+    wt = fx.add("both")
+    (wt / "other.txt").write_text("tracked\n", encoding="utf-8")
+    _git(wt, "add", "other.txt")
+    _git(wt, "commit", "-qm", "other")
+    _git(wt, "update-index", "--skip-worktree", "seed.txt")
+    (wt / "seed.txt").write_text("hidden edit\n", encoding="utf-8")
+    (wt / "other.txt").write_text("visible edit\n", encoding="utf-8")
+
+    proc = run(fx, "-Name", "both")
+
+    assert proc.returncode != 0
+    assert "uncommitted tracked changes" in proc.stderr, proc.stdout + proc.stderr
+    assert "flagged seed.txt" in proc.stdout, proc.stdout
+    assert fx.is_registered(wt)
+
+
+def test_name_runs_no_blanket_prune_so_another_stale_registration_survives(fx: Fixture) -> None:
+    """Red before the fix (and BACKLOG #7619): -Name ran `git worktree prune` after the removal, which
+    drops every registration whose directory is missing at that moment, with its HEAD reflog."""
+    gone = fx.add("gone")
+    shutil.rmtree(gone)
+    assert fx.is_registered(gone), "PRECONDITION: the stale registration must exist"
+    # The negative control: a prune in this fixture WOULD drop it, so its survival below means something.
+    dry = subprocess.run(
+        ["git", "-C", str(fx.primary), "worktree", "prune", "--dry-run", "--verbose"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "repo-gone" in dry.stdout + dry.stderr, dry
+    wt = fx.add("mine")
+
+    proc = run(fx, "-Name", "mine")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not wt.exists() and not fx.is_registered(wt)
+    assert fx.is_registered(gone), (
+        "a blanket prune dropped a registration this run was not asked about"
+    )
 
 
 # --- claims and the removed worktree: refused before, never released after --------------------

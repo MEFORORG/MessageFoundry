@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from harness.load.connscale.profile import FUSE_OFF, FUSE_ON
@@ -78,30 +78,73 @@ class _ArmMetrics:
     # --- loss reconcile (the AUTHORITATIVE signal; from the independent sink counter, NOT the
     # /stats achieved-rate poller that zeroes under overload — see the report's reading caveat). ---
     no_loss_ok: bool
+    #: The arm's reconcile could not clear it and proved no loss either (BACKLOG #5574). It is not
+    #: a breach, so it can never make a resilience win, and a baseline in this state fails the row.
+    no_loss_inconclusive: bool
+    #: How many trials could not clear zero-loss and proved no loss, whatever the others did. A
+    #: baseline with any fails its row (BACKLOG #5574): the fold must be monotone, so a proven breach
+    #: in another trial cannot turn an INCONCLUSIVE trial's fail into a resilience win, which it did
+    #: when the row read ``no_loss_inconclusive`` alone ([LOSS, INCONCLUSIVE] passed as a win while
+    #: [OK, INCONCLUSIVE] failed).
+    inconclusive_trials: int
     sent: int
     sink_received: int
     backlog: int
     no_loss_detail: str
+    trials: int = 1
+    # The intake rate's mean over the trials that held zero-loss; ``None`` when none did. The throughput
+    # guard compares against it, so one lossy per_lane trial does not make the whole row incomparable.
+    clean_read_per_s: float | None = None
+    # Every trial's post-load drain completed. Kept apart from the loss reconcile, as ``_FuseArm`` keeps
+    # it: a timed-out drain stranded rows somewhere, which is not the same claim as a lost message.
+    drain_completed: bool = True
 
     @classmethod
-    def from_record(cls, r: ConnScaleRecord) -> _ArmMetrics:
+    def from_records(cls, recs: list[ConnScaleRecord]) -> _ArmMetrics:
+        """One arm's read-off over EVERY trial of its cell (BACKLOG #5429). Keeping only the last trial
+        let an earlier lossy or timed-out trial vanish from a passing verdict, so the loss signal and
+        the drain signal are both all-trials. Rates are trial means; peaks and tail latencies are the
+        worst trial."""
+        last = recs[-1]
+        losses = [
+            r.no_loss.detail if len(recs) == 1 else f"trial {r.trial}: {r.no_loss.detail}"
+            for r in recs
+            if not r.no_loss.ok
+        ]
+
+        def _mean_or_none(values: Iterable[float | None]) -> float | None:
+            present = [v for v in values if v is not None]
+            return statistics.fmean(present) if present else None
+
+        def _max_or_none[T: (int, float)](values: list[T | None]) -> T | None:
+            present = [v for v in values if v is not None]
+            return max(present) if present else None
+
         return cls(
-            claim_mode=r.claim_mode,
-            achieved_read_per_s=r.achieved_read_per_s,
-            achieved_written_per_s=r.achieved_written_per_s,
-            idle_poll_per_s=r.idle_poll_per_s,
-            wake_fanout_per_s=r.wake_fanout_per_s,
-            ack_p99_ms=r.ack_p99_ms,
-            pool_wait_p99_ms=r.pool_wait_p99_ms,
-            cpu_seconds_total=r.cpu_seconds_total,
-            cpu_util_cores_mean=r.cpu_util_cores_mean,
-            fd_count_peak=r.fd_count_peak,
-            working_set_peak_bytes=r.working_set_peak_bytes,
-            no_loss_ok=r.no_loss.ok,
-            sent=r.no_loss.sent,
-            sink_received=r.no_loss.sink_received,
-            backlog=r.no_loss.backlog,
-            no_loss_detail=r.no_loss.detail,
+            claim_mode=last.claim_mode,
+            achieved_read_per_s=statistics.fmean(r.achieved_read_per_s for r in recs),
+            achieved_written_per_s=statistics.fmean(r.achieved_written_per_s for r in recs),
+            idle_poll_per_s=statistics.fmean(r.idle_poll_per_s for r in recs),
+            wake_fanout_per_s=statistics.fmean(r.wake_fanout_per_s for r in recs),
+            ack_p99_ms=max(r.ack_p99_ms for r in recs),
+            pool_wait_p99_ms=_max_or_none([r.pool_wait_p99_ms for r in recs]),
+            cpu_seconds_total=_mean_or_none([r.cpu_seconds_total for r in recs]),
+            cpu_util_cores_mean=_mean_or_none([r.cpu_util_cores_mean for r in recs]),
+            fd_count_peak=_max_or_none([r.fd_count_peak for r in recs]),
+            working_set_peak_bytes=_max_or_none([r.working_set_peak_bytes for r in recs]),
+            no_loss_ok=not losses,
+            # Inconclusive only when no trial PROVED a loss: one proven loss is a breach, whatever
+            # the other trials could not clear (BACKLOG #5574).
+            no_loss_inconclusive=bool(losses)
+            and all(r.no_loss.inconclusive for r in recs if not r.no_loss.ok),
+            inconclusive_trials=sum(1 for r in recs if not r.no_loss.ok and r.no_loss.inconclusive),
+            sent=sum(r.no_loss.sent for r in recs),
+            sink_received=sum(r.no_loss.sink_received for r in recs),
+            backlog=max(r.no_loss.backlog for r in recs),
+            no_loss_detail="; ".join(losses) or last.no_loss.detail,
+            trials=len(recs),
+            drain_completed=all(r.drain_seconds is not None for r in recs),
+            clean_read_per_s=_mean_or_none([r.achieved_read_per_s for r in recs if r.no_loss.ok]),
         )
 
 
@@ -130,7 +173,14 @@ class ComparisonRow:
     def resilience_win(self) -> bool:
         """per_lane breached zero-loss but pooled held it — the 'pooled survives, per_lane breaks'
         outcome the poller-zeroed throughput delta cannot show."""
-        return not self.pooled_missing and not self.baseline.no_loss_ok and not self.candidate_lost
+        return (
+            not self.pooled_missing
+            and not self.baseline.no_loss_ok
+            and not self.baseline.inconclusive_trials
+            and not self.candidate_lost
+            and self.candidate is not None
+            and self.candidate.drain_completed
+        )
 
     @property
     def ok(self) -> bool:
@@ -140,6 +190,14 @@ class ComparisonRow:
         sound*. A baseline that itself breached zero-loss yields no sound throughput comparison, so
         the row passes on the resilience basis (pooled held) rather than on a phantom-zero delta."""
         if self.pooled_missing or self.candidate_lost:
+            return False
+        # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
+        if self.candidate is not None and not self.candidate.drain_completed:
+            return False
+        # A baseline trial that cleared nothing is no breach and no measurement, so it fails the
+        # row whatever the other trials proved (BACKLOG #5574): it cannot make a resilience win, and
+        # the row makes no throughput comparison.
+        if self.baseline.inconclusive_trials:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False
@@ -161,10 +219,15 @@ class ClaimModeComparison:
     # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012). An A/B
     # from before #1420 or #2024 read a different window, so it does not compare with this one.
     rate_window: str | None = None
+    # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
+    # They have no row to fail, so the verdict fails on them directly rather than skipping them.
+    orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return all(row.ok for row in self.rows) and bool(self.rows)
+        return (
+            all(row.ok for row in self.rows) and bool(self.rows) and not self.orphan_candidate_cells
+        )
 
     @property
     def missing_arms(self) -> int:
@@ -179,7 +242,20 @@ class ClaimModeComparison:
     def baseline_zero_loss_breaches(self) -> int:
         """Counts where per_lane breached the at-least-once reconcile (context for the resilience
         story; it also marks those counts' throughput comparison unsound)."""
-        return sum(1 for row in self.rows if not row.baseline.no_loss_ok)
+        # A breach is a trial that PROVED a loss. A baseline none of whose trials did is not one
+        # (BACKLOG #5574); it fails its row instead. A row with a proven trial and an INCONCLUSIVE
+        # one is counted here and in `baseline_inconclusive` both, and fails.
+        return sum(
+            1
+            for row in self.rows
+            if not row.baseline.no_loss_ok and not row.baseline.no_loss_inconclusive
+        )
+
+    @property
+    def baseline_inconclusive(self) -> int:
+        """Counts with a per_lane trial that could not clear zero-loss and proved no loss (BACKLOG
+        #5574), whatever its other trials proved. Each fails its row, so the summary names them."""
+        return sum(1 for row in self.rows if row.baseline.inconclusive_trials)
 
     @property
     def resilience_wins(self) -> int:
@@ -226,9 +302,13 @@ class ClaimModeComparison:
                 "candidate_zero_loss_ok": self.candidate_zero_loss_ok,
                 "throughput_non_regression": self.throughput_non_regression,
                 "baseline_zero_loss_breaches": self.baseline_zero_loss_breaches,
+                "baseline_inconclusive": self.baseline_inconclusive,
                 "resilience_wins": self.resilience_wins,
                 "worst_collapse": self.worst_collapse,
                 "missing_arms": self.missing_arms,
+                "orphan_candidate_cells": [
+                    {"sweep_mode": sm, "count": n} for sm, n in self.orphan_candidate_cells
+                ],
             },
             "rows": [_row_json(row) for row in self.rows],
             "notes": self.notes,
@@ -250,9 +330,14 @@ class ClaimModeComparison:
         lines.append(
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
             f"throughput_non_regression={_tnr_label(self.throughput_non_regression)}, "
-            f"resilience_wins={self.resilience_wins}, worst_collapse={self.worst_collapse}, "
-            f"missing_arms={self.missing_arms})"
+            f"resilience_wins={self.resilience_wins}, "
+            f"baseline_inconclusive={self.baseline_inconclusive}, "
+            f"worst_collapse={self.worst_collapse}, missing_arms={self.missing_arms}, "
+            f"orphan_candidate_cells={len(self.orphan_candidate_cells)})"
         )
+        if self.orphan_candidate_cells:
+            orphans = ", ".join(f"[{sm}] N={n}" for sm, n in self.orphan_candidate_cells)
+            lines.append(f"POOLED CELLS WITH NO per_lane BASELINE (the A/B fails): {orphans}")
         for row in self.rows:
             lines.append("")
             lines.append(f"[{row.sweep_mode}] N={row.count}")
@@ -325,9 +410,10 @@ def build_comparison(
     )
     missing_detail = missing_detail or {}
 
-    by_key: dict[tuple[str, str, int], ConnScaleRecord] = {}
+    # Every trial of a cell, not the last one (BACKLOG #5429): ``profile.trials`` repeats each cell.
+    by_key: dict[tuple[str, str, int], list[ConnScaleRecord]] = {}
     for r in records:
-        by_key[(r.claim_mode, r.sweep_mode, r.count)] = r
+        by_key.setdefault((r.claim_mode, r.sweep_mode, r.count), []).append(r)
 
     # Iterate the (sweep_mode, count) cells the BASELINE produced, in first-seen order, so the report
     # is stable and a missing pooled arm is detected against the baseline that always runs.
@@ -342,10 +428,9 @@ def build_comparison(
 
     rows: list[ComparisonRow] = []
     for sweep_mode, count in baseline_cells:
-        base_rec = by_key[(baseline_mode, sweep_mode, count)]
-        base = _ArmMetrics.from_record(base_rec)
-        cand_rec = by_key.get((candidate_mode, sweep_mode, count))
-        if cand_rec is None:
+        base = _ArmMetrics.from_records(by_key[(baseline_mode, sweep_mode, count)])
+        cand_recs = by_key.get((candidate_mode, sweep_mode, count))
+        if not cand_recs:
             rows.append(
                 ComparisonRow(
                     sweep_mode=sweep_mode,
@@ -362,13 +447,23 @@ def build_comparison(
                 )
             )
             continue
-        cand = _ArmMetrics.from_record(cand_rec)
+        cand = _ArmMetrics.from_records(cand_recs)
         # The throughput delta is only SOUND when both arms held zero-loss; a breached (drowning)
         # baseline has a poller-zeroed achieved rate we must not read as a pass/fail.
         candidate_lost = not cand.no_loss_ok
-        throughput_comparable = base.no_loss_ok and cand.no_loss_ok
+        # Sound when the pooled arm held zero-loss and at least one per_lane trial did: compare against
+        # the clean per_lane trials only (BACKLOG #5429), not the all-trials mean a drowning trial
+        # zeroes, and not "no comparison" because one trial of several drowned.
+        # A baseline trial that could not clear zero-loss is no measurement, so a row carrying one
+        # makes no throughput comparison either (BACKLOG #5574): it fails, and the summary's
+        # throughput verdict does not rest on it.
+        throughput_comparable = (
+            cand.no_loss_ok and base.clean_read_per_s is not None and not base.inconclusive_trials
+        )
         thr_ok, thr_delta = _throughput_verdict(
-            base.achieved_read_per_s, cand.achieved_read_per_s, throughput_tolerance
+            base.clean_read_per_s if base.clean_read_per_s is not None else 0.0,
+            cand.achieved_read_per_s,
+            throughput_tolerance,
         )
         collapse, col_delta, ratio = _collapse_verdict(
             base.idle_poll_per_s, cand.idle_poll_per_s, collapse_material_ratio, idle_floor_per_s
@@ -400,6 +495,16 @@ def build_comparison(
             "-- see each arm's recorded reason (on SQL Server one cause is READ_COMMITTED_SNAPSHOT "
             "OFF; set RCSI ON on the target DB)."
         )
+    orphans: list[tuple[str, int]] = []
+    for r in records:
+        key = (r.sweep_mode, r.count)
+        if r.claim_mode == candidate_mode and key not in seen and key not in orphans:
+            orphans.append(key)
+    if orphans:
+        notes.append(
+            f"{len(orphans)} pooled cell(s) with NO per_lane baseline to compare against: "
+            f"{', '.join(f'[{sm}] N={n}' for sm, n in orphans)} -- the A/B fails rather than skip them."
+        )
     return ClaimModeComparison(
         baseline_mode=baseline_mode,
         candidate_mode=candidate_mode,
@@ -409,6 +514,7 @@ def build_comparison(
         rows=rows,
         notes=notes,
         rate_window=records_rate_window(records),
+        orphan_candidate_cells=orphans,
     )
 
 
@@ -469,11 +575,28 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             # achieved rate cannot express.
             "per_lane_zero_loss": row.baseline.no_loss_ok,
             "pooled_zero_loss": (None if row.candidate is None else row.candidate.no_loss_ok),
+            # A False above is a proven breach or an INCONCLUSIVE arm; this says which (BACKLOG #5574).
+            "per_lane_zero_loss_inconclusive": row.baseline.no_loss_inconclusive,
+            # Any of these fails the row, even beside a trial that proved a breach.
+            "per_lane_inconclusive_trials": row.baseline.inconclusive_trials,
+            "pooled_zero_loss_inconclusive": (
+                None if row.candidate is None else row.candidate.no_loss_inconclusive
+            ),
             "candidate_lost": row.candidate_lost,
             "throughput_comparable": row.throughput_comparable,
             "resilience_win": row.resilience_win,
             "per_lane_detail": row.baseline.no_loss_detail,
             "pooled_detail": (None if row.candidate is None else row.candidate.no_loss_detail),
+        },
+        # Every rate above is a mean over this many trials; a drain that timed out in any trial
+        # fails a pooled row (BACKLOG #5429).
+        "trials": {
+            "per_lane": row.baseline.trials,
+            "pooled": None if row.candidate is None else row.candidate.trials,
+        },
+        "drain_completed": {
+            "per_lane": row.baseline.drain_completed,
+            "pooled": None if row.candidate is None else row.candidate.drain_completed,
         },
     }
     if row.missing_detail:
@@ -515,9 +638,31 @@ def _tnr_label(value: bool | None) -> str:
 
 
 def _loss_label(row: ComparisonRow) -> str:
+    # An INCONCLUSIVE arm still fails its row (fail closed), but it is named for what it is, not
+    # as a breach: nothing proved a message lost (BACKLOG #5574).
+    if row.candidate_lost and row.candidate is not None and row.candidate.no_loss_inconclusive:
+        return (
+            f"CANDIDATE INCONCLUSIVE -- pooled could not clear zero-loss and proved no loss "
+            f"({row.candidate.no_loss_detail})"
+        )
     if row.candidate_lost:
         detail = row.candidate.no_loss_detail if row.candidate is not None else ""
         return f"CANDIDATE LOST -- pooled breached zero-loss ({detail})"
+    if row.candidate is not None and not row.candidate.drain_completed:
+        return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
+    if row.baseline.inconclusive_trials:
+        # Beside a trial that proved a breach, say so: the summary counts that breach, and the
+        # label must not read as if per_lane lost nothing.
+        breached = (
+            "; another per_lane trial proved a breach, which cannot pass the row beside it"
+            if not row.baseline.no_loss_inconclusive
+            else ""
+        )
+        return (
+            f"BASELINE INCONCLUSIVE -- {row.baseline.inconclusive_trials} of "
+            f"{row.baseline.trials} per_lane trial(s) could not clear zero-loss and proved no "
+            f"loss{breached}, so the row has no sound basis ({row.baseline.no_loss_detail})"
+        )
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
     return "both clean"
@@ -655,11 +800,20 @@ class _FuseArm:
     # whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across ingress+routed+outbound) reaches 0, so a
     # timeout means rows stranded in SOME stage. A ``None`` here is the WORST case ("never drained"), NOT
     # "unmeasured": a timed-out trial poisons the worst-case so a partial strand can't be dropped. (The
-    # outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows, so it is NOT a
-    # whole-pipeline gauge — drain completion is.) ---
+    # final ``no_loss.backlog`` is one reading after the drain wait; drain completion is the signal that
+    # the whole pipeline emptied within the timeout, so it is the gate.) ---
     drain_seconds_worst: float | None
+    #: Of the trials with no drain time, how many recorded traffic (``await_drain`` timed out over a
+    #: real run) and how many recorded none (a failed cell's placeholder, see `_undrained_reason`).
+    #: The drain guard's reason names which (BACKLOG #5574); the gate reads only
+    #: ``drain_seconds_worst``.
+    drain_timeouts: int
+    drainless_unsent: int
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
+    #: The arm did not hold zero-loss and no trial PROVED a loss: every failing trial's reconcile was
+    #: INCONCLUSIVE (BACKLOG #5574). It still fails closed, but is named for what it is, not a breach.
+    zero_loss_inconclusive: bool
     offered_rate: float
     # --- latency SIGNAL (INFORMATIONAL, not gated) — the "distance insurance" readout the ADR 0075
     # statement-batching bench surfaced: at an injected engine→store RTT, batch-ON showed a LOWER ACK p99
@@ -701,8 +855,16 @@ class _FuseArm:
             mean_written_per_s=statistics.fmean(writtens) if writtens else 0.0,
             in_pipeline_peak=max((r.in_pipeline_peak for r in recs), default=0),
             drain_seconds_worst=drain_seconds_worst,
+            drain_timeouts=sum(1 for r in recs if r.drain_seconds is None and r.no_loss.sent > 0),
+            drainless_unsent=sum(
+                1 for r in recs if r.drain_seconds is None and r.no_loss.sent <= 0
+            ),
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
+            zero_loss_inconclusive=(
+                not (all(r.no_loss.ok for r in recs) and bool(recs))
+                and all(r.no_loss.inconclusive for r in recs if not r.no_loss.ok)
+            ),
             offered_rate=recs[0].offered_aggregate_rate if recs else 0.0,
             # The informational latency signal (see the field docstring) — trial means of the record's
             # ACK-on-receipt percentiles.
@@ -728,7 +890,7 @@ class FuseComparisonRow:
         bool  # B1 whole-pipeline drain COMPLETED AND drain time flat-or-lower vs B0 (authoritative)
     )
     delivered_offered_ok: bool  # B1 delivered/offered >= the floor
-    candidate_lost: bool  # B1 breached zero-loss (hard fail)
+    candidate_lost: bool  # B1 did not hold zero-loss, a breach or INCONCLUSIVE (hard fail)
     reason: str  # a human one-liner explaining the verdict
     candidate_missing: bool = False
 
@@ -1096,9 +1258,8 @@ def _in_pipeline_ok(base: _FuseArm, cand: _FuseArm, tolerance: float) -> bool:
     ``drain_seconds`` only once the whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across
     ingress+routed+outbound) reaches 0 and the counters settle; on timeout it returns ``None``. So
     ``drain_seconds_worst is None`` means at least one trial's drain never completed — rows stranded in
-    SOME stage. (The outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows,
-    so it is NOT usable here — a fully-offered arm that strands upstream would false-pass; the whole-
-    pipeline drain gauge is the only reliable one.)
+    SOME stage. (The final ``no_loss.backlog`` is one reading after the drain wait, not the drain
+    itself, so it is not used here; the whole-pipeline drain completion is the gate.)
 
     1. **Candidate fully drained.** If B1's worst drain did NOT complete (``drain_seconds_worst is
        None``) the whole pipeline never emptied — the backlog mirage — so FAIL, never auto-pass. This is
@@ -1203,15 +1364,11 @@ def _fuse_verdict(
     in_pipeline, delivered/offered) gate first — a breach is a NO-GO regardless of the raw intake
     number. Then the throughput bar: below 10% is a NO-GO (fusion banked nothing); >= 10% but within
     trial spread is INCONCLUSIVE (need more/cleaner trials); >= 10% and outside 2σ is a GO."""
-    if candidate_lost:
+    if candidate_lost and not cand.zero_loss_inconclusive:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
         if not cand.drain_completed:
-            return FUSE_NO_GO, (
-                "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
-                "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
-                "rides a backlog, not a real ceiling lift"
-            )
+            return FUSE_NO_GO, _undrained_reason(cand)
         return FUSE_NO_GO, (
             f"B1 drain time grew (B1 {_fmt(cand.drain_seconds_worst)}s > B0 "
             f"{_fmt(base.drain_seconds_worst)}s) -- the higher intake rode a larger backlog, not a real "
@@ -1222,13 +1379,22 @@ def _fuse_verdict(
         return FUSE_NO_GO, (
             f"delivered/offered {shown} < {min_delivered_offered:.2f} -- B1 is not keeping up end-to-end"
         )
-    if lift_pct is None:
-        return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
-    if lift_pct < min_lift_pct:
+    if lift_pct is not None and lift_pct < min_lift_pct:
         return FUSE_NO_GO, (
             f"lift {lift_pct:+.1f}% < {min_lift_pct:.0f}% -- fusion banked no worthwhile margin "
             "(null/negative → ADR 0071 escalates to free-threading)"
         )
+    if candidate_lost:
+        # INCONCLUSIVE, after every guard that can return a definite NO-GO (drain, keeping-up, a
+        # lift under the bar), so that NO-GO still reads as one. Still a hard fail (the row's `ok`
+        # reads `candidate_lost`), but nothing proved a message dropped, so it is not called a
+        # breach (BACKLOG #5574).
+        return FUSE_INCONCLUSIVE, (
+            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
+            "the run fails closed until a clean measurement clears it"
+        )
+    if lift_pct is None:
+        return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
     if not significant:
         if base.trials < 2 or cand.trials < 2:
             return FUSE_INCONCLUSIVE, (
@@ -1245,6 +1411,30 @@ def _fuse_verdict(
         f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% and > {sigma_multiple:.0f}sigma, in_pipeline "
         f"flat-or-lower, delivered/offered >= {min_delivered_offered:.2f}, zero-loss held"
     )
+
+
+def _undrained_reason(cand: _FuseArm) -> str:
+    """Why a B1 arm with no drain time did not drain, told by what each undrained trial carries.
+
+    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout and keeps
+    its specific reason (BACKLOG #5574). One that recorded none is not asserted to have stalled:
+    a batch cell whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries a
+    placeholder ``sent`` of 0 whatever its fleet drove, and a step that sent nothing may still have
+    timed out on rows it did not send; its reconcile detail says which.
+    """
+    unread = (
+        f"{cand.drainless_unsent} B1 trial(s) recorded no traffic and no drain time (a failed "
+        f"cell's placeholder, or a step that sent nothing; whether rows were stranded is not "
+        f"asserted, and the reconcile detail says why)"
+    )
+    if cand.drain_timeouts:
+        also = f"; {unread}" if cand.drainless_unsent else ""
+        return (
+            "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
+            "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
+            f"rides a backlog, not a real ceiling lift{also}"
+        )
+    return f"B1 pipeline did not fully drain: {unread} -- no ceiling lift is measured"
 
 
 def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
@@ -1299,6 +1489,9 @@ def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
             "candidate_lost": row.candidate_lost,
             "b0_zero_loss": row.baseline.zero_loss_ok,
             "b1_zero_loss": (None if row.candidate is None else row.candidate.zero_loss_ok),
+            "b1_zero_loss_inconclusive": (
+                None if row.candidate is None else row.candidate.zero_loss_inconclusive
+            ),
         },
         # INFORMATIONAL latency signal (ADR 0075 distance insurance) — NOT a gate: the GO/NO-GO verdict
         # above is unchanged. ``*_delta_pct`` is (B1 - B0) / B0 * 100, so a NEGATIVE value means B1 is

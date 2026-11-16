@@ -41,8 +41,10 @@ import io
 import ipaddress
 import logging
 import math
+import ntpath
 import os
 import re
+import stat
 import sys
 import threading
 import tokenize
@@ -58,7 +60,7 @@ from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -97,6 +99,7 @@ from messagefoundry.config.models import (
     check_db_connect_timeout,
     flag_from_settings,
     remote_file_protocol,
+    require_flag,
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
@@ -214,6 +217,8 @@ __all__ = [
     "accepted_cleartext_hops",
     "ech_cleartext_sidecar_hops",
     "UNRESOLVED_ECH_SIDECAR",
+    "listener_trusted_proxy_hops",
+    "UNRESOLVED_LISTENER_PROXIES",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -221,6 +226,7 @@ __all__ = [
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -1110,9 +1116,9 @@ def DatabaseRef(
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
     refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
-    set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The
-    dial-out is gated by the **fail-closed** ``[egress].allowed_db`` allowlist, exactly like a
-    DATABASE poll source — point the engine only at allowed hosts.
+    set; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed**
+    ``[egress].allowed_db`` allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
 
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
@@ -1300,9 +1306,10 @@ def DatabaseLookup(
     statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
     Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused unless
-    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
-    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed**
+    ``[egress].allowed_db`` allowlist, like a DATABASE source — point the engine only at allowed
+    hosts. Example::
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
                        username=env("clarity_user"), password=env("clarity_pw"))
@@ -1543,6 +1550,17 @@ _COMPOSER_BOOL_SETTINGS: Final[Mapping[str, bool | None]] = MappingProxyType(
     {"smart_enabled": False, "oauth2_enabled": False, "sign_enabled": None}
 )
 
+#: The composer that writes each :data:`_COMPOSER_BOOL_SETTINGS` key, so a refusal names the call
+#: the author wrote and not only the key it stored. ``tests/test_env_uncast_bool_setting.py`` pins
+#: it against what each composer writes.
+_COMPOSER_OF_BOOL_SETTING: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "smart_enabled": "with_smart_backend",
+        "oauth2_enabled": "with_oauth2_client_credentials",
+        "sign_enabled": "with_signing",
+    }
+)
+
 
 class _BoolSettings(NamedTuple):
     """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
@@ -1632,6 +1650,98 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
     return default if value is None else _cast_bool(value)
 
 
+def _bool_literal_problem(key: str, value: Any) -> str | None:
+    """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
+    may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
+    :func:`_refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
+    value is withheld.
+
+    Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
+    strict = _bool_settings().defaults
+    if key not in strict or isinstance(value, EnvRef):
+        return None
+    if value is None and strict[key] is not None and key not in _COMPOSER_BOOL_SETTINGS:
+        return None
+    try:
+        require_flag(value, f"setting {key!r}")
+    except ValueError as exc:  # names the key and the type, never the value
+        composer = _COMPOSER_OF_BOOL_SETTING.get(key)
+        named = f" (the key {composer}(enabled=) writes)" if composer is not None else ""
+        return f"{exc}{named}{_bool_remedy(key, value)}"
+    return None
+
+
+def _quoted_false_hint(value: object) -> str:
+    """A hint for a false spelling in quotes, which every lax read takes as true. It says the value
+    is a false spelling, never which."""
+    if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
+        return " (a false spelling in quotes reads as true)"
+    return ""
+
+
+def _bool_remedy(key: str, value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with, :func:`_quoted_false_hint` first.
+    A hop-policy flag refuses ``env()`` (:func:`refuse_unresolved_hop_flags`), so it gets that
+    flag's own remedy, :func:`_flag_hint`, rather than advice to write a reference. It gets no
+    quoted-false hint either, since at least ``flag_from_settings`` refuses a string rather than
+    reading a quoted false as true."""
+    if key in HOP_POLICY_FLAGS:
+        return _flag_hint(value)
+    return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
+
+
+def _bool_literal_problems_in(settings: Mapping[str, Any]) -> Iterator[str]:
+    """:func:`_bool_literal_problem` for every setting in ``settings``, in order. The one loop
+    behind :func:`_refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
+    for key, value in settings.items():
+        if (bad := _bool_literal_problem(key, value)) is not None:
+            yield bad
+
+
+def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse every non-bool literal on a boolean setting, in one error, before a connection's own
+    checks or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted
+    false would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
+    ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it.
+    Raising stops the config module, so a later declaration in it is not reached, as with every
+    other refusal a declaration raises.
+
+    A factory calls it too, on one of its own arguments, where a check inside the factory reads
+    that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
+    itself as ``where``, since it runs before the declaration has a name. Problems are joined with
+    `` | ``, because a problem can hold a ``;`` before its remedy."""
+    if problems := list(_bool_literal_problems_in(settings)):
+        raise WiringError(f"{where}: " + " | ".join(problems))
+
+
+def _refuse_non_bool_flags(
+    where: str, flags: Mapping[str, object], *, none_inherits: tuple[str, ...] = ()
+) -> None:
+    """Refuse a flag ``inbound()`` or ``outbound()`` takes itself that is not a real ``bool``
+    (vault BACKLOG #3234). The engine reads most of these by truthiness and resolves no ``env()``
+    on them, so ``simulate="false"``, a non-zero number or a reference would read True. ``0`` and
+    ``1`` are refused too, as :func:`~messagefoundry.config.models.require_flag` refuses them.
+    ``None`` passes only on a flag in ``none_inherits``, where it means inherit the service
+    default. The hop-policy flags are not passed here: their own checks refuse a non-bool first."""
+    for key, value in flags.items():
+        inherits = key in none_inherits
+        if value is None and inherits:
+            continue
+        try:
+            require_flag(value, key)
+        except ValueError as exc:  # names the key and the type, never the value
+            problem = str(exc)
+        else:
+            continue
+        # Raised outside the handler, so the chain stays empty (tests/test_from_none_is_not_redaction.py).
+        # Validation, a pydantic model, stores strict="false" as False, so the quoted-false hint
+        # would be untrue there.
+        hint = "" if key == "strict" else _quoted_false_hint(value)
+        env_hint = " (no env() is resolved on this flag)" if _is_nested_envref(value) else ""
+        tail = "; write True or False, or None to inherit" if inherits else "; write True or False"
+        raise WiringError(f"{where}: {problem}{hint}{env_hint}{tail}")
+
+
 def resolve_env_settings(
     settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
 ) -> dict[str, Any]:
@@ -1649,7 +1759,8 @@ def resolve_env_settings(
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
     first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
     **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
-    (BACKLOG #1656; see the handler)."""
+    (BACKLOG #1656), and so is a ``SystemExit`` from ``sys.exit()`` in it (vault BACKLOG #5105; see
+    the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -1679,7 +1790,7 @@ def resolve_env_settings(
                 if name in bool_defaults:
                     want = "bool"
                     got = _read_bool_setting(got, bool_defaults[name])
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
                 # an arbitrary callable, so it can raise anything -- a `KeyError` from a
                 # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
@@ -1687,8 +1798,14 @@ def resolve_env_settings(
                 # text. That re-opened, for every other exception type, exactly the leak
                 # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
                 # whole point of catching it, so it has to cover every way a cast can fail.
-                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                # failure and must keep propagating.
+                #
+                # `SystemExit` too (vault BACKLOG #5105): a cast that calls `sys.exit()` is a
+                # script habit in a setting reader, not a request to stop. Uncaught, it left a
+                # reload, and `messagefoundry check` ended with the cast's code, 0 included,
+                # which reads as a pass; `sys.exit("...")` can also carry the value it was
+                # handed. It is refused here like any other cast failure, its code and text
+                # withheld. NEVER `BaseException`: a KeyboardInterrupt is an operator stopping
+                # the work, not a cast failure, and must keep propagating.
                 #
                 # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                 # and connector keys, and this string is raised at startup into the operator
@@ -1726,7 +1843,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings.
+            # a literal only in this copy would split one setting into two readings. The loader
+            # refuses one that is not a bool (Registry.bool_literal_problems); a Registry built in
+            # code and never validated is not checked there.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -1821,8 +1940,7 @@ _SECRET_SETTING_KEYS = frozenset(
         "proxy_password",
         "proxy_user",
         # ADR 0015 — WS-* SOAP outbound: the WS-Security UsernameToken credentials and the mTLS
-        # client-key passphrase. ``ws_password`` back-fills from ``basic_password`` in the connector,
-        # so omitting these disclosed under one name the very credential the other name masks.
+        # client-key passphrase; credentials in their own right (no basic_* fallback since #5526).
         "ws_username",
         "ws_password",
         "client_key_password",
@@ -2082,9 +2200,10 @@ def connector_secret_env_values(
 _URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy", "urls", "uris", "endpoints", "proxies")
 
 #: Names that end in a URL word and hold no URL: a proxy EXCLUSION host list and an on/off flag
-#: (BACKLOG #2721 shape 6). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
+#: (BACKLOG #2721 shape 6), and the HTTP listener's list of proxy addresses, which an operator
+#: needs to read in the settings view (BACKLOG #5525). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
 #: of them and ``proxy_url`` is not. The cost of a miss here is only over-masking.
-_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy")
+_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy", "trusted_proxies")
 
 
 def _is_url_setting(name: str) -> bool:
@@ -2726,6 +2845,10 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
+    if tls_client_subjects is not None:
+        # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
+        # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
+        _refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
@@ -3078,6 +3201,8 @@ def Http(
     | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
     | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
+    trusted_proxies: Sequence[str]
+    | EnvRef = (),  # api_key/bearer: proxies whose X-Forwarded-For is read
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
@@ -3164,6 +3289,17 @@ def Http(
     ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
     where" oracle on a PHI intake socket.
 
+    ``trusted_proxies`` (BACKLOG #5525) names the HTTP reverse proxies in front of the listener
+    that append the client's address to ``X-Forwarded-For``, under ``api_key`` and ``bearer``
+    only. The failed-attempt budget keys on the socket peer, so behind a proxy every partner
+    shares one budget and one client's failures would ``429`` the rest. From a listed peer the
+    budget keys instead on the client address in ``X-Forwarded-For``, walked right to left as
+    uvicorn walks it. Each entry is an address or a network, read by the rules
+    ``[api].trusted_proxies`` follows, but this list is the connection's own. At least the
+    allowlist, the connection caps and the peer recorded in the audit row and the connection event
+    stay the socket peer; a refusal records the forwarded address beside it.
+    ``docs/CONNECTIONS.md`` has the walk and what it does not cover.
+
     **Synchronous captured-downstream reply (ADR 0154 D4).** Naming ``reply_from`` turns this inbound
     from fire-and-forget into a **proxy**: the HTTP turn blocks until the named outbound's reply has
     been captured and **committed**, then returns that reply as the response body. One knob, not two —
@@ -3226,6 +3362,72 @@ def Http(
     }
     _validate_intake_auth(settings)
     _validate_sync_reply(settings)
+    # BACKLOG #5525, owner ruling 2026-11-10 ("Per-connection proxies"). Read by the listener's own
+    # reader, so the factory and the listener cannot disagree on an entry; never [api].trusted_proxies.
+    # The list refusal runs first, as its rule requires. A whole-setting env() is read through the
+    # same reader twice more: its default= here, since the config holds it and `check` loads it,
+    # and its environment value by the listener once resolved, at the build `check` and serve run.
+    _reject_envref_in_lists("Http", trusted_proxies=trusted_proxies)
+    from_default = isinstance(trusted_proxies, EnvRef)
+    written: Any = trusted_proxies
+    if isinstance(trusted_proxies, EnvRef):
+        written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    refusal: str | None = None
+    try:
+        trusted_proxy_networks(written)
+    except ValueError as exc:
+        refusal = str(exc)  # withholds every value; raised below, outside this handler
+    if refusal is not None:
+        if from_default:
+            refusal = f"Http trusted_proxies env() default= is refused: {refusal}"
+        raise WiringError(refusal)
+    if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
+        raise WiringError(
+            f"Http sets trusted_proxies but intake_auth={intake_auth!r}; it keys the failed-attempt "
+            "budget only under 'api_key' or 'bearer'. Under 'mtls_subject' the certificate is "
+            "checked at accept, before any header is read, and under 'none' nothing is budgeted. "
+            "Remove the setting; a control that is configured but never consulted reads as "
+            "protection that does not exist"
+        )
+    # Neither budget may be off once trusted_proxies is set. The global one: each forwarded client
+    # keys its own per-peer budget, so only it bounds guessing across the clients behind the
+    # proxy. The per-peer one: the global budget exempts a key that authenticated in the window,
+    # so a listed proxy that writes such a partner's address is bounded there by it alone.
+    budget_reasons = (
+        (
+            "intake_auth_rate_limit_global",
+            intake_auth_rate_limit_global,
+            "Each client behind a listed proxy keys its own per-peer budget, so without the "
+            "global budget nothing bounds guessing across them",
+        ),
+        (
+            "intake_auth_rate_limit",
+            intake_auth_rate_limit,
+            "The global budget exempts an address that authenticated recently, so a request a "
+            "listed proxy keys on such a partner's address is bounded by the per-peer budget "
+            "alone, and without it nothing bounds guessing there",
+        ),
+    )
+    for knob, budget, reason in budget_reasons if trusted_proxies else ():
+        if not budget:
+            raise WiringError(
+                f"Http sets trusted_proxies but {knob} is off. {reason}. Set {knob}, or remove "
+                "the setting"
+            )
+        # The runner reads a budget with int(), so a fraction below 1 would pass the test above
+        # and turn the arm off; a negative, a bool or an env() is no checked budget either.
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise WiringError(
+                f"Http sets trusted_proxies but {knob} is not an integer of at least 1 (value "
+                "withheld). The listener reads it with int(), so a fraction below 1 would turn "
+                "that budget off. Set it to an integer number of failed attempts per minute, or "
+                "remove the setting"
+            )
+    settings["trusted_proxies"] = (
+        trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
+    )
     return ConnectionSpec(ConnectorType.HTTP, settings)
 
 
@@ -3449,7 +3651,8 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             raise WiringError("Http intake_api_key_header must be a non-empty header name")
         return
 
-    # mtls_subject
+    # mtls_subject. The check below reads tls by truthiness, so 0 would be refused as "needs tls=True".
+    _refuse_bool_literals({"tls": settings["tls"]}, "Http")
     if not settings["tls"] or not settings["tls_ca_file"]:
         raise WiringError(
             "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
@@ -3766,7 +3969,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared (never beside ech_egress, which refuses it whatever is attested), and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3785,7 +3988,7 @@ def Rest(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -3914,7 +4117,7 @@ def FHIR(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4153,7 +4356,9 @@ def Direct(
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
     (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
-    ``host:port`` over STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+    ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
+    except the certificates' validity window: construction only warns on it, and each send refuses
+    a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -4385,7 +4590,7 @@ def DICOMweb(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4398,7 +4603,9 @@ def DICOMweb(
     — it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener, cleartext-credential
     refusal, the retry/dead-letter classification, the ``[egress].allowed_http`` gate) and adds only the
     STOW-RS multipart framing + the ``application/dicom+json`` response classification (a per-instance
-    ``FailedSOPSequence`` → permanent dead-letter; 5xx/408/429/connection errors → retry). This is the
+    ``FailedSOPSequence`` → permanent dead-letter, as are some other 2xx replies that do not confirm
+    the store, though not all; which ones is docs/CONNECTIONS.md *DICOMweb*, *Status classification*;
+    5xx/408/429/connection errors → retry). This is the
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever).
@@ -4406,6 +4613,10 @@ def DICOMweb(
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("DICOMweb", headers)
+    if tls_ca_file is not None:
+        # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification
+        # off. Only here: elsewhere outbound() refuses it, naming the connection.
+        _refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
     _check_tls_ca_file(
         "DICOMweb",
         tls_ca_file,
@@ -4559,7 +4770,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS does not permit it, even at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -4656,7 +4867,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS does not permit it, even at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -4688,8 +4899,8 @@ def DatabasePoll(
     its cursor. The *Database source* section of docs/CONNECTIONS.md says what one needs and names
     some of the cases where it loses a row even then (BACKLOG #4958). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
-    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
-    ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
+    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it,
+    even at ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
 
     ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
     fetches at most this many rows and leaves the rest of the result set in the table for the next poll.
@@ -4831,7 +5042,7 @@ def Soap(
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
-    basic_user: str | EnvRef | None = None,
+    basic_user: str | EnvRef | None = None,  # set with basic_password, or neither (#5526)
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
@@ -4851,8 +5062,8 @@ def Soap(
     client_key_file: str | EnvRef | None = None,  # PEM private key (path or env() text)
     client_key_password: str | EnvRef | None = None,  # key passphrase — secret, use env()
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
-    ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
-    ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
+    ws_username: str | EnvRef | None = None,  # UsernameToken user; pairs with ws_password
+    ws_password: str | EnvRef | None = None,  # no basic_password fallback (#5526)
     ws_password_type: Literal["text"] = "text",  # PasswordText; "digest" retired (#1171)
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
@@ -4867,7 +5078,7 @@ def Soap(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -5061,8 +5272,7 @@ def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
     the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
     here, because :func:`resolve_env_settings` never casts a default.
 
-    A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
-    item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""
+    A literal is a real ``bool`` here: :func:`Ftp` refuses anything else first."""
     if not isinstance(tls, EnvRef):
         return "ftps" if tls else "ftp"
     default = tls.default
@@ -5116,6 +5326,14 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
+    # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
+    # insecure side, so anything but a bool is refused first, before the CA check reads it too.
+    # require_flag's wording, raised outside any handler (tests/test_from_none_is_not_redaction.py).
+    if not isinstance(tls, (bool, EnvRef)):
+        raise WiringError(
+            f"Ftp: setting 'tls' must be true or false, not {type(tls).__name__}{_bool_remedy('tls', tls)}"
+        )
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -5851,7 +6069,11 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
         if raw.cast is not None:
             try:
                 value = raw.cast(value)
-            except (ValueError, TypeError):
+            except (Exception, SystemExit):  # noqa: BLE001
+                # Any cast failure, a sys.exit() in it included (vault BACKLOG #5105), is skipped
+                # here unread: its text can carry the value, and resolve_env_settings refuses the
+                # same ref loud and redacted when the connector is built. Not BaseException: a
+                # KeyboardInterrupt is not the cast's failure.
                 return None
         raw = value
     try:
@@ -5981,7 +6203,9 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
             return raw
         try:
             return ref.cast(raw)
-        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+        # BACKLOG #1656: any cast error can quote the value; a sys.exit() in the cast is a cast
+        # failure too (vault BACKLOG #5105), as resolve_env_settings treats it.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
             _logger.debug(
                 "env() value %r: its cast raised %s; skipped by this probe",
                 ref.key,
@@ -6311,6 +6535,9 @@ class Registry:
                 "declared, so this graph would receive and send nothing; declare one, or run "
                 "'messagefoundry-toolkit init' to scaffold a starter config"
             )
+        # Before the other rules: some read the same literals laxly, and validate raises only the
+        # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
+        yield from self.bool_literal_problems()
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
@@ -6382,6 +6609,58 @@ class Registry:
             and not isinstance(port, bool)
         ]
         return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
+
+    def bool_literal_problems(self) -> list[str]:
+        """A literal on a boolean setting that is neither a ``bool`` nor ``None`` (vault BACKLOG
+        #3234). A connector reads most flags with ``bool()`` or plain truthiness, so a code-first
+        ``persistent="false"`` or ``tls_allow_expired="no"`` would read as True; ``connections.toml``
+        already refuses a quoted value there (``_check_setting_types``).
+
+        Refused, never read: a factory's own body and the pre-resolve readers have read the literal
+        by now, so turning it into a bool here would split one setting into two readings, and a
+        refused graph never runs. Here and not only in the factories, because a ``with_*`` composer
+        writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
+        registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
+        ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
+        (:func:`_refuse_bool_literals`); this pass sees the rest, a lookup's and a composer's
+        included. ``None`` passes where the setting has one default on every factory: there an
+        explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
+        a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
+        and on a setting with no single default. ``env()`` references are read strictly once
+        resolved (:func:`resolve_env_settings`). The value is withheld.
+
+        Only a graph that is validated sees this, as the loader's is; a :class:`Registry` built in
+        code and handed straight to a runner is not checked here."""
+        problems: list[str] = []
+        try:
+            for kind, name, settings, _deployed in self.settings_carriers():
+                problems.extend(
+                    f"{kind} {name!r}: {bad}" for bad in _bool_literal_problems_in(settings)
+                )
+        except WiringError as exc:  # a factory whose annotations do not resolve; report, not raise
+            return [str(exc)]
+        return problems
+
+    def settings_carriers(self) -> Iterator[tuple[str, str, Mapping[str, Any], bool]]:
+        """Every declaration that carries transport settings, as ``(kind, name, settings,
+        deployed)``: each inbound and outbound connection, database lookup, FHIR lookup and
+        reference set's source. A reader that must see them all reads this rather than keeping its
+        own copy, so a table added here reaches each of them (:meth:`bool_literal_problems`,
+        :meth:`_declared_encodings`, ``anchor._iter_settings_values``).
+
+        ``deployed`` is the #233 / ADR 0111 flag. Only a connection has one; a lookup, a FHIR lookup
+        and a reference set are always ``True``, there being no declared-but-not-deployed state for
+        them."""
+        for name, ic in self.inbound.items():
+            yield _INBOUND_ENCODING_KIND, name, ic.spec.settings, ic.deployed
+        for name, oc in self.outbound.items():
+            yield "outbound connection", name, oc.spec.settings, oc.deployed
+        for name, lk in self.lookups.items():
+            yield "database lookup", name, lk.settings, True
+        for name, fl in self.fhir_lookups.items():
+            yield "fhir lookup", name, fl.settings, True
+        for name, ref in self.references.items():
+            yield "reference set", name, ref.source.settings, True
 
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
@@ -6513,32 +6792,12 @@ class Registry:
         """``(kind, name, value, deployed)`` for every registry entry whose settings carry an
         ``encoding``.
 
-        Every settings-bearing table, because an unusable codec name is a property of the setting and
-        not of the direction it is read in. The table list is the same one
-        ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
-        together, since a sixth settings-bearing table added to one and missed here reads as clean.
-
-        ``deployed`` is the #233 / ADR 0111 flag, carried so :func:`resolved_encoding_problems` can
-        honour it without re-deriving it per table. Only a connection has one; a lookup, a FHIR lookup
-        and a reference set are always ``True``, there being no declared-but-not-deployed state for
-        them."""
-        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
-            (
-                _INBOUND_ENCODING_KIND,
-                ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
-            ),
-            (
-                "outbound connection",
-                ((n, c.spec.settings, c.deployed) for n, c in self.outbound.items()),
-            ),
-            ("database lookup", ((n, s.settings, True) for n, s in self.lookups.items())),
-            ("fhir lookup", ((n, s.settings, True) for n, s in self.fhir_lookups.items())),
-            ("reference set", ((n, r.source.settings, True) for n, r in self.references.items())),
-        ]
-        for kind, entries in tables:
-            for name, settings, deployed in entries:
-                if "encoding" in settings:
-                    yield kind, name, settings["encoding"], deployed
+        Every settings-bearing table (:meth:`settings_carriers`), because an unusable codec name is a
+        property of the setting and not of the direction it is read in. ``deployed`` is carried so
+        :func:`resolved_encoding_problems` can honour it without re-deriving it per table."""
+        for kind, name, settings, deployed in self.settings_carriers():
+            if "encoding" in settings:
+                yield kind, name, settings["encoding"], deployed
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -6575,7 +6834,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.cleartext_accepted
+        if _declares(oc.cleartext_accepted)
     ]
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
@@ -6606,6 +6865,35 @@ class AttestedHop:
 # and a reason that must be a str (or None).
 _LAX_BOOL: Final = TypeAdapter(bool)
 _MODEL_REASON: Final = TypeAdapter(str | None)
+
+
+def read_lax_flag(value: object, where: str, key: str) -> bool:
+    """``value`` read as the typed models read a declaration flag: pydantic's lax ``bool``, so a
+    false spelling such as ``"off"`` or ``b"false"`` is ``False`` (vault BACKLOG #5286).
+
+    A value that lax ``bool`` refuses is a :class:`WiringError` naming ``where`` and ``key``, never
+    the value: pydantic's own error quotes its input, so it is raised after the handler ends,
+    with neither a cause nor a context."""
+    try:
+        return _LAX_BOOL.validate_python(value)
+    except ValidationError:
+        pass
+    raise WiringError(f"{where}: {key} must be a boolean")
+
+
+def _declares(flag: object) -> bool:
+    """Whether a connection's typed declaration flag is set, for a report. A report lists a flag
+    lax ``bool`` reads as true, as :func:`read_lax_flag` reads it and the build and the settings
+    mirror honour it, and does not list one it reads as false, so a falsy string such as ``"no"``
+    is not listed (vault BACKLOG #5286). ``None`` is not listed, as
+    :func:`attested_secure_hop_records` reads it. Every other value lax ``bool`` refuses is listed
+    although the build refuses it, because a report fails toward listing (vault BACKLOG #2232)."""
+    if flag is None:
+        return False
+    try:
+        return _LAX_BOOL.validate_python(flag)
+    except ValidationError:
+        return True
 
 
 def _attested_reason_text(value: object) -> str | None:
@@ -6680,17 +6968,17 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
         # is the flag the typed Source or Destination holds, the build builds it and it is no
         # refusal, and a reason of another type is refused as the model refuses it, never passed to
-        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
-        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
-        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". The
+        # flags go through read_lax_flag, the reader _dest_config's settings mirror uses too, so a
+        # string "false" reads unset in both (vault BACKLOG #5286).
         try:
             refuse_raw_hop_attestation(settings, "")
-            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
             )
             _check_revocation_attestation(
-                _LAX_BOOL.validate_python(revocation),
+                read_lax_flag(revocation, "", "tls_revocation_attested"),
                 _MODEL_REASON.validate_python(revocation_reason),
             )
         except (WiringError, ValueError):
@@ -6730,7 +7018,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
-    settings_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
+    hop_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
         *(
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
@@ -6744,7 +7032,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             _attested_reason_text(settings.get("tls_hop_attested_reason")),
             _refused(name, settings, accepted),
         )
-        for name, settings, accepted in settings_carriers
+        for name, settings, accepted in hop_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out, key=lambda hop: hop.name)
@@ -7138,12 +7426,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = [
         (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.tls_revocation_attested
+        if _declares(oc.tls_revocation_attested)
     ]
     out.extend(
         (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
-        if ic.tls_revocation_attested
+        if _declares(ic.tls_revocation_attested)
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(
@@ -7220,6 +7508,56 @@ def ech_cleartext_sidecar_hops(
     return sorted(out)
 
 
+#: The note :func:`listener_trusted_proxy_hops` gives a listener whose ``trusted_proxies`` is an
+#: ``env()`` value it could not resolve. Short, since the posture entry shows it beside the name and
+#: its text says what a name marked possibly means.
+UNRESOLVED_LISTENER_PROXIES = "possibly"
+
+
+def listener_trusted_proxy_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every inbound ``Http()`` listener that trusts ``X-Forwarded-For`` from a listed proxy, as
+    ``(name, note)`` (BACKLOG #5525).
+
+    The single reader of that set, on the contract of :func:`ech_cleartext_sidecar_hops`:
+    ``GET /security/posture`` reads it for the ``listener_trusted_proxies`` entry of
+    ``security_loosenings()``, which the ``posture_loosened`` alert and the start's audit row read
+    too. Sorted by name.
+
+    Any non-empty list is named, a single proxy address included. A listed proxy may key the
+    failed-attempt budget on any address it writes, so each client behind it holds its own
+    per-peer budget, and the global budget is then the only bound on guessing across them; the
+    ``[api]`` list names only ranges because there a single proxy changes no budget. The note is
+    ``"range"`` where an entry covers more than one address, since every host inside it is trusted
+    as a proxy, and empty otherwise. An ``env()`` value is resolved against ``env_values`` as the
+    build resolves it; one this cannot resolve is named with :data:`UNRESOLVED_LISTENER_PROXIES`,
+    never left off. A ``deployed=False`` listener with an ``env()`` value is skipped, as
+    :func:`ech_cleartext_sidecar_hops` skips one, since its values are never resolved. A value the
+    build would refuse is skipped too: no listener is built from it."""
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    out: list[tuple[str, str]] = []
+    for ic in registry.inbound.values():
+        if ic.spec.type != ConnectorType.HTTP:
+            continue
+        raw = ic.spec.settings.get("trusted_proxies")
+        if not ic.deployed and isinstance(raw, EnvRef):
+            continue
+        value = _db_setting(ic.spec.settings, "trusted_proxies", None, env_values)
+        if value is _UNRESOLVED:
+            out.append((ic.name, UNRESOLVED_LISTENER_PROXIES))
+            continue
+        try:
+            networks = trusted_proxy_networks(value)
+        except ValueError:
+            continue  # the build refuses this list, so no listener reads it
+        if networks:
+            ranged = any(network.num_addresses > 1 for network in networks)
+            out.append((ic.name, "range" if ranged else ""))
+    return sorted(out)
+
+
 #: Opens the reason :func:`unverified_generic_db_hops` gives for a hop whose ``env()`` dialect it
 #: could not resolve. ``GET /security/posture`` keeps only names, so it marks such a name with this
 #: text rather than state the hop is generic.
@@ -7281,6 +7619,56 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
+    """Entries of the graph that open an ODBC connection, as ``(kind, record name, dialect,
+    driver)``, for ``messagefoundry verify``'s ``host.odbc`` and ``host.ciphers`` rows (BACKLOG
+    #3803 R3).
+
+    Kept beside the factories that write the settings it reads, so the verifier does not re-derive
+    them. The entries are each deployed ``DATABASE`` connection, on either dialect, each
+    database-backed reference set and each database lookup; the last two are always on the
+    ``sqlserver`` preset. ``dialect`` is that preset or ``generic``, in lower case, and ``driver``
+    the ``odbc_driver`` setting as written, the factories' ``ODBC Driver 18 for SQL Server`` when
+    unset; either is ``None`` when it is an ``env()`` reference, read with no values. Which driver
+    a name is, and so which TLS the hop takes, is the caller's to judge. A connection that is not
+    deployed is left out, since the engine never builds it (ADR 0111). A connection is named by its
+    record name, as the other readers here name it, so an inbound and an outbound of one name stay
+    apart. The connections come first, then the reference sets, then the lookups, each by name."""
+
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
+    def driver(settings: Mapping[str, Any]) -> str | None:
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        return None if value is _UNRESOLVED else str(value)
+
+    connections = [
+        (
+            "DATABASE connection",
+            record_name(conn.name),
+            _db_dialect(conn.spec.settings, None),
+            driver(conn.spec.settings),
+        )
+        for record_name, table in (
+            (_outbound_record_name, registry.outbound),
+            (inbound_record_name, registry.inbound),
+        )
+        for conn in table.values()
+        if conn.spec.type is ConnectorType.DATABASE and conn.deployed
+    ]
+    connections.sort(key=lambda hop: hop[1])
+    references = [
+        ("DatabaseRef reference set", name, "sqlserver", driver(ref.source.settings))
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    lookups = [
+        ("DatabaseLookup", name, "sqlserver", driver(spec.settings))
+        for name, spec in sorted(registry.lookups.items())
+    ]
+    return [*connections, *references, *lookups]
 
 
 def unverified_generic_db_hops(
@@ -7987,6 +8375,24 @@ def build_inbound_connection(
     the caller is responsible for ``add_inbound``. ``content_type`` accepts a :class:`ContentType`
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
+    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
+    # because the settings dict stays mutable after the declaration returns. Before the bool-literal
+    # refusal, which would otherwise give a raw non-bool tls_hop_attested the generic remedy.
+    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
+    _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
+    # Before any check below reads one: the content_type check read strict="false" as strict on.
+    _refuse_non_bool_flags(
+        f"inbound connection {name!r}",
+        {
+            "strict": strict,
+            "inline": inline,
+            "auto_start": auto_start,
+            "deployed": deployed,
+            "capture_ack": capture_ack,
+            "capture_connection_errors": capture_connection_errors,
+        },
+        none_inherits=("capture_ack", "capture_connection_errors"),
+    )
     content_type = _coerce_content_type(name, content_type)
     if (
         spec.type
@@ -8160,9 +8566,6 @@ def build_inbound_connection(
     _hop_attestation_entries(
         f"inbound connection {name!r}", tls_hop_attested, tls_hop_attested_reason
     )
-    # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
-    # because the settings dict stays mutable after the declaration returns.
-    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
     # ADR 0173: the revocation-attestation pair is coherence-checked at this shared choke point, so a
     # flag with no reason fails at `messagefoundry check` / dry-run on either authoring surface.
     try:
@@ -8380,6 +8783,14 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    # Before the bool-literal refusal, which would otherwise give a raw non-bool tls_hop_attested
+    # the generic remedy instead of naming the declaration that carries it.
+    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
+    _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
+    _refuse_non_bool_flags(
+        f"outbound connection {name!r}",
+        {"simulate": simulate, "auto_start": auto_start, "deployed": deployed},
+    )
     # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
     # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
     # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError
@@ -8396,7 +8807,6 @@ def build_outbound_connection(
     _refuse_attested_and_accepted(
         f"outbound connection {name!r}", tls_hop_attested, cleartext_accepted
     )
-    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
     if dead_letter_days is not None and dead_letter_days < 0:
         # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
         # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
@@ -9523,16 +9933,23 @@ _WIN_REJECTED_SIDS = frozenset(
 # BUILTIN\Administrators, the group a foreign owner must resolve into to be trusted.
 _WIN_ADMINISTRATORS_SID = "S-1-5-32-544"
 
+# NT SERVICE\TrustedInstaller, the Windows servicing identity. It can replace any system file
+# already and owns ``C:\`` and ``C:\Program Files`` as Windows ships them, so refusing it as an
+# owner or a grantee would refuse on no evidence. ``auth/anchor_path.py`` trusts it the same way.
+_WIN_TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
 # Literal SIDs whose holder administers this machine whatever domain it is joined to.
 _WIN_ADMIN_SIDS = frozenset(
     {
         "S-1-5-18",  # NT AUTHORITY\SYSTEM
         _WIN_ADMINISTRATORS_SID,
+        _WIN_TRUSTED_INSTALLER_SID,
     }
 )
 
-# SIDs trusted to hold write on executed config (the current process user and the directory owner are
-# added at evaluation time): the admin SIDs above, plus two owner-relative placeholders.
+# SIDs trusted to hold write on executed config (the directory owner, and the current process user
+# unless it is LocalService or NetworkService, are added at evaluation time): the admin SIDs above,
+# plus two owner-relative placeholders.
 #
 # CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) are trusted because neither names a principal
 # this ACL can be read against, so refusing them would refuse on no evidence: S-1-3-4 carries the
@@ -9564,8 +9981,23 @@ _WIN_ADMIN_RIDS = frozenset(
     }
 )
 
-# ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE — the only type that grants rights.
+# The admin RIDs above that name a GROUP (Domain, Schema, Enterprise Admins): the only ones a
+# grantee may carry (:func:`_is_domain_admin_group_sid`). 500 is an account.
+_WIN_ADMIN_GROUP_RIDS = frozenset({512, 518, 519})
+
+# ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE, the only granting type whose
+# trustee the reader parses.
 _WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
+
+# ACE types that can GRANT a right in a DACL: allowed, compound, object, callback and callback-object.
+# A callback or object entry grants conditionally, so the policy cannot say whom it applies to and
+# refuses one that carries a write-class right (BACKLOG #5622; ``auth/anchor_path.py`` reads the
+# same set). Deny entries are not here: they can only take a right away.
+_WIN_GRANTING_ACE_TYPES = frozenset({0x00, 0x04, 0x05, 0x09, 0x0B})
+
+# LocalService and NetworkService run many services, so the engine running as one of them does not
+# make that SID the engine's alone: self-trust skips them, as a grantee and as an owner.
+_WIN_SHARED_SERVICE_SIDS = frozenset({"S-1-5-19", "S-1-5-20"})
 
 
 def _is_well_known_admin_sid(sid: str) -> bool:
@@ -9599,6 +10031,22 @@ def _is_well_known_admin_sid(sid: str) -> bool:
     return int(rid_text) in _WIN_ADMIN_RIDS
 
 
+def _is_domain_admin_group_sid(sid: str) -> bool:
+    """Whether ``sid`` is a Domain, Schema or Enterprise Admins group SID by its form alone.
+
+    These are the only domain-relative grantees the DACL pass trusts, and only once the local
+    Administrators lookup resolves them (BACKLOG #5622). A group, not an account: UAC marks these
+    groups deny-only in an unelevated token, so a write grant to one is usable only by an elevated
+    administrator, who could take ownership anyway. A user account's own SID is never deny-only, so
+    a grant to one does not depend on elevation, and a non-owner account stays refused as a grantee
+    (the built-in Administrator, RID 500, included)."""
+    return (
+        _is_well_known_admin_sid(sid)
+        and sid not in _WIN_ADMIN_SIDS
+        and int(sid.rsplit("-", 1)[1]) in _WIN_ADMIN_GROUP_RIDS
+    )
+
+
 def _evaluate_config_dacl(
     owner_sid: str,
     aces: Sequence[tuple[int, int, str]],
@@ -9608,23 +10056,31 @@ def _evaluate_config_dacl(
     """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
     ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
-    form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
-    that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID —
-    and unconditionally when a broad/low-privilege SID (Everyone/Authenticated Users/Users/…) holds
-    such a right.
+    form), with an empty trustee for every type but 0x00. A source is refused when any **ALLOWED**
+    ACE grants a **write-class** right to a principal that is neither the file owner, nor the current
+    process user, nor a trusted admin/SYSTEM/TrustedInstaller SID, nor a Domain/Schema/Enterprise
+    Admins group that resolves as a direct member of Administrators
+    (:func:`_is_domain_admin_group_sid`) — and unconditionally when a broad/low-privilege SID
+    (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
+    (compound, object, callback) carrying a write-class right refuses too, because its trustee or
+    condition cannot be judged here. A LocalService or NetworkService process user is not
+    self-trusted: other services share that SID (BACKLOG #5622).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
     this loader executes as the service account no matter what the DACL currently says. The owner
-    passes as the current process user, as a well-known admin SID (:func:`_is_well_known_admin_sid`),
-    or as a resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
+    passes as the current process user (unless that user is LocalService or NetworkService, which
+    other services share), as a well-known admin SID (:func:`_is_well_known_admin_sid`), or as a
+    resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
     membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
     ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
     The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
     raised through :func:`_refuse_unsafe_config_source`, which says where that escape is honoured.
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
-    reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
+    reported as itself instead of being masked by the owner verdict, and the scan runs past an entry
+    it cannot judge, so a definite insecure entry later in the list is reported ahead of it. A
+    ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
     :func:`_enforce_windows_paths` refuses an unreadable token before any path is evaluated
@@ -9633,33 +10089,77 @@ def _evaluate_config_dacl(
     for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
+    # The engine's own SID earns self-trust only when no other service can hold it.
+    engine_sid = self_sid if self_sid not in _WIN_SHARED_SERVICE_SIDS else None
     trusted = set(_WIN_TRUSTED_SIDS)
     trusted.add(owner_sid)
-    if self_sid is not None:
-        trusted.add(self_sid)
+    if engine_sid is not None:
+        trusted.add(engine_sid)
+    unsure: str | None = None  # the first entry that cannot be judged, reported if none is worse
     for ace_type, access_mask, trustee_sid in aces:
-        if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-            continue  # DENY/audit/etc. ACEs never grant a right
+        if ace_type not in _WIN_GRANTING_ACE_TYPES:
+            continue  # DENY ACEs never grant a right
         if not access_mask & _WIN_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
+        if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
+            unsure = unsure or (
+                f"a compound, object or callback access entry (type 0x{ace_type:02x}) grants write "
+                "access, and this check cannot tell whom it applies to"
+            )
+            continue
         if trustee_sid in _WIN_REJECTED_SIDS:
             return f"a broad/low-privilege principal ({trustee_sid}) has write access"
-        if trustee_sid not in trusted:
-            return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
-    if self_sid is None or owner_sid == self_sid or _is_well_known_admin_sid(owner_sid):
+        if trustee_sid in trusted:
+            continue
+        if trustee_sid == self_sid:
+            return (
+                f"the account the engine runs as ({trustee_sid}) has write access, but other "
+                "services share that identity, so it is not trusted as the engine's own"
+            )
+        # The RID arm alone would trust an admin group of any domain (ADR 0036 Amendment A accepted
+        # that for owners only), so a grantee must also resolve as a member of Administrators here.
+        if _is_domain_admin_group_sid(trustee_sid):
+            member = owner_in_admins(trustee_sid)
+            if member is True:
+                continue
+            if member is None:
+                unsure = unsure or (
+                    f"an administrators group ({trustee_sid}) has write access, and its "
+                    "Administrators membership could not be resolved"
+                )
+                continue
+        return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    # A definite owner refusal is reported ahead of an entry the scan could not judge.
+    return _config_owner_problem(owner_sid, self_sid, engine_sid, owner_in_admins) or unsure
+
+
+def _config_owner_problem(
+    owner_sid: str,
+    self_sid: str | None,
+    engine_sid: str | None,
+    owner_in_admins: Callable[[str], bool | None],
+) -> str | None:
+    """The owner arm of :func:`_evaluate_config_dacl`: a refusal reason, or ``None``."""
+    if self_sid is None or owner_sid == engine_sid or _is_well_known_admin_sid(owner_sid):
         return None
     owner_is_admin = owner_in_admins(owner_sid)
+    if owner_is_admin:
+        return None
+    if owner_sid == self_sid:
+        who = "is the account the engine runs as, but other services share that identity"
+    else:
+        who = "is not the account the engine runs as"
     if owner_is_admin is None:
         return (
-            f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
-            f"membership could not be resolved"
+            f"the owner ({owner_sid}) {who}, and its Administrators membership could not be "
+            "resolved"
         )
-    if not owner_is_admin:
-        return (
-            f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
-            f"so it can rewrite the code this loader executes"
-        )
-    return None
+    if owner_sid == self_sid:
+        return f"the owner ({owner_sid}) {who}, so it can rewrite the code this loader executes"
+    return (
+        f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
+        f"so it can rewrite the code this loader executes"
+    )
 
 
 # ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
@@ -10039,7 +10539,8 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         member SID and a short read alike, with no way to tell which."""
         _logger.warning(
             "config-source trust guard could not resolve local Administrators membership (%s); an "
-            "owner that is neither the run-as account nor a well-known admin SID will be REFUSED "
+            "owner that is neither the run-as account nor a well-known admin SID, or an admins "
+            "group holding write, will be REFUSED "
             "(see docs/SERVICE.md for the required config-dir ownership)",
             why,
         )
@@ -10173,16 +10674,19 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
                     return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
-                if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-                    aces.append((header.AceType, 0, ""))  # non-allow ACE: policy ignores it
-                    continue
+                # Every ACE type carries its access mask right after the 4-byte header, so the mask
+                # is read for all of them: the policy refuses a callback or object entry granting a
+                # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
-                # The trustee SID begins at the SidStart field offset within the ACE structure.
-                sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
-                sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
-                trustee = _sid_to_str(sid_ptr) if sid_ptr else None
-                if trustee is None:
-                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
+                trustee = ""  # parsed for type 0x00 only
+                if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
+                    # The trustee SID begins at the SidStart field offset within the ACE structure.
+                    sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
+                    sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
+                    parsed = _sid_to_str(sid_ptr) if sid_ptr else None
+                    if parsed is None:
+                        return _WinPathSecurity(owner_sid=owner_sid, aces=None)
+                    trustee = parsed
                 aces.append((header.AceType, int(allowed.Mask), trustee))
             return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:
@@ -10381,21 +10885,155 @@ def _enforce_posix_paths(
 # answer to "who can write this path" for config and for start, on each platform.
 
 
-def _file_and_folder(files: Iterable[Path]) -> list[Path]:
-    """Each file in ``files`` that exists, then the folder it sits in, each path once.
+def _stat_mode(path: Path) -> int | None:
+    """The mode of what an open of ``path`` reaches, following links.
 
-    The folder counts because whoever can write it can replace the file. A file that does not exist
-    is left out with its folder, because nothing reads it. The value file is read again on every
-    reload, and each of those reads checks it again (``serve``'s ``env_values``), so one created
-    after the start is checked when it is first read."""
-    return list(
-        dict.fromkeys(
-            path
-            for file in files
-            if file.is_file()
-            for path in (file.absolute(), file.absolute().parent)
-        )
-    )
+    ``None`` where no object can be opened by that path (:func:`is_missing_directory`), so nothing
+    there is read. Any other stat error raises: ``Path.is_dir`` and ``Path.is_file`` answer
+    ``False`` for it too, and the start check then vetted nothing there (vault BACKLOG #6654 items
+    2 and 17)."""
+    try:
+        return path.stat().st_mode
+    except OSError as exc:
+        if is_missing_directory(exc):
+            return None
+        raise
+
+
+def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
+    """What a walk modelling an open of ``path`` passes through that its writer could re-point,
+    and where the walk ends.
+
+    The first list holds the real folder holding each link the walk follows, a folder link
+    anywhere in the path included, and on Windows the link itself: whoever can write that folder,
+    or on Windows the link, can re-point it between a vet and a read. A POSIX link's own mode
+    means nothing, so it is not listed. The list ends with the real object the walk reaches, which
+    the second item names too (vault BACKLOG #2596, #6654 item 5). Where the walk meets a name
+    that is not there, the list ends instead with the last real folder the walk reached on the way
+    to it, or, for a file met where a folder belongs, the folder holding that file, if a link led
+    there, and the second item is ``None``. A path may appear more than once. Only folders holding
+    a link are named: the folders above a path's own folder are not vetted, as for a path with no
+    link.
+
+    A model of how the open resolves, walked one name at a time from the root, so a relative link
+    target names a path from the real folder holding the link: on POSIX ``..`` is the real parent
+    of the folder reached, and on Windows the text is normalized before each pass. The model is
+    not the open: :func:`_file_and_folder` checks where it ends against the kernel's own answer.
+
+    Raises ``OSError`` where a name cannot be stat'ed for any reason but absence, a link cannot be
+    read, more than :data:`_LINK_HOPS` links are followed, or, on Windows, a name in the path or
+    in a link target holds a colon or ends in a space or a dot, a link leads to a device path, a
+    drive with no separator after it or a path rooted with no drive, the name is a reparse point
+    other than a symbolic link or a junction, or a relative link target holding ``..`` is met
+    after a junction. Each of those could leave a folder the open passes through unread, or have
+    the walk vet another object than the open reaches: Win32 strips a trailing dot or space where
+    a link's target, opened as written, keeps it, a joined name holding a colon restarts the path
+    at a drive (``anchor_path.windows_chain`` refuses both), and the open can resolve the ``..``
+    of a relative link reached through a junction against the path through the junction
+    (measured). That last refusal holds for the rest of the walk, so it also refuses some layouts
+    the open would land on safely, such as one with an absolute link between the junction and the
+    relative link: it fails closed."""
+    from messagefoundry.auth.anchor_path import _IO_REPARSE_TAG_MOUNT_POINT, _NAME_SURROGATE_BIT
+
+    windows = os.name == "nt"
+    found: list[Path] = []
+    hops = 0
+    # Measured on Windows: the open can resolve the ``..`` of a relative link reached through a
+    # junction against the path through the junction, not the real folder this walk reaches, so
+    # it can take a route this walk never vets. Once a junction is crossed, such a target is
+    # refused for the rest of the walk, which fails closed on some layouts the open lands on
+    # safely, such as an absolute link between the two.
+    junction_crossed = False
+    pending = os.fspath(path.absolute())
+    while True:
+        if windows:
+            # Win32 collapses ``.`` and ``..`` in the text before it follows any link.
+            pending = os.path.normpath(pending)
+        drive, rest = os.path.splitdrive(pending)
+        cur = drive + os.sep
+        cur_is_folder = True
+        parts = [part for part in rest.split(os.sep) if part]
+        if windows:
+            # Checked over the whole pass before anything is joined, as windows_chain does: a
+            # remaining name ``a:b`` joined after a link target restarts the path at ``a:\``.
+            if any(":" in part for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path holds a colon")
+            if any(part.endswith((" ", ".")) and part not in (".", "..") for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path ends in a space or a dot")
+        for index, name in enumerate(parts):
+            if name == ".":
+                continue
+            if name == "..":
+                # POSIX only: the kernel takes the parent of the folder already reached, which
+                # holds no link.
+                cur = os.path.dirname(cur)
+                cur_is_folder = True
+                continue
+            child = os.path.join(cur, name)
+            try:
+                st = os.lstat(child)
+            except OSError as exc:
+                if is_missing_directory(exc):
+                    if found:
+                        # A link leads here: whoever can write this folder can create the
+                        # missing name before the read. A file met where a folder belongs
+                        # (ENOTDIR) can be replaced by a folder through its own folder.
+                        found.append(Path(cur if cur_is_folder else os.path.dirname(cur)))
+                    return found, None
+                raise
+            tag = getattr(st, "st_reparse_tag", 0)
+            if not (stat.S_ISLNK(st.st_mode) or tag == _IO_REPARSE_TAG_MOUNT_POINT):
+                if tag & _NAME_SURROGATE_BIT:
+                    raise OSError(
+                        errno.EINVAL, f"a reparse point (tag 0x{tag:08x}) this check cannot follow"
+                    )
+                cur, cur_is_folder = child, stat.S_ISDIR(st.st_mode)
+                continue
+            hops += 1
+            if hops > _LINK_HOPS:
+                raise OSError(errno.ELOOP, f"more than {_LINK_HOPS} links were followed")
+            found.append(Path(cur))
+            if windows:
+                # GetNamedSecurityInfoW reads a link's own access list, not its target's.
+                found.append(Path(child))
+            target = os.readlink(child)
+            if windows:
+                target = _windows_link_target(target)
+            if not os.path.isabs(target):
+                if junction_crossed and ".." in re.split(r"[\\/]", target):
+                    raise OSError(
+                        errno.EINVAL, "a relative link climbing with '..' follows a junction"
+                    )
+                target = os.path.join(cur, target)
+            if tag == _IO_REPARSE_TAG_MOUNT_POINT:
+                junction_crossed = True
+            pending = os.path.join(target, *parts[index + 1 :])
+            break
+        else:
+            found.append(Path(cur))
+            return found, found[-1]
+
+
+#: Past every platform's own bound on a chain of links (40 on Linux, 63 on Windows), so a chain
+#: the open follows is never refused for its length alone.
+_LINK_HOPS: Final = 64
+
+
+def _windows_link_target(text: str) -> str:
+    """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
+    Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
+    device path, a drive with no separator after it (``D:x``), read from that drive's own working
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+
+    plain = _strip_win_prefix(text)
+    if plain is None:
+        raise OSError(errno.EINVAL, "a link leads to a device path")
+    if _drive_relative(plain):
+        raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
+    if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
+        raise OSError(errno.EINVAL, "a link leads to a path rooted with no drive")
+    return plain
 
 
 def assert_trusted_start_paths(
@@ -10403,28 +11041,102 @@ def assert_trusted_start_paths(
 ) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
-    ``files`` are the settings file and the value file this start reads. Each one that exists is
-    checked with the folder it sits in, by the config-source policy: on Windows the owner and DACL,
-    on POSIX the mode and the owning uid. A refusal raises :class:`WiringError` through
-    :func:`_refuse_unsafe_config_source`, so the clamped ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``
-    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599). Each message
-    starts with ``lead``, so a re-read of the value file on reload says what it refused.
+    ``files`` are the settings file and the value file this start reads. Each one that is a
+    regular file is checked with the folder it sits in, by the config-source policy: on Windows the
+    owner and DACL, on POSIX the mode and the owning uid. A refusal raises :class:`WiringError`
+    through :func:`_refuse_unsafe_config_source`, so the clamped
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape downgrades it exactly as it does a config refusal
+    (vault BACKLOG #2599). Each message starts with ``lead``, so a re-read of the value file on
+    reload says what it refused.
 
     Neither file is code, but each one steers code: the settings file sets the posture, the DR hook
     command, the reload roots and the egress lists, and the value file feeds every ``env()`` lookup
     in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
     step 3).
 
-    Each of ``folders`` that exists is checked too, whether or not a file in it does: a reload that
-    applies value bytes read earlier needs the folder vetted even when the file has gone since
+    Each of ``folders`` that is a folder is checked too, whether or not a file in it is: a reload
+    that applies value bytes read earlier needs the folder vetted even when the file has gone since
     (vault BACKLOG #2596).
 
-    **Not checked**, at least: the folders above each file's own folder, and a file named in the
-    settings that the start reads later, such as a key, certificate or CRL file. Those have their
-    own checks where they are read, or none."""
-    paths = _file_and_folder(files)
-    paths += [f.absolute() for f in folders if f.is_dir() and f.absolute() not in paths]
+    Where a file or folder is reached through links, what :func:`_link_chain` names is checked
+    too, by the same policy; docs/SECURITY.md says what that refuses and misses (vault BACKLOG
+    #6654 item 5).
+
+    A path that cannot be stat'ed, for any reason but nothing being there, or whose link chain
+    cannot be walked, is refused with ``WiringError`` naming it, and the escape does not downgrade
+    that: nothing about it was vetted (vault BACKLOG #6654 item 2). So is a path whose open and
+    walk disagree, where one reaches an object and the other none, or ``os.path.samefile`` says
+    they reach two: the walk vetted another route than the open takes. That includes a path no
+    open can read but the walk can, such as one whose final link names a file with a trailing
+    separator, which is refused rather than read as absent. A file or folder that both
+    find not there is not itself checked, because nothing reads it; what its link chain names,
+    if a link leads to it, still is.
+
+    **Not checked**, at least: the folders above each file's own folder and above each folder
+    holding a link, a ``subst`` drive's own folder, and a file named in the settings that the start
+    reads later, such as a key, certificate or CRL file. Those have their own checks where they are
+    read, or none."""
+    paths = _file_and_folder(files, folders, lead=lead)
     _check_trusted_paths(paths, lead=lead, refuse=_refuse_unsafe_config_source)
+
+
+def _file_and_folder(
+    files: Iterable[Path], folders: Iterable[Path] = (), *, lead: str = "refusing to start from"
+) -> list[Path]:
+    """What :func:`assert_trusted_start_paths` checks, each path once: each of ``files`` that is a
+    regular file, then the folder it sits in, then what :func:`_link_chain` names for it with the
+    real file's real folder; then each of ``folders`` that is a folder, with what
+    :func:`_link_chain` names for it. A file or folder that is not there adds what its link chain
+    names, if a link leads to it, and nothing otherwise; so does a path holding a NUL, which no
+    open accepts, logged as skipped. Raises ``WiringError``, its message starting with ``lead``,
+    for a path that cannot be stat'ed or walked, and for one whose open and walk disagree: one
+    reaches an object and the other reaches none, or they reach two objects."""
+    paths: list[Path] = []
+    for path, folder in [*((f, False) for f in files), *((f, True) for f in folders)]:
+        if "\0" in os.fspath(path):
+            _logger.warning(
+                "the start check skipped %s: no file can have that name",
+                scrub_log_argument(repr(os.fspath(path))),
+            )
+            continue
+        try:
+            mode = _stat_mode(path)
+            present = mode is not None and (stat.S_ISDIR if folder else stat.S_ISREG)(mode)
+            chain, end = _link_chain(path)
+            # The kernel's own answer, against the walk's, for any gap left in the walk's model:
+            # a final link naming a file with a trailing separator, for one, which the open
+            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
+            # literally. Where they disagree the walk vetted another route than the open takes.
+            if mode is not None and end is None:
+                raise OSError(
+                    errno.EINVAL, "the open reaches an object where the walk reaches none"
+                )
+            if mode is None and end is not None:
+                raise OSError(
+                    errno.EINVAL, "the walk reaches an object where the open reaches none"
+                )
+            if end is not None and not os.path.samefile(path, end):
+                raise OSError(errno.EINVAL, "the open reaches another object than the walk")
+        except (OSError, ValueError) as exc:
+            # ValueError: a link target holding a NUL, which lstat refuses.
+            refusal = safe_exc(exc)
+        else:
+            if not present and (end is not None or not chain):
+                # Nothing there, or something that is not a file or folder as asked, with no
+                # dangling link leading anywhere a writer could create one.
+                continue
+            if present:
+                given = path.absolute()
+                paths += [given, given.parent] if not folder else [given]
+            # A dangling link's chain too: it ends with the last real folder the walk reached on
+            # the way to the missing name.
+            paths += chain
+            if end is not None and not folder:
+                paths.append(end.parent)
+            continue
+        # Outside the handler, so the refusal carries no __context__.
+        raise WiringError(f"{lead} {path}: could not vet it: {refusal}")
+    return list(dict.fromkeys(paths))
 
 
 def install_trust_paths() -> list[Path]:
@@ -10917,8 +11629,9 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     leave the loader with its text (vault BACKLOG #3765 item 4).
 
     A module that calls ``sys.exit()`` at import is a bad config, not a request to end the process
-    (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module leave
-    ``SystemExit`` alone because it is not their kind of failure; this runs the author's module: on a
+    (vault BACKLOG #3134). The config diagnostics elsewhere in this module leave ``SystemExit``
+    alone because it is not their kind of failure, though the ``env()`` cast readers refuse it since
+    vault BACKLOG #5105, a cast being the author's code too; this runs the author's module: on a
     serving engine (at least a reload) it would leave the event loop and stop every connection, and
     at ``check`` it would end the run as if it had passed. So it is refused like any
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the

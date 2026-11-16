@@ -7,8 +7,9 @@ sweeps ENGINE-PROCESS count against ONE shared store, to answer the pre-1500-con
 unified server DB hold when N engine processes commit concurrently, or is the shared store the aggregate
 ceiling at some N\\*?*
 
-This is emphatically **not** ``serve --shard`` / ``supervise`` (ADR 0037 L3): that gives each shard its
-OWN db file plus SHARED outbounds — the inverse of what this measures. Here every engine points at the
+This is emphatically **not** ``serve --shard`` / ``supervise`` (ADR 0037 L3). Engine shards also share
+ONE store (ADR 0063), but they run one config, split by inbound, with the outbounds SHARED across every
+engine shard; here each engine loads its own disjoint graph, outbounds included. Every engine points at the
 **same** ``MEFOR_STORE_*`` store, with **disjoint** inbound/sink/API ports AND **disjoint connection
 names** (a per-engine ``MEFOR_CONNSCALE_NAME_PREFIX``), so the N engines contend on the store's
 write/commit path while their FIFO lanes stay isolated (a same-named lane across engines would share
@@ -38,7 +39,7 @@ import asyncio
 import contextlib
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,6 +66,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import RIG_SESSION
 
 if TYPE_CHECKING:
@@ -86,6 +88,11 @@ _SEED = "messagefoundry-multishard"
 # One trivial ADT type — the connscale graph routes every message identically (the wall is the store,
 # not message-type spread).
 _MIX = TypeMix({"ADT^A01": 1.0})
+
+#: A check a caller runs against the live fleet: every engine is up and reporting its own inbound
+#: lanes, the rig Administrator is provisioned in the shared store, and no traffic has been offered
+#: yet. It is handed the nodes in engine order.
+FleetProbe = Callable[[Sequence[EngineNode]], Awaitable[None]]
 
 
 # --- the aggregate record ----------------------------------------------------
@@ -211,6 +218,7 @@ class MultiShardRecord:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
             },
             "pool_wait": {"p95_ms": self.pool_wait_p95_ms},
             "ack_ms": {
@@ -235,7 +243,13 @@ class MultiShardRecord:
         }
 
     def render_console(self) -> str:
-        loss = "OK" if self.no_loss.ok else f"LOSS ({self.no_loss.detail})"
+        loss = (
+            "OK"
+            if self.no_loss.ok
+            else f"INCONCLUSIVE ({self.no_loss.detail})"
+            if self.no_loss.inconclusive
+            else f"LOSS ({self.no_loss.detail})"
+        )
         pool = "n/a" if self.pool_wait_p95_ms is None else f"{self.pool_wait_p95_ms:.1f}ms"
         drain = "n/a" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
         return (
@@ -271,7 +285,7 @@ class MultiShardReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive (BACKLOG #5574)
             "kind": "multishard",
             "store_backend": self.store_backend,
             "cluster_enabled": self.cluster_enabled,
@@ -318,6 +332,7 @@ async def run_multishard(
     db_path: str | None = None,
     install_executor_shim: bool = False,
     drain_timeout_s: float = _DRAIN_TIMEOUT_S,
+    probe: FleetProbe | None = None,
 ) -> MultiShardReport:
     """Run the N-engine store-contention sweep and return a :class:`MultiShardReport`.
 
@@ -326,6 +341,12 @@ async def run_multishard(
     genuinely share one store; on a server backend the shared connection comes from ``MEFOR_STORE_*``.
     ``drain_timeout_s`` bounds the post-hold drain + settled reconcile (a short value keeps the CI smoke
     inside its per-test budget; the bench uses the long default).
+
+    ``probe``, when given, runs once per step against the live fleet (:data:`FleetProbe`), before
+    the hold. It is how a test asks one engine about a connection another engine owns, with the
+    orchestrator's own start-up and teardown around it. Whatever it raises ends the run, and the
+    engines are still stopped. Every step shares ``db_path``, so a probe that writes to the store, as
+    one that creates an account does, must tolerate what an earlier step left, or be given one step.
 
     ``engine_index_base`` offsets the per-engine lane index — engine ``k`` is tagged
     ``E{k + engine_index_base}`` (name prefix, node id, attribution) — so a SECOND concurrent
@@ -357,6 +378,7 @@ async def run_multishard(
             db_path=db_path,
             install_executor_shim=install_executor_shim,
             drain_timeout_s=drain_timeout_s,
+            probe=probe,
         )
         records.append(record)
     return MultiShardReport(
@@ -386,6 +408,7 @@ async def _run_one_step(
     db_path: str | None,
     install_executor_shim: bool,
     drain_timeout_s: float,
+    probe: FleetProbe | None,
 ) -> MultiShardRecord:
     if engines < 1:
         raise ConnScaleError(f"engine count must be >= 1, got {engines}")
@@ -491,6 +514,8 @@ async def _run_one_step(
         # engine only, so the single-engine `_await_inbound_rows` would undercount here — sum each
         # engine's /connections directly.
         await _await_inbound_rows_all(nodes, count_per_engine, timeout=_PORTS_READY_TIMEOUT)
+        if probe is not None:
+            await probe(nodes)
 
         # Ramp every engine's connections open, then HOLD all N concurrently.
         for driver in drivers:
@@ -603,7 +628,14 @@ def _build_record(
     # Budget = total connection count across every engine — a small-run FLOOR under the reconcile's
     # half-the-run excusal fraction, not the retired "~one stranded in-flight per connection" model.
     # Its independent intake floor keeps `read >= sent // 2` required whatever this value is.
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=engines * count_per_engine)
+    no_loss = _reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=engines * count_per_engine,
+        drain_seconds=drain_seconds,
+        counter_reset=_counter_reset(poller),
+    )
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
     # Aggregate achieved/delivered rate = the read/written delta across EXACTLY the hold window
     # (bracket samples + measured wall time), so the number is a true steady-state rate. The

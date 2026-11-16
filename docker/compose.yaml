@@ -57,9 +57,12 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_USERNAME: "mefor"
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
-  # DEV-ONLY: the local Postgres has no CA-trusted cert, so verification can't succeed here. This
-  # disables TLS verification across ALL transports — it is a CI/lab switch and must NEVER be set in
-  # a real deployment. Give a managed Postgres a CA-trusted cert and remove this line.
+  # AS SHIPPED, THIS LINE CHANGES NOTHING: this file leaves [security].enforcement at enforce, where
+  # the escape has no effect, and the escape never lifts a weakened store hop (vault BACKLOG #3533
+  # item 2). The local Postgres below has no TLS set up, so as shipped the engines' verified store hop
+  # cannot succeed here. Give it a certificate the engines trust, or use a managed Postgres, and
+  # remove this line. What the escape means: docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS
+  # escape hatch".
   MEFOR_ALLOW_INSECURE_TLS: "1"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -96,7 +99,11 @@ services:
       MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
       # MEFOR_EGRESS_ALLOWED_MLLP: "partner-a.example.org:6661"
       # MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor/out"
-      # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here — it is a CI-only switch and disables TLS verification.
+      # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here. It is a dev / trusted-lab switch: at
+      # [security].enforcement = warn it permits weakened hops that would otherwise be refused
+      # (docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS escape hatch").
+      # --- secrets directory (optional; see the ./secrets volume below). A path, not a secret ---
+      # MEFOR_SECRETS_DIRECTORY: "/run/mefor/secrets"
 
     # Secrets via env_file (gitignored). Each line: MEFOR_STORE_ENCRYPTION_KEY=..., MEFOR_API_TLS_KEY_PASSWORD=...
     # Plain env is visible in `docker inspect` + image-less but on the host — for stricter handling use a
@@ -135,6 +142,16 @@ services:
       # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and would be
       # refused, as config is.
       - ./tls:/etc/mefor/tls:ro
+      # OPTIONAL secrets directory (vault BACKLOG #2595, ADR 0214), an alternative to env_file for
+      # the engine's own secret settings other than the store key, and env() values: one file per
+      # setting, named as its variable (for example MEFOR_API_TLS_KEY_PASSWORD), which wins over the
+      # variable. docs/CONFIGURATION.md lists what it supplies. Uncomment this line and the
+      # MEFOR_SECRETS_DIRECTORY line under environment. The engine refuses a directory or file with a
+      # group or other read or write bit, and a bind mount keeps the host's modes, so own it as ./tls
+      # is owned, the directory 0700 and each file 0600. On Linux:
+      #   sudo chown -R 10001:10001 ./secrets && sudo chmod 0700 ./secrets && sudo find ./secrets -type f -exec chmod 0600 {} +
+      # docs/CONFIGURATION.md "The secrets directory" holds the rules.
+      # - ./secrets:/run/mefor/secrets:ro
 
     # Hardening: non-root is the image default (uid 10001); lock the rest down.
     read_only: true            # root fs read-only; the store volume + tmpfs below are the only writable paths

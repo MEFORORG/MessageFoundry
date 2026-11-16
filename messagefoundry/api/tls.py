@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import ssl
+import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -23,7 +24,12 @@ from typing import TYPE_CHECKING, Literal
 
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.audit_write import write_audit_soft
-from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
+from messagefoundry.auth.trust_anchors import (
+    anchor_refusal,
+    api_client_anchor_spec,
+    api_client_crl_spec,
+    verified_anchor_cadata,
+)
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -122,13 +128,61 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         ctx.verify_mode = ssl.CERT_REQUIRED
         if api.tls_client_cert_identities:
             _attach_issuer_index(ctx, cadata, api.tls_client_cert_identities)
+            if api.trusted_proxies:
+                # Vault BACKLOG #5628. Here rather than where the shim is built, which is before
+                # serve configures logging, so the line reaches the operator's handlers.
+                log.warning(
+                    "[api].trusted_proxies is set beside [api].tls_client_cert_identities: a client "
+                    "certificate presented by a declared proxy maps to no principal, because the "
+                    "proxy forwards other callers' requests"
+                )
         # Opt-in revocation (#1005). NOTE THE POSITION: harden_verify_flags runs ABOVE, before the
         # CA is loaded, and this must NOT sit beside it. The CRL goes into the trust store, so
         # loading it before the CA yields a context with the check flag set and zero CRLs -- which
         # refuses EVERY client rather than skipping the check.
-        if api.tls_client_crl_file:
-            harden_crl_check(ctx, api.tls_client_crl_file, setting="[api].tls_client_crl_file")
+        crl = api_client_crl_spec(api)
+        if crl is not None:
+            # Vault BACKLOG #5627: the CRL decides which client certificates are refused, so it
+            # takes the client CA's owner-only ACL and path preflight. A broadly writable CRL could
+            # be swapped for an older one, signed and unexpired, from before a revocation. A
+            # missing file is left to harden_crl_check, which says so in its own words; a file
+            # that is there and cannot be read is refused here, naming the setting.
+            if Path(crl.path).is_file():
+                refusal = anchor_refusal(crl, enforcing=enforcing)
+                if refusal is not None:
+                    raise refusal
+            # And the whole chain is checked, so a revoked intermediate refuses its clients too.
+            harden_crl_check(ctx, crl.path, setting=crl.setting, chain=True)
+            _refuse_a_loaded_ca_without_its_own_crl(ctx, crl.path, setting=crl.setting)
     return ctx
+
+
+def _refuse_a_loaded_ca_without_its_own_crl(
+    ctx: ssl.SSLContext, crl_file: str, *, setting: str
+) -> None:
+    """Refuse the build when a loaded client CA has no CRL of its own in ``crl_file`` (vault BACKLOG
+    #5627). With the whole chain checked, OpenSSL needs that CRL for every certificate the CA
+    issued, a leaf or an intermediate a client sends, and refuses each client with ``unable to
+    get certificate CRL`` when it is missing: a context that builds and then refuses every client
+    under that CA, which this says at start instead. Which CRL is a CA's own is
+    :func:`messagefoundry.pki.cas_without_own_crl`'s to say, and the words are
+    :func:`messagefoundry.pki.own_crl_refusal`'s, which the running-hop reload says too. An
+    intermediate only the client sends is not loaded, so its own CRL cannot be checked here.
+    Raises ``ValueError`` naming ``setting``."""
+    from messagefoundry.pki import cas_without_own_crl, own_crl_refusal
+
+    try:
+        pem = Path(crl_file).read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{setting} could not be read again after loading: {exc}") from exc
+    try:
+        missing = cas_without_own_crl(ctx.get_ca_certs(binary_form=True), pem)
+    except ValueError as exc:
+        raise ValueError(
+            f"{setting} could not be checked against [api].tls_client_ca_file: {exc}"
+        ) from exc
+    if missing:
+        raise ValueError(f"{setting}: {own_crl_refusal(missing)}")
 
 
 class ApiHandshakeRecord:
@@ -666,7 +720,7 @@ def ensure_api_tls_material(
         return str(cert_path), str(key_path)
     events = replacements if replacements is not None else []
     try:
-        state_dir.mkdir(parents=True, exist_ok=True)
+        _make_state_dir(state_dir)
         with _generated_pair_lock(state_dir):
             _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
     except OSError as exc:
@@ -685,6 +739,20 @@ def ensure_api_tls_material(
             "at an unknown date" if current is None else log_timestamp(current.not_after_iso),
         )
     return str(cert_path), str(key_path)
+
+
+def _make_state_dir(state_dir: Path) -> None:
+    """Make the state dir if it is missing. On POSIX the directory this creates is ``0o755`` at
+    most, whatever the umask: no group or other account may write it, because the key-file check
+    refuses the generated key in a directory they may (vault BACKLOG #5636). It stays readable, so
+    a client running as another account can still read the certificate it pins. A missing parent
+    above it gets the umask's mode. On Windows no mode is passed, so the directory inherits its
+    parent's access list, which a mode would replace with a protected one. An existing directory is
+    left as it is, and the generated-key gate in ``serve`` and ``supervise`` judges it."""
+    if sys.platform == "win32":
+        state_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
 
 def _settle_under_the_lock(

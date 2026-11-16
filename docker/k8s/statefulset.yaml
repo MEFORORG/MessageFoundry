@@ -17,7 +17,7 @@
 # adopter image (COPY writes root-owned files; run chmod -R a+rX,go-w on it in the build context first):
 #     FROM messagefoundry:<version>
 #     COPY config /config
-# and set both image: fields below (copy-tls and engine) to it.
+# and set all three image: fields below (tls-dir, copy-tls and engine) to it.
 #
 # Single replica: the default SQLite store is single-writer. For multi-node HA use the Postgres/SQL Server
 # store backend + the built leader election (docs/CLUSTERING.md) — out of scope for this baseline manifest.
@@ -80,11 +80,34 @@ spec:
         fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
-      # Under enforce the engine refuses a group-readable TLS key, and a Secret volume serves one
+      # Under enforce the engine refuses a TLS key reached through a link or readable by a group, and
+      # a Secret volume serves each file as a root-owned link, group-readable through fsGroup
       # (docs/PHI.md section 2, *Key files*). copy-tls copies the pair into a memory emptyDir at 0600 as
       # uid 10001, and the engine mounts that, never the Secret. A Secret update reaches the engine at
       # the next pod start. Copy a connection's key file, such as an MLLP tls_key_file, the same way.
+      # The engine also refuses a key in a directory that accounts other than its owner may write with
+      # no sticky bit, since any of them could put another file in its place. The kubelet makes the
+      # emptyDir's root, and its mode is the kubelet's, so tls-dir first makes the pair's own directory,
+      # engine/, at 0700 as uid 10001, and copy-tls copies into that.
       initContainers:
+        - name: tls-dir
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
+          command:
+            - install
+            - "-d"
+            - "-m"
+            - "0700"
+            - /etc/mefor/tls/engine
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits: { cpu: "100m", memory: "64Mi" }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/mefor/tls }
         - name: copy-tls
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
           command:
@@ -93,7 +116,7 @@ spec:
             - "0600"
             - /etc/mefor/tls-secret/api.crt
             - /etc/mefor/tls-secret/api.key
-            - /etc/mefor/tls/
+            - /etc/mefor/tls/engine/
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -126,8 +149,8 @@ spec:
             - { name: MEFOR_SECURITY_LOCAL_ACCESS_ONLY, value: "false" }
             - { name: MEFOR_SECURITY_LISTEN_ADDRESS, value: "0.0.0.0" }
             - { name: MEFOR_API_PORT, value: "8443" }
-            - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
-            - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
+            - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/engine/api.crt" }
+            - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/engine/api.key" }
             # Off loopback serve also refuses this certificate bind until you attest revocation with
             # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
@@ -152,7 +175,7 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 30
       volumes:
-        - name: tls                     # what the engine reads: copy-tls writes it, at 0600
+        - name: tls                     # what the engine reads: copy-tls writes engine/, at 0600
           emptyDir: { medium: Memory, sizeLimit: 1Mi }
         - name: tls-secret              # mounted on copy-tls only, never on the engine
           secret:

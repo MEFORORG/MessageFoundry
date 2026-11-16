@@ -87,6 +87,10 @@ LIST_SETTINGS: dict[tuple[str, str], Callable[[Any], Any]] = {
     ("Soap", "proxy_no_proxy"): lambda v: messagefoundry.Soap(
         url="https://example.invalid/svc", soap_action="urn:probe", proxy_no_proxy=v
     ),
+    # BACKLOG #5525: read only under a header intake mode.
+    ("Http", "trusted_proxies"): lambda v: messagefoundry.Http(
+        port=8080, intake_auth="api_key", intake_api_key=messagefoundry.env("k"), trusted_proxies=v
+    ),
 }
 
 #: ``Http``'s ``intake_client_subjects`` is a TABLE of lists, keyed by the issuing CA's DN (vault
@@ -143,6 +147,7 @@ def _static(setting: str) -> str:
     return {
         "allowed_entry_methods": "POST",
         "allowed_entry_types": "Patient",
+        "trusted_proxies": "10.0.0.5",  # an address, not a host name (BACKLOG #5525)
     }.get(setting, "static.example.invalid")
 
 
@@ -602,7 +607,9 @@ def test_a_static_list_still_builds(target: tuple[str, str]) -> None:
     assert spec.settings[setting] == [_static(setting)]
 
 
-_WHOLE_SETTING_TARGETS = sorted(LIST_SETTINGS)
+#: ``Http``'s ``trusted_proxies`` needs an intake credential, itself an ``env()`` these resolves do
+#: not supply; ``tests/test_inbound_http_trusted_proxies.py`` resolves its whole-setting form.
+_WHOLE_SETTING_TARGETS = sorted(t for t in LIST_SETTINGS if t != ("Http", "trusted_proxies"))
 
 
 @pytest.mark.parametrize("target", _WHOLE_SETTING_TARGETS)

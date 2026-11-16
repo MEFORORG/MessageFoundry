@@ -79,19 +79,185 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # Blank the CONTENTS of quoted spans, keeping the quotes and the length, so a separator or a
 # find-looking word inside quotes never reaches program position (`echo "find /proc"`). Equal
 # length is what lets an offset into the blanked text index the raw text.
-function Hide-QuotedSpans([string]$Text) {
+#
+# READ AS BASH READS IT, NOT AS A QUOTE TOGGLE (BACKLOG #5607). A toggle that blanked every span
+# whole and ignored backslashes allowed three kinds of walk. Inside double quotes bash still runs a
+# `$(...)` or backtick substitution, so `echo "$(find /proc)"` hid the walk; such a substitution is
+# left visible here, and starts its own quoting. An unquoted `"` or `'`, and a `"` inside double
+# quotes, opens or closes nothing, so a toggle shifted every later span by one and blanked the
+# separator and the walk after it. And `$'...'` takes backslash escapes, so `$'\''` is one quote
+# character rather than the end of a span. Unclosed contexts at the end simply stop.
+#
+# BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
+# backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
+# quote and blank the command after them. -Plain keeps the toggle this guard had before, which
+# reads neither PowerShell's `"$(...)"` subexpression nor a backtick-escaped quote. The same toggle
+# also runs beside the bash reading, as a floor; the call site says why.
+#
+# A HEREDOC BODY IS DATA, and it is blanked here too, line for line. Hide-HeredocBodies runs on the
+# output of this function, so a quote in a body (`don't`) would otherwise open a span here that
+# blanks the terminator and the walk after it -- most often inside "$(cat <<'EOF' ... EOF)", the
+# commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
+# as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
+# `#` of a comment, whose body is blanked.
+function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
-    $sb = New-Object System.Text.StringBuilder
-    $quote = $null
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($null -ne $quote) {
-            if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
-            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
-            else { [void]$sb.Append(' ') }
+    if ($Plain) {
+        $sb = [System.Text.StringBuilder]::new($Text.Length)
+        $quote = $null
+        foreach ($ch in $Text.ToCharArray()) {
+            if ($null -ne $quote) {
+                if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
+                elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+                else { [void]$sb.Append(' ') }
+                continue
+            }
+            if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch }
+            [void]$sb.Append($ch)
+        }
+        return $sb.ToString()
+    }
+    $sb = [System.Text.StringBuilder]::new($Text.Length)
+    # The context stack: top (unquoted), dq, sq, ansi ($'...'), sub ($( inside double quotes, with
+    # its open-paren depth) and bt (a backtick substitution inside double quotes). Only top, sub and
+    # bt are unquoted; a substitution OUTSIDE double quotes needs no context, as it was never blanked.
+    $kinds = [System.Collections.Generic.List[string]]::new()
+    $depths = [System.Collections.Generic.List[int]]::new()
+    $kinds.Add('top'); $depths.Add(0)
+    $prevDollar = $false
+    # Whether the next unquoted character starts a word, which is where a `#` starts a comment, and
+    # the depth of unquoted `${...}`, inside which it never does.
+    $wordStart = $true
+    $braceDepth = 0
+    # The delimiter of a heredoc opened on this line, then of the body being blanked.
+    $pending = $null
+    $bodyTerm = $null
+    $n = 0
+    while ($n -lt $Text.Length) {
+        if ($null -ne $bodyTerm) {
+            # At the start of a body line: blank it whole, or keep the terminator line as it is.
+            $end = $Text.IndexOf("`n", $n)
+            if ($end -lt 0) { $end = $Text.Length }
+            $line = $Text.Substring($n, $end - $n)
+            if ($line.Trim() -ceq $bodyTerm) { [void]$sb.Append($line); $bodyTerm = $null }
+            else { [void]$sb.Append(' ' * $line.Length) }
+            if ($end -lt $Text.Length) { [void]$sb.Append("`n") }
+            $n = $end + 1
             continue
         }
-        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; [void]$sb.Append($ch); continue }
+        $ch = $Text[$n]
+        $top = $kinds.Count - 1
+        $kind = $kinds[$top]
+        $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
+        if ($kind -ceq 'arith') {
+            # Arithmetic still runs a substitution, so that is left visible as in double quotes.
+            if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
+            }
+            if ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $wordStart = $true; $n++; continue }
+            if ($ch -ceq '(') { $depths[$top]++; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ')' -and $depths[$top] -gt 0) { $depths[$top]--; [void]$sb.Append(' ') }
+            elseif ($ch -ceq ')' -and $next -ceq ')') {
+                $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append('))'); $wordStart = $false; $n += 2; continue
+            }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(' -and
+            $kind -cne 'sq' -and $kind -cne 'ansi') {
+            $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
+            $n += 3; continue
+        }
+        if ($kind -ceq 'sq' -or $kind -ceq 'ansi') {
+            if ($kind -ceq 'ansi' -and $ch -ceq '\' -and $null -ne $next) {
+                [void]$sb.Append(' ')
+                [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' }))
+                $n += 2; continue
+            }
+            if ($ch -ceq "'") { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch) }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        if ($kind -ceq 'dq') {
+            # A backslash is consumed inside double quotes when it guards one of " $ ` \. Before a
+            # newline it is blanked alone, so the newline stays where Hide-HeredocBodies counts it.
+            if ($ch -ceq '\' -and $null -ne $next -and '"$`\'.IndexOf($next) -ge 0) {
+                [void]$sb.Append('  '); $n += 2; continue
+            }
+            if ($ch -ceq '"') { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch) }
+            elseif ($ch -ceq '$' -and $next -ceq '(') {
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $wordStart = $true; $n += 2; continue
+            }
+            elseif ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $wordStart = $true }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        # Unquoted: top, sub or bt. A newline ends the line a heredoc was opened on, so its body
+        # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
+        # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
+        if ($ch -ceq "`n" -and $null -ne $pending) {
+            [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false; $wordStart = $true
+            $n++; continue
+        }
+        if ($ch -ceq '<' -and $next -ceq '<' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])) -and
+            -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<')) {
+            $d = [regex]::Match($Text.Substring($n + 2), '^-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+            if ($d.Success) {
+                $pending = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                    Where-Object { $_ } | Select-Object -First 1
+            }
+            [void]$sb.Append('<<'); $prevDollar = $false; $wordStart = $false
+            $n += 2; continue
+        }
+        # A `#` starting a word starts a comment, which bash never runs and in which a quote opens
+        # nothing. It is blanked up to the newline (or, in a backtick substitution, the closing
+        # backtick), keeping the `#`. A word starts after unquoted, unescaped whitespace, `;`, `&`,
+        # `|`, `(` or an opening `$(` or backtick -- never after a `)`, a quote or an escape, nor
+        # inside `${...}`, where bash carries the word on (`$(echo a)#b` and `a\ #b` are words).
+        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) {
+            $end = $Text.IndexOf("`n", $n)
+            if ($end -lt 0) { $end = $Text.Length }
+            if ($kind -ceq 'bt') {
+                $tick = $Text.IndexOf('`', $n)
+                if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
+            }
+            [void]$sb.Append('#' + ' ' * ($end - $n - 1)); $prevDollar = $false
+            $n = $end; continue
+        }
+        # An unquoted backslash escapes the next character, whatever it is.
+        if ($ch -ceq '\') {
+            [void]$sb.Append($ch)
+            if ($null -ne $next) { [void]$sb.Append($next) }
+            $prevDollar = $false; $wordStart = $false
+            $n += 2; continue
+        }
+        if ($ch -ceq "'") {
+            $kinds.Add($(if ($prevDollar) { 'ansi' } else { 'sq' })); $depths.Add(0)
+        }
+        elseif ($ch -ceq '"') { $kinds.Add('dq'); $depths.Add(0) }
+        elseif ($kind -ceq 'sub' -and $ch -ceq '(') { $depths[$top]++ }
+        elseif ($kind -ceq 'sub' -and $ch -ceq ')') {
+            if ($depths[$top] -gt 0) { $depths[$top]-- } else { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
+        }
+        elseif ($kind -ceq 'bt' -and $ch -ceq '`') { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
+        # A top-level backtick is pushed too, only so that a comment inside it ends at its close.
+        elseif (($kind -ceq 'sub' -or $kind -ceq 'top') -and $ch -ceq '`') {
+            $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $prevDollar = $false; $wordStart = $true
+            $n++; continue
+        }
+        elseif ($kind -cne 'top' -and $ch -ceq '$' -and $next -ceq '(') {
+            $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $prevDollar = $false; $wordStart = $true
+            $n += 2; continue
+        }
+        elseif ($ch -ceq '{' -and $prevDollar) { $braceDepth++ }
+        elseif ($ch -ceq '}' -and $braceDepth -gt 0) { $braceDepth-- }
         [void]$sb.Append($ch)
+        $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
+        $prevDollar = ($ch -ceq '$') -and -not $prevDollar
+        $n++
     }
     return $sb.ToString()
 }
@@ -194,17 +360,35 @@ try {
 
     # The blanked view says where a command starts and what program it is; the raw view, at the
     # same offsets, gives its operands. Quotes are masked before heredocs, for the reason above.
-    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
+    # Read safely: under strict mode a missing tool_name would throw, and the catch would allow.
+    $tool = if ($j.PSObject.Properties['tool_name']) { [string]$j.tool_name } else { '' }
+    # THE PLAIN TOGGLE IS A FLOOR UNDER THE BASH READING, NOT REPLACED BY IT (BACKLOG #5607). The
+    # bash reading was added to deny walks the toggle blanked, but a misreading of its own blanked
+    # walks the toggle sees: measured, an arithmetic `$((...))` holding a substitution, `$((cmd) )`,
+    # `cat<<` with no space, two heredocs on one line, and a `#` comment holding an apostrophe inside
+    # "$(...)". So a bash command is scanned under BOTH views and denied if either denies: the bash
+    # reading can only add denies to the toggle's, never remove one. The floor does NOT make the bash
+    # reading right. Where the toggle blanks the same walk -- inside one double-quoted span, say --
+    # a misreading still allows it; at least `$((cmd) )`, `cat<<`, and two heredocs on a line remain.
+    # The price is the toggle's own false denies, such as `'It'\''s; find /proc'`, which main had.
+    # Most commands mask the same under both, and then one scan is enough.
+    $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
+    if ($tool -cne 'PowerShell') {
+        $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
+        if ($bashScan -cne $scans[0]) { $scans += $bashScan }
+    }
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.
-    $bounds = New-Object 'System.Collections.Generic.List[int[]]'
-    $cursor = 0
-    foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
-        $bounds.Add(@($cursor, ($m.Index - $cursor)))
-        $cursor = $m.Index + $m.Length
+    $bounds = New-Object 'System.Collections.Generic.List[object[]]'
+    foreach ($scan in $scans) {
+        $cursor = 0
+        foreach ($m in [regex]::Matches($scan, '(\|\||&&|[;|&\n()`])')) {
+            $bounds.Add(@($scan, $cursor, ($m.Index - $cursor)))
+            $cursor = $m.Index + $m.Length
+        }
+        $bounds.Add(@($scan, $cursor, ($scan.Length - $cursor)))
     }
-    $bounds.Add(@($cursor, ($scan.Length - $cursor)))
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
     # pattern or path. Only separate-word options belong here: listing an attached-value one such
@@ -227,10 +411,14 @@ try {
                "MSYS root: measured 2026-09-20, 'ls //' listed the network root, so the walk " +
                "enumerates network and WSL shares with no bound. " + $UNSTOPPABLE
 
+    # A segment both views mask alike is checked once.
+    $checked = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($b in $bounds) {
-        if ($b[1] -le 0) { continue }
-        $s = $scan.Substring($b[0], $b[1]).Trim()
-        $rawSeg = $cmd.Substring($b[0], $b[1]).Trim()
+        if ($b[2] -le 0) { continue }
+        $seg = $b[0].Substring($b[1], $b[2])
+        if (-not $checked.Add("$($b[1]):$seg")) { continue }
+        $s = $seg.Trim()
+        $rawSeg = $cmd.Substring($b[1], $b[2]).Trim()
         if (-not $s) { continue }
 
         # Program position is decided on the blanked view; a first token carrying a quote is the

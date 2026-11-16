@@ -9,12 +9,18 @@ acknowledgements, at two strengths, because the engine gives two different guara
 * A **positive** acknowledgement (AA or CA) is sent only after ``enqueue_ingress`` commits a row
   carrying the message's control id (ACK-on-receipt). So for each one, the control id the ACK
   echoes in MSA-2 must name a stored row -- a NEW one, when the campaign could predict that id and
-  count its rows before sending -- with a disposition. This is the per-message check.
+  count its rows before sending -- with a disposition. This is the per-message check. A positive
+  acknowledgement with an empty MSA-2 breaks it unless the engine's own ACK builder would have
+  written that MSA-2 empty for the frame (:func:`echo_owed`), since an id it dropped would leave
+  only the batch count to notice a missing row.
 * A **negative** acknowledgement (AE AR CE CR) is sent after the decode, NUL, parse or strict path
   has recorded an ERROR row, but the decode and parse paths record it with no control id, because
   none could be read. So a NAK cannot be matched to its row. It is counted instead: across each
   batch the store must grow by at least the number of acknowledgements of either kind. That lower
   bound holds under unrelated traffic, which only adds rows.
+
+**Only HL7 v2 over MLLP is judged.** ``build_transport`` builds the MLLP transport alone and refuses
+every other driver kind as a setup error; :mod:`harness.fuzz.transport` says why.
 
 The MLLP transport reads every reply frame until the engine closes, so a case carrying two frames is
 counted twice, not once with a surplus row that would hide a missing one later.
@@ -24,8 +30,9 @@ so an exchange must carry exactly one acknowledgement per complete frame sent (c
 decoder), then a clean close; an incomplete frame owes nothing, so a case whose framing a mutation
 broke may end in silence. An inbound configured with ``ack_mode = "none"`` never answers and is not
 a target for the MLLP transport. A timeout, a reset, a refused connection, a reply cut off
-mid-frame, bytes outside a reply frame or a reply that is not an acknowledgement breaks the reply
-invariant. Any API call answering 5xx breaks the API invariant, and ``/health`` must answer ``ok``.
+mid-frame, bytes outside a reply frame, a frame whose trailer is not exactly FS CR (BACKLOG
+#5421) or a reply that is not an acknowledgement breaks the reply invariant. Any API call answering
+5xx breaks the API invariant, and ``/health`` must answer ``ok``.
 
 Nothing here quotes a message or reply body: problems name codes, counts and control ids.
 """
@@ -39,6 +46,7 @@ from functools import partial
 
 from harness.fuzz.transport import CLOSED, REPLY, Exchange
 from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.mllpcodec import build_ack
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS
 
@@ -115,9 +123,9 @@ class Judgement:
     problem: str = ""
 
 
-def judge(exchange: Exchange, *, expected: int | None) -> Judgement:
+def judge(exchange: Exchange, *, expected: int) -> Judgement:
     """Hold an exchange to the reply invariant: one acknowledgement per complete frame sent, then a
-    clean close. ``expected`` is that frame count, or None for a transport that cannot say."""
+    clean close. ``expected`` is that frame count."""
     acks: list[Ack] = []
     for reply in exchange.replies:
         ack, problem = _read_ack(reply)
@@ -127,7 +135,7 @@ def judge(exchange: Exchange, *, expected: int | None) -> Judgement:
         acks.append(ack)
     if exchange.outcome not in (REPLY, CLOSED):
         return Judgement(tuple(acks), f"{exchange.outcome}: {exchange.detail}")
-    if expected is not None and len(acks) != expected:
+    if len(acks) != expected:
         return Judgement(
             tuple(acks),
             f"{expected} complete frame(s) sent but {len(acks)} acknowledgement(s) came back",
@@ -146,6 +154,21 @@ def _read_ack(reply: bytes) -> tuple[Ack | None, str]:
     if msa1 is None or msa1 not in ACK_CODES:
         return None, f"reply MSA-1 is not an acknowledgement code ({shown(msa1)})"
     return Ack(msa1, msa2 or None), ""
+
+
+def echo_owed(payload: bytes) -> str | None:
+    """The MSA-2 a positive ACK for the frame ``payload`` must echo, or None when it owes none.
+
+    Read from :func:`~messagefoundry.mllpcodec.build_ack`, the engine's own ACK builder, through
+    the same parser :func:`_read_ack` reads a reply with: the builder blanks a control id the
+    default delimiters would restructure (BACKLOG #2875), and the parser strips the reply's trailing
+    whitespace, so both a blank and a shortened echo are what the engine legitimately writes. Any
+    other empty MSA-2 on a positive ACK is a control id the engine dropped (BACKLOG #5420)."""
+    try:
+        ack = build_ack(payload.decode("utf-8", errors="replace"), timestamp="20260101")
+        return Peek.parse(ack).field("MSA-2") or None
+    except PEEK_READ_FAULTS:
+        return None
 
 
 def queryable(control_id: str) -> bool:
@@ -174,7 +197,8 @@ def check_health(client: EngineClient) -> str:
 
 def check_stored(client: EngineClient, control_id: str, before: int, settle: float) -> str:
     """Empty when more than ``before`` stored rows carry ``control_id``, the newest with a
-    disposition. Polls for up to ``settle`` seconds: ACK-on-receipt makes the row visible before
+    disposition. ``before`` is the pre-send count plus the rows earlier positive ACKs of the batch
+    already matched. Polls for up to ``settle`` seconds: ACK-on-receipt makes the row visible before
     the ACK, so a deploying site's store should need none of it."""
     deadline = time.monotonic() + settle
     query = partial(client.list_messages, control_id=control_id, limit=1)
@@ -186,7 +210,7 @@ def check_stored(client: EngineClient, control_id: str, before: int, settle: flo
                 return ""
             return f"control id {shown(control_id)} is stored with unknown status {shown(status)}"
         if time.monotonic() >= deadline:
-            have = f"{listing.total} row(s), {before} before the send"
+            have = f"{listing.total} row(s), more than {before} owed"
             return f"positively ACKed control id {shown(control_id)} is not in the store ({have})"
         time.sleep(_POLL_SECONDS)
 

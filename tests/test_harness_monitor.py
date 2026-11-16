@@ -20,6 +20,7 @@ import time
 import weakref
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -30,7 +31,7 @@ from messagefoundry.config.settings import EgressSettings
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QInputDialog  # noqa: E402
+from PySide6.QtWidgets import QInputDialog, QLineEdit  # noqa: E402
 
 from harness import monitor  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
@@ -738,3 +739,176 @@ def test_server_fixture_stops_its_thread_when_startup_times_out(
     # join(timeout=10) has already run inside the fixture's finally, so a thread still alive here
     # was never asked to stop.
     assert leaked == [], f"the fixture leaked {len(leaked)} live thread(s): {leaked}"
+
+
+# --- the second factor a sign-in still owes (BACKLOG #5568) -----------------
+
+
+def _mfa_pending_dialog(client: object, parent: object = None) -> Any:
+    """A sign-in the engine accepted with ``mfa_required``: the session is pending a second factor."""
+
+    class _Dialog:
+        must_change_password = False
+        mfa_required = True
+
+        def exec(self) -> bool:
+            return True
+
+    return _Dialog()
+
+
+class _MfaPendingClient(_RefusedClient):
+    """Holds the MFA-pending session the sign-in left. ``GOOD`` is the one code it verifies; any
+    other is a 401, as the engine answers a wrong code. ``totp`` is whether the account has an
+    authenticator enrolled, and ``refusal``, when set, is what every verify raises instead."""
+
+    GOOD = "123456"
+
+    def __init__(
+        self,
+        *,
+        totp: bool = True,
+        refusal: ApiError | None = None,
+        status_error: ApiError | None = None,
+    ) -> None:
+        super().__init__("tok-pending", logout_fails=False)
+        self.codes: list[str] = []
+        self.polling_token: str | None = None
+        self._totp = totp
+        self._refusal = refusal
+        self._status_error = status_error
+
+    def mfa_status(self) -> Any:
+        self.calls.append("mfa_status")
+        if self._status_error is not None:
+            raise self._status_error
+        return SimpleNamespace(enabled=self._totp)
+
+    def verify_mfa(self, code: str) -> None:
+        self.calls.append("verify_mfa")
+        self.codes.append(code)
+        if self._refusal is not None:
+            raise self._refusal
+        if code != self.GOOD:
+            raise ApiError("invalid code", status=401)
+        self.token = "tok-verified"
+
+    def for_polling(self) -> None:
+        # Records the session the polling client would take, then stops _connect there, so a test
+        # reads everything up to the point the panel adopts a verified session.
+        self.calls.append("for_polling")
+        self.polling_token = self.token
+        raise ApiError("stop here")
+
+
+def _answer(monkeypatch: pytest.MonkeyPatch, answer: tuple[str, bool]) -> list[tuple[Any, ...]]:
+    """Answer the code prompt with ``answer``, and return the arguments each prompt was shown."""
+    shown: list[tuple[Any, ...]] = []
+
+    def get_text(*args: Any, **kwargs: Any) -> tuple[str, bool]:
+        shown.append(args)
+        return answer
+
+    monkeypatch.setattr(QInputDialog, "getText", get_text)
+    return shown
+
+
+def test_an_mfa_pending_sign_in_verifies_the_code_before_connecting(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_ensure_auth`` ignores the dialog's ``mfa_required`` and connects on the pending
+    session, whose every poll and action the engine refuses until a second factor is verified; or
+    when the polling client is built before the verify rotates the session."""
+    client = _MfaPendingClient()
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(monitor, "LoginDialog", _mfa_pending_dialog)
+    shown = _answer(monkeypatch, (" 123456 ", True))
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.codes == ["123456"]
+        assert client.calls[:5] == ["health", "me", "mfa_status", "verify_mfa", "for_polling"]
+        assert client.polling_token == "tok-verified"
+        # The code is a secret, masked as the step-up password prompt masks its own.
+        assert QLineEdit.EchoMode.Password in shown[0]
+    finally:
+        panel.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("client_kwargs", "answer", "codes", "status"),
+    [
+        ({}, ("", False), [], "no second factor"),
+        ({}, ("   ", True), [], "no second factor"),
+        ({}, ("000000", True), ["000000"], "second factor refused: invalid code"),
+        (
+            {"refusal": ApiError("session ended; sign in again", status=401)},
+            ("123456", True),
+            ["123456"],
+            "session ended; sign in again",
+        ),
+        (
+            {"refusal": ApiError("the directory could not confirm it", status=403)},
+            ("123456", True),
+            ["123456"],
+            "the directory could not confirm it",
+        ),
+        (
+            {"refusal": ApiError("could not reach engine: timed out")},
+            ("123456", True),
+            ["123456"],
+            "second factor outcome unknown: could not reach engine",
+        ),
+        ({"totp": False}, None, [], "enrol an authenticator"),
+        (
+            {"status_error": ApiError("engine unavailable", status=503)},
+            None,
+            [],
+            "engine unavailable",
+        ),
+    ],
+    ids=[
+        "cancelled",
+        "blank",
+        "wrong-code",
+        "session-ended",
+        "refused",
+        "reply-lost",
+        "no-authenticator",
+        "status-unreadable",
+    ],
+)
+def test_an_unverified_second_factor_ends_the_pending_session(
+    qapp: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    client_kwargs: dict[str, Any],
+    answer: tuple[str, bool] | None,
+    codes: list[str],
+    status: str,
+) -> None:
+    """RED when: a sign-in whose second factor was never verified still connects, or leaves the
+    pending session live when the panel drops the client (BACKLOG #2091's rule, for this case); or
+    when an account with no authenticator, which no code can verify, is asked for one."""
+    client = _MfaPendingClient(**client_kwargs)
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(monitor, "LoginDialog", _mfa_pending_dialog)
+    if answer is None:
+        monkeypatch.setattr(
+            QInputDialog, "getText", lambda *a, **k: pytest.fail("asked for a code no one has")
+        )
+    else:
+        _answer(monkeypatch, answer)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.codes == codes
+        assert [c for c in client.calls if c not in ("mfa_status", "verify_mfa")] == [
+            "health",
+            "me",
+            "logout",
+            "close",
+        ]
+        assert panel._client is None
+        assert status in panel._status.text()
+    finally:
+        panel.shutdown()

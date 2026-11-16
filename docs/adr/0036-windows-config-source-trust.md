@@ -12,6 +12,11 @@
   `[security].enforcement = enforce`. It is honoured only at `warn`, and it is then a reported
   loosening. Wherever this ADR says the escape downgrades a refusal, read "where Amendment C lets
   it". The amendment has its own section below.
+  **Amended 2026-11-14 (Amendment E, BACKLOG #5622):** the grantee and owner rules are corrected
+  for conditional and object entries, LocalService and NetworkService run-as accounts,
+  TrustedInstaller, and domain admin groups. The amendment is inline in Decision 1; read Decisions
+  1 and 3, and the cures under *Consequences*, as it amends them. An owner ruling of 2026-11-15
+  keeps its consequence for the config editors fail-closed, at the end of Amendment E.
 - **Built:** yes — [`_assert_safe_config_source`](../../messagefoundry/config/wiring.py) now dispatches
   to a real Windows check (`_assert_safe_config_source_windows` + the pure `_evaluate_config_dacl`
   policy) instead of an unconditional early-return; [`install-service.ps1`](../../scripts/service/install-service.ps1)
@@ -47,6 +52,29 @@ could drop/rewrite a config module that executes as the service account on the n
    ACEs (e.g. a repo checkout's `Users:RX`) carry no write bits and **pass** — that is why the mask
    filters to write-class rights only. A **NULL/absent DACL** (everyone implicitly allowed) is
    **refused**.
+
+   **Amended 2026-11-14 (Amendment E, BACKLOG #5622): corrections to the grantee and owner rules.** At least
+   these changed:
+   - A compound, object or callback allow entry (types 0x04, 0x05, 0x09, 0x0B) carrying a
+     write-class right is refused, because its trustee or condition cannot be judged. Before, the
+     reader recorded such entries with no rights and the policy skipped them. Inherit-only entries
+     are still counted on the object they sit on, as type 0x00 ones always were.
+   - A process user of LocalService (`S-1-5-19`) or NetworkService (`S-1-5-20`) earns no
+     self-trust, as grantee or owner, because other services share the SID.
+   - TrustedInstaller is trusted with SYSTEM and Administrators, as owner and grantee.
+   - A Domain, Schema or Enterprise Admins **group** (RID 512, 518, 519) is trusted as a grantee
+     only once the local Administrators lookup resolves it a direct member; an unresolved lookup
+     refuses. UAC makes those groups deny-only in an unelevated token, so such a grant is usable
+     only elevated. A user account's SID is never deny-only, so a grant to an account that is not
+     the owner stays refused, the built-in Administrator (RID 500) included. An account that
+     **owns** the object is still trusted once the owner arm resolves it, as Amendment A decided.
+   - A definite refusal is reported ahead of an entry the checks cannot judge.
+
+   **Consequence kept fail-closed (owner ruling 2026-11-15, in a batch 482 Manager session).** The
+   LocalService and NetworkService rule also changes what the config editors' output earns when
+   they run as such an engine's own account. The owner ruled to keep that fail-closed rather than
+   relax the rule. The rule's effect and the remedy are in
+   [`docs/SERVICE.md`](../SERVICE.md), *Lock down the config directory (CONFIG-2)*.
 
    **Amended 2026-09-18 (BACKLOG #1647): the owner is vetted, not trusted unconditionally.** As
    originally built, `_evaluate_config_dacl` added the owner SID to the trusted set with no check, so a
@@ -236,6 +264,10 @@ caller. One process needs the variables handed to it: the sandbox worker starts 
 environment (vault BACKLOG #2587), so the sandbox carries the escape and every spelling of the dial
 into it by name. The dial is a posture switch and not a secret. Without it the worker would see the
 escape alone and refuse a directory the engine loaded at `warn`.
+**CORRECTED 2026-11-05 (vault BACKLOG #2587):** in this paragraph, "the sandbox worker's boot load" in the list of processes and the three sentences from "One process needs" no longer hold. Since vault
+BACKLOG #2596 the worker loads the snapshot its parent read with this check, sent in the boot frame,
+and runs no check of its own, so the sandbox now hands it neither the escape nor the dial. A
+sandbox session that reads its own directory runs the check in the parent.
 The environment outranks the settings file and no command-line override sets this dial, so an
 instance whose settings come from that environment and resolve to `enforce` cannot unlock the
 escape. The cost is one limit: **`warn` set only in the settings file does not unlock it.** That is
@@ -318,7 +350,8 @@ Item 5 is left as written, as the record of what was decided on its date.
 - **Amendment A widens what can be refused, and one shape is worth stating plainly.** A config
   directory owned by an IT account whose administrator rights come only through a nested domain group
   is refused, because the membership lookup is deliberately local. The cures are to re-own the
-  directory to `Administrators`, `SYSTEM` or the service account — which
+  directory to `Administrators`, `SYSTEM` or the service account (not LocalService or
+  NetworkService, which Amendment E refuses as owner because other services share them) — which
   `install-service.ps1 -LockConfigDir` now does for you (Decision 4 as amended: it sets the owner as
   well as the DACL, since a DACL-only lockdown left this refusal in place); to point `-Config` at an
   admin-owned directory; or, for a dev/CI checkout, `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`. Run

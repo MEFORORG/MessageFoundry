@@ -805,6 +805,7 @@ nothing was accepted. It reuses the existing `HttpRequestError` arm.
 **Three audit channels:**
 
 1. `logger.warning` with peer host and mode only — always. Never the credential, not a prefix, not a length.
+   *(No longer "only": since 2026-11-10 it also carries `forwarded_for`; see the note at the end.)*
 2. A tamper-evident **`audit_log`** row through a runner-injected sink (the `ConnectionEventSink` shape, so
    `transports/` stays store-free) calling `record_audit(action="intake.auth_failed", channel_id=<inbound>,
    client=<peer_ip>, detail=<scrubbed>)`. This is the **first engine-internal writer of `client=`** (ADR 0150),
@@ -1757,3 +1758,22 @@ calls `FileSource._emit` and reads the one `ERROR` row; it drives neither `_scan
 `RemoteFileSource._hand_off`, so that the file is consumed is not tested, and the remote-file
 source is covered only by calling its batch split, `split_batch_bytes`, on a name that refuses
 every conversion.
+
+## Note 2026-11-10: the refusal records the forwarded client beside the peer
+
+D6 channel 1 said the `logger.warning` carries the peer host and mode only. Since BACKLOG #5525
+(owner ruling 2026-11-10, "Per-connection proxies") that is false. Under `intake_auth = "api_key"`
+or `"bearer"`, a listener with `trusted_proxies` keys the failed-attempt budget on the client
+address a listed proxy writes in `X-Forwarded-For`. The warning then also carries `forwarded_for=`,
+`-` where there was none, and the audit row's detail and the `connection_event` reason add
+`; forwarded_for=<address>`. The peer column of each stays the socket peer.
+
+The recorded value is an address the listener parsed and wrote back out, never the header's own
+text, and still no credential crosses the boundary. The budget key is not always that address.
+An IPv4 client keys on its address and an IPv6 client on its `/64`, except in the IPv4-carrying
+prefixes CONNECTIONS.md names, where it keys on the IPv4 client the address carries (at least
+under NAT64's well-known prefix, Teredo and 6to4) or on the whole address. A bare IPv6 hop that
+also reads as an address and a port is keyed on each of its readings that CONNECTIONS.md says is
+kept, so one failure may charge a second key beside the recorded address's. The socket peer's key
+follows the same rules. The HTTP listener's `trusted_proxies` row in
+[CONNECTIONS.md](../CONNECTIONS.md) says how the header is read.

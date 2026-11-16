@@ -82,11 +82,13 @@ from harness.load.coord import (
 )
 from harness.load.enginepoll import EMPTY_POOL_STATS, PoolStats
 from harness.load.shardcert import (
+    ENGINE_SETUP_FAILED,
     FIDELITY_ACKED_FLOOR,
     FIDELITY_GATE_VERSION,
     FIDELITY_SENT_FLOOR,
     INBOUND_BAND_CHECK_BASIS,
     PRODUCT_STORE_POOL_SIZE,
+    EngineSetupFailed,
     RungFidelity,
     ShardCertDriveReport,
     ShardCertEngineReport,
@@ -96,6 +98,7 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
@@ -891,6 +894,25 @@ class RungVerdict(enum.Enum):
 _OBSERVER_DISAGREE_TOL = 0.01
 
 
+def is_gated_shortfall(
+    *,
+    drain_gated: bool,
+    engine_ok: bool,
+    acked: int,
+    sink_received: int,
+    delivering: int,
+    tol: float = _OBSERVER_DISAGREE_TOL,
+) -> bool:
+    """A4b trigger (c), BACKLOG #5577: the sinks tallied behind the drain gate, the store-truth is clean,
+    and the sinks are more than ``tol x A x D`` short, but not ZERO (a zero is trigger (b), a blind
+    collector, which proves nothing). The one definition: :func:`observers_inconclusive` fires on it, and
+    :func:`build_rung_outcome` records it, so a soak in this state reads SOAK_NOT_SUSTAINED."""
+    if not (drain_gated and engine_ok) or acked <= 0 or delivering <= 0 or sink_received <= 0:
+        return False
+    expected = acked * delivering
+    return sink_received < expected - tol * expected
+
+
 def observers_inconclusive(
     *,
     engine_ok: bool,
@@ -903,6 +925,7 @@ def observers_inconclusive(
     ingress_stranded: int = -1,
     routed_stranded: int = -1,
     outbound_stranded: int = -1,
+    drain_gated: bool = False,
     tol: float = _OBSERVER_DISAGREE_TOL,
 ) -> bool:
     """Whether the two INDEPENDENT observers of a rung — the ENGINE store-truth tally and the DRIVE sink
@@ -940,9 +963,10 @@ def observers_inconclusive(
         if sink_received ≥ expected and unclear > 0:  return True
         # (a) below the lossless line the sink UNDER-counts; only THEN credit the H>D budget:
         free    = acked × max(0, handlers − delivering)   # non-delivering-handler routed rows
-        if H > D and the per-stage strand split is present (BACKLOG #229):
-            blocked = ingress_stranded × D + max(0, routed_stranded − free) + outbound_stranded
-        else:  # H==D, or per-stage counts absent (sentinel) → stage-blind, pre-#229 identical
+        if the per-stage strand split is present (BACKLOG #229; at H == D too since #5577):
+            residual = max(0, unclear − (ingress + routed + outbound))   # rows at no named stage
+            blocked  = (ingress_stranded + residual) × D + max(0, routed_stranded − free) + outbound_stranded
+        else:  # per-stage counts absent (sentinel) → stage-blind, pre-#229 identical
             blocked = max(0, unclear − free)
         permit  = expected − blocked
 
@@ -975,15 +999,16 @@ def observers_inconclusive(
     ``free`` budget is credited AGAINST the ROUTED strands ONLY — the non-delivering handlers' routed rows —
     which is the load-bearing bit: a genuine H>D collapse strands ~A×H routed rows, ~A×(H−D) of them
     non-delivering, so crediting ``free`` there keeps the collapse an honest COLLAPSED instead of re-fabricating
-    the INCONCLUSIVE this guard exists to prevent. The sound branch is GATED to ``H > D`` **and** all three
-    per-stage counts present (``≥ 0``); at H==D (``free==0``) or an absent split (an older payload / aborted
-    rung → the ``< 0`` sentinel) it falls back to the stage-blind ``max(0, unclear − free)``, byte-identical to
-    the pre-#229 formula.
+    the INCONCLUSIVE this guard exists to prevent. Under #229 the sound branch was GATED to ``H > D``; since
+    #5577 it needs only all three per-stage counts present (``≥ 0``). An absent split (an older payload /
+    aborted rung → the ``< 0`` sentinel) falls back to the stage-blind ``max(0, unclear − free)``,
+    byte-identical to the pre-#229 formula.
 
-    **``H == D`` identity (matches the pre-fix formula wherever the two observers can disagree, so no published
-    run regresses).** At ``H == D`` (and for any caller that does not pass ``handlers`` — it defaults to ``0``
-    with ``max(0, 0 − D) == 0``), ``free == 0``, so the UNDER-counting branch is ``permit == expected −
-    max(0, stranded) − max(0, dead)`` — EXACTLY the old expression. (Reaching that branch already guarantees
+    **``H == D`` identity — WITHOUT the per-stage split only (narrowed by BACKLOG #5577).** At ``H == D``
+    (and for any caller that does not pass ``handlers`` — it defaults to ``0`` with ``max(0, 0 − D) == 0``),
+    ``free == 0``, so the stage-blind UNDER-counting branch is ``permit == expected − max(0, stranded) −
+    max(0, dead)`` — EXACTLY the old expression. With the split present the permit is now the per-stage one
+    at H == D too, which is never larger (an ingress or residual row is charged D, not 1). (Reaching that branch already guarantees
     ``stranded ≥ 0`` and ``dead ≥ 0``: the ``< 0`` sentinel path below returns first when ``not engine_ok``,
     and when ``engine_ok`` the store-truth pass bar forces both to ``0``, so ``max(0, s) + max(0, d)`` equals
     ``max(0, s + d)`` and the terms fold identically.) The lossless-sink clause (a′) is the ONE point where the
@@ -994,7 +1019,7 @@ def observers_inconclusive(
     lossless rung (a run that stranded rows was not lossless), so this stricter edge changes no real verdict —
     it only removes a corner where the noise slack wrongly forgave a real contradiction.
 
-    Two triggers, each a hard inter-observer contradiction rather than a mere shortfall:
+    Three triggers, each a hard inter-observer contradiction rather than a mere shortfall:
 
     (a) **The sink counted MORE deliveries than the engine's own store-truth permits.** Split in two by the
         lossless line. When the sink is FULLY lossless (``S ≥ A×D``) and the engine reports ANY unclear row,
@@ -1012,6 +1037,22 @@ def observers_inconclusive(
         is a blind/absent collector, not a measured zero — it cannot certify SUSTAINED nor a benign
         FROZEN_TAIL. (A genuine total collapse also reads ``S == 0``, but then the engine CONFIRMS it —
         ``engine_ok`` is False — and the run is honestly COLLAPSED, not caught here.)
+
+    (c) **BACKLOG #5577 — a MATERIAL sink under-count behind a clean DRAIN GATE.** ``drain_gated`` says the
+        ENGINE_DRAINED gate arrived, so the sinks tallied only AFTER the engine reported every row done. A
+        clean store-truth then says every copy was delivered, and a sink more than ``tol × A×D`` short of
+        ``A×D`` contradicts it. That is not the benign frozen tail FROZEN_TAIL names (a tail is what a LOST
+        gate produces, when the sinks may tally early), so it fires. Without the gate the shortfall stays a
+        FROZEN_TAIL, as before.
+
+    **BACKLOG #5577 — the per-stage permit is used WHENEVER the split is present, at ``H == D`` too, and it
+    charges rows at a stage outside the three it names.** The stage-blind fallback charged an INGRESS strand
+    one delivery at ``H == D`` where it blocks ``D``. And ``_summarize_queue_rows`` drops a row at any other
+    stage (``response``, ADR 0013) from the split while ``stranded`` still counts it, so the split summed to
+    less than ``unclear`` and those rows were charged nothing at ``H > D``. Each such residual row is now
+    charged ``D``, the most a row can block: an unexplained row may only lower the permit, never raise it.
+    The price is that a real collapse with residual rows can read INCONCLUSIVE (the fail-safe verdict, never
+    a PASS); the shardcert graph declares no ``reingress_to``, so it produces no ``response`` rows.
     """
     if acked < 0 or sink_received < 0:
         return False  # observer counts not supplied ⇒ guard inert (see docstring)
@@ -1021,6 +1062,18 @@ def observers_inconclusive(
     slack = tol * expected
     # (b) blind required collector: the engine says all-clean-delivered, the sink saw nothing.
     if sink_received == 0 and engine_ok:
+        return True
+    # (c) BACKLOG #5577: the drain gate held the sink tally until the engine reported every row done, so a
+    # clean store-truth asserts all A×D copies delivered. A sink materially short of that contradicts it;
+    # only a LOST gate (sinks may tally early) makes such a shortfall a benign FROZEN_TAIL.
+    if is_gated_shortfall(
+        drain_gated=drain_gated,
+        engine_ok=engine_ok,
+        acked=acked,
+        sink_received=sink_received,
+        delivering=delivering,
+        tol=tol,
+    ):
         return True
     # (a) the sink over-counts vs the engine store-truth's permitted deliveries. When the engine claims a
     # collapse we need the strand/dead tally to compute the permit; an unknown tally (a sentinel <0) can't
@@ -1045,12 +1098,10 @@ def observers_inconclusive(
     # strand count scales with H while deliveries scale with D, and the sink honestly under-counts) read as
     # the honest COLLAPSED the observers AGREE on, rather than a fabricated INCONCLUSIVE.
     free = acked * max(0, handlers - delivering)
-    if (
-        handlers > delivering
-        and ingress_stranded >= 0
-        and routed_stranded >= 0
-        and outbound_stranded >= 0
-    ):
+    # BACKLOG #5577: the per-stage branch applies whenever the split is present, H == D included. At
+    # H == D `free` is 0, and the stage-blind fallback below would charge an ingress strand ONE delivery
+    # where it blocks D, raising the permit and hiding an over-count.
+    if ingress_stranded >= 0 and routed_stranded >= 0 and outbound_stranded >= 0:
         # BACKLOG #229 — SOUND per-stage `blocked`. `stranded` is opaque across all stages, so the
         # stage-blind `max(0, unclear - free)` credits an INGRESS strand (which blocks all D copies — the
         # message never routed) or an OUTBOUND strand (blocks 1) to the non-delivering-handler `free` budget
@@ -1065,11 +1116,19 @@ def observers_inconclusive(
         #     genuine H>D collapse strands ~A×H routed rows, of which ~A×(H−D) are non-delivering; `free`
         #     absorbs exactly those so the collapse reads as the honest COLLAPSED the observers agree on,
         #     rather than re-fabricating the INCONCLUSIVE this guard exists to prevent.
-        blocked = ingress_stranded * delivering + max(0, routed_stranded - free) + outbound_stranded
+        #   * RESIDUAL (BACKLOG #5577) → rows `unclear` counts that the three-stage split does not (a
+        #     `response`-stage row, or any stage the split drops). Their weight is unknown, so each is
+        #     charged D, the most a row can block: an unexplained row may only LOWER the permit.
+        residual = max(0, unclear - (ingress_stranded + routed_stranded + outbound_stranded))
+        blocked = (
+            (ingress_stranded + residual) * delivering
+            + max(0, routed_stranded - free)
+            + outbound_stranded
+        )
     else:
-        # H==D (free==0 ⇒ `blocked == unclear`, so permit == expected − unclear) OR the per-stage split is
-        # absent (an older payload / aborted rung → the `< 0` sentinel): the stage-blind tally, byte-identical
-        # to the pre-#229 formula `expected - max(0, stranded) - max(0, dead)` (see docstring).
+        # The per-stage split is absent (an older payload / aborted rung → the `< 0` sentinel): the
+        # stage-blind tally, byte-identical to the pre-#229 formula `expected - max(0, stranded) -
+        # max(0, dead)` at H == D (see docstring).
         blocked = max(0, unclear - free)
     permit = expected - blocked
     return sink_received > permit + slack
@@ -1091,6 +1150,7 @@ def classify_rung(
     ingress_stranded: int = -1,
     routed_stranded: int = -1,
     outbound_stranded: int = -1,
+    drain_gated: bool = False,
     observer_tol: float = _OBSERVER_DISAGREE_TOL,
 ) -> RungVerdict:
     """Classify one rung from the two RELIABLE authorities only. ``engine_reported`` is whether the ENGINE
@@ -1111,7 +1171,8 @@ def classify_rung(
     required collector) are also INCONCLUSIVE — trusting one to break the tie is the exact silent fabrication
     this ladder refuses; (4) a CONFIRMED non-drained engine that the sink does NOT contradict is a true
     COLLAPSE; (5) the engine having drained clean, a lossless run is SUSTAINED and a short sink tally is a
-    (benign) frozen tail, never collapse.
+    (benign) frozen tail, never collapse — unless ``drain_gated`` (the sinks tallied behind the ENGINE_DRAINED
+    barrier) and the shortfall is past tolerance, which step (3) has already made INCONCLUSIVE (#5577).
 
     **NO FILLING TERM — and that is a KNOWN GAP, stated so nobody assumes otherwise (2026-07-13).** A rung
     can be lossless-and-drained yet still have been FILLING (its in-flight backlog growing through the hold,
@@ -1139,6 +1200,7 @@ def classify_rung(
         ingress_stranded=ingress_stranded,
         routed_stranded=routed_stranded,
         outbound_stranded=outbound_stranded,
+        drain_gated=drain_gated,
         tol=observer_tol,
     ):
         return RungVerdict.INCONCLUSIVE
@@ -1221,6 +1283,15 @@ class RungOutcome:
     engine_ingress_stranded: int = -1
     engine_routed_stranded: int = -1
     engine_outbound_stranded: int = -1
+    #: BACKLOG #5577: the drive tallied its sinks behind the ENGINE_DRAINED barrier, which arms the A4b
+    #: material-shortfall trigger. Recorded so the verdict can be re-derived from the rung record alone.
+    drain_gated: bool = False
+    #: BACKLOG #5577: this rung is INCONCLUSIVE by A4b trigger (c) (:func:`is_gated_shortfall`) on a
+    #: CONFIRMED store-truth. That is not the unknown an unconfirmed INCONCLUSIVE is: the rung demonstrably
+    #: did not show its deliveries, so a soak in this state still reads SOAK_NOT_SUSTAINED, as the
+    #: FROZEN_TAIL it used to be did, never the weaker SOAK_UNCONFIRMED.
+    gated_shortfall: bool = False
+
     #: WHICH SHAPE served this rung (from the drive report, which learned it from SHARDS_READY). Load-bearing
     #: for reading `handlers`/`delivering`: under `partitioned` they are the DERIVED accounting pair (1, 1),
     #: which a legal BROADCAST run can also produce with a totally different lane topology.
@@ -1517,6 +1588,8 @@ class RungOutcome:
                 "routed_stranded": self.engine_routed_stranded,
                 "outbound_stranded": self.engine_outbound_stranded,
                 "in_pipeline_final": self.engine_in_pipeline_final,
+                "drain_gated": self.drain_gated,  # v9 (#5577): sinks tallied behind the drain gate
+                "gated_shortfall": self.gated_shortfall,  # v9 (#5577): A4b trigger (c) fired
             },
             "in_pipeline_slope": self.in_pipeline_slope,
             "phase_timing": self.phase.to_json_dict(),
@@ -1627,6 +1700,7 @@ def build_rung_outcome(
             "processes; this run's pool is NOT the one it claims"
         )
 
+    drain_gated = gate is not None and drive.tallied_behind_gate
     verdict = classify_rung(
         engine_reported=engine_reported,
         engine_ok=engine_ok,
@@ -1651,6 +1725,20 @@ def build_rung_outcome(
         ingress_stranded=engine_ingress_stranded,
         routed_stranded=engine_routed_stranded,
         outbound_stranded=engine_outbound_stranded,
+        # BACKLOG #5577: only a drive that RECEIVED the gate before tallying counted after the drain; a gate
+        # that reached disk after the drive's wait timed out does not make an early tally late.
+        drain_gated=drain_gated,
+    )
+    gated_shortfall = (
+        verdict is RungVerdict.INCONCLUSIVE
+        and engine_reported
+        and is_gated_shortfall(
+            drain_gated=drain_gated,
+            engine_ok=engine_ok,
+            acked=drive.acked,
+            sink_received=drive.sink_received,
+            delivering=drive.delivering,
+        )
     )
     # A4b: distinguish this INCONCLUSIVE from the store-truth-unconfirmed one (which already noted itself
     # above) so an operator sees WHY a confirmed rung would not certify — the two observers disagreed.
@@ -1659,7 +1747,7 @@ def build_rung_outcome(
             "cross-observer INCONCLUSIVE: the ENGINE store-truth and the DRIVE sink count are "
             f"inconsistent (acked={drive.acked} delivering={drive.delivering} "
             f"sink_received={drive.sink_received} engine_ok={engine_ok} stranded={engine_stranded} "
-            f"dead={engine_dead_total}) — neither observer is trusted to break the tie (excluded from "
+            f"dead={engine_dead_total} drain_gated={drain_gated}) — neither observer is trusted to break the tie (excluded from "
             "the ceiling bracket)"
         )
     # ARTIFACT 4: the FIDELITY gate. It is deliberately NOT folded into `verdict` — a drive shortfall is not
@@ -1736,6 +1824,8 @@ def build_rung_outcome(
         engine_ingress_stranded=engine_ingress_stranded,
         engine_routed_stranded=engine_routed_stranded,
         engine_outbound_stranded=engine_outbound_stranded,
+        drain_gated=drain_gated,
+        gated_shortfall=gated_shortfall,
         engine_in_pipeline_final=engine_in_pipeline_final,
         in_pipeline_slope=slope,
         phase=phase,
@@ -2404,12 +2494,18 @@ class ConsolidatedLadderReport:
         return (
             self.soak is not None
             and not self.soak_aborted
-            and (self.soak.verdict is RungVerdict.INCONCLUSIVE or self.soak_fidelity_unattributed)
+            # BACKLOG #5577: a gated shortfall's store-truth WAS confirmed; it reads NOT_SUSTAINED instead.
+            and (
+                (self.soak.verdict is RungVerdict.INCONCLUSIVE and not self.soak.gated_shortfall)
+                or self.soak_fidelity_unattributed
+            )
         )
 
     @property
     def soak_not_sustained(self) -> bool:
-        """B9: a soak RAN, its store-truth WAS confirmed, and it did not hold — COLLAPSED or FROZEN_TAIL.
+        """B9: a soak RAN, its store-truth WAS confirmed, and it did not hold — COLLAPSED, FROZEN_TAIL, or
+        (BACKLOG #5577) an INCONCLUSIVE gated shortfall (:attr:`RungOutcome.gated_shortfall`), which was a
+        FROZEN_TAIL before trigger (c) and must not soften to SOAK_UNCONFIRMED.
 
         Excluding INCONCLUSIVE is load-bearing, not defensive. Without it a soak whose engine store-truth
         never arrived (a coord glitch — ``classify_rung`` returns INCONCLUSIVE exactly when
@@ -2441,7 +2537,9 @@ class ConsolidatedLadderReport:
         return (
             self.soak is not None
             and not self.soak_aborted
-            and self.soak.verdict is not RungVerdict.INCONCLUSIVE
+            # BACKLOG #5577: a gated shortfall is INCONCLUSIVE on a CONFIRMED store-truth, the FROZEN_TAIL
+            # it replaced read NOT_SUSTAINED, and the change must not soften that.
+            and (self.soak.verdict is not RungVerdict.INCONCLUSIVE or self.soak.gated_shortfall)
             and not self.soak_drive_shortfall
             and not self.soak_fidelity_unattributed
             and not self.soak_ok
@@ -2885,7 +2983,15 @@ class ConsolidatedLadderReport:
             # ingress strand D copies, an outbound strand 1, a routed strand [0,1] (crediting the
             # non-delivering-handler `free` budget against ROUTED strands only). At H == D or when the split is
             # absent (an older engine payload → a `< 0` sentinel) the permit is byte-identical to v7.
-            "schema_version": 8,
+            #
+            # v9 (BACKLOG #5577) — one new key, per-rung `engine.drain_gated`; three SCORING changes, each
+            # only ever moves a rung toward
+            # INCONCLUSIVE: (1) the per-stage permit applies at H == D too (v8 charged an ingress strand ONE
+            # delivery there, not D); (2) rows `stranded` counts outside the three-stage split (a `response`
+            # row) are charged D each, where v8 charged them 1 at H == D and nothing at H > D; (3) when the
+            # drive tallied behind the drain gate, a sink more than the tolerance short of A*D against a clean
+            # store-truth is INCONCLUSIVE, not FROZEN_TAIL.
+            "schema_version": 9,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -3327,6 +3433,10 @@ async def run_engine_ladder(
     # after rung 0's handshake, so a startup clear never races a live signal. The drive clears the same pair
     # at the top of run_drive_ladder — clearing from both sides at startup is idempotent.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)
+    # BACKLOG #5576: the drive waits on rung k while this half is still between rungs, so a failure file
+    # an EARLIER run left for rung k would abort it before rung k's own clear. Clear them all now.
+    for planned in [*(r.run_suffix for r in climb), "soak"]:
+        base_coord.for_run(f"{base_coord.run_id}.{planned}").clear_messages(ENGINE_SETUP_FAILED)
 
     for rung in climb:
         # Early-stop: before arming any rung after the first, give the drive's just-posted LADDER_STOP a
@@ -3477,6 +3587,7 @@ async def run_drive_ladder(
     sink_host: str,
     base_coord: FileDropCoord,
     allow_insecure: bool = False,
+    cacert: str | None = None,
     # NB: the DEFAULT is a real 300s soak — the "off" switch is ``do_soak=False`` (CLI ``--no-soak``), NOT a
     # dropped/zero ``soak_hold_seconds`` (0 arms a degenerate 0s soak, it does not skip).
     soak_hold_seconds: float = 300.0,
@@ -3524,6 +3635,7 @@ async def run_drive_ladder(
     stopped = False
     climb_aborted = False
     soak_aborted = False
+    engine_setup_failed = False
     for rung in climb:
         rung_coord = base_coord.for_run(f"{base_coord.run_id}.{rung.run_suffix}")
         try:
@@ -3537,10 +3649,25 @@ async def run_drive_ladder(
                 coord=rung_coord,
                 drain_timeout=rung.drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
             )
+        except EngineSetupFailed as exc:
+            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset) and it has exited. Not a
+            # drive abort: say whose it was, and post no RUNG_ABORTED to an engine that is gone. LADDER_STOP
+            # still goes out for a half that is still polling. The soak is skipped below.
+            base_coord.post(
+                LADDER_STOP, {"stopped_at": rung.run_suffix, "verdict": "engine_setup_failed"}
+            )
+            notes.append(  # str(exc) is already terminal-escaped by _await_shards_ready
+                f"{rung.run_suffix}: ENGINE setup failed ({exc}) — climb aborted, soak skipped"
+            )
+            engine_setup_failed = True
+            climb_aborted = True
+            stopped = True
+            break
         except CoordTimeout as exc:
             # The engine half never handed off this rung within the window (dead / desynced) — a two-box
             # RENDEZVOUS failure, NOT a bench result. Post LADDER_STOP so the engine stops climbing
@@ -3554,7 +3681,7 @@ async def run_drive_ladder(
             # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
             rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
             notes.append(
-                f"{rung.run_suffix}: drive aborted ({exc}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
+                f"{rung.run_suffix}: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
             climb_aborted = True
             stopped = True
@@ -3584,7 +3711,11 @@ async def run_drive_ladder(
             break
 
     # Soak selection + handshake.
-    soak_rate = pick_soak_rate(outcomes, soak_rate_override) if do_soak else None
+    soak_rate = (
+        pick_soak_rate(outcomes, soak_rate_override)
+        if do_soak and not engine_setup_failed
+        else None
+    )
     soak_outcome: RungOutcome | None = None
     if soak_rate is None:
         base_coord.post(LADDER_SOAK, {"skip": True})
@@ -3598,6 +3729,8 @@ async def run_drive_ladder(
         void_sustained = [r for r in sustained if not r.fidelity_admissible]
         if not do_soak:
             notes.append("no soak (soak disabled)")
+        elif engine_setup_failed:
+            notes.append("no soak: the engine half failed its setup and exited")
         elif sustained and len(void_sustained) == len(sustained):
             notes.append(
                 f"no soak: {len(sustained)} of {len(outcomes)} climb rung(s) SUSTAINED but ALL were "
@@ -3635,6 +3768,7 @@ async def run_drive_ladder(
                 coord=soak_coord,
                 drain_timeout=soak_drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
@@ -3652,6 +3786,9 @@ async def run_drive_ladder(
                 soak_coord, timeout_seen=engine_rung_report_timeout
             )
             soak_outcome = build_rung_outcome(soak_rung, drive, gate, report_msg)
+        except EngineSetupFailed as exc:
+            soak_aborted = True
+            notes.append(f"soak: ENGINE setup failed ({exc}) — soak ABORTED (setup-degraded)")
         except CoordTimeout as exc:
             # A soak rendezvous failure does NOT set climb_aborted (the CLIMB already pinned the ceiling), but
             # it IS a setup degradation: the soak never produced a measurement, so it must read as ABORTED
@@ -3661,7 +3798,7 @@ async def run_drive_ladder(
             soak_aborted = True
             soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
             notes.append(
-                f"soak: drive aborted ({exc}) — soak ABORTED (setup-degraded, not a bench result)"
+                f"soak: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — soak ABORTED (setup-degraded, not a bench result)"
             )
 
     if stopped and not climb_aborted:

@@ -37,7 +37,8 @@ per-connection `source_ip_allowlist`.
 
 This is the whole correctness argument and everything else hangs off it.
 
-uvicorn's `ProxyHeadersMiddleware` is the **single** X-Forwarded-For trust point in the process. It
+uvicorn's `ProxyHeadersMiddleware` is the **single** X-Forwarded-For trust point in the process
+*(no longer true of the process, only of the API: see the 2026-11-10 note below)*. It
 rewrites `scope["client"]` from XFF when, and only when, the socket peer matches
 `forwarded_allow_ips` — which [`__main__.py`](../../messagefoundry/__main__.py) builds from
 `[api].trusted_proxies` with `uvicorn_trusted_hosts`, not verbatim *(corrected 2026-10-29; see the
@@ -167,3 +168,17 @@ D-1's argument is unchanged: uvicorn's `ProxyHeadersMiddleware` is still the sin
 and the decision still reads `scope["client"]` and parses no header. D-3 still reads the configured
 list. The added spelling of a single-host entry is a single host too, so D-3's refusal of every
 multi-address entry still covers what uvicorn is handed (vault BACKLOG #3764 item 4).
+
+## Note (2026-11-10) -- the API's single trust point, not the process's
+
+D-1 called uvicorn's `ProxyHeadersMiddleware` the single X-Forwarded-For trust point in the
+process. Since BACKLOG #5525 (owner ruling 2026-11-10, "Per-connection proxies") that is false of
+the process. The inbound HTTP listener has its own, per connection: `Http(trusted_proxies=...)`,
+under `intake_auth = "api_key"` or `"bearer"` only, keys that listener's failed-attempt budget on
+the client address a listed proxy writes in `X-Forwarded-For`. The `trusted_proxies` row of the
+HTTP listener in [CONNECTIONS.md](../CONNECTIONS.md) says how it reads the header.
+
+D-1's argument for this ADR is unchanged. The listener's walk never reaches `scope["client"]`, the
+API, or `[security].allowed_client_networks`, and it does not read `[api].trusted_proxies`, so the
+gate this ADR decides still reads only what uvicorn substituted. Uvicorn is the single trust point
+for the API.

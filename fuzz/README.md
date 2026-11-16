@@ -185,9 +185,10 @@ a separate test fails when a target is registered without one. For most targets 
 the engine code the target drives; for `hl7_tree`, `dicom_peek` and `stream_frames` it replaces the
 entry call itself, which shows less, and the table's comment says so. Further tests break the
 split-invariance, cap, ceiling and deflate-tail properties on purpose and assert the target says so,
-and others assert that each known-finding carve-out lets out a different `ValueError` on its own
-reproducer, and the engine's own message on a body without the registered shape. A fuzz harness nobody has seen catch anything measures
-nothing.
+and others assert that a separators `ValueError` planted on either retired binary-carriage
+reproducer escapes, whether planted in the detach scan or in the extract, and that the target
+refuses an `UnreadableDelimitersError` out of the extract or the detach scan on a body whose
+delimiters are readable. A fuzz harness nobody has seen catch anything measures nothing.
 
 ## Where the files go
 
@@ -262,34 +263,29 @@ to delete the entry. A carve-out cannot quietly outlive its defect and become a 
 The register's first entry, the empty-segment finding, was fixed under BACKLOG #1594 and came out
 with its carve-out. Its reproducer stays on as the `hl7_peek` seed `BLANK_SEGMENT_HL7`.
 
-**It holds two entries today**, both from `binary_carriage` under vault BACKLOG #2683, and both a
-bare `ValueError("cannot determine HL7 separators ...")` out of `Message`, which reads its separators
-from an MSH it cannot always find. They are registered separately because their shapes and
-consequences differ:
+**It is empty today.** The two entries `binary_carriage` produced under vault BACKLOG #2683 were
+both a bare `ValueError("cannot determine HL7 separators ...")` out of `extract_obx_document`, on
+an MSH-led body whose MSH-2 carries fewer than four encoding characters and on an FHS- or BHS-led
+body with no MSH (BACKLOG #2873 and #2874). Both were fixed under BACKLOG #2873:
+`extract_obx_document` now refuses either as `UnreadableDelimitersError`, the refusal
+`iter_obx_documents` already raised for such a body, and so do the reader `strip_documents_in_hl7`
+and the writer `embed_obx_document`; the entries and the carve-out in `_binary_carriage` came out
+with them. `UnreadableDelimitersError` is a `ValueError` and deliberately not a
+`BinaryCarriageError`, so a Handler that skips an OBX that is not a document on
+`BinaryCarriageError` does not skip, and silently drop, every OBX of such a message. Both
+reproducers stay on as `binary_carriage` seeds, so the fix cannot quietly regress.
 
-* **An MSH-led body whose MSH-2 carries fewer than four encoding characters.** `Peek.parse` and
-  `Message.parse` accept it and `build_ack` answers it `AA`; then `extract_obx_document` lets the
-  `ValueError` out, so a Handler that called it on such a body would get a bare `ValueError` on
-  first deployment, not the `BinaryCarriageError` that function documents. `strip_documents` no
-  longer raises on it: it returns such a body unchanged, so the retention document-strip pass,
-  which calls it with no `try`, skips the row rather than aborting (BACKLOG #5099).
-* **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
-  and `extract_obx_document` then raises. A Handler that parsed such a body
-  with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
-  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected: it
-  returns a body with no MSH unchanged (BACKLOG #5099).
-
-On either shape `iter_obx_documents` no longer lets the bare `ValueError` out: a body with an OBX
-and no MSH, or an MSH-2 shorter than four characters, is its named refusal, `UnreadableDelimitersError`, a
-`ValueError` subclass (BACKLOG #5099). Only the first shape reaches the over-threshold ingress
-detach, which records a body of it that has an OBX as `ERROR`; the listener's parse refuses the
-second before any detach.
-
-Each carve-out swallows an error only when it is a bare `ValueError` with that message AND the input
-has that entry's shape; tests plant a different `ValueError` on each reproducer, and the engine's
-message on a well-formed body, and assert both escape. The reproducers, full summaries and
-discriminators are on the entries in `fuzz/targets.py`. Both are registered and not fixed: fixing
-them is an engine change, and this harness does not make one.
+The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`. ADR 0054 is the source
+of record for what the parse refuses: only a header too short for MSH-1 plus one encoding
+character. Where to refuse the short MSH-2 is decided: in the OBX helpers, not at parse, by
+Manager decision d20261110T013333950-2b2a11 after adversarial review under BACKLOG #2873's first
+closing step. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
+other ingress check refuses it. Over the threshold, a body with an OBX reaches the ingress document
+detach, where `iter_obx_documents` refuses it as `UnreadableDelimitersError` with an `ERROR` row and
+a refusal from the listener, `AR` over MLLP (BACKLOG #5099).
+`strip_documents` returns such a body unchanged, so the retention document-strip pass skips the row
+rather than aborting. The FHS- or BHS-led body is refused by `Peek.parse`, so the listener refuses
+it before any detach; that `Message.parse` accepts it is BACKLOG #2874, not changed here.
 
 ## Not covered
 
@@ -313,7 +309,8 @@ out" says why it does not.
 | `transports/http_listener.py` `_read_head` and `_read_body` | target `http_request` | The unauthenticated, pre-ingress request parser. One request through `_read_request` on an in-memory `StreamReader`, with small caps; the listener's authentication step between the two reads is not run. |
 | `transports/http_listener.py` header-mode authentication (`_authorize_head`) | ruled out, for now | Needs a configured `HttpSource` with credentials. The next candidate on this surface. |
 | `parsing/compression.py`, all four decompressors | target `compression` | `gzip_decompress` runs on a File feed with `decompress="gzip"`; the rest are Handler-facing. |
-| `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced both known findings above. |
+| `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced two findings (BACKLOG #2873 and #2874), whose reader refusals were fixed under BACKLOG #2873. |
+| `parsing/binary.py` `embed_obx_document`, and `strip_documents_in_hl7` called directly | not yet a target | `embed_obx_document` is Handler-facing, exported from `messagefoundry.parsing`; `strip_documents_in_hl7` is not exported there and is called by `strip_documents`. Their unreadable-delimiter refusals are pinned by unit tests in `tests/test_binary_carriage.py` only; `binary_carriage` reaches `strip_documents_in_hl7` only through `strip_documents`, which skips such a body first. |
 | `parsing/binary.py` `reattach_documents_in_hl7`, `may_hold_doc_ref`, `doc_ref_addresses_in_hl7` | not yet a target | Delivery side, through an async store reader. It is not out of reach of untrusted input: a sender's `OBX-5.5` text and its MSH, FHS and BHS headers reach all three (BACKLOG #5099). The candidate next to `binary_carriage`. |
 | `parsing/sniff.py` | ruled out as a target of its own | Prefix tests with no exception path. The archive-member checks run inside `zip_decompress`, so `compression` reaches them. |
 | `parsing/split.py` `split_batch` (File ingress batch split) | ruled out | A regex split and string operations on a `str`, with no exception path. |

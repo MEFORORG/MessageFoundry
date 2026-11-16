@@ -15,6 +15,7 @@ finally reaches, and it does not see a native driver that dials on its own.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import urllib.parse
 from collections.abc import Mapping
@@ -22,14 +23,24 @@ from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
+from messagefoundry.config.settings import (
+    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+    EgressSettings,
+    pinned_host_port,
+)
 from messagefoundry.config.wiring import WiringError, resolve_env_settings
 from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.transports.base import _ECH_ROUTING_DESTINATIONS
 from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.proxy_address import ProxyAddress, parse_proxy_url
+from messagefoundry.transports.proxy_address import (
+    _UNCACHED_URLSPLIT,
+    ProxyAddress,
+    parse_proxy_url,
+)
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
+    ech_sidecar_url_from_settings,
     refuse_url_credentials,
     url_host_label,
     url_scheme,
@@ -166,7 +177,7 @@ _CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
     # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
     ("smart_token_url", "SMART token endpoint"),
     # ADR 0126 — the client-credentials grant POSTs ``client_id`` + ``client_secret`` here, either as
-    # form fields or as a Basic header (``transports/http_auth.py`` ``_fetch_token``). Ungated until
+    # form fields or as a Basic header (``transports/http_auth.py`` ``_grant``). Ungated until
     # 2026-07-31: the scheme was constrained to http(s) and nothing else, so a crafted
     # ``oauth2_token_url`` exfiltrated the client credentials to any host while ``[egress]
     # .allowed_http`` gated only the data URL. Found re-scoring ASVS 14.2.3.
@@ -194,7 +205,7 @@ def _check_credential_token_url_egress(
             use="the connection's client credential settings",
             error=WiringError,
         )
-        if not _http_egress_allowed(token_url, allowed_http):
+        if not http_egress_allowed(token_url, allowed_http):
             host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
@@ -302,6 +313,113 @@ def _check_forward_proxy_egress(
         )
 
 
+#: The port urllib dials for an ``http`` or ``https`` URL that names none.
+_HTTP_DEFAULT_PORTS: Mapping[str, int] = {"http": 80, "https": 443}
+
+
+def http_dial_port(scheme: str, port: int | None) -> int:
+    """The port urllib dials for an ``http`` or ``https`` URL: ``port`` when the URL names one,
+    else the scheme's default. The ``[egress].allowed_ech_sidecar`` gate judges the sidecar at it
+    (BACKLOG #5528).
+
+    Raises ``ValueError`` for any other scheme, whether or not ``port`` is set: it knows only what
+    urllib dials for these two. The message does not quote ``scheme``."""
+    default = _HTTP_DEFAULT_PORTS.get(scheme.lower())
+    if default is None:
+        raise ValueError("http_dial_port reads only an http or https URL")
+    return default if port is None else port
+
+
+def _check_ech_sidecar_egress(
+    label: str, settings: Mapping[str, Any], allowed_ech_sidecar: list[str]
+) -> None:
+    """Gate an ``ech_egress`` connection's loopback sidecar (ADR 0139) against
+    ``[egress].allowed_ech_sidecar`` (BACKLOG #5528).
+
+    The sidecar is where the connection's bytes go first: every request, body and credential
+    headers included, and on a SMART or OAuth2 connection the token-endpoint POST, which
+    ``http_auth`` re-addresses to the same sidecar. The resolver refuses a host off this machine,
+    but nothing bounded the port, so without this gate a deploying site's connection could name any
+    loopback listener and it would receive all of that.
+
+    **Its own list, deny-by-default on its own terms**, for the reasons
+    :func:`_check_forward_proxy_egress` gives for ``allowed_proxy``: the sidecar is an intermediary
+    rather than a PHI destination, so folding it into ``allowed_http`` would let one list entry
+    stand for two different hops, and an empty list that allowed any port under the
+    ``[security].block_unlisted_outbound = false`` opt-out would leave the hop ungated there.
+
+    **It judges the address that is dialled.** The sidecar is read by
+    :func:`~messagefoundry.transports.rest.ech_sidecar_url_from_settings`, the resolver the
+    connector dials from, so a value the build refuses is refused here first, in that resolver's
+    words, which name no credential. That includes a URL credential, which urllib would dial as
+    part of the host rather than the host this gate reads. A port that cannot be read, or port 0,
+    which no entry can list, is refused next in fixed words. The port is the URL's, or 80 for
+    ``http`` and 443 for ``https`` where it names none, as urllib dials. That host and port, and
+    each entry, are read by :func:`~messagefoundry.config.settings.pinned_host_port`, the parse the
+    list is validated with at load, so an IP literal compares in one spelling and an entry it
+    cannot read never matches: no entry stands for any port. An unset ``ech_egress`` is a no-op."""
+    refusal: str | None = None
+    try:
+        sidecar = ech_sidecar_url_from_settings(settings)
+    except ValueError as exc:
+        sidecar, refusal = None, str(exc)
+    # Raised after the handler ends, so the refusal carries no exception context.
+    if refusal is not None:
+        log.warning(
+            "egress denied: %s ECH sidecar refused before [egress].allowed_ech_sidecar", label
+        )
+        raise WiringError(f"{label}: {refusal}")
+    if sidecar is None:
+        return
+    # Uncached, as the resolver's own split is (vault BACKLOG #5287).
+    parts = _UNCACHED_URLSPLIT(sidecar)
+    try:
+        url_port = parts.port
+        unreadable = False
+    except ValueError:
+        # A port of more than 4300 digits, leading zeros and all, passes the resolver's credential
+        # screen and breaks int(). urlsplit's own text is not let out.
+        url_port, unreadable = None, True
+    if unreadable:
+        log.warning("egress denied: %s ECH sidecar port cannot be read", label)
+        raise WiringError(f"{label}: ech_sidecar names a port that cannot be read as a number")
+    if url_port == 0:
+        # Not "not in the allowlist": no entry can list port 0, so that would send the operator
+        # looking for an entry to add.
+        log.warning("egress denied: %s ECH sidecar names port 0", label)
+        raise WiringError(
+            f"{label}: ech_sidecar names port 0, which is not a port a sidecar can listen on and "
+            "no [egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
+        )
+    if not allowed_ech_sidecar:
+        log.warning(
+            "egress denied: %s ECH sidecar set with an empty [egress].allowed_ech_sidecar", label
+        )
+        raise WiringError(
+            f"{label}: ech_egress is set but [egress].allowed_ech_sidecar is empty — list the "
+            "sidecar's host:port to permit it (the sidecar receives every request and its "
+            "credentials, so this list is deny-by-default even under "
+            "[security].block_unlisted_outbound = false)"
+        )
+    port = http_dial_port(parts.scheme, url_port)
+    hostname = parts.hostname or ""
+    # Read back through the entries' own parse, so a host is compared in one spelling on both
+    # sides: `0:0:0:0:0:0:0:1` matches a `[::1]` entry.
+    dialled = pinned_host_port(f"[{hostname}]:{port}" if ":" in hostname else f"{hostname}:{port}")
+    if dialled is None or not any(pinned_host_port(e) == dialled for e in allowed_ech_sidecar):
+        host = url_host_label(sidecar)
+        log.warning(
+            "egress denied: %s ECH sidecar host %r port %s not in [egress].allowed_ech_sidecar",
+            label,
+            host,
+            port,
+        )
+        raise WiringError(
+            f"{label}: ECH sidecar host {host!r} at port {port} is not in the "
+            "[egress].allowed_ech_sidecar allowlist"
+        )
+
+
 def check_fhir_lookup_allowed(
     name: str,
     settings: Mapping[str, Any],
@@ -337,7 +455,7 @@ def check_fhir_lookup_allowed(
     if egress.allowed_http:
         url = str(settings.get("url", ""))
         refuse_url_credentials(url, f"FhirLookup {name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(
+        if not http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
             host = url_host_label(url)
@@ -442,10 +560,10 @@ def check_egress_allowed(
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
     exfiltrate PHI. ``build_destination`` runs it on every build (vault BACKLOG #2605). Under the
     default ``deny_by_default`` an empty list refuses; only the audited opt-out makes an empty list
-    unrestricted, and ``allowed_proxy`` and ``allowed_recipient_domains`` stay deny-by-default on
-    their own terms either way. Checked against the resolved
-    (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
-    PHI bodies and keep their own ``[alerts]`` host allowlists.
+    unrestricted, and at least ``allowed_proxy``, ``allowed_ech_sidecar`` and
+    ``allowed_recipient_domains`` stay deny-by-default on their own terms either way. Checked
+    against the resolved (``env()``-substituted) destination at config load/reload/start.
+    Webhook/SMTP alert sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
 
     Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
@@ -465,6 +583,14 @@ def check_egress_allowed(
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
+    # ADR 0139 ECH sidecar: the loopback hop every request of an ech_egress connection takes, gated
+    # by its OWN deny-by-default [egress].allowed_ech_sidecar list for the same reason (BACKLOG
+    # #5528). Keyed off the set build_destination admits ech_egress on, so a connector added to it
+    # is gated here too.
+    if dest.type in _ECH_ROUTING_DESTINATIONS:
+        _check_ech_sidecar_egress(
+            f"outbound {dest.name!r}", dest.settings, egress.allowed_ech_sidecar
+        )
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under
@@ -560,7 +686,7 @@ def check_egress_allowed(
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(url, egress.allowed_http):
+        if not http_egress_allowed(url, egress.allowed_http):
             host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
@@ -737,22 +863,80 @@ def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str 
 
 
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
+    """True if an entry in ``allowed`` names ``host`` and either names no port or names ``port``.
+    A ``port`` of ``None`` matches only an entry that names no port, never one spelled ``None``."""
     return any(
-        not allow_port or str(port) == allow_port.strip()
+        not allow_port or (port is not None and str(port) == allow_port)
         for allow_port in _allowed_ports_for(host, allowed)
     )
 
 
+#: A host as the allowlist compares it: an IP literal as an address, a name lowercased.
+_CanonicalHost = ipaddress.IPv4Address | ipaddress.IPv6Address | str
+
+
+def _canonical_host(text: str) -> _CanonicalHost | None:
+    """``text``, a host as a connection names it, in the form the allowlist compares, or ``None``
+    when no entry may match it (BACKLOG #5915).
+
+    An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. Anything else
+    holding a ``:``, a bracketed ``[::1]`` included, matches no entry: no entry's host is such a
+    name, and reading it as an address would be a guess about how its connector dials it. A name
+    compares lowercased. Canonical equivalence only,
+    never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
+    the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
+    only the dotted quad. A ``%`` zone id gets ``None``. :mod:`ipaddress` compares the zone, but a
+    URL's zone is compared as written and dialled decoded: ``urlsplit`` reads ``[::1%31]`` as the
+    host ``::1%31``, which an entry ``[::1%31]`` names, and ``urllib.request`` decodes it to
+    ``::11`` before it dials, so the entry would admit a host it does not name."""
+    if not text or "%" in text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None if ":" in text else text.lower()
+
+
+def _parse_allow_entry(entry: str) -> tuple[_CanonicalHost, str] | None:
+    """``entry`` read as ``(host, port text)``, the port text ``""`` where it names none, or
+    ``None`` for an entry that matches nothing (BACKLOG #5915).
+
+    ``host``, ``host:port``, ``[v6]`` and ``[v6]:port`` are read. Brackets hold an IPv6 literal and
+    nothing else. An unbracketed entry holding more than one ``:``, such as ``::1`` or
+    ``fe80::1:443``, is ambiguous, so it matches nothing: the last group is never read as a port,
+    and the entry is not read as a host with no port. A ``:`` with no port after it, such as
+    ``[::1]:`` or ``db:`` (an ``env()`` that expanded to nothing), matches nothing too, rather
+    than any port. The host is read by :func:`_canonical_host`."""
+    text = entry.strip()
+    if text.startswith("["):
+        close = text.find("]")
+        if close == -1:
+            return None
+        inner, rest = text[1:close], text[close + 1 :]
+        if (rest and not rest.startswith(":")) or ":" not in inner:
+            return None
+        host, sep, port = inner, rest[:1], rest[1:]
+    elif text.count(":") > 1:
+        return None
+    else:
+        host, sep, port = text.partition(":")
+    port = port.strip()
+    canonical = _canonical_host(host.strip())
+    if canonical is None or (sep and not port):
+        return None
+    return canonical, port
+
+
 def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
-    """The port text of each ``host`` / ``host:port`` entry whose host is ``host``, in any case:
-    ``""`` for an entry that names no port. The parse :func:`host_port_allowed` and the DATABASE
-    check share; at least ``transports.ai_broker.endpoint_host_allowed`` keeps its own copy."""
-    host = host.lower()
-    return [
-        allow_port
-        for allow_host, _, allow_port in (entry.partition(":") for entry in allowed)
-        if allow_host.strip().lower() == host
-    ]
+    """The port text of each entry in ``allowed`` whose host is ``host``, ``""`` for an entry that
+    names no port. Hosts compare in :func:`_canonical_host`'s form and entries are read by
+    :func:`_parse_allow_entry`. The one parse :func:`host_port_allowed`, the DATABASE check and
+    ``transports.ai_broker.endpoint_host_allowed`` share."""
+    canonical = _canonical_host(host)
+    if canonical is None:
+        return []
+    parsed = (_parse_allow_entry(entry) for entry in allowed)
+    return [entry[1] for entry in parsed if entry is not None and entry[0] == canonical]
 
 
 def _database_refusal(
@@ -766,8 +950,9 @@ def _database_refusal(
     ``dialect`` setting. The host and port are read by
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
     dialect's connection string sends. A host no entry names is refused as unlisted, before its
-    port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
-    the entries for that host say, and so is a driver or ``server`` the SQL Server preset refuses
+    port is read, and so is a host holding a ``:``, an IPv6 literal included. Once the host is
+    listed, a port the reading cannot settle is refused, whatever the entries for that host say,
+    and so is a driver or ``server`` the SQL Server preset refuses
     (BACKLOG #4873); both arrive as the reading's ``conflict``. An entry that pins a port admits
     only that port, compared as a number on both sides. A connection whose port the engine cannot
     read matches an entry that names no port, and never one that pins one."""
@@ -775,7 +960,8 @@ def _database_refusal(
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)
     host, port = endpoint.host, endpoint.port
-    pins = _allowed_ports_for(host, allowed)
+    # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
+    pins = [] if ":" in host else _allowed_ports_for(host, allowed)
     if not pins:
         return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if endpoint.conflict is not None:
@@ -811,7 +997,7 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
-def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
+def http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
     ``host`` / ``host:port`` matching as MLLP.
 

@@ -95,9 +95,11 @@ async def _race_stale_scan(
     armed = False
     scans = 0
 
-    def _a_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+    def _a_scan(
+        held: list[Any] | None = None, *, outage_raises: bool = False
+    ) -> list[UploadedFileMeta]:
         nonlocal scans
-        out = real_a_scan(held)
+        out = real_a_scan(held, outage_raises=outage_raises)
         if armed:
             scans += 1
             if scans == 2:  # 1 = the pre-reserve scan, 2 = the scan inside _build_and_write

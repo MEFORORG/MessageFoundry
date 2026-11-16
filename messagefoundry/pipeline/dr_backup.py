@@ -53,7 +53,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -473,9 +473,22 @@ class BackupRunner:
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
         hop_posture: HopPosture | None = None,
+        dr_paused: Callable[[], bool] = lambda: False,
     ) -> None:
         self._store = store
         self._settings = settings
+        # Read before each pass starts; while it answers True, none starts (vault BACKLOG #5712).
+        # The engine answers True on a passive DR standby, and during an activation until its reload
+        # has completed. A pass writes a `dr_backup` audit row, and the server-DB live seed probe
+        # reads any such row as proof the database was restored from a primary, so a standby's own
+        # row would pass that probe on an unrestored database. It would also become the latest
+        # anchor the restore-token check compares, and refuse a valid restore.
+        # THIS IS THE ONE STATEMENT OF WHAT STILL WRITES SUCH A ROW ON A DR BOX; the probe's
+        # docstrings point here. At least: the `messagefoundry backup` command, which builds its
+        # runner without this gate; a pass already running when the gate turns True, which
+        # finishes and records its row; and a box booted with `[dr].activate = true`, which is not
+        # paused.
+        self._dr_paused = dr_paused
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
@@ -532,6 +545,11 @@ class BackupRunner:
             self._settings.retention_keep,
             self._settings.snapshot_method,
         )
+        if self._dr_paused():
+            log.info(
+                "DR backup: no pass starts while this box is a passive DR standby; an activation "
+                "starts them once its reload has completed"
+            )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -571,11 +589,16 @@ class BackupRunner:
         target = self._settings.schedule_time()
         if target is None:
             return False
-        if not self._coordinator.is_leader():
-            return False  # leader-gated: a follower never backs up the shared destination (AC-12)
+        if not self._may_back_up():
+            return False
         lt = time.localtime(now)
         reached = (lt.tm_hour, lt.tm_min) >= target
         return reached and self._last_backup_day != _day_key(now)
+
+    def _may_back_up(self) -> bool:
+        """Leader-gated, so a follower never backs up the shared destination (AC-12), and never
+        while ``dr_paused`` answers True (vault BACKLOG #5712)."""
+        return self._coordinator.is_leader() and not self._dr_paused()
 
     # --- one pass ------------------------------------------------------------
 
@@ -589,12 +612,13 @@ class BackupRunner:
         the rule it follows is stated once, at :data:`_STAGING_SUFFIX`.
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
-        destination (so in a cluster exactly one node backs up). On success records a ``dr_backup`` audit
+        destination (so in a cluster exactly one node backs up), and so does a passive DR standby
+        (vault BACKLOG #5712). On success records a ``dr_backup`` audit
         row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
         ``AlertSink.backup_failed``, leaves any prior good archive intact, and re-raises
         :class:`BackupError`. ``force_config_only`` (the CLI ``--config-only`` flag) backs up the config
         bundle only even on a SQLite store (a server-DB store is always config-only per the boundary)."""
-        if not self._coordinator.is_leader():
+        if not self._may_back_up():
             return None
         now = self._clock() if now is None else now
         self._last_backup_day = _day_key(now)  # advance the daily cadence even if this pass fails
@@ -1755,8 +1779,15 @@ def _verify_archive_blocking(
     Steps (ADR 0049): (1) key-fingerprint precheck — a mismatch is a clean ``KEY_MISMATCH`` BEFORE any
     decrypt; (2) decrypt the archive; (3) extract + open ``store.db`` read-only, run
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
-    re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
-    authenticates every cipher-covered cell in it — heavier. That leg returns its own
+    decrypts + authenticates the cipher-covered cells the snapshot holds as archived, re-opens it
+    through the real ``open_store`` path (cipher + migrations), then decrypts + authenticates the
+    cells of the opened copy — heavier. The first walk reads the archive's own schema, before the
+    open's at-open sweep can seal a value it would judge; it reads a cell only where that schema holds
+    the cell's table and every column its tag binds. The second walk reads the migrated schema, so it
+    also reads a cell that only a migration adds or renames, at least ``queue.payload`` on a schema
+    without ``body_ref``, ``search_presets.criteria`` on one without ``owner_user_id``, and a value the
+    outbox fold moves into ``queue``. The first walk's verdict leads the second's, and the cell count
+    is the first walk's. The full leg returns its own
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
     recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
     configuration that is not are not both reported as ``FAIL``.
@@ -1974,9 +2005,17 @@ def _fd_walk(
 _walk = _fd_walk
 
 
-def _empty_files_in_place(staging: Path) -> list[str]:
+def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = None) -> list[str]:
     """Truncate every regular file under ``staging`` to zero bytes. Returns what could NOT be shown
     empty: a file that refused, or a directory that could not be listed.
+
+    A name in ``spared``, directly under ``staging``, is never truncated, and is reported with the
+    note it maps to; its spare marker is kept too, unreported. In a restore's directory any other
+    marker holding one of the restore's reasons is kept unreported, ``released`` included
+    (:func:`_release_spare_marker`), since emptied it would read as a spare; one that cannot be read
+    at that moment is kept and reported. A restore spares its staged store when that name could not be removed after placement and is
+    still the restored store's own file, which a volume that misreports its link count would
+    otherwise let this empty (BACKLOG #5617; see :func:`_spared_items`).
 
     Walked with a walk that reports a listing error, and an ``lstat``, rather than ``Path.rglob`` and
     ``Path.is_file``, which on Python 3.14 swallow ``OSError``: a directory that cannot be listed would
@@ -2009,9 +2048,37 @@ def _empty_files_in_place(staging: Path) -> list[str]:
         if reason is not None and not (reason == _OUTSIDE_REASON and reason in unproven):
             unproven.append(reason)
 
+    spares = spared or {}
+    # Only a restore writes a spare marker, so only a restore's directory is read for one.
+    reads_markers = staging.name.startswith(_RESTORE_STAGING_PREFIX)
+
+    def _is_spared(at_root: bool, name: str) -> bool:
+        if not at_root:
+            return False
+        if name in spares:
+            unproven.append(f"{name} ({spares[name]})")
+            return True
+        target = _marker_target(name)
+        if target is None:
+            return False
+        if target in spares:
+            return True
+        if not reads_markers:
+            return False
+        # A marker holding one of the restore's reasons holds that word alone, and emptied it would
+        # read as a spare, `released` included. One that cannot be read at this moment may be
+        # either, so it is kept and reported; only one that reads as something else is emptied.
+        found = _read_spare_marker(staging / name)
+        if found is None:
+            unproven.append(f"{name} {_UNREAD_MARKER}")
+            return True
+        return found in _SPARE_REASONS
+
     walked = False
     if sys.platform == "win32":
         for dirpath, dirnames, filenames, here in _win_held_walk(staging, unproven, _report):
+            # Both walks are top-down, so the first directory they yield is `staging` itself.
+            at_root = not walked
             walked = True
             kept: list[str] = []
             for d in dirnames:
@@ -2026,12 +2093,15 @@ def _empty_files_in_place(staging: Path) -> list[str]:
                     kept.append(d)
             dirnames[:] = kept
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
+                if not _is_spared(at_root, name):
+                    _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
     else:
         for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
+            at_root = not walked
             walked = True
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
+                if not _is_spared(at_root, name):
+                    _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
     if not walked and not unproven:
         # A walk that yields nothing at all and reports nothing still did not show the root empty.
         unproven.append(f"{staging.name}/ (not listed)")
@@ -2123,8 +2193,10 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
     # the link itself holds no plaintext.
     if not stat.S_ISREG(st.st_mode):
         return None
-    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. No file
-    # the engine stages has a second link, so one here was put there by someone else.
+    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. The one
+    # file the engine stages with a second link is a restore's extracted store once it is placed by
+    # a link, whose other name IS the restored store (BACKLOG #5617); any other was put there by
+    # someone else.
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
@@ -2593,9 +2665,15 @@ def _ps_path(text: str) -> str:
     return "(" + " + ".join(parts) + ")"
 
 
-def _discard_verify_staging(staging: Path) -> str | None:
+def _discard_verify_staging(
+    staging: Path, *, spared: Mapping[str, str] | None = None
+) -> str | None:
     """Remove a DR staging directory -- a backup's snapshot and plaintext tar, or a verify's decrypted
     archive. Never raises.
+
+    With ``spared`` (:func:`_spared_items`) the directory is never removed, since a removal unlinks
+    every name in it: every other file is emptied in place, the spared ones are not, and the
+    sentence returned names them with their notes (BACKLOG #5617).
 
     Returns ``None`` when no file there still holds plaintext, or a PHI-free sentence naming the
     directory when one might. When the first removal is refused it empties every file in place at
@@ -2614,13 +2692,20 @@ def _discard_verify_staging(staging: Path) -> str | None:
     directory, and never hands one here."""
     unproven: list[str] = []
     try:
-        if _remove_tree(staging):
-            return None
-        unproven = _empty_files_in_place(staging)
-        for delay in _STAGING_REMOVE_DELAYS:
-            time.sleep(delay)
+        if spared:
+            # A spared name gone by the walk (its own restore unlinked it meanwhile) leaves
+            # nothing reported, but the directory was still not removed.
+            unproven = _empty_files_in_place(staging, spared=spared) or [
+                f"{staging.name}/ (spared by a restore, not removed)"
+            ]
+        else:
             if _remove_tree(staging):
                 return None
+            unproven = _empty_files_in_place(staging)
+            for delay in _STAGING_REMOVE_DELAYS:
+                time.sleep(delay)
+                if _remove_tree(staging):
+                    return None
     except Exception as exc:  # never raise over the verdict or the error in flight
         log.error("DR staging directory %s could not be cleared: %s", staging, safe_exc(exc))
         return (
@@ -2675,7 +2760,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #: The staging directory prefixes. The sweep looks for these and nothing else.
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
-_SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
+#: A restore's, beside its destination (BACKLOG #5617): locked, torn down and swept like the other two.
+_RESTORE_STAGING_PREFIX = "mefor-restore-"
+_SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX, _RESTORE_STAGING_PREFIX)
 #: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file. Never a
 #: staging directory; a leaked one is empty, and the sweep removes it only while it is empty. The
 #: sweep also removes an empty probe-named directory by ``rmdir`` alone.
@@ -2694,6 +2781,311 @@ _HELD_MARKER_NAME = ".lock-held"
 #: ``errno`` values that mean the file system cannot lock at all (an NFS mount without a lock daemon,
 #: some FUSE and SMB mounts), as opposed to a lock someone else holds.
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
+
+#: A restore's spare marker, beside a file in its staging directory (BACKLOG #5617): the file's
+#: name plus this suffix, holding one of the reasons below, read by the staging teardown and
+#: sweeps. Held in memory alone, the decision lasted one run, and the next run's sweep of the
+#: leftover handed the file to the fail-safe, which on a volume that hard-links and reports one
+#: link truncated the restored store through it.
+_SPARE_SUFFIX = ".mefor-spared"
+#: The file is still a name for the restored store.
+_SPARE_RESTORED = "restored-store"
+#: The file is a name for a store a failed restore placed and its rollback could not remove, and so
+#: the only decrypted copy once that store is deleted by hand.
+_SPARE_ROLLBACK_FAILED = "rollback-failed"
+#: The file is the only decrypted copy of a store a failed restore placed and then removed.
+_SPARE_ROLLED_BACK = "rolled-back"
+#: The file is spared no longer: written where the marker itself will not go, so the decision lasts
+#: past this run. A marker that reads so spares nothing, and is never emptied, since an empty marker
+#: reads as a spare for a reason that could not be read.
+_SPARE_RELEASED = "released"
+#: What a teardown reports beside each spared file. Each says only what is certain of the file
+#: when its marker was written; none predicts what a sweep will do, which races can change.
+_SPARE_NOTES = {
+    _SPARE_RESTORED: "the restored store, not truncated",
+    _SPARE_ROLLBACK_FAILED: (
+        "a second name for the placed store the failed restore's rollback could not remove, not "
+        "truncated: delete it by hand with that store"
+    ),
+    _SPARE_ROLLED_BACK: (
+        "the only decrypted copy of the store the failed restore rolled back, not truncated: "
+        "delete it by hand"
+    ),
+}
+_SPARE_NOTE_UNREAD = "spared by a restore for a reason that could not be read, not truncated"
+#: Every reason a restore writes into a marker.
+_SPARE_REASONS = frozenset({*_SPARE_NOTES, _SPARE_RELEASED})
+#: What the fail-safe reports, after the name, for a marker it could not read (see
+#: :func:`_empty_files_in_place`).
+_UNREAD_MARKER = "(a spare marker that could not be read, not truncated)"
+
+
+def _spare_marker(item: Path) -> Path:
+    return item.with_name(item.name + _SPARE_SUFFIX)
+
+
+def _marker_target(name: str) -> str | None:
+    """The name a spare marker called ``name`` spares, or ``None`` when ``name`` is no marker."""
+    target = name.removesuffix(_SPARE_SUFFIX)
+    return target if target and target != name else None
+
+
+def _still_there(path: Path) -> bool:
+    """Whether ``path`` names something, itself unfollowed. ``True`` when that is not known."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename in ``directory`` durable, on POSIX. Windows exposes no directory handle to
+    flush through :func:`os.open`, so this does nothing there. Never raises: a failure, as on a
+    network mount that refuses a directory fsync, is logged at WARNING, and the rename it was to
+    make durable then survives a process crash but not necessarily a power loss."""
+    if sys.platform == "win32":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        log.warning(
+            "could not open %s to flush a spare marker's rename: %s", directory, safe_exc(exc)
+        )
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        log.warning("could not flush a spare marker's rename in %s: %s", directory, safe_exc(exc))
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            log.warning("could not close %s after flushing it: %s", directory, safe_exc(exc))
+
+
+def _write_spare_marker(item: Path, reason: str) -> bool:
+    """Write ``item``'s spare marker, holding ``reason``, beside it, read by the staging teardown
+    and sweeps.
+    Atomic: written whole to a temporary name and renamed over the marker, so a reader finds the
+    old reason or the new one, never part of one. Never raises; ``False``, logged, when it did not
+    land."""
+    marker = _spare_marker(item)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{marker.name}.", suffix=".tmp", dir=item.parent)
+    except OSError as exc:
+        log.error("could not record that %s must not be removed: %s", item, safe_exc(exc))
+        return False
+    try:
+        try:
+            os.write(fd, reason.encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, marker)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError as unlink_exc:
+            # It holds a reason word, no plaintext; the teardown removes or empties it.
+            log.warning(
+                "could not remove the temporary spare marker %s: %s", tmp, safe_exc(unlink_exc)
+            )
+        log.error("could not record that %s must not be removed: %s", item, safe_exc(exc))
+        return False
+    # The rename too, before the caller links: else a power loss could keep a link the restore
+    # makes next and lose the marker that spares its second name. Outside the `try` above, so
+    # nothing it does can report a marker that landed as one that did not.
+    _fsync_dir(item.parent)
+    return True
+
+
+def _withhold_from_sweep(staging: Path) -> None:
+    """Try to remove the ``.lock-held`` marker a sweep needs before it takes ``staging``: for a
+    spare whose marker could not be written, which no later teardown could read. The lock file
+    stays, so a config walk still prunes the directory (:func:`_is_staging_dir`). A restore calls
+    this twice while it still holds the lock: where a relabel fails (:func:`_record_spare`), and
+    in :meth:`_Staging.release`. Two callers run after the lock dropped, when a sweep can already
+    hold the directory: the teardown, for a spare the release could not read, and the relabel to
+    ``rolled-back`` a late rollback makes (:func:`_finish_rollback`). Never raises; a marker that
+    could not be removed is logged at ERROR. The directory stays sweepable in at least that case:
+    a removal that worked can also be undone, as by a sweep that already held the directory and
+    re-marks it."""
+    try:
+        os.unlink(staging / _HELD_MARKER_NAME)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.error(
+            "could not remove the %s marker of DR staging directory %s, which holds a file a "
+            "restore spared but could not record: %s",
+            _HELD_MARKER_NAME,
+            staging,
+            safe_exc(exc),
+        )
+
+
+def _record_spare(item: Path, reason: str) -> bool:
+    """:func:`_write_spare_marker`, and where it does not land, :func:`_withhold_from_sweep`.
+    ``True`` when the marker landed."""
+    if _write_spare_marker(item, reason):
+        return True
+    _withhold_from_sweep(item.parent)
+    return False
+
+
+def _clear_spare_marker(item: Path, *, level: int = logging.ERROR) -> bool:
+    """Remove ``item``'s spare marker, once nothing needs it spared. Never raises; ``False``,
+    logged at ``level``, when the marker is still there and so still spares ``item`` (a caller
+    for which that has no consequence, or that recovers it, passes a lower level)."""
+    try:
+        os.unlink(_spare_marker(item))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.log(level, "could not remove the spare marker of %s: %s", item, safe_exc(exc))
+        return False
+    return True
+
+
+def _release_spare_marker(item: Path) -> bool:
+    """Put on disk that ``item`` is spared no longer: remove its marker, or where that is refused,
+    rewrite it in place to read ``released``, which spares nothing. Held in memory alone, the
+    decision lasted one run, and the teardown then emptied the marker, which every later sweep
+    reads as a spare (BACKLOG #5617). In place, because a holder that refuses the unlink usually
+    shares write access, and an atomic rename over the marker needs what the unlink did. Written
+    before it is cut to length, so a failure leaves the old reason or an unknown one, both still a
+    spare, and never an empty marker. Never raises; ``False``, logged, when the marker may still
+    spare ``item``."""
+    if _clear_spare_marker(item, level=logging.WARNING):
+        return True
+    marker = _spare_marker(item)
+    refused: str | None = None
+    try:
+        # Opened as the fail-safe opens what it truncates (no link followed), and vetted on the
+        # handle, so the rewrite never reaches another file through a link.
+        fd = _open_unfollowed(marker, None, None)
+        try:
+            _vet_for_truncate(fd)
+            os.write(fd, _SPARE_RELEASED.encode("ascii"))
+            os.ftruncate(fd, len(_SPARE_RELEASED))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return True  # gone since the refused unlink, as a delete-pending one goes
+    except OSError as exc:
+        refused = safe_exc(exc)
+    if refused is None:
+        if _read_spare_reason(marker) == _SPARE_RELEASED:
+            return True
+        refused = "it did not read back"
+    log.error(
+        "could not record that %s is spared no longer, so its marker may still mark it spared; it "
+        "may hold decrypted data: delete it, and its directory, by hand: %s",
+        item,
+        refused,
+    )
+    return False
+
+
+def _not_a_plain_marker(marker: Path) -> str | None:
+    """Why ``marker`` must not be opened by name to read it as a spare marker, or ``None``: it must
+    be a regular file, unfollowed, and on Windows neither a name Windows opens as another object,
+    such as a device (:func:`_win_rewritten`), nor any reparse point (``_O_NOFOLLOW`` is 0 there).
+    Screened on Windows with :func:`_win_lstat`, not ``os.lstat``, which opens a cloud, dedup or
+    tiered file through its filter (BACKLOG #4992). Raises ``OSError`` when it cannot be
+    screened."""
+    if _win_rewritten(marker):
+        return "a name Windows opens as another object"
+    if sys.platform == "win32":
+        st, tag = _win_lstat(marker)
+        if tag:
+            return "a reparse point"
+    else:
+        st = os.lstat(marker)
+    return None if stat.S_ISREG(st.st_mode) else "not a regular file"
+
+
+def _read_spare_reason(marker: Path) -> str:
+    """The reason a spare marker holds, or ``""`` when it is not there or cannot be read as one
+    (:func:`_read_spare_marker`)."""
+    return _read_spare_marker(marker) or ""
+
+
+def _read_spare_marker(marker: Path) -> str | None:
+    """What a spare marker holds: ``""`` when it is not there, and ``None``, logged, when it is
+    there but cannot be read as one. A name :func:`_not_a_plain_marker` refuses is not opened."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
+    try:
+        refused = _not_a_plain_marker(marker)
+        if refused is not None:
+            log.warning("did not read the spare marker %s: %s", marker, refused)
+            return None
+        fd = os.open(marker, flags)
+        try:
+            return os.read(fd, 64).decode("ascii")
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeDecodeError) as exc:
+        log.warning("could not read the spare marker %s: %s", marker, safe_exc(exc))
+        return None
+
+
+def _spare_recorded(item: Path, reason: str) -> bool | None:
+    """Whether ``item``'s spare marker records ``reason``: ``False`` when it is not there or reads
+    another reason, and ``None`` when it is there but cannot be read, or reads empty, at the
+    moment: unknown, and a later sweep reads such a marker as a spare whatever it holds."""
+    marker = _spare_marker(item)
+    if not _still_there(marker):
+        return False
+    found = _read_spare_marker(marker)
+    return None if not found else found == reason
+
+
+def _records_another_reason(item: Path, reason: str) -> bool:
+    """Whether ``item``'s spare marker is known not to record ``reason`` (:func:`_spare_recorded`)."""
+    return _spare_recorded(item, reason) is False
+
+
+def _spared_items(staging: Path, in_memory: Mapping[str, str] | None) -> dict[str, str] | None:
+    """The files directly in ``staging`` that its teardown must neither unlink nor truncate, each
+    mapped to the note that reports it (:func:`_empty_files_in_place`, which keeps their markers
+    too): every name a marker records, and the names in ``in_memory``, each with this run's
+    reason, while that name is still there. An empty reason in ``in_memory`` unspares its name
+    whatever a marker says: the restore that wrote the marker knows it no longer applies. A marker
+    that reads ``released`` spares nothing (:func:`_release_spare_marker`). A marker whose file is
+    gone spares nothing and goes with the directory, so deleting a spared file by hand lets the
+    next sweep finish.
+
+    Only a restore writes a marker, so only a restore's directory is read for one. ``None`` when that
+    directory could not be listed: whether anything in it is spared is then not known."""
+    spared: dict[str, str] = {}
+    if staging.name.startswith(_RESTORE_STAGING_PREFIX):
+        try:
+            with os.scandir(staging) as entries:
+                names = {entry.name for entry in entries}
+        except FileNotFoundError:
+            names = set()
+        except OSError as exc:
+            log.error("DR staging: could not list %s for spare markers: %s", staging, safe_exc(exc))
+            return None
+        for name in names:
+            target = _marker_target(name)
+            if target is not None and target in names:
+                reason = _read_spare_reason(staging / name)
+                if reason != _SPARE_RELEASED:
+                    spared[target] = _SPARE_NOTES.get(reason, _SPARE_NOTE_UNREAD)
+    for name, reason in (in_memory or {}).items():
+        if not reason:
+            spared.pop(name, None)
+        elif _still_there(staging / name):
+            spared[name] = _SPARE_NOTES.get(reason, _SPARE_NOTE_UNREAD)
+    return spared
 
 
 def _unlock_and_close(fd: int) -> None:
@@ -2733,22 +3125,97 @@ class _Staging:
             self._claimed = True
             return True
 
-    def release(self, *, unless_claimed: bool = False) -> str | None:
+    def release(
+        self, *, unless_claimed: bool = False, spared: Mapping[str, str] | None = None
+    ) -> str | None:
         """Drop the lock and remove the directory. Never raises. Returns ``None`` when no file there
         still holds plaintext, or a PHI-free sentence naming the directory when one might (see
         :func:`_discard_verify_staging`). The lock is dropped first because Windows will not delete a
-        file that is still open."""
+        file that is still open. ``spared`` maps files directly in the directory that the
+        teardown must neither unlink nor truncate to why, beside those a spare marker there
+        records (:func:`_spared_items`).
+
+        Where a spare in ``spared`` is unrecorded (:func:`_spare_records`), removing the
+        directory's ``.lock-held`` is tried again here, BEFORE the lock drops. What this read
+        found is handed to the teardown, which neither reads those spares again nor re-marks the
+        directory (BACKLOG #5617). The unlock and the teardown run whatever this does."""
         with self._mutex:
             if self._released or (unless_claimed and self._claimed):
                 return None
             self._released = True
-        _unlock_and_close(self._fd)
-        return _teardown_staging(self.path)
+        records: _SpareRecords | None = None
+        leftover: str | None = None
+        try:
+            try:
+                if spared:
+                    records = _spare_records(self.path, spared)
+            except Exception as exc:  # the unlock and the teardown must still run
+                log.error(
+                    "DR staging directory %s: could not check its spares before releasing it: %s",
+                    self.path,
+                    safe_exc(exc),
+                )
+        finally:
+            _unlock_and_close(self._fd)
+            # `spared` is passed only when set, so a stand-in for a seam keeps its one-argument
+            # shape.
+            leftover = (
+                _teardown_staging(self.path, spared=spared, records=records)
+                if spared
+                else _teardown_staging(self.path)
+            )
+        return leftover
 
 
-def _teardown_staging(path: Path) -> str | None:
+@dataclass(frozen=True)
+class _SpareRecords:
+    """What a release read of a restore's spares while it held the lock (:func:`_spare_records`):
+    the names whose marker is known not to record their reason, and the names whose marker could
+    not be read."""
+
+    unrecorded: tuple[str, ...]
+    unknown: tuple[str, ...]
+
+
+def _spare_records(path: Path, spared: Mapping[str, str]) -> _SpareRecords:
+    """Read which spares in ``spared``, still in ``path``, their markers record
+    (:func:`_spare_recorded`), and where one is known not to, try :func:`_withhold_from_sweep`.
+    The marker's reason, not its existence, since a relabel that failed leaves an older reason,
+    which a later sweep would read in place of this run's."""
+    unrecorded: list[str] = []
+    unknown: list[str] = []
+    for n, reason in sorted(spared.items()):
+        if not reason or not _still_there(path / n):
+            continue
+        recorded = _spare_recorded(path / n, reason)
+        if recorded is None:
+            unknown.append(n)
+        elif not recorded:
+            unrecorded.append(n)
+    if unrecorded:
+        _withhold_from_sweep(path)
+    return _SpareRecords(tuple(unrecorded), tuple(unknown))
+
+
+def _teardown_staging(
+    path: Path,
+    *,
+    spared: Mapping[str, str] | None = None,
+    records: _SpareRecords | None = None,
+) -> str | None:
     """:func:`_discard_verify_staging`, then, if the directory survived, put its lock file and marker
-    back so the next sweep can prove it abandoned. Never raises.
+    back so the next sweep can prove it abandoned. Never raises. A file a restore spares, in
+    ``spared`` or by a marker in the directory, is neither unlinked nor truncated
+    (:func:`_spared_items`).
+
+    A directory holding a spare this run could not record, or whose marker still reads another
+    reason, is never re-marked (BACKLOG #5617). ``records`` is what :meth:`_Staging.release` read
+    of the spares while it held the lock, when it also tried to withhold the directory; it is
+    taken as final, never read again. A spare whose marker could not be read then, every spare
+    when ``records`` is ``None``, is read once more here, after the lock dropped, and where it is
+    now known unrecorded the withholding is tried here too. Nothing here words what a sweep will
+    do: a failed withholding is logged at ERROR by :func:`_withhold_from_sweep`, and the notes
+    name each spared file and that it is to be deleted by hand.
 
     A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
     listing order and on NTFS the dot-names list first. Left like that, the directory would hold
@@ -2765,8 +3232,44 @@ def _teardown_staging(path: Path) -> str | None:
     if refusal is not None:
         log.error("DR staging: %s", refusal)
         return refusal
-    leftover = _discard_verify_staging(path)
-    if os.path.lexists(path):
+    # Read here, the one teardown every path runs (a release and the sweep alike), so no path can
+    # unlink or truncate a file a restore spared in an earlier run (BACKLOG #5617).
+    held = _spared_items(path, spared)
+    # A spare whose marker could not be written holds for this run alone; its restore tried to
+    # withhold the directory when the write failed (`_record_spare`), and again in `release` while
+    # it still held the lock.
+    unrecorded = list(records.unrecorded) if records else []
+    if spared and not unrecorded:
+        unread = records.unknown if records else tuple(n for n, r in spared.items() if r)
+        unrecorded = [
+            n
+            for n in unread
+            if spared.get(n)
+            and _still_there(path / n)
+            and _records_another_reason(path / n, spared[n])
+        ]
+        if unrecorded:
+            _withhold_from_sweep(path)
+    leftover: str | None
+    if held is None:
+        leftover = (
+            f"the plaintext staging directory {path} could not be listed, so it was left as it is; "
+            "delete it once nothing holds it open"
+        )
+    else:
+        leftover = (
+            _discard_verify_staging(path, spared=held) if held else _discard_verify_staging(path)
+        )
+    if not os.path.lexists(path):
+        return leftover
+    if unrecorded:
+        log.error(
+            "DR staging directory %s keeps %s, which a restore spared but could not record, so it "
+            "is not re-marked; each may hold decrypted data: delete it by hand",
+            path,
+            ", ".join(unrecorded),
+        )
+    else:
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
         # otherwise hold this thread in the open until a reader came, which may be never.
         flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
@@ -2928,7 +3431,13 @@ def _space_shortfall(needs: list[tuple[Path, int]]) -> str | None:
 
 
 class StagingNotPrivateError(OSError):
-    """A secured staging directory did not come out owner-only, so nothing was staged in it."""
+    """A secured staging directory did not come out owner-only, so nothing was staged in it.
+    ``path`` names it, and ``removed`` says whether it is gone again."""
+
+    def __init__(self, message: str, *, path: Path, removed: bool) -> None:
+        super().__init__(message)
+        self.path = path
+        self.removed = removed
 
 
 def _staging_is_private(path: Path) -> bool:
@@ -2985,7 +3494,9 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
             + ("" if removed else " (empty, could not be removed; delete it)")
             + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
             "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
-            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify"
+            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify",
+            path=path,
+            removed=removed,
         )
     try:
         fd = os.open(
@@ -3699,9 +4210,9 @@ def _verify_in_staging(
         )
     decrypted_cells = 0
     if full:
-        # The heavier end-to-end restore: open the snapshot through the real open_store path
-        # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
-        # discard it.
+        # The heavier end-to-end restore: decrypt + authenticate its PHI as archived, open the
+        # snapshot through the real open_store path (cipher + migrations) to prove it restores,
+        # then discard it.
         full_status, full_msg, decrypted_cells = _full_open_check(
             snap,
             _as_store_settings(store_settings),
@@ -3893,7 +4404,8 @@ def _full_open_check(
     engine_version: str = "",
     posture: HopPosture | None = None,
 ) -> tuple[str, str, int]:
-    """Open the snapshot through the real ``open_store`` path, then decrypt + authenticate its PHI.
+    """Decrypt + authenticate the snapshot's PHI as archived, open it through the real
+    ``open_store`` path, then decrypt + authenticate the opened, migrated copy's PHI.
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
 
@@ -3930,19 +4442,37 @@ def _full_open_check(
         # from one says nothing about an encrypted archive — which is the archive worth verifying.
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
+
+    def _walk() -> tuple[str, str, int]:
+        try:
+            return _decrypt_check(snap, snap_settings, posture=posture)
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+            # Its cipher build and its read-only connect are the open's own, so a failure there (a
+            # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
+            # read) is reported as the FAIL the open's handler gives the same failure. Before the
+            # open it is still behind an incompatible snapshot's verdict, so the open runs and the
+            # order below decides; after the open it is the verdict.
+            return "FAIL", safe_exc(exc), 0
+
+    # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
+    # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
+    # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
+    # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store. A second walk
+    # after the open reads the cells a migration adds or renames, which this one cannot see.
+    walked = _walk()
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
     # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
-    # so the decrypt pass below is unaffected. The copy is discarded afterwards either way.
-    import sqlite3
-
+    # so neither walk is affected. The copy is discarded afterwards either way.
     from messagefoundry.store.store import forget_store_salt
 
     try:
         forget_store_salt(snap)
     except sqlite3.Error as exc:
-        return "FAIL", safe_exc(exc), 0
+        # The walk's verdict, read before this, still leads (the order below).
+        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an
@@ -3961,20 +4491,33 @@ def _full_open_check(
         finally:
             await store.close()
 
+    # Verdict order: an incompatible snapshot first, since its cells may read wrongly only because
+    # this build reads them differently, and the remedy is the version that wrote it; then the
+    # walk's verdict, which read the archive before the open could change it; then the open's; then
+    # the second walk's, over the migrated copy.
     try:
         ok, msg = run_guarded(_open())
-    except StoreKeylessError as exc:
-        # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
-        # encrypted store, and they reach this before the decrypt pass below ever runs. Same cause,
-        # same verdict — an absent keyring, not a bad archive.
-        return "KEY_MISMATCH", safe_exc(exc), 0
     except SchemaMismatchError as exc:
         return "FAIL", _incompatible_snapshot(exc, engine_version), 0
+    except StoreKeylessError as exc:
+        # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
+        # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive — as
+        # before the walk ran first, whatever the walk found. Its text names the setting to fix, so
+        # it leads, and a walk that found anything keeps its line after it.
+        reason = safe_exc(exc) if walked[0] == "PASS" else f"{safe_exc(exc)}; {walked[1]}"
+        return "KEY_MISMATCH", reason, 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
-        return "FAIL", safe_exc(exc), 0
+        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+    if walked[0] != "PASS":
+        return walked
     if not ok:
         return "FAIL", msg, 0
-    return _decrypt_check(snap, snap_settings, posture=posture)
+    # The open ran the migrations on this copy, so this walk also reads a cell they add or rename.
+    # It decides a verdict only. Its count would include a value the open's own sweep sealed, which
+    # the archive did not hold sealed, so the count reported is the first walk's: the archive's
+    # cells that decrypted as it holds them.
+    status, reason, _rewalked_cells = _walk()
+    return status, reason, walked[2]
 
 
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
@@ -4000,8 +4543,7 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
     return safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive opened and passed its integrity and row-count checks; its"
-        f" cells were not decrypted. {tail}",
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks. {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
 
@@ -4038,9 +4580,14 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first. That agreement is this pass's: in a full verify the
-    store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
-    this pass reads anything.
+    decides it, whichever row comes first. A full verify runs this pass before the store's own
+    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads,
+    and again after it, over the migrated copy.
+
+    It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
+    the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the
+    store refuses it at read. Selecting by the marker alone never read such a value, which is where
+    a damaged marker lands. One on a surface no keyed open recorded is legacy plaintext, and passes.
     """
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
@@ -4052,7 +4599,24 @@ def _decrypt_check(
         mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
         if mismatch is not None:
             return "KEY_MISMATCH", mismatch, cells
-        for reading in read_cipher_cells(conn, cipher):
+        for reading in read_cipher_cells(conn, cipher, unmarked=True):
+            if reading.kind == "unmarked":
+                # A non-blank value with no marker on a surface the keyed store sealed: the store
+                # refuses it at read, so it is a damaged or stripped marker or a planted row, as
+                # `cipher-audit` reports it. Under the audited opt-out the store reads it as
+                # plaintext, and so does this. Only a keyed walk yields one.
+                if settings.allow_unmarked_ciphertext:
+                    continue
+                return (
+                    "FAIL",
+                    f"{reading.cell.table}.{reading.cell.column} {reading.where} carries no "
+                    "at-rest marker on a surface this keyed store has sealed, so the store "
+                    "refuses it at read: a damaged or stripped marker, or a planted row",
+                    cells,
+                )
+            if reading.kind == "legacy":
+                # Plaintext on a surface no keyed open recorded, which the next keyed open seals.
+                continue
             if reading.kind == "keyless":
                 # The #241 F2 keyless-open trap: the snapshot holds sealed text and these settings
                 # resolved no key for it. Nothing could have opened it, so the keyring is
@@ -4444,18 +5008,20 @@ def _restore_blocking(
     destination is removed on any exception after the store is placed, so a failed restore leaves the
     destination as it found it and the operator can simply run the command again — rather than meeting
     the never-overwrite refusal on the retry and having to delete a PHI-bearing file by hand. The
-    cleanup runs AFTER the staging directory is gone and removes only the paths this restore recorded
-    writing (:func:`_discard_partial_restore`), so it cannot reach the staging directory or anything
-    else that shares the destination's parent.
+    cleanup runs AFTER the staging directory's teardown and removes only the paths this restore
+    recorded writing (:func:`_discard_partial_restore`), so it cannot reach the staging directory, or
+    a leftover of it the teardown could not remove, or anything else that shares the destination's
+    parent.
 
     **A restore that is whole is never rolled back, whatever happens after it.** The one thing that
-    runs after the config bundle lands is the staging directory's own removal, and it can fail: on
-    Windows an antivirus scanner or the indexer holding the just-written store open makes that
-    ``rmtree`` raise ``PermissionError``. That is a leftover to report, not a restore to undo --
-    undoing it would delete a placed, verified store to answer a directory that could not be
-    deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
-    still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
-    store and bundle intact.
+    runs after the config bundle lands is the staging directory's own teardown (:meth:`_Staging.release`,
+    BACKLOG #5617), and its removal can fail: on Windows an antivirus scanner or the indexer holding
+    the just-written store open. The teardown then empties what it can in place and leaves the
+    directory marked for the next sweep. That is a leftover, not a restore to undo -- undoing it would
+    delete a placed, verified store to answer a directory that could not be deleted. Where a file in
+    it could not be emptied, as the extracted store hard-linked to the placed one cannot be, it raises
+    ``BackupError("cleanup", ...)`` naming the directory, with the store and bundle intact; where
+    every file was emptied, it returns the result and the teardown logs the empty leftover.
 
     **``dest_store_path`` is ``None`` only for a CONFIG-ONLY archive's bundle (vault BACKLOG #5233).**
     A server-DB store's archive carries no store, so ``--to`` has nothing to name, and the refusal that
@@ -4522,7 +5088,15 @@ def _restore_blocking(
 
     # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
     # parent, which would stage the decrypted archive inside the bundle's own directory.
-    staging_parent = anchor.parent if dest_store_path is not None else anchor.resolve().parent
+    # Absolute and normalized on the store route too: the sweep below tells this run's own
+    # directory from a dead run's by comparing the paths it lists under this root with the one
+    # `mkdtemp` returned, which `os.path.abspath` makes, so a relative `--to` or one holding `..`
+    # must read the same way.
+    staging_parent = (
+        Path(os.path.abspath(anchor)).parent
+        if dest_store_path is not None
+        else anchor.resolve().parent
+    )
     if dest_store_path is None and staging_parent == anchor.resolve():
         raise BackupError(
             "destination",
@@ -4540,31 +5114,34 @@ def _restore_blocking(
     # rather than `except` for the rollback: nothing is caught on its account, so no failure mode is
     # missed -- a cancelled or interrupted restore rolls back too.
     #
-    # `completed` flips on the LAST LINE INSIDE the staging block, not after the block closes, and
-    # the difference is the regression this ordering exists to prevent. What runs between the two is
-    # the staging directory's own teardown, and `TemporaryDirectory` raises when that fails. A flag
-    # set after the block read the failed teardown as a failed restore and rolled back a store that
-    # was placed, verified and published -- the one outcome worse than the leftover it was reporting.
-    # So the teardown failure is its own arm below: reported, never rolled back.
+    # `completed` flips on the LAST LINE INSIDE the staging block, before the staging directory is
+    # torn down. A flag set after the teardown would read a failed teardown as a failed restore and
+    # roll back a store that was placed, verified and published -- the one outcome worse than the
+    # leftover it was reporting. So a teardown that leaves the directory is reported, never rolled
+    # back.
     published = False
     completed = False
+    store_removed = False
+    rolled_back = False
+    # What the staging teardown must neither unlink nor truncate: the staged store, while it is
+    # or may become a name for the placed one (set just before the placement, and unset or given
+    # an empty reason, which unspares it, on every path that finds it no such name).
+    # A spare marker beside it records that for every later teardown and sweep too (BACKLOG #5617).
+    spared_item: Path | None = None
+    spared_reason = _SPARE_RESTORED
     config_written: list[Path] = []
-    staging: Path | None = None
     try:
-        # Inside the `try`, so a parent that cannot be made meets the `staging is None` refusal
-        # below, and the `finally` removes what the mkdir made before it failed.
-        staging_parent.mkdir(parents=True, exist_ok=True)
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
         # by a hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a
         # shared temp volume that may be less protected than the store's own.
         #
         # "Less protected than the store's own" is a claim about the VOLUME, and it does not carry to
-        # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
-        # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
-        # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
-        # decrypted archive and, on the store route, the whole extracted store. Both can be full-body
-        # PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
-        # store-carrying archive is decrypted whole before it is refused, and an archive can also
+        # the files. `_open_staging` refuses a directory that did not come out owner-only: `mkdtemp`
+        # restricts it on POSIX, and on Windows under Python 3.13+ writes its own protected DACL
+        # (SYSTEM, Administrators, OWNER RIGHTS -- measured on 3.14.6) rather than inheriting the
+        # parent's. The files staged inside it are the whole decrypted archive and, on the store
+        # route, the whole extracted store. Both can be full-body PHI at rest (docs/PHI.md section
+        # 3), the archive on the config-only route too when a store-carrying archive is decrypted whole before it is refused, and an archive can also
         # carry a config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
@@ -4573,8 +5150,35 @@ def _restore_blocking(
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
         # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
         # published DACL. A follow-up recorded in ADR 0163.
-        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=staging_parent) as tmp:
-            staging = Path(tmp)
+        #
+        # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
+        # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner
+        # holding the extracted store open) and left the whole decrypted archive behind, with no
+        # later run that would ever remove it. `release` never raises; a directory it cannot remove
+        # has its files emptied where they can be, keeps its lock file and marker, and the next
+        # restore, backup or verify that sweeps this directory removes it. `_open_staging` makes
+        # `staging_parent`, inside the `try`, so the `finally` removes what that made before it
+        # failed.
+        try:
+            work = _open_staging(staging_parent, _RESTORE_STAGING_PREFIX, secure=True)
+        except StagingNotPrivateError as exc:
+            # Its own words, not `_open_staging`'s: that text names the backup's and verify's
+            # settings, none of which moves a restore's staging directory.
+            left = "" if exc.removed else " (empty, could not be removed; delete it)"
+            raise BackupError(
+                "destination",
+                f"the restore's staging directory {exc.path} did not come out owner-only{left}, "
+                "so nothing was decrypted there. Choose a --to or --config-to on a volume that "
+                "keeps a directory's mode or ACL",
+            ) from exc
+        except OSError as exc:
+            # The staging directory itself could not be made (an unwritable parent, say), so
+            # nothing was decrypted or written: a refusal line, not a traceback.
+            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
+        staging = work.path
+        try:
+            # Before the decrypt, so a dead run's plaintext is gone before this one needs the space.
+            _sweep_abandoned_staging(staging_parent, owner=work.owner(), own=staging)
             tar_path = staging / "archive.tar"
             with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as tar_fh:
                 src = _HashingReader(raw_src)
@@ -4722,7 +5326,7 @@ def _restore_blocking(
                 # forged archive from exhausting the staging dir (ASVS 5.2.3). `secure` locks the
                 # extracted store to its owner before the first byte lands (see the block comment
                 # above the staging directory).
-                snap = _extract_member(tar_path, _STORE_MEMBER, Path(tmp), secure=True)
+                snap = _extract_member(tar_path, _STORE_MEMBER, staging, secure=True)
             except tarfile.TarError as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
             if snap is None:
@@ -4777,8 +5381,34 @@ def _restore_blocking(
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
             # `published` flips only once the store at `dest_store_path` is one THIS call made.
+            # The staged store is marked spared just BEFORE the placement's link can make it a
+            # second name for the restored store, so no crash point leaves that name unmarked for a
+            # later sweep's fail-safe, and unspared before a copy placement, which makes it no
+            # such name (BACKLOG #5617). A marker that cannot be written, or removed before a copy,
+            # refuses the placement while nothing is placed yet. `published` flips the moment the
+            # link or the copy lands, so a placement that raises after that is rolled back like any
+            # later failure, and the staged store stays spared while it is a name for that file.
+
+            def _placed() -> None:
+                nonlocal published
+                published = True
+
+            spared_item = snap
             try:
-                store_bytes = _place_restored_store(snap, dest_store_path)
+                try:
+                    store_bytes, linked = _place_restored_store(
+                        snap,
+                        dest_store_path,
+                        before_link=lambda: _spare_before_link(snap),
+                        before_copy=lambda: _unspare_before_copy(snap),
+                        on_placed=_placed,
+                    )
+                except BaseException:
+                    if not (
+                        _still_there(dest_store_path) and _names_same_file(snap, dest_store_path)
+                    ):
+                        spared_item, spared_reason = _unspare(snap)
+                    raise
             except FileExistsError as exc:
                 raise BackupError(
                     "destination", _OVERWRITE_REFUSAL.format(path=dest_store_path)
@@ -4786,6 +5416,28 @@ def _restore_blocking(
             except OSError as exc:
                 raise BackupError("destination", safe_exc(exc)) from exc
             published = True
+            if not linked:
+                spared_item = None  # its marker went before the copy (`_unspare_before_copy`)
+            # The staged name goes at once: placed by a hard link, it is a second name for the
+            # restored store, and the teardown's fail-safe must never be handed it. It refuses a
+            # file with two links, but a volume that hard-links and reports one link would have
+            # it truncate the restored store itself. Placed by a copy, it is a second plaintext
+            # copy with no further use. Where the unlink is refused (a scanner holding it) after a
+            # link placement, it stays spared, by the marker written above, which every later
+            # teardown and sweep reads as well as this run's, rather than left to the link count
+            # or to a same-file test that volume could answer wrongly.
+            try:
+                snap.unlink()
+            except OSError as exc:
+                log.warning(
+                    "could not remove the staged copy %s of the placed store: %s",
+                    snap,
+                    safe_exc(exc),
+                )
+            else:
+                # The name is gone, so its marker spares nothing even where it will not clear.
+                _clear_spare_marker(snap, level=logging.WARNING)
+                spared_item = None
 
             # The config bundle is written AFTER the store, and every way it can fail used to leave
             # the store published anyway: a refused member name, a cap, a collision, an archive with
@@ -4800,53 +5452,128 @@ def _restore_blocking(
                 )
             # The restore is whole from here. Nothing after this line may roll it back.
             completed = True
-    except OSError as exc:
-        if staging is None:
-            # The staging directory itself could not be made (an unwritable parent, say), so
-            # nothing was decrypted or written: a refusal line, not a traceback.
-            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
-        if not completed:
-            # A refusal already leaving the block, found anywhere in the chain: an OSError raised
-            # on its way out (the staging teardown, whose rmtree retry chains its own first
-            # failure, or a close-time flush) would otherwise replace it with a traceback.
-            refusal = _refusal_in_flight(exc)
-            if refusal is None:
-                # No refusal behind it: the OSError is the failure itself, such as a full volume
-                # mid-decrypt. A refusal line rather than a traceback, on both routes; the
+        except BaseException as exc:
+            if published and dest_store_path is not None:
+                # The placed store goes before the teardown, not with the rest of the rollback
+                # after it: hard-linked to the staged one, it keeps that file at two links, which
+                # the teardown's fail-safe never truncates, and the rollback would then leave the
+                # staged name as the one full copy. Once this unlink succeeds the rollback must not
+                # unlink that path again: through the teardown it is free, and a file there by the
+                # time the rollback runs is another restore's, which won the exclusive create.
+                try:
+                    dest_store_path.unlink(missing_ok=True)
+                    store_removed = True
+                except OSError as unlink_exc:
+                    log.warning(
+                        "could not remove the partially restored store at %s: %s",
+                        dest_store_path,
+                        safe_exc(unlink_exc),
+                    )
+            if spared_item is None or not spared_reason:
+                pass  # nothing spared, or already unspared above
+            elif store_removed:
+                # Once the placed store is gone the staged copy is the only one, so it is unspared,
+                # on disk too, and the teardown removes or empties it on its own retry schedule. A
+                # marker that will not say so is overridden for this run by an empty reason.
+                spared_item, spared_reason = _unspare(spared_item)
+            elif _drop_staged_name(spared_item):
+                spared_item = None
+            elif not published:
+                # The placement raised before its link or copy landed, and whether the staged name
+                # is a name for the file at --to, which is not this restore's, could not be told:
+                # it stays spared as it is, under the reason already written.
+                pass
+            else:
+                # The rollback could not remove the placed store, so the staged name stays a name
+                # for it, and once the operator deletes that store it is the only decrypted copy.
+                # Relabelled where the write lands, and reported; a sweep spares it only while its
+                # marker reads anything but `released`. The refusal below names it through the
+                # teardown's leftover.
+                spared_reason = _SPARE_ROLLBACK_FAILED
+                _record_spare(spared_item, spared_reason)
+                log.error(
+                    "the failed restore's rollback could not remove the placed store at %s, so "
+                    "the staged copy %s, a second name for it, is kept unemptied; it still holds "
+                    "the decrypted store once that store is deleted: delete both by hand",
+                    dest_store_path,
+                    spared_item,
+                )
+            leftover = work.release(spared=_spare_of(spared_item, spared_reason))
+            # The rest of the rollback runs here, after the teardown and before the refusal is
+            # worded, so the refusal states what the rollback left rather than what it might.
+            left_at_dest = False
+            if published:
+                rolled_back = True
+                left_at_dest = _finish_rollback(
+                    dest_store_path, store_removed, config_written, spared_item, spared_reason
+                )
+            if left_at_dest:
+                kept = (
+                    f"the partially restored store at {dest_store_path} could not be removed: "
+                    "delete it by hand, or a retry refuses to overwrite it"
+                )
+                leftover = kept if leftover is None else f"{leftover}. Separately, {kept}"
+            refusal: BaseException = exc
+            if isinstance(exc, OSError):
+                # A refusal already leaving a `with` block, found in the chain: an OSError raised on
+                # its way out (a close-time flush on a full volume) would otherwise replace it.
+                # With no refusal behind it the OSError is the failure itself, such as a full
+                # volume mid-decrypt: a refusal line rather than a traceback, on both routes; the
                 # `finally` still rolls back what was published.
-                raise BackupError("restore", f"the restore failed: {safe_exc(exc)}") from exc
-            if not staging.exists():
-                raise refusal from exc
-            # The teardown failed, and the directory holds decrypted archive content.
-            raise BackupError(
-                refusal.kind,
-                f"{str(refusal).rstrip('.')}. Separately, the restore's own staging directory "
-                f"{staging}, beside the destination, could not be removed ({safe_exc(exc)}) and "
-                "still holds decrypted archive content: delete it by hand once nothing holds it "
-                "open",
-            ) from refusal
-        # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
-        # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
-        # open). The store and bundle are intact; what is left is the plaintext staging directory,
-        # which its own remover just failed to delete. A BackupError, so the CLI prints a refusal
-        # line rather than a traceback, and a kind of its own, so the line does not read as the
-        # restore having failed. The `finally` below sees `completed` and leaves the restore alone.
-        intact: list[str] = []
-        if dest_store_path is not None:
-            intact.append(f"the restored store at {dest_store_path}")
-        if config_dest is not None:
-            intact.append(f"the config bundle at {config_dest}")
-        held = "archive and store" if dest_store_path is not None else "archive"
-        raise BackupError(
-            "cleanup",
-            f"the restore completed, but its staging directory {staging} could not be removed: "
-            f"{safe_exc(exc)}. Intact: {', and '.join(intact)}. The staging "
-            f"directory still holds the decrypted {held}: delete it by hand once nothing "
-            "holds it open. Do not re-run the restore; the destination is now in use.",
-        ) from exc
+                refusal = _refusal_in_flight(exc) or BackupError(
+                    "restore", f"the restore failed: {safe_exc(exc)}"
+                )
+            if leftover is not None:
+                if isinstance(refusal, BackupError):
+                    joined = join_before_checks(
+                        str(refusal).rstrip("."), ". Separately, ", leftover
+                    )
+                    if not _split_checks(joined)[1]:
+                        # A sentence the CLI can append its own remedy to, such as the age hint.
+                        joined = f"{joined.rstrip('.')}."
+                    refusal = BackupError(refusal.kind, joined)
+                else:
+                    exc.add_note(leftover)
+            if refusal is exc:
+                raise
+            raise refusal from exc
+        finally:
+            # A `finally` rather than an `else`, because the config-only route returns from inside
+            # the `try`. On the exception path `release` already ran above and this returns None,
+            # so only a restore that completed reaches the refusal below. The store and bundle are
+            # intact; what is left is the staging directory, which its own remover could not
+            # delete. A BackupError, so the CLI prints a refusal line rather than a traceback, and a
+            # kind of its own, so the line does not read as the restore having failed. The outer
+            # `finally` sees `completed` and leaves the restore alone.
+            # The release runs in a `finally` of its own: an interrupt during the retry's sleeps
+            # must not skip it, and an unfinished retry leaves the name spared.
+            try:
+                if completed and spared_item is not None and _drop_staged_name(spared_item):
+                    spared_item = None
+            finally:
+                leftover = work.release(spared=_spare_of(spared_item, spared_reason))
+            if leftover is not None:
+                intact: list[str] = []
+                if dest_store_path is not None:
+                    intact.append(f"the restored store at {dest_store_path}")
+                if config_dest is not None:
+                    intact.append(f"the config bundle at {config_dest}")
+                raise BackupError(
+                    "cleanup",
+                    join_before_checks(
+                        f"the restore completed, but {leftover}",
+                        ". ",
+                        f"Intact: {', and '.join(intact)}. Do not re-run the restore; the "
+                        "destination is now in use.",
+                    ),
+                )
     finally:
-        if published and not completed:
-            _discard_partial_restore(dest_store_path, config_written)
+        if published and not completed and not rolled_back:
+            # Only where the staging block's own handler did not reach its rollback.
+            rolled_back = True
+            _finish_rollback(
+                dest_store_path, store_removed, config_written, spared_item, spared_reason
+            )
         if not completed:
             # After the staging directory's own teardown and the rollback, so each is empty again.
             _remove_made_dirs(made_dirs)
@@ -5024,6 +5751,121 @@ _CONTRADICTORY_ARCHIVE_REFUSAL = (
     f"the archive is malformed: its manifest marks it CONFIG-ONLY, yet it carries a {_STORE_MEMBER} "
     "member; refusing to restore it on either route"
 )
+
+
+def _spare_of(item: Path | None, reason: str) -> dict[str, str]:
+    return {} if item is None else {item.name: reason}
+
+
+def _unspare(item: Path) -> tuple[Path | None, str]:
+    """What a restore holds for its teardown once its staged store is spared no longer: nothing
+    where :func:`_release_spare_marker` put that on disk, and otherwise the name with an empty
+    reason, which unspares it for this run's teardown at least."""
+    return (None if _release_spare_marker(item) else item), ""
+
+
+def _spare_before_link(item: Path) -> None:
+    """Mark a restore's staged store spared before the placement's link, or refuse the placement
+    while nothing is placed: a link with no marker beside it could, through a crash, leave a
+    later sweep's fail-safe a second name for the restored store (BACKLOG #5617)."""
+    if not _write_spare_marker(item, _SPARE_RESTORED):
+        raise BackupError(
+            "destination",
+            f"could not record, in {item.parent}, that the staged store must not be removed once "
+            "the restored store is placed, so nothing was placed",
+        )
+
+
+def _unspare_before_copy(item: Path) -> None:
+    """Unspare a restore's staged store before a copy placement, which makes it no name for the
+    placed store, or refuse the placement while nothing is placed: a marker left beside it through
+    a crash mid-copy would keep the whole decrypted store from every later sweep."""
+    if not _release_spare_marker(item):
+        raise BackupError(
+            "destination",
+            f"could not remove, in {item.parent}, the record that the staged store must not be "
+            "removed before copying it into place, so nothing was placed",
+        )
+
+
+def _names_same_file(item: Path, other: Path) -> bool:
+    """Whether ``item`` and ``other`` name one file. ``True``, logged, when that is not known: for
+    a spare, the safe answer."""
+    try:
+        return os.path.samefile(item, other)
+    except OSError as exc:
+        log.warning(
+            "could not tell whether %s is a name for %s, so it is kept as one: %s",
+            item,
+            other,
+            safe_exc(exc),
+        )
+        return True
+
+
+def _drop_staged_name(item: Path) -> bool:
+    """Retry the unlink of a restore's staged store, refused once after placement, on the staging
+    teardown's schedule, and remove its spare marker once the name is gone. ``True`` when it is.
+    Unlinking a name never empties the store the name shares, whatever the link count reads; the
+    teardown is not trusted with the name, because its fail-safe truncates (BACKLOG #5617)."""
+    refused: OSError | None = None
+    for delay in (0.0, *_STAGING_REMOVE_DELAYS):
+        time.sleep(delay)
+        try:
+            item.unlink(missing_ok=True)
+        except OSError as exc:
+            refused = exc
+            continue
+        # The name is gone, so its marker spares nothing even where it will not clear.
+        _clear_spare_marker(item, level=logging.WARNING)
+        return True
+    log.warning(
+        "the staged copy %s of the placed store still could not be removed: %s",
+        item,
+        safe_exc(cast(OSError, refused)),  # the loop runs at least once, and each miss sets it
+    )
+    return False
+
+
+def _finish_rollback(
+    dest_store_path: Path | None,
+    store_removed: bool,
+    written: list[Path],
+    spared_item: Path | None,
+    spared_reason: str,
+) -> bool:
+    """The rest of a failed :func:`_restore_blocking`'s rollback, run once after its staging
+    teardown: :func:`_discard_partial_restore`, never on a placed store the rollback already
+    removed, then the staged name a late removal of that store leaves as the only decrypted copy.
+    Returns whether the store this restore placed is still at ``dest_store_path``."""
+    _discard_partial_restore(None if store_removed else dest_store_path, written)
+    left = dest_store_path is not None and not store_removed and _still_there(dest_store_path)
+    # Where this second attempt removed the placed store after the teardown had spared the staged
+    # name, that name is now the only decrypted copy of it. The rollback finishes the job where it
+    # can, and otherwise relabels and reports it.
+    if spared_item is None or not spared_reason or dest_store_path is None or store_removed or left:
+        return left
+    if _drop_staged_name(spared_item):
+        log.warning(
+            "the failed restore's rollback removed the placed store at %s and its staged copy %s "
+            "on a later attempt: neither is left to delete by hand",
+            dest_store_path,
+            spared_item,
+        )
+        return left
+    # A marker that kept its older reason would mislabel the copy as a name for a store that is
+    # gone, so where the relabel fails, removing the directory's `.lock-held` is tried instead
+    # (`_record_spare`).
+    relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
+    log.error(
+        "the failed restore's rollback removed the placed store at %s only after its staging "
+        "teardown, so the staged copy %s is the only decrypted copy of it, kept unemptied%s: "
+        "delete it by hand",
+        dest_store_path,
+        spared_item,
+        "" if relabelled else ", and its marker could not be relabelled",
+    )
+    return left
 
 
 def _discard_partial_restore(dest_store_path: Path | None, written: list[Path]) -> None:
@@ -5312,26 +6154,48 @@ def _is_within(root: Path, path: Path) -> bool:
     return _norm_for_compare(path).is_relative_to(_norm_for_compare(root))
 
 
-def _place_restored_store(src: Path, dest: Path) -> int:
-    """Put the verified ``store.db`` at ``dest`` without ever overwriting, and return its size.
+def _place_restored_store(
+    src: Path,
+    dest: Path,
+    *,
+    before_link: Callable[[], object] | None = None,
+    before_copy: Callable[[], object] | None = None,
+    on_placed: Callable[[], object] | None = None,
+) -> tuple[int, bool]:
+    """Put the verified ``store.db`` at ``dest`` without ever overwriting, and return its size and
+    whether it was placed by a link, so that ``src`` is a second name for it.
 
     A hard link first: ``src`` was staged on the destination's own volume, so this costs nothing where
     a multi-GB copy would, and ``os.link`` raises ``FileExistsError`` on a collision — closing the
     check-then-write race that a concurrent creator could otherwise slip through. Where links are
     unavailable (FAT, some SMB shares) the fallback is an EXCLUSIVE-create copy, which has the same
     never-overwrite property. Either way the restored file is a full copy of the PHI-bearing store, so
-    it is locked down the way ``Store.snapshot_to`` locks its own output down."""
+    it is locked down the way ``Store.snapshot_to`` locks its own output down.
+
+    ``before_link`` runs just before the link, and may raise to refuse the placement;
+    ``before_copy`` just before the copy fallback. The restore marks and unmarks ``src`` spared
+    with them (BACKLOG #5617). ``on_placed`` runs once the link or the copy has made ``dest`` this
+    call's own file, and also when a failed copy's partial file at ``dest`` cannot be removed. Once
+    it has returned, the caller owns the rollback of ``dest``, and a failure after that leaves
+    ``dest`` for it, so ``dest`` is not unlinked by both. Until then, a failure after the placement
+    removes ``dest`` here, logged where that removal fails."""
     # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
     # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
     # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
     from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
     size = src.stat().st_size
+    if before_link is not None:
+        before_link()
+    linked = False
     try:
         os.link(src, dest)
+        linked = True
     except FileExistsError:
         raise
     except OSError:
+        if before_copy is not None:
+            before_copy()
         # The exclusive create sits OUTSIDE the cleanup guard on purpose: a lost create race raises
         # FileExistsError here, and the file then at ``dest`` belongs to the winner — deleting it would
         # turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -5350,9 +6214,36 @@ def _place_restored_store(src: Path, dest: Path) -> int:
             # ``except``, so nothing is caught and no failure mode is missed. It runs after ``with out``
             # has closed the handle, which Windows requires before an unlink.
             if not placed:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Logged, never raised: it would replace the copy's own failure. The truncated
+                    # file is this call's, so a caller that owns rollbacks is handed it to retry.
+                    log.error(
+                        "could not remove the partial copy of the store at %s, a truncated store "
+                        "a retry refuses to overwrite: %s",
+                        dest,
+                        safe_exc(exc),
+                    )
+                    if on_placed is not None:
+                        on_placed()
+    owned = False
+    try:
+        if on_placed is not None:
+            on_placed()
+            owned = True
+        _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
+    except BaseException:
+        # Best-effort and non-raising by contract, so this is an interrupt: the file at ``dest``
+        # is this call's, and goes, as a copy that dies mid-stream does above, unless the caller
+        # has taken over its rollback, which it has only once ``on_placed`` returned.
+        if not owned:
+            try:
                 dest.unlink(missing_ok=True)
-    _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
-    return size
+            except OSError as exc:
+                log.error("could not remove the store just placed at %s: %s", dest, safe_exc(exc))
+        raise
+    return size, linked
 
 
 def _restore_config_members(

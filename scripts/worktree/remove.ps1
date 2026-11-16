@@ -14,25 +14,24 @@
 
       -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the checkout THIS
                   COPY lives in. Unchanged by the routes below. It can also delete the branch.
-      -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees: a
+      -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees (a
+                  segment above the primary does not count, as the list below says): a
                   harness scratchpad, a hand-made directory, a sibling. This is the CHECKED route, and
                   it is the one the worktree gate's rule 3d names (vault BACKLOG #1017). It removes
                   the directory and never the branch: it does not take -DeleteBranch.
       -List       Read-only. Every registered linked worktree, its class, and which route reaches it.
 
     WHAT -Path REFUSES, WHATEVER -Force SAYS:
-      * any run with GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE set, since each makes
-        `git -C <path>` answer for a different checkout;
       * a path component ending in a dot or a space, which Windows drops, so it names another directory;
       * anything that is not a registered linked worktree of this clone, compared on its full path as
         git records it. The primary, another repository's worktree, a plain directory, and a junction,
         subst or 8.3 spelling of a real target are all refused;
-      * the target you are standing in, and a target that holds the copy of this script being run;
       * a target under a .claude/worktrees path segment. That is where the Claude Code harness puts
         its worktrees, and a subagent started with `isolation: worktree` is recorded under its
         PARENT's directory, so the occupancy check below would read its tree as empty (BACKLOG
         #1038, Manager decision batch 184). A sibling new.ps1 made beside a linked worktree also
-        sits there; the copy of this script in that worktree still removes it by -Name;
+        sits there; the copy of this script in that worktree still removes it by -Name. A segment
+        ABOVE the primary checkout does not count, so a clone that lives below one is reachable;
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
       * a target git has locked, which is git's own in-use flag;
@@ -41,20 +40,31 @@
         holds. The removal deletes that reflog and those refs, so nothing would reach the commits;
       * a target the session registry records a session in, or any target at all when the registry
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
-        registry that was read and holds no record at all clears the target. This fence sees only
-        the directory a session was launched in, never where it writes, so on its own it is blind
-        to a subagent's tree. The refusals in the next list are the signals that are not;
+        registry that was read and holds no record at all clears the target. The registry is every
+        %USERPROFILE%\.claude* config root, and the caller's CLAUDE_CONFIG_DIR when it names another;
+        a session on any other root is not seen. A CLAUDE_CONFIG_DIR holding a backtick, [, ], * or
+        ? refuses, and so does a second listing of the registry that counts a different number of
+        roots than the registry's own read, or, when that read is available, of records. A record
+        whose process still runs counts unless that process started more than a minute after the
+        record's startedAt. This fence sees only the directory a session was launched in, never
+        where it writes, so on its own it is blind to a subagent's tree. The refusals in the next
+        list are the signals that are not;
       * every refusal in the next list, which -Name shares.
 
     WHAT BOTH REMOVAL ROUTES REFUSE, WHATEVER -Force SAYS (-Name since vault BACKLOG #2988):
+      * any run with GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE set, since each makes
+        `git -C <path>` answer for a different checkout. -List refuses it too. -Name since BACKLOG
+        #5648; before that it refused only under -Discard;
+      * the target you are standing in, and a target that holds the copy of this script being run
+        (-Name since BACKLOG #5648);
       * a target that still holds a work claim (claim.ps1), or any target when a claim file cannot
         be read, parses to something other than one record, or names no worktree. The registry is
         found the way claim.ps1 finds it, mefor.claimsRoot included;
       * a target whose own git directory was written to in the last six hours: a commit, a checkout,
         a merge or a fetch. Nothing here can tell whether what did that has finished;
       * a target whose working tree was written to in the last six hours: its top directory, any
-        entry directly under it, or anything in .pytest_cache or .ruff_cache. A worker that only
-        reads files and runs tests leaves no git trace, but a FINISHED test run rewrites
+        entry directly under it, or anything in .pytest_cache, .ruff_cache or .mypy_cache. A worker
+        that only reads files and runs tests leaves no git trace, but a FINISHED test run rewrites
         .pytest_cache (vault BACKLOG #2985, part B item 1). A run still in progress has written
         nothing there yet, so this does not see one;
       * a target holding uncommitted work written in the last six hours, at any depth (vault BACKLOG
@@ -130,9 +140,14 @@
     is seen only if it left the tree dirty, or wrote where the activity signal below reads.
 
     -Name KEEPS ITS OLD RULES OTHERWISE. Of the -Path-only refusals it shares only the detached HEAD
-    one: tracked changes refuse without -Force, untracked files older than six hours and ignored
-    files other than the repositories named above go with the worktree, there is no occupancy check, and it runs `git worktree prune` afterwards. -Path runs no blanket prune,
-    because that also drops OTHER worktrees' registrations.
+    one: tracked changes refuse without -Force, and so do files flagged skip-worktree or
+    assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
+    run names the flagged files it lets go. Untracked files older than six hours and ignored
+    files other than the repositories named above go with the worktree, and there is no occupancy
+    check. NEITHER ROUTE RUNS A BLANKET `git worktree prune` (-Name ran one until BACKLOG #5648 and
+    #7619): `git worktree remove` already drops the target's own registration, and a prune also drops
+    OTHER worktrees' registrations whose directories are missing for the moment, with their HEAD
+    reflogs.
 
     NEITHER ROUTE RELEASES A CLAIM. The work has to land, or the claim be released with
     claim.ps1 -Release, which records the release in the claims .history file, first. Both routes
@@ -231,20 +246,20 @@ if ($PSCmdlet.ParameterSetName -eq 'ByName' -and -not $Name) {
 $byPath = $PSCmdlet.ParameterSetName -eq 'ByPath'
 $listing = $PSCmdlet.ParameterSetName -eq 'List'
 
-if ($byPath -or $listing -or $Discard) {
-    # Refused rather than cleared: a script run as `.\remove.ps1` shares the caller's process, so
-    # clearing them would change the operator's shell. Each one makes `git -C <path>` answer for a
-    # checkout other than the one named. -Discard sets GIT_INDEX_FILE for its snapshot and removes it
-    # after, so a caller's own value would be lost; it refuses on -Name too.
-    # -Discard also writes objects, so a redirected object store would park its commit where the
-    # clone's own refs/attic cannot reach it.
-    $redirectNames = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
-    if ($Discard) { $redirectNames += @('GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES') }
-    $gitRedirects = $redirectNames | Where-Object { [Environment]::GetEnvironmentVariable($_) }
-    if ($gitRedirects) {
-        throw ("$($gitRedirects -join ', ') is set, so git would answer for a different checkout than " +
-            "the one named. Unset it and re-run. Nothing was removed.")
-    }
+# ON EVERY ROUTE (-Name since BACKLOG #5648, which used to check these only under -Discard). Refused
+# rather than cleared: a script run as `.\remove.ps1` shares the caller's process, so clearing them
+# would change the operator's shell. Each one makes `git -C <path>` answer for a checkout other than
+# the one named, so every status, ref and claim read below would describe the wrong tree, and the
+# force-removal would act on what those reads cleared. -Discard sets GIT_INDEX_FILE for its snapshot
+# and removes it after, so a caller's own value would be lost.
+# -Discard also writes objects, so a redirected object store would park its commit where the clone's
+# own refs/attic cannot reach it.
+$redirectNames = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
+if ($Discard) { $redirectNames += @('GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES') }
+$gitRedirects = $redirectNames | Where-Object { [Environment]::GetEnvironmentVariable($_) }
+if ($gitRedirects) {
+    throw ("$($gitRedirects -join ', ') is set, so git would answer for a different checkout than " +
+        "the one named. Unset it and re-run. Nothing was removed.")
 }
 
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
@@ -260,10 +275,41 @@ $RepoName = Split-Path $RepoRoot -Leaf
 $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '--exclude=refs/bisect/*',
     '--exclude=refs/rewritten/*', '--exclude=refs/original/*')
 
-# A path with a .claude/worktrees segment ANYWHERE in it, on a ConvertTo-Norm value. prune-merged.ps1
-# excludes this population too, for the same reason; its own test needs a trailing slash and is asked
-# only of the primary's siblings, so the two are not the same expression. This one is the wider.
-$managedSegment = '/\.claude/worktrees(/|\z)'
+# Whether a path is under a .claude/worktrees segment, other than one that lies ABOVE the primary
+# checkout. prune-merged.ps1 and the worktree gate exclude this population too, for the same reason,
+# but count a segment anywhere, so for a clone below one they exclude more than this does.
+# A segment above the primary does not count (vault BACKLOG #2985, item 3): a clone made inside
+# another checkout's .claude/worktrees would otherwise have every one of its trees refused. At least
+# the harness and new.ps1 -Nested put their trees under the MAIN worktree's .claude/worktrees (the
+# "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1). Every other segment
+# counts, including one under a directory git does not list, so this fails closed.
+# ORDINAL, because the exemption ALLOWS: the culture comparison ignores a zero-width character or a
+# soft hyphen, so a primary differing by one from the segment's spelling would read as below it. The
+# path is normalised here, so a caller's spelling and case cannot skip the match.
+function Test-UnderManagedSegment([string]$Path) {
+    $Norm = ConvertTo-Norm $Path
+    $primaryNorm = ConvertTo-Norm $PrimaryRoot
+    foreach ($m in [regex]::Matches($Norm, '/\.claude/worktrees(?=/|\z)')) {
+        $above = $Norm.Substring(0, $m.Index + $m.Length) + '/'
+        if (-not $primaryNorm.StartsWith($above, [System.StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+# The caller's cwd, or the copy of this script being run, inside the target. On both routes (-Name
+# since BACKLOG #5648). Standing in it, git's own removal fails part-way, after it has deleted what it
+# could; the copy being run would be deleted part-way through its own run. -Force overrides neither.
+function Assert-NotInsideTarget([string]$Target, [string]$Remedy) {
+    $there = ConvertTo-Norm $Target
+    $here = ConvertTo-Norm $PWD.ProviderPath
+    if ($here -eq $there -or $here.StartsWith("$there/")) {
+        throw "You are standing inside '$Target'. Run this from another checkout. Nothing was removed."
+    }
+    $scriptDir = ConvertTo-Norm $PSScriptRoot
+    if ($scriptDir -eq $there -or $scriptDir.StartsWith("$there/")) {
+        throw "This copy of remove.ps1 lives inside '$Target'. $Remedy Nothing was removed."
+    }
+}
 
 $PrimaryRoot = ''
 $registered = @()
@@ -310,7 +356,7 @@ if ($listing) {
             $rest = (Split-Path $w.Path -Leaf).Substring($RepoName.Length + 1)
             if ($namePattern -and $rest -match $namePattern) { $leafName = $rest }
         }
-        $isManaged = $norm -match $managedSegment
+        $isManaged = Test-UnderManagedSegment $norm
         $class = if ($leafName) { 'sibling' } elseif ($isManaged) { 'managed' } else { 'other' }
         $counts[$class]++
         $routes = @()
@@ -330,7 +376,7 @@ if ($listing) {
     Write-Host "Columns: class, route(s), -Name argument ('-' for none), branch, path."
     Write-Host ("sibling {0}, managed {1}, other {2}. -Name reaches {3} of {4} and -Path reaches {5}." -f
         $counts.sibling, $counts.managed, $counts.other, $counts.sibling, $linked.Count, $byPathCount)
-    Write-Host ("A 'managed' row is under .claude/worktrees. -Path never removes one; the header of this " +
+    Write-Host ("A 'managed' row is under .claude/worktrees, not counting a segment above the primary. -Path never removes one; the header of this " +
         "script says why.")
     return
 }
@@ -359,24 +405,13 @@ if ($byPath) {
         throw "Not a registered worktree. Nothing was removed."
     }
     $entry = $entry[0]
-
-    $here = ConvertTo-Norm $PWD.ProviderPath
-    if ($here -eq $there -or $here.StartsWith("$there/")) {
-        throw "You are standing inside '$WorktreePath'. Run this from another checkout. Nothing was removed."
-    }
-    # The copy being run would be deleted part-way through its own run. The gate names the PRIMARY's
-    # copy for this reason.
-    $scriptDir = ConvertTo-Norm $PSScriptRoot
-    if ($scriptDir -eq $there -or $scriptDir.StartsWith("$there/")) {
-        throw ("This copy of remove.ps1 lives inside '$WorktreePath'. Run the copy in the primary " +
-            "checkout ($PrimaryRoot). Nothing was removed.")
-    }
+    Assert-NotInsideTarget $WorktreePath "Run the copy in the primary checkout ($PrimaryRoot)."
 
     # NOT REACHED, ON PURPOSE (BACKLOG #1038, Manager decision batch 184). The occupancy fence below
     # reads the directory a session was LAUNCHED in. A subagent under `isolation: worktree` is
     # recorded under its parent's directory (measured: 0 occupants for a live subagent's tree), and
     # its tree is one of these. A fence that fails open on a population is worse than no route to it.
-    if ($there -match $managedSegment) {
+    if (Test-UnderManagedSegment $there) {
         Write-Host "REFUSED: '$WorktreePath' is under .claude/worktrees, where the Claude Code harness puts its worktrees." -ForegroundColor Red
         Write-Host ("-Path never removes one: a subagent's tree there is recorded under its parent's directory, " +
             "so the occupancy check would read it as empty.") -ForegroundColor Red
@@ -404,6 +439,7 @@ if ($byPath) {
 else {
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
     if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
+    Assert-NotInsideTarget $WorktreePath "Run the copy in the checkout the worktree was created from ($RepoRoot)."
     # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
     # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
     # on -Path, and for the same reason not overridable.
@@ -500,8 +536,8 @@ if ($byPath) {
         }
     }
 
-    # The occupancy fence. The registry is found under $env:USERPROFILE, which is how the tests point
-    # it at a fixture.
+    # The occupancy fence. The registry is found under $env:USERPROFILE, and CLAUDE_CONFIG_DIR below,
+    # which is how the tests point it at a fixture.
     #
     # UNREADABLE REFUSES; READABLE AND EMPTY CLEARS (Manager decision, batch 184, ported from the
     # vault copy). occupancy.ps1 reports Available false in both cases. An unreadable registry,
@@ -516,25 +552,68 @@ if ($byPath) {
     # USERPROFILE through Get-EntriesOrThrow: any error refuses, and a different root count refuses,
     # because the two reads then disagree. NOT Get-ChildItem -ErrorAction Stop, which lists a
     # directory this user may not read as empty and does not throw (vault BACKLOG #2985, item 15).
-    $occ = Get-WorktreeOccupancy -Repo $PrimaryRoot
+    # A `sessions` entry that is not a directory refuses by name: the receipt counts it as a root, and
+    # no session of that root can register there (item 4).
+    #
+    # THE CALLER'S OWN CONFIG ROOT IS READ TOO WHEN IT IS NOT ONE OF THOSE (item 6). CLAUDE_CONFIG_DIR
+    # can name any directory, and the sessions sharing it are then invisible to a listing of
+    # USERPROFILE. So that root joins both reads. A session on some OTHER root outside USERPROFILE is
+    # still not seen: nothing on this machine lists the roots in use.
+    #
+    # A RECORD WHOSE RUNNING PROCESS STARTED BEFORE ITS startedAt READS AS LIVE HERE (item 9). The
+    # registry's default reads such a record as STALE, which vetoes nothing. The skew is unbounded
+    # here, so only a process started AFTER the record's startedAt reads as a reused pid. The
+    # receipt also matches sessions against the worktree list read above, not a second read (item 5).
+    $pinRoot = ''
+    if ($env:CLAUDE_CONFIG_DIR) {
+        if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
+            throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
+        }
+        # A root holding a backtick, [, ], * or ? refuses. The registry reads every path literally
+        # (session-registry.ps1, vault BACKLOG #2985).
+        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
+            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, which this route refuses rather than read. Occupancy unknown. Nothing was removed."
+        }
+        # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
+        $pin = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR))
+        $underHome = $env:USERPROFILE -and ((Split-Path $pin -Leaf) -like '.claude*') -and
+            ((ConvertTo-Norm (Split-Path $pin -Parent)) -eq (ConvertTo-Norm $env:USERPROFILE))
+        if (-not $underHome -and (Test-PresentOrThrow (Join-Path $pin 'sessions') 'the session registry CLAUDE_CONFIG_DIR names')) {
+            $pinRoot = $pin
+        }
+    }
+    $occArgs = @{ Repo = $PrimaryRoot; Worktrees = $registered; StartSkewMinutes = [int]::MaxValue }
+    if ($pinRoot) { $occArgs.ConfigRoot = @(@(Get-ClaudeConfigRoots) + $pinRoot) }
+    $occ = Get-WorktreeOccupancy @occArgs
     $listedRoots = 0
     $listedRecords = 0
     $listingError = ''
     try {
         if (-not $env:USERPROFILE) { throw 'USERPROFILE is not set' }
         $homes = Get-EntriesOrThrow $env:USERPROFILE 'config roots' '.claude*'
-        foreach ($d in @($homes | Where-Object { $_ -is [System.IO.DirectoryInfo] })) {
-            $kids = Get-EntriesOrThrow $d.FullName 'registry entries'
-            if (-not ($kids | Where-Object { $_ -is [System.IO.DirectoryInfo] -and $_.Name -eq 'sessions' })) { continue }
+        $rootDirs = @($homes | Where-Object { $_ -is [System.IO.DirectoryInfo] } | ForEach-Object { $_.FullName })
+        if ($pinRoot) { $rootDirs += $pinRoot }
+        foreach ($d in $rootDirs) {
+            $registry = Get-EntriesOrThrow $d 'registry entries' 'sessions' | Select-Object -First 1
+            if (-not $registry) { continue }
+            if ($registry -isnot [System.IO.DirectoryInfo]) {
+                throw "'$($registry.FullName)' is not a directory, so no session of that config root can be read"
+            }
             $listedRoots++
-            $listedRecords += @(Get-EntriesOrThrow (Join-Path $d.FullName 'sessions') 'session records' '*.json' -FilesOnly).Count
+            $listedRecords += @(Get-EntriesOrThrow $registry.FullName 'session records' '*.json' -FilesOnly).Count
         }
     }
     # Never empty, so an exception with no message cannot read as a clean listing.
     catch { $listingError = "the second listing failed: $($_.Exception.Message)" }
-    if ($listingError -or ($listedRoots -ne $occ.RootsExamined)) {
-        $why = if ($listingError) { $listingError } else {
-            "the receipt examined $($occ.RootsExamined) registry root(s) and a second listing found $listedRoots" }
+    # A record count that differs means the receipt read a different set of records, so a receipt
+    # that is available cannot clear.
+    # An unavailable receipt clears only as readable-empty below, which needs both counts at zero.
+    $why = if ($listingError) { $listingError }
+    elseif ($listedRoots -ne $occ.RootsExamined) {
+        "the receipt examined $($occ.RootsExamined) registry root(s) and a second listing found $listedRoots" }
+    elseif ($occ.Available -and ($listedRecords -ne $occ.RecordsExamined)) {
+        "the receipt examined $($occ.RecordsExamined) session record(s) and a second listing found $listedRecords" }
+    if ($why) {
         Write-Host "REFUSED: the session registry could not be listed consistently: $why." -ForegroundColor Red
         throw "Occupancy unknown. Nothing was removed."
     }
@@ -579,12 +658,15 @@ if ($byPath) {
 # the target, and follows it ONE hop to that repository's common dir. Reading only this clone's
 # own registry would be blind to every claim once the setting is made. The clone's own registry is
 # read AS WELL: a claim taken before the setting was made, or by an older claim.ps1, is there.
-# This repository's shared root, resolved and probed once for both claims/ and alloc/. The target
-# worktree and $GitRoot share one common dir, so either names the same root.
-$script:OwnSharedRoot = $null
-function Get-OwnSharedRoot {
-    if ($null -eq $script:OwnSharedRoot) { $script:OwnSharedRoot = Resolve-CoordSharedRoot -From $GitRoot }
-    return $script:OwnSharedRoot
+# THIS REPOSITORY'S SHARED ROOT, resolved and probed ONCE, here, for both claims/ and alloc/
+# (docs/COORD-SHARED-ROOT.md). The target worktree and $GitRoot share one common dir, so either names
+# the same root. A resolver error leaves both registries unknown, so it refuses on both routes before
+# either is read (vault BACKLOG #2985, item 11). One refusal for both: a later one for the allocation
+# registry alone could never fire, because this one has already stopped the run.
+$ownShared = Resolve-CoordSharedRoot -From $GitRoot
+if ($ownShared.Error) {
+    throw ("The coordination registries of '$GitRoot' could not be resolved ($($ownShared.Error)), so its " +
+        "claims and allocations are unknown. Nothing was removed.")
 }
 
 function Get-TargetClaimsDirs {
@@ -594,13 +676,7 @@ function Get-TargetClaimsDirs {
     if ($code -ne 0 -and $code -ne 1) {
         throw "git could not read mefor.claimsRoot in '$WorktreePath' (exit $code), so claims are unknown. Nothing was removed."
     }
-    # The registry may sit on the shared root (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names
-    # it. A resolver error is claims-unknown, which refuses like every other cannot-tell here.
-    $own = Get-OwnSharedRoot
-    if ($own.Error) {
-        throw "the claim registry of '$WorktreePath' could not be resolved ($($own.Error)), so claims are unknown. Nothing was removed."
-    }
-    $dirs = @(Join-Path $own.Path 'claims')
+    $dirs = @(Join-Path $ownShared.Path 'claims')
     if ($code -eq 0 -and $setting) {
         # claim.ps1 hands the value to git as it stands, so a relative one resolves against the
         # caller's shell. Nothing here can tell which shell that was.
@@ -713,12 +789,19 @@ if ($stateFiles.Count -eq 0) {
 # tree, in a reused tree, that has only read files and run tests leaves no git trace at all. What it
 # does leave: pytest rewrites .pytest_cache on every run, and anything created or deleted directly
 # under the root changes the root's own write time. So the root, every entry directly under it, and
-# everything in the two small caches are read. The worktree's `.git` file is a pointer, like `gitdir`.
+# everything in the small caches worktree-gates.ps1 Get-WorkingTreeActivity reads are read, from its
+# own list, $WORKING_TREE_ACTIVITY_CACHES (.mypy_cache since BACKLOG #5603: a mypy run rewrites it and
+# nothing else). The worktree's
+# `.git` file is a pointer, like `gitdir`.
 # A cache too big to read to the end cannot be dated, so it refuses rather than samples.
 $treeCacheCap = 5000
+# A lost list would date no cache, so a tree a test run just wrote to would read quiet.
+if (-not $WORKING_TREE_ACTIVITY_CACHES) {
+    throw "The list of caches to date (worktree-gates.ps1) is not set, so the tree's last activity is unknown. Nothing was removed."
+}
 $treeFiles = @(Get-Item -LiteralPath $WorktreePath -Force -ErrorAction Stop)
 $treeFiles += @(Get-EntriesOrThrow $WorktreePath 'working-tree entries' | Where-Object { $_.Name -ne '.git' })
-foreach ($cacheName in @('.pytest_cache', '.ruff_cache')) {
+foreach ($cacheName in $WORKING_TREE_ACTIVITY_CACHES) {
     $cache = $treeFiles | Where-Object { $_.Name -eq $cacheName -and $_ -is [System.IO.DirectoryInfo] -and
         -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } | Select-Object -First 1
     if (-not $cache) { continue }
@@ -934,6 +1017,12 @@ if ($Discard -and $untrackedNested.Count -gt 0) {
     throw "-Discard cannot park a git repository inside the tree. Nothing was removed."
 }
 
+# Files flagged skip-worktree (S) or assume-unchanged (lower case), read once for both routes. git status
+# does not look at one, so an edit to one is invisible to every status read above.
+$flaggedRead = Get-FlaggedFiles $WorktreePath
+if (-not $flaggedRead.Read) { throw "git ls-files failed in '$WorktreePath'. Nothing was removed." }
+$flagged = $flaggedRead.Lines
+
 if ($byPath) {
     # EVERYTHING GIT WOULD DELETE IS SHOWN, whatever status.showUntrackedFiles says: tracked changes,
     # untracked files and ignored files all refuse without -Force. A -Path target is often another
@@ -969,10 +1058,6 @@ if ($byPath) {
     # git status does not look at a file flagged skip-worktree (S) or assume-unchanged (lower case), so
     # an edit to one is invisible above. Count every flagged file as pending: nothing here can tell an
     # edited one from an untouched one without reading it.
-    $flagged = @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
-    if ($LASTEXITCODE -ne 0) {
-        throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
-    }
     $pending += @($flagged | ForEach-Object { "flagged $($_.Substring(2))" })
     # -Discard parks tracked changes and untracked files: exactly the status lines that are not
     # ignored. Named by what may be parked, so a line of any other kind, added later or not, refuses.
@@ -1006,9 +1091,33 @@ else {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
-    if ($tracked -and -not $Force -and -not $Discard) {
-        Write-Host ($tracked -join "`n")
-        throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Force."
+    # FILES FLAGGED skip-worktree (S) OR assume-unchanged (lower case), BACKLOG #5648. git status does
+    # not look at one, so an edit to it is invisible to the guard above, and `worktree remove --force`
+    # deletes it. Nothing here can tell an edited one from an untouched one without reading it, so
+    # every flagged file refuses. -Force overrides, as it does for tracked changes, and the run names
+    # each file it let go so the override leaves a record in the caller's output. -Discard refuses
+    # them whatever -Force says, in its own block below.
+    # ONE REFUSAL NAMES BOTH KINDS, so an operator told to re-run with -Force for a tracked change has
+    # also been shown every flagged file that -Force would take with it.
+    $refuseFlagged = $flagged.Count -gt 0 -and -not $Discard -and -not $Force
+    if (($tracked -and -not $Force -and -not $Discard) -or $refuseFlagged) {
+        $why = @()
+        if ($tracked -and -not $Discard) { Write-Host ($tracked -join "`n"); $why += 'uncommitted tracked changes' }
+        if ($flagged.Count -gt 0 -and -not $Discard) {
+            $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
+            if ($flagged.Count -gt 20) { Write-Host "... and $($flagged.Count - 20) more" }
+            $why += ("$($flagged.Count) file(s) flagged skip-worktree or assume-unchanged, which git status " +
+                "does not read, so an edit to one would be lost unseen")
+        }
+        throw ("Worktree has $($why -join ', and '). Commit/push them, or re-run with -Force, which discards " +
+            "them and is the operator's switch. Nothing was removed.")
+    }
+    if ($flagged.Count -gt 0 -and -not $Discard) {
+        # Said before the checks below, any of which can still refuse; the line says "if", not "did".
+        Write-Host ("-Force: not refusing $($flagged.Count) file(s) flagged skip-worktree or assume-unchanged in " +
+            "'$WorktreePath'. They go, unread, if the worktree is removed:") -ForegroundColor Yellow
+        $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "  flagged $($_.Substring(2))" -ForegroundColor Yellow }
+        if ($flagged.Count -gt 20) { Write-Host "  ... and $($flagged.Count - 20) more" -ForegroundColor Yellow }
     }
 }
 
@@ -1032,15 +1141,10 @@ else {
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
 #
-# BOTH ROUTES FAIL CLOSED on a common dir git cannot name and on an alloc directory that cannot be
-# listed. -Name used to read both as "no records found" (vault BACKLOG #2985, item 11, and #2988).
-# The allocation registry may sit on the shared root (docs/COORD-SHARED-ROOT.md); an error is
-# allocations-unknown, which refuses.
-$allocResolved = Get-OwnSharedRoot
-if ($allocResolved.Error) {
-    throw "the allocation registry of '$GitRoot' could not be resolved ($($allocResolved.Error)), so allocations are unknown. Nothing was removed."
-}
-$allocDirRoot = Join-Path $allocResolved.Path 'alloc'
+# BOTH ROUTES FAIL CLOSED on a shared root that cannot be resolved (refused above, before the claims
+# are read) and on an alloc directory that cannot be listed. -Name used to read both as "no records
+# found" (vault BACKLOG #2985, item 11, and #2988).
+$allocDirRoot = Join-Path $ownShared.Path 'alloc'
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
@@ -1161,12 +1265,9 @@ if ($Discard) {
     }
     # A FLAGGED FILE IS NOT PARKED, whatever -Force says: `add -A` does not read the disk version of
     # one flagged assume-unchanged or skip-worktree, so an edit to it would go unparked.
-    $flaggedFiles = if ($byPath) { $flagged } else {
-        @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
-        if ($LASTEXITCODE -ne 0) { throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed." }
-    }
-    if (@($flaggedFiles).Count -gt 0) {
-        $flaggedFiles | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
+    # Both routes read $flagged above.
+    if ($flagged.Count -gt 0) {
+        $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
         throw ("-Discard cannot park a tree with files flagged skip-worktree or assume-unchanged, a sparse " +
             "checkout among them. Nothing was removed.")
     }
@@ -1266,10 +1367,10 @@ if ($removeCode -ne 0) {
     }
     throw "git worktree remove failed (exit $removeCode)"
 }
-# -Name only. `git worktree remove` already dropped the target's registration, and a blanket prune
-# also drops OTHER worktrees' registrations, with the HEAD reflog each one holds. The -Name route
-# keeps the prune it has always run; the -Path route, which is new, does not start one.
-if (-not $byPath) { & git -C $RepoRoot worktree prune }
+# NO BLANKET `git worktree prune`, on either route (BACKLOG #5648, #7619). `git worktree remove` has
+# already dropped the target's own registration, so a prune could only touch OTHER worktrees: it drops
+# every registration whose directory is missing at that moment, a tree on a drive not mounted yet or
+# one half-way through another removal, with the HEAD reflog each one holds. -Name used to run one.
 
 # --- A CLAIM TAKEN AFTER THE CHECK: reported, never released (vault BACKLOG #2988) -----------------
 #

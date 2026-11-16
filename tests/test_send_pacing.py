@@ -29,8 +29,9 @@ from messagefoundry.config.wiring import (
     env,
     validate_config,
 )
+from messagefoundry.pipeline.stage_dispatcher import LaneResultKind
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _resolve_send_pace
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, OutboxItem
 from messagefoundry.transports.base import DestinationConnector
 
 DEST = "OB_ADT"
@@ -377,3 +378,137 @@ async def test_single_message_seam_is_paced(
     assert probe.slept == [pytest.approx(interval - work, abs=1e-9)]
     depth, _ = await store.pending_depth(DEST)
     assert depth == 0
+
+
+# --- BACKLOG #5709: the pooled seam asks the pause and the halt before AND after the pacing wait ----
+
+
+async def _one_claimed_head(store: MessageStore) -> OutboxItem:
+    await store.enqueue_message(channel_id="c1", raw=_msg(1), deliveries=[(DEST, _msg(1))])
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    return head
+
+
+def _paced_runner(store: MessageStore, rec: _Recorder) -> RegistryRunner:
+    runner = _runner(store)
+    runner._destinations[DEST] = rec
+    runner._retry[DEST] = RetryPolicy()
+    return runner
+
+
+async def test_a_pause_that_lands_during_the_pacing_wait_sends_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator pause lands while the pooled head waits out its pacing interval. Before the fix
+    the seam asked nothing after the wait and sent the head past the pause. Now it releases it: still
+    pending, due at once for a resume, with the claim's attempt given back."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+
+    async def _pause_during_wait(name: str) -> None:
+        runner._outbound_paused.add(name)  # the pause set an operator stop writes
+
+    monkeypatch.setattr(runner, "_pace_outbound", _pause_during_wait)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert rec.sent == []  # no egress past the pause
+    assert result.kind is LaneResultKind.RETRY  # parks; the dispatcher's pause_pending wins
+    again = await store.claim_next_fifo(DEST)  # released, not rescheduled: due at once
+    assert again is not None and again.id == head.id
+    assert again.attempts == head.attempts  # the release gave back the claim's increment
+
+
+async def test_a_halt_that_lands_during_the_pacing_wait_sends_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #122 log-write halt lands during the pacing wait. Before the fix the seam asked the halt
+    only above the wait and sent the head unlogged. Now it reschedules it into the future, as the
+    gate above the wait does, without counting a second gate hit."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+
+    async def _halt_during_wait(name: str) -> None:
+        runner._log_write_stopped = True  # what both halt sites set
+
+    monkeypatch.setattr(runner, "_pace_outbound", _halt_during_wait)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert rec.sent == []  # no unlogged egress
+    assert result.kind is LaneResultKind.RETRY
+    assert runner.halted_claim_gate_hits == 0  # a halt inside the wait is pause lag, not a door
+    assert await store.claim_next_fifo(DEST) is None  # rescheduled: not due yet
+    depth, _ = await store.pending_depth(DEST)
+    assert depth == 1  # ...but pending, not lost or dead-lettered
+
+
+async def test_a_paused_lane_is_refused_before_the_pacing_wait(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A head claimed for a lane already paused is handed back before the pacing wait, as the
+    per_lane worker's per-item gate does (#2771). Before the fix only the halt was asked there."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+    runner._outbound_paused.add(DEST)
+    probe = install_pace_probe(monkeypatch, runner)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert rec.sent == []
+    assert result.kind is LaneResultKind.RETRY
+    assert probe.calls == []  # refused above the wait: no pacing for a send that will not happen
+
+
+async def test_a_demoted_node_with_a_paused_lane_releases_and_stops(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node that lost leadership releases the head and STOPs the lane for the new leader, as the
+    send path's leadership check does, rather than handing it back and parking."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+    runner._outbound_paused.add(DEST)
+    runner._log_write_stopped = True  # the halt too: a hand-back here would reschedule
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert rec.sent == []
+    assert result.kind is LaneResultKind.STOP  # stopped for the new leader, not parked
+    again = await store.claim_next_fifo(DEST)  # released, not rescheduled: due at once
+    assert again is not None and again.id == head.id
+
+
+async def test_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No pause and no halt, so the seam lets the head through to the single-row body. Its
+    leadership check comes before the missing-connector arm, so a demoted node releases the head
+    and STOPs the lane rather than charging it a failed attempt."""
+    head = await _one_claimed_head(store)
+    runner = _paced_runner(store, _Recorder())
+    runner._retry[DEST] = RetryPolicy(max_attempts=1)  # one charged attempt would dead-letter it
+    del runner._destinations[DEST]
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert result.kind is LaneResultKind.STOP
+    (row,) = await store.outbox_for(head.message_id)
+    assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 0, None)
+
+
+async def test_a_halted_head_on_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt holds on a demoted node whose outbound has no connector (a reload, or one that
+    failed to start). The head is released and the lane STOPs, with no attempt spent. Before the
+    repair the gate let a demoted node through to the missing-connector arm, which charged the head
+    a failed attempt and, under a finite cap, could dead-letter it unsent; before the branch the
+    halt rescheduled it with none spent."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+    runner._retry[DEST] = RetryPolicy(max_attempts=1)  # one charged attempt would dead-letter it
+    del runner._destinations[DEST]
+    runner._log_write_stopped = True
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert result.kind is LaneResultKind.STOP
+    (row,) = await store.outbox_for(head.message_id)
+    assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 0, None)

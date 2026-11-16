@@ -155,7 +155,7 @@ def _env(directory: Path | None, **values: str) -> dict[str, str]:
 
 
 def test_serviceenv_takes_its_lists_from_the_one_list() -> None:
-    assert (*serviceenv.KEY_CLASS_NAMES, *serviceenv.LOOSENING_CLASS_NAMES) == SECRET_SETTING_NAMES
+    assert (*serviceenv.KEY_CLASS_NAMES, *serviceenv.DIRECTORY_CLASS_NAMES) == SECRET_SETTING_NAMES
     assert set(KEY_CLASS_NAMES).isdisjoint(DIRECTORY_SETTING_NAMES)
     assert set(KEY_CLASS_NAMES) | set(DIRECTORY_SETTING_NAMES) == set(SECRET_SETTING_NAMES)
 
@@ -608,21 +608,48 @@ def test_a_directory_link_on_windows_is_refused_before_anything_follows_it(
     assert followed == []
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX judges the directory a link names")
-def test_a_posix_link_to_a_directory_is_followed_and_a_link_to_a_file_is_refused(
-    tmp_path: Path,
-) -> None:
-    """On POSIX the access check follows a link, so a link to a restricted directory is accepted,
-    and a link to a restricted file passes the access check and is then refused as no directory."""
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="a POSIX symbolic link, which needs no privilege"
+)
+def test_a_posix_link_to_a_directory_or_a_file_is_refused_as_a_link(tmp_path: Path) -> None:
+    """On POSIX, as on Windows, the access check judges a link as itself and refuses it, so a link
+    to a restricted directory is no longer accepted on the strength of what it names (vault
+    BACKLOG #5636). The directory itself is the control."""
     directory = _directory(tmp_path)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
     to_directory = tmp_path / "to_directory"
     to_directory.symlink_to(directory, target_is_directory=True)
-    assert open_secrets_directory(_env(to_directory)) is not None
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
+        open_secrets_directory(_env(to_directory))
 
     to_file = tmp_path / "to_file"
     to_file.symlink_to(_put(tmp_path, "restricted_file", "not a directory"))
-    with pytest.raises(SecretsDirectoryError, match="is not a directory, or does not exist"):
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
         open_secrets_directory(_env(to_file))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_a_posix_secret_file_linked_from_elsewhere_is_refused(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    elsewhere = _put(tmp_path, "restricted_elsewhere", _FROM_FILE)
+    (directory / "MEFOR_STORE_PASSWORD").symlink_to(elsewhere)
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
+        secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_a_posix_secrets_directory_whose_parent_others_may_write_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Whoever may write the directory above may rename the secrets directory away and put
+    another in its place, whatever the secrets directory's own mode (vault BACKLOG #5656)."""
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    directory = _directory(parent)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
+    parent.chmod(0o777)
+    with pytest.raises(SecretsDirectoryError, match="with no sticky bit"):
+        open_secrets_directory(_env(directory))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is a Windows link")
@@ -729,6 +756,97 @@ def test_a_broad_right_to_delete_a_file_in_the_directory_is_refused() -> None:
         _windows_access_problem(delete_child, _DIRECTORY_REACH_MASK)
     )
     assert _windows_access_problem(delete_child, _REACH_MASK) is None
+
+
+def _shared_folder(path: Path) -> Path:
+    """A folder at ``path`` in which a broad group may delete or re-point an entry: Users granted
+    FILE_DELETE_CHILD on Windows, mode 0777 elsewhere."""
+    path.mkdir()
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["icacls", str(path), "/grant", f"*{_USERS}:(DC)"], check=True, capture_output=True
+        )
+    else:
+        path.chmod(0o777)
+    return path
+
+
+def _folder_link(link: Path, target: Path) -> None:
+    """A folder link at ``link`` onto ``target``: a junction on Windows, which needs no privilege,
+    and a symbolic link elsewhere."""
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5656 and #5657: the check read the directory alone, never the folders on its
+    path, so one reached through a junction or a link passed."""
+    from tests.test_restricted_file import judge_links_only_under
+
+    judge_links_only_under(monkeypatch, tmp_path)
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
+    directory = _directory(real)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    opened = open_secrets_directory(_env(directory))  # the control
+    assert opened is not None and opened.read("MEFOR_STORE_PASSWORD") == _FROM_FILE
+    _folder_link(tmp_path / "mine", real)  # the engine's own link in its own folder passes
+    assert open_secrets_directory(_env(tmp_path / "mine" / "secrets")) is not None
+    shared = _shared_folder(tmp_path / "shared")
+    _folder_link(shared / "linked", real)
+    with pytest.raises(SecretsDirectoryError, match="junction or link on its path can be changed"):
+        open_secrets_directory(_env(shared / "linked" / "secrets"))
+
+
+def test_the_folders_above_the_directory_are_read_for_it_and_not_again_for_each_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own check reads the folders above it and the folder that holds it; each
+    file's check does not read them again, since the folder that holds it is the one just judged."""
+    import messagefoundry.restricted_file as restricted_file
+
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    _put(directory, "MEFOR_AI_API_KEY", _FROM_FILE)
+    real = restricted_file.broad_access_problem
+    asked: list[tuple[str, bool, bool]] = []
+
+    def spy(path: Path, *, directory: bool = False, holder_judged: bool = False) -> str | None:
+        asked.append((path.name, directory, holder_judged))
+        return real(path, directory=directory, holder_judged=holder_judged)
+
+    walked: list[str] = []
+    walk_name = (
+        "_windows_surroundings_problem" if sys.platform == "win32" else "_posix_host_link_problem"
+    )
+    real_walk = getattr(restricted_file, walk_name)
+
+    def walk(path: Path, *args: Any) -> str | None:
+        walked.append(path.name)
+        answer: str | None = real_walk(path, *args)
+        return answer
+
+    monkeypatch.setattr(restricted_file, "broad_access_problem", spy)
+    monkeypatch.setattr(restricted_file, walk_name, walk)
+    opened = open_secrets_directory(_env(directory))
+    assert opened is not None
+    assert opened.read("MEFOR_STORE_PASSWORD") == opened.read("MEFOR_AI_API_KEY") == _FROM_FILE
+    assert walked == ["secrets"]  # the directory's folders are walked once, and no file's
+    assert asked == [
+        ("secrets", True, False),
+        ("MEFOR_STORE_PASSWORD", False, True),
+        ("MEFOR_AI_API_KEY", False, True),
+    ]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list, set with icacls")

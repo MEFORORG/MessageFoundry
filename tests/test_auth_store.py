@@ -78,9 +78,11 @@ async def test_role_assignment_replace_and_resolution() -> None:
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles("u1", ["operator", "viewer"], assigned_by="admin", now=2.0)
+        await store.set_user_roles(
+            "u1", ["operator", "viewer"], assigned_by="admin", now=2.0, audits=()
+        )
         assert set(await store.get_user_role_ids("u1")) == {"operator", "viewer"}
-        await store.set_user_roles("u1", ["viewer"], now=3.0)  # replace
+        await store.set_user_roles("u1", ["viewer"], now=3.0, audits=())  # replace
         assert await store.get_user_role_ids("u1") == ["viewer"]
     finally:
         await store.close()
@@ -256,7 +258,7 @@ async def test_delete_user_cascades_roles_and_sessions() -> None:
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles("u1", ["viewer"], now=2.0)
+        await store.set_user_roles("u1", ["viewer"], now=2.0, audits=())
         await store.create_session(token_hash="t", user_id="u1", expires_at=1000.0, now=2.0)
         await store.delete_user("u1")
         assert await store.get_user("u1") is None

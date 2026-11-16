@@ -3,13 +3,14 @@
 """Auth/session/account page builders for the /ui ops dashboard (ADR 0065): sign-in, step-up
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
-The account pages carry the normal chrome. The UNAUTHENTICATED entry pages (sign-in, the Windows-SSO
-challenge) are bare — ``nav=Markup("")``. Every page that is reached WITH a live session but drops the
-full nav for focus/confinement (step-up re-auth, reauth-continue, the forced must-change-password
-page, passkey enrolment, the federated landing hop) renders ``nav=minimal_nav()`` instead: the
-wordmark plus the same one-click POST Sign-out form, so an authenticated page never leaves the
-operator without a way out (ASVS 7.4.4). Every dynamic value is placed through the escaping element
-builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
+The account pages carry the normal chrome. A page that drops the full nav for focus/confinement
+renders ``nav=minimal_nav()``: the wordmark plus, by default, the same one-click POST Sign-out form
+(ASVS 7.4.4) and the session watchdog. ``minimal_nav`` does not read the request. A page that may be served
+either way, at least the OIDC "leaving this site" page and the IdP hop, passes
+``minimal_nav(session=...)`` with what its route found, because the watchdog on a page with no
+session sends the browser to the login page. The sign-in entry pages, at least sign-in and the
+Windows-SSO challenge, are bare, ``nav=Markup("")``. Every dynamic value is placed through the
+escaping element builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
 ``<input type=password>`` (never echoed back), and the TOTP secret / recovery codes render exactly
 once on their dedicated pages.
 """
@@ -26,6 +27,7 @@ from ._common import _deadline_passed, _deadline_stamp
 
 __all__ = [
     "account_page",
+    "idp_handoff",
     "leaving_site",
     "login",
     "oidc_landing",
@@ -183,25 +185,64 @@ def oidc_landing(target: str = "/ui") -> Markup:
     through a document served from OUR origin makes the next navigation same-site, so the cookie is
     unambiguously sent.
 
-    No JavaScript, so this works under the strict ``/ui`` CSP with no nonce and no ``script-src``
-    relaxation. The visible link is the fallback for a browser with meta refresh disabled.
+    The navigation needs no JavaScript, so it asks for no ``script-src`` relaxation under the strict
+    ``/ui`` CSP. The visible link is the fallback for a browser with meta refresh disabled.
 
     ``target`` is ``/ui`` after a sign-in. After a federated step-up (BACKLOG #296) it is the GET
     admin form the step-up unlocked, which the caller has ALREADY validated as a registered /ui
     action. This page never takes a URL from the request.
     """
-    body = el(
+    body = _hop_card("Signed in — continuing to the console…", target)
+    return page("Signing in", body, nav=minimal_nav(), head_extra=_meta_refresh(target))
+
+
+def _hop_card(message: str, target: str) -> Markup:
+    """The body of a navigating hop: its message, and a visible link for a browser with meta
+    refresh disabled."""
+    return el(
         "div",
         el("h1", wordmark(tm=True)),
-        el("p", "Signed in — continuing to the console…"),
+        el("p", message),
         el("p", el("a", "Continue", href=target), class_="muted"),
         class_="card",
     )
+
+
+def _meta_refresh(target: str) -> Markup:
+    """The ``<head>`` element of a navigating hop. ``el`` escapes the attribute, so a ``&`` or a
+    quote in ``target`` cannot end it early."""
+    return el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"})
+
+
+def idp_handoff(authorization_url: str, *, session: bool) -> Markup:
+    """The hop from a federated START leg to the IdP. ``POST /ui/oidc/start`` and
+    ``POST /ui/reauth/oidc`` answer with it, and so does ``GET /ui/oidc/start`` when it skips its
+    interstitial and runs the sign-in POST leg itself.
+
+    Returned as **200 HTML with a meta refresh**, deliberately NOT a 303, for a reason unlike
+    :func:`oidc_landing`'s. The two POST legs are form submissions, and the ``/ui`` CSP carries
+    ``form-action 'self'``. Chromium checks ``form-action`` again on each redirect that follows a
+    form submission, so a 303 to the IdP's origin is blocked and the browser never leaves the page
+    (measured in headless Edge 157 against the real ``POST /ui/oidc/start``). A meta refresh is a
+    navigation from this document, not a form submission, so ``form-action`` does not govern it,
+    and the CSP needs no IdP origin. The GET that runs the POST leg gets the same page: a 303
+    would work there, but one leg with one answer is simpler to hold.
+
+    ``session`` is whether the request carries a live session, and goes to
+    :func:`.._html.minimal_nav`. With one, as on the step-up leg, the page keeps its sign-out control
+    (ASVS 7.4.4) and the watchdog. Without one, as on a first sign-in, it carries neither: the
+    watchdog's first probe would send the browser to the login page, racing this page's own
+    navigation to the IdP.
+
+    ``authorization_url`` comes from the engine's flow state, built from configuration, never from
+    the request.
+    """
+    body = _hop_card("Continuing to your organization's sign-in provider.", authorization_url)
     return page(
         "Signing in",
         body,
-        nav=minimal_nav(),
-        head_extra=el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"}),
+        nav=minimal_nav(session=session),
+        head_extra=_meta_refresh(authorization_url),
     )
 
 
@@ -212,6 +253,7 @@ def leaving_site(
     idn_disguised: bool = False,
     cancel_href: str = "/ui/login",
     purpose: str = "",
+    session: bool,
 ) -> Markup:
     """The ASVS 3.7.3 interstitial: you are leaving, here is where to, and you may cancel.
 
@@ -231,7 +273,7 @@ def leaving_site(
     ``Sec-Fetch-Site`` check — which also closes the pre-existing hole where any external page could
     start a federated sign-in just by linking to the start leg.
 
-    No JavaScript: the ``/ui`` CSP is strict, with no nonce and no ``script-src`` relaxation.
+    Continue and Cancel need no JavaScript, so the page asks for no ``script-src`` relaxation.
     """
     warn = (
         el(
@@ -264,10 +306,12 @@ def leaving_site(
         class_="card",
     )
     # ASVS 7.4.4: `nav=Markup("")` would suppress the shared chrome AND its sign-out control,
-    # stranding a signed-in operator on a page with no way out. `minimal_nav()` is what the
-    # sibling interstitial (`oidc_landing`) uses for exactly this reason. The first version of
-    # this page used the bare Markup("") and was wrong.
-    return page("Leaving this site", body, nav=minimal_nav())
+    # stranding a signed-in operator on a page with no way out. The first version of this page used
+    # the bare Markup("") and was wrong. But this page is also served to a browser with no session,
+    # the federated sign-in's first step, and there the session watchdog that minimal_nav carries
+    # would send the browser to the login page before Continue could be clicked. So the route says
+    # which: `session` is whether its request carries a live session.
+    return page("Leaving this site", body, nav=minimal_nav(session=session))
 
 
 def sso_challenge() -> Markup:
@@ -1076,12 +1120,23 @@ def enrolment_code_input(owed: bool = True) -> Markup:
     )
 
 
-def mfa_enroll_page(secret: str, otpauth_uri: str, *, enrolment_code: bool = False) -> Markup:
-    """The staged-enrollment page: the TOTP secret + otpauth URI (shown once for authenticator entry)
-    and the confirm-code form. No QR image — the /ui surface is zero-dependency (ADR 0065), so the
-    secret is entered manually or the URI pasted; the desktop console renders the QR.
-    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one."""
-    confirm = el(
+def _mfa_code_form(enrolment_code: bool, reauth_prompt: str | None) -> Markup:
+    """The confirm-code form, or, with ``reauth_prompt``, a code-less Continue button in its place.
+
+    The button stands in for the form while the session holds no confirm proof (BACKLOG #5931): a
+    code posted then would be refused at the gate and lost. It posts to the same verify route with
+    no code. The route answers a code-less post ahead of its gate with the re-auth, which lands on
+    the confirm form with the proof held, so a proof already held is not spent on it."""
+    if reauth_prompt is not None:
+        return el(
+            "form",
+            el("p", reauth_prompt),
+            el("button", "Continue", type="submit"),
+            method="post",
+            action="/ui/account/mfa/verify",
+            class_="ctl",
+        )
+    return el(
         "form",
         el(
             "label",
@@ -1100,13 +1155,37 @@ def mfa_enroll_page(secret: str, otpauth_uri: str, *, enrolment_code: bool = Fal
         action="/ui/account/mfa/verify",
         class_="ctl",
     )
+
+
+def mfa_enroll_page(
+    secret: str,
+    otpauth_uri: str,
+    *,
+    enrolment_code: bool = False,
+    code_form: bool = True,
+) -> Markup:
+    """The staged-enrollment page: the TOTP secret + otpauth URI (shown once for authenticator entry)
+    and, with ``code_form``, the confirm-code form. No QR image — the /ui surface is zero-dependency
+    (ADR 0065), so the secret is entered manually or the URI pasted; the desktop console renders the
+    QR. ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``code_form=False``
+    puts the Continue button to the confirm re-auth in the form's place (:func:`_mfa_code_form`)."""
+    confirm = _mfa_code_form(
+        enrolment_code,
+        None
+        if code_form
+        else "Next, confirm it's you, then enter a code from your authenticator to turn MFA on.",
+    )
+    lead = (
+        "Add this secret to your authenticator app (manual entry), then prove a live code. "
+        if code_form
+        else "Add this secret to your authenticator app (manual entry) before you continue. "
+    )
     body = el(
         "div",
         el("h1", "Enroll an authenticator"),
         el(
             "p",
-            "Add this secret to your authenticator app (manual entry), then prove a live code. "
-            "The secret is shown once and is not active until confirmed.",
+            lead + "The secret is shown once and is not active until confirmed.",
             class_="muted",
         ),
         el("p", "Secret: ", el("code", secret)),
@@ -1176,29 +1255,21 @@ def webauthn_enroll_page(options_json: str, *, enrolment_code: bool = False) -> 
     return page("Add a passkey", body, nav=minimal_nav())
 
 
-def mfa_confirm_page(*, error: str | None = None, enrolment_code: bool = False) -> Markup:
+def mfa_confirm_page(
+    *,
+    error: str | None = None,
+    enrolment_code: bool = False,
+    code_form: bool = True,
+) -> Markup:
     """The standalone confirm-code form (the unlock re-entry point after a step-up re-auth): the
     secret is already staged server-side and in the user's authenticator, so it is NOT re-shown.
-    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one."""
+    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``code_form=False``,
+    on a refused code whose proof the gate spent, puts the Continue button to a fresh re-auth in the
+    form's place (:func:`_mfa_code_form`)."""
     banner = el("p", error, class_="banner") if error else Markup("")
-    form = el(
-        "form",
-        el(
-            "label",
-            "Code from your authenticator",
-            el(
-                "input",
-                name="code",
-                inputmode="numeric",
-                autocomplete="one-time-code",
-                autofocus=True,
-            ),
-        ),
-        enrolment_code_input(enrolment_code),
-        el("button", "Activate MFA", type="submit"),
-        method="post",
-        action="/ui/account/mfa/verify",
-        class_="ctl",
+    form = _mfa_code_form(
+        enrolment_code,
+        None if code_form else "To try a code again, first confirm it's you again.",
     )
     body = el(
         "div",

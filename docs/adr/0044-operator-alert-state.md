@@ -8,8 +8,11 @@
   alert state must stay a **side observer**, never gate a disposition) ·
   [ADR 0027](0027-per-connection-retention.md) (the additive-table-across-three-backends + single-pass-audit
   discipline this matches; alert-state pruning rides the **same** purge pass) ·
-  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in logs/alerts),
-  §9 ([PHI.md](../PHI.md) — metadata-only) ·
+  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in
+  logs/alerts),
+  §9 ([PHI.md](../PHI.md) — metadata-only) · *(Note 2026-11-10, BACKLOG #5021: neither the
+  general log nor alerts are PHI-free in the shipped code, and the stored alert reason is not
+  metadata-only; the note under Context says why.)* ·
   [`pipeline/alerts.py`](../../messagefoundry/pipeline/alerts.py) (`AlertSink` Protocol + `LoggingAlertSink`) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) (`NotifierAlertSink._emit`, the
   `(event['type'], event['connection'])` key, `AlertRuleSet`) ·
@@ -59,7 +62,21 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   "the connection name + queue shape only — **no PHI**" ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py)
   module docstring); the alert-instance row stores only those same metadata fields (type, connection, severity,
   a `safe_text`-scrubbed reason), so it introduces **no** new PHI classification — like `connection_event`,
-  it sits in the existing metadata tier.
+  it sits in the existing metadata tier. *(Note 2026-11-10, BACKLOG #5021: the quoted docstring no
+  longer says this, and the quoted claim was false: some events carry free-text detail. The
+  [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
+  transports say what an event carries, and PHI.md's `alert_instance.reason` at-rest row grades the
+  stored reason **Possibly** PHI at PL-2, so that column is not plain metadata. The clause *"like
+  `connection_event`, it sits in the existing metadata tier"* is false too: PHI.md grades
+  `connection_event.reason` the same way, **Possibly** PHI at PL-2 and ciphered when a key is
+  set, so neither reason column sits in a metadata tier. Where this ADR calls `connection_event`
+  or `alert_instance` metadata-only, that does not hold for its `reason` column. The general
+  application log is not PHI-free either: PHI.md's logging inventory row 1 says it can contain
+  PHI. The off-box alert key allowlist the owner ruled for would not restore this ADR's claim
+  about the stored alert-instance reason, which stays outside it. Which alert copies it can make
+  PHI-free is in
+  [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+  note of 2026-11-10.)*
 
 ## Decision
 
@@ -350,3 +367,46 @@ three backends (the ADR 0064 `_schema_hash` bumps automatically on the server ba
 in-memory map per sink. Deliberately **notification-only**: suspend/mute never hides the open condition
 (that is what `resolve` is for) and — matching "gates notification only" — a suspended alert's #144
 control action still fires (a windowed mute is not a control-action mute; disable the rule for that).
+
+## Amendment (2026-11-09) -- one staleness sweep, for `intake_paused` only (BACKLOG #3269)
+
+The generic "has not re-fired in N cooldowns, so it is stale" sweep this ADR defers (D2, and under
+*Consequences*) is still deferred. One narrow case is built. An `intake_paused` subject names its
+engine process (`intake:<reason>@<process>`), so one whose process never returns under that name had
+no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now resolves an open
+`intake_paused` instance of another process whose `count` has not moved for four reminder intervals
+of its own monotonic clock. That rule reads only whether a reminder landed, by design: a process
+still paused whose reminders stop reaching the store (cut off, failing writes, or a check that keeps
+raising) has its alert resolved while its intake stays paused, a false clear accepted as the cost of
+a time-to-live. What such a process keeps in memory is stated in
+[CONFIGURATION.md](../CONFIGURATION.md#alerts) (vault BACKLOG #8190). A failed sweep read counts none of the time from the
+last good read to the next, and holds what was counted to `STALE_SECONDS` minus
+`GAP_GRACE_SECONDS`, so a live process whose reminder an outage ate has time to land its next one;
+the graces do not stack. The resolve is bounded by the `(id, count)` it read
+(`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
+no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
+does; retention then treats it as any other resolved row. Other subjects that name a process, or a
+node that may not return, are not swept by it: at least `crl_reload_refused`, `posture_loosened`,
+`log_forward_failed`, `remote_debug_refused`, `leadership_acquired` and `dr_activated`.
+
+## Amendment (2026-11-09) -- an auto-resolve is fenced to the raises it speaks for (BACKLOG #4916)
+
+D2's auto-resolve closed every live instance of its key when it landed. It waits behind the key's
+FIFO lock (#2272 defect 8) and its retries (BACKLOG #3756), so another engine shard or node on the
+same store could raise the key in that window, and the late resolve closed the newer raise.
+
+Each raise now stamps the instance with its writer's id: `alert_instance.raised_by`, a nullable
+column on all three backends holding a random id each notifier draws once per process run.
+
+A fenced auto-resolve (`resolve_alert_instances_fenced`) closes the key's live instance only when
+it is the instance the resolve's snapshot saw with no raise past the snapshot's count, or its
+newest raise is this run's own raise, so an earlier run's raise is matched only through the
+snapshot. So a raise another process lands after the snapshot keeps
+the instance open, unless this run's own raise is newer. No clock is compared:
+the `last_seen <= now` guard the PR for #3756 declined (decision d20261030T211551515-1de84e) would
+leave an alert open for good under cross-node clock skew. The code is the authority: for the
+close rule, `resolve_alert_instances_fenced` in `messagefoundry/store/store.py`, `postgres.py` and
+`sqlserver.py`; for the rest, `messagefoundry/pipeline/alert_sinks.py` (`_ResolveFence`,
+`NotifierAlertSink._run_state`, `_record_state`, `_resolve_settled` and
+`NotifierAlertSink.connection_started`) and the store's `upsert_alert_instance` and
+`open_alert_generations`.

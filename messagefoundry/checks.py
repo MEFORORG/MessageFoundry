@@ -11,7 +11,8 @@ checks). Two checks are **required** (they can block a commit):
   routes through its inbound's Router/Handler(s) without erroring. A fixture under a
   ``<messages>/<inbound_name>/`` subdir is dry-run **only** against that feed (#11); a fixture not under
   such a subdir runs against **every** inbound. A fixture may also declare its expected dry-run
-  disposition in a sibling ``<fixture>.expect`` file (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``)
+  disposition in a sibling ``<fixture>.expect`` file (at least ``RECEIVED``/``UNROUTED``/``FILTERED``/
+  ``ERROR``, and ``ERROR <reason>``; ``docs/ADOPTER-CI.md`` section 3 lists the forms and their rules)
   — an executable acceptance-criteria check (Secure Development Standards §5); without one the default
   is "must not ERROR". Absent fixtures → skipped (never blocks). The preview runs under
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
@@ -101,7 +102,6 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
-import json
 import os
 import re
 import shutil
@@ -110,7 +110,7 @@ import sys
 from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -1772,7 +1772,12 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
 # but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
 # present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
 # router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
-# to ``RECEIVED`` for authoring ergonomics.
+# to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies a bare ``ERROR`` only
+# when the validate, though late, returned a content refusal; a late pass or a late raise does not.
+# ``ERROR <reason>`` requires the run's error or the validator's content refusal to contain the
+# reason; past the timeout the error is the timeout text, which counts only for a reason holding
+# _TIMEOUT_REASON_WORDS. docs/ADOPTER-CI.md section 3 states the rule for adopters.
+_TIMEOUT_REASON_WORDS = "timed out"  # in the dry run's (and the listener's) timeout text
 _DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
@@ -1782,14 +1787,27 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
+class _Expectation(NamedTuple):
+    """A fixture's declared expectation: the disposition name, and for ``ERROR <reason>`` the
+    substring the run must show (``None`` for every other form). Which texts it is matched
+    against is ``_check_dryrun``'s rule, stated in ``docs/ADOPTER-CI.md`` section 3."""
+
+    disposition: str
+    reason: str | None = None
+
+
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
-    Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
-    ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
-    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
-    (ASVS 5.1.1, BACKLOG #1127).
+    The sidecar holds one disposition name, case-insensitive, or ``ERROR <reason>``: ``ERROR``, one
+    space, then the rest of the line, matched case-sensitively as a substring of the run's error or
+    of the strict validator's content refusal (BACKLOG #5107; ``docs/ADOPTER-CI.md`` section 3 has
+    the whole rule, the timeout case included). Surrounding whitespace is ignored. Returns the normalized name (one of
+    :data:`_DRYRUN_DISPOSITIONS`) with the reason, or ``None`` when no sidecar exists — then the
+    fixture keeps the default "must not ERROR" semantics. Raises ``ValueError`` for an unreadable,
+    over-cap or unrecognized declaration (a fixture-authoring mistake); the error names only the
+    disposition word, since a reason can quote message content. The sidecar is read under its
+    fixture's ``cap``, so it never lands in memory whole (ASVS 5.1.1, BACKLOG #1127).
     """
     from messagefoundry.pipeline.dryrun import read_fixture
 
@@ -1799,16 +1817,46 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
     data = read_fixture(
         sidecar,
         cap,
-        advice="an .expect sidecar holds one disposition name",
+        advice="an .expect sidecar holds one disposition name, or ERROR and a reason",
     )
-    raw = data.decode("utf-8").strip().upper()
+    # utf-8-sig: a Windows editor's BOM must not turn a correct sidecar into an unknown name.
+    text = data.decode("utf-8-sig").strip()
+    # A membership test, not splitlines(): the sidecar can be as large as the fixture cap. A rarer
+    # line break is whitespace, so the word checks below still refuse it.
+    if "\n" in text or "\r" in text:
+        # Checked first, so a stray second line under a bare word is named as such rather than
+        # read as a malformed reason separator. Not echoed, as below.
+        raise ValueError(
+            "invalid .expect: a sidecar holds one line (one disposition name, or ERROR and a "
+            "reason); remove the other lines"
+        )
+    word, sep, reason = text.partition(" ")
+    if any(ch.isspace() for ch in word):
+        # Not echoed: what follows another whitespace separator can be a reason, which can quote
+        # the message.
+        if word.split(None, 1)[0].upper() == "ERROR":
+            raise ValueError("invalid .expect: separate ERROR from its reason with one space")
+        raise ValueError(
+            "invalid .expect: a sidecar holds one disposition name, and only ERROR takes a reason"
+        )
+    raw = word.upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
-        valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
+        valid = "/".join(sorted(_DRYRUN_DISPOSITIONS))
+        # Echoed only when it is a plain word: ``ERROR:DOE^JOHN`` is a reason joined to ERROR
+        # without the space, and a reason can quote the message.
+        shown = repr(raw) if raw.replace("_", "").isalpha() else "(not a plain word, not shown)"
         raise ValueError(
-            f"invalid .expect disposition {raw!r} (use one of {valid}; PROCESSED/ROUTED alias RECEIVED)"
+            f"invalid .expect disposition {shown} (use one of {valid}, or ERROR <reason>; "
+            "PROCESSED/ROUTED/DELIVERED/DELIVERS alias RECEIVED)"
         )
-    return normalized
+    if not sep:
+        return _Expectation(normalized)
+    if normalized != "ERROR":
+        raise ValueError(f"invalid .expect: only ERROR takes a reason, not {raw!r}")
+    if reason[:1].isspace():
+        raise ValueError("invalid .expect: separate ERROR from its reason with one space")
+    return _Expectation(normalized, reason)
 
 
 def _resolve_snapshot_on_send(
@@ -1951,9 +1999,43 @@ def _check_dryrun(
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
-                if actual != expected:
+                if actual != expected.disposition:
                     got = safe_error(result.error) or actual
-                    errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
+                    errors.append(
+                        f"{label} @ {ic_name}: expected {expected.disposition}, got {got}"
+                    )
+                elif expected.reason is not None:
+                    # Matched against the raw texts, never safe_error's: redaction must not decide
+                    # whether the gate fails. A content refusal the validate returned, on time or
+                    # late, is one candidate; ``is not None``: an empty verdict still counts. The
+                    # run's error is the other, except that past the timeout it is the timeout
+                    # text, which counts only for a reason naming the timeout itself: a fixture
+                    # pinning the DoS backstop, which the listener answers with a final AR
+                    # (BACKLOG #5107). Otherwise a reason such as ``strict-validation``, written
+                    # for a content refusal, would pass on every slow runner.
+                    error_counts = (
+                        not result.strict_timed_out or _TIMEOUT_REASON_WORDS in expected.reason
+                    )
+                    candidates = (result.strict_refusal, result.error if error_counts else None)
+                    said = [t for t in candidates if t is not None]
+                    if not any(expected.reason in text for text in said):
+                        # Neither text is printed: the error and the reason can both quote the
+                        # message, and this detail lands in a CI log.
+                        errors.append(
+                            f"{label} @ {ic_name}: expected ERROR with the .expect reason, got "
+                            "an ERROR whose reason does not match it"
+                        )
+                elif result.strict_timed_out and result.strict_refusal is None:
+                    # A bare ERROR: a timeout is the validator's wall clock, not the message, so on
+                    # its own it never proves the fixture (BACKLOG #5107); only ERROR <reason>
+                    # naming the timeout text pins the backstop, above. A content refusal the
+                    # validate returned after the timeout does prove it: the verdict is the
+                    # message's, only its arrival was slow. The detail names the refusal kind
+                    # only: the timeout text carries no message content.
+                    errors.append(
+                        f"{label} @ {ic_name}: expected {expected.disposition}, got a "
+                        "strict-validation timeout, which does not show the content is invalid"
+                    )
             elif result.error or result.disposition is MessageStatus.ERROR:
                 shown = safe_error(result.error) or result.disposition.value
                 errors.append(f"{label} @ {ic_name}: {shown}")
@@ -2572,19 +2654,6 @@ def _check_alert_smtp_tls(
 _BARE_DECLARATION_NAME = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
-def _quoted_text(text: str) -> str:
-    """``text`` as one double-quoted token that its own content cannot close or extend.
-
-    JSON string quoting escapes every quote, backslash and C0 control, so a reason cannot end its
-    token and write a separator, a second entry or a mark after it. ``ensure_ascii`` also writes
-    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
-    right-to-left letter, cannot fake that end for a human reader. The log escape then covers DEL,
-    the one ASCII control JSON leaves raw (vault BACKLOG #3139)."""
-    from messagefoundry.controlchars import scrub_control_chars
-
-    return scrub_control_chars(json.dumps(text))
-
-
 def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> str:
     """One entry of a declaration list on an advisory check line: ``name ("reason")``.
 
@@ -2593,8 +2662,10 @@ def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> 
     pattern, so any other name is quoted too. Every character an author controls is therefore
     inside quotes, and ``REFUSED`` after the entry can only come from the caller (vault BACKLOG
     #3139)."""
-    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else _quoted_text(name)
-    why = "none recorded" if reason is None else _quoted_text(reason)
+    from messagefoundry.controlchars import quote_log_text
+
+    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else quote_log_text(name)
+    why = "none recorded" if reason is None else quote_log_text(reason)
     return f"{shown} ({why}){' REFUSED' if refused else ''}"
 
 

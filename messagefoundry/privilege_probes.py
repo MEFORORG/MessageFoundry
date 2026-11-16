@@ -44,6 +44,7 @@ from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
     exception_chain,
+    is_ssl_error,
     raised_by_the_engine,
     raised_through,
 )
@@ -143,7 +144,7 @@ def excused_failure(exc: BaseException) -> bool:
         chain = list(exception_chain(exc))
     except ExceptionChainTooLong:  # a chain not read to its end excuses nothing
         return False
-    if any(_is_ssl(e, "SSLError") and not _is_ssl(e, "SSLEOFError") for e in chain):
+    if any(is_ssl_error(e, "SSLError") and not is_ssl_error(e, "SSLEOFError") for e in chain):
         return False
     if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror, TruncatedResponseError)):
         return True
@@ -153,15 +154,8 @@ def excused_failure(exc: BaseException) -> bool:
         return False
     if isinstance(exc, rex.SSLError):
         # Excused only where the chain shows a handshake the peer cut off.
-        return any(_is_ssl(e, "SSLEOFError") for e in chain)
+        return any(is_ssl_error(e, "SSLEOFError") for e in chain)
     return isinstance(exc, (rex.ConnectionError, rex.Timeout, rex.ChunkedEncodingError))
-
-
-def _is_ssl(exc: BaseException, name: str) -> bool:
-    """Whether ``exc`` is the stdlib ``ssl`` module's class ``name`` or a subclass of it. Read off
-    the class's MRO, so this module reads an exception's type without importing ``ssl``, which the
-    crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
-    return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
 
 
 def unexcused_cause(exc: BaseException) -> str | None:

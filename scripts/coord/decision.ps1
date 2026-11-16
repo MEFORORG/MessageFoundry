@@ -36,7 +36,8 @@
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     NO-REVIEW needs all of: the kill switch reads exactly OFF (afk-kill.ps1 -Status); the seat's
-    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration);
+    Class B is calibrated, by the digest's own arithmetic (_decisionlog.ps1 Get-DecisionCalibration,
+    under which a roster alias earns its own 60 samples; owner ruling 2026-11-15, option c);
     no decision on the item was reversed in the 60 days read; the reversal budget is open (plan 4.5:
     3 reversals fleet-wide or 2 of the seat's own decisions inside 24 hours close it for 24 hours);
     the chain is no deeper than two (plan 4.6, below); and the cost rung is not hit (plan 4.7).
@@ -341,8 +342,14 @@ function Invoke-DecisionGate {
                 return (New-GateAnswer 'REVIEW' $why)
             }
         }
-        if (-not $Seat) {
+        if (-not (ConvertTo-DecisionSeat $Seat)) {
             $why.Add('no seat was given or found in the seat registry, so its calibration and its reversal budget cannot be read')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        if ($null -eq (Get-DecisionSeatAliases)) {
+            # Without the roster an alias cannot be joined to its seat, so the seat's history may be
+            # read in part (BACKLOG #5597).
+            $why.Add("the seat roster docs/roles/seats.json could not be read, so $Seat's aliases cannot be joined to its calibration and reversal budget")
             return (New-GateAnswer 'REVIEW' $why)
         }
         if ($Offline) {
@@ -375,8 +382,10 @@ function Invoke-DecisionGate {
         $closed = $false
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
-        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
-                $_.kind -eq 'decision' -and [string]$_.seat -eq $Seat -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+        # Every seat's Class B pool and -Seat as asked; Get-DecisionCalibration applies the alias
+        # ruling (owner ruling 2026-11-15, option c) and says how.
+        $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Seat $Seat -Decisions @($all | Where-Object {
+                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
             })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")
@@ -454,8 +463,9 @@ if ($Flush) {
 if ($List) {
     try { $Day = Resolve-DecisionDay $Day } catch { [Console]::Error.WriteLine("decision.ps1: $($_.Exception.Message)"); exit 2 }
     $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Days)
+    $canon = ConvertTo-DecisionSeat $Seat
     $rows = @($res.Records | Where-Object {
-            (-not $Seat -or [string]$_.seat -eq $Seat) -and (-not $Item -or [string]$_.item -eq $Item)
+            (-not $Seat -or (ConvertTo-DecisionSeat ([string]$_.seat)) -eq $canon) -and (-not $Item -or [string]$_.item -eq $Item)
         })
     if ($Json) {
         Write-Output (ConvertTo-Json -InputObject $rows -Depth 8)
@@ -470,6 +480,10 @@ if ($List) {
     }
     if (-not $res.Complete) {
         foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the log was not fully read: $e") }
+        exit 4
+    }
+    if ($Seat -and $null -eq (Get-DecisionSeatAliases)) {
+        [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the seat roster docs/roles/seats.json could not be read, so records under an alias of '$Seat' were not matched.")
         exit 4
     }
     exit 0

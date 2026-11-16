@@ -86,7 +86,9 @@ def _seed(
                     password_generated=False,
                     audits=(),
                 )
-                await store.set_user_roles("u-viewer", [Role.VIEWER.value], assigned_by="test")
+                await store.set_user_roles(
+                    "u-viewer", [Role.VIEWER.value], assigned_by="test", audits=()
+                )
             return list(outcome.recovery_codes)
         finally:
             await store.close()
@@ -305,7 +307,9 @@ def test_a_directory_administrator_is_accepted(
                 password_generated=False,
                 audits=(),
             )
-            await store.set_user_roles("u-ad", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await store.set_user_roles(
+                "u-ad", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
             staged_cell = await store.set_totp_secret("u-ad", secret=PROVISION_TOTP_SECRET)
             assert (
                 await store.enable_totp(
@@ -589,7 +593,9 @@ def test_a_second_enabled_administrator_is_refused_and_named(
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles("u-second", [Role.ADMINISTRATOR.value], assigned_by="test")
+        await store.set_user_roles(
+            "u-second", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+        )
 
     _with_store(db, add_admin)
     before = _state(db)

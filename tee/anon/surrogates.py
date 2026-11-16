@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,12 +145,16 @@ REDACTED = "[REDACTED]"
 
 @dataclass(frozen=True)
 class Seps:
-    """The component/repetition/subcomponent separators of the message being anonymized, read from
-    its own MSH-1/MSH-2 (never hardcoded). The field separator is the adapter's concern."""
+    """The component/repetition/subcomponent separators and the escape character of the message
+    being anonymized, read from its own MSH-1/MSH-2 (never hardcoded). The field separator is the
+    adapter's concern. The surrogate kinds never read ``escape``; the leak-check decodes an escaped
+    value with it before its detectors look (BACKLOG #5532), and so does the site-code scrub
+    (BACKLOG #5632)."""
 
     component: str = "^"
     repetition: str = "~"
     subcomponent: str = "&"
+    escape: str = "\\"
 
 
 def _fake_digits(rng: random.Random, length: int) -> str:
@@ -158,16 +163,18 @@ def _fake_digits(rng: random.Random, length: int) -> str:
 
 
 def _fake_like(rng: random.Random, sample: str) -> str:
-    """A fabricated value with the **same shape** as ``sample``: each digit → a digit, each ASCII
-    letter → an upper-case letter, anything else kept verbatim. Preserves the original width AND the
-    alphanumeric shape (so ``A0049`` → ``X7321``, not a shrunk digit-only string)."""
+    """A fabricated value with the **same shape** as ``sample``: each digit becomes an ASCII digit,
+    each letter and each other non-ASCII character becomes an upper-case ASCII letter, and ASCII
+    punctuation and spaces are kept verbatim. Preserves the original width AND the alphanumeric
+    shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
+    an accented letter of a real id reached the output (BACKLOG #5534)."""
     if not sample:
         return _fake_digits(rng, 6)
     out: list[str] = []
     for ch in sample:
         if ch.isdigit():
             out.append(str(rng.randrange(10)))
-        elif ch.isascii() and ch.isalpha():
+        elif ch.isalpha() or not ch.isascii():
             out.append(chr(rng.randrange(ord("A"), ord("Z") + 1)))
         else:
             out.append(ch)
@@ -196,14 +203,42 @@ def surrogate_address(rep: str, keyer: Keyer, seps: Seps) -> str:
     return seps.component.join([street, "", city, state, zip_code, "USA"])
 
 
-def _surrogate_identifier(kind: str, rep: str, keyer: Keyer, seps: Seps) -> str:
+#: The 1-based CX components an identifier surrogate keeps as captured: CX.3 check-digit scheme,
+#: CX.4 assigning authority, CX.5 identifier type, CX.6 assigning facility, CX.9 assigning
+#: jurisdiction and CX.10 assigning agency. They describe the id, its scheme, type and issuer,
+#: rather than hold it, and routing and correlation read them. They are kept as the sender wrote
+#: them, so the leak-check scans them for the shapes it knows (``leak.kept_component_hits``). Every other component past the first is blanked: CX.2, the
+#: check digit, is computed from the real id and is wrong for the fabricated one; CX.7 and CX.8
+#: are the effective and expiration dates; and a component past CX.10, such as a security check,
+#: is blanked until someone decides it is safe to keep (BACKLOG #5534).
+_CX_KEPT_COMPONENTS = frozenset({3, 4, 5, 6, 9, 10})
+
+
+def _kept_tail(comps: list[str], kept: frozenset[int]) -> list[str]:
+    """Components 2 onward of ``comps``, each one whose 1-based position is not in ``kept``
+    blanked, and the empty components that leaves at the end dropped, so a blanked date is not
+    left behind as a run of separators."""
+    tail = [comp if index in kept else "" for index, comp in enumerate(comps[1:], start=2)]
+    while tail and not tail[-1]:
+        tail.pop()
+    return tail
+
+
+def _surrogate_identifier(
+    kind: str,
+    rep: str,
+    keyer: Keyer,
+    seps: Seps,
+    kept: frozenset[int] = _CX_KEPT_COMPONENTS,
+) -> str:
     """Replace the **id** component (component 1) with a fabricated value of the same length and
-    alphanumeric shape, keeping the assigning authority / id-type components (non-PHI, routing-
-    relevant) intact — so an alphanumeric MRN keeps its width and shape, not just its digit count."""
+    alphanumeric shape, keep the components ``kept`` names (by default the CX authority
+    components, :data:`_CX_KEPT_COMPONENTS`: non-PHI, routing-relevant) and blank the rest — so an alphanumeric MRN keeps its width and shape, not
+    just its digit count, and its check digit and dates do not survive (BACKLOG #5534)."""
     rng = keyer.rng(kind, rep)
     comps = _components(rep, seps)
-    comps[0] = _fake_like(rng, comps[0])
-    return seps.component.join(comps)
+    fabricated = _fake_like(rng, comps[0])
+    return seps.component.join([fabricated, *_kept_tail(comps, kept)])
 
 
 def surrogate_mrn(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -212,21 +247,45 @@ def surrogate_mrn(rep: str, keyer: Keyer, seps: Seps) -> str:
 
 
 def surrogate_id(rep: str, keyer: Keyer, seps: Seps) -> str:
-    """A generic identifier — fabricated id, trailing components preserved."""
+    """A generic identifier — fabricated id, authority components kept, the rest blanked."""
     return _surrogate_identifier("id", rep, keyer, seps)
+
+
+#: The 1-based DLN components a driver's licence surrogate keeps: DLN.2, the issuing state,
+#: province or country. DLN.3, the expiration date, is blanked (BACKLOG #5534).
+_DLN_KEPT_COMPONENTS = frozenset({2})
+
+
+def surrogate_dln(rep: str, keyer: Keyer, seps: Seps) -> str:
+    """A DLN driver's licence number (PID-20): a fabricated number of the same shape, the issuing
+    state kept and the expiration date blanked. The generic identifier reads a field as a CX, so
+    it would blank the state as a check digit and could not tell the expiry was a date."""
+    return _surrogate_identifier("dln", rep, keyer, seps, _DLN_KEPT_COMPONENTS)
+
+
+#: The identifier kinds, whose surrogate keeps sender components past the first as captured:
+#: the three that call :func:`_surrogate_identifier`, and ``ssn``. The leak-check scans what they
+#: keep (``leak.kept_component_hits``), so an identifier kind that starts keeping a component
+#: belongs here. They are not every kind that keeps captured text in a field it maps: at least
+#: ``date`` keeps a TS.2 precision code, and ``freetext`` on ``OBX-5`` keeps some values whole,
+#: and neither is scanned there.
+COMPONENT_KEEPING_KINDS: frozenset[SurrogateKind] = frozenset(
+    {SurrogateKind.ID, SurrogateKind.MRN, SurrogateKind.SSN, SurrogateKind.DLN}
+)
 
 
 def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
-    any trailing CX components (an assigning authority) so a CX-shaped national id is not collapsed."""
+    the CX authority components a CX-shaped national id carries, blanking the rest as
+    :func:`_surrogate_identifier` does (BACKLOG #5534)."""
     rng = keyer.rng("ssn", rep)
     comps = _components(rep, seps)
     id_part = comps[0]
     if re.fullmatch(r"\d{3}-\d{2}-\d{4}", id_part):
-        comps[0] = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
+        fabricated = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
     else:
-        comps[0] = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
-    return seps.component.join(comps)
+        fabricated = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
+    return seps.component.join([fabricated, *_kept_tail(comps, _CX_KEPT_COMPONENTS)])
 
 
 def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -358,6 +417,7 @@ _SURROGATES: dict[SurrogateKind, _Surrogate] = {
     SurrogateKind.ADDRESS: surrogate_address,
     SurrogateKind.MRN: surrogate_mrn,
     SurrogateKind.ID: surrogate_id,
+    SurrogateKind.DLN: surrogate_dln,
     SurrogateKind.SSN: surrogate_ssn,
     SurrogateKind.PHONE: surrogate_phone,
     SurrogateKind.DOB: surrogate_dob,
@@ -415,35 +475,96 @@ def surrogate_field_recorded(
     return surrogate_field(kind, value, keyer, seps)
 
 
-def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
-    """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component** that is
-    exactly a site code with a fabricated non-site code of the same width, leaving a coincidental
-    site-code run inside a longer value (timestamps, order numbers) untouched. Applied to every field
-    as a net under the rule map, since a site code can lurk in an unexpected field. A no-op when no
-    site-code prefix is configured (a token-less build; the rule map remains the primary control).
-    """
+def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
+    """True if ``part``, one component or one subcomponent, is a site code on any reading a
+    consumer can take (BACKLOG #5632): as written, trimmed, with its invisible characters dropped
+    (:func:`dropped`), split at each invisible character, or any of :func:`decoded_readings`.
+    Each reading must be a site code whole, by ``fullmatch``. A part with no escape character is
+    not split on whitespace, so a site-code run inside a longer value, such as ``Call 971234
+    today``, reads as no site code. A part that holds one is also read split on
+    whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
+    and :func:`scrub_site_codes` then replaces the whole part. A part that holds one is also read
+    as written, split at the escape character, each piece trimmed and read whole, and each
+    escape body further split at every character that is not a digit: a raw viewer, or a
+    receiver that defines the escape, shows that text, and a site code is digits only. The
+    argument of a closed, well-formed hex or character-set escape (:data:`_HEX_ARGUMENT_ESCAPE`)
+    is not split that way, so ``\\M242844\\Yamada`` and ``Name \\X414243\\`` keep their text
+    whatever the site prefix, and a site code written as one passes. docs/PHI.md section 9, *Field-anchored site-code scrub*, states the rule and its
+    consequences."""
+    forms = [trim(part), trim(dropped(part)), *map(trim, _split_at_invisible(part))]
+    forms += decoded_readings(part, seps, field_sep, resplit=True)
+    if seps.escape and seps.escape in part:
+        pieces = part.split(seps.escape)
+        forms += map(trim, pieces)
+        # The odd pieces are the escape bodies, an unclosed tail among them. A tail is no escape,
+        # so it is split whatever it holds.
+        for at in range(1, len(pieces), 2):
+            body = pieces[at]
+            if at == len(pieces) - 1 or not _HEX_ARGUMENT_ESCAPE.fullmatch(body):
+                forms += _NON_DIGITS.split(body)
+    return any(SITE_CODE_RE.fullmatch(form) for form in forms)
+
+
+#: What splits an escape body read as written: any run of characters that are not ASCII digits.
+_NON_DIGITS: re.Pattern[str] = re.compile(r"[^0-9]+")
+#: The body of a well-formed escape whose argument is hex: ``\\Xhh..\\``, hex data in whole pairs,
+#: and ``\\Mxxyy\\`` or ``\\Mxxyyzz\\``, the multi-byte character-set escape. The argument codes
+#: bytes or a character set, not digits a consumer shows: the hex data is read decoded, and a
+#: character-set escape shows nothing. So its digits are not read as a site code (BACKLOG #5654).
+#: The cost: a site code written as such an argument, such as ``\\X971234\\``, passes, though a
+#: raw viewer shows its digits. ``\\Cxxyy\\`` is left out: four hex digits never hold a six-digit
+#: site code. A body of any other shape, an odd count of hex digits or a longer ``\\C..\\``
+#: among them, is read as before.
+_HEX_ARGUMENT_ESCAPE: re.Pattern[str] = re.compile(
+    r"X(?:[0-9A-Fa-f]{2})+|M[0-9A-Fa-f]{4}(?:[0-9A-Fa-f]{2})?"
+)
+
+
+def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
+    """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component or
+    subcomponent** that is a site code with a fabricated non-site code of the same width, leaving a
+    coincidental site-code run inside a longer value with no escape character (timestamps, order
+    numbers) untouched. In a part that holds an escape character, a site-code run that whitespace
+    or an escaped delimiter sets apart counts, and the whole part, free text included, becomes
+    digits (:func:`_reads_as_site_code`). Applied
+    to every field as a net under the rule map, since a site code can lurk in an unexpected field.
+    A no-op when no site-code prefix is configured (a token-less build; the rule map remains the
+    primary control).
+
+    A part is a site code on any reading :func:`_reads_as_site_code` takes, so one joined to an
+    escaped delimiter or written with a hex escape is replaced too, and the whole part as written,
+    escape sequences included, gives way to digits of its own width (BACKLOG #5632). A component
+    with subcomponents that reads as a site code whole, as received, is replaced whole, its
+    subcomponent separators included; otherwise each subcomponent is replaced on its own. The surrogate is keyed on
+    the part as written, so one site code written two ways gets two unrelated surrogates.
+    ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to."""
     if not value or not _SITE_PREFIXES:
         return value
-    if not any(p in value for p in _SITE_PREFIXES):
+    # The check also reads the value with its invisible characters dropped, so the fast exit does.
+    visible = dropped(value)
+    if not any(p in visible for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
         return value
 
-    def _one(component: str) -> str:
-        if not SITE_CODE_RE.fullmatch(component):
-            return component
-        rng = keyer.rng("sitecode", component)
+    def _fake(part: str) -> str:
+        rng = keyer.rng("sitecode", part)
         prefix = rng.choice(_NON_SITE_PREFIXES)
-        return f"{prefix}{_fake_digits(rng, len(component) - len(prefix))}"
+        return f"{prefix}{_fake_digits(rng, len(part) - len(prefix))}"
 
-    reps = value.split(seps.repetition)
-    out_reps = []
-    for rep in reps:
-        comps = rep.split(seps.component)
-        comps = [
-            seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
-            for comp in comps
-        ]
-        out_reps.append(seps.component.join(comps))
-    return seps.repetition.join(out_reps)
+    def _one(part: str) -> str:
+        return _fake(part) if _reads_as_site_code(part, seps, field_sep) else part
+
+    def _component(comp: str) -> str:
+        # The whole-component reading is decided on the component as received: replacing a
+        # subcomponent first can remove the escape that makes the component split on whitespace,
+        # which would leave a code in a sibling subcomponent, as in ``Call 971234&97\X31\234``.
+        if seps.subcomponent in comp and _reads_as_site_code(comp, seps, field_sep):
+            return _fake(comp)
+        return seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
+
+    return seps.repetition.join(
+        seps.component.join(_component(comp) for comp in rep.split(seps.component))
+        for rep in value.split(seps.repetition)
+    )
 
 
 def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
@@ -485,17 +606,246 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
 
 
 def read_message_seps(text: str) -> tuple[Seps, str] | None:
-    """The ``(component/repetition/subcomponent, field)`` separators of an HL7 message, read from its
-    own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the **full four**
-    encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed identically (the
-    engine's ``Message`` itself raises when MSH-2 has fewer than four chars). Shared (parity)."""
+    """The ``(component/repetition/escape/subcomponent, field)`` separators of an HL7 message, read
+    from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
+    **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
+    identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
+    Shared (parity)."""
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if seg[:3].upper() == "MSH" and len(seg) >= 5:
             field = seg[3]
             enc = seg[4:].split(field, 1)[0]
             if len(enc) >= 4:
-                return Seps(component=enc[0], repetition=enc[1], subcomponent=enc[3]), field
+                seps = Seps(component=enc[0], repetition=enc[1], escape=enc[2], subcomponent=enc[3])
+                return seps, field
     return None
+
+
+#: The dotted formatting commands that write a break or spaces: ``.br``, ``.sp``, ``.ce``, ``.in``,
+#: ``.ti`` and ``.sk``. Any other dotted body, ``.fi`` and ``.nf`` among them, decodes to nothing.
+_SPACING_FORMAT_COMMANDS = frozenset({".br", ".sp", ".ce", ".in", ".ti", ".sk"})
+#: The largest repeat count the engine's parser expands in a dotted command
+#: (``_builtin_hl7.MAX_ESCAPE_REPEAT``). A count past it, or below 1, writes nothing there.
+_MAX_ESCAPE_REPEAT = 512
+
+
+def _decode_hex(digits: str) -> str:
+    """A ``\\Xhh...\\`` body after its ``X``, decoded one pair at a time to the character with
+    that code, as the engine's parser decodes it. A last single digit is read alone, and the
+    decode stops at the first pair that is not hex, keeping what it already decoded."""
+    out: list[str] = []
+    for at in range(0, len(digits), 2):
+        try:
+            out.append(chr(int(digits[at : at + 2], 16)))
+        except ValueError:
+            break
+    return "".join(out)
+
+
+def _spacing_command(body: str) -> bool:
+    """True if a dotted ``body`` writes a break or spaces on the engine's parser: a spacing command
+    alone, or one whose repeat count ``int()`` reads as 1 to :data:`_MAX_ESCAPE_REPEAT`."""
+    if body[:3] not in _SPACING_FORMAT_COMMANDS:
+        return False
+    if len(body) == 3:
+        return True
+    try:
+        return 0 < int(body[3:]) <= _MAX_ESCAPE_REPEAT
+    except ValueError:
+        return False
+
+
+def _decode_escape(body: str, letters: dict[str, str]) -> str:
+    """What one escape sequence decodes to, given the text between its two escape characters and
+    the message's single-letter escapes. It follows ``messagefoundry/parsing/_builtin_hl7.unescape``,
+    the engine's own reading, so a value reads here as an HL7 receiver reads it (BACKLOG #5532): a
+    delimiter escape becomes the message's own delimiter, ``\\H\\`` and ``\\N\\`` become
+    ``_``, a hex escape becomes its characters, and a sequence the receiver cannot map, an empty
+    one included, decodes to nothing. One deliberate difference: a dotted command that writes a
+    break or spaces decodes to one space, not the break or the run of spaces. Either keeps two
+    runs of digits apart. ``tests/test_anon_b214_5532.py`` compares the two decoders."""
+    if (letter := letters.get(body)) is not None:
+        return letter
+    if body.startswith("X"):
+        return _decode_hex(body[1:])
+    return " " if _spacing_command(body) else ""
+
+
+def unescape(value: str, seps: Seps, field_sep: str) -> str:
+    """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
+    separators (BACKLOG #5532), as :func:`_decode_escape` reads each one. The tee cannot import the
+    engine's parser, so the leak-check of both copies decodes here, in this byte-identical file.
+    Of the anonymizer's own passes, only the site-code scrub calls it, through
+    :func:`decoded_readings` (BACKLOG #5632). Pass one component or one subcomponent, the two parts the
+    engine's ``Message`` decodes on a component read and a subcomponent read: an escape character
+    no second one closes is kept, with the text after it, and across a separator it would pair
+    with the next sequence's opener. Never raises."""
+    escape = seps.escape
+    if not escape or escape not in value:
+        return value
+    # The single-letter escapes: F field, S component, T subcomponent, R repetition, E the escape
+    # character itself, and H and N, highlighting on and off, which the engine writes as ``_``.
+    letters = {
+        "F": field_sep,
+        "S": seps.component,
+        "T": seps.subcomponent,
+        "R": seps.repetition,
+        "E": escape,
+        "H": "_",
+        "N": "_",
+    }
+    out: list[str] = []
+    at = 0
+    while (start := value.find(escape, at)) != -1:
+        end = value.find(escape, start + 1)
+        if end == -1:
+            break
+        out.append(value[at:start])
+        out.append(_decode_escape(value[start + 1 : end], letters))
+        at = end + 1
+    out.append(value[at:])
+    return "".join(out)
+
+
+def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) -> list[str]:
+    """The decoded readings a consumer can take of ``part``, one component or one subcomponent,
+    for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
+    decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
+    that shows highlighting rather than a character reads it; each of those with its invisible
+    characters dropped (:func:`dropped`); and each trimmed (:func:`trim`). Empty when ``part``
+    holds no escape character: :func:`_reads_as_site_code` and the MRN-typed check read the part
+    as written themselves.
+
+    With ``resplit`` each reading is also split again on the message's delimiters, its field
+    separator, its escape character, whitespace and every invisible character, and each piece is
+    a reading too: a consumer that unescapes the part sees an escaped delimiter as a real one,
+    stops at a control character such as ``\\X00\\``, and :func:`unescape` writes a break
+    command such as ``\\.br\\`` as a space where the engine writes a line break. The site-code
+    check takes it, since a site code is digits only, so a word split out of free text is no
+    false hit. The MRN-typed check does not: a split-out word ``MR`` or ``Mr`` in ordinary text,
+    such as ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO``, would refuse the message."""
+    escape = seps.escape
+    if not escape or escape not in part:
+        return []
+    shown = part.replace(f"{escape}H{escape}", "").replace(f"{escape}N{escape}", "")
+    breaks = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent + escape)
+    forms: list[str] = []
+    for decoded in dict.fromkeys(
+        (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
+    ):
+        candidates = [decoded, dropped(decoded)]
+        if resplit:
+            # An invisible character becomes a space first, so the one class splits on it too.
+            spaced = "".join(" " if _is_invisible(c) else c for c in decoded)
+            candidates += re.split(f"[{breaks}{_TRIM_CLASS}]", spaced)
+        forms.extend(trim(form) for form in candidates)
+    return list(dict.fromkeys(forms))
+
+
+#: The Unicode categories of a character that takes up no place in what a consumer shows: Cc, every
+#: C0 and C1 control character and DEL, and Cf, the format characters, among them the soft hyphen
+#: U+00AD, the zero-width space U+200B and the byte-order mark U+FEFF. A consumer drops, trims or
+#: stops at them, and a one-byte hex escape reaches the controls, so a value padded, split or
+#: interleaved with one, such as ``971234\\X00\\``, ``97\\XAD\\1234`` or ``MR`` with a U+200B, reads
+#: as the value without it (BACKLOG #5632, #5654).
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
+#: The split class besides the delimiters: whitespace, which :func:`decoded_readings` maps every
+#: invisible character to before it splits.
+_TRIM_CLASS = "\\s"
+
+
+def _is_invisible(char: str) -> bool:
+    """True if ``char`` is in :data:`_INVISIBLE_CATEGORIES`."""
+    return unicodedata.category(char) in _INVISIBLE_CATEGORIES
+
+
+def _is_blank(char: str) -> bool:
+    """True if ``char`` is whitespace or invisible: what :func:`trim` takes off."""
+    return char.isspace() or _is_invisible(char)
+
+
+def dropped(text: str) -> str:
+    """``text`` with every invisible character (:data:`_INVISIBLE_CATEGORIES`) removed, as a
+    consumer that drops them reads it."""
+    return "".join(c for c in text if not _is_invisible(c))
+
+
+def trim(text: str) -> str:
+    """``text`` without the whitespace and invisible characters at either end. It walks in from
+    each end once, so a long run of them inside the text costs nothing extra."""
+    start, end = 0, len(text)
+    while start < end and _is_blank(text[start]):
+        start += 1
+    while end > start and _is_blank(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
+def _split_at_invisible(text: str) -> list[str]:
+    """``text`` split at each invisible character, as a consumer that stops at one reads each
+    piece. Whitespace does not split it, a tab, a form feed or NEL included, though they are
+    category Cc: free text such as ``Call<TAB>971234<TAB>today`` keeps the code, as it does with
+    spaces."""
+    pieces: list[str] = []
+    start = 0
+    for at, char in enumerate(text):
+        if _is_invisible(char) and not char.isspace():
+            pieces.append(text[start:at])
+            start = at + 1
+    pieces.append(text[start:])
+    return pieces
+
+
+def _unescape_field(field: str, seps: Seps, field_sep: str, *, by_component: bool) -> str:
+    """``field`` with each subcomponent decoded on its own, or with ``by_component`` each component
+    decoded whole, and the separators kept as written."""
+    if not seps.escape or seps.escape not in field:
+        return field
+
+    def decoded(comp: str) -> str:
+        if by_component:
+            return unescape(comp, seps, field_sep)
+        leaves = comp.split(seps.subcomponent)
+        return seps.subcomponent.join(unescape(leaf, seps, field_sep) for leaf in leaves)
+
+    return seps.repetition.join(
+        seps.component.join(decoded(comp) for comp in rep.split(seps.component))
+        for rep in field.split(seps.repetition)
+    )
+
+
+def unescaped_message(text: str, *, by_component: bool = False) -> str:
+    """``text`` with the escape sequences in every field decoded, a subcomponent at a time, or with
+    ``by_component`` a component at a time, the two readings :func:`unescape` names, for the token
+    scan (BACKLOG #5532). The segment id and encoding characters of a header line are left as
+    written, since they hold the escape character itself. Every other line is decoded from its
+    first field, so a line with no field separator, which is all one field, is decoded too.
+    ``text`` is returned as it is when it has no parseable MSH or no field holds an escape
+    sequence."""
+    parsed = read_message_seps(text)
+    if parsed is None:
+        return text
+    seps, field_sep = parsed
+    changed = False
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
+        fields = line.split(field_sep)
+        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
+        changed = changed or decoded != fields
+        lines.append(field_sep.join(decoded))
+    return "\r".join(lines) if changed else text
+
+
+def unescaped_fields(
+    fields: list[str], seps: Seps, field_sep: str, *, by_component: bool
+) -> list[str]:
+    """The split ``fields`` of one line, each decoded as :func:`unescaped_message` decodes it. The
+    segment id and encoding characters of a header line are left as written."""
+    kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 0
+    return fields[:kept] + [
+        _unescape_field(field, seps, field_sep, by_component=by_component)
+        for field in fields[kept:]
+    ]
 
 
 def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[list[str], int], bool]:
@@ -547,15 +897,22 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
 
 
 def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
-    """True if any whole field/component/subcomponent **is exactly** a site code — the field-anchored
-    leak-check that matches the scrub (ADR 0030 §5). Using ``fullmatch`` per component (not a broad
+    """True if any whole field/component/subcomponent **is** a site code, on any reading
+    :func:`_reads_as_site_code` takes — the field-anchored leak-check that matches the scrub (ADR
+    0030 §5). Using ``fullmatch`` per component (not a broad
     substring search) means a value that merely *contains* a site-code run — a timestamp, a fabricated
     date, a long order number — is not falsely flagged, while a genuine scrub *miss* still is. Falls
     back to a broad search only for unstructured (no-MSH) text. Always False when no site-code prefix
     is configured.
 
     ``rules`` are the rules the text was anonymized with. A field they filled with the ``DATE`` kind
-    is not checked, for the reason :func:`_date_output_test` gives."""
+    is not checked, for the reason :func:`_date_output_test` gives.
+
+    Each component and subcomponent is read as :func:`scrub_site_codes` reads it
+    (:func:`_reads_as_site_code`), so a site code joined to an escaped delimiter or written with a
+    hex escape is found, and the scrub's output reads as clean (BACKLOG #5632)."""
+    if not _SITE_PREFIXES:
+        return False  # no site code can match, so skip decoding every escaped part
     parsed = read_message_seps(text)
     if parsed is None:
         return SITE_CODE_RE.search(text) is not None
@@ -568,7 +925,10 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
                 continue
             for rep in field.split(seps.repetition):
                 for comp in rep.split(seps.component):
-                    if any(SITE_CODE_RE.fullmatch(sub) for sub in comp.split(seps.subcomponent)):
+                    parts = comp.split(seps.subcomponent)
+                    if len(parts) > 1:
+                        parts.append(comp)
+                    if any(_reads_as_site_code(part, seps, field_sep) for part in parts):
                         return True
     return False
 
@@ -576,8 +936,8 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
 def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ...] = ()) -> str:
     """Field-anchored site-code safety pass over a whole ``\\r``-delimited message (ADR 0030 §5).
 
-    Splits on the message's own separators and replaces any whole **component** that is exactly a
-    site code, anywhere in the message — the net under the rule map for a site code lurking in an
+    Splits on the message's own separators and replaces any whole component or subcomponent that is
+    a site code on any reading :func:`scrub_site_codes` names, anywhere in the message — the net under the rule map for a site code lurking in an
     unexpected field. MSH-1 (field separator) and MSH-2 (encoding characters) are left untouched so
     the header stays parseable. The broad, unanchored catch-all stays in the publish leak-gate as
     defense-in-depth; here we never over-redact a coincidental site-code run inside a longer value.
@@ -599,12 +959,12 @@ def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ..
         if fields[0].upper() == "MSH":
             # fields[0]="MSH", fields[1]=encoding chars (^~\&) — never scrub the header machinery.
             head = fields[:2]
-            tail = [scrub_site_codes(f, keyer, seps) for f in fields[2:]]
+            tail = [scrub_site_codes(f, keyer, seps, field_sep) for f in fields[2:]]
             out_segments.append(field_sep.join(head + tail))
         else:
             head = fields[:1]
             tail = [
-                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps)
+                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps, field_sep)
                 for i, f in enumerate(fields[1:], start=1)
             ]
             out_segments.append(field_sep.join(head + tail))

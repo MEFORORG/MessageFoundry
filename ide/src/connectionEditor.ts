@@ -11,7 +11,7 @@ import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
-import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, openChannel, postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
 import { connectionEditorScript } from "./connectionEditorWebview";
 
 // The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
@@ -38,7 +38,7 @@ export async function formSchemaFor(
   try {
     const schema = await connectionSchema(cwd);
     const transports = Object.keys(schema.transports).sort();
-    return { transports, groups: buildForm(schema, transport, direction, settings) };
+    return { transports, groups: buildForm(schema, transport, direction, settings), transport, direction };
   } catch {
     return undefined; // logged by the caller's status surface; the form still opens
   }
@@ -135,9 +135,11 @@ export async function openConnectionEditor(
       ) {
         // Rebuild the descriptors HERE, so the grouping/typing rules live in the one tested module
         // rather than being reimplemented in webview script.
+        // Answered only while the page that asked is still the one showing (postToSameRender).
+        const asked = requestToken(m);
         const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
         if (rebuilt) {
-          void postToWebview(current.webview, { command: "fields", groups: rebuilt.groups });
+          void postToSameRender(current.webview, asked, { command: "fields", groups: rebuilt.groups });
         }
       }
     },
@@ -246,6 +248,9 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
 export interface FormSchema {
   transports: string[];
   groups: FieldGroup[];
+  /** What `groups` was built for. A new connection's pickers show these, so they match the fields. */
+  transport: string;
+  direction: "inbound" | "outbound";
 }
 
 export function connectionFormHtml(
@@ -373,6 +378,7 @@ export function connectionFormHtml(
     routers,
     transports: form?.transports?.length ? form.transports : TRANSPORTS,
     fieldGroups: form?.groups ?? null,
+    fieldGroupsFor: form ? { transport: form.transport, direction: form.direction } : null,
     siblings,
     clone,
   })}

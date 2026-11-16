@@ -38,6 +38,9 @@ checks the signature too, and refuses only the proven case, which is
 that a start loads with a warning, so this reload holds back some files a start would load. The
 remedy says which (vault BACKLOG #3506): a proven bad signature is a file to fix, and one the engine
 could not confirm asks for a check, then a restart, since such a file can be right.
+A hop that checks revocation for the whole chain, at least the API listener, must also find
+each CA it lists with a CRL of its own in the file (:func:`~messagefoundry.pki.cas_without_own_crl`,
+vault BACKLOG #5627), the rule a start applies there, so a file that fails it is a file to fix.
 The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
 not in it, so a CRL that intermediate issued is refused with :data:`NO_ISSUER`. That refusal is
 retried every pass, because a CA directory adds a CA to the store only when a handshake first needs
@@ -127,6 +130,7 @@ from messagefoundry.config.loaded_crls import (
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import (
+    context_checks_chain_revocation,
     crl_in_effect,
     crl_label,
     crl_not_in_effect,
@@ -141,7 +145,9 @@ from messagefoundry.pki import (
     CrlFacts,
     CrlIssuerKey,
     CrlSignatureFinding,
+    cas_without_own_crl,
     crl_signature_finding,
+    own_crl_refusal,
     quoted_issuer,
 )
 from messagefoundry.redaction import log_timestamp
@@ -874,6 +880,7 @@ def _load(
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
     reloaded = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
+    unowned: dict[frozenset[bytes], str | None] = {}  # why the own-CRL rule refuses, if it does
     for ctx, held, held_back in ready:
         if held_back is not None:
             # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
@@ -893,7 +900,27 @@ def _load(
                 continue
             if anchors not in signatures:
                 signatures[anchors] = crl_signature_finding(pem, anchors)
-            if (unsigned := signatures[anchors]) is not None:
+            unsigned = signatures[anchors]
+            # In a start's order: a proven bad signature, then the own-CRL rule, then a signature
+            # short of proof. A start refuses the first two, so each is a file to fix, and the
+            # third would send the operator to a restart the own-CRL rule then refuses.
+            if unsigned is not None and unsigned.state == "bad":
+                refusals.add(f"{label}: {unsigned.why}", BAD_SIGNATURE)
+                continue
+            if context_checks_chain_revocation(ctx):
+                # Vault BACKLOG #5627: the rule a start applies to a hop checking the whole chain,
+                # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
+                # loads live.
+                if anchors not in unowned:
+                    try:
+                        missing = cas_without_own_crl(anchors, pem)
+                        unowned[anchors] = own_crl_refusal(missing) if missing else None
+                    except ValueError as exc:  # a start refuses the same file, naming it
+                        unowned[anchors] = f"it could not be checked against the hop's CAs: {exc}"
+                if (unowned_why := unowned[anchors]) is not None:
+                    refusals.add(f"{label}: {unowned_why}", FIX)
+                    continue
+            if unsigned is not None:
                 refusals.add(f"{label}: {unsigned.why}", _SIGNATURE_REMEDY[unsigned.state])
                 continue
             if held_back is not None:

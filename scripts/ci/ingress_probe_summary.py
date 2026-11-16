@@ -18,7 +18,8 @@ MSYS argument conversion. It accepts exactly the two line shapes ``harness/load/
 prints:
 
 * a measurement: ``RESULT rate=.. sent=.. acked=.. stranded=.. pct=.. read=.. written=.. sink=..
-  backlog=.. ok=.. wall=..``, every key present once and no other;
+  backlog=.. ok=.. no_loss=.. wall=..``, every key present once and no other, where ``no_loss`` is
+  ``OK``, ``LOSS`` or ``INCONCLUSIVE`` and must agree with ``ok`` (BACKLOG #5574);
 * a setup failure: ``RESULT rate=.. ERROR=<reason>``, after which the probe stops repeating.
 
 Every value is checked against a pattern for its key before it is written anywhere. A line whose
@@ -49,6 +50,7 @@ _DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?")
 # The probe prints the rate with `:g`, which uses an exponent from 1e6 upward and below 1e-4.
 _RATE = re.compile(r"[0-9]+(\.[0-9]+)?(e[+-][0-9]+)?")
 _BOOL = re.compile(r"True|False")
+_VERDICT = re.compile(r"OK|LOSS|INCONCLUSIVE")
 _REASON = re.compile(r"[a-z_]{1,64}")
 
 _MEASUREMENT: dict[str, re.Pattern[str]] = {
@@ -65,6 +67,7 @@ _MEASUREMENT: dict[str, re.Pattern[str]] = {
     "sink": _INT,
     "backlog": _SIGNED_INT,
     "ok": _BOOL,
+    "no_loss": _VERDICT,
     "wall": _DECIMAL,
 }
 _SETUP_FAILURE: dict[str, re.Pattern[str]] = {"rate": _RATE, "ERROR": _REASON}
@@ -99,6 +102,9 @@ def parse_line(line: str) -> dict[str, str]:
     for key, pattern in schema.items():
         if not pattern.fullmatch(pairs[key]):
             raise MalformedResult(f"{key}= value does not match {pattern.pattern}")
+    # A row whose two readings of one verdict disagree is a broken probe, not a measurement.
+    if "ok" in pairs and (pairs["ok"] == "True") != (pairs["no_loss"] == "OK"):
+        raise MalformedResult(f"ok={pairs['ok']} contradicts no_loss={pairs['no_loss']}")
     return pairs
 
 
@@ -109,7 +115,7 @@ def render_row(pairs: dict[str, str]) -> str:
     p = pairs
     return (
         f"| {p['rate']}/s | {p['sent']} | {p['acked']} | {p['stranded']} | {p['pct']}% "
-        f"| {p['read']} | {p['ok']} |"
+        f"| {p['read']} | {p['no_loss']} |"
     )
 
 

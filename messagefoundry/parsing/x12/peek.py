@@ -27,6 +27,7 @@ from messagefoundry.parsing.x12.delimiters import (
     Delimiters,
     discover_delimiters,
     find_isa_start,
+    iter_segments,
 )
 from messagefoundry.parsing.x12.errors import X12PeekError
 
@@ -90,7 +91,8 @@ class X12Peek:
         """Peek the interchange that starts ``raw`` (after any leading whitespace/BOM).
 
         Raises :class:`X12PeekError` if the bytes are not a parseable X12 interchange (no ISA,
-        truncated/malformed ISA, non-distinct delimiters) or exceed ``max_bytes``."""
+        truncated/malformed ISA, non-distinct delimiters, the element separator or segment terminator
+        in ISA element data) or exceed ``max_bytes``."""
         if isinstance(raw, (bytes, bytearray)):
             raw = bytes(raw).decode("utf-8", "replace")
         if max_bytes is not None and len(raw) > max_bytes:
@@ -160,17 +162,8 @@ class X12Peek:
 
     def _iter_segments(self) -> Iterator[list[str]]:
         """Yield each segment of the first interchange as a list of elements (``[tag, e1, e2, …]``),
-        stopping after ``IEA``. Tolerates cosmetic whitespace between segments."""
-        element = self.delimiters.element
-        terminator = self.delimiters.segment
-        for chunk in self.raw[self.isa_start :].split(terminator):
-            stripped = chunk.lstrip(" \t\r\n")
-            if not stripped:
-                continue
-            fields = stripped.split(element)
-            yield fields
-            if fields[0] == "IEA":
-                return
+        stopping after ``IEA``. The body is tokenized only past the fixed-width ISA."""
+        return iter_segments(self.raw, self.isa_start, self.delimiters)
 
     def groups(self) -> list[X12Group]:
         """Every functional group in the interchange, with its transaction-set ids. Empty if none."""

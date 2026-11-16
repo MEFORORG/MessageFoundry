@@ -431,6 +431,10 @@ HANDLED_CONTAINERS: dict[str, str] = {
         "topology, not a secret (ADR 0154 D6): both are in every handshake's certificates, and "
         "masking them would hide the access-control decision from the operator who audits it"
     ),
+    "trusted_proxies": (
+        "the HTTP listener's reverse-proxy addresses and networks (BACKLOG #5525) -- topology, not "
+        "a credential, and masking it would hide which peers the budget trusts"
+    ),
     "tls_client_subjects": (
         "the MLLP listener's expected senders, issuing-CA DNs mapped to certificate subject names "
         "(BACKLOG #4907) -- topology, not a secret, for the reason intake_client_subjects gives"

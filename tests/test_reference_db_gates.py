@@ -124,6 +124,13 @@ def _patch_pool(monkeypatch: pytest.MonkeyPatch, rows: list[tuple[Any, ...]]) ->
         return pool
 
     monkeypatch.setattr(database, "_make_pool", fake_make_pool)
+
+    async def no_probe(*_a: object, **_k: object) -> database.LoginRoleReading:
+        # The role probe has tests of its own; here it would borrow and close the one shared fake
+        # cursor first, so an assertion that the statement path closed it would pass vacuously.
+        return database.LoginRoleReading(database.LoginRoleVerdict.CLEAN)
+
+    monkeypatch.setattr(database, "probe_login_roles", no_probe)
     return pool
 
 

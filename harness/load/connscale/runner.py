@@ -85,6 +85,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import RIG_SESSION
 from harness.load.sender import _BACKOFF_MAX
 from harness.load.sink import CorrelationSink
@@ -380,6 +381,8 @@ async def run_connscale(
                                 break
                             records.append(record)
                             step += 1
+    if not records:
+        notes.append("NO STEP WAS RECORDED: the sweep measured nothing, so the run fails")
     slos = _evaluate_slos(profile, records)
     comparison: ClaimModeComparison | None = build_comparison(
         records, profile.claim_modes, missing_detail=missing_detail
@@ -405,7 +408,9 @@ async def run_connscale(
     # misses it can pair against a present arm: in a fusion A/B, a cell whose B0 and B1 both failed to
     # start leaves no row and no baseline gap, so nothing else would fail it.
     result_ok = (
-        steps_missed == 0
+        # A sweep that recorded nothing measured nothing, whatever its SLOs read (BACKLOG #5432).
+        bool(records)
+        and steps_missed == 0
         and all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
@@ -530,6 +535,7 @@ async def _run_one_step(
             sandbox_mode=sandbox_mode,
             mode=mode,
             count=count,
+            trial=trial,
             aggregate_rate=aggregate_rate,
             sink_host=sink_host,
             base_env=base_env,
@@ -556,6 +562,7 @@ async def _run_started_step(
     sandbox_mode: str,
     mode: str,
     count: int,
+    trial: int,
     aggregate_rate: float,
     sink_host: str,
     base_env: Mapping[str, str],
@@ -775,16 +782,22 @@ async def _run_started_step(
         # `_build_record` hands `_reconcile`, and the audit has to be triggered by the shortfall the
         # step will actually REPORT. The two diverge on the drain-timeout path, where the local
         # `final` can be None while the poller still holds an earlier sample.
+        # A counter reset makes the read delta no run total, so neither shortfall below may be
+        # read off it (BACKLOG #5574); `_build_record` reads the same poller for the reconcile.
+        counter_reset = _counter_reset(poller)
         read_short = _read_shortfall(
             metrics.counters,
             poller.baseline,
             poller.final,
             unconfirmed_budget=count,
+            counter_reset=counter_reset,
             reload_stranded=reload_account.stranded if reload_account is not None else 0,
         )
         # The part no excusal forgives, computed HERE because only this side knows whether the
         # excusal was clamped. The audit must not re-derive it -- see `_unexplained_shortfall`.
-        unexplained_short = _unexplained_shortfall(metrics.counters, poller.baseline, poller.final)
+        unexplained_short = _unexplained_shortfall(
+            metrics.counters, poller.baseline, poller.final, counter_reset=counter_reset
+        )
         # The two NOT_RUN reasons answer different questions, and each is stated at the branch it
         # describes. The disabled one has to be reachable on a step that DID have a shortfall: "no
         # shortfall to attribute" printed on a failing step is a false statement about the run, in
@@ -792,6 +805,21 @@ async def _run_started_step(
         # artifact to read.
         if ledger is None:
             audit_live = intake_audit.not_run(_AUDIT_DISABLED, moment=intake_audit.MOMENT_LIVE)
+        elif poller.baseline is None or poller.final is None:
+            # As under a reset below: "no shortfall" would be a false statement, since there is no
+            # read to compare the sends with. The post-mortem still checks every confirmed send.
+            audit_live = intake_audit.not_run(
+                "the engine metrics are unavailable, so there is no count shortfall to attribute",
+                moment=intake_audit.MOMENT_LIVE,
+            )
+        elif counter_reset is not None:
+            # "No shortfall" would be a false statement here: the counts cannot say either way.
+            # The post-mortem below still checks every confirmed send for a row.
+            audit_live = intake_audit.not_run(
+                f"{counter_reset} -- the read delta is no run total, so there is no count "
+                f"shortfall to attribute",
+                moment=intake_audit.MOMENT_LIVE,
+            )
         elif read_short > 0:
             audit_live = await intake_audit.run_intake_audit(
                 ledger,
@@ -852,6 +880,7 @@ async def _run_started_step(
             reload_account=reload_account,
             per_lane_wake=_effective_per_lane_wake(node_env),
             sandbox=sandbox,
+            trial=trial,
         )
     finally:
         for task in sampler_tasks:
@@ -1756,6 +1785,9 @@ def _build_record(
     fd_probe_root_pid: int | None = None,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
+    # Required, like the other axes: a default would file a forgotten trial as trial 0 and chain the
+    # repeats into one lane again (BACKLOG #5570).
+    trial: int,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1765,7 +1797,15 @@ def _build_record(
     # rate x ACK-latency): `_reconcile` treats the count only as a small-run FLOOR under its
     # half-the-run fraction, and its separate intake floor keeps `read >= sent // 2` required here
     # even when `count` exceeds half the step's sends (the short-hold smoke cells).
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=count, reload=ra)
+    no_loss = _reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=count,
+        drain_seconds=drain_seconds,
+        counter_reset=_counter_reset(poller),
+        reload=ra,
+    )
     live = audit_live if audit_live is not None else intake_audit.not_run("audit not wired")
     post = audit_final if audit_final is not None else intake_audit.not_run("audit not wired")
     # BACKLOG #1292: ATTRIBUTE the reconcile's own failure text, never soften it. `ok` is untouched --
@@ -1774,6 +1814,10 @@ def _build_record(
     # currently gives them only a number they cannot act on.
     if not no_loss.ok and post.verdict != intake_audit.VERDICT_NOT_RUN:
         no_loss = replace(no_loss, detail=f"{no_loss.detail}; {post.summary()}")
+        # The per-message audit can PROVE what the counts could only leave open: an accept-ACKed
+        # message absent from the store is a loss, so the step is not INCONCLUSIVE (BACKLOG #5574).
+        if post.engine_suspect:
+            no_loss = replace(no_loss, inconclusive=False)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
     # Wall #1: executor saturation (None when the shim isn't installed → all-None samples).
@@ -1821,6 +1865,9 @@ def _build_record(
     return ConnScaleRecord(
         sweep_mode=mode,
         count=count,
+        # The repeat of this cell, so the monotonicity pairing keeps each trial in its own lane
+        # (BACKLOG #5570).
+        trial=trial,
         offered_aggregate_rate=aggregate_rate,
         sent=c.sent,
         acked=c.acked,
@@ -1938,19 +1985,28 @@ def _read_shortfall(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    counter_reset: str | None,
     reload_stranded: int = 0,
 ) -> int:
     """``confirmed sent - engine_read`` -- the shortfall ``_reconcile`` reports as intake loss, and
-    the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable (there is then no
-    shortfall to attribute; ``_reconcile`` fails the step on its own for that)."""
-    if base is None or final is None:
+    the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable, or when the
+    engine counters reset mid-step (``counter_reset``, from
+    :func:`harness.load.report._counter_reset`): ``final.read - base.read`` is then no run total,
+    so there is no shortfall to attribute, and ``_reconcile`` reports the step INCONCLUSIVE on its
+    own (BACKLOG #5574). Required, with no default, so a caller cannot hand the audit a phantom
+    shortfall by omission."""
+    if base is None or final is None or counter_reset is not None:
         return 0
     ex = _excusal(c, unconfirmed_budget=unconfirmed_budget, reload_stranded=reload_stranded)
     return c.sent - ex.excused - (final.read - base.read)
 
 
 def _unexplained_shortfall(
-    c: Counters, base: EngineSample | None, final: EngineSample | None
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    counter_reset: str | None,
 ) -> int:
     """The part of the shortfall NO excusal can forgive -- ``sent - unconfirmed - engine_read``.
 
@@ -1968,8 +2024,10 @@ def _unexplained_shortfall(
     definition of the population. Do not swap in ``_excusal(...).unconfirmed``: since BACKLOG #1292
     that EXCLUDES the reload-stranded sends, and using it would put them back into this remainder,
     so the audit would call a reload-stranded gap a gauge finding.
+
+    0 under a counter reset, for the reason ``_read_shortfall`` gives (BACKLOG #5574).
     """
-    if base is None or final is None:
+    if base is None or final is None or counter_reset is not None:
         return 0
     return c.sent - c.timeouts - (final.read - base.read)
 
@@ -1980,23 +2038,41 @@ def _reconcile(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    drain_seconds: float | None,
+    counter_reset: str | None,
     reload: _ReloadAccount | None = None,
 ) -> NoLoss:
+    """The step's no-loss verdict: PASS, LOSS, or INCONCLUSIVE (``ok`` False, ``inconclusive``).
+
+    INCONCLUSIVE is the step that cannot clear itself although no arm proved a loss (BACKLOG
+    #5574), in the shapes ``harness.load.report._reconcile`` names: the engine metrics are
+    missing, nothing was sent, nothing was delivered, the drain timed out (``drain_seconds`` None),
+    rows are still in some stage, or the engine counters reset mid-step. ``counter_reset`` is
+    :func:`harness.load.report._counter_reset` over the step's poller, or None when it saw none.
+    Both are required, with no default, so a caller that forgets one cannot pass by omission.
+    """
     sent = c.sent
     sink_received = c.sink_received
+    # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
+    # and must not skip the arms that read only client counters: those still prove a loss without
+    # the engine (BACKLOG #5574). The stand-ins 0/0/-1 are what a band report carries for "no
+    # reading" (the batch-box aggregate reads the -1).
+    metrics_missing = base is None or final is None
     if base is None or final is None:
-        return NoLoss(
-            False,
-            sent,
-            0,
-            0,
-            sink_received,
-            -1,
-            "engine metrics unavailable — cannot verify no-loss",
-        )
-    read = final.read - base.read
-    written = final.written - base.written
-    backlog = final.backlog
+        read, written, backlog = 0, 0, -1
+    else:
+        read = final.read - base.read
+        written = final.written - base.written
+        # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
+        backlog = final.backlog
+    # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
+    # the engine deltas may rest on it; the load copy's reasoning is the source of record. The arms
+    # that read only client counters (the stranding budget and the reload guards) still prove a loss
+    # across it, as the load copy keeps its dead-ACK-path signature. A negative delta is not
+    # published.
+    engine_judged = counter_reset is None and not metrics_missing
+    if not engine_judged:
+        read, written = max(0, read), max(0, written)
     # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
     # or the stop-grace expiring) is UNCONFIRMED, not lost: `sent` was counted at write-buffer time, so
     # the frame may never have left the closed socket. Requiring `read >= sent` false-fails exactly when
@@ -2067,6 +2143,7 @@ def _reconcile(
     # COUNTS: one duplicated outbound row, or one row carried over from before the baseline, cancels
     # one lost message. Only a per-message audit separates them.
     write_short = read - written
+    # The whole pipeline, not the outbound stage alone: see EngineSample.backlog (BACKLOG #5433).
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
     # applies to a step that offered nothing at all (`sent == 0`, e.g. a zero-rate lane).
@@ -2082,21 +2159,41 @@ def _reconcile(
     not_back = offered and reload is not None and reload.not_reconnected > 0
     no_sends = offered and sent_after == 0
     no_reply = offered and sent_after > 0 and replies_after == 0
-    ok = (
-        read_short <= 0
-        and floor_short <= 0
-        and deliver_short <= 0
-        and write_short <= 0
-        and drained
-        and not over_budget
-        and not (not_back or no_sends or no_reply)
-    )
+    # `write_short` proves a loss only once the pipeline is empty: before that, a message still in
+    # ingress or routed reads exactly like a dead-letter, so an undrained step is INCONCLUSIVE on
+    # it rather than LOSS (BACKLOG #5574).
+    write_lost = write_short > 0 and drained
+    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost
+    lost = (engine_judged and engine_lost) or over_budget or not_back or no_sends or no_reply
+    # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
+    # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
+    # undelivering step satisfies trivially.
+    unproven: list[str] = []
+    if metrics_missing:
+        unproven.append("engine metrics unavailable — cannot verify no-loss")
+    elif counter_reset is not None:
+        unproven.append(
+            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
+            f"sends, so the intake and delivery arms were not judged"
+        )
+    if sent == 0:
+        unproven.append("nothing was sent — the step measured nothing")
+    elif sink_received == 0 and written <= 0 and not metrics_missing:
+        unproven.append(
+            f"nothing was delivered (sink_received 0, engine_written {written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    ok = not lost and drained and not unproven
     parts: list[str] = []
-    if read_short > 0:
+    if not engine_judged:
+        pass  # the engine-delta arms were not judged; `unproven` says why
+    elif read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
         )
-    if floor_short > 0:
+    if engine_judged and floor_short > 0:
         of_what = (
             f"the {population} send(s) the reload probe did not strand"
             if stranded
@@ -2106,11 +2203,18 @@ def _reconcile(
             f"engine_read {read} < intake floor {population // 2} (half of {of_what}) — "
             f"the unconfirmed-send excusal cannot lower this floor"
         )
-    if deliver_short > 0:
+    if engine_judged and deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if write_short > 0:
+    if not engine_judged:
+        pass
+    elif write_short > 0 and not drained:
+        parts.append(
+            f"engine_written {written} < engine_read {read} with rows still in the pipeline — "
+            f"not judged as a loss until it drains"
+        )
+    elif write_short > 0:
         naked = (
             f"; {c.nak} send(s) were NAKed, and a NAK counts here only where its row was recorded"
             if c.nak
@@ -2118,11 +2222,15 @@ def _reconcile(
         )
         parts.append(
             f"engine_written {written} < engine_read {read} ({write_short} read but never "
-            f"delivered; causes include a dead-letter, a worker refusal, a rejection recorded "
-            f"before its NAK, and a message still in an earlier stage{naked})"
+            f"delivered; causes include a dead-letter, a worker refusal, and a rejection "
+            f"recorded before its NAK{naked})"
         )
-    if not drained:
-        parts.append(f"backlog {backlog} not drained")
+    if not drained and final is not None:
+        parts.append(
+            f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
+            f"in_pipeline {final.in_pipeline} not done in any stage)"
+        )
+    parts.extend(unproven)
     if not_back and reload is not None:
         parts.append(
             f"{reload.not_reconnected} connection(s) never came back "
@@ -2148,6 +2256,13 @@ def _reconcile(
             f"({budget} = max(connections, {of_run})) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
         )
+    elif unconfirmed > 0 and not engine_judged:
+        # No intake reading to compare them with: a reset clamps `read` and missing metrics zero
+        # it, so "not observed at intake" would be read off a stand-in (BACKLOG #5574).
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) — not counted "
+            f"as loss; intake was not judged, so whether they reached the engine is unknown"
+        )
     elif unconfirmed > 0 and read < sent:
         # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.
         parts.append(
@@ -2169,7 +2284,9 @@ def _reconcile(
         if parts
         else "read>=sent, written>=read, sink_received>=written, backlog drained"
     )
-    return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
+    return NoLoss(
+        ok, sent, read, written, sink_received, backlog, detail, inconclusive=not ok and not lost
+    )
 
 
 def _no_reply_detail(reload: _ReloadAccount, sent_after: int) -> str:
@@ -2535,8 +2652,14 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     out: list[SloCheck] = []
     slo = profile.slo
     if slo.zero_loss:
-        all_ok = all(r.no_loss.ok for r in records)
-        out.append(SloCheck("zero_loss", True, all_ok, all_ok))
+        # `all()` over nothing is True, so a sweep that kept no record would read zero-loss PASS;
+        # this function is shared with the batch-box aggregate, so the guard is here (BACKLOG #5432).
+        # An empty list says so, rather than reading as a message loss.
+        if not records:
+            out.append(SloCheck("zero_loss", True, "no step was recorded", False))
+        else:
+            all_ok = all(r.no_loss.ok for r in records)
+            out.append(SloCheck("zero_loss", True, all_ok, all_ok))
     if profile.intake_audit:
         # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
         # zero_loss is a per-COUNT one, so they can disagree, and each disagreement is informative.
@@ -2567,10 +2690,11 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
             SloCheck("intake_audit", "no accept-ACKed message absent", observed, not suspect)
         )
     if slo.max_drain_seconds is not None:
-        worst = max(
-            (r.drain_seconds for r in records if r.drain_seconds is not None),
-            default=None,
-        )
+        # A timed-out drain (None) POISONS the worst case, as in the batchbox and compare copies:
+        # dropping it let any sibling that drained in time mask the step that never did (BACKLOG
+        # #5434).
+        drains = [r.drain_seconds for r in records]
+        worst = None if not drains or None in drains else max(d for d in drains if d is not None)
         ok = worst is not None and worst <= slo.max_drain_seconds
         out.append(
             SloCheck(
@@ -2859,8 +2983,8 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     The run-level bound that some group actually had a pair to compare lives in
     ``tests/test_connscale_smoke.py`` (WALL #4 NEVER COMPARED), because only a real run knows whether
     the metric was measurable. Any new caller needs its own such bound or it inherits the hole."""
-    # The pairing itself — including the group-by-(sweep_mode, claim_mode) rule BACKLOG #1101 records
-    # as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
+    # The pairing itself — including the lane key, `monotonic_lane`, which BACKLOG #1101 and #5570
+    # record as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
     # same function, so a passing run and a failing run cannot describe the sequence differently.
     pairs = monotonic_pairs(records, key, tolerance=tolerance)
     breaches = [p for p in pairs if not p.ok]
@@ -2868,7 +2992,10 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
         "monotonic"
         if not breaches
         else "; ".join(
-            f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
+            # A non-finite reading is a broken instrument, not a drop: say so (BACKLOG #5570).
+            f"{p.label}@N={p.count}: reading {p.value} is not finite"
+            if not p.finite
+            else f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
             for p in breaches
         )
     )

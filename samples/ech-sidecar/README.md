@@ -126,13 +126,19 @@ cleartext note under `[egress]` in [CONFIGURATION.md](../../docs/CONFIGURATION.m
 `127.0.0.1` in full: a short form such as `127.1` is refused. It is **mutually exclusive** with the `proxy_url` settings key
 (the sidecar *is* that connection's egress proxy) — refused in `RestDestination.__init__`
 ([`transports/rest.py`](../../messagefoundry/transports/rest.py); named by symbol rather than by line,
-because a line number goes stale silently and a wrong one reads as a working reference forever). It
-composes with the connection's TLS verify/allowlist/signing posture.
+because a line number goes stale silently and a wrong one reads as a working reference forever).
+`verify_tls = false` beside it is refused there too (vault BACKLOG #2977). It composes with the
+connection's allowlist/signing posture.
 
 **Both of the connection's outbound hops take the sidecar.** The delivery request and — when the
 connection uses OAuth2 client-credentials or SMART Backend Services — the **token-endpoint POST** are
 each re-addressed to it, so the authorization server's hostname is not left in a cleartext outer
 ClientHello while the payload hop is routed (BACKLOG #1176).
+
+**List the sidecar's `host:port` in `[egress].allowed_ech_sidecar`** (BACKLOG #5528), for the
+example above `allowed_ech_sidecar = ["127.0.0.1:1080"]`, or the connection is refused at config
+load. The upstream `url` still goes in `allowed_http`. The key's row under `[egress]` in
+[CONFIGURATION.md](../../docs/CONFIGURATION.md) states its rules.
 
 **An `http://` sidecar leaves the hop to it cleartext on this host.** The engine logs a WARNING for
 each such connection and lists it as a loosening. What crosses that hop, and how it is reported, is

@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import (
     DICOM,
     FHIR,
@@ -187,6 +188,57 @@ def test_ech_and_proxy_mutually_exclusive_at_construction() -> None:
         _rest(
             ech_egress=True, ech_sidecar="http://127.0.0.1:8123", proxy_url="http://127.0.0.1:3128"
         )
+
+
+def _build_attested(posture: HopPosture, **settings: object) -> object:
+    """Build a REST destination carrying both attestations, so neither the verify-off gate nor the
+    revocation guard is left to refuse it under ``posture``."""
+    full = Rest(url="https://partner.example/ingest").settings
+    full.update(settings)
+    with active_hop_posture(posture):
+        return build_destination(
+            Destination(
+                name="OB_REST",
+                type=ConnectorType.REST,
+                settings=full,
+                tls_hop_attested=True,
+                tls_hop_attested_reason="partner cert pinned out of band",
+                tls_revocation_attested=True,
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
+            ),
+            egress=permitting(full),
+        )
+
+
+@pytest.mark.parametrize("enforcing", [True, False], ids=["enforce", "warn"])
+def test_ech_and_verify_off_refused_at_construction_whatever_attested(
+    enforcing: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2977 item 8. The sidecar, not the engine, makes the TLS connection to the
+    destination, so ``verify_tls=false`` turns off no verification the engine does, and it used to
+    skip the revocation guard. It is refused in either posture, and neither attestation crosses it,
+    as with ``proxy_url``. It is refused before the verify-off gate, so that gate logs no attested
+    crossing and no DISABLED warning for a connection that never builds."""
+    posture = HopPosture(enforcing=enforcing)
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(ValueError, match="ech_egress and verify_tls=false are mutually exclusive"):
+        _build_attested(
+            posture, ech_egress=True, ech_sidecar="http://127.0.0.1:8123", verify_tls=False
+        )
+    assert "DISABLED" not in caplog.text
+    if enforcing:  # the verify-off gate logs an attested crossing only on an enforcing instance
+        assert "ATTESTED" not in caplog.text
+    # CONTROL 1: the same attested verify-off hop with no sidecar builds and logs the same lines, so
+    # the absence above is the refusal's placement and not a log this capture cannot see.
+    caplog.clear()
+    _build_attested(posture, verify_tls=False)
+    assert "DISABLED" in caplog.text
+    if enforcing:
+        assert "ATTESTED" in caplog.text
+    # CONTROL 2: the same ECH hop with verify_tls on builds, so the refusal keys on verify_tls.
+    dest = _build_attested(posture, ech_egress=True, ech_sidecar="http://127.0.0.1:8123")
+    assert isinstance(dest, RestDestination)
+    assert dest._ech_sidecar == "http://127.0.0.1:8123"
 
 
 # --- behavioral: _post actually routes through the (stub) sidecar ---------------------------------

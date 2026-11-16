@@ -138,7 +138,7 @@ against one case that matters, described under
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set both `image:` fields (`copy-tls` and `engine`) to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -179,7 +179,12 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
-  production.
+  production. At least the engine's own secret settings other than the store key, and every
+  `MEFOR_VALUE_*` value, can instead come from a **secrets directory**, one file per setting,
+  mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect` shows as a path
+  only. Which settings it supplies, and which it does not, are listed in
+  [CONFIGURATION.md](../docs/CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
+  `compose.yaml` carries it commented out, with the ownership and modes the engine requires.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
   passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`). Under the default `enforce` the engine
   refuses a group-readable key file ([PHI.md](../docs/PHI.md) §2, *Key files*, which also says what
@@ -224,10 +229,9 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   ([the rule](../docs/SECURITY.md#multi-factor-authentication-totp-wp-14)). An exposed instance with
   `require_mfa=false` is **refused at startup** under the shipped `enforce`, unless
   `[security].allow_single_factor_admin_when_exposed` is set.
-- **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** See
-  [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) for the hops it
-  reaches, and the ones it does not. It has no effect on the alert webhook. It is a CI-only switch
-  for self-signed test containers.
+- **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
+  [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
+  means.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

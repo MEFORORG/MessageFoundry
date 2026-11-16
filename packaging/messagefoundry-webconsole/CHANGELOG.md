@@ -239,18 +239,63 @@ this line.**
 
 ### Fixed
 
+- **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
+  `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
+  `form-action 'self'` because it checks that directive again on the redirect after a form POST.
+  Both now answer 200 with a page that navigates to the same target by meta refresh, with a
+  Continue link as the fallback, and so does `GET /ui/oidc/start` when it skips its interstitial.
+  The CSP is unchanged. The "leaving this site" page and that hop now carry Sign-out and the
+  session watchdog only when the request carries a live session: before, the watchdog on the
+  interstitial sent a browser with no session to the login page before Continue could be clicked.
+  The interstitial sends `Clear-Site-Data: "cache"` to a browser whose session cookie no longer
+  authenticates; the hop does not. Both pages decide through `AuthService.session_shows_signed_in`,
+  which ends a refused session as the watchdog's probe would, except one whose temporary
+  credential has lapsed, which it leaves for the sign-in callback to end and record. Needs the
+  engine seam that carries `AuthService.session_shows_signed_in`.
+- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
+  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
+  changed its terminators. The editor now carries the original's style in a hidden `eol` field
+  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
+  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
+  that set, an empty one included, is refused with the generic "invalid input". A body that starts
+  with a line break keeps it. The seam digest moved because the route's form parser changed, and
+  it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
+
+- **TOTP enrolment no longer drops the first code.** Under the default
+  `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
+  gate refused for want of its own single-use proof, sending the operator to re-auth and losing the
+  code. While no confirm proof is held, the enroll page now shows the secret with a code-less
+  Continue button that takes the operator through that re-auth to the code form first. Enroll and
+  confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
+  the re-rendered page offers the same Continue instead of a form that would drop the next code.
+  The confirm page itself is unchanged. A Continue can be posted while the confirm proof is
+  already held, from another tab or after Back. It now goes to the re-auth and leaves that proof
+  unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
+  grew by that check, so the engine seam moves. (BACKLOG #5931)
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a
   503 a later handler change adds is no longer named as the store's refusal. The console now catches
   the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **An uploaded-log browse, resend or delete that meets a key-service outage says so.** The engine
+  now answers a Vault Transit outage on an uploaded file 503 with `Retry-After`. The console mapped
+  every 503 on those routes to "Uploaded logs are not available on this engine", which tells an
+  administrator to set an uploads directory that is already set. A 503 that carries `Retry-After`
+  now lands on the list page with its own notice, `key_service_busy`, which says nothing was opened,
+  injected or removed and to try again. The no-store 503, which carries no `Retry-After`, keeps its
+  notice. An engine without that change never sends it, so nothing changes there.
+  (`BACKLOG #3734`)
 - **The Approvals page offers no Approve on a held reload that names no config digest.** The
   engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
   Withdraw on the requester's own row, with a note saying why. A held reload's digest parameter
   that is null or not of the form the engine writes is shown as that refusal, never raw.
   Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
   which the page never read. (vault `BACKLOG #3192`, `#3193`)
+- **The Interrupted releases table heads its time column "Cut off or claimed".** It read "Cut off",
+  but a release a restart or an operator interrupt moved keeps its claim time there, not the time
+  it stopped. Its note no longer says every such release was cut off while it ran: it says the
+  engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

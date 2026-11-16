@@ -61,6 +61,8 @@ class SearchSpec:
     def __post_init__(self) -> None:
         # make_spec clamps; a spec built any other way must already be in range, or SQLite would take
         # `LIMIT 0` / `LIMIT -1` (no limit at all) from fetch_limit and the cap would vanish (#2068).
+        # A bool passes the range check (True == 1), so it is refused by type first (#6700).
+        _require_int(self.scan_limit)
         if not 1 <= self.scan_limit <= MAX_SCAN_LIMIT:
             raise ValueError(f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}")
 
@@ -75,12 +77,52 @@ class SearchSpec:
 def newest_first(rows: Iterable[Any]) -> list[Any]:
     """Order fetched candidates newest-first, as the scan walks them. Done here rather than by an
     outer SQL ``ORDER BY``, which would make the database sort the rows with their bodies (and may
-    spill them to temp files) when the rows are already in memory (BACKLOG #2068)."""
+    spill them to temp files) when the rows are already in memory (BACKLOG #2068).
+
+    Equal timestamps tie-break on ``id`` in code-point order. That agrees with each backend's
+    ``ORDER BY received_at DESC, id DESC`` under a binary, a case-insensitive or a default
+    linguistic collation, because every message id is 32 lowercase hex characters (``uuid4().hex``
+    or a truncated SHA-256 hex digest), which sort alike under each of those. A collation with
+    numeric ordering would not agree (BACKLOG #6699)."""
     return sorted(rows, key=lambda r: (r["received_at"], r["id"]), reverse=True)
 
 
 class ContentSearchError(ValueError):
-    """A malformed content-search request (empty needle, both/neither needle kinds, bad field path)."""
+    """A malformed content-search request: at least an empty needle, both or neither needle kinds, a
+    ``field_value`` beside a content substring or with no field path, a bad field path, a bad
+    ``target``, or a ``scan_limit`` not an ``int``."""
+
+
+def _sent(value: str | None) -> str | None:
+    """``value`` unchanged, or ``None`` when it is empty or only whitespace (counts as not sent)."""
+    return value if value and not value.isspace() else None
+
+
+def _text(name: str, value: object) -> str | None:
+    """``value`` when it is a ``str`` or ``None``; anything else, such as a number from a stored
+    preset, is refused here so it is a 400 rather than an ``AttributeError`` (BACKLOG #6700)."""
+    if value is None or isinstance(value, str):
+        return value
+    raise ContentSearchError(f"{name} must be text, not {type(value).__name__}")
+
+
+def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
+    """Whether a request on a route where a needle is optional sent any needle term. A route calls
+    :func:`make_spec` exactly when this is true, so a lone ``field_value`` is refused there rather
+    than dropped (BACKLOG #6700). Any non-empty ``content`` or ``field_path`` counts, spaces only
+    included, so :func:`make_spec` refuses a blank pair with a 400 rather than the route treating it
+    as no needle; a ``field_value`` of only spaces does not count, as it is not sent. A non-str
+    ``field_value`` does not count either, so a malformed one on a preset that carries no needle is
+    left unread, as before; beside a needle, :func:`make_spec` refuses it."""
+    has_value = isinstance(field_value, str) and _sent(field_value) is not None
+    return bool(content or field_path) or has_value
+
+
+def _require_int(scan_limit: object) -> int:
+    """``scan_limit`` itself, refused unless it is an ``int`` (a ``bool`` is refused too, BACKLOG #6700)."""
+    if isinstance(scan_limit, bool) or not isinstance(scan_limit, int):
+        raise ContentSearchError(f"scan_limit must be an int, not {type(scan_limit).__name__}")
+    return scan_limit
 
 
 def make_spec(
@@ -88,33 +130,47 @@ def make_spec(
     content: str | None,
     field_path: str | None,
     field_value: str | None,
-    target: SearchTarget = SearchTarget.BOTH,
+    target: SearchTarget | str = SearchTarget.BOTH,
     scan_limit: int = DEFAULT_SCAN_LIMIT,
 ) -> SearchSpec:
-    """Validate + normalize a content-search request into a :class:`SearchSpec`.
+    """Validate a content-search request into a :class:`SearchSpec`.
 
     Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field path,
-    or a malformed HL7 field path. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
-    has_content = bool(content and content.strip())
-    has_field = bool(field_path and field_path.strip())
-    if has_content == has_field:
+    a ``field_value`` beside a substring or with no field path (it would otherwise be dropped unread),
+    a needle value that is not text, a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
+    is not an ``int`` (a ``bool`` is refused too). A value of only whitespace counts as not sent; any
+    other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match.
+    ``target`` may be the enum or its string value. ``scan_limit`` is clamped into
+    ``[1, MAX_SCAN_LIMIT]``."""
+    limit = max(1, min(_require_int(scan_limit), MAX_SCAN_LIMIT))
+    try:
+        target = SearchTarget(target)
+    except ValueError as exc:
+        raise ContentSearchError("target must be raw, summary or both") from exc
+    needle = _sent(_text("content", content))
+    path = (_text("field_path", field_path) or "").strip()  # a locator: its padding is noise
+    fv = _sent(_text("field_value", field_value))
+    if needle is None and not path and fv is not None:
+        raise ContentSearchError("field_value needs an HL7 field path")
+    if (needle is None) == (not path):
         raise ContentSearchError("provide exactly one of a content substring or an HL7 field path")
-    limit = max(1, min(int(scan_limit), MAX_SCAN_LIMIT))
-    if has_content:
+    if needle is not None:
+        if fv is not None:
+            raise ContentSearchError(
+                "field_value applies only to an HL7 field path, not to content"
+            )
         return SearchSpec(
-            substring=content.strip(),  # type: ignore[union-attr]
+            substring=needle,
             field_path=None,
             field_value=None,
             target=target,
             scan_limit=limit,
         )
     # Field-path needle — validate the path eagerly so a bad path is a 4xx, not a per-row failure.
-    path = field_path.strip()  # type: ignore[union-attr]
     try:
         parse_path(path)
     except HL7PeekError as exc:
         raise ContentSearchError(str(exc)) from exc
-    fv = field_value.strip() if field_value and field_value.strip() else None
     return SearchSpec(
         substring=None,
         field_path=path,

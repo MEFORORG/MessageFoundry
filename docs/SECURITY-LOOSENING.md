@@ -51,16 +51,15 @@ credential-shaped under a neutral header name, over plain `http` off this machin
 of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
-or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, with two exceptions. SFTP: the host key is known only once the server
+or when an SSH host key is unknown. The engine refuses each case below before the credential is
+sent, at a point that depends on the hop. SFTP, for example: the host key is known only once the server
 answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
 builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host, with one exception: on the plain
 `http` row a loopback host still carries a credential, since that hop never leaves this machine.
-Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
+Each refusal offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
 also offers removing them. The engine then judges the hop as one with no credential, under its own
 levers. `Email` and `Direct`
@@ -79,6 +78,7 @@ pointed at one of those levers.
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
 | `[alerts]` SMTP relay login (`email_username`) | `email_use_tls = false` or `email_tls_verify = false`, refused at load (vault BACKLOG #3533) | turn both on; pin the relay's CA with `email_tls_ca_file`; or remove the login |
 | AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
+| The store login (`[store]`, SQL Server and PostgreSQL) | `trust_server_certificate = true` or `encrypt = false` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2) | trust the server's certificate, or pin it with `[store].ssl_root_cert` |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
@@ -116,9 +116,10 @@ engine has not verified, when the lever named beside each is set:
   [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
   an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
   hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
-- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
-  `encrypt = false`.
+  `encrypt = false`, when the connection declares `tls_hop_attested` with its reason. Without that
+  declaration the hop is refused at every posture, whatever `MEFOR_ALLOW_INSECURE_TLS` says (owner
+  ruling 2026-11-14, vault BACKLOG #3533 item 2).
 
 **The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
@@ -259,6 +260,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
+| | `trusted_proxies` on an HTTP listener | `[]` on every `Http()` inbound (*connection-scoped*; any non-empty list is the loosening, named as `listener_trusted_proxies`, because each listed proxy, and every host inside a listed range, may key the failed-attempt budget on any address it writes. BACKLOG #5525; [CONNECTIONS.md](CONNECTIONS.md) has the walk and the range floor) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
@@ -509,10 +511,20 @@ false premise.
 - **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
-  stricter, and is not named. The registry reads the value the load copied into `[auth]`, so the
-  preview `messagefoundry security set` prints reflects the value from before the edit, and can
-  miss a new loosening or keep one just removed. The next `security show` is right, when it can
-  load the whole file.
+  stricter, and is not named. `messagefoundry security show` and the `security set` preview read
+  both limits from the file's `[security]`, the authored values `show` prints. When a
+  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value other than the
+  file's, and that value is itself a loosening, it is named too, after the authored entries and
+  beside any entry for the file's own value, with a risk that starts by naming the variable. Where
+  the load and the `[security]` read disagree with no such variable set, as a concurrent edit
+  between the two reads leaves them, the entry says the two reads disagreed instead. A
+  variable equal to the file's value, or one whose value is no loosening, adds no entry. Only the
+  two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
+  `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
+  and succeeded, so a report the failed load left partial names none, and so does `security show` on a file that does
+  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
+  security editor marks a value above the default it is shown.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -522,6 +534,9 @@ false premise.
 - **Still refused:** a **PHI** instance with fully-open egress refuses to start under **strict enforcement**
   (`enforcement = enforce`, the default; warns at `enforcement = warn`). Leaving this unset keeps
   deny-by-default **on**; [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) says what that does.
+- **Not opened by it:** at least `[egress].allowed_proxy`, `allowed_ech_sidecar` and
+  `allowed_recipient_domains` stay deny-by-default under this opt-out, so an empty one still refuses
+  the forward proxy, the ECH sidecar or the `Email()` destination it gates.
 
 ### `delete_message_bodies_after_days = 0` / `allow_keeping_phi_indefinitely = true` — unbounded PHI retention
 - **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).
@@ -687,13 +702,12 @@ is refused, so an opt-out does nothing and is not reported.
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
   (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, only where the
-  code knows this posture. A plain `ldap://` AD bind is not: it is refused at every posture, and
-  the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
-  BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
-  (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
-  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
-  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
-  know the posture* below).
+  code knows this posture and only in the cells each escape reaches. What `MEFOR_ALLOW_INSECURE_TLS`
+  opens, and what it never opens, the store hop among them, is stated once in
+  [DEPLOYMENT.md](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch). A plain `ldap://` AD
+  bind is not: it is refused at every posture, and the opt-in that this dial used to release,
+  `[auth].ad_allow_insecure_ldap`, was removed (vault BACKLOG #3533). A check that reads no posture
+  refuses the escape whatever the dial says (vault BACKLOG #2354).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
@@ -939,12 +953,17 @@ count is above `0` (vault BACKLOG #2613).
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
 - **What you lose, the unreachable-account page:** the page about one account the directory keeps
-  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so its
-  least delay runs from that account's first failing probe, not from the first outage pass. An
-  `ad_reconcile_outage_passes` above `3`, a longer
-  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
-  than the budget delays it. The `ad_reconcile_outage_passes` row of
-  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes: it pages
+  once `ad_reconcile_outage_passes` of its last `2 * ad_reconcile_outage_passes - 1` probes fail,
+  in a row or alternating with answers (vault BACKLOG #3709). Its time runs from that account's
+  first failing probe, not from the first outage pass. A value of `ad_reconcile_outage_passes`
+  other than `3` changes which failure patterns raise this page, and when. It does not simply
+  delay it: a pattern that pages at one value may never page at another. A longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate
+  larger than the budget, spaces this account's probes further apart, which changes which failures
+  that vary over time raise this page, and when. A failure bounded in time can end before it pages
+  at all. The
+  `ad_reconcile_outage_passes` row of [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
@@ -988,8 +1007,12 @@ count is above `0` (vault BACKLOG #2613).
 > ([ADR 0077](adr/0077-action-bound-step-up.md)).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
-  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
-  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  With the switch off, those routes accept the session-wide step-up window instead. At least a
+  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  completes a pending factor with the user-verification flag, on any session but an `oidc` one,
+  can open that window; that flag is
+  the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
   or export bodies in bulk with no fresh proof.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
@@ -1602,18 +1625,29 @@ count is above `0` (vault BACKLOG #2613).
 > above). It needs its `[ai].endpoint_revocation_attested_reason`.
 - **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
-  checks no CRL and no OCSP. So an `[ai].endpoint` whose host is not loopback is refused under
+  checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
+  `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
+  endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
+  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
+  to a `TlsSettings`.
+  So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
+  the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
+  Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
   comes there, answered 503; `serve` starts, and `messagefoundry check` does not report it.
-- **What you lose:** that refusal. A revoked but unexpired endpoint certificate is then accepted
-  unless something outside the engine stops it, and the API key crosses to whoever holds it.
-  **Setting the flag adds no check on the wire.**
-- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
-  this hop, so `[tls].crl_file` does not reach it and the flag is the only way across under
-  `enforce`. A short-lived endpoint certificate is the main honest basis; put its lifetime in the
-  reason. A gateway on this machine that checks the upstream's revocation itself needs no
-  attestation at all: a loopback endpoint is not refused.
+- **What you lose:** that refusal. Where no CRL is checked on the hop, a revoked but
+  unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
+  crosses to whoever holds it. **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527 a set
+  `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
+  endpoint on an engine started by `serve`, and there it is the other way across under
+  `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
+  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  in that file fails its handshake, and this flag does not change that.
+  For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
+  main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
+  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
@@ -1628,7 +1662,9 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again.
+- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+  unless a set `[tls].crl_file` is checked on it, where the first bullet says (BACKLOG #5527):
+  that hop crosses on its CRL, with or without this pair.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
@@ -1636,9 +1672,9 @@ count is above `0` (vault BACKLOG #2613).
 > same environment. Under `enforce` it is inert: a safe config directory loads as usual, and an
 > unsafe one is refused with an error that names the variable.
 > **`warn` set only in the settings file does not unlock it.** The check runs in every process that
-> loads config, and some of those read no settings file: at least the sandbox worker, and the
-> offline commands that load config before any settings. So the dial has to sit where the escape
-> does.
+> loads config, and some of those read no settings file: at least the offline commands that load
+> config before any settings. So the dial has to sit where the escape does. The sandbox worker is
+> not one of them: it runs the config its parent read and checked, and neither variable reaches it.
 > **The dial in the environment is the instance's dial, not a switch for this check alone.** A
 > `messagefoundry check` run with both variables judges every posture gate at `warn`. To check a
 > config at `enforce`, lock its directory instead.
@@ -1732,8 +1768,9 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
-  hop. If the claim is false, the payload and any credential the connection carries cross in the
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a weakened database TLS hop, and a verify-off HTTP-family
+  egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not
+  read the attestation) and sets no `ech_egress` (why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)). If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
   credential the refusal recognizes over cleartext `http` to a
   host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
@@ -1962,6 +1999,11 @@ count is above `0` (vault BACKLOG #2613).
   build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
   `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
   it.
+- **What else you keep, whatever the scheme:** the sidecar's `host:port` must be on
+  `[egress].allowed_ech_sidecar` (BACKLOG #5528), a deny-by-default list rather than a loosening;
+  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) states its rules. Loopback alone would not
+  bound the hop: without the list a deploying site's connection could send this traffic to whatever
+  listened on a port its author named.
 - **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
   normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
   `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
@@ -2161,7 +2203,11 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
 - **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
   `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in
-  `GET /security/posture`.
+  `GET /security/posture`. The warning and the `vault_privilege_warning` alert still fire, but the
+  alert is keyed on the hop alone, so where engine processes share one store, another process's
+  clean start can resolve it while this accepted over-grant still runs, so a closed alert does not
+  prove the over-grant is gone (what an operator checks:
+  [docs/SECURITY.md](SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap)). The audit row of each start is the record that stays.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is
@@ -2540,7 +2586,7 @@ count is above `0` (vault BACKLOG #2613).
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
-### `service_environment_secret`, `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+### `store_key_in_service_environment`, `service_environment_unobservable` and `secret_in_service_environment`: secrets in the Windows service's environment
 
 > **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
 > Windows service gets its environment. Vault BACKLOG #2595 and #2601.
@@ -2548,45 +2594,82 @@ count is above `0` (vault BACKLOG #2613).
   NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
   `Environment` value. Who can read that key, and how that was measured, is stated once in
   [`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
-- **What is refused:** a store key in those lists, `MEFOR_STORE_ENCRYPTION_KEY` or
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`. `serve` and `supervise` refuse to start on it under
-  **every** `[security].enforcement` setting, before they open the store, and the refusal names
-  the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in the
-  environment, and a secret in a Windows service's NSSM environment, are refused always. They also
+- **What is refused:** an engine secret in those lists. `serve` and `supervise` refuse to start on
+  one under **every** `[security].enforcement` setting, before they open the store, and the
+  refusal names the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in
+  the environment, and a secret in a Windows service's NSSM environment, are refused always. The
+  names are the one list in `messagefoundry/engine_secrets.py`: a store key,
+  `MEFOR_STORE_ENCRYPTION_KEY` or `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`, whose way in is the DPAPI
+  key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
+  other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
+  names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
+  `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
+  a password, since the engine cannot tell which `env()` value is a secret (owner ruling
+  2026-11-14, vault BACKLOG #8212). The refusal never spells one, since the name was read from
+  the registry and may hold a value typed in the wrong place. It counts them: the names are
+  de-duplicated without regard to case, and each is counted once, under the first registry value
+  that sets it, so a name a later value also sets is not counted there. It sends each to the
+  secrets directory, or a value that is not a secret and is the same for every instance to the
+  active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
+  reference names is refused too, and the secrets directory does not supply it, since that
+  provider reads the environment only; the refusal says to drop the reference and put the
+  credential in the secrets directory under the setting it stands for, or else to use
+  `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
+  the bare name `MEFOR_VALUE_`, rather than move it. They also
   refuse a store key in their own environment when they found their service but could not read
-  its lists, since the key most likely came from there. The DPAPI key file is the way in
-  ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)).
-- **`service_environment_secret`: another engine secret is in that list.** The entry names each
-  one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
-  signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
-  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
-  one there and remove it from the list. A secret left in the list is still named and not refused;
-  the refusal is later work under vault BACKLOG #2595.
+  its lists, since the key most likely came from there; another secret in their own environment is
+  not refused then.
+- **`secret_in_service_environment`: what `serve` and `supervise` refuse, read where no refusal
+  ran.** An application that builds the API without them, with `create_app` or
+  `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
+  is named, with the refusal's finding and remedy, only where the refusal would fire
+  (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
+  engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
+  variable is in that service's lists, or the lists could not be read and a store key is in the
+  engine's own environment. A
+  console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
+  interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
+  find its service there and this entry is not named. The reading is taken once per process, and
+  at least `serve`, `supervise` and both factories refuse on it before they serve the API, so the
+  entry reaches a caller that reads the loosenings itself, through `security_loosenings` with a
+  service reading. A factory refuses the app, not the engine: an engine the caller built, and
+  perhaps started, before `create_app(engine)` has already opened its store, and an engine
+  embedded with no API is not refused and has no posture to name it in. Clear it the way the
+  refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
-  machine-wide environment is readable by every local user too. A key in the service's own
-  lists refuses first, so the entry normally means the machine-wide environment.
+  machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
+  key in the service's own lists refuses first, so there the entry normally means the
+  machine-wide environment.
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
-  service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
-  It starts unless the last case applies with a store key in its environment. Check the lists
-  yourself.
-- **How the engine finds its own service:** it walks up through the Python interpreter processes
-  above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
-  service runs there. When that process is anything else, such as a shell, the engine is not a
-  service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
-  shell inside another NSSM service, and names `service_environment_unobservable`.
-- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
-  for the engine's own process. `supervise` logs one WARNING for each entry at start.
+  service, an `nssm.exe` above a process that is neither Python nor `messagefoundry.exe`, or a
+  registry key it could not read. It starts unless the last case applies with a store key in its
+  environment. Check the lists yourself.
+- **How the engine finds its own service:** it walks up through the Python interpreter and
+  `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks
+  the Service Control Manager which service runs there. When that process is anything else, such
+  as a shell, the engine is not a service, unless an `nssm.exe` sits further up. Then it cannot
+  tell a wrapper NSSM starts from a shell inside another NSSM service, and names
+  `service_environment_unobservable`.
+- **Where they are reported:** `secret_in_service_environment` is reported where its bullet above
+  says. The others are reported in the serve-time loosening warning and `GET /security/posture`,
+  each for the engine's own process, and `supervise` logs one WARNING for each of them at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
-  line says so. The reading is taken once, at start.
-- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
-  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+  line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
+  the first reading an app built without them takes.
+- **How to clear them:** remove each variable the entry names or counts from the registry value
+  it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
+  environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  a variable named by a `[secrets].provider = "env"` reference, whose name only your config
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
+  other than a store key that reaches the engine from the machine-wide environment, which is
+  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
+  reference.
 
 ---
 
@@ -2648,7 +2731,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
-| `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
+| `store_key_in_service_environment` / `service_environment_unobservable` / `secret_in_service_environment` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

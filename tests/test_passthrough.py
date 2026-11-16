@@ -43,6 +43,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
 )
 from messagefoundry.transports.passthrough import PassThroughSource
+from tests._passthrough_marker_scope_contract import CASES as PT_MARKER_SCOPE_CASES
 from tests._store_audit import no_operator_audit
 
 
@@ -640,11 +641,11 @@ async def test_resend_to_never_takes_a_marker_as_its_source(pt_store: MessageSto
 # a real SQLite store. What is under test is the GUARD, not any real backend's limits.
 
 
-def _pt_graph() -> Registry:
+def _pt_graph(pt_name: str = "PT_FOO") -> Registry:
     """A graph with a PT inbound (the offending element) plus a normal inbound + outbound."""
     reg = Registry()
     reg.add_inbound(build_inbound_connection("IB_REAL", MLLP(port=2575), router="r"))
-    reg.add_inbound(build_inbound_connection("PT_FOO", PassThrough(), router="r2"))
+    reg.add_inbound(build_inbound_connection(pt_name, PassThrough(), router="r2"))
     reg.add_outbound(build_outbound_connection("OB_REAL", MLLP(host="127.0.0.1", port=2576)))
     return reg
 
@@ -928,4 +929,57 @@ async def test_reload_non_pt_graph_unaffected_on_non_sqlite(
         assert engine.registry_runner is not None and engine.registry_runner.running
     finally:
         await engine.stop()
+        await s.close()
+
+
+@pytest.mark.parametrize("case", PT_MARKER_SCOPE_CASES)
+async def test_passthrough_marker_scope_contract(pt_store: MessageStore, case: Any) -> None:
+    """BACKLOG #5614: a pass-through marker is scoped to its parent's channel, keyless and keyed (the
+    keyed store binds the marker payload's tag to the channel it carries). The Postgres and SQL
+    Server suites run the same contract."""
+    await case(pt_store)
+
+
+def _dashboard_edges(rows: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+    """The /connections destination rows, without the fields read off the wall clock."""
+    return sorted(
+        (r["name"], r["channel_id"], r["destination"], r["queue_depth"], r["written"], r["errored"])
+        for r in rows
+        if r["role"] == "destination"
+    )
+
+
+async def test_a_passthrough_marker_lists_no_connections_edge(tmp_path: Any) -> None:
+    """BACKLOG #5614: a done or dead marker is not a delivery, so the /connections dashboard lists
+    the same destination rows with one as without, and no phantom "IB_REAL > PT_NEXT" edge."""
+    import httpx
+
+    from messagefoundry.api import create_app
+
+    s = await MessageStore.open(tmp_path / "pt_dashboard.db")
+    engine = Engine(s, egress_settings=EgressSettings(deny_by_default=False))
+    engine.add_registry(_pt_graph("PT_NEXT"))  # the PT name _handoff Sends into
+    transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            # The control: one real delivery from IB_REAL, which the dashboard lists as its edge.
+            parent, routed = await _seed_routed(s, routed_id="routed-0", now=100.0)
+            assert await s.transform_handoff(
+                routed_id=routed,
+                message_id=parent,
+                channel_id="IB_REAL",
+                deliveries=[("OB_REAL", "MSH|out")],
+                now=101.0,
+            )
+            assert await _deliver(s, "OB_REAL", now=102.0) == 1
+            before = _dashboard_edges((await client.get("/connections")).json())
+            assert [edge[:3] for edge in before] == [
+                ("IB_REAL \u25b8 OB_REAL", "IB_REAL", "OB_REAL")
+            ]
+            # A done marker, then a dead one, on the same channel.
+            await _handoff(s, outbound=False, routed_id="routed-1")
+            await _handoff(s, outbound=False, depth_capped=True, routed_id="routed-2")
+            after = _dashboard_edges((await client.get("/connections")).json())
+            assert after == before
+    finally:
         await s.close()

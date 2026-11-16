@@ -175,18 +175,63 @@ async def test_config_version_seed_and_bump(store) -> None:
     await c._ensure_tables()
     assert await c.config_version() == 0
     assert c.config_version_cached() == 0
-    assert await c.bump_config_version() == 1
+    assert c.config_digest_cached(0) is None, "a fresh row holds no initiator's digest"
+    assert await c.bump_config_version(digest="digest-1") == 1
     assert c.config_version_cached() == 1
-    assert await c.bump_config_version() == 2
-    # A fresh reader sees the bumped value.
+    assert c.config_digest_cached(1) == "digest-1"
+    # vault BACKLOG #3109: a reader gets the digest with the version, from the same statement.
     other = _coord(store, "nodeB:2:bbbb")
+    assert await other.config_version() == 1 and other.config_digest_cached(1) == "digest-1"
+    assert await c.bump_config_version(digest=None) == 2
+    # A fresh reader sees the bumped value, and not version 1's digest beside it.
     assert await other.config_version() == 2
+    assert other.config_digest_cached(2) is None and other.config_digest_cached(1) is None
+    assert await c.bump_config_version(digest="digest-3") == 3
+    assert await other.config_version() == 3 and other.config_digest_cached(3) == "digest-3"
+
+
+async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
+    """vault BACKLOG #3109: a cluster_config created before config_digest gets the column from the
+    coordinator's schema, and its existing row reads as an unknown digest."""
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute(
+            "CREATE TABLE cluster_config (id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
+            " updated_at FLOAT NOT NULL)"
+        )
+        await cur.execute("INSERT INTO cluster_config VALUES (1, 5, 0)")
+        await conn.commit()
+    c = _coord(store, "nodeA:1:aaaa")
+    await c._ensure_tables()
+    await c._ensure_tables()  # a second run is a no-op
+    assert await c.config_version() == 5 and c.config_digest_cached(5) is None
+    assert await c.bump_config_version(digest="d") == 6 and c.config_digest_cached(6) == "d"
+
+
+async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store) -> None:
+    """vault BACKLOG #3109: an engine that predates the digest still bumps the version, and leaves
+    the previous bump's digest in the row. That digest is stamped with the earlier version, so no
+    reader sets it beside the new one."""
+    a = _coord(store, "nodeA:1:aaaa")
+    await a._ensure_tables()
+    b = _coord(store, "nodeB:2:bbbb")
+    await a.config_version()
+    assert await a.bump_config_version(digest="digest-1") == 1
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute(
+            "UPDATE cluster_config SET config_version = config_version + 1, updated_at = 0"
+        )
+        await conn.commit()
+    assert await b.config_version() == 2 and b.config_digest_cached(2) is None
+    assert await a.bump_config_version(digest="digest-3") == 3
+    assert await b.config_version() == 3 and b.config_digest_cached(3) == "digest-3"
 
 
 async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     """HA-16 clause 2 (sibling reload propagation) over a REAL coordinator: a ConfigConvergenceRunner
     on node B converges when a SECOND coordinator A bumps the shared ``cluster_config`` token in the DB
-    and B's cache is refreshed by an actual DB round-trip (the maintenance step, cluster_sqlserver.py:399).
+    and B's cache is refreshed by an actual DB round-trip (the maintenance step, SqlServerCoordinator._refresh_config_version).
 
     The unit test in tests/test_cluster.py scripts ``config_version_cached`` on a fake coordinator; this
     exercises the full live chain the fake can't — A bumps the DB row → B refreshes its cache from the
@@ -219,15 +264,16 @@ async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     assert reloads == []
 
     # A real operator reload on node A bumps the shared token in the DB.
-    assert await a.bump_config_version() == 1
+    assert await a.bump_config_version(digest=None) == 1
     # B has NOT yet refreshed its cache from the DB, so its convergence poll still reads 0 → no reload.
     # (The cached poll is what gates convergence, so the DB bump alone does nothing until B's tick.)
     assert b.config_version_cached() == 0
     assert await runner.converge_once() is False
     assert reloads == []
 
-    # B's maintenance tick refreshes the cached version from the REAL DB (the config_version() step).
-    assert await b.config_version() == 1
+    # B's maintenance tick refreshes the cached version from the REAL DB (the clamped
+    # _refresh_config_version step, the one the loop runs).
+    assert await b._refresh_config_version() == 1
     assert b.config_version_cached() == 1
     # Now B is behind → it reloads ONCE and advances applied to 1.
     assert await runner.converge_once() is True

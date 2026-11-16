@@ -186,11 +186,11 @@ def _parse_seconds(reps: int) -> float:
 def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     """A Content-Disposition line of many word chars and no ``="`` must not blow up quadratically.
 
-    The header block is attacker-supplied and ``parse_single_file_upload`` runs synchronously on the
-    asyncio event loop, so a quadratic scan here is a whole-engine denial of service, not a slow
-    request. ``_MAX_PART_HEADER_BYTES`` bounds the input as well, but the two controls are independent
-    on purpose: the cap is a size policy someone could reasonably raise, while this bounds what the
-    scan costs at the size the cap admits today.
+    The header block is attacker-supplied, and one regex scan holds the GIL even in the worker
+    thread the upload route parses in, so a quadratic scan here is a whole-engine denial of service,
+    not a slow request. ``_MAX_PART_HEADER_BYTES`` bounds the input as well, but the two controls
+    are independent on purpose: the cap is a size policy someone could reasonably raise, while this
+    bounds what the scan costs at the size the cap admits today.
 
     **This replaced a growth-ratio assertion, and the ratio is why BACKLOG #1385 has this row.** The
     old arm timed the bare regex at n and 4n and required the quotient under 8.0, reasoning that
@@ -302,3 +302,131 @@ def test_realistic_part_header_is_well_under_the_cap() -> None:
         max_file_bytes=1024,
     )
     assert file.filename == "acme.hl7"
+
+
+# --- part-count and text-field caps (BACKLOG #5522) -----------------------------------------------
+
+
+def _field(name: str, value: bytes) -> bytes:
+    return f'Content-Disposition: form-data; name="{name}"'.encode() + b"\r\n\r\n" + value
+
+
+_FILE_PART = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\nMSH|body'
+
+
+def _no_part_parse(head: bytes) -> tuple[str | None, str | None]:
+    raise AssertionError("a part header was parsed")
+
+
+def _parts(n: int) -> list[bytes]:
+    """One file part and ``n - 1`` small text fields: ``n`` parts in all."""
+    return [_FILE_PART] + [_field(f"f{i}", b"v") for i in range(n - 1)]
+
+
+class _SplitRecorder(bytes):
+    """A body that records the ``maxsplit`` every ``split`` on it was given."""
+
+    maxsplits: list[int]
+
+    def split(  # type: ignore[override]
+        self, sep: bytes | None = None, maxsplit: int = -1
+    ) -> list[bytes]:
+        self.maxsplits.append(maxsplit)
+        return super().split(sep, maxsplit)
+
+
+def test_too_many_parts_is_refused_before_any_part_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One part over ``_MAX_PARTS`` is refused with the 400 base error, and no part header is read.
+
+    The sentinel on ``_disposition`` is what makes "refused" mean "refused up front": a cap that
+    parsed the first ``_MAX_PARTS`` parts and then stopped would still raise, but only after it had
+    done the per-part work the cap exists to bound. The next test shows the sentinel can fire."""
+    monkeypatch.setattr(multipart, "_disposition", _no_part_parse)
+    with pytest.raises(MultipartError, match="more parts than the limit") as caught:
+        parse_multipart_form(
+            f"multipart/form-data; boundary={_B}",
+            _body(_parts(multipart._MAX_PARTS + 1)),
+            max_file_bytes=1024,
+        )
+    # 400, not 413: the handler maps the base class to 400 and only the subclass to 413.
+    assert type(caught.value) is MultipartError
+
+
+def test_the_part_parse_sentinel_fires_when_a_part_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control for the sentinel above: on a body the cap admits, the same substitution must
+    raise, or the arm above could pass because the monkeypatch never reached the parse."""
+    monkeypatch.setattr(multipart, "_disposition", _no_part_parse)
+    with pytest.raises(AssertionError, match="a part header was parsed"):
+        parse_multipart_form(
+            f"multipart/form-data; boundary={_B}",
+            _body(_parts(multipart._MAX_PARTS)),
+            max_file_bytes=1024,
+        )
+
+
+def test_the_split_is_bounded_so_many_parts_never_build_a_long_list() -> None:
+    """The cap exists to stop a body of millions of tiny parts from building a segment per part. A
+    refusal reached after an unbounded ``split`` would pass the arms above while that list came
+    back, so the split's own bound is pinned here."""
+    body = _SplitRecorder(_body(_parts(multipart._MAX_PARTS * 4)))
+    body.maxsplits = []
+    with pytest.raises(MultipartError, match="more parts than the limit"):
+        parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
+    assert body.maxsplits, "the parser did not split the body"
+    assert all(0 <= m <= multipart._MAX_PARTS + 2 for m in body.maxsplits), body.maxsplits
+
+
+def test_an_unterminated_body_over_the_part_cap_is_refused() -> None:
+    """With no closing delimiter, a body of ``_MAX_PARTS + 1`` parts is still over the cap. The
+    count must not assume a terminator segment is there to absorb one split."""
+    delim = f"--{_B}".encode()
+    body = b"".join(delim + b"\r\n" + p + b"\r\n" for p in _parts(multipart._MAX_PARTS + 1))
+    with pytest.raises(MultipartError, match="more parts than the limit"):
+        parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
+
+
+def test_an_epilogue_after_the_terminator_does_not_count_as_parts() -> None:
+    """RFC 2046 makes everything after the closing delimiter an ignorable epilogue, so delimiter
+    text there is not a part. A well-formed one-file body with such an epilogue still parses."""
+    epilogue = (f"--{_B}\r\n".encode()) * (multipart._MAX_PARTS * 2)
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", _body([_FILE_PART]) + epilogue, max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body"
+
+
+def test_a_body_at_the_part_cap_still_parses() -> None:
+    """Positive control for the cap: exactly ``_MAX_PARTS`` parts is admitted, so the count includes
+    the closing delimiter correctly and the refusal is not off by one."""
+    form = parse_multipart_form(
+        f"multipart/form-data; boundary={_B}",
+        _body(_parts(multipart._MAX_PARTS)),
+        max_file_bytes=1024,
+    )
+    assert len(form.files) == 1
+    assert len(form.fields) == multipart._MAX_PARTS - 1
+
+
+def test_an_oversized_text_field_is_refused_as_too_large() -> None:
+    """A non-file field past ``_MAX_FIELD_BYTES`` is refused with the 413 subclass. Before the cap a
+    text field was bounded only by the body cap and decoded whole into a ``str``."""
+    big = _field("note", b"x" * (multipart._MAX_FIELD_BYTES + 1))
+    with pytest.raises(MultipartTooLargeError, match="text field .* plain filename parameter"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART, big]), max_file_bytes=1024
+        )
+
+
+def test_a_text_field_at_the_cap_still_parses() -> None:
+    """Positive control: a field of exactly ``_MAX_FIELD_BYTES`` is kept, decoded, beside the file."""
+    value = b"x" * multipart._MAX_FIELD_BYTES
+    form = parse_multipart_form(
+        f"multipart/form-data; boundary={_B}",
+        _body([_FILE_PART, _field("note", value)]),
+        max_file_bytes=1024,
+    )
+    assert form.fields["note"] == value.decode()

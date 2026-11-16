@@ -58,7 +58,7 @@ class _Coordinator(NullCoordinator):
     def config_version_cached(self) -> int:
         return 0
 
-    async def bump_config_version(self) -> int:
+    async def bump_config_version(self, *, digest: str | None) -> int:
         return 0
 
 
@@ -187,6 +187,11 @@ class _RecordingStore:
         # Read first by Engine.start's vault_transit attestation gate (BACKLOG #2337): a keyless
         # store has no Transit key, so the gate does nothing here.
         return CipherInfo(encrypts=False, active_key_id=None)
+
+    def row_sealer(self) -> None:
+        # Read next by Engine.start's row-sealer start probe (ADR 0217 slice 1b-iii): a keyless
+        # store has no sealer, so the probe does nothing here.
+        return None
 
 
 async def test_engine_single_node_resets_and_spawns_no_leader_task() -> None:

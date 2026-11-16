@@ -992,6 +992,9 @@ _ALERT_API = frozenset(
         "count_open_alerts_by_connection",
         "summarize_active_alert_instances",  # #1564 scoped nav-bell aggregate
         "purge_alert_instances",
+        "open_alert_generations",  # BACKLOG #3269 expiry sweep, #4916 resolve fence
+        "resolve_alert_generation",  # BACKLOG #3269
+        "resolve_alert_instances_fenced",  # BACKLOG #4916
     }
 )
 
@@ -1084,6 +1087,7 @@ def test_three_backend_parity_columns() -> None:
         "resolved_at",
         "suspended_until",  # #143 windowed suspend
         "escalation_tier",  # #81 occurrence-driven escalation
+        "raised_by",  # BACKLOG #4916 newest raise's writer, for the resolve fence
     }
     assert _alert_table_columns_sqlite() == expected
     assert _alert_table_columns(pg._SCHEMA) == expected

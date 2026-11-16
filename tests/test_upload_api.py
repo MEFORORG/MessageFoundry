@@ -46,6 +46,7 @@ from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests._deadline_capture import DeadlineCapture, capture_deadlines, expect_cut_off
 from tests._log_absence import assert_capture_sees
+from tests._upload_root import upload_entries
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -365,8 +366,7 @@ async def test_upload_accepts_txt_and_xml(engine: Engine, tmp_path: Path) -> Non
 
 async def test_upload_rejects_binary_container_415(engine: Engine, tmp_path: Path) -> None:
     # ASVS 14.2.8: a metadata-bearing binary container (JPEG/PDF/ZIP incl. DOCX) is refused with HTTP 415
-    # BEFORE anything is written, even under a permitted text extension — so no embedded metadata
-    # (EXIF/XMP/docProps) can be stored (closes "no metadata stripping" without a stripper). The magic
+    # BEFORE anything is written, even under a permitted text extension. The magic
     # bytes are sent as BYTES so they survive multipart encoding; the audit records the shape, never a body.
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
@@ -418,6 +418,29 @@ async def test_upload_rejects_nul_body_415(engine: Engine, tmp_path: Path) -> No
     assert any(a["action"] == "upload.reject" for a in await engine.store.list_audit())
 
 
+async def test_upload_rejects_a_nul_past_the_first_8_kib_415(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #5551: a NUL past the 8 KiB the route used to sample, in an .hl7 whose header
+    passes the sniff, is refused 415 by save()'s whole-body check, and nothing is stored."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    body = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\rPID|1\r" + b"x" * 9000 + b"\x00tail"
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post("/uploads", files={"file": ("late.hl7", body, "text/plain")}, headers=h)
+        assert up.status_code == 415, up.text
+        assert "NUL" in up.json()["detail"]
+        assert "late.hl7" not in up.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+    rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
+    assert len(rej) == 1 and "late" not in str(rej[0]["detail"])
+
+
 async def test_upload_text_formats_pass_text_only_gate(engine: Engine, tmp_path: Path) -> None:
     # ASVS 14.2.8: the permitted text fixtures are UNCHANGED by the text-only 415 gate — a valid .hl7,
     # a plain .txt and a leading-'<' .xml all still upload (200).
@@ -436,6 +459,130 @@ async def test_upload_text_formats_pass_text_only_gate(engine: Engine, tmp_path:
         ):
             up = await c.post("/uploads", files={"file": (name, blob, "text/plain")}, headers=h)
             assert up.status_code == 200, (name, up.text)
+
+
+async def test_upload_parse_runs_in_a_worker_thread(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5522: the multipart parse walks a body of up to ``[store].max_upload_bytes`` part by
+    part, so it runs on the parser's own executor, not on the event-loop thread. The parser is
+    wrapped to record the thread it ran on; the test body runs on the loop, so its thread is the one
+    to avoid. The upload must still succeed, which shows the wrapper was reached on the real path.
+
+    This pins where the per-part Python work runs, not that the loop never stalls: each whole-body
+    ``split``, slice and ``partition`` is one C call that holds the GIL wherever it runs."""
+    pytest.importorskip("psutil")
+    import threading
+
+    from messagefoundry.api import create_app, multipart
+
+    real_parse = multipart.parse_single_file_upload
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def parse(*args: Any, **kwargs: Any) -> multipart.FilePart:
+        seen.append(threading.get_ident())
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post(
+            "/uploads", files={"file": ("acme.hl7", BATCH, "application/octet-stream")}, headers=h
+        )
+        assert up.status_code == 200, up.text
+    assert len(seen) == 1
+    assert seen[0] != loop_thread, "the multipart parse ran on the event-loop thread"
+
+
+async def test_concurrent_upload_parses_hold_at_most_two_threads(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5522: each parse holds transient copies of its body, so the parser's executor runs
+    at most two at once. Four uploads are sent together. Each parse waits until a second one is
+    running (or a generous timeout passes), which makes the overlap certain rather than a matter of
+    timing, then lingers so a third would be seen if the bound let one in. The most that ever ran
+    together must be exactly two, and every upload must succeed."""
+    pytest.importorskip("psutil")
+    import threading
+    import time
+
+    from messagefoundry.api import create_app, multipart
+
+    real_parse = multipart.parse_single_file_upload
+    lock = threading.Lock()
+    two_running = threading.Event()
+    running = 0
+    peak = 0
+
+    def parse(*args: Any, **kwargs: Any) -> multipart.FilePart:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+            if running >= 2:
+                two_running.set()
+        try:
+            two_running.wait(timeout=10)
+            time.sleep(0.2)
+            return real_parse(*args, **kwargs)
+        finally:
+            with lock:
+                running -= 1
+
+    monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ups = await asyncio.gather(
+            *(
+                c.post(
+                    "/uploads",
+                    files={"file": (f"f{i}.hl7", BATCH, "application/octet-stream")},
+                    headers=h,
+                )
+                for i in range(4)
+            )
+        )
+    assert [u.status_code for u in ups] == [200] * 4, [u.text for u in ups]
+    assert peak == 2, f"{peak} upload parses ran at once; the bound is 2"
+
+
+async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #5522: through the route, too many parts is a 400 (the base ``MultipartError``) and an
+    oversized text field is a 413 (``MultipartTooLargeError``). Nothing is stored either way."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app, multipart
+
+    def body_of(parts: list[bytes]) -> bytes:
+        return b"".join(b"--B\r\n" + part + b"\r\n" for part in parts) + b"--B--\r\n"
+
+    file_part = (
+        b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n' + BATCH.encode()
+    )
+
+    def field(i: int, size: int) -> bytes:
+        return f'Content-Disposition: form-data; name="f{i}"\r\n\r\n'.encode() + b"v" * size
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = {**await _login(c, "op"), "Content-Type": "multipart/form-data; boundary=B"}
+        many = body_of([file_part] + [field(i, 1) for i in range(multipart._MAX_PARTS)])
+        r = await c.post("/uploads", content=many, headers=h)
+        assert r.status_code == 400, r.text
+        big = body_of([file_part, field(0, multipart._MAX_FIELD_BYTES + 1)])
+        r = await c.post("/uploads", content=big, headers=h)
+        assert r.status_code == 413, r.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
 
 
 async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_path: Path) -> None:
@@ -1528,7 +1675,7 @@ async def test_a_create_row_that_fails_removes_the_stored_file(
         assert deleted == []
     else:
         assert await us.list_files() == []
-        assert not list((tmp_path / "uploads").iterdir())
+        assert not upload_entries(tmp_path / "uploads")
         assert [row["actor"] for row in deleted] == ["system"]
 
 
@@ -1929,3 +2076,46 @@ async def test_a_refused_upload_read_through_a_route_alerts_without_promising_a_
         assert "unsealed for good, an operator may delete it" in reason
         assert "docs/PHI.md section 3 names at least some kinds neither can remove" in reason
         assert "until" not in reason and "acme" not in reason and fid not in reason
+
+
+async def test_a_lone_field_value_on_an_upload_browse_is_refused(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #6700: browse_uploaded_file ran make_spec only beside content or field_path, so a
+    lone field_value was dropped and the whole file came back as though filtered. Control: beside a
+    field path the same value filters to the one matching message."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post(
+            "/uploads", files={"file": ("acme.hl7", BATCH, "application/octet-stream")}, headers=h
+        )
+        assert up.status_code == 200, up.text
+        fid = up.json()["file_id"]
+        lone = await c.post(
+            f"/uploads/{fid}/messages/search", json={"field_value": "MRN123"}, headers=h
+        )
+        assert lone.status_code == 400, lone.text
+        assert "field_value needs an HL7 field path" in lone.json()["detail"]
+        ok = await c.post(
+            f"/uploads/{fid}/messages/search",
+            json={"field_path": "PID-3", "field_value": "MRN123"},
+            headers=h,
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["matched"] == 1
+        # A blank field_value is not a needle, so the browse stays an unfiltered one.
+        blank = await c.post(
+            f"/uploads/{fid}/messages/search", json={"field_value": "   "}, headers=h
+        )
+        assert blank.status_code == 200, blank.text
+        assert blank.json()["matched"] == 2
+        # A content of only spaces is refused, as on origin/main: it must not browse the whole
+        # file as though it had filtered it.
+        spaces = await c.post(f"/uploads/{fid}/messages/search", json={"content": "   "}, headers=h)
+        assert spaces.status_code == 400, spaces.text

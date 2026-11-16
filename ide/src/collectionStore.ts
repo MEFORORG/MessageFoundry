@@ -94,6 +94,8 @@ function isCollection(v: unknown): v is TestCollection {
         isRecord(c) &&
         typeof c.name === "string" &&
         typeof c.input === "string" &&
+        // Absent on a case saved before #5416; any other non-string would loosen its judging.
+        (c.disposition === undefined || typeof c.disposition === "string") &&
         Array.isArray(c.expected) &&
         c.expected.every(
           (d: unknown) => isRecord(d) && typeof d.to === "string" && typeof d.payload === "string",

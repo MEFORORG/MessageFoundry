@@ -47,7 +47,7 @@ import functools
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol
@@ -103,7 +103,8 @@ class HoldResult(Enum):
     caller returns. Every other end sends no further retry of that write, leaves its rows
     INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
     per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
-    tail release (``_run_lane`` says when)."""
+    tail release (``_run_lane`` says when). ``RegistryRunner._repend_claimed_on_fault`` names
+    at least one caller that differs."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
@@ -243,7 +244,9 @@ class _LanePhase(Enum):
     CLAIMING = auto()  # in the current claim_fifo_heads batch (slot reserved)
     PROCESSING = auto()  # a live serializer is draining its claimed prefix (slot consumed)
     PARKED = auto()  # head backing off until park_until; unpark by timer / sweep-due / notify_work
-    STOPPED = auto()  # deliberately halted; re-armed only by reload / notify_work
+    # (or claim-gated, ``_LaneState.gated``: no timer unparks it, only release_gated / notify_work)
+    # Deliberately halted; re-armed by reload / notify_work or an operator resume_lane (#5700).
+    STOPPED = auto()
     # Operator PAUSE (connection controls): delivery halted by an operator; queued rows RETAINED PENDING.
     # A NEW distinct phase — NOT STOPPED, which notify_work/reload deliberately resurrect and which means
     # content-STOP. PAUSED is reload-surviving: only pause_lane's counterpart resume_lane re-arms it; a
@@ -269,7 +272,8 @@ class _LaneState:
     ready_woken: bool = True
     # ADR 0070 fix B: consecutive zero-progress (i==0) T17 infra faults for this lane. Incremented on
     # each such fault, reset to 0 on clean drain / forward-progress-or-non-infra RETRY / the STOPPED→
-    # READY notify_work resume (NEVER on a PARKED park-timer/sweep unpark — the sharp edge, §3). Reaches
+    # READY notify_work or resume_lane resume (NEVER on a PARKED park-timer/sweep unpark — the sharp
+    # edge, §3). Reaches
     # infra_fault_stop_after → STOP (stop policy). In-memory only; intentionally lost on restart.
     infra_error_streak: int = 0
     # ADR 0070 retry_forever: True once the throttled lane_stuck alert has fired for the current stuck
@@ -292,6 +296,11 @@ class _LaneState:
     # BACKLOG #2075: this lane holds one of the stage's processing slots. Paired by
     # _reserve_lane_slot / _release_lane_slot; why the phase cannot say this is at the release.
     slot_held: bool = False
+    # BACKLOG #5704: PARKED because ``may_claim`` refused the lane (the #122 log-write claim gate), not
+    # because a head is backing off. The park arms no timer and touches no row; the sweep, and a
+    # timer the sweep arms for a head not yet due, leave it parked, and only release_gated or
+    # notify_work unparks it. Cleared by _unpark.
+    gated: bool = False
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
@@ -457,6 +466,7 @@ class StageDispatcher:
         alert_sink: AlertSink | None = None,
         on_lane_paused: Callable[[str], None] | None = None,
         on_lane_stopped: Callable[[str], None] | None = None,
+        stop_rearmed: Callable[[str], bool] | None = None,
         empty_counter: _EmptyClaimObserver | None = None,
         clock: Callable[[], float] | None = None,
         call_later: _CallLater | None = None,
@@ -465,6 +475,7 @@ class StageDispatcher:
         infra_fault_backoff_cap: float = 60.0,
         is_leader: Callable[[], bool] | None = None,
         current_epoch: Callable[[], int | None] | None = None,
+        may_claim: Callable[[str], bool] | None = None,
     ) -> None:
         assert claimers_per_stage >= 1
         assert max_processing_lanes >= 1
@@ -498,6 +509,13 @@ class StageDispatcher:
         # this to its operator hold and an active-window scheduler never re-arms them (BACKLOG #2072).
         # A T16 content STOP is not reported: its runner STOP site holds it, or not, itself.
         self._on_lane_stopped = on_lane_stopped
+        # Asked (if set) as a T16 content STOP ends: True means the body's STOP is void because a
+        # reload re-deployed what it stopped for while the episode ran, so the lane goes READY
+        # instead (BACKLOG #5708). That reload's notify_work found the lane PROCESSING and only set
+        # dirty, which a STOP does not read, and no wake or sweep re-arms a STOPPED lane. Not dirty
+        # itself: a producer wake or the sweep sets it too, and a STOP the runner holds (the
+        # internal-error policy) must outlive a broadcast that lands mid-episode (_broadcast_to).
+        self._stop_rearmed = stop_rearmed
         self._clock: Callable[[], float] = clock or time.time
         self._call_later = call_later  # resolved to loop.call_later at start() when None
         # Pooled T17 (infra/machinery-fault) bound (ADR 0070 fix B). Policy "stop" STOPs a persistently
@@ -510,6 +528,12 @@ class StageDispatcher:
         # with no epoch to fence on.
         self._is_leader: Callable[[], bool] = is_leader or (lambda: True)
         self._current_epoch: Callable[[], int | None] = current_epoch or (lambda: None)
+        # The pre-claim gate (BACKLOG #5704). A lane it refuses parks at chunk assembly with NO claim
+        # and NO row write, so a gate held for hours makes no claim or reschedule for that lane and
+        # cannot reach the T17 infra-fault STOP while it is parked. Not no store I/O: the sweep
+        # still reads the stage's lane heads every pass (list_fifo_lanes), the gated lane's
+        # included. The runner lifts it with release_gated. None: every lane may claim.
+        self._may_claim: Callable[[str], bool] = may_claim or (lambda _lane: True)
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [
@@ -626,15 +650,22 @@ class StageDispatcher:
             st.dirty_woken = (st.dirty and st.dirty_woken) or woken
             st.dirty = True
 
-    def notify_work(self) -> None:
+    def notify_work(self, *, keep_stopped: Callable[[str], bool] | None = None) -> None:
         """Recovery broadcast (replay, DR failback, reload tail, post-recovery nudge): mark every known
         + registry lane READY, UNPARK every PARKED lane and re-arm every STOPPED lane (the broadcast
         overrides a park/stop), then request an immediate sweep. Snapshots the lane set before iterating
         so a concurrent producer can't raise 'set changed size during iteration' (mirrors ``_wake_all``,
-        wiring_runner:487)."""
+        wiring_runner:487). A STOPPED lane ``keep_stopped`` names is left STOPPED (BACKLOG #5704)."""
         lanes = set(self._states) | self._lane_provider()
         for lane in lanes:
             st = self._states.get(lane)
+            if (
+                st is not None
+                and st.phase is _LanePhase.STOPPED
+                and keep_stopped is not None
+                and keep_stopped(lane)
+            ):
+                continue
             if st is not None and st.phase is _LanePhase.PAUSED:
                 # Reload-survival (connection controls): a recovery broadcast must NEVER resurrect a
                 # deliberately operator-PAUSED lane (only resume_lane re-arms it). Skip it entirely —
@@ -666,7 +697,8 @@ class StageDispatcher:
         purge's PENDING-only ``cancel_queued`` could never clear. So a lane mid-episode
         (CLAIMING/PROCESSING) is
         marked ``pause_pending`` and reaches PAUSED at the terminal transition / next empty claim, after
-        its <=1 in-flight OUTBOUND head finishes (delivered, or re-pended PENDING by a FIFO RETRY) —
+        its <=1 in-flight OUTBOUND head finishes (delivered, re-pended PENDING by a FIFO RETRY, or
+        handed back unsent by the runner's pause gate, BACKLOG #5709) —
         leaving zero rows INFLIGHT, which is exactly the require-stopped-before-purge precondition."""
         st = self._states.get(key)
         if st is None:  # not yet registered — create it already PAUSED so a first wake can't arm it
@@ -689,11 +721,16 @@ class StageDispatcher:
         else:  # STOPPED — operator intent overrides a content-STOP
             self._to_paused(key, st)
 
-    def resume_lane(self, key: str) -> None:
-        """Operator RESUME for a paused lane (sync). Re-arm a fully-PAUSED lane from the head via
-        ``mark_ready`` AND request an immediate sweep, so a head that backed off while paused is
-        re-evaluated promptly (never stranded until the next periodic sweep) — folds the low finding on a
-        resumed-lane RETRY head. An unknown lane is a no-op.
+    def resume_lane(self, key: str) -> bool:
+        """Operator RESUME for a PAUSED or STOPPED lane (sync); returns whether it re-armed the lane.
+        Re-arm a fully-PAUSED lane from the head via ``mark_ready`` AND request an immediate sweep,
+        so a head that backed off while paused is re-evaluated promptly (never stranded until the
+        next periodic sweep) — folds the low finding on a resumed-lane RETRY head. An unknown lane
+        is a no-op.
+
+        A STOPPED lane is re-armed too (BACKLOG #5700), for every stage, as :meth:`notify_work`
+        already re-arms one. Which callers may reach a STOPPED lane is the runner's to decide
+        (``RegistryRunner._resume_pooled_lane`` and ``_schedule_holds``).
 
         CANCEL A STILL-PENDING PAUSE: a lane paused while mid-episode (CLAIMING/PROCESSING) carries
         ``pause_pending`` and has NOT yet reached PAUSED. A ``restart_outbound`` calls stop+start in ONE
@@ -702,19 +739,29 @@ class StageDispatcher:
         quiesce to PAUSED after resume returned, with nothing left to re-arm it (a wedged lane)."""
         st = self._states.get(key)
         if st is None:
-            return
+            return False
         if st.phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
             st.pause_pending = (
                 False  # cancel the not-yet-landed pause; the episode resumes normally
             )
-            return
+            return False
+        if st.phase is _LanePhase.STOPPED:
+            # BACKLOG #5700: an operator start of a lane still at STOPPED (a credential,
+            # configuration or claimer-death STOP it never paused over) re-arms it, as the
+            # notify_work broadcast does and with the same fresh budgets. Ignoring it let the start
+            # report success while the lane stayed down. Operator intent overrides a content STOP,
+            # as pause_lane already lets it.
+            self._unpark(key, woken=True)
+            self._sweep_now.set()
+            return True
         if st.phase is not _LanePhase.PAUSED:
-            return
+            return False
         st.pause_pending = False
         st.claimer_deaths = 0  # an operator re-arm starts a fresh #2074 budget, as notify_work does
         st.phase = _LanePhase.IDLE
         self.mark_ready(key, woken=True)  # IDLE -> READY + enqueue (T2)
         self._sweep_now.set()
+        return True
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -1052,14 +1099,14 @@ class StageDispatcher:
         the lane is STOPPED with nothing in flight and its head PENDING in its original place.
 
         It reuses the ADR 0070 T17 STOP: the STOPPED phase, a ``connection_stopped`` alert, and a
-        re-arm only by reload or ``notify_work``, never by a wake or the sweep. Without it, the lane
-        is re-readied at every respawn and kills the next claimer too. ``release_claimed`` restores
+        re-arm only by reload, ``notify_work`` or ``resume_lane`` (#5700), never by a wake or the
+        sweep. Without it, the lane is re-readied at every respawn and kills the next claimer too. ``release_claimed`` restores
         the row's attempts, so ``max_attempts`` never dead-letters it, and every other lane on the
         partition waits out the respawn backoff each time. Unlike the T17 bound this applies under
         ``retry_forever`` as well, because the cost of retrying lands on the lane's siblings.
 
-        The streak resets here, so every re-arm path (``notify_work``, an operator resume from
-        PAUSED) starts a fresh budget. A lane at the threshold is therefore always the lane just
+        The streak resets here, so every re-arm path (at least ``notify_work`` and an operator
+        resume from PAUSED or, since #5700, STOPPED) starts a fresh budget. A lane at the threshold is therefore always the lane just
         charged, never a sibling abandoned behind it. The wording says the deaths were raised WHILE
         dispatching the lane: a raise from shared machinery in that window is charged to it too."""
         deaths = st.claimer_deaths
@@ -1153,6 +1200,13 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
+            may = self._lane_may_claim(lane)
+            if may is None:  # the gate raised: a timed park, so the lane asks again after a backoff
+                self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
+                continue
+            if not may:  # BACKLOG #5704: gated, so park, no claim, no slot
+                self._park_gated(lane, st)
+                continue
             st.phase = _LanePhase.CLAIMING  # T8
             st.dirty = False
             # The lane EPISODE opens exactly HERE — reserving the slot is the moment the lane stops being
@@ -1188,12 +1242,14 @@ class StageDispatcher:
             )
         except Exception as exc:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
-            err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+            # The end stamp rides the lane-episode lever, which stamped the start (BACKLOG #5699).
+            err_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             for lane in lanes:
                 st = self._states[lane]
                 # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
                 # timer already makes for a raised claim — but the lane WAS occupied for that interval,
-                # so it is booked as `dropped` (occupancy), never as `episode` (service).
+                # so it is booked as `dropped` (occupancy), never as `episode` (service). A pause that
+                # landed mid-claim goes to PAUSED instead: _end_claim honours it (BACKLOG #5699).
                 self._end_claim(lane, st, err_ns, _LanePhase.READY)
             # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
             claimer.faults = claimer.faults.record(
@@ -1246,8 +1302,9 @@ class StageDispatcher:
                     stage=self._stage.value, claimers=len(self._claimers)
                 )
             # ONE clock read for every non-service release this dispatch pass books (they all end at the same
-            # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
-            rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+            # instant — the claim has returned and this loop is await-free). Zero when the lane-episode
+            # lever, which stamped the start, is off (#5699).
+            rel_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
             # it is read once here and booked once below — never per lane. Booking it per lane is the
             # arithmetic half of #1270's first defect: at the default chunk one abort moved the operator
@@ -1539,7 +1596,20 @@ class StageDispatcher:
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
-            self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
+            # Only with every claimed row re-pended: a READY lane's next claim would pass any still
+            # in flight. Not asked otherwise, so the runner's record stays for its next item to clear.
+            # A STOP has no head re-pend, so `unlanded` is the tail, whose release _land_while_holding
+            # already retried. It ends unlanded at least on SUPERSEDED, where this node may no longer
+            # hold the lease it claimed under, so another node may have led and re-claimed these rows,
+            # and on EXHAUSTED, the stop policy's bound that also STOPs a T17 lane (BACKLOG #5708). The
+            # rows stay INFLIGHT, so the lane stays STOPPED even when a reload restored its inbound:
+            # re-arming it here would claim past them at once. This does not keep it down. A later
+            # notify_work or resume_lane re-arms a STOPPED lane without checking for rows in flight,
+            # as it does after any STOP or T17 bound that left rows unlanded.
+            if not unlanded and self._stop_voided(lane):
+                self._to_ready(lane, woken=True)  # as the reload's notify_work would have
+            else:
+                self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -1629,9 +1699,7 @@ class StageDispatcher:
     def _hold_abandoned(self, lane: str) -> bool:
         """Whether a ``pause_lane`` waits on this lane, so its hold ends and the terminal transition
         reaches PAUSED. On every stage: at least a stop or pause of an outbound (an operator's, a
-        schedule window's or a DR park's) pauses an OUTBOUND lane, and the #122 fail-closed halt
-        (application log unwritable) pauses the INGRESS, ROUTED and RESPONSE lanes of each halted
-        inbound (``RegistryRunner._pause_internal_lanes``)."""
+        schedule window's or a DR park's) pauses an OUTBOUND lane."""
         st = self._states.get(lane)
         return st is not None and st.pause_pending
 
@@ -1682,7 +1750,8 @@ class StageDispatcher:
 
         **A pause ends the hold** (``ABANDONED``). It is read at the base interval through the
         backoff, so a pause, a stop of the outbound, the purge that waits on it and the #122 halt
-        are not held until the store heals. :meth:`_hold_abandoned` says what pauses a lane.
+        of the DELIVERY tier are not held until the store heals. :meth:`_hold_abandoned` says what
+        pauses a lane.
 
         **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
         the hold ends (``EXHAUSTED``) and :meth:`_run_lane` raises the lane's ``infra_error_streak``
@@ -1827,11 +1896,12 @@ class StageDispatcher:
         st.phase = _LanePhase.PAUSED
         st.pause_pending = False
         st.dirty = False
+        st.gated = False
         self._fire_paused(lane)
 
     def _to_stopped(self, lane: str, st: _LaneState, detail: str) -> None:
-        """STOP a lane and raise ``connection_stopped``. Re-armed only by reload or
-        ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
+        """STOP a lane and raise ``connection_stopped``. Re-armed only by reload, ``resume_lane``
+        (#5700) or ``notify_work`` (:meth:`_unpark`), never by a wake or the sweep. The phase is set first and
         a raising sink is logged, not propagated, as the runner guards the same call: a stop must
         not also kill the claimer or serializer that reached it."""
         st.phase = _LanePhase.STOPPED
@@ -1845,14 +1915,32 @@ class StageDispatcher:
                 exc_info=True,
             )
 
+    def _stop_voided(self, lane: str) -> bool:
+        """Whether the runner says a T16 STOP of ``lane`` is void (``stop_rearmed``). False when no
+        hook is wired, and when the hook raises, which is logged: a fault there keeps the STOP, the
+        state the lane had before the hook existed."""
+        if self._stop_rearmed is None:
+            return False
+        try:
+            return self._stop_rearmed(lane)
+        except Exception:  # noqa: BLE001 — a hook failure must not kill the serializer
+            log.warning(
+                "StageDispatcher %s stop_rearmed raised for lane %s; stopping it",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+            return False
+
     def _report_own_stop(self, lane: str) -> None:
         """Tell the runner (``on_lane_stopped``) about a STOP this dispatcher decided on its own: the
         T17 infra-fault bound or the #2074 claimer-death bound. Called after :meth:`_to_stopped`, so
         after the alert and whether or not it raised: a raising sink does not undo the STOP here.
 
         NOT for the T16 content STOP. Its body is a runner STOP site, and each such site decides for
-        itself whether its STOP needs an operator: a credential fault does, a leadership loss or a
-        removed inbound does not. Reporting those here would hold lanes nothing needs to clear."""
+        itself whether its STOP is held against the calendar: a credential fault is, a leadership
+        loss or a removed inbound is not. Reporting those here would hold lanes nothing needs to
+        clear."""
         if self._on_lane_stopped is not None:
             try:
                 self._on_lane_stopped(lane)
@@ -1878,6 +1966,10 @@ class StageDispatcher:
         a drop, and move the lane to ``to``. READY uses ``woken``, defaulting to the lane's own
         ``ready_woken``; STOPPED raises ``connection_stopped`` with ``detail``.
 
+        READY or IDLE on a lane with ``pause_pending`` lands the pause instead (BACKLOG #5699): a
+        pause that arrived while the lane was CLAIMING must never leave it claimable, whichever
+        release path ends the claim. Such a lane would deliver its next head past the pause.
+
         BACKLOG #2075. The slot goes back FIRST, and at most once per reservation. If the bookkeeping
         after it raises, the lane is left CLAIMING with its slot already returned, and the claimer
         dies. The respawn's adoption then ends the lane's claim again, and the second release is a
@@ -1885,6 +1977,8 @@ class StageDispatcher:
         itself raised after the lane had already left CLAIMING, because nothing would come back."""
         self._release_lane_slot(st)
         self._drop_lane_episode(st, end_ns)
+        if to in (_LanePhase.READY, _LanePhase.IDLE) and st.pause_pending:
+            to = _LanePhase.PAUSED
         if to is _LanePhase.READY:
             self._to_ready(lane, woken=st.ready_woken if woken is None else woken)
         elif to is _LanePhase.PAUSED:
@@ -1943,15 +2037,52 @@ class StageDispatcher:
         st.phase = _LanePhase.PARKED
         st.dirty = False
         st.park_until = until
+        st.gated = False  # a backoff park: its timer and the sweep unpark it
         if until is not None:
             self._arm_timer(lane, until)
+
+    def _lane_may_claim(self, lane: str) -> bool | None:
+        """Ask the pre-claim gate; None when it raised, which is logged. The caller parks the lane
+        on a timer rather than letting the raise kill the claimer with the lane popped and READY."""
+        try:
+            return self._may_claim(lane)
+        except Exception as exc:  # noqa: BLE001 — a gate fault must not kill the claimer
+            log.error(
+                "StageDispatcher %s may_claim raised %s for lane %s; parking it for a backoff",
+                self._stage.value,
+                type(exc).__name__,
+                lane,
+            )
+            return None
+
+    def _park_gated(self, lane: str, st: _LaneState) -> None:
+        """Park a lane the pre-claim gate refused (BACKLOG #5704), with no timer: nothing is due to
+        re-check, because the gate lifts only when the runner says so, through release_gated. A wake
+        meanwhile only sets dirty (T6)."""
+        self._cancel_timer(lane)
+        st.phase = _LanePhase.PARKED
+        st.dirty = False
+        st.park_until = None
+        st.gated = True
+
+    def release_gated(self, keys: Iterable[str] | None = None) -> None:
+        """Unpark lanes the pre-claim gate parked (BACKLOG #5704): ``keys``, or every gate-parked lane
+        when None. Sync and await-free. A lane parked for a backing-off head, STOPPED or PAUSED is left
+        exactly as it is, so lifting the gate releases no hold and re-arms nothing an operator or the
+        T17 bound halted. A lane the gate still refuses parks again at its next chunk assembly."""
+        lanes = list(self._states) if keys is None else list(keys)
+        for lane in lanes:
+            st = self._states.get(lane)
+            if st is not None and st.phase is _LanePhase.PARKED and st.gated:
+                self._unpark(lane, woken=True)
 
     def _unpark(self, lane: str, *, woken: bool) -> None:
         """PARKED/STOPPED -> READY (T18/T19): cancel the park timer, clear dirty, enqueue.
 
         Sharp edge (ADR 0070 fix B, test 3): reset ``infra_error_streak`` ONLY on the STOPPED→READY
-        resume — a ``notify_work`` reload re-arm of a deliberately-STOPPED lane, keyed on the lane
-        being STOPPED at entry (the sole caller that unparks a STOPPED lane). NEVER reset on the shared
+        resume — a ``notify_work`` reload re-arm or a ``resume_lane`` operator re-arm (BACKLOG #5700)
+        of a deliberately-STOPPED lane, keyed on the lane being STOPPED at entry (the only callers
+        that unpark a STOPPED lane). NEVER reset on the shared
         PARKED park-timer / sweep unpark (which keeps ``phase is PARKED`` here): if a still-faulting
         head's park-timer unpark reset the streak, the ``stop`` threshold would never accrue and the
         original ~4×/s spin would silently return. Guard it on the pre-transition phase, not on
@@ -1968,6 +2099,7 @@ class StageDispatcher:
         st.phase = _LanePhase.READY
         st.dirty = False
         st.park_until = None
+        st.gated = False
         st.ready_woken = woken
         self._enqueue(lane)
 
@@ -2095,7 +2227,7 @@ class StageDispatcher:
         st = self._states.get(lane)
         if st is None:
             return
-        if st.phase is _LanePhase.PARKED:  # T18
+        if st.phase is _LanePhase.PARKED and not st.gated:  # T18; a gated park waits for release
             self._unpark(lane, woken=False)  # a due head is a sweep-class readiness, not a wake
         elif st.phase is _LanePhase.IDLE:  # a not-due head became due while the lane was idle
             self.mark_ready(lane, woken=False)
@@ -2165,7 +2297,8 @@ class StageDispatcher:
         """The sweep found an owned lane's HEAD due. Ready it per phase (T20), including UNPARKING a
         PARKED lane whose backoff has elapsed (the bounded backstop for a lost park timer — a due head
         is legitimately re-claimable, distinct from a wake behind a still-backing-off head which stays
-        parked). A deliberately STOPPED lane is left halted (only reload/notify_work re-arms it)."""
+        parked). A deliberately STOPPED lane is left halted (reload, notify_work or an operator
+        resume_lane re-arms it, #5700; the sweep never does)."""
         st = self._states.get(lane)
         if st is None:  # T1 create-or-stick, sweep-sourced
             self.mark_ready(lane, woken=False)
@@ -2173,6 +2306,8 @@ class StageDispatcher:
         phase = st.phase
         if phase in (_LanePhase.IDLE, _LanePhase.READY):
             self.mark_ready(lane, woken=False)  # T20
+        elif phase is _LanePhase.PARKED and st.gated:
+            st.dirty = True  # BACKLOG #5704: a gated park waits for release_gated, not a due head
         elif phase is _LanePhase.PARKED:
             self._unpark(lane, woken=False)  # T18 — backoff elapsed; the backstop
         elif phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
@@ -2257,8 +2392,9 @@ class StageDispatcher:
 
     def stopped(self, key: str) -> bool:
         """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
-        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. False
-        for an unknown lane."""
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. The
+        outbound status reads do not read it: they read the runner's stop-hold record
+        (``RegistryRunner.outbound_stop_held`` says why). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
 

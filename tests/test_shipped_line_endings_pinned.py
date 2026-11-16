@@ -62,8 +62,9 @@ def _packaging_license_files() -> tuple[str, ...]:
 SHIPPED_PACKAGING_FILES = _packaging_license_files()
 
 #: The vendored HAPI fixtures carry their own `-text` pin in
-#: `samples/messages/hapi-hl7v2/.gitattributes`, because they are stored byte-verbatim and EOL
-#: normalization would break the MPL-2.0 "unmodified" basis. Four are bare-CR terminated and three
+#: `samples/messages/hapi-hl7v2/.gitattributes`, because most are stored byte-verbatim, and EOL
+#: normalization would break the MPL-2.0 "unmodified" basis; the de-identified ones keep
+#: upstream's line endings (see that README). Four are bare-CR terminated and three
 #: are CRLF, which is what HL7 v2 segment termination looks like on disk. This module must never
 #: assert they are unpinned, and the shipped-set stanza must never reach them.
 VENDORED_FIXTURES = "samples/messages/hapi-hl7v2/"

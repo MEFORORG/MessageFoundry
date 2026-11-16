@@ -567,9 +567,9 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     an old sentence true again reds this test instead of passing it. A provider check added at the
     ROUTE layer would slip past this AST read; the service methods are what it covers.
 
-    ``verify_mfa`` is off the no-provider list since BACKLOG #2023, and only for one branch: a
-    directory account is asked of the directory before its code is checked. That branch adds a
-    refusal and exempts nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
+    ``verify_mfa`` is off the no-provider list since BACKLOG #2023: a directory account is asked
+    of the directory before its code is checked. Its provider branches add or reorder refusals and
+    exempt nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
     rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
     lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
 
@@ -580,9 +580,14 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     begin legs still read no provider, and the finish legs read none themselves.
     """
 
-    # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
-    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    # Since BACKLOG #3068 the directory check lives in the shared helper both second-factor legs
+    # call, and the helper reads the provider exactly once (through _is_directory_account since
+    # BACKLOG #3780; _provider_reads counts either form). Since BACKLOG #3780 item 2 verify_mfa
+    # reads it once itself, re-derived against the rows: for a directory account its in-queue
+    # read stands in for the holder re-read the helper no longer runs for it, so it adds a
+    # refusal (lookup keys moved since the role test) and asks the lock before TOTP and the lapse.
+    # Both only add or reorder refusals; nothing is exempted, and the lockout feed below is pinned
+    # as before.
     def _tree(func: object) -> ast.AST:
         return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
 
@@ -592,17 +597,17 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     verify_tree = _tree(AuthService.verify_mfa)
     helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        _provider_reads(verify_tree) == 0
+        _provider_reads(verify_tree) == 1
         and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
         and "_directory_vouches_for_factor" in _attrs(verify_tree)
         and _provider_reads(helper_tree) == 1
         and "_directory_step_up_refusal" in _attrs(helper_tree)
     ), (
-        "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
-        "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
+        "verify_mfa's provider reads changed; re-derive the pathway rows, which say a directory "
+        "account's TOTP leg feeds and meets the lockout."
     )
     assert "BACKLOG #2023" in _section(), (
-        "the pathway section no longer names verify_mfa's one provider branch (BACKLOG #2023)."
+        "the pathway section no longer names verify_mfa's directory check (BACKLOG #2023)."
     )
     for func in (
         AuthService.begin_mfa_enrollment,
@@ -971,6 +976,62 @@ def _called(node: ast.AST, name: str) -> bool:
     )
 
 
+def _anchored_factor_writes(node: ast.AST) -> list[ast.Call]:
+    """The ``mark_session_mfa_verified`` calls under ``node`` that pass an ``anchor=`` keyword,
+    which is how the passkey leg re-anchors and stamps (vault BACKLOG #2964 item 14)."""
+    return [
+        c
+        for c in call_sites(node, "mark_session_mfa_verified")
+        if any(k.arg == "anchor" for k in c.keywords)
+    ]
+
+
+def _anchor_is_none_on_oidc(leg: ast.AST) -> bool:
+    """Whether ``leg`` binds ``anchor`` only to ``None if <x>.auth_mechanism == ...OIDC.value else
+    ...``, so an oidc session's factor write applies no anchor and opens no window (BACKLOG #2142).
+    """
+    bound = [
+        n.value
+        for n in ast.walk(leg)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "anchor" for t in n.targets)
+    ]
+    return bool(bound) and all(
+        isinstance(v, ast.IfExp)
+        and isinstance(v.body, ast.Constant)
+        and v.body.value is None
+        and isinstance(v.test, ast.Compare)
+        and isinstance(v.test.left, ast.Attribute)
+        and v.test.left.attr == "auth_mechanism"
+        and all(isinstance(op, ast.Eq) for op in v.test.ops)
+        and all(
+            isinstance(c, ast.Attribute)
+            and c.attr == "value"
+            and isinstance(c.value, ast.Attribute)
+            and c.value.attr == "OIDC"
+            for c in v.test.comparators
+        )
+        for v in bound
+    )
+
+
+#: Named calls that read a session's or account's factor state, called directly in a route body.
+#: A fixed list: a new helper that reads factor state passes unseen until it is added here
+#: (vault BACKLOG #2964 item 14).
+_FACTOR_STATE_READERS = (
+    "mfa_satisfied",
+    "mfa_status",
+    "rotation_comes_first",
+    "confined_before_its_factor",
+    "must_change_target",
+    "must_enrol_first",
+    "_enrols_first",
+    "must_enrol_before_rotating",
+    "password_change_owes_factor",
+    "_owes_known_factor",
+)
+
+
 def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     """ASVS 6.1.3 was held at partial a third time (BACKLOG #1133) on passages older than both fixes.
 
@@ -980,9 +1041,10 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     1. ``GET /ui/oidc/start`` is not simply "rate-limited" or simply "free". It renders the ASVS 3.7.3
        interstitial and charges nothing, unless ``_interstitial_needed()`` is false, when it runs the
        POST leg itself: limiter, flow and all.
-    2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
-       ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
-       met its factor, so a TOTP or recovery code opens a fresh window at any time. A passkey does not.
+    2. A browser SSO session's first sensitive action does not always force a step-up.
+       Except on an oidc session, a TOTP or recovery code that ``verify_mfa`` accepts stamps
+       ``reauth_at``, and since vault BACKLOG #2964 item 14 so does a passkey assertion with the UV
+       flag that completes a pending factor.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
        four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
        count is now derived from the route list below rather than written into this test.
@@ -1025,8 +1087,11 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert _called(verify, "mark_session_reauthed"), (
         "verify_mfa no longer stamps reauth_at; the step-up paragraph says a TOTP opens a window."
     )
-    assert not _called(assertion, "mark_session_reauthed"), (
-        "a passkey assertion now stamps reauth_at; the doc says it marks the factor only."
+    # Vault BACKLOG #2964 item 14: the passkey stamps reauth_at through its factor write's anchor,
+    # in one write, never through a second mark_session_reauthed.
+    assert _anchored_factor_writes(assertion) and not _called(assertion, "mark_session_reauthed"), (
+        "a passkey assertion no longer stamps reauth_at through its factor write's anchor; the "
+        "step-up paragraph says a user-verified passkey that completes a pending factor does."
     )
     assert not _called(verify, "mfa_satisfied") and not any(
         isinstance(n, ast.Attribute) and n.attr == "mfa_verified_at" for n in ast.walk(verify)
@@ -1039,10 +1104,33 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "mfa_verify"
     )
     for label, handler in (("POST /ui/mfa", routes["POST /ui/mfa"]), ("JSON", json_verify)):
-        assert _called(handler, "verify_mfa") and not _called(handler, "mfa_satisfied"), (
-            f"the {label} MFA route now checks whether the session already met its factor; the "
-            "doc says a TOTP refreshes the step-up window at any time."
+        # Vault BACKLOG #2964 item 14: POST /ui/mfa may call mfa_satisfied after verify_mfa has run,
+        # to send a satisfied session's refused code to /ui instead of re-rendering the gate.
+        verify_lines = [c.lineno for c in call_sites(handler, "verify_mfa")]
+        asked_lines = [c.lineno for c in call_sites(handler, "mfa_satisfied")]
+        assert verify_lines and (
+            not asked_lines if label == "JSON" else all(a > min(verify_lines) for a in asked_lines)
+        ), (
+            f"the {label} MFA route now checks whether the session already met its factor before "
+            "the code; the doc says a TOTP refreshes the step-up window at any time."
         )
+        # The route also reads factor state BEFORE the code through a helper: rotation_comes_first
+        # sends a must-change session that must rotate first to the password page unread. The doc
+        # names that one pre-code ask; any other factor-state reader ahead of verify_mfa is a new
+        # ask the doc does not state.
+        pre_code = sorted(
+            name
+            for name in _FACTOR_STATE_READERS
+            if any(c.lineno < min(verify_lines) for c in call_sites(handler, name))
+        )
+        assert pre_code == ([] if label == "JSON" else ["rotation_comes_first"]), (
+            f"the {label} MFA route's factor-state reads before verify_mfa are {pre_code}; the doc "
+            "names only rotation_comes_first's must-change redirect."
+        )
+    assert (
+        "before the code, through `rotation_comes_first`, whether a must-change session must "
+        "change its password first" in " ".join(_doc_text().split())
+    ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
@@ -1138,6 +1226,11 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert guarded and not unguarded, (
         "verify_mfa stamps reauth_at outside its auth_mechanism branch; the doc says an oidc code "
         "opens no window."
+    )
+    # Vault BACKLOG #2964 item 14: the passkey's factor write carries no anchor on an oidc session.
+    assert _anchor_is_none_on_oidc(assertion), (
+        "finish_webauthn_assertion no longer passes anchor=None on an oidc session; the doc says "
+        "a passkey on an oidc session opens no window."
     )
     assert _called(verify, "_code_owes_nothing_to_oidc_session"), (
         "verify_mfa no longer refuses a satisfied oidc session's code; the doc says it does."
@@ -1932,15 +2025,17 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
         "6.8.4 fallback says no directory sign-in opens the step-up window."
     )
     # The AD re-bind and the IdP step-up stamp the window and never mark the second factor; the
-    # passkey marks the factor and never stamps the window. Controls: the TOTP leg does both.
+    # TOTP leg does both, and since vault BACKLOG #2964 item 14 the passkey does both in its one
+    # factor write, through its anchor (the window only with the UV flag).
     for func in (AuthService.reauth, AuthService.complete_oidc_step_up):
         assert _calls_method(func, "mark_session_reauthed"), func.__name__
         assert not _calls_method(func, "mark_session_mfa_verified"), func.__name__
     assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_mfa_verified")
     assert not _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
+    assert _anchored_factor_writes(_service_func("finish_webauthn_assertion"))
     assert _calls_method(AuthService.verify_mfa, "mark_session_mfa_verified")
     assert _calls_method(AuthService.verify_mfa, "mark_session_reauthed")
-    # The passkey is not relied on for user verification: asked for at PREFERRED, never required.
+    # User verification is asked for at PREFERRED and never required to verify an assertion.
     assert "`verify_assertion`" in block
     uv_required = keyword_values(webauthn_module.verify_assertion, "require_user_verification")
     assert all(isinstance(v, ast.Constant) and v.value is False for v in uv_required), (

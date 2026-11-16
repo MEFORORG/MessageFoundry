@@ -58,9 +58,11 @@ import os
 import re
 import sys
 import weakref
-from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 from functools import cache, partial
 from itertools import islice
 from typing import Any, NamedTuple, TypeGuard, cast
@@ -93,13 +95,10 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     EgressSettings,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
-    HopPosture,
     InsecureHopRefused,
-    current_hop_posture,
     hop_name_prefix,
 )
 from messagefoundry.config.wiring import _is_text_codec
@@ -108,15 +107,21 @@ from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
     CallGate,
+    UngatedConnectionError,
     call_gate,
+    close_one_shot,
     drop_handle,
-    install_call_gate,
     raw_cursor,
     report_once,
+    require_call_gate,
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
+from messagefoundry.sqlserver_roles import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
+)
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     POLL_STOP_GRACE_S,
@@ -158,6 +163,10 @@ __all__ = [
     "DatabaseDestination",
     "DatabaseLookupExecutor",
     "DatabaseSource",
+    "LoginRoleReading",
+    "LoginRoleVerdict",
+    "classify_login_roles",
+    "probe_login_roles",
 ]
 
 logger = logging.getLogger(__name__)
@@ -171,59 +180,63 @@ _PARAM_RE = re.compile(r"(?<![:\w]):(\w+)")
 # deadlock (40001); plus the ODBC connect/operation timeouts.
 _TRANSIENT_PREFIXES = ("08", "40")
 _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
+# BACKLOG #5713: connect-time states that are the connection's fault, not the message's
+# (:func:`_classify_db_error`). Class 28 is "invalid authorization specification"; class IM is the
+# ODBC driver manager's own; 01000 is how unixODBC reports a driver library it could not load.
+_CREDENTIAL_PREFIXES = ("28",)
+_CONFIG_PREFIXES = ("IM",)
+_CONFIG_STATES = frozenset({"01000"})
+# BACKLOG #5714: nextset() states that end the walk rather than fail the write. IM001 and HYC00
+# are a driver with no SQLMoreResults; HY007 is what pyodbc's own source records the SQL Server
+# driver returning after a batch of successful statements.
+_NO_NEXTSET_STATES = frozenset({"IM001", "HYC00", "HY007"})
+# A fetch state that is the client failing to convert a value, not the statement failing.
+_CLIENT_FETCH_STATES = frozenset({"07006"})
 
 
-def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
-    """Whether a weakened (verify-off) customer-DB TLS posture may be used, routed through the ONE
-    shared hop authority (#200, ADR 0092).
+def _weakened_tls_permitted(*, attested: bool) -> bool:
+    """Whether a weakened (verify-off) customer-DB TLS posture may be used (#200, ADR 0092).
 
-    A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
-    means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
-    cell** (decision 5): refused unless the global ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and
-    that escape works only at ``[security].enforcement = warn`` (decision 2), so it can never relax
-    an enforcing hop.
-
-    The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
-    so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the
-    construction-time posture; the send-time tripwire passes the one its connector captured, because
-    a delivery worker runs outside the scope that stamped it. ``None`` fails closed (vault BACKLOG
-    #2354). CORRECTED: an unstamped call used to fall back to the unclamped escape, on the premise
-    that the enforced gate had already vetted the real posture; callers the gate never reaches made
-    that false."""
-    return attested or weakened_tls_escape_permitted(posture)
+    Only a per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by
+    other means: a proxy-terminated or trusted-segment DB link). Otherwise this is a **STRICT
+    verify-off cell** (decision 5), refused at every posture. The connection's login would cross the
+    hop, so ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even on an instance at
+    ``[security].enforcement = warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used
+    to take a posture, and the escape on such an instance let the login cross."""
+    return attested
 
 
 def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
-    """Loud-log a per-connection attestation that suppresses a would-be **production-PHI** weakened-TLS
-    refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
-    non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
-    posture = current_hop_posture()
-    if posture is not None and posture.enforcing:
-        logger.warning(
-            "%s%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
-            "instance (operator attests the hop is secure by other means)",
-            hop_name_prefix(connection),
-            cell,
-        )
+    """Loud-log a per-connection attestation that suppresses a weakened-TLS refusal (#200 decision 3 —
+    attestation is AUDITED when it crosses a hop that would otherwise be refused).
+
+    It logs at every posture, because the refusal it suppresses holds at every posture: without the
+    attestation :func:`_weakened_tls_permitted` refuses the hop even at ``[security].enforcement =
+    warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used to log only while
+    enforcing, when ``MEFOR_ALLOW_INSECURE_TLS`` could permit the hop at ``warn`` instead."""
+    logger.warning(
+        "%s%s: weakened TLS permitted by per-connection tls_hop_attested (operator attests the hop is "
+        "secure by other means)",
+        hop_name_prefix(connection),
+        cell,
+    )
 
 
 def _assert_send_hop(
     *,
     weakened: bool,
     attested: bool,
-    posture: HopPosture | None,
     connection: str | None = None,
 ) -> None:
     """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
-    DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
-    (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
-    a non-weakened (verifying-TLS) hop. ``posture`` is the one the connector captured when it was
-    built."""
-    if weakened and not _weakened_tls_permitted(attested=attested, posture=posture):
+    DB hop, re-confirm :func:`_weakened_tls_permitted` still permits it. Raises
+    :class:`InsecureHopRefused` (a ``ValueError``) otherwise — a fail-closed tripwire behind the
+    construction-time gate. No-op for a non-weakened (verifying-TLS) hop."""
+    if weakened and not _weakened_tls_permitted(attested=attested):
         raise InsecureHopRefused(
             f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
             "weakened-TLS database hop "
-            "(posture-keyed refusal, #200)"
+            "(#200)"
         )
 
 
@@ -241,10 +254,9 @@ def _build_dsn(
     BACKLOG #4873).
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
-    ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
-    authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
-    for staging AND prod PHI, with the global escape clamped so it can never relax a production hop;
-    ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
+    ``ServerCertificate`` pin. A weakened TLS posture is **refused** (:func:`_weakened_tls_permitted`,
+    #200) at every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set at
+    ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2); ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
 
     ``read_only`` (the db_lookup pool and, since BACKLOG #2617, the ``DatabaseRef`` sync set it;
     destination/source omit it, keeping their DSN byte-identical) appends ``ApplicationIntent=ReadOnly``
@@ -264,18 +276,15 @@ def _build_dsn(
         raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
-    if (trust or not encrypt) and not _weakened_tls_permitted(
-        attested=attested, posture=current_hop_posture()
-    ):
+    if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
-            "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
-            f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
-            "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
-            f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
-            "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
-            "the default, or with no posture)."
+            "which is MITM-able, and the connection's login would cross it. Use a trusted server "
+            f"certificate with encrypt=true, or set {HOP_ATTESTATION_LEVER} on the connection if the "
+            "hop is secure by other means (a proxy-terminated or isolated segment; reported as a "
+            f"loosening). {INSECURE_TLS_ESCAPE_ENV}=1 does not permit it, even on an instance at "
+            "[security].enforcement = warn."
         )
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
@@ -759,7 +768,7 @@ class _DriverFamily(NamedTuple):
     tls_example: tuple[str, str]
     #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
-    #: keyword never brings an unmeasured escape with it.
+    #: keyword does not put the family on the escape list.
     brace_escape: bool
 
 
@@ -775,8 +784,13 @@ class _DriverFamily(NamedTuple):
 #
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
-# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
-# escape by the SQL Server preset and the store.
+# on 2026-10-30 to read that escape, and Microsoft's, which the SQL Server preset and the store also
+# rely on. A test on the hosted ``sql server (store + connector)`` leg measures Microsoft's for ODBC
+# Driver 18 on Linux (``msodbcsql18`` under unixODBC):
+# tests/test_sqlserver_store.py::test_microsoft_odbc_driver_reads_the_braced_password_escape.
+# That leg installs whichever ``msodbcsql18`` build apt resolves. Unmeasured: at least other Driver
+# 18 builds, Windows ``msodbcsql18.dll``, macOS, every other major the family accepts, and every
+# driver the SQL Server preset accepts outside this family.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         "sslmode",
@@ -1481,47 +1495,88 @@ def _refuse_ca_content(setting: str, data: bytes, *, refusing: str) -> None:
 _LIBPQ_ROOT_CERT = "root.crt"
 
 
-def _libpq_root_cert() -> tuple[str, str] | None:
-    """The ``(setting, path)`` of the root certificate libpq reads from the engine's environment
-    when no ``sslrootcert`` is given, which the generic dialect never gives (BACKLOG #3090, step
-    3): ``PGSSLROOTCERT`` when it is set and not empty, else ``root.crt`` in
-    :func:`_libpq_home`. ``None`` for ``system``, libpq 16's name for the platform's own store,
-    which is no file, and when no home directory can be named, where libpq reads no default
-    either. A libpq older than 16 reads ``system`` as a file in its working directory, and that
-    file is not read here."""
+def _libpq_root_certs() -> list[tuple[str, str]]:
+    """The ``(setting, path)`` of each root certificate the installed libpq could read from the
+    engine's environment when no ``sslrootcert`` is given, which the generic dialect never gives
+    (BACKLOG #3090, step 3), for the caller to refuse on any of them: ``PGSSLROOTCERT`` when it
+    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`.
+
+    Empty for ``system``: the engine then checks no root-certificate file. libpq 16 and later load
+    at least OpenSSL's default CA file and directory for it, which ``SSL_CERT_FILE`` and
+    ``SSL_CERT_DIR`` can redirect, and a libpq older than 16 opens a file named ``system`` in its
+    working directory; none of these is checked. Empty too when libpq names no home, as when the
+    effective user has no password-file entry and ``HOME`` is unset: libpq then reads no default
+    file. Raises ``OSError`` when the engine cannot ask which home libpq names, as when ``pwd``,
+    ``ctypes`` or the shell call cannot be loaded or made, and :class:`_UnholdableShellFolder`
+    for a ``?`` in the Windows folder (:func:`_libpq_homes`)."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
-        return None if named == "system" else ("libpq root certificate PGSSLROOTCERT", named)
-    home = _libpq_home()
-    if home is None:
-        return None
-    return "libpq's default root certificate", os.path.join(home, _LIBPQ_ROOT_CERT)
+        return [] if named == "system" else [("libpq root certificate PGSSLROOTCERT", named)]
+    return [
+        (f"libpq's default root certificate{label}", os.path.join(home, _LIBPQ_ROOT_CERT))
+        for label, home in _libpq_homes()
+    ]
 
 
-def _libpq_home() -> str | None:
-    """The directory libpq reads its default files from, found as libpq 15 and later find it:
-    ``postgresql`` in the roaming application-data folder the shell names on Windows, and
-    ``.postgresql`` in ``HOME``, or in the effective user's password-file home when ``HOME`` is
-    unset or empty, elsewhere. libpq 14 and older read the password-file home only. ``None`` when
-    neither can be named, as libpq then reads no default file.
+class _UnholdableShellFolder(ValueError):
+    """:func:`_libpq_homes` met a ``?`` the ANSI call wrote into the roaming folder's name."""
+
+
+def _libpq_homes() -> list[tuple[str, str]]:
+    """``(label, directory)`` for each directory a libpq version reads its default files from.
+    The label words a refusal, and is empty when only one directory is named.
+
+    On Windows, ``postgresql`` in the roaming application-data folder the shell names, which every
+    version asks for. Elsewhere, ``.postgresql`` in ``HOME``, or in the effective user's
+    password-file home when ``HOME`` is unset or empty, as libpq 15 and later find it; and in the
+    password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
+    differ, both are named, so a check of one cannot clear a file libpq loads from the other.
+    Empty when no directory can be named, as libpq then reads no default file.
+
+    On Windows, a ``?`` past the drive of the shell's ANSI folder raises
+    :class:`_UnholdableShellFolder`, which the build refuses: the ANSI call writes ``?`` for a
+    character its code page cannot hold, so the engine cannot say which file libpq reads there.
+    Best-fit maps other such characters to other characters, and that path is named and checked
+    like any other; one mapped to a character no Windows name holds, at least ``*`` for a
+    fullwidth asterisk, makes the check's walk refuse the build.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
     and ``initialize_SSL`` in libpq 17). Raises ``OSError`` when the Windows shell call cannot be
-    made (:func:`_windows_roaming_appdata`)."""
+    made (:func:`_windows_roaming_appdata`), or off Windows when ``pwd`` cannot be imported."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
-        return None if appdata is None else os.path.join(appdata or os.sep, "postgresql")
-    home = os.environ.get("HOME")
-    if not home:
+        if appdata is None:
+            return []
+        if "?" in os.path.splitdrive(appdata)[1]:
+            # The refusal names the cause, never the path, which holds the account's name.
+            logger.debug("libpq's roaming folder holds a substituted '?': %s", appdata)
+            raise _UnholdableShellFolder(
+                "the ANSI code page cannot hold the roaming folder's name, so the folder libpq "
+                "reads could not be checked"
+            )
+        return [("", os.path.join(appdata or os.sep, "postgresql"))]
+    try:
         import pwd
+    except ImportError as exc:
+        raise OSError("the password file could not be read to name libpq's home") from exc
 
-        try:
-            home = pwd.getpwuid(os.geteuid()).pw_dir
-        except KeyError:
-            return None
-    return os.path.join(home or os.sep, ".postgresql")
+    # Keyed by the joined directory, so the same spelling of one home is named once. No lexical
+    # normpath: past a link, its ".." names another directory than the system resolves.
+    named: dict[str, str] = {}
+    env_home = os.environ.get("HOME")
+    if env_home:
+        named[os.path.join(env_home, ".postgresql")] = " in HOME"
+    try:
+        password_home = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        logger.debug("no password-file entry for this user, so libpq 14 and older name no home")
+    else:
+        named.setdefault(
+            os.path.join(password_home or os.sep, ".postgresql"), " in the password-file home"
+        )
+    return [(label if len(named) > 1 else "", home) for home, label in named.items()]
 
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
@@ -1529,31 +1584,47 @@ _CSIDL_APPDATA = 0x1A
 
 
 def _windows_roaming_appdata() -> str | None:
-    """``SHGetFolderPathW``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
-    ``APPDATA`` variable, which a service's environment may not carry. ``None`` when the call
-    reports a failure, as libpq then reads no default file, and possibly empty when it succeeds.
-    Raises ``OSError`` off Windows, and when ``shell32`` or its export cannot be loaded: then the
-    engine cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
+    """``SHGetFolderPathA``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
+    ``APPDATA`` variable, which a service's environment may not carry. libpq is built without
+    ``UNICODE``, so it calls the ANSI export and stats the ANSI path it gets back; for a folder
+    the code page cannot hold, that names a different file than the wide export would. The bytes
+    are decoded in that code page (``mbcs``). OpenSSL then opens the file by trying the bytes as
+    UTF-8 first and the ANSI path only when that finds no file, so for bytes that are also valid
+    UTF-8 it can load a file other than the one checked here.
+
+    ``None`` when the call reports a failure, as libpq then reads no default file, and possibly
+    empty when it succeeds. Raises ``OSError`` off Windows, and when ``ctypes``, ``shell32`` or its
+    export cannot be loaded, the call cannot be made, or its bytes do not decode: then the engine
+    cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the application-data folder is read only on Windows")
-    import ctypes
-
     try:
-        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathW
-    except (OSError, AttributeError) as exc:
-        raise OSError("SHGetFolderPathW could not be loaded from shell32") from exc
-    get_folder.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_wchar_p,
-    ]
-    get_folder.restype = ctypes.c_long
-    buf = ctypes.create_unicode_buffer(260)  # MAX_PATH, the size the call is documented to take
-    if get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0:
+        import ctypes
+    except ImportError as exc:
+        raise OSError("ctypes could not be loaded to ask for SHGetFolderPathA") from exc
+    try:
+        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathA
+        get_folder.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+        ]
+        get_folder.restype = ctypes.c_long
+        buf = ctypes.create_string_buffer(260)  # MAX_PATH, the size the call is documented to take
+        failed = get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0
+    except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+        raise OSError("SHGetFolderPathA could not be loaded from shell32 or called") from exc
+    if failed:
         return None
-    return buf.value
+    try:
+        return buf.value.decode("mbcs")
+    except UnicodeDecodeError:
+        # The error holds the folder's bytes, the account's name among them, so it ends with the
+        # handler and the raise below carries no cause or context (encode_wire_body in base.py).
+        pass
+    raise OSError("SHGetFolderPathA gave a folder its code page does not decode")
 
 
 def _refuse_encrypted_libpq_root_cert(
@@ -1564,7 +1635,8 @@ def _refuse_encrypted_libpq_root_cert(
     refuses an ``sslca``.
 
     psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
-    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names. libpq 17's
+    ``pqopt``, so libpq takes a file :func:`_libpq_root_certs` names, each of which is judged
+    here and refused on its own. libpq 17's
     ``initialize_SSL`` loads that file at every TLS attempt whose ``stat`` of it succeeds, whatever
     the mode, and only a ``verify`` mode fails the connect when the ``stat`` fails. So the check
     runs for the psqlODBC family whenever ``sslmode`` asks libpq for TLS, erring wide on ``allow``
@@ -1601,17 +1673,24 @@ def _refuse_encrypted_libpq_root_cert(
     ):
         return
     try:
-        found = _libpq_root_cert()
+        found = _libpq_root_certs()
     except OSError as exc:
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
             "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
             f"it was not read to check {_CA_CHECKED_FOR}"
         ) from exc
-    if found is None:
-        return
-    source, path = found
-    setting = f"{hop_name_prefix(connection)}DATABASE {source}"
+    except _UnholdableShellFolder as exc:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
+            f"PGSSLROOTCERT to a local path; {exc}"
+        ) from exc
+    for source, path in found:
+        _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
+
+
+def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
+    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
     what = "root certificate file"
     unread: dict[str, str] = {}
     verdicts = file_keyword_verdicts(path, unread)
@@ -1859,8 +1938,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
-    always braced with the ``}}`` escape, as every family on the list reads it
-    (:func:`_odbc_password`).
+    always braced with the ``}}`` escape (:func:`_odbc_password`; the comment above
+    :data:`_DRIVER_FAMILIES` says which drivers were measured to read it).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
@@ -1962,7 +2041,7 @@ def _warn_generic_tls_unenforced(
     params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
-    path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
+    path **cannot introspect the driver's TLS posture**, so the weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
     is a deliberate operator-owned-TLS model.
 
@@ -2025,7 +2104,7 @@ def _warn_generic_tls_unenforced(
 # construction.
 #
 # SCOPE IS DELIBERATE: the generic dialect only, and only when the classifier returns a reason. The SQL
-# Server preset keeps its own posture-keyed weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
+# Server preset keeps its own weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
 # onto this gradient would ADD the loopback and ``cleartext_accepted`` relaxations to a path that
 # refuses today, which is a loosening.
 
@@ -2044,7 +2123,7 @@ def generic_cleartext_hop_guard(
     nothing on this arm to gate (BACKLOG #1178).
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
-    Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
+    Server preset keeps its own weakened-TLS refusal in :func:`_build_dsn`. A generic
     connection returns ``None`` when :func:`generic_odbc_tls_unenforced` does, because it found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
     written down above :data:`_ODBC_NO_TLS_VALUES`.
@@ -2533,9 +2612,17 @@ def _driver_code(message: str) -> str | None:
     return str(found[-1]) if found else None
 
 
-def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
+def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
+
+    ``connecting`` says the error came from opening the connection, before the statement ran, so
+    no message can be at fault (BACKLOG #5713). There a refused login (class ``28``) is a
+    ``credential_fault`` and a missing driver or DSN (class ``IM``, or unixODBC's ``01000``) a
+    ``config_fault``, so the delivery worker stops the lane and keeps the queue (ADR 0095) rather
+    than dead-letter every queued row on the same refusal. Any other permanent state there is
+    retried, never a per-message reject: a server in recovery or failing over may refuse a login
+    under ``42000`` or ``HY000``, and stopping the lane on that would need an operator to resume it.
 
     ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
     (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
@@ -2548,6 +2635,22 @@ def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
     detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
+    if connecting:
+        if sqlstate[:2] in _CREDENTIAL_PREFIXES:
+            return NegativeAckError(
+                f"database refused the login {detail}",
+                code=sqlstate,
+                permanent=True,
+                credential_fault=True,
+            )
+        if sqlstate[:2] in _CONFIG_PREFIXES or sqlstate in _CONFIG_STATES:
+            return NegativeAckError(
+                f"database connection refused by its configuration {detail}",
+                code=sqlstate,
+                permanent=True,
+                config_fault=True,
+            )
+        return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
         code=sqlstate or "db",
@@ -3111,8 +3214,9 @@ class _AutocommitPool:
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
         # BACKLOG #2394: here, not only in _acquire, because a DatabaseRef sync borrows through
-        # acquire_pooled, and because the set below goes through the gate.
-        install_call_gate(conn)
+        # acquire_pooled, and because the set below goes through the gate. One the gate cannot
+        # wrap is refused before that set, its first call.
+        await _require_gate_or_discard(self._pool, conn)
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
@@ -3233,15 +3337,75 @@ async def _acquire(pool: Any, timeout: float) -> Any:
     hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
 
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
-    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded."""
+    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
+    real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
+    runs on it (:func:`_require_gate_or_discard`)."""
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
         raise DeliveryError(
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
-    install_call_gate(conn)
+    await _require_gate_or_discard(pool, conn)
     return conn
+
+
+async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
+    """Gate a connection just borrowed from ``pool``, or refuse it (BACKLOG #2394).
+
+    Call it before the first pyodbc call on ``conn``, with no await between the borrow and it. A
+    real aioodbc connection the call gate cannot wrap
+    (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
+    it is closed here, while no call runs on it.
+    :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then propagates, and each caller
+    classifies it as it does any other failure to borrow. A stand-in the gate cannot wrap is not
+    refused, as ``require_call_gate`` leaves it alone.
+
+    **Its handle is dropped before any await**, so the pool never lends it again, and given back
+    closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
+    for it, as the store's refusal does not: nothing runs on the connection, so the close can race
+    nothing, and the borrow is not held behind a busy executor or a slow disconnect. Where the
+    executor is already shut down, at loop teardown, no thread can take the close, and the handle
+    is freed as this refusal unwinds, on the event loop thread.
+
+    **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
+    no handle to drop, so it is closed through its own ``close()``
+    (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), and goes back to ``pool`` only once
+    that close has returned, through :func:`_return_when_settled` when a cancellation lands
+    meanwhile. So the pool can neither lend it nor close it again while that close runs. On this
+    path the borrow does wait for the close, and nothing bounds that wait. A close that failed
+    leaves it open: it goes back open, and the next borrow refuses and closes it again."""
+    try:
+        require_call_gate(conn)
+    except UngatedConnectionError:
+        raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
+        if raw is not None:
+            try:
+                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+            except RuntimeError as exc:  # the executor is shut down; see the docstring
+                logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
+        else:
+            closing = asyncio.ensure_future(close_one_shot(conn, None))
+            # The loop holds a task only weakly; keep this one alive until it ends, since on a
+            # cancellation only _return_when_settled's callback is left waiting on it.
+            _DETACHED_SETTLES.add(closing)
+            closing.add_done_callback(_DETACHED_SETTLES.discard)
+            try:
+                await asyncio.shield(closing)
+            except BaseException:
+                _return_when_settled(pool, conn, closing, "a refused connection's close")
+                raise
+        await _return_to_pool(pool, conn)
+        raise
+
+
+def _close_refused(raw: Any) -> None:
+    """On a worker thread: close the driver connection of a borrow the call gate refused. No call
+    ever ran on it, so no transaction can be open. Never raises."""
+    try:
+        raw.close()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
+        logger.warning("DATABASE: closing a refused connection failed: %s", _safe_db_error(exc))
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -3299,20 +3463,21 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     alone is handed to that call, so the connection goes back only once it has returned, and the
     gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
     to the connection's executor but before that call entered the gate leaves a call that never
-    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A connection
-    with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
-    which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
-    drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
-    and then the connection once nothing uses them, since its cursor holds the connection.
+    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A real aioodbc
+    connection the gate cannot wrap does not reach here through this module's borrows, which refuse
+    and discard it before its first call (:func:`_require_gate_or_discard`); a connection taken
+    from a plain aioodbc pool some other way, such as ``acquire_pooled`` on a pool that is not an
+    :class:`_AutocommitPool`, is not checked. A connection with no gate, a test double or one that
+    came that other way, has nothing to hand a close to, so a cancellation drops its handle
+    and closes nothing: the pool gets it back closed, and its unclosed handles are freed where
+    their last reference drops, rather than under the call.
 
     **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
     an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
     once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
-    the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
-    unclosed handles are freed where their last reference drops, which can be the event loop, for
-    one through the cancelled call's own result: that free rolls back and disconnects there, the
-    trade for not freeing them under the call. Its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
-    thread, but before the loop delivered the result, leaves that cursor for the collector.
+    the connection out of the pool (:func:`_return_when_settled`). A cancellation that lands after
+    a ``cursor()`` call returned on its thread, but before the loop delivered the result, leaves
+    that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
@@ -3575,24 +3740,38 @@ def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
         )
 
 
+async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, Any]:
+    """The pool and a connection borrowed from it, with a failure to connect classified.
+
+    Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver or
+    the missing ``sqlserver`` extra surfaces here (BACKLOG #5713). A driver error is classified as
+    a connect failure (:func:`_classify_db_error`), and the missing extra is a ``config_fault``.
+    Any other failure, with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire
+    timeout already is: nothing has run, so no message can be at fault."""
+    try:
+        pool = await get_pool()
+        return pool, await _acquire(pool, timeout)
+    except DeliveryError:
+        raise
+    except _DriverMissingError as exc:
+        raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
+    except Exception as exc:
+        state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
+        if state is None:
+            raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
+        raise _classify_db_error(state, str(exc), connecting=True) from exc
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
     """Open the pool and run ``SELECT 1`` — a no-data, no-write reachability probe shared by the
     DATABASE source and destination's ``test_connection``. A driver error is mapped via
-    :func:`_classify_db_error` (transient vs permanent); a non-driver failure (e.g. an unreachable host
-    before any SQLSTATE) becomes a transient :class:`DeliveryError`. Triggers the connector's lazy pool;
+    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); any
+    other non-driver failure (e.g. an unreachable host before any SQLSTATE) becomes a transient
+    :class:`DeliveryError`. Triggers the connector's lazy pool;
     the caller closes it with ``aclose()``."""
-    try:
-        pool = await get_pool()
-        conn = await _acquire(pool, timeout)
-    except Exception as exc:
-        state = _sqlstate(exc)
-        raise (
-            _classify_db_error(state, str(exc))
-            if state
-            else DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}")
-        ) from exc
+    pool, conn = await _connect(get_pool, timeout)
     cur: Any = None
     try:
         cur = await conn.cursor()
@@ -3624,6 +3803,58 @@ def _json_default(value: Any) -> Any:
     )
 
 
+async def _fetch_result_set(cur: Any) -> list[Any] | None:
+    """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
+
+    "None" is read from ``cur.description`` (DB-API 2.0), never from a failed fetch (BACKLOG
+    #5714): pyodbc raises *No results* from a fetch in exactly that state. A driver error from the
+    fetch, one carrying a SQLSTATE, is the statement's own, such as a deadlock or a procedure's
+    error, and propagates so the caller's write is rolled back rather than committed and recorded
+    as delivered. An error with none, or with a client conversion state
+    (:data:`_CLIENT_FETCH_STATES`), is the client failing to read what it was sent, such as
+    pyodbc's *ODBC SQL type -155 is not yet supported* or a decode error, and is raised as
+    :class:`_ResultUnreadable`, a capture problem that leaves the write alone."""
+    if cur.description is None:
+        return None
+    try:
+        rows: list[Any] = await cur.fetchall()
+    except Exception as exc:
+        state = _log_sqlstate(exc)
+        if state is None:
+            raise _ResultUnreadable(type(exc).__name__) from exc
+        if state in _CLIENT_FETCH_STATES:
+            raise _ResultUnreadable(f"{type(exc).__name__} [{state}]") from exc
+        raise
+    return rows
+
+
+class _ResultUnreadable(Exception):
+    """A result set the client could not read, named by the error type alone (never its text)."""
+
+
+async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
+    """Whether ``nextset()`` reached another result set (BACKLOG #5714).
+
+    A driver error there is a later statement's own failure and propagates, as from a fetch. A
+    state in :data:`_NO_NEXTSET_STATES`, or a client error with no SQLSTATE, ends the walk with
+    what was read, as before, and is logged by state or type alone."""
+    try:
+        return bool(await advance())
+    except Exception as exc:
+        state = _log_sqlstate(exc)
+        if state in _NO_NEXTSET_STATES:
+            logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
+            return False
+        if state is None:
+            logger.warning(
+                "DATABASE: nextset() failed in the client (%s); the capture keeps the result "
+                "sets read so far",
+                type(exc).__name__,
+            )
+            return False
+        raise
+
+
 class DatabaseDestination(DestinationConnector):
     """Execute one parameterized statement per payload against a SQL database (SQL Server today)."""
 
@@ -3644,8 +3875,6 @@ class DatabaseDestination(DestinationConnector):
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
         self._connection_name = config.name
-        # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
-        self._hop_posture = current_hop_posture()
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
@@ -3718,15 +3947,14 @@ class DatabaseDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
-        # #200 decision 4: zero-I/O byte-crossing re-assertion of the posture-keyed hop decision, so a
-        # payload never crosses a weakened-TLS DB hop the shared authority would refuse. Defense-in-depth
-        # BEHIND the construction-time _build_dsn gate (which already refused a prod-PHI weakened hop),
+        # #200 decision 4: zero-I/O byte-crossing re-assertion of the hop decision, so a
+        # payload never crosses a weakened-TLS DB hop _weakened_tls_permitted would refuse. Defense-in-depth
+        # BEHIND the construction-time _build_dsn gate (which already refused an unattested weakened hop),
         # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
         # fires as a tripwire.
         _assert_send_hop(
             weakened=self._weakened_tls,
             attested=self._hop_attested,
-            posture=self._hop_posture,
             connection=self._connection_name,
         )
         # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on
@@ -3735,8 +3963,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.assert_send()
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
-        pool = await self._get_pool()
-        conn = await _acquire(pool, self._acquire_timeout)
+        pool, conn = await _connect(self._get_pool, self._acquire_timeout)
         cur: Any = None
         discard = False
         try:
@@ -3744,8 +3971,9 @@ class DatabaseDestination(DestinationConnector):
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
-                # a separate post-commit SELECT could read changed state on a crash-replay). _capture
-                # never raises — a capture problem must not roll back an otherwise-successful write.
+                # a separate post-commit SELECT could read changed state on a crash-replay). A capture
+                # problem never rolls back the write, but a driver error reading the result is the
+                # statement's own failure and rolls it back like one (BACKLOG #5714).
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
@@ -3780,8 +4008,9 @@ class DatabaseDestination(DestinationConnector):
     async def _capture(self, cur: Any) -> DeliveryResponse:
         """Serialize the statement's RETURNING/OUTPUT result-set to a bounded JSON body (ADR 0013).
 
-        Never raises (capture must not un-succeed a committed write): a missing result set / over-cap
-        becomes ``no_reply`` / ``unparseable`` with an empty body. Generated ids in a RETURNING are
+        A capture problem never un-succeeds the write: a missing result set / over-cap / an
+        unserializable value becomes ``no_reply`` / ``unparseable`` with an empty body. A driver
+        error from the fetch propagates (:func:`_fetch_result_set`). Generated ids in a RETURNING are
         only as stable as the write's idempotency — a non-idempotent INSERT re-derives a new id on a
         crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs).
 
@@ -3790,8 +4019,12 @@ class DatabaseDestination(DestinationConnector):
         if self.capture_out_params:
             return await self._capture_merged(cur)
         try:
-            rows = await cur.fetchall()
-        except Exception:  # noqa: BLE001 - statement produced no result set; capture nothing, keep the write
+            rows = await _fetch_result_set(cur)
+        except _ResultUnreadable as exc:
+            return DeliveryResponse(
+                body="", outcome="unparseable", detail=f"result-set not readable ({exc})"
+            )
+        if rows is None:
             return DeliveryResponse(body="", outcome="no_reply", detail="no result set")
         if not rows:
             return DeliveryResponse(body="", outcome="no_reply", detail="0 rows")
@@ -3802,7 +4035,7 @@ class DatabaseDestination(DestinationConnector):
                 detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
             )
         try:
-            cols = [d[0] for d in cur.description] if cur.description else []
+            cols = [d[0] for d in cur.description]
             data = [dict(zip(cols, tuple(row))) for row in rows]  # noqa: B905
             body = json.dumps(data, default=_json_default)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
@@ -3833,35 +4066,34 @@ class DatabaseDestination(DestinationConnector):
         the atomicity caveat for a proc that COMMIT/ROLLBACKs internally). Bounded by
         ``capture_max_rows``/``capture_max_bytes`` like the single-set path.
 
-        Never raises (capture must not un-succeed a committed write): a problem degrades to
-        ``no_reply``/``unparseable`` with an empty body."""
+        A capture problem never un-succeeds the write: it degrades to ``no_reply``/``unparseable``
+        with an empty body. A driver error from a fetch (:func:`_fetch_result_set`) or from
+        ``nextset()`` (:func:`_next_result_set`), where a later statement's error surfaces,
+        propagates (BACKLOG #5714)."""
         merged: list[dict[str, Any]] = []
+        spoiled: str | None = None  # why the capture is unparseable, once it is
         advance = getattr(cur, "nextset", None)
         while True:
-            try:
-                rows = await cur.fetchall()
-            except Exception:  # noqa: BLE001 - this set is not a query (INSERT/EXEC) → nothing to fetch
-                rows = []
-            if rows:
+            if spoiled is None:
                 try:
-                    cols = [d[0] for d in cur.description] if cur.description else []
-                    merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
-                except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
-                    pass
-            if len(merged) > self._capture_max_rows:
-                return DeliveryResponse(
-                    body="",
-                    outcome="unparseable",
-                    detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
-                )
-            if advance is None:
-                break  # a driver/cursor with no nextset() → single set only
-            try:
-                has_next = await advance()
-            except Exception:  # noqa: BLE001 - driver can't advance → stop with what we have
-                break
-            if not has_next:
-                break
+                    rows = await _fetch_result_set(cur)
+                except _ResultUnreadable as exc:
+                    spoiled, rows = f"result-set not readable ({exc})", None
+                if rows:
+                    try:
+                        cols = [d[0] for d in cur.description]
+                        merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
+                    except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
+                        pass
+                    if len(merged) > self._capture_max_rows:
+                        spoiled = f"result-set exceeded capture_max_rows={self._capture_max_rows}"
+            # Once spoiled the walk still advances, fetching nothing (nextset() discards the rows in
+            # the driver), so an error a later statement raises still reaches send() rather than
+            # being left unread under the commit.
+            if advance is None or not await _next_result_set(advance):
+                break  # no nextset() (a single-set driver/cursor), or the last set
+        if spoiled is not None:
+            return DeliveryResponse(body="", outcome="unparseable", detail=spoiled)
         if not merged:
             return DeliveryResponse(
                 body="", outcome="no_reply", detail="no OUT params / return value"
@@ -4038,7 +4270,7 @@ class DatabaseSource(SourceConnector):
         if refusal is not None:
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
-        # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
+        # verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
             s,
             attested=config.tls_hop_attested,
@@ -4675,8 +4907,13 @@ def _lookup_connect_failure(connection: str, exc: Exception) -> str:
     prefix = f"db_lookup on {connection!r}: could not open a connection"
     if isinstance(exc, _DriverMissingError):
         return f"{prefix}; the 'sqlserver' extra is not installed"
-    detail = _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
-    return f"{prefix} ({detail})"
+    return f"{prefix} ({_credential_free_detail(exc)})"
+
+
+def _credential_free_detail(exc: BaseException) -> str:
+    """A driver error's SQLSTATE and native number, or its type alone: never its text, which can
+    carry DSN attributes (the rule :func:`_lookup_connect_failure` states)."""
+    return _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
 
 
 #: Row ceiling for one ``db_lookup`` call when its ``DatabaseLookup`` sets no ``max_rows``
@@ -4745,6 +4982,191 @@ def max_rows_setting(value: Any, *, label: str, default: int) -> int | None:
     )
 
 
+# --- the partner-login role probe (BACKLOG #2617) ---------------------------------------------
+class LoginRoleVerdict(str, Enum):  # noqa: UP042 - the repo's str-enum convention (see config.settings)
+    """What the role probe of one ``db_lookup`` or ``DatabaseRef`` login found. Four answers, so
+    "could not read" never reads as "read, and it is fine"."""
+
+    CLEAN = "clean"  # every role read, and none of them can write or administer
+    OVER_GRANTED = "over_granted"  # at least one role read as held that can
+    CANNOT_JUDGE = "cannot_judge"  # no over-grant read, but a role went unread
+    NOT_RUN = "not_run"  # the probe could not run: no borrow, a failed statement, no row
+
+
+#: The fixed database roles a read-only partner login may hold and still be clean: reading, and the
+#: two ``db_deny*`` roles, which only take access away. Every fixed SERVER role, and every other fixed
+#: database role, is a finding: each one writes or administers database-wide or wider.
+LOOKUP_LOGIN_READ_ROLES: frozenset[str] = frozenset(
+    {"db_datareader", "db_denydatareader", "db_denydatawriter"}
+)
+
+#: Both closed role sets in one statement, read by name. Each column answers 1, 0 or NULL.
+_LOGIN_ROLE_PROBE_ROLES: tuple[tuple[str, str], ...] = tuple(
+    [("server", r) for r in SQLSERVER_FIXED_SERVER_ROLES]
+    + [("database", r) for r in SQLSERVER_FIXED_DATABASE_ROLES]
+)
+_LOGIN_ROLE_PROBE_SQL = "SELECT " + ", ".join(
+    f"{'IS_SRVROLEMEMBER' if kind == 'server' else 'IS_ROLEMEMBER'}(?) AS r_{i}"
+    for i, (kind, _) in enumerate(_LOGIN_ROLE_PROBE_ROLES)
+)
+_LOGIN_ROLE_PROBE_PARAMS: tuple[str, ...] = tuple(role for _, role in _LOGIN_ROLE_PROBE_ROLES)
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRoleReading:
+    """One role probe's result. ``held`` names each role read as held that a read-only login does
+    not need, as ``server role <name>`` or ``database role <name>``. ``unread`` names each role that
+    :func:`classify_login_roles` could not read. ``cause`` says why a probe did not run. No field holds a DSN, a credential, a server's error text or a row."""
+
+    verdict: LoginRoleVerdict
+    held: tuple[str, ...] = ()
+    unread: tuple[str, ...] = ()
+    cause: str | None = None
+
+
+def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
+    """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
+
+    Read three ways, as ``store/privilege.py`` ``probed_grant`` reads the store login: ``1`` held,
+    ``0`` not held, NULL **not read**. Only an int or a bool that is 0 or 1 reads, so any other
+    value, such as the text ``"1"``, ``1.0`` or ``2``, is not read either, and ``probed_grant``
+    reads all three the same way (BACKLOG #6015). Not even a ``1`` of another type reads as held,
+    because a held ``db_denydatawriter`` takes a finding away.
+    ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
+    login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
+    reported when another is not read. An unread role can hide an over-grant, and an unread
+    ``db_denydatawriter`` beside a held ``db_datawriter`` reports that writer as an over-grant
+    rather than clearing it, though the deny may have taken it back.
+
+    "Clean" means **no database-wide write role**: none of the classic fixed server roles, and no
+    fixed database role but ``db_datareader`` and the two ``db_deny*`` roles. It reads role
+    membership only: a permission granted directly at any scope (``INSERT`` on one table,
+    ``CONTROL SERVER``), a user-defined role, a ``##MS_...##`` server role or a role in another
+    database reads clean (``docs/CONNECTIONS.md`` lists them).
+    ``db_datawriter`` held with ``db_denydatawriter`` is not a finding, since the deny takes back the
+    table writes that role grants."""
+    if len(row) != len(_LOGIN_ROLE_PROBE_ROLES):
+        return LoginRoleReading(
+            LoginRoleVerdict.NOT_RUN,
+            cause=f"the probe returned {len(row)} columns, not {len(_LOGIN_ROLE_PROBE_ROLES)}",
+        )
+    held: list[tuple[str, str]] = []
+    unread: list[str] = []
+    for (kind, role), value in zip(_LOGIN_ROLE_PROBE_ROLES, row, strict=True):
+        # The rule is the docstring's: anything but an int or bool 0 or 1 is unread.
+        if not isinstance(value, int) or value not in (0, 1):
+            unread.append(f"{kind} role {role}")
+        elif value == 1:
+            held.append((kind, role))
+    allowed = set(LOOKUP_LOGIN_READ_ROLES)
+    if ("database", "db_denydatawriter") in held:
+        allowed.add("db_datawriter")
+    findings = tuple(
+        f"{kind} role {role}" for kind, role in held if kind == "server" or role not in allowed
+    )
+    if findings:
+        verdict = LoginRoleVerdict.OVER_GRANTED
+    elif unread:
+        verdict = LoginRoleVerdict.CANNOT_JUDGE
+    else:
+        verdict = LoginRoleVerdict.CLEAN
+    return LoginRoleReading(verdict, held=findings, unread=tuple(unread))
+
+
+def _probe_failure_cause(exc: Exception) -> str:
+    """A PHI-free, credential-free cause: the engine's own pool-timeout text, a driver error's
+    SQLSTATE and native number, or the type alone. Never a driver message, which can carry DSN
+    attributes (the rule :func:`_lookup_connect_failure` states)."""
+    return str(exc) if isinstance(exc, DeliveryError) else _credential_free_detail(exc)
+
+
+def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
+    """One log line per probe. Only a clean read is INFO; every other answer WARNS, and none refuses."""
+    if reading.verdict is LoginRoleVerdict.CLEAN:
+        logger.info(
+            "%r: login role probe: none of the classic fixed server roles and no database-wide "
+            "write role in this database (role membership only; at least permission grants at "
+            "any scope, user-defined roles, ##MS_...## server roles and other databases are not "
+            "read)",
+            label,
+        )
+    elif reading.verdict is LoginRoleVerdict.OVER_GRANTED:
+        logger.warning(
+            "%r: the login this partner hop dials holds %s, which can write or administer beyond "
+            "reading; give it SELECT on what it reads and nothing else. Warning only: nothing is "
+            "refused%s",
+            label,
+            ", ".join(reading.held),
+            f" (also not read: {', '.join(reading.unread)})" if reading.unread else "",
+        )
+    elif reading.verdict is LoginRoleVerdict.CANNOT_JUDGE:
+        logger.warning(
+            "%r: login role probe cannot judge this login: %s read NULL, or a value that is "
+            "not an integer 0 or 1. A NULL means the name did not resolve for it, not that it is "
+            "not a member. No write role read as held",
+            label,
+            ", ".join(reading.unread),
+        )
+    else:
+        logger.warning(
+            "%r: login role probe did not run (%s); this login's roles are unjudged, and the hop "
+            "goes ahead",
+            label,
+            reading.cause,
+        )
+
+
+async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) -> LoginRoleReading:
+    """Read the role membership of the login ``pool`` dials, log the answer, and return it (BACKLOG
+    #2617). The ``db_lookup`` executor runs it when a connection's pool first opens, and the
+    ``DatabaseRef`` sync when a set's pool first opens for its DSN.
+
+    **It never refuses, and never raises an** ``Exception``. An over-granted login warns, and the hop
+    goes ahead. A probe that cannot run, because the partner went unreachable after the pool opened,
+    the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
+    cancellation is let through.
+
+    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
+    lookup's own statement, it runs until the driver returns."""
+    reading = await _read_login_roles(pool, acquire_timeout)
+    _log_login_role_reading(reading, label)
+    return reading
+
+
+async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReading:
+    """The probe's read, unlogged. Every failure is a :attr:`LoginRoleVerdict.NOT_RUN` reading."""
+    try:
+        conn = await _acquire(pool, acquire_timeout)
+    except Exception as exc:
+        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
+    cur: Any = None
+    try:
+        cur = await conn.cursor()
+        await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
+        row = await cur.fetchone()
+    except Exception as exc:
+        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
+    except BaseException:  # a cancellation: the connection still goes back, then it propagates
+        await _close_and_release(pool, conn, cur)
+        raise
+    else:
+        reading = (
+            LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
+            if row is None
+            else classify_login_roles(tuple(row))
+        )
+    # Outside a finally, so a release that raises (a pool aclose() is closing, say) cannot escape
+    # the never-raises promise; the reading it already holds still stands.
+    try:
+        await _close_and_release(pool, conn, cur)
+    except Exception as exc:
+        logger.warning(
+            "login role probe: its connection did not go back to the pool cleanly (%s)",
+            _credential_free_detail(exc),
+        )
+    return reading
+
+
 class DatabaseLookupExecutor:
     """Pooled executor for handler-callable **live** lookups (``db_lookup``, ADR 0010).
 
@@ -4762,7 +5184,9 @@ class DatabaseLookupExecutor:
     anywhere. Pools here are opened **autocommit**, so a write that
     got past the statement test would commit rather than be rolled back. What actually bounds this connection is the
     privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
-    (BACKLOG #1574). ADR 0010's *Scope* consequence says this executor never commits; a dated
+    (BACKLOG #1574). The engine can detect a role-level over-grant, and does: when a connection's
+    pool first opens, :func:`probe_login_roles` reads the login's fixed-role membership and warns on
+    a database-wide write role, without refusing (BACKLOG #2617). ADR 0010's *Scope* consequence says this executor never commits; a dated
     correction beneath it (BACKLOG #1791) records why that is false and supersedes it.
 
     Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
@@ -4818,6 +5242,7 @@ class DatabaseLookupExecutor:
             )
             self._max_rows[cname] = _lookup_max_rows(s.get("max_rows"), cname)
         self._pools: dict[str, Any] = {}
+        self._role_readings: dict[str, LoginRoleReading] = {}
         self._locks: dict[str, asyncio.Lock] = {c: asyncio.Lock() for c in self._dsn}
 
     @property
@@ -4830,14 +5255,31 @@ class DatabaseLookupExecutor:
         if pool is not None:
             return pool
         async with self._locks[connection]:
-            if connection not in self._pools:
-                self._pools[connection] = await _make_pool(
-                    self._dsn[connection],
-                    self._pool_max[connection],
-                    autocommit=True,
-                    login_timeout=self._login_timeout[connection],
-                )
-        return self._pools[connection]
+            if connection in self._pools:
+                return self._pools[connection]
+            pool = await _make_pool(
+                self._dsn[connection],
+                self._pool_max[connection],
+                autocommit=True,
+                login_timeout=self._login_timeout[connection],
+            )
+            # Kept before the probe runs, so aclose() closes it whatever the probe does.
+            self._pools[connection] = pool
+            # BACKLOG #2617: once, when the pool first opens, since start does not dial
+            # lookups. It warns and never raises; a pool that failed to open is not probed,
+            # and the next lookup opens and probes it again.
+            self._role_readings[connection] = await probe_login_roles(
+                pool,
+                label=f"db_lookup:{connection}",
+                acquire_timeout=self._acquire_timeout[connection],
+            )
+        # The local, not a re-read: an aclose() that ran during the probe has removed the entry.
+        return pool
+
+    @property
+    def role_readings(self) -> Mapping[str, LoginRoleReading]:
+        """The role probe's reading for each connection whose pool has opened (BACKLOG #2617)."""
+        return dict(self._role_readings)
 
     async def query(
         self, connection: str, statement: str, params: Mapping[str, Any] | None

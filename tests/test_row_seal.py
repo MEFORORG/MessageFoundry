@@ -9,6 +9,10 @@ everything or refusing everything.
 from __future__ import annotations
 
 import base64
+import contextlib
+import sqlite3
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -161,3 +165,90 @@ def test_the_cipher_root_is_the_active_keys() -> None:
     cipher = make_cipher(active, [retired])
     assert cipher.authz_root() == _derive_authz_root(base64.b64decode(active))
     assert cipher.authz_root() != _derive_authz_root(base64.b64decode(retired))
+
+
+_NOT_FINITE = (float("nan"), float("inf"), float("-inf"))
+
+
+def _through_sqlite_real(value: float) -> object:
+    """``value`` as a SQLite ``REAL`` column hands it back, the round trip a stored row makes."""
+    with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+        conn.execute("CREATE TABLE t (v REAL)")
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+        return conn.execute("SELECT v FROM t").fetchone()[0]
+
+
+def test_a_negative_zero_seal_survives_a_sqlite_real_round_trip() -> None:
+    # BACKLOG #6717. SQLite's REAL column reads -0.0 back as 0.0, so a seal over -0.0's own
+    # encoding failed the next read as if the row had been changed.
+    back = _through_sqlite_real(-0.0)  # 0.0 on SQLite 3.50; the check holds either way
+    sealer = _sealer()
+    stored = sealer.seal("session", (("revoked_at", -0.0),))
+    assert sealer.verify("session", (("revoked_at", back),), stored)
+    # Control: a different value still fails, so the check did not open up.
+    assert not sealer.verify("session", (("revoked_at", 5e-324),), stored)
+
+
+@pytest.mark.parametrize(
+    "value", [0.0, 1.5, -1.5, 1_700_000_000.123456, 5e-324, -5e-324, 1e308, -1e308]
+)
+def test_every_float_but_negative_zero_keeps_its_float_hex_encoding(value: float) -> None:
+    # Only -0.0 moved: a seal made before the change over any other float still verifies.
+    expected = b"F" + len(value.hex()).to_bytes(4, "big") + value.hex().encode("ascii")
+    assert seal_bytes("k", [("f", value)]).endswith(expected)
+
+
+def test_negative_zero_encodes_as_zero_does() -> None:
+    assert seal_bytes("k", [("f", -0.0)]) == seal_bytes("k", [("f", 0.0)])
+
+
+@pytest.mark.parametrize("value", _NOT_FINITE)
+def test_a_seal_refuses_a_float_that_is_not_finite(value: float) -> None:
+    # BACKLOG #6717. SQLite stores a NaN as NULL, so a seal over one could never verify again.
+    sealer = _sealer()
+    with pytest.raises(ValueError):
+        sealer.seal("session", (("expires_at", value),))
+    assert sealer.seal("session", (("expires_at", 1.5),))  # control: a finite value seals
+
+
+@pytest.mark.parametrize("value", _NOT_FINITE)
+def test_a_row_changed_to_a_float_that_is_not_finite_fails_without_raising(value: float) -> None:
+    sealer = _sealer()
+    stored = sealer.seal("session", (("expires_at", 1.5),))
+    assert sealer.verify("session", (("expires_at", 1.5),), stored)  # control
+    assert sealer.verify_held("session", (("expires_at", 1.5),), stored)  # control
+    assert not sealer.verify("session", (("expires_at", value),), stored)
+    assert not sealer.verify_held("session", (("expires_at", value),), stored)
+
+
+def test_a_seal_reads_a_one_shot_iterable_of_fields_whole() -> None:
+    sealer = _sealer()
+    stored = sealer.seal("session", (pair for pair in _FIELDS))
+    assert sealer.verify("session", _FIELDS, stored)
+    assert sealer.verify("session", iter(_FIELDS), stored)
+
+
+@pytest.mark.parametrize(
+    "as_type",
+    [lambda s: s.encode("ascii"), lambda s: bytearray(s, "ascii"), lambda s: 7, lambda s: 7.5],
+    ids=["bytes", "bytearray", "int", "float"],
+)
+def test_a_stored_seal_that_is_not_text_fails_every_check_without_raising(
+    as_type: Callable[[str], Any],
+) -> None:
+    # BACKLOG #6718. A SQLite column can hand back a blob or a number whatever the column says;
+    # each check must read that as a malformed seal, not raise AttributeError or TypeError.
+    old, new = generate_key(), generate_key()
+    stored = _sealer(old).seal("session", _FIELDS)
+    rekeyed = RowSealer.for_cipher(make_cipher(new, [old]))
+    assert rekeyed is not None
+    held = _sealer(old)
+    assert held.verify("session", _FIELDS, stored)  # controls: the text form verifies
+    assert held.verify_held("session", _FIELDS, stored)
+    assert held.is_active(stored)
+    assert rekeyed.sealed_by_retired_key("session", _FIELDS, stored)  # control
+    other = as_type(stored)
+    assert not held.verify("session", _FIELDS, other)
+    assert not held.verify_held("session", _FIELDS, other)
+    assert not held.is_active(other)
+    assert not rekeyed.sealed_by_retired_key("session", _FIELDS, other)

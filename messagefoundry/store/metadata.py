@@ -9,17 +9,23 @@ sub-key, the operator/handler-attached bag written by :class:`~messagefoundry.co
 
 These two functions are the ONLY places that shape that split, shared by every store backend (so the
 merge can never drift across SQLite / Postgres / SQL Server) and by the API (so the internal keys never
-leak). They are pure: no I/O, no crypto — the caller decrypts before and encrypts after.
+leak). They are pure: no I/O beyond a content-free WARNING for an unreadable cell, no crypto — the
+caller decrypts before and encrypts after.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
+
+from messagefoundry.redaction import json_loads_or_refusal
+
+log = logging.getLogger(__name__)
 
 
 def _reference_json_default(value: Any) -> Any:
@@ -58,8 +64,21 @@ def encode_reference_value(value: Any) -> str:
 
     An unencodable type still raises ``TypeError``: the sync's caller keeps the last-good snapshot
     rather than committing a set with a value silently replaced by a placeholder (ADR 0006's graceful
-    degradation), which is the same never-accept-and-drop rule the rest of the store follows."""
-    return json.dumps(value, default=_reference_json_default)
+    degradation), which is the same never-accept-and-drop rule the rest of the store follows.
+
+    A non-finite float (a TOML ``nan``, a DATABASE double column) raises the same ``TypeError``
+    (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON."""
+    try:
+        return json.dumps(value, default=_reference_json_default, allow_nan=False)
+    except (ValueError, RecursionError):
+        # Raised below, OUTSIDE this handler: json's error carries notes naming the dict keys on the
+        # path, and a reference key may be PHI, so it must ride neither __cause__ nor __context__.
+        # ValueError covers at least a non-finite float, a circular value and an int too long to print.
+        pass
+    raise TypeError(
+        "reference snapshot cannot serialize this value to JSON (at least a non-finite float, a "
+        "circular value, an oversized int or one nested too deep)"
+    )
 
 
 def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
@@ -78,21 +97,60 @@ def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
     return json.dumps(clean)
 
 
+class MetadataTooDeepError(RuntimeError):
+    """A stored metadata cell nested past json's depth limit, raised where reading it as empty would
+    change an outcome (BACKLOG #6712). A ``RuntimeError``, as json's own ``RecursionError`` was on
+    main, so no ``ValueError`` arm downstream turns it into "no metadata". Carries no content."""
+
+
+def _load_object(
+    text: str | bytes | bytearray | None, *, too_deep_raises: bool = True
+) -> dict[str, Any]:
+    """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text;
+    text nested too deep to decode raises unless ``too_deep_raises`` is false.
+
+    It decodes through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's depth-limit
+    ``RecursionError`` never escapes (BACKLOG #6712): it raises :class:`MetadataTooDeepError`,
+    outside any handler so nothing is chained, or reads as malformed where ``too_deep_raises`` is
+    false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A
+    refusal that reads as empty is logged with json's content-free hint, never the text.
+    ``bytes``/``bytearray`` decode as ``json.loads`` decoded them before; any other type reads as
+    ``{}``, as the ``TypeError`` arm this replaced did."""
+    if isinstance(text, bytearray):
+        text = bytes(text)
+    if not isinstance(text, str | bytes) or not text:
+        return {}
+    value, refusal = json_loads_or_refusal(text)
+    if refusal is not None:
+        if too_deep_raises and refusal == RecursionError.__name__:
+            raise MetadataTooDeepError("a stored metadata cell is too deeply nested to decode")
+        log.warning("a stored JSON cell is unreadable (%s); read as empty", refusal)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _dumps_or_raise(value: Any) -> str:
+    """``json.dumps(value)``, or :class:`MetadataTooDeepError` when json's encoder hits its depth
+    limit, raised outside the handler so nothing is chained.
+
+    The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
+    be too deep to write back (BACKLOG #6712)."""
+    try:
+        return json.dumps(value)
+    except RecursionError:
+        pass
+    raise MetadataTooDeepError("a stored metadata cell is too deeply nested to re-encode")
+
+
 def decode_response_headers(headers_json: str | None) -> dict[str, str]:
     """Parse the decrypted ``resp_headers`` JSON back to a ``{name: value}`` map (BACKLOG #154).
 
     ``None``/empty/unparseable/non-object → ``{}`` (the byte-identical default), so a purged row (
     retention nulls the column) or a legacy row reads as "no captured headers". Only ``str``→``str``
-    entries survive. Pure: the caller decrypts before calling."""
-    if not headers_json:
-        return {}
-    try:
-        loaded = json.loads(headers_json)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(loaded, dict):
-        return {}
-    return {str(k): str(v) for k, v in loaded.items() if isinstance(v, (str, int, float, bool))}
+    entries survive, as :func:`encode_response_headers` writes nothing else. Pure: the caller decrypts
+    before calling."""
+    loaded = _load_object(headers_json, too_deep_raises=False)
+    return {k: v for k, v in loaded.items() if isinstance(v, str)}
 
 
 def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str, str]]) -> str:
@@ -101,21 +159,18 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
 
     Any non-``user`` keys already present (ADR 0013 correlation lineage) are preserved untouched. Within
     one message the same key is last-writer-wins. ``existing_json`` may be ``None``/empty (no metadata
-    yet) or a non-object (defensively treated as empty). Caller passes decrypted JSON in and encrypts the
-    result out — this function does neither."""
-    parsed: dict[str, Any] = {}
-    if existing_json:
-        try:
-            loaded = json.loads(existing_json)
-        except (TypeError, ValueError):
-            loaded = None
-        if isinstance(loaded, dict):
-            parsed = loaded
-    user: dict[str, Any] = dict(parsed.get("user") or {})
+    yet) or a non-object (defensively treated as empty), and so may a non-object ``"user"`` bag. A
+    cell too deep to decode, or one that decodes but is too deep to re-encode, raises
+    :class:`MetadataTooDeepError` rather than being written back as the ops alone, which would erase
+    the engine-internal keys. Caller passes decrypted JSON in and encrypts the result out — this
+    function does neither."""
+    parsed = _load_object(existing_json)
+    existing_user = parsed.get("user")
+    user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
     for key, value in meta_ops:
         user[key] = value
     parsed["user"] = user
-    return json.dumps(parsed)
+    return _dumps_or_raise(parsed)
 
 
 def user_metadata(metadata_json: str | None) -> str | None:
@@ -130,16 +185,13 @@ def user_metadata(metadata_json: str | None) -> str | None:
     refusal names the body's length and the head bound, never the digest or a byte of the body.
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
-    ``null`` rather than ``"{}"`` when nothing was attached."""
-    if not metadata_json:
-        return None
-    try:
-        loaded = json.loads(metadata_json)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(loaded, dict):
-        return None
-    user = loaded.get("user")
+    ``null`` rather than ``"{}"`` when nothing was attached. A cell too deep to decode or re-encode
+    raises :class:`MetadataTooDeepError` instead: ``None`` would send a ``dynamic_headers`` delivery
+    out without its headers. The delivery worker takes the error on its internal-error arm: under
+    the default ``InternalErrorPolicy.CONTINUE`` it dead-letters the row, and under ``STOP`` it
+    re-pends the row on the retry policy's backoff (dead-lettering it once a finite attempt cap is
+    reached) and halts the lane until an operator reloads or restarts."""
+    user = _load_object(metadata_json).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    return json.dumps(user)
+    return _dumps_or_raise(user)

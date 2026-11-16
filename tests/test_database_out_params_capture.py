@@ -9,6 +9,7 @@ are unit-tested without a real SQL Server.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Database, WiringError, build_outbound_connection
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import DatabaseDestination
 
 # `{ ? = CALL proc }` ODBC escape with a :name bind (translated to positional ? by the connector).
@@ -197,15 +199,175 @@ class _Pool:
 
 async def test_send_captures_out_params_pre_commit() -> None:
     cur = _SendCursor([([(0, 555)], [("return_value",), ("new_id",)])])
-    conn = _Conn(cur)
-    d = _dest()
-    d._pool = _Pool(conn)
+    d, conn = _send_dest(cur)
     resp = await d.send('{"mrn": "42"}')
     assert conn.committed and not conn.rolledback
     assert resp is not None and resp.outcome == "accepted"
     assert '"return_value": 0' in resp.body and '"new_id": 555' in resp.body
     # The proc was executed with the :mrn bind translated to positional ?.
     assert cur.executed == [("{ ? = CALL dbo.ingest(?) }", ("42",))]
+
+
+# --- BACKLOG #5714: a driver error reading the result is the write's failure -------------
+
+
+# pyodbc's shape: ``args == (sqlstate, message)``. 40001 is SQL Server's deadlock victim, 42000 a
+# RAISERROR from a later statement in the proc's batch.
+def _deadlock() -> Exception:
+    return Exception("40001", "[40001] deadlock victim (1205) (SQLFetch)")
+
+
+def _proc_error() -> Exception:
+    return Exception("42000", "[42000] proc failed (50000) (SQLMoreResults)")
+
+
+class _FaultCursor(_SendCursor):
+    """A ``_SendCursor`` whose fetch or ``nextset()`` raises a driver error on a chosen set."""
+
+    def __init__(
+        self,
+        sets: list[Any],
+        *,
+        fetch_raises_on: int | None = None,
+        nextset_raises_on: int | None = None,
+        fetch_error: Callable[[], Exception] = _deadlock,
+        nextset_error: Callable[[], Exception] = _proc_error,
+    ) -> None:
+        super().__init__(sets)
+        self._fetch_raises_on = fetch_raises_on
+        self._nextset_raises_on = nextset_raises_on
+        self._fetch_error = fetch_error
+        self._nextset_error = nextset_error
+        self.fetched: list[int] = []
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        self.fetched.append(self._i)
+        if self._i == self._fetch_raises_on:
+            raise self._fetch_error()
+        return await super().fetchall()
+
+    async def nextset(self) -> bool:
+        if self._i == self._nextset_raises_on:
+            raise self._nextset_error()
+        return await super().nextset()
+
+
+def _send_dest(cur: _SendCursor, **over: Any) -> tuple[DatabaseDestination, _Conn]:
+    conn = _Conn(cur)
+    d = _dest(**over)
+    d._pool = _Pool(conn)
+    return d, conn
+
+
+async def test_send_rolls_back_when_a_result_set_fetch_fails() -> None:
+    """Red on the old code: the blanket ``except`` around ``fetchall`` read the deadlock as "not a
+    query", so the write committed and the row would have been recorded as delivered."""
+    cur = _FaultCursor([([(1,)], [("id",)]), ([(0,)], [("status",)])], fetch_raises_on=1)
+    d, conn = _send_dest(cur)
+    with pytest.raises(DeliveryError) as ei:
+        await d.send('{"mrn": "42"}')
+    assert not isinstance(ei.value, NegativeAckError)  # 40001 is transient: the row retries
+    assert conn.rolledback and not conn.committed
+
+
+async def test_send_rolls_back_when_nextset_raises_a_later_statement_error() -> None:
+    """Red on the old code: an error ``nextset()`` raised stopped the walk and the write committed."""
+    cur = _FaultCursor([([(1,)], [("id",)]), ([(0,)], [("status",)])], nextset_raises_on=0)
+    d, conn = _send_dest(cur)
+    with pytest.raises(NegativeAckError) as ei:
+        await d.send('{"mrn": "42"}')
+    assert ei.value.permanent is True and ei.value.code == "42000"
+    assert conn.rolledback and not conn.committed
+
+
+async def test_an_error_past_the_row_cap_still_reaches_send() -> None:
+    """Over ``capture_max_rows`` the walk goes on to the last set, so a later statement's error is
+    not left unread under the commit. Red on the old code, which returned at the cap."""
+    cur = _FaultCursor(
+        [([(1,), (2,)], [("x",)]), ([(3,)], [("x",)]), ([(4,)], [("x",)])],
+        nextset_raises_on=1,
+    )
+    d, conn = _send_dest(cur, capture_max_rows=2)
+    with pytest.raises(NegativeAckError):
+        await d.send('{"mrn": "42"}')
+    assert conn.rolledback and not conn.committed
+
+
+async def test_over_cap_walks_every_set_before_reporting_unparseable() -> None:
+    cur = _FaultCursor([([(1,), (2,)], [("x",)]), ([(3,)], [("x",)]), (None, None)])
+    d, conn = _send_dest(cur, capture_max_rows=2)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable" and resp.body == ""
+    assert cur._i == 2  # the walk reached the last set
+    assert cur.fetched == [0, 1]  # past the cap nextset() alone discards the rows
+    assert conn.committed
+
+
+def _unsupported_type() -> Exception:
+    # pyodbc's own client-side error puts the message first, so it carries no SQLSTATE.
+    return Exception("ODBC SQL type -155 is not yet supported.  column-index=0  type=-155", "HY106")
+
+
+async def test_a_result_the_client_cannot_read_is_a_capture_problem() -> None:
+    """A fetch error with no SQLSTATE is the client failing to read what it was sent, not the
+    statement's failure: the capture is unparseable and the write still commits."""
+    cur = _FaultCursor(
+        [([(1,)], [("id",)]), ([(0,)], [("status",)])],
+        fetch_raises_on=0,
+        fetch_error=_unsupported_type,
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable" and resp.body == ""
+    assert resp.detail == "result-set not readable (Exception)"
+    assert cur._i == 1 and cur.fetched == [0]  # walked on to the last set, fetching nothing
+    assert conn.committed and not conn.rolledback
+
+
+async def test_a_client_conversion_state_on_fetch_is_a_capture_problem() -> None:
+    """07006 is the client failing to convert a value it was sent, not the statement failing."""
+    cur = _FaultCursor(
+        [([(1,)], [("id",)])],
+        fetch_raises_on=0,
+        fetch_error=lambda: Exception("07006", "[07006] restricted data type (0) (SQLGetData)"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable"
+    assert resp.detail == "result-set not readable (Exception [07006])"
+    assert conn.committed and not conn.rolledback
+
+
+@pytest.mark.parametrize("state", ["IM001", "HYC00", "HY007"])
+async def test_a_driver_that_cannot_advance_keeps_what_it_read(state: str) -> None:
+    """A driver with no SQLMoreResults, or SQL Server's spurious HY007 after a successful batch,
+    ends the walk with what was read, as before."""
+    cur = _FaultCursor(
+        [([(7,)], [("status",)]), ([(0,)], [("x",)])],
+        nextset_raises_on=0,
+        nextset_error=lambda: Exception(state, f"[{state}] not supported (0) (SQLMoreResults)"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "accepted" and '"status": 7' in resp.body
+    assert conn.committed
+
+
+async def test_a_set_with_no_description_is_not_fetched() -> None:
+    """A genuine "not a query" set is read from ``description``, never from a failed fetch, so the
+    write still commits. pyodbc raises "No results" from a fetch in exactly that state."""
+
+    class _NoFetch(_SendCursor):
+        async def fetchall(self) -> list[tuple[Any, ...]]:
+            if self.description is None:
+                raise AssertionError("fetched a set with no description")
+            return await super().fetchall()
+
+    cur = _NoFetch([(None, None), ([(7,)], [("status",)])])
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "accepted" and '"status": 7' in resp.body
+    assert conn.committed and not conn.rolledback
 
 
 # --- wiring-time opt-in gate -------------------------------------------------

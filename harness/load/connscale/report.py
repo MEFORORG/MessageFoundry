@@ -25,8 +25,9 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from harness.load.connscale.intake_audit import (
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
 
+# Still 1 after `no_loss.inconclusive` was added (BACKLOG #5574): the key is additive, and 2 is the
+# readings payload's version, which `connscale_harvest` tells apart from this one by number.
 SCHEMA_VERSION = 1
 
 #: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
@@ -125,6 +128,10 @@ class NoLoss:
     sink_received: int
     backlog: int
     detail: str
+    #: ``ok`` is False and nothing proved a loss: the step cannot clear itself (BACKLOG #5574), as
+    #: in ``harness.load.report.NoLoss``. ``detail`` holds the reasons. It still fails zero_loss.
+    #: Defaulted, so a constructor that names no verdict reads as a loss rather than a pass.
+    inconclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,6 +382,11 @@ class ConnScaleRecord:
     # The [sandbox] arm this step ran and the evidence it ran that way (BACKLOG #3132). None means
     # not recorded: a two-box cell, a record built by hand, or an older artifact.
     sandbox: SandboxReading | None = None
+    # Which repeat of its (arm, sweep_mode, N) cell this step was, 0-based (`profile.trials`). The
+    # monotonicity pairing keeps each trial in its own lane, so a repeat at the same N is never read
+    # as the next N (BACKLOG #5570). Defaults to 0 so a single-trial run and an older artifact read
+    # as the first trial.
+    trial: int = 0
 
     @property
     def sandbox_mode(self) -> str:
@@ -395,6 +407,7 @@ class ConnScaleRecord:
             "batch_handoff_statements": self.batch_handoff_statements,
             "per_lane_wake": self.per_lane_wake,
             "sandbox": None if self.sandbox is None else self.sandbox.to_json_dict(),
+            "trial": self.trial,
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
@@ -442,6 +455,7 @@ class ConnScaleRecord:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
             },
             "wall1_executor": {
                 "queue_depth_peak": self.executor_queue_depth_peak,
@@ -528,26 +542,138 @@ def lane_label(sweep_mode: str, claim_mode: str) -> str:
     return sweep_mode if claim_mode == "per_lane" else f"{sweep_mode}/{claim_mode}"
 
 
+#: The axes of :func:`monotonic_lane` past :func:`lane_label`'s two, each as its label prefix and how
+#: a record's value is read and spelled. The ONE list of them: the lane key and its label both read
+#: it, so an axis cannot be in one and missing from the other.
+_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str | int]], ...] = (
+    ("fuse", lambda r: "on" if r.fuse_thread_hops else "off"),
+    ("batch", lambda r: "on" if r.batch_handoff_statements else "off"),
+    ("sandbox", lambda r: r.sandbox_mode),
+    # An int, so lanes sort trial=2 before trial=10.
+    ("trial", lambda r: r.trial),
+)
+
+#: ``(sweep_mode, claim_mode, *each _LANE_AXES value)``.
+MonotonicLane = tuple[str | int, ...]
+
+
+def monotonic_lane(r: ConnScaleRecord) -> MonotonicLane:
+    """The lane a record's monotonicity reading belongs to: one run of the sweep over N.
+
+    Every axis a profile can vary besides N is in it -- the claim mode, the fusion, batching and
+    sandbox arms, and the trial. Keying on ``(sweep_mode, claim_mode)`` alone chained a fusion arm,
+    a batching arm or a repeat trial onto its sibling at the same N, so the band compared two arms
+    rather than two N, and two records at one N shared one pair (BACKLOG #5570, after #1101).
+    """
+    return (r.sweep_mode, r.claim_mode, *(read(r) for _, read in _LANE_AXES))
+
+
+def monotonic_lane_labeler(records: list[ConnScaleRecord]) -> Callable[[ConnScaleRecord], str]:
+    """Name a record's :func:`monotonic_lane` within ``records``.
+
+    :func:`lane_label`, qualified by each further axis that takes more than one value in
+    ``records``. So a run that varies no axis but N and the claim mode keeps the label it has always
+    had, whatever arm it ran -- the same label the herd floor and its harvest read -- while the lanes
+    of an A/B or a multi-trial run read apart (BACKLOG #5570).
+    """
+    varying = [(name, read) for name, read in _LANE_AXES if len({read(r) for r in records}) > 1]
+
+    def label(r: ConnScaleRecord) -> str:
+        return "/".join(
+            [lane_label(r.sweep_mode, r.claim_mode)]
+            + [f"{name}={read(r)}" for name, read in varying]
+        )
+
+    return label
+
+
 @dataclass(frozen=True)
 class MonotonicPair:
     """One consecutive smaller-N-to-larger-N comparison inside a single lane.
 
-    The lane is ``(sweep_mode, claim_mode)`` — grouping by ``sweep_mode`` alone would chain a pooled
+    The lane is :func:`monotonic_lane` -- grouping by ``sweep_mode`` alone would chain a pooled
     reading onto a per_lane one, which BACKLOG #1101 records as wrong independently of whether a
-    shipped profile currently triggers it.
+    shipped profile currently triggers it, and grouping without the arms and the trial chains those
+    the same way (BACKLOG #5570).
 
     This is the SINGLE definition of the pairing. :func:`monotonic_pairs` is read both by the SLO that
     fails on an excursion and by the emitter that records every reading, so the numbers a passing run
     reports and the numbers a failing run reports cannot drift apart.
     """
 
-    label: str  # ``sweep_mode``, or ``sweep_mode/claim_mode`` when the claim mode is not per_lane
+    label: str  # the lane, named by :func:`monotonic_lane_labeler`
     count: int  # the LARGER N — the reading being judged
     value: float  # the metric at that N
-    prior: float  # the metric at the previous N in the same lane
+    prior: float  # the metric at the previous N in the same lane; NaN where there is none
     tolerance_floor: float  # the FRACTION, e.g. 0.75 — what the detail string prints after "*"
     threshold: float  # ``prior * tolerance_floor`` — the number ``value`` must actually beat
     ok: bool
+
+    @property
+    def finite(self) -> bool:
+        """False for a NaN or infinite reading, which fails whatever its prior."""
+        return math.isfinite(self.value)
+
+
+class _Reading(NamedTuple):
+    label: str
+    record: ConnScaleRecord
+    value: float
+    pair: MonotonicPair | None  # None: no finite prior in the lane, and the reading is finite
+    first: bool  # the first reading in its lane, finite or not
+
+
+def _lane_readings(
+    records: list[ConnScaleRecord],
+    key: Callable[[ConnScaleRecord], float | int | None],
+    *,
+    tolerance: float,
+) -> list[_Reading]:
+    """Every reading, lane by lane then by N.
+
+    THE ONE WALK. :func:`monotonic_pairs` and both emitters read it, so the SLO and the recorded
+    rows cannot pair the readings differently, and each row carries its own record's pair rather
+    than one looked up by label and N, which two records can share (BACKLOG #5570).
+
+    ``pair`` is ``None`` for a finite reading with no finite prior in its lane. Readings of ``None``
+    are skipped rather than failed, and a skipped reading does not become the ``prior`` for the next
+    N. A non-finite reading is not skipped: it gets a failing pair even where it is first in its lane
+    (prior NaN then), because ``v < prior * floor`` is False for a NaN and would read as a pass. It
+    does not become the prior either, so the next finite reading is judged against the last finite
+    one rather than failed for its predecessor (BACKLOG #5570). ``first`` is set on the lane's first
+    reading only, so a finite reading after a non-finite first is not mistaken for the lane's base.
+    """
+    label = monotonic_lane_labeler(records)
+    floor = 1.0 - tolerance
+    out: list[_Reading] = []
+    prev_lane: MonotonicLane | None = None
+    prev_val: float | None = None
+    first = True
+    for r in sorted(records, key=lambda r: (monotonic_lane(r), r.count)):
+        lane = monotonic_lane(r)
+        if lane != prev_lane:
+            prev_lane, prev_val, first = lane, None, True
+        val = key(r)
+        if val is None:
+            continue
+        v = float(val)
+        pair: MonotonicPair | None = None
+        if prev_val is not None or not math.isfinite(v):
+            prior = math.nan if prev_val is None else prev_val
+            pair = MonotonicPair(
+                label=label(r),
+                count=r.count,
+                value=v,
+                prior=prior,
+                tolerance_floor=floor,
+                threshold=prior * floor,
+                ok=math.isfinite(v) and not (v < prior * floor),
+            )
+        if math.isfinite(v):
+            prev_val = v
+        out.append(_Reading(label(r), r, v, pair, first))
+        first = False
+    return out
 
 
 def monotonic_pairs(
@@ -560,38 +686,14 @@ def monotonic_pairs(
 
     The SLO only ever needed the violations. An excursion-only record cannot establish the metric's
     variance, because the sample is selected on having already left the band (BACKLOG #1211) — so this
-    returns the whole sequence and lets the caller decide which half it wants.
-
-    Readings of ``None`` are skipped rather than failed, and a skipped reading does not become the
-    ``prior`` for the next N.
+    returns the whole sequence and lets the caller decide which half it wants. The rules for a
+    missing and a non-finite reading are :func:`_lane_readings`'s.
     """
-    by_lane: dict[tuple[str, str], list[ConnScaleRecord]] = {}
-    for r in records:
-        by_lane.setdefault((r.sweep_mode, r.claim_mode), []).append(r)
-
-    floor = 1.0 - tolerance
-    pairs: list[MonotonicPair] = []
-    for (mode, claim_mode), rs in by_lane.items():
-        prev_val: float | None = None
-        for r in sorted(rs, key=lambda r: r.count):
-            val = key(r)
-            if val is None:
-                continue
-            v = float(val)
-            if prev_val is not None:
-                pairs.append(
-                    MonotonicPair(
-                        label=lane_label(mode, claim_mode),
-                        count=r.count,
-                        value=v,
-                        prior=prev_val,
-                        tolerance_floor=floor,
-                        threshold=prev_val * floor,
-                        ok=not (v < prev_val * floor),
-                    )
-                )
-            prev_val = v
-    return pairs
+    return [
+        reading.pair
+        for reading in _lane_readings(records, key, tolerance=tolerance)
+        if reading.pair is not None
+    ]
 
 
 #: Queue-draining workers the connscale graph runs PER CONNECTION, under ``claim_mode = per_lane``.
@@ -693,7 +795,9 @@ class HerdFloorReading:
     """
 
     label: (
-        str  # through `lane_label`, so this and `MonotonicPair` cannot spell one lane differently
+        # Through `lane_label`, the stem of `MonotonicPair`'s label, so the two spell a default-arm
+        # lane the same way.
+        str
     )
     count: int
     value: float | None
@@ -726,8 +830,10 @@ def herd_floor_readings(
     fail, and this repo already records one of those as a defect (the FD "never compared" guard in
     tests/test_connscale_smoke.py).
 
-    Lanes are grouped on ``(sweep_mode, claim_mode)`` -- the same key :func:`monotonic_pairs` uses.
-    Only ``per_lane`` lanes are graded: the prediction's premise is one worker set per lane per stage,
+    Lanes are grouped on ``(sweep_mode, claim_mode)``, which is NOT the key :func:`monotonic_pairs`
+    uses since BACKLOG #5570: that one also splits the fusion, batching and sandbox arms and the
+    trials. Here the first record at ``base_count`` in each such group is the one graded. Only
+    ``per_lane`` lanes are graded: the prediction's premise is one worker set per lane per stage,
     which a pooled dispatcher does not satisfy.
     """
     by_lane: dict[tuple[str, str], list[ConnScaleRecord]] = {}
@@ -959,23 +1065,20 @@ class ConnScaleReport:
         Pure: returns the text and writes nothing. Row count is capped because an oversized
         ``$GITHUB_STEP_SUMMARY`` write is dropped in full rather than trimmed; a truncation SAYS so.
         """
-        pair_by_row = {
-            (p.label, p.count): p for p in monotonic_pairs(self.records, key, tolerance=tolerance)
-        }
         rows: list[str] = []
         dropped = 0
-        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
-            val = key(r)
-            if val is None:
-                continue
+        for label, r, val, pair, first in _lane_readings(self.records, key, tolerance=tolerance):
             if len(rows) >= max_rows:
                 dropped += 1
                 continue
-            label = lane_label(r.sweep_mode, r.claim_mode)
-            pair = pair_by_row.get((label, r.count))
             if pair is None:
-                # First reading in its lane: a real sample, but nothing to compare it against.
-                rows.append(f"| {label} | {r.count} | {float(val):.4g} | | | | first in lane |")
+                # A real sample with nothing to compare it against: the lane's first reading, or the
+                # first finite one after a non-finite first.
+                note = "first in lane" if first else "no finite prior"
+                rows.append(f"| {label} | {r.count} | {val:.4g} | | | | {note} |")
+            elif not pair.finite:
+                # A non-finite reading did not drop below the band, and has no margin; say what it is.
+                rows.append(f"| {label} | {r.count} | {val} | | | | NOT FINITE |")
             else:
                 margin = pair.value - pair.threshold
                 verdict = "within band" if pair.ok else "OUTSIDE BAND"
@@ -1096,28 +1199,41 @@ class ConnScaleReport:
         summary write is dropped IN FULL rather than trimmed; an artifact has no such cliff, and
         silently dropping rows from the machine-readable copy would be the worse trade.
 
-        Both this and the table go through :func:`monotonic_pairs`, so they cannot disagree about a
-        lane, a band or a verdict -- the single-definition rule that function's docstring states.
+        Both this and the table go through :func:`_lane_readings` and so :func:`monotonic_pairs`, so
+        they cannot disagree about a lane, a band or a verdict -- the single-definition rule that
+        function's docstring states.
         """
-        pair_by_row = {
-            (p.label, p.count): p for p in monotonic_pairs(self.records, key, tolerance=tolerance)
-        }
         readings: list[dict[str, object]] = []
-        for r in sorted(self.records, key=lambda r: (r.sweep_mode, r.claim_mode, r.count)):
-            val = key(r)
-            if val is None:
-                continue
-            label = lane_label(r.sweep_mode, r.claim_mode)
-            pair = pair_by_row.get((label, r.count))
+        for label, r, val, pair, first in _lane_readings(self.records, key, tolerance=tolerance):
             if pair is None:
-                # First reading in its lane: a real sample with nothing to compare against. Recorded
-                # rather than skipped -- it is the PRIOR for the next N and a reader needs its value.
+                # A real sample with nothing to compare against. Recorded rather than skipped -- it
+                # is the PRIOR for the next N and a reader needs its value. `first_in_lane` is False
+                # where a non-finite reading came first, so a harvest never takes this, a larger N,
+                # as the lane's base. `ok` and `prior` are null rather than absent, so a reader can
+                # take them off every row.
                 readings.append(
                     {
                         "lane": label,
                         "count": r.count,
-                        "value": float(val),
-                        "first_in_lane": True,
+                        "value": val,
+                        "prior": None,
+                        "ok": None,
+                        "first_in_lane": first,
+                    }
+                )
+                continue
+            if not pair.finite:
+                # NaN and infinity are not JSON, and a strict reader refuses the whole artifact on
+                # one, so the value is null here and its spelling travels as text.
+                readings.append(
+                    {
+                        "lane": label,
+                        "count": r.count,
+                        "value": None,
+                        "not_finite": str(val),
+                        "prior": pair.prior if math.isfinite(pair.prior) else None,
+                        "ok": False,
+                        "first_in_lane": first,
                     }
                 )
                 continue
@@ -1369,6 +1485,11 @@ class ConnScaleReport:
         # A `no_loss` shortfall renders as a bare count in the table above, which is exactly the
         # unattributable failure this exists to replace -- so the verdict goes on the console beside
         # it, not only in the JSON artifact.
+        # BACKLOG #5574: a step that could not clear itself says why, beside the table, so a failed
+        # zero_loss SLO is not read as a message loss nobody can find.
+        for r in self.records:
+            if r.no_loss.inconclusive:
+                lines.append(f"no-loss INCONCLUSIVE: {r.step_label} -- {r.no_loss.detail}")
         for r in self.records:
             for audit in (r.intake_audit_live, r.intake_audit):
                 if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):

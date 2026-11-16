@@ -17,8 +17,16 @@ export interface Field {
   type: FieldType;
   group: string;
   // The value that is a LOOSENING (mirrors security_loosenings in config/settings.py); undefined = the
-  // switch is never a loosening on its own (listen_address, the posture lever, session lifetimes).
+  // switch is never a loosening at one value (listen_address, the posture lever).
   insecure?: boolean | number;
+  // True for a number that is a loosening ABOVE its shipped default, read from the state's own
+  // `defaults` rather than restated here: the two session limits (vault BACKLOG #2600). 0 or less ends
+  // every session at once, which is stricter, so only a value above the default is marked.
+  looserAboveDefault?: boolean;
+  // The least value an int switch takes, where the engine refuses less. Save refuses a value below
+  // it (BACKLOG #5412), and the host checks it again (securityEditorModel.ts). Unset means no
+  // minimum: a session limit of 0 or less is stricter, and the engine takes it.
+  min?: number;
   risk?: string;
 }
 
@@ -55,15 +63,18 @@ export const FIELDS: Field[] = [
   { key: "allow_single_factor_admin_when_exposed", label: "Allow single-factor sign-in when exposed", type: "bool", group: "Sign-in & identity",
     desc: "Audited ack (ADR 0140): lifts the start refusal that an exposed instance with Require MFA off meets under strict enforcement.",
     insecure: true, risk: "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa off, on an audited warning instead of the refusal. Every account with no second factor enrolled is then single-factor over the network, unless an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on" },
+  // Each risk ends with the engine's own clause; tests/test_security_config.py reds when it drifts.
   { key: "sign_out_after_idle_minutes", label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
-    desc: "Session idle timeout, in minutes." },
+    desc: "Session idle timeout, in minutes. Above the default is a loosening.",
+    looserAboveDefault: true, risk: "the idle sign-out is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
   { key: "max_session_hours", label: "Max session (hours)", type: "int", group: "Sign-in & identity",
-    desc: "Absolute session lifetime, in hours." },
+    desc: "Absolute session lifetime, in hours. Above the default is a loosening.",
+    looserAboveDefault: true, risk: "the absolute session lifetime is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
   // ── Data handling ───────────────────────────────────────────────
   { key: "block_unlisted_outbound", label: "Block unlisted outbound", type: "bool", group: "Data handling",
     desc: "Deny-by-default egress — only allow-listed destinations send.",
     insecure: false, risk: "outbound egress is allow-any — a transform may send PHI to any destination" },
-  { key: "delete_message_bodies_after_days", label: "Delete message bodies after (days)", type: "int", group: "Data handling",
+  { key: "delete_message_bodies_after_days", min: 0, label: "Delete message bodies after (days)", type: "int", group: "Data handling",
     desc: "Bounded PHI-body retention; 0 = keep indefinitely. docs/SECURITY-LOOSENING.md says what the start gate refuses and records.",
     insecure: 0, risk: "message bodies are kept indefinitely (enforcement = enforce refuses an explicit 0 unless allow_keeping_phi_indefinitely is set)" },
   { key: "allow_keeping_phi_indefinitely", label: "Allow keeping PHI indefinitely", type: "bool", group: "Data handling",
@@ -132,7 +143,10 @@ export function securityEditorScript(token: string, fields: unknown): string {
           input = document.createElement('select');
           for (const [v, t] of [['','Derived from environment'],['true','Yes'],['false','No']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; input.appendChild(o); }
         } else if (f.type === 'int') {
-          input = document.createElement('input'); input.type = 'number'; input.min = '0';
+          input = document.createElement('input'); input.type = 'number';
+          // The spinner's floor. Only a field's own min is enforced on Save (intProblem); 0 here keeps
+          // the arrows from walking a session limit below 0, where every session would end at once.
+          input.min = String(typeof f.min === 'number' ? f.min : 0);
         } else {
           input = document.createElement('input'); input.type = 'text';
         }
@@ -152,20 +166,44 @@ export function securityEditorScript(token: string, fields: unknown): string {
       for (const s of root.querySelectorAll('select')) { s.selectedIndex = -1; }
     }
 
+    // A cleared number field is null: Save sends it as a reset to the secure default, never as 0,
+    // which for the retention switch is keep-indefinitely (BACKLOG #5412). Any other text is read
+    // as a number, and intProblem() refuses one that is not a whole number at or above the minimum.
     function currentValue(f) {
       const input = $('in-' + f.key);
       if (f.type === 'bool') return input.value === 'true';
       if (f.type === 'tristate') return input.value === '' ? null : input.value === 'true';
-      if (f.type === 'int') { const v = input.value.trim(); return v === '' ? 0 : Number(v); }
+      if (f.type === 'int') { const v = input.value.trim(); return v === '' ? null : Number(v); }
       return input.value;
+    }
+
+    // What is wrong with the first number field Save would send, or null. A browser empties a
+    // number field that holds text it cannot parse and sets validity.badInput, so that case is
+    // refused here rather than read as cleared.
+    function intProblem() {
+      for (const f of FIELDS) {
+        if (f.type !== 'int') { continue; }
+        const input = $('in-' + f.key);
+        if (input.validity && input.validity.badInput) { return f.label + ' is not a number'; }
+        const v = currentValue(f);
+        if (v === null) { continue; }
+        if (!mfInt(v)) { return f.label + ' must be a whole number'; }
+        if (typeof f.min === 'number' && v < f.min) { return f.label + ' must be ' + f.min + ' or more'; }
+      }
+      return null;
     }
 
     function markLoosened(f, input) {
       // A control refuse() replaced can still fire, for example a number field committed on blur.
       // It would be read through its replacement's id, and could mark the cleared form.
-      if (f.insecure === undefined || !input.isConnected) return;
+      if ((f.insecure === undefined && !f.looserAboveDefault) || !input.isConnected) return;
       const v = currentValue(f);
-      const loosened = (v === f.insecure);
+      // Against the defaults the last state carried. None are held before a state renders or
+      // after a refusal, so nothing is marked then.
+      const d = defaults[f.key];
+      const loosened = f.looserAboveDefault
+        ? (typeof d === 'number' && typeof v === 'number' && v > d)
+        : (v === f.insecure);
       $('field-' + f.key).classList.toggle('loosened', loosened);
     }
 
@@ -226,6 +264,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
 
     $('save').addEventListener('click', () => {
       if (!rendered) { return; }
+      const problem = intProblem();
+      if (problem !== null) { show('Not saved: ' + problem + '. Clear the field to reset it to the default.'); return; }
       vscode.postMessage({ command: 'save', updates: collectUpdates() });
     });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));

@@ -16,7 +16,8 @@ A copy of every record can also be **forwarded off-box** to a syslog/SIEM collec
 (``[logging].forward_*``; sec-offbox-log, ASVS 16.x) so log evidence survives a host compromise; PHI
 redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout. The off-box
 transport is UDP (RFC 5426), plaintext TCP (RFC 6587), or **native TLS** (RFC 5425 — an ``ssl``-wrapped
-TCP socket, ADR 0080), so evidence can be encrypted on the wire without a local forwarding agent. That
+TCP socket, ADR 0080); both stream arms send octet-counted frames (:meth:`_TimeoutSysLogHandler.emit`,
+BACKLOG #5924), so evidence can be encrypted on the wire without a local forwarding agent. That
 socket is reached through a **bounded hand-off queue drained by its own thread**
 (:class:`_ForwardQueueHandler`), so the network send never runs on the thread that logged the record.
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import errno
 import json
 import logging
 import logging.handlers
@@ -57,7 +59,11 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports only the standard library and is therefore reachable from
 # ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
-from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
+from messagefoundry.controlchars import (
+    escape_lone_surrogates,
+    log_field_token,
+    scrub_control_chars,
+)
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
@@ -66,6 +72,7 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
+from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
     prepare_log_record,
@@ -98,6 +105,10 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "redact_log_value",
+    "redacted_log_field",
+    "UNREADABLE_LOG_VALUE",
+    "LOG_FIELD_READ_MAX",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -396,6 +407,202 @@ def _scrub_credential_query(text: str) -> str:
     return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
 
 
+def _shipped_filters() -> tuple[logging.Filter, ...]:
+    """The ``logging.Filter`` objects :func:`_install_phi_filters` puts on a shipped handler, built
+    by that function, so the reading :func:`redact_log_value` takes follows the text rewrites those
+    objects make to a record (BACKLOG #3770). It would not model, at least, a filter that is not a
+    ``logging.Filter`` instance, which this drops, or a filter's return value (a veto or a
+    replacement record), which :func:`_settled_reading` ignores."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
+
+
+#: The most handler passes :func:`_settled_reading` runs before it gives up on a line that is still
+#: changing (BACKLOG #3770); one that is still changing is read as unreadable rather than as any one
+#: pass's output. The cap is the only bound on the passes: the count has no limit of its own, and a
+#: run of quotes can add a pass per quote (review round-c0b0d12d measured a 59-character path that
+#: changed on 13 passes, which logs the placeholder). Review round-5454441c measured, over 6,000
+#: seeded paths of quote and label pieces, at most 8 passes that changed the line. A line stops at
+#: the first pass that changes nothing.
+_SHIPPED_READING_MAX_PASSES = 12
+
+#: The longest text :func:`redact_log_value` reads through the filters; it reads longer text as
+#: unreadable, so :func:`redacted_log_field` logs :data:`UNREADABLE_LOG_VALUE` (BACKLOG #3770).
+#: This bounds the work on the caller's thread: one field can run several readings, each of up to
+#: :data:`_SHIPPED_READING_MAX_PASSES` passes of the whole chain and as many again for the tab
+#: round. Review round-c0b0d12d measured one past-cap field near this bound at about 76 ms, against
+#: about 10 ms for main's three-handler line, on a loaded box. Blanking is safe because the
+#: placeholder carries none of the text. Never cut the text to the field bound before reading it
+#: instead: a quote that closes past the cut decides what the logged head hides. The value is set
+#: above the 5,000-character path ``tests/test_admin_new_ip.py`` pins as logging a cut form.
+LOG_FIELD_READ_MAX = 8192
+
+
+def _settled_reading(text: str, filters: tuple[logging.Filter, ...]) -> str | None:
+    """What a shipped handler writes for a record whose message is ``text`` once further handlers
+    change it no more, or ``None`` when it is still changing after
+    :data:`_SHIPPED_READING_MAX_PASSES` passes (BACKLOG #3770). Each handler runs the whole chain
+    over the one shared record, as on a configured logger, so the Nth sink writes what N passes
+    leave; a reading taken at a fixed count would hide less than a logger with more handlers, and
+    :func:`configure_logging` installs up to three. The settled line is what every later pass
+    leaves, so it does not depend on the handler count."""
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    # The filters keep no state, so a first pass that leaves the text as it was already settles.
+    previous = text
+    for _ in range(_SHIPPED_READING_MAX_PASSES):
+        for log_filter in filters:
+            log_filter.filter(record)
+        out = record.getMessage()
+        if out == previous:
+            return out
+        previous = out
+    return None
+
+
+def _shipped_reading(line: str) -> str | None:
+    """``line`` as :func:`_settled_reading` reads it, then, when that holds a tab, read again with
+    each tab written as a space: a tab, which the control-character escape keeps, makes the
+    encoded-HL7-run pass of :func:`messagefoundry.redaction.redact` (its
+    ``_HL7_ENCODED_FIELD_RUN`` substitution) read the text as not printable and skip it; its other
+    passes still run (BACKLOG #3770). ``None`` when either reading did not settle."""
+    filters = _shipped_filters()
+    out = _settled_reading(line, filters)
+    if out is not None and "\t" in out:
+        out = _settled_reading(out.replace("\t", " "), filters)
+    return out
+
+
+def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
+    """``text`` as :func:`_shipped_reading` reads it in the line ``before`` + ``text`` + ``after``,
+    or ``None`` when that line's context did not survive, the reading did not settle within
+    :data:`_SHIPPED_READING_MAX_PASSES` passes, or ``text`` is longer than
+    :data:`LOG_FIELD_READ_MAX`, which is not read (BACKLOG #3770). It takes no ``checks``, so a
+    caller does not call it directly for a logged field: it calls :func:`redacted_log_field`.
+
+    The field's own escape hides its text from every handler, so this value is meant to carry what
+    the handlers would have hidden in that line. The filters are the ones
+    :func:`_install_phi_filters` installs, not a copy, and the context is kept because some passes
+    read past a value.
+
+    The value is what lies between ``before`` and ``after``, each found exactly at its end of the
+    result. When a pass rewrote either, the boundary is unknown, so this returns ``None`` rather
+    than a value that may carry the context's text; a caller logs a fixed placeholder then. A
+    control logs as its escape spelling and a tab as a space, so the value no longer tells either
+    from that text."""
+    if len(text) > LOG_FIELD_READ_MAX:
+        return None
+    out = _shipped_reading(before + text + after)
+    if out is None or len(out) < len(before) + len(after):
+        return None
+    if not (out.startswith(before) and out.endswith(after)):
+        return None
+    return out[len(before) : len(out) - len(after)]
+
+
+#: What :func:`redacted_log_field` logs when its value cannot be read apart from its context,
+#: escaped and bounded like any value, so it logs as ``"unreadable-redacted"`` at every limit of
+#: 19 or more; a limit of 16 to 18 gives a cut form, its first 0 to 2 characters and a checksum,
+#: and a limit under 16 gives ``"unloggable-ValueError"``. Spelled apart from the two
+#: placeholders, so it does not read as a credential or PHI redaction. The escape keeping a
+#: character does not stop a filter reading it, so what keeps this spelling whole is only that the
+#: shipped handlers leave it unchanged, which ``tests/test_admin_new_ip.py`` checks through two of
+#: them: a second handler that changes nothing leaves the line the same for every later one. A
+#: respelling needs that check again.
+UNREADABLE_LOG_VALUE = "unreadable-redacted"
+
+
+def redacted_log_field(
+    text: str,
+    limit: int,
+    *,
+    before: str = "",
+    after: str = "",
+    checks: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
+    :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
+    bounded by :func:`~messagefoundry.controlchars.log_field_token`; or
+    :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``; or ``unloggable-`` and an
+    exception type when a reading or the bound raises, since a log argument must never raise. A
+    ``checks`` pair is read only to compare with, never logged, so its text never reaches the field.
+    The placeholders the passes write are kept as they are, not escaped, so a search for
+    ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a search
+    for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts, and the
+    ``unloggable-`` spelling. Its hides-no-less-than-main tests cover only the call in
+    :func:`messagefoundry.auth.service._new_ip_path_field`, and no rule for what to pass in
+    ``before``, ``after`` and ``checks`` is stated beyond this one, which is necessary and not
+    enough: text from a request, a message, configuration or another field never goes in ``before``
+    or ``after``. What a caller passes there decides what the field hides, and empty or wrongly
+    spelled context can leave readable what the shipped filters would redact in the full line. A new
+    caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py does, before it
+    ships.
+
+    The reading is the one every later shipped handler leaves, not a fixed number of handler
+    passes, so the field hides what the last sink of a logger with any number of handlers would
+    have hidden; :func:`_settled_reading` gives up after a fixed number of passes, and a line still
+    changing then reads as unreadable.
+
+    Apart from a bound under 16, which gives ``unloggable-ValueError``, and a bound of 16 to 18,
+    which gives the cut form :data:`UNREADABLE_LOG_VALUE` states where that value is due, the field
+    is :data:`UNREADABLE_LOG_VALUE` at least when ``text`` is longer than
+    :data:`LOG_FIELD_READ_MAX`, when the reading of ``before`` + ``text`` + ``after`` does not keep
+    ``before`` and ``after`` whole at its ends, or when, for a
+    ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
+    ``head``, the value, and the tail either as it was or as written alone; or when a reading
+    does not settle. This rule is stated here once for callers to link to.
+
+    For example (measured, each pinned in ``tests/test_admin_new_ip.py`` through the new-address
+    path field, whose check puts ``seen_ip=`` and the seen address after the path):
+
+    - a percent-encoded HL7 run, as ``/api/x a%7Cb%7Cc``, with a seen address that turns a pass
+      off for the whole line, as ``code=SECRETVALUE`` or ``10.0.0.1`` and a no-break space;
+    - a path ending in a credential label followed by ``:`` or ``=``, as ``/x/password:`` or
+      ``/x/password=``, or in the Bearer word, as ``/api/auth/bearer``;
+    - a path holding a no-break space or a credential shape, as ``/x code=SECRETVALUE``, with a
+      seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``;
+    - a path holding a credential matrix parameter, as ``/x;password=abc``, ``;token=``,
+      ``;secret=``, ``;id_token=`` or ``;access_token=``: the repeat line logs the label and the
+      placeholder, and the past-cap line logs :data:`UNREADABLE_LOG_VALUE` with ``10.0.0.1``,
+      ``2001:DB8:0:0:0:0:0:1`` and the hostile seen texts the tests name. Not with every seen
+      text: with ``||`` or ``a^b^c`` that line logs what the repeat line logs, the value still
+      replaced by the placeholder."""
+    try:
+        value = redact_log_value(text, before=before, after=after)
+        if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):
+            return log_field_token(UNREADABLE_LOG_VALUE, limit)
+        return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
+    except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
+        name = type(exc).__name__
+        # Reported by type only, since the message and traceback may carry the value, and once per
+        # type, since a replayed request reaches this on every call.
+        if name not in _UNLOGGABLE_REPORTED:
+            _UNLOGGABLE_REPORTED.add(name)
+            logging.getLogger(__name__).error(
+                "a log field could not be redacted (%s); it logs as a placeholder", name
+            )
+        # No space or ":": a type name is an identifier, so this holds nothing that ends a field.
+        return f'"unloggable-{name}"'
+
+
+def _reads_as(value: str, head: str, text: str, tail: str) -> bool:
+    """Whether the line ``head`` + ``text`` + ``tail`` reads with ``value`` unchanged where ``text``
+    stood, then ``tail`` as it was or as the passes write it alone (BACKLOG #3770). The tail is read
+    alone only when the line is not exactly ``head``, ``value`` and ``tail``. A reading that did not
+    settle matches nothing."""
+    line = _shipped_reading(head + text + tail)
+    if line is None:
+        return False
+    if line == head + value + tail:
+        return True
+    alone = _shipped_reading(tail)
+    return alone is not None and line == head + value + alone
+
+
+#: The exception types :func:`redacted_log_field` has reported, so each is reported once.
+_UNLOGGABLE_REPORTED: set[str] = set()
+
+
 class CredentialQueryScrubFilter(logging.Filter):
     """Redact credential-bearing **query parameters** from every emitted record (ADR 0142 AC-10).
 
@@ -656,7 +863,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     thread indefinitely. That thread is the forwarder's listener thread (:class:`_ForwardQueueHandler`);
     :data:`_FORWARD_TCP_TIMEOUT` says what the bound still buys once the send is off the event loop.
 
-    It also makes ``emit``'s reconnect branch reachable — see :meth:`handleError`."""
+    It also makes ``emit``'s reconnect branch reachable — see :meth:`handleError` — and frames a
+    stream send by octet counting (:meth:`emit`). Every forwarder arm is this class or its TLS
+    subclass, UDP included, so the listener reads every arm's send errors (BACKLOG #5923)."""
 
     #: ANNOTATION ONLY (no value), so nothing is created at runtime and the base class's own attribute
     #: is inherited untouched. ``SysLogHandler.socket`` is set at runtime and is absent from typeshed,
@@ -672,6 +881,10 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: Set by :meth:`handleError` for a send error that is NOT a network error (a formatting bug,
     #: say). The listener never counts such a record as sent (BACKLOG #1966).
     send_error: bool = False
+    #: The last failed send's exception type and errno, set by :meth:`handleError` for the
+    #: listener's report (BACKLOG #5923). Never the exception's text, which for a formatting error
+    #: can quote the record, and never a record field.
+    send_error_cause: str = ""
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
 
@@ -704,6 +917,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             # before createSocket, and leaves `socket` None on a failed connect, so the handler is
             # whole: the first send retries the connect, fails, and the listener spools.
             if not defer_connect or is_permanent_connect_error(exc):
+                self.close()  # deregisters the half-built handler; its socket is already None
                 raise
             self.startup_error = exc
 
@@ -714,6 +928,34 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         sock = getattr(self, "socket", None)
         if self._sock_timeout is not None and sock is not None:
             sock.settimeout(self._sock_timeout)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Send ``record`` as ``<PRI>`` plus the formatted line in UTF-8, framed for the transport.
+
+        A stream send is octet-counted and a datagram is not (BACKLOG #5924); the framing, and the
+        collectors it does not fit, are stated once, in ``docs/CONFIGURATION.md``, ``[logging]``,
+        ``forward_protocol``. The stdlib handler sent a stream record NUL-terminated with no length.
+
+        Otherwise this is the stdlib ``emit`` for a **network address**: the same priority, the same
+        encoding, the same lazy reconnect, and every failure routed to :meth:`handleError`. The
+        stdlib's Unix-socket branch is left out, because every forwarder arm is built with a
+        ``(host, port)`` address; do not build this class with a socket path."""
+        try:
+            msg = self.format(record)
+            if self.ident:
+                msg = self.ident + msg
+            pri = self.encodePriority(self.facility, self.mapPriority(record.levelname))
+            payload = b"<%d>" % pri + msg.encode("utf-8")
+            if not self.socket:
+                self.createSocket()
+            if self.socktype == socket.SOCK_DGRAM:
+                if self.append_nul:
+                    payload += b"\x00"
+                self.socket.sendto(payload, self.address)
+            else:
+                self.socket.sendall(b"%d %b" % (len(payload), payload))
+        except Exception:
+            self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
         """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
@@ -731,21 +973,48 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         on the listener thread; the bounded queue fills and :meth:`_ForwardQueueHandler.enqueue`
         reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
         and the listener backs off and keeps the record on disk instead of losing it.
+
+        **A datagram too large to send** (``EMSGSIZE`` on a datagram socket, never from a
+        ``socket.gaierror``) sets :attr:`send_error`, never :attr:`send_failed` (BACKLOG #5923). A
+        retry resends the same record as the same datagram, so read as a network failure it would
+        hold every later spooled entry behind it for as long as the size limit that refused it
+        stands. It is the only ``OSError`` read that way; why every other one, ``EACCES``
+        included, stays a failed send is ADR 0200 Amendment B. On a stream arm an ``EMSGSIZE``
+        keeps the reconnect path, since a ``sendall`` that raised may have written part of a frame.
+
+        **It never calls the stdlib** ``handleError`` (BACKLOG #5923), which writes a traceback, the
+        call stack and the record's message and arguments to stderr on every failed send, outside
+        every log control, unless the process-wide ``logging.raiseExceptions`` is off. It logs
+        nothing itself, since it runs under this handler's lock, mid-send. It leaves
+        :attr:`send_error_cause` for :meth:`_ForwardQueueListener._send`, which reports once the
+        send has returned, throttled and with no record content.
         """
         exc = sys.exception()
-        if exc is not None and not isinstance(exc, OSError):
-            # Not the network's fault, so no reconnect; but never counted as sent (BACKLOG #1966).
+        if exc is not None:
+            errno_part = f", errno {exc.errno}" if isinstance(exc, OSError) and exc.errno else ""
+            self.send_error_cause = type(exc).__name__ + errno_part
+        if exc is not None and (
+            not isinstance(exc, OSError)
+            or (
+                exc.errno == errno.EMSGSIZE
+                and self.socktype == socket.SOCK_DGRAM
+                and not isinstance(exc, socket.gaierror)
+            )
+        ):
+            # Not the network's fault, or a datagram a retry would resend unchanged, so no
+            # reconnect; but never counted as sent (BACKLOG #1966, #5923).
             self.send_error = True
-        if isinstance(exc, OSError):
+        elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
-            if sock is not None:
+            # An unconnected datagram socket stays usable after a failed sendto, so only a stream
+            # socket is dropped; a UDP reset would cost a fresh lookup per record in an outage.
+            if sock is not None and self.socktype != socket.SOCK_DGRAM:
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
                 # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
                 # it) is achieved above, and logging from inside the logging error path would recurse.
                 with contextlib.suppress(OSError):
                     sock.close()
-        super().handleError(record)
 
 
 def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
@@ -957,10 +1226,13 @@ def _build_syslog_handler(
     The handler this returns is **not** attached to a logger directly. :func:`configure_logging` puts
     it behind :class:`_ForwardQueueHandler`, which is what keeps the send off the caller's thread.
 
-    **The UDP arm stays the plain stdlib handler**, deliberately. Its socket is unconnected and it
-    sends with ``sendto``, so there is no connection to lose mid-run and nothing for
-    :meth:`_TimeoutSysLogHandler.handleError`'s reconnect to repair; the permanent-break defect that
-    override closes is a stream-socket defect.
+    **The UDP arm is a** :class:`_TimeoutSysLogHandler` **too** (BACKLOG #5923), with no timeout.
+    The plain stdlib handler carried no failure flag, so the listener counted a ``sendto`` that
+    raised on this host (``ENETUNREACH``, for example) as delivered, and with a spool behind it
+    replay deleted the spooled entry unsent. The spool is kept on UDP: it holds at least what the
+    drain deadline spooled at stop and what a network send error left unsent. A datagram to a
+    collector that is down still raises nothing, which no flag can see, and neither does one this
+    host drops after ``sendto`` returned.
 
     ``defer_connect`` (BACKLOG #1966, set when a spool is behind the handler) absorbs a failed
     startup connect instead of raising it: the handler is returned unconnected, carrying the error
@@ -982,15 +1254,15 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    handler = logging.handlers.SysLogHandler(
-        address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
+    # A UDP createSocket connects nothing, but it can still raise an OSError, at least for a failed
+    # name lookup. Without a spool every such error raises. With one, every such error is deferred
+    # as on the stream arms except a name that does not exist (EAI_NONAME, or 11001 on Windows),
+    # which still raises (is_permanent_connect_error).
+    return _TimeoutSysLogHandler(
+        address=(forward.host, forward.port),
+        socktype=socket.SOCK_DGRAM,
+        defer_connect=defer_connect,
     )
-    try:
-        _retry_a_swallowed_lookup(handler)
-    except OSError:
-        handler.close()
-        raise
-    return handler
 
 
 def _is_audit_record(item: object) -> bool:
@@ -1135,9 +1407,12 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         #: it rises by one per audit row too, so close() publishes it only through
         #: :func:`_published_counts`.
         self.spooled_at_stop = 0
-        #: Records a non-network send error made undeliverable (BACKLOG #1966). Never "sent".
+        #: Records made undeliverable by a datagram too large to send (``EMSGSIZE``, BACKLOG #5923)
+        #: or by a send error that was not a network error (BACKLOG #1966). Never "sent".
         self.undeliverable = 0
         self._last_undeliverable_report: float | None = None
+        #: When :meth:`_send` last reported a failed network send (BACKLOG #5923).
+        self._last_send_failure_report: float | None = None
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
         #: ``spool.read_errors`` as of the last read-fault report (BACKLOG #2278).
@@ -1217,16 +1492,24 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         """Send one record through the target; ``False`` if it hit a network error.
 
         ``SysLogHandler.emit`` swallows the error, so the answer is read off the flag
-        :meth:`_TimeoutSysLogHandler.handleError` sets. A UDP handler has no such flag and reports
-        every send as sent, which is the most a connectionless socket can know."""
+        :meth:`_TimeoutSysLogHandler.handleError` sets, on every arm, UDP included (BACKLOG #5923).
+        A target without the flags (a test double) reports every send as sent.
+
+        Both reports below run here, after the send returned and outside the target's lock, never
+        from ``handleError`` (BACKLOG #5923). Each names the exception's type and errno from
+        :attr:`_TimeoutSysLogHandler.send_error_cause` and no record content."""
         target = self._target
         if isinstance(target, _TimeoutSysLogHandler):
             target.send_failed = False
             target.send_error = False
+            target.send_error_cause = ""
         super().handle(record)
+        cause = getattr(target, "send_error_cause", "") or "no exception recorded"
         if getattr(target, "send_error", False):
-            # Deterministic, so retrying would hold every later entry behind it for good. The
-            # record is dropped as undeliverable and reported; it is never counted as sent.
+            # A datagram too large to send, or an error that is not a network error (a record that
+            # could not be formatted or encoded, say): a retry would repeat the same attempt, so it
+            # would hold every later entry behind it. The record is
+            # dropped as undeliverable and reported; it is never counted as sent.
             self.undeliverable += 1
             now = time.monotonic()
             last = self._last_undeliverable_report
@@ -1235,14 +1518,34 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
                 self._last_undeliverable_report = now
                 _log.error(
-                    "off-box log forwarding could not send a record (not a network error; %d so "
-                    "far); it was dropped as undeliverable, not delivered.",
+                    "off-box log forwarding could not send a record (%s: a datagram too large "
+                    "to send, or an error that is not a network error, so a retry would repeat "
+                    "the same attempt; %d so far); it was dropped as undeliverable, not delivered.",
+                    cause,
                     self.undeliverable,
                 )
             return True
         self.send_failing = bool(getattr(target, "send_failed", False))
         if self.send_failing:
             self.send_failures += 1
+            now = time.monotonic()
+            last = self._last_send_failure_report
+            # Throttled for the same reason as the report above. The count is a running total, so
+            # failures inside the window are in the next report's figure rather than lost. During
+            # the shutdown drain too, unless the throttle holds it: the line then reaches the local
+            # sinks only, and close() counts nothing a failed send cost. It does not wait on the
+            # queue handler's lock, which logging.shutdown holds, because the queue handler's
+            # handle() skips that lock on this thread (BACKLOG #5923); at least another root
+            # handler's lock, or logging's module lock, can still hold it. ERROR, not WARNING, so
+            # it survives [logging].level = "ERROR", as the stdlib's stderr traceback did.
+            if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
+                self._last_send_failure_report = now
+                _log.error(
+                    "off-box log forwarding: a send to the collector failed (%s; %d failed "
+                    "send(s) so far). Record content is not shown here.",
+                    cause,
+                    self.send_failures,
+                )
         return not self.send_failing
 
     def _spool_record(self, record: logging.LogRecord) -> bool:
@@ -1494,6 +1797,27 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         """The handlers on the far side of the queue — the syslog forwarder itself."""
         return tuple(self._listener.handlers)
 
+    def handle(self, record: logging.LogRecord) -> bool:
+        """``Handler.handle`` without the handler lock on the listener thread (BACKLOG #5923).
+
+        ``logging.shutdown`` holds this handler's lock across :meth:`close`, which joins the
+        listener thread. A record the listener logs then, at least its failed-send, undeliverable,
+        spool-drop and spool-read-fault reports, reaches this handler through the root logger, and
+        under the stdlib ``handle`` it would wait on that lock until the join gave up, leaving the
+        listener running and the tail unsent. On that thread the lock is skipped: the filters run
+        outside it in the stdlib too, ``put_nowait`` is thread-safe, and the drop counters carry
+        their own lock. Every other thread still takes it, so a producer cannot read
+        ``_accepting`` before close() and enqueue after close() counted the tail."""
+        if threading.current_thread() is not self._listener._thread:
+            return super().handle(record)
+        rv = self.filter(record)
+        if isinstance(rv, logging.LogRecord):
+            record = rv
+        if rv:
+            self.emit(record)
+        # bool, as typeshed declares it; the stdlib returns the record, and no caller here reads it.
+        return bool(rv)
+
     def enqueue(self, record: logging.LogRecord) -> None:
         """Hand ``record`` to the listener, or **count and report** it when the queue is full.
 
@@ -1511,9 +1835,13 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         lane is full. Its drop is counted and reported exactly as a general record's is, and the
         report reads the same whichever lane dropped (BACKLOG #1131)."""
         if not self._accepting:
-            if getattr(self._reporting, "active", False):
-                # close()'s own report, arriving at the handler it is closing. It was never going
-                # to the collector, and counting it would log a false "queue is full" drop.
+            if (
+                getattr(self._reporting, "active", False)
+                or threading.current_thread() is self._listener._thread
+            ):
+                # close()'s own report, or one the listener logged during the drain (BACKLOG
+                # #5923), arriving at the handler it is closing. Neither was going to the
+                # collector, and counting it would log a false "queue is full" drop.
                 return
             self._count_drop()
             return
@@ -1752,9 +2080,12 @@ class ForwarderStatus:
     #: and there is no spool to wait behind), or ``""``.
     start_failure: str = ""
     #: Whether a send that does not reach the collector is visible here at all. ``False`` over
-    #: UDP, where no failed send is counted (a datagram to a dead collector raises nothing, and
-    #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
-    #: at zero while every record is lost on the wire, and only queue and spool losses count.
+    #: UDP, where a datagram to a dead collector raises nothing: ``send_failing``, ``unsent`` and
+    #: so ``lost`` can then stay at zero while every record is lost on the wire. What the engine
+    #: can see there is at least a ``sendto`` that raises on this host (BACKLOG #5923), and queue
+    #: and spool losses. A network error such as ``ENETUNREACH`` sets ``send_failing``; a datagram
+    #: too large to send (``EMSGSIZE``) is counted in ``undeliverable`` and never sets
+    #: ``send_failing``.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.
@@ -1770,7 +2101,8 @@ class ForwarderStatus:
     queue_dropped: int = 0
     #: Records a network error cost, with no spool to keep them.
     unsent: int = 0
-    #: Records dropped for a send error that was not a network error.
+    #: Records dropped for a datagram too large to send (``EMSGSIZE``) or a send error that was
+    #: not a network error.
     undeliverable: int = 0
     #: Records the on-disk spool refused: full, or the write failed.
     spool_dropped: int = 0
@@ -1889,7 +2221,8 @@ def configure_logging(
     The forwarder is **best-effort and never blocks the engine**: UDP is fire-and-forget; a TCP or
     TLS collector **unreachable at startup** is deferred when a spool is configured (records spool
     until it answers) and skipped when none is (the connect error is logged on stdout and the service
-    starts without it); a certificate that fails verification or a name that does not resolve is
+    starts without it), and so is a UDP collector whose name lookup failed for a temporary reason
+    (BACKLOG #5923); a certificate that fails verification or a name that does not resolve is
     reported at ERROR and skipped either way; and the send itself runs on the forwarder's own listener thread
     (:class:`_ForwardQueueHandler`), so a collector that **stalls at runtime** costs the engine's
     threads nothing at all. A stalled collector instead fills a bounded hand-off queue, and records
@@ -2009,7 +2342,7 @@ def configure_logging(
                 # Deferred, not skipped (BACKLOG #1966): the spool holds records until it answers.
                 _log.warning(
                     "off-box log forwarding to %s:%d (%s) is not reachable yet: %s; records are "
-                    "spooled to %s and sent when the collector answers",
+                    "spooled to %s and sent once the collector can be reached",
                     forward.host,
                     forward.port,
                     forward.protocol,
