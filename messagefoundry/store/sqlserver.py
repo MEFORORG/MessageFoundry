@@ -12207,7 +12207,7 @@ class SqlServerStore:
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
 
-        def _seal() -> tuple[str, int, list[str]]:
+        def _hash() -> tuple[str, int, list[str]]:
             # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
             # work in proportion to its size, and nothing else would run meanwhile.
             hasher = hashlib.sha256()
@@ -12223,28 +12223,48 @@ class SqlServerStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
-        now = time.time()
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards; then reserve the whole burst in the persisted bound (ASVS 11.3.4).
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-                if await cur.fetchone() is not None:
-                    await self._commit_read(
-                        conn
-                    )  # dedup: identical content already stored — write nothing
-                    return ref
+                exists = await cur.fetchone() is not None
+                await self._commit_read(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        if exists:
+            return ref
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
+        now = time.time()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # BACKLOG #5753: a concurrent put of the same content waits on the key-range lock
+                # here and then inserts nothing, rather than failing the upload on a duplicate key.
+                # The first put's copy wins and this one's sealed chunks are dropped. OUTPUT, not
+                # rowcount, reports the insert (see _exec_terminal on SET NOCOUNT ON).
                 await cur.execute(
                     "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                    " VALUES (?,?,?,0,?)",
-                    (ref, content_type, total, now),
+                    " OUTPUT inserted.id SELECT ?,?,?,0,? WHERE NOT EXISTS"
+                    " (SELECT 1 FROM attachment WITH (UPDLOCK, HOLDLOCK) WHERE id=?)",
+                    (ref, content_type, total, now, ref),
                 )
+                if not await cur.fetchall():
+                    await self._commit_read(conn)
+                    return ref
                 for seq, ct in enumerate(sealed):
                     await cur.execute(
                         "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
