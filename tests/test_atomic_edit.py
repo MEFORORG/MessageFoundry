@@ -480,10 +480,10 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
         path, f"D:P(A;;FA;;;{owner})(A;;FA;;;{_EDITOR_SID})", protected=True
     )
     assert written.failure is None and written.dacl_status == 0, written
-    # Pin the refusal's stem, which names the arm and the principal, not the remedy text after it.
-    refusal = _config_verdict(path, owner)
-    assert refusal is not None
-    assert refusal.startswith(f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access")
+    assert (
+        _config_verdict(path, owner)
+        == f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access"
+    )
 
 
 #: A service account no real account here is: the live file's foreign owner where this process
