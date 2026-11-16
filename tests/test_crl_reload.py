@@ -1294,8 +1294,8 @@ def test_a_reload_inside_the_skew_window_says_the_revocation_is_not_enforced_yet
     assert _accepts(hop, pki.server()) is early
     if early:
         assert line.levelno == logging.WARNING
-        assert "a revocation only that CRL lists is not enforced" in line.getMessage()
-        assert "takes effect only at" in line.getMessage()
+        assert "a revocation only such a CRL lists is not enforced" in line.getMessage()
+        assert "1 CRL(s) in it take effect only after" in line.getMessage()
     else:
         assert line.levelno == logging.INFO
         assert "not enforced" not in line.getMessage()
@@ -1318,7 +1318,7 @@ def test_a_reload_that_keeps_the_held_crl_beside_a_later_one_says_the_later_one_
     assert _accepts(hop, pki.server())  # the revocation is not enforced yet
     (line,) = [r for r in caplog.records if "crl_reload: applied" in r.getMessage()]
     assert line.levelno == logging.WARNING
-    assert "a revocation only that CRL lists is not enforced" in line.getMessage()
+    assert "a revocation only such a CRL lists is not enforced" in line.getMessage()
 
 
 def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:

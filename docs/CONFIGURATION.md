@@ -2542,7 +2542,9 @@ the engine says to fix the file with a CRL that is in effect now. A start and a 
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
 effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
 engine logs a WARNING that says so. A reload applies it too, but OpenSSL allows no skew, so a
-revocation only that CRL lists is not enforced until its `thisUpdate` passes. The reload's applied
+revocation only that CRL lists is not enforced until its `thisUpdate` passes, and where the hop
+holds no CRL in effect from that issuer, the hop refuses every peer that CRL judges until then, as
+at a start. The reload's applied
 line is then a WARNING that says so and names the time (vault BACKLOG #5507). It says the same of
 any CRL in the applied file that is not in effect yet, such as a successor kept beside the CRL the
 hop holds.

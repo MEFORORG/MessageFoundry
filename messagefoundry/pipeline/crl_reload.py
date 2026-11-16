@@ -857,18 +857,17 @@ def _reload_path(
         # Judged again each pass, so a warning goes once its time has passed, and a refusal a
         # later pass finds for these bytes is reported (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`).
         refusals.reopen()
-    # OpenSSL uses a CRL only once it is in effect, with no skew, so the applied line must say when
-    # the last CRL in the file starts to count (vault BACKLOG #5507). Any such CRL, not only an
-    # issuer's sole one: a file that keeps the held CRL beside a successor not yet in effect is
-    # applied too, and the successor's revocations wait all the same.
+    # OpenSSL uses a CRL only once it is in effect, with no skew, so the applied line must say
+    # when each CRL in the file not yet in effect starts to count (vault BACKLOG #5507). Any such
+    # CRL, not only an issuer's sole one: a file that keeps the held CRL beside a successor not yet
+    # in effect is applied too, and the successor's revocations wait all the same.
     early = (
-        max(
+        sorted(
             (block for block in blocks if not crl_in_effect(block, now=now, skew=0.0)),
             key=lambda block: block.this_update,
-            default=None,
         )
         if reloaded
-        else None
+        else []
     )
     return _finish(label, path, fingerprint, stale, reloaded, refusals, prior, early)
 
@@ -971,14 +970,14 @@ def _finish(
     reloaded: int,
     refusals: _Refusals,
     prior: ReloadRefusal | None,
-    early: CrlBlock | None,
+    early: Sequence[CrlBlock],
 ) -> ReloadOutcome:
     """Log and record what one file's reload did, and return it.
 
-    ``early`` is the applied file's latest CRL that is not in effect yet with no clock skew
-    allowed, or ``None`` (vault BACKLOG #5507)."""
+    ``early`` holds the applied file's CRLs that are not in effect yet with no clock skew
+    allowed, earliest first (vault BACKLOG #5507)."""
     if reloaded:
-        if early is None:
+        if not early:
             log.info(
                 "crl_reload: applied %s to %d running TLS context(s) without a restart",
                 label,
@@ -990,16 +989,19 @@ def _finish(
             # effect below one that is, so until thisUpdate a revocation only this CRL lists is
             # not enforced, and the INFO line alone would say it was applied.
             log.warning(
-                "crl_reload: applied %s to %d running TLS context(s) without a restart, but its "
-                "CRL from issuer %s takes effect only at %s, after this host's clock reads now. "
-                "OpenSSL uses a CRL only once it is in effect, so until then a revocation only "
-                "that CRL lists is not enforced: each hop judges that issuer's peers by a CRL it "
-                "holds that is in effect, or refuses them with 'CRL is not yet valid' where it "
-                "holds none",
+                "crl_reload: applied %s to %d running TLS context(s) without a restart, but %d "
+                "CRL(s) in it take effect only after this host's clock reads now: %s. OpenSSL "
+                "uses a CRL only once it is in effect, so until then a revocation only such a CRL "
+                "lists is not enforced: each hop judges that issuer's peers by a CRL it holds "
+                "that is in effect, or refuses them with 'CRL is not yet valid' where it holds "
+                "none",
                 label,
                 reloaded,
-                quoted_issuer(early.issuer),
-                log_timestamp(early.this_update),
+                len(early),
+                "; ".join(
+                    f"from issuer {quoted_issuer(block.issuer)} at {log_timestamp(block.this_update)}"
+                    for block in early
+                ),
             )
     if refusals.strongest is None:
         clear_reload_refusal(path)
