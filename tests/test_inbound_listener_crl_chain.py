@@ -49,13 +49,13 @@ def _dicom(s: dict[str, Any]) -> ssl.SSLContext | None:
 _LISTENERS = pytest.mark.parametrize("build", [_mllp, _dicom], ids=["mllp-and-http", "dicom-scp"])
 
 
-def _listener(build: _Builder, pki: _TwoTier, crl: Path, ca: Path | None = None) -> ssl.SSLContext:
+def _listener(build: _Builder, pki: _TwoTier, crl: Path) -> ssl.SSLContext:
     ctx = build(
         {
             "tls": True,
             "tls_cert_file": str(pki.server_cert),
             "tls_key_file": str(pki.server_key),
-            "tls_ca_file": str(ca or pki.root_file),
+            "tls_ca_file": str(pki.root_file),
             "tls_crl_file": str(crl),
         }
     )
@@ -105,8 +105,13 @@ def test_a_loaded_client_ca_with_no_crl_of_its_own_refuses_the_build(
     ):
         _listener(build, two_tier, crl)
     assert "The file is loaded" not in caplog.text
+    # The control: the file that builds also holds the intermediate's CRL, which no loaded CA
+    # signed, so the warning this test looks for is logged there and the instrument can differ.
     crl.write_bytes(two_tier.revokes_nothing.read_bytes())
-    _handshake(_client(two_tier), _listener(build, two_tier, crl))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"):
+        ctx = _listener(build, two_tier, crl)
+    assert "The file is loaded" in caplog.text
+    _handshake(_client(two_tier), ctx)
 
 
 @_LISTENERS

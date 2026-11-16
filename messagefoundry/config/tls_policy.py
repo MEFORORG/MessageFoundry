@@ -648,8 +648,9 @@ def _check_crl_signatures(
     There is no setting that turns this off and none that widens it, as for the expired-CRL
     refusal in :func:`judge_crl_bytes`.
 
-    ``refusal``, where given, is raised after a proven bad signature and before the warning, so a
-    start the caller refuses never first logs that the file is loaded (vault BACKLOG #5511)."""
+    ``refusal``, where given, is raised after a proven bad signature and before the warning, and
+    the ERROR for a failed judgment is not logged beside it, so a start the caller refuses never
+    first logs that the file is loaded (vault BACKLOG #5511)."""
     from messagefoundry.config.loaded_crls import crl_fingerprint, first_unconfirmed_signature
     from messagefoundry.pki import (
         PROVEN_BAD_SIGNATURE,
@@ -670,7 +671,11 @@ def _check_crl_signatures(
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature. The
         # verdicts already reached are used below: a proof refuses, and the unconfirmed warn.
-        if first_unconfirmed_signature(crl_file, fingerprint, ("unjudged", type(exc).__name__)):
+        # Not logged where the caller's ``refusal`` refuses the start anyway, since the line says
+        # the file is loaded (vault BACKLOG #5511).
+        if refusal is None and first_unconfirmed_signature(
+            crl_file, fingerprint, ("unjudged", type(exc).__name__)
+        ):
             logger.error(
                 "%s: the engine could not check the signatures of the CRL(s) in this file at "
                 "start (%s), after judging %d of them. That is not a verdict on the rest. Unless "

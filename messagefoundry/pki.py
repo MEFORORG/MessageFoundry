@@ -1273,7 +1273,10 @@ def own_crl_reason(ca_ders: Iterable[bytes], crl_pem: bytes) -> str | None:
     try:
         missing = cas_without_own_crl(ca_ders, crl_pem)
     except ValueError as exc:
-        return f"it could not be checked against the hop's client CAs: {exc}"
+        return (
+            "it could not be checked against the client CAs the hop loaded from its client-CA "
+            f"setting, such as tls_ca_file or [api].tls_client_ca_file: {exc}"
+        )
     return own_crl_refusal(missing) if missing else None
 
 
