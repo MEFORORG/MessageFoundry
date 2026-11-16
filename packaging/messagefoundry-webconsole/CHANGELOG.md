@@ -76,11 +76,14 @@ this line.**
 
 ### Security
 
-- **The sign-in, MFA and step-up forms refuse what the JSON routes refuse.** `POST /ui/login`,
-  `POST /ui/mfa` and `POST /ui/reauth` check their hand-parsed username, password and code through
-  the JSON routes' own `LoginRequest`, `MfaVerifyRequest` and `ReauthRequest`, so an oversized value
-  is refused before it is hashed, audited or sent to the directory. Needs the engine seam that
-  carries those three models. (vault BACKLOG #5397, #5398, #5399)
+- **The sign-in, MFA, step-up and enrolment-confirm forms check their credentials through the JSON
+  routes' own models.** `POST /ui/login`, `POST /ui/mfa`, `POST /ui/reauth` and
+  `POST /ui/account/mfa/verify` check at least their hand-parsed username, password and codes
+  through `LoginRequest`, `MfaVerifyRequest`, `ReauthRequest` and `MfaConfirmRequest`, so a value
+  one of those refuses is refused before it is hashed, audited or sent to the directory. Not every
+  form field is checked: `_form_fits` names the ones that are. The sign-in authenticator code is
+  now refused past the JSON route's bound rather than cut to 16 characters. Needs the engine seam
+  that carries those four models. (vault BACKLOG #5397, #5398, #5399)
 - **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`
   records on the handshake whether it admitted the caller, which the engine's accept gate reads,
   the latest recorded answer standing. A handshake with no Origin is not this gate's to judge, so it

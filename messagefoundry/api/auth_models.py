@@ -35,6 +35,9 @@ _GROUP_MAX = 512
 #: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``). The browser /ui/mfa and
 #: /ui/reauth handlers refuse past the same bound (BACKLOG #5398, #5399).
 _MFA_CODE_MAX = 64
+#: A TOTP code confirming a staged enrolment (``MfaConfirmRequest.code``). The browser
+#: /ui/account/mfa/verify handler refuses past the same bound.
+_CONFIRM_CODE_MAX = 16
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
@@ -479,7 +482,7 @@ class MfaEnrollResponse(CredentialReply):
 class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
-    code: str = Field(max_length=16)
+    code: str = Field(max_length=_CONFIRM_CODE_MAX)
     #: ADR 0207: the issued enrolment code, which a directory account's first
     #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
     enrolment_code: str | None = Field(default=None, max_length=64)

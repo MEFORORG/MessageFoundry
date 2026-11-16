@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.auth_models import (
+    MfaConfirmRequest,
     NotifyEmailRequest,
     PasswordChangeRequest,
 )
@@ -31,6 +32,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
+    Elevation,
     EnrolmentCodeRefused,
     NotifyEmailAlreadySet,
 )
@@ -61,7 +63,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _CEREMONY_RETRY_AFTER, _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _form_fits, _refusal_error
 
 _log = logging.getLogger(__name__)
 
@@ -631,17 +633,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
-        code = form.get("code", "").strip()
+        raw_code = form.get("code", "")
         try:
-            elevation = await service.confirm_mfa_enrollment(
-                identity,
-                code,
-                token=token,
-                client=client,
-                # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
-                # code is that long, so the cut only stops an outsized value being normalised.
-                enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
-            )
+            # The JSON MfaConfirmRequest's bound, on the code as submitted: an oversized code is
+            # never checked, and reads as a wrong one.
+            if not _form_fits(request, MfaConfirmRequest, code=raw_code):
+                elevation = Elevation()
+            else:
+                elevation = await service.confirm_mfa_enrollment(
+                    identity,
+                    raw_code.strip(),
+                    token=token,
+                    client=client,
+                    # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
+                    # code is that long, so the cut only stops an outsized value being normalised.
+                    enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
+                )
         except EnrolmentCodeRefused as exc:
             # ADR 0207: the one reply, so the holder can retry; the refusal spent no TOTP step and
             # left the staged secret in place. The gate spent the confirm proof, though, so under

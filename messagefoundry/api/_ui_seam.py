@@ -914,18 +914,19 @@ from typing import Any
 #: and the session watchdog. A method the console calls, so a skew would be an AttributeError at
 #: request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
 #:
-#: BACKLOG #5397, #5398, #5399: the console's sign-in, MFA and step-up forms validate their
-#: hand-parsed fields through the JSON routes' own ``LoginRequest``, ``MfaVerifyRequest`` and
-#: ``ReauthRequest``, so those three models joined the discovered surface. The digest records their
-#: field names, not their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to
-#: ``06d9b33b5b2f12fb``.
+#: BACKLOG #5397, #5398, #5399: the console's sign-in, MFA, step-up and enrolment-confirm forms
+#: check some of their hand-parsed fields through the JSON routes' own ``LoginRequest``,
+#: ``MfaVerifyRequest``, ``ReauthRequest`` and ``MfaConfirmRequest``, so those four models joined the
+#: discovered surface. Which fields each form checks is stated once, on ``_form_fits`` in
+#: ``messagefoundry_webconsole/routes/core.py``. The digest records the models' field names, not
+#: their bounds. Re-derived with ``--write``, from ``bc56eed44a1590fd`` to ``f16ae6b198ad952b``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "06d9b33b5b2f12fb"
+ENGINE_UI_SEAM: str = "f16ae6b198ad952b"
 
 
 @dataclass(frozen=True, slots=True)

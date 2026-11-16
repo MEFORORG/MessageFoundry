@@ -2,11 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The browser credential forms refuse what the JSON routes refuse (BACKLOG #5397, #5398, #5399).
 
-The JSON login, MFA-verify and reauth routes bound their credential fields through their request
-models, so an oversized value is a 422 before any hash runs. The /ui form handlers parse the body
-by hand, so each must apply the same bound itself, or an oversized value reaches the password hash,
-the recovery-code loop or the directory. Each test pins both sides of the bound: one past it never
-reaches the service call, and one at it still does.
+The JSON login, MFA-verify, reauth and enrolment-confirm routes bound their credential fields
+through their request models, so an oversized value is a 422 before any hash runs. The /ui form
+handlers parse the body by hand, so each must apply the same bound itself, or an oversized value
+reaches the password hash, the recovery-code loop or the directory. Each test pins both sides of the
+bound: one past it never reaches the service call, and one at it still does.
 
 Each test names the mutation that must turn it RED.
 """
@@ -17,11 +17,17 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from _ui_clients import PW, SAME_ORIGIN, held_totp_code, provision, ui_client
+from _ui_clients import PW, SAME_ORIGIN, held_totp_code, mint_bound_proof, provision, ui_client
 
-from messagefoundry.api.auth_models import _MFA_CODE_MAX, _NAME_MAX, _PASSWORD_MAX
+from messagefoundry.api.auth_models import (
+    _CONFIRM_CODE_MAX,
+    _MFA_CODE_MAX,
+    _NAME_MAX,
+    _PASSWORD_MAX,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.totp import MAX_DIGITS
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._auth import PASSKEY_SIGN_IN_COOKIE_NAME
@@ -49,12 +55,13 @@ async def _add(service: AuthService) -> None:
 
 
 def _spy(monkeypatch: pytest.MonkeyPatch, service: AuthService, name: str) -> list[tuple[Any, ...]]:
-    """Record each call of ``service.<name>`` and still run it. Returns the positional args seen."""
+    """Record each call of ``service.<name>`` and still run it. Returns, per call, the positional
+    args seen followed by the keyword args as one dict."""
     calls: list[tuple[Any, ...]] = []
     real: Callable[..., Awaitable[Any]] = getattr(service, name)
 
     async def spy(*args: Any, **kwargs: Any) -> Any:
-        calls.append(args)
+        calls.append((*args, kwargs))
         return await real(*args, **kwargs)
 
     monkeypatch.setattr(service, name, spy)
@@ -115,7 +122,27 @@ async def test_an_oversized_sign_in_clears_the_passkey_handle_it_consumed(
         )
         assert r.headers["location"] == "/ui/login?e=bad" and calls == []
         cleared = [h for h in r.headers.get_list("set-cookie") if PASSKEY_SIGN_IN_COOKIE_NAME in h]
-        assert cleared and all("Max-Age=0" in h or "expires=" in h.lower() for h in cleared)
+        assert cleared and all("Max-Age=0" in h for h in cleared)
+
+
+async def test_an_oversized_sign_in_code_never_reaches_login(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ui_login cuts the authenticator code to a length instead of refusing it through
+    LoginRequest, or checks it against a bound other than the JSON route's."""
+    service = await _service(engine)
+    calls = _spy(monkeypatch, service, "login")
+    async with ui_client(engine, service) as c:
+        base = {"username": "op", "password": PW}
+        r = await c.post("/ui/login", data={**base, "totp_code": "1" * (MAX_DIGITS + 1)})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
+        assert calls == []
+        # At the bound the code is passed on whole, as the JSON route passes it.
+        await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
+        assert len(calls) == 1 and calls[0][-1]["totp_code"] == "1" * MAX_DIGITS
+        # A blank code is the two-step flow, passed on as no code.
+        await c.post("/ui/login", data={**base, "totp_code": ""})
+    assert len(calls) == 2 and calls[1][-1]["totp_code"] is None
 
 
 # --- BACKLOG #5398: POST /ui/mfa --------------------------------------------------------------
@@ -199,7 +226,7 @@ async def test_an_oversized_step_up_password_never_reaches_reauth(
         r = await c.post(
             "/ui/reauth", data={"next": _REVOKE_OTHERS, "password": PW}, headers=SAME_ORIGIN
         )
-        assert r.status_code == 200 and "Incorrect password." not in r.text
+        assert r.status_code == 200 and "Continuing:" in r.text
         assert len(calls) == 1
         r = await c.post(
             "/ui/reauth",
@@ -208,3 +235,33 @@ async def test_an_oversized_step_up_password_never_reaches_reauth(
         )
         assert "Incorrect password." in r.text
         assert len(calls) == 2
+
+
+# --- POST /ui/account/mfa/verify, the enrolment confirm ------------------------------------------
+
+
+async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ui_mfa_verify stops checking the code against MfaConfirmRequest before it calls
+    confirm_mfa_enrollment, or checks the stripped value rather than the one submitted."""
+    service = await _service(engine)
+    await _add(service)
+    calls = _spy(monkeypatch, service, "confirm_mfa_enrollment")
+    async with ui_client(engine, service) as c:
+        await c.post("/ui/login", data={"username": "op", "password": PW})
+        await mint_bound_proof(c, "/ui/account/mfa/enroll")
+        staged = await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)
+        assert staged.status_code == 200 and "Secret:" in staged.text
+        for refused in ("1" * (_CONFIRM_CODE_MAX + 1), "1" * _CONFIRM_CODE_MAX + " "):
+            await mint_bound_proof(c, "/ui/account/mfa/confirm")
+            r = await c.post("/ui/account/mfa/verify", data={"code": refused}, headers=SAME_ORIGIN)
+            assert r.status_code == 400 and "Invalid code." in r.text
+        assert calls == []
+        # At the bound the code is checked, as the JSON route checks it.
+        await mint_bound_proof(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify", data={"code": "1" * _CONFIRM_CODE_MAX}, headers=SAME_ORIGIN
+        )
+        assert r.status_code == 400 and "Invalid code." in r.text
+    assert len(calls) == 1 and calls[0][1] == "1" * _CONFIRM_CODE_MAX

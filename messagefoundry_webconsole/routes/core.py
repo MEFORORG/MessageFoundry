@@ -183,12 +183,18 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
 def _form_fits(request: Request, model: type[BaseModel], **fields: str) -> bool:
     """Whether the JSON route's own request ``model`` accepts these hand-parsed form values.
 
-    The /ui credential forms parse their bodies with ``parse_qsl``, so nothing bounds a field the
-    way the JSON route's model does. Asking the model itself keeps one definition of each bound
-    (BACKLOG #5397, #5398, #5399). Any refusal by the model counts, not only a length one, so a
-    constraint later added to the model binds the form too. A refusal is logged in the JSON 422
-    handler's own words, with the method, the path and the error count, and never a value: the
-    fields are credentials."""
+    The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
+    route's model does. Asking the model keeps one definition of each bound (BACKLOG #5397, #5398,
+    #5399). Only the fields a caller passes are checked: at least the sign-in username, password and
+    authenticator code, the MFA and step-up codes, the step-up password and the enrolment-confirm
+    code. A field a caller does not pass, such as the sign-in passkey assertion, is not. Any refusal
+    by the model counts, not only a length one, so a constraint later added to a checked field binds
+    the form too.
+
+    Every caller runs its rate limiter before this check, so a refused value has spent the attempt
+    that limiter charged, which the JSON route's 422 does not spend. A refusal is logged in the JSON 422 handler's own
+    words, with the method, the path and the error count, and never a value: the fields are
+    credentials."""
     try:
         model(**fields)
     except ValidationError as exc:
@@ -789,11 +795,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
         # (and the JSON /me/reauth).
         #
-        # BACKLOG #5397: an oversized username or password is refused here, before auth.login hashes
-        # or audits it, as the JSON route's 422 refuses it before the engine sees it. That holds for
-        # provider "ad" too. Refused, never clamped: a truncated password is a different credential.
-        # Unlike that 422, this refusal comes after the sign-in budget above was charged and the
-        # passkey challenge was popped.
+        # BACKLOG #5397: an oversized username, password or authenticator code is refused here,
+        # before auth.login hashes or audits it, as the JSON route's 422 refuses it before the
+        # engine sees it. That holds for provider "ad" too. Refused, never clamped: a truncated
+        # credential is a different one. The passkey challenge was already popped, and the budget
+        # charged as _form_fits says.
 
         def _refused() -> Response:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -804,8 +810,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         provider_value = form.get("provider", "local")
         username = form.get("username", "")
         password = form.get("password", "")
+        # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
+        # one is today's two-step flow.
+        totp_code = form.get("totp_code", "")
         if provider_value not in ("local", "ad") or not _form_fits(
-            request, LoginRequest, username=username, password=password
+            request, LoginRequest, username=username, password=password, totp_code=totp_code
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
@@ -823,10 +832,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             password,
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
-            # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
-            # one is today's two-step flow. Clamped as the JSON route bounds it; a longer value is
-            # simply a wrong code.
-            totp_code=form.get("totp_code", "")[:16] or None,
+            totp_code=totp_code or None,
             # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
@@ -1907,7 +1913,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         code = form.get("code", "")
         # BACKLOG #5398: the JSON MfaVerifyRequest's own bound. An oversized code never reaches
         # verify_mfa, whose recovery-code leg hashes it once per slot, so it is not audited and it
-        # reads as a wrong code. The ceremony budget above has already been charged for it.
+        # reads as a wrong code.
         elevation = (
             await auth.verify_mfa(token, code, client=client)
             if _form_fits(request, MfaVerifyRequest, code=code)
@@ -2116,8 +2122,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             raw_code = form.get("code", "")
             code = raw_code.strip()
             # BACKLOG #5399: the JSON MfaVerifyRequest's bound, on the value as submitted. An
-            # oversized code is not checked or audited, and reads as a wrong one. The ceremony
-            # budget above has already been charged for it.
+            # oversized code is not checked or audited, and reads as a wrong one.
             code_elevation = (
                 await auth.verify_mfa(token, code, client=client)
                 if code and _form_fits(request, MfaVerifyRequest, code=raw_code)
@@ -2164,7 +2169,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             # BACKLOG #5399: the JSON ReauthRequest's bound. An oversized password is neither
             # hashed nor sent to the directory, is not audited, and takes the wrong-password exit
-            # below. The ceremony budget above has already been charged for it.
+            # below.
             pw_elevation = (
                 await auth.reauth(
                     identity,
