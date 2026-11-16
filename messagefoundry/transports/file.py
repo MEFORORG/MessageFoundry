@@ -52,8 +52,6 @@ from messagefoundry.config.models import (
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
 from messagefoundry.parsing.sniff import (
-    _LEADING_WS_STR,
-    _TEXT_SNIFF_HEAD_CHARS,
     _content_matches_declared,
     _looks_like_hl7,
     text_sniff_head,
@@ -791,8 +789,12 @@ class FileDestination(DestinationConnector):
             )
 
 
-#: Bytes decoded per step while looking for a file's first significant characters (BACKLOG #5684).
-_SNIFF_DECODE_CHUNK = 4096
+#: The most of a file the decoded sniff reads. It runs on the event loop, so it is bounded however
+#: much leading whitespace a drop carries; a head with nothing significant inside it matches nothing.
+_SNIFF_DECODE_MAX = 64 * 1024
+#: Leading noise and every leading magic, as the raw sniff reads them. An encoding that spells all of
+#: them as ASCII does (a UTF-8 BOM aside) reads the same raw as decoded, so it needs no decoded sniff.
+_SNIFF_PROBE = " \t\r\n\x0b\x0cMSHFBISA{[<"
 
 
 def _decoded_sniff_head(raw: bytes, encoding: str) -> bytes:
@@ -802,61 +804,79 @@ def _decoded_sniff_head(raw: bytes, encoding: str) -> bytes:
     The runner decodes a file source's bytes with its configured ``encoding``, so the sniff must
     read them the same way: a UTF-16 or UTF-32 drop leads with a BOM and NUL-interleaved
     characters, never a bare ``MSH`` or ``{``, and a raw-byte sniff would quarantine every such
-    file. Decoded incrementally, a chunk at a time, only until the first significant characters
-    appear, so a large file is not decoded whole here; a character split at a chunk edge waits for
-    the next chunk. An undecodable byte becomes U+FFFD, which no magic matches. The caller tries
-    the raw-byte sniff first and this head only when that fails, so no file the raw sniff admits is
-    quarantined by it."""
+    file. Only the first ``_SNIFF_DECODE_MAX`` bytes are decoded, in one ``bytes.decode`` as the
+    runner decodes, so a large file is not decoded whole here; a character cut at that edge, or an
+    undecodable byte, becomes U+FFFD, which no magic matches. A codec that refuses the bytes or the
+    error handler outright yields an empty head, which matches nothing either."""
     try:
-        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-    except LookupError:
-        return b""  # no such codec: nothing decodes, so nothing matches (config load refuses one)
-    text = ""
-    for start in range(0, len(raw), _SNIFF_DECODE_CHUNK):
-        end = start + _SNIFF_DECODE_CHUNK
-        text += decoder.decode(raw[start:end], final=end >= len(raw))
-        text = text.lstrip(_LEADING_WS_STR)
-        if len(text) >= _TEXT_SNIFF_HEAD_CHARS:
-            break
+        text = raw[:_SNIFF_DECODE_MAX].decode(encoding, errors="replace")
+    except (LookupError, UnicodeError):
+        # No such codec (config load refuses one), or one that refuses the bytes or the error
+        # handler: nothing decodes, so nothing matches.
+        return b""
     return text_sniff_head(text)
 
 
+@functools.cache
+def _reads_as_ascii(encoding: str) -> bool:
+    """Whether ``encoding`` spells the sniff's noise and magics as ASCII, a UTF-8 BOM aside."""
+    try:
+        spelled = _SNIFF_PROBE.encode(encoding)
+    except (LookupError, UnicodeError):
+        return False
+    return spelled.removeprefix(codecs.BOM_UTF8) == _SNIFF_PROBE.encode("ascii")
+
+
+def _content_matches_encoded(content_type: ContentType | None, raw: bytes, encoding: str) -> bool:
+    """Whether ``raw`` matches the declared content type (ASVS 5.2.2), read as the runner will read
+    it (BACKLOG #5684). The raw bytes first. Only when that fails, and only for a text type on an
+    encoding that does not read as ASCII (``utf-16``, ``utf-32`` and the like), the head decoded with
+    ``encoding``, so such a drop is not quarantined for its BOM and NULs. So no file the raw sniff
+    admits is refused, and an ASCII-superset encoding admits exactly what the raw sniff admits. A
+    binary type's magic is only ever read from the raw bytes. Both file sources call this."""
+    if _content_matches_declared(content_type, raw):
+        return True
+    if (content_type is not None and content_type.is_binary) or _reads_as_ascii(encoding):
+        return False
+    return _content_matches_declared(content_type, _decoded_sniff_head(raw, encoding))
+
+
 def _archive_subdir(directory: Path, value: object, knob: str) -> Path:
-    """The ``processed_subdir``/``error_subdir`` directory ``value`` names under ``directory``,
-    normalised, or ValueError for a value that would break the scan (BACKLOG #5682).
+    """The ``processed_subdir``/``error_subdir`` directory ``value`` names, normalised, or ValueError
+    for a value that would break the scan (BACKLOG #5682).
 
     The scan skips a listed file whose parents hold either archive directory, comparing paths
-    lexically. A value that names the watch directory itself or one above it (``""``, ``"."``,
-    ``".."``, ``"a/.."``, or an absolute path to either) puts that directory among every drop's
-    parents, so every drop would be skipped and none counted. An unnormalised value (``"./a"``,
-    ``"a/../b"``) would never compare equal to a listed parent, so files moved there would be listed
-    and ingested again on every recursive scan. Purely lexical: no filesystem call, so it is safe on
-    the event loop. The value is withheld from the error, as the other setting refusals here do."""
+    lexically. A value that names the watch directory itself or one above it puts that directory
+    among every drop's parents, so every drop would be skipped and none counted: at least ``""``,
+    ``"."``, ``".."``, ``"a/.."``, ``"../in"`` for a watch directory named ``in``, an absolute path
+    to either, and on Windows a root-relative ``"\\"`` or a drive-relative ``"C:"``. An unnormalised
+    value (``"x/../a"``) would never compare equal to a listed parent, so files moved there would
+    be listed and ingested again on every recursive scan; on Windows a name ending in a dot or a
+    space does the same, because Win32 strips that end when it creates the directory, so it is
+    refused there. The value is joined onto the watch directory, normalised and compared with it;
+    one inside the watch tree is spelled from the watch directory as configured, as every listed
+    path is. Purely lexical (``abspath`` reads only the working directory), so it is safe on the
+    event loop. The value is withheld from the error, as the other setting refusals here do."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"file source {knob} must name a directory (value withheld)")
-    sub = Path(value)
-    if sub.is_absolute():
-        target = Path(os.path.normpath(sub))
-        # Absolute: compare against the absolute watch directory. abspath reads only the cwd.
-        base = Path(os.path.normpath(os.path.abspath(directory)))
-        if target == base or target in base.parents:
-            raise ValueError(
-                f"file source {knob} must not be the watch directory or a directory above it "
-                "(value withheld)"
-            )
-        if base in target.parents:
-            # Inside the watch tree: spell it from the watch directory as configured, which is how
-            # every listed path is spelled, so the lexical parent test matches.
-            return directory / target.relative_to(base)
-        return target
-    rel = os.path.normpath(sub)
-    parts = Path(rel).parts
-    if rel == os.curdir or all(part == os.pardir for part in parts):
+    if sys.platform == "win32":
+        sub = Path(value)
+        for part in sub.parts[1:] if sub.anchor else sub.parts:
+            if part not in (os.curdir, os.pardir) and part != part.rstrip(". "):
+                raise ValueError(
+                    f"file source {knob} must not have a path part ending in a dot or a space on "
+                    "Windows (value withheld)"
+                )
+    base = Path(os.path.normpath(os.path.abspath(directory)))
+    target = Path(os.path.normpath(os.path.abspath(directory / value)))
+    if target == base or target in base.parents:
         raise ValueError(
             f"file source {knob} must not be the watch directory or a directory above it "
             "(value withheld)"
         )
-    return directory / rel
+    if base in target.parents:
+        return directory / target.relative_to(base)
+    return target
 
 
 class FileSource(SourceConnector):
@@ -1015,17 +1035,6 @@ class FileSource(SourceConnector):
         if root is None:
             root = self._root_real_cache = self.directory.resolve()
         return root
-
-    def _content_matches(self, raw: bytes) -> bool:
-        """Whether ``raw`` matches the declared content type (ASVS 5.2.2): the raw bytes first, then,
-        for a text type, the head decoded with this source's ``encoding`` (BACKLOG #5684), so a
-        UTF-16 or UTF-32 drop is not quarantined for its BOM and NULs. DICOM's magic is binary and
-        is only ever read from the raw bytes."""
-        if _content_matches_declared(self.content_type, raw):
-            return True
-        if self.content_type in (ContentType.DICOM, ContentType.BINARY, ContentType.TEXT):
-            return False
-        return _content_matches_declared(self.content_type, _decoded_sniff_head(raw, self.encoding))
 
     def _prepare_subdirs(self) -> None:
         """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
@@ -1379,7 +1388,7 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 return _Step.CHARGED
-        if not self._content_matches(raw):
+        if not _content_matches_encoded(self.content_type, raw, self.encoding):
             # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
             # body on an x12 inbound, a headerless HL7 drop, …) — quarantine before its bytes reach
             # the pipeline (ASVS 5.2.2). Like the oversize reject above it never became a "received

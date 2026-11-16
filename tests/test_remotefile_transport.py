@@ -706,6 +706,22 @@ async def test_source_leave_durable_ledger_read_is_the_dedup(
     assert "/in/a.hl7" in client.files  # left in place
 
 
+async def test_source_utf16_drop_is_sniffed_through_its_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5684: the remote source shares the local one's encoding-aware sniff, so a UTF-16 HL7
+    # drop on an encoding="utf-16" inbound is handed over, not quarantined for its BOM.
+    body = "MSH|^~\\&|A|B\r".encode("utf-16")
+    client = _FakeClient(files={"/in/a.hl7": body})
+    src = _src(monkeypatch, client, encoding="utf-16")
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    await src._poll_once()
+    assert not any(p.startswith("/in/.error") for p in client.files)
+    assert h.bodies, "the drop was quarantined"
+
+
 async def test_source_leave_failed_ledger_write_is_retried_not_cached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

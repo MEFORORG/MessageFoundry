@@ -13,6 +13,7 @@ Synthetic HL7 only. Deliberately ASCII-only: pytest echoes a failing body to a c
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -145,11 +146,52 @@ async def test_a_utf16_drop_on_a_utf8_inbound_is_still_quarantined(tmp_path: Pat
     assert rec.bodies == []
 
 
+async def test_a_bomless_drop_on_a_utf16_inbound_never_aborts_the_scan(tmp_path: Path) -> None:
+    """An incremental utf-16 decoder raises on a stream with no BOM. The sniff must not: a plain
+    ASCII PDF on a utf-16 inbound is quarantined, and the scan goes on to the next file."""
+    (tmp_path / "a.hl7").write_bytes(b"%PDF-1.7 not an HL7 message")
+    (tmp_path / "b.hl7").write_bytes(_HL7.encode("utf-16"))
+    src = _source(tmp_path, encoding="utf-16")
+    rec = _Recorder()
+    src._handler = rec
+    src._prepare_subdirs()
+    await _scan_twice(src)
+    assert (tmp_path / ".error" / "a.hl7").exists()
+    assert len(rec.bodies) == 1
+
+
+def test_the_decoded_sniff_reads_a_bounded_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It runs on the event loop, so however much leading whitespace a drop carries, it decodes at
+    most _SNIFF_DECODE_MAX bytes; MSH past that bound is not found."""
+    from messagefoundry.transports import file as file_mod
+
+    monkeypatch.setattr(file_mod, "_SNIFF_DECODE_MAX", 64)
+    near = (" " * 10 + "MSH|").encode("utf-16-le")
+    far = (" " * 100 + "MSH|").encode("utf-16-le")
+    assert file_mod._content_matches_encoded(ContentType.HL7V2, near, "utf-16-le")
+    assert not file_mod._content_matches_encoded(ContentType.HL7V2, far, "utf-16-le")
+
+
+async def test_an_ascii_encoding_admits_only_what_the_raw_sniff_admits(tmp_path: Path) -> None:
+    """A form feed before MSH fails the raw HL7 sniff. The decoded head would strip it, so on a
+    utf-8 inbound the decoded sniff must not run and the drop stays quarantined as before."""
+    (tmp_path / "a.hl7").write_bytes(b"\x0c" + _HL7.encode())
+    src = _source(tmp_path)
+    rec = _Recorder()
+    src._handler = rec
+    src._prepare_subdirs()
+    await _scan_twice(src)
+    assert (tmp_path / ".error" / "a.hl7").exists()
+    assert rec.bodies == []
+
+
 # --- BACKLOG #5682 -----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("knob", ["processed_subdir", "error_subdir"])
-@pytest.mark.parametrize("value", ["", "   ", ".", "./", "..", "a/..", "a/../..", "../.."])
+@pytest.mark.parametrize(
+    "value", ["", "   ", ".", "./", "..", "a/..", "a/../..", "../..", "../in", "x/../../in"]
+)
 def test_an_archive_subdir_at_or_above_the_watch_directory_is_refused(
     tmp_path: Path, knob: str, value: str
 ) -> None:
@@ -181,10 +223,25 @@ def test_an_unnormalised_archive_subdir_is_normalised(tmp_path: Path) -> None:
     # An absolute path inside the watch tree is spelled from the watch directory, as listings are.
     src = _source(inbox, processed_subdir=str(inbox / "x" / ".." / "arch"))
     assert src.processed_dir == inbox / "arch"
-    # Outside the watch tree, absolute or relative, stays allowed.
+    # A relative value that climbs out and back in is spelled from the watch directory too.
+    assert _source(inbox, processed_subdir="../in/arch").processed_dir == inbox / "arch"
+    # Outside the watch tree, absolute or relative, stays allowed, normalised.
     outside = tmp_path / "archive"
     assert _source(inbox, processed_subdir=str(outside)).processed_dir == outside
-    assert _source(inbox, processed_subdir="../archive").processed_dir == inbox / ".." / "archive"
+    assert _source(inbox, processed_subdir="../archive").processed_dir == outside
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path forms")
+@pytest.mark.parametrize("value", ["\\", "/", "\\Users", "C:", "arch.", "arch ", "a./b"])
+def test_windows_root_drive_and_trailing_dot_values_are_refused(tmp_path: Path, value: str) -> None:
+    """A root-relative or drive-relative value is not absolute on Windows and names the drive root,
+    an ancestor or the watch directory; a trailing dot or space is stripped by Win32 at creation, so
+    the listed parent never matches. Each is refused."""
+    inbox = tmp_path / "in"
+    if value == "\\Users" and Path(f"{tmp_path.drive}\\Users") not in inbox.parents:
+        pytest.skip("the temp directory is not under \\Users here")
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _source(inbox, processed_subdir=value)
 
 
 async def test_files_moved_to_an_unnormalised_subdir_are_not_ingested_again(

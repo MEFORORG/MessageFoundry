@@ -144,7 +144,7 @@ from messagefoundry.transports.file import (
     SETTLE_SEEN_MAX,
     ScanRejected,
     _check_template_fits,
-    _content_matches_declared,
+    _content_matches_encoded,
     render_filename,
     scan_inbound_file,
 )
@@ -3092,15 +3092,17 @@ class RemoteFileSource(SourceConnector):
                     safe_exc(exc, file_name=name),
                 )
                 continue
-            # Content-vs-type magic-byte check (ASVS 5.2.2), mirroring the local File source's
-            # _content_matches_declared dispatch (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
+            # Content-vs-type magic-byte check (ASVS 5.2.2), the local File source's own helper: the raw
+            # bytes, then for a text type on a non-ASCII encoding the head decoded with `encoding`, so a
+            # UTF-16 or UTF-32 drop is not quarantined for its BOM (BACKLOG #5684). The dispatch is
+            # _content_matches_declared's (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
             # json/fhir→{/[, xml→<; binary/text unchecked). The remote dir is a less-trusted source, so a
             # drop whose leading bytes contradict its declared content_type is quarantined before its bytes
             # reach the pipeline. The former None-skips-sniff carve-out was REMOVED (ASVS 5.2.2): the check
             # now ALWAYS runs, converging onto the local source's semantics — the helper's None arm already
             # means hl7v2, so a content_type=None drop is sniffed as HL7 (a binary drop is quarantined to
             # .error, not delivered raw).
-            if not _content_matches_declared(self.content_type, raw):
+            if not _content_matches_encoded(self.content_type, raw, self._encoding):
                 # Like the oversize / scan-reject cases it never became a "received message", so there
                 # is no store disposition; preserve it in .error and log it (never a silent drop).
                 declared = (self.content_type or ContentType.HL7V2).value

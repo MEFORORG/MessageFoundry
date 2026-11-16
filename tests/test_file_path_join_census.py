@@ -951,7 +951,10 @@ SITES: dict[str, Site] = {
         "names the watch directory or one above it (BACKLOG #5682).",
     ),
     "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
-        1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."
+        1,
+        OPERATOR,
+        "The operator's error subdirectory setting, joined unnormalised only when `_archive_subdir` "
+        "refuses it, so the guard still protects what a refused value names.",
     ),
     "messagefoundry/transports/file.py::_prune_entries": Site(
         1,
