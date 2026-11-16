@@ -121,6 +121,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    read_intake_budget,
     read_lax_flag,
     refuse_capture_conflicts,
     refuse_resolved_verify_off,
@@ -281,7 +282,6 @@ from messagefoundry.transports.base import (
     ProcessedArchive,
     ReplyBodyDropped,
     SyncReplyResolver,
-    cap_setting,
     check_file_key,
     guard_dir_settings,
     guarded_destination_dirs,
@@ -14046,16 +14046,17 @@ def _intake_budget(
 ) -> int:
     """One intake-auth failed-attempt budget, read from env()-RESOLVED settings (BACKLOG #5677).
 
-    Read by :func:`~messagefoundry.transports.base.cap_setting`, the rule every other int cap
-    follows: ``None`` and a zero disable the arm, and digit text from an uncast env() is a count. A
-    bool, a fraction or other text is refused there, and a negative here, since a negative budget
-    would refuse every intake request. ``written`` is the inbound's settings as configured: where
-    the budget was an env() reference that resolved to ``""`` or ``None`` (a set-but-empty
-    variable, or an unset one with ``default=None``), it is refused too rather than turning the
-    bound off; a zero the environment resolves to still turns it off.
+    Read by :func:`~messagefoundry.config.wiring.read_intake_budget`, the rule the ``Http()``
+    factory applies at load, so the outcome does not depend on how the value arrived. The off set
+    is ``None``, an integer ``0``, and plain-digit text that spells zero, such as an env() that
+    resolves to ``"0"``; those return ``0``. Any other text (at least ``""``, whitespace,
+    ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits), a bool, a fraction and a
+    negative are refused. ``written`` is the inbound's settings as configured: where the budget was
+    an env() reference that resolved to ``None`` (an unset variable with ``default=None``) it is
+    refused too rather than turning the bound off, as is one that resolved to ``""``.
     Refused as a ``WiringError`` naming the connection and the setting, with the value withheld."""
     refusal: str | None = None
-    budget: int | None = None
+    budget = 0
     value = settings.get(knob)
     ref = written.get(knob)
     if isinstance(ref, EnvRef) and (value is None or value == ""):
@@ -14065,17 +14066,15 @@ def _intake_budget(
             "minute, or to 0 to disable that budget"
         )
     try:
-        budget = cap_setting(value, int, knob=knob, transport="HTTP")
+        budget = read_intake_budget(value, knob, "HTTP")
     except ValueError as exc:
         refusal = str(exc)  # withholds the value; raised below, outside this handler
-    if refusal is None and budget is not None and budget < 0:
-        refusal = f"HTTP {knob} is negative (value withheld), which would refuse every request"
     if refusal is not None:
         raise WiringError(
             f"inbound connection {name!r}: {refusal}. Set it to a whole number of failed attempts "
             "per minute, or 0 to disable that budget"
         )
-    return budget or 0
+    return budget
 
 
 def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) -> None:

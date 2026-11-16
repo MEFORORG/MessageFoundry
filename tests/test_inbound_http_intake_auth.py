@@ -1001,3 +1001,47 @@ def test_the_factory_refuses_an_env_budget_default_of_no_value(default: object) 
     knobs: dict[str, Any] = {"intake_auth_rate_limit": env("budget", default=default)}
     with pytest.raises(WiringError, match="default= of intake_auth_rate_limit is refused"):
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+# A literal "" or other non-digit text must not turn a budget off where an env() "" is refused:
+# one rule, however the value arrived (BACKLOG #5677). Before this rule a literal "" (and "0.0")
+# loaded with the budget off.
+_NOT_PLAIN_DIGITS = ["", "   ", "0.0", " 0 ", "+5", "1_000", "٥", "5\n", "-0"]
+
+
+@pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
+@pytest.mark.parametrize("text", _NOT_PLAIN_DIGITS)
+def test_the_factory_refuses_budget_text_other_than_plain_digits(knob: str, text: str) -> None:
+    knobs: dict[str, Any] = {knob: text}
+    with pytest.raises(WiringError, match=knob):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    # The same text as an env() default= is refused too, named as the default.
+    knobs = {knob: env("budget", default=text)}
+    with pytest.raises(WiringError, match=f"default= of {knob}"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+@pytest.mark.parametrize("text", [t for t in _NOT_PLAIN_DIGITS if t])
+def test_the_runner_refuses_resolved_budget_text_other_than_plain_digits(text: str) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    runner, ic = _budget_runner(intake_auth_rate_limit=env("budget"))
+    cfg = _source_config(ic, "127.0.0.1", {"budget": text, "k": "synthetic-key"})
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match="intake_auth_rate_limit is text other than plain"):
+            refuse()
+
+
+def test_read_intake_budget_off_set_is_none_zero_and_digit_zero_text() -> None:
+    from messagefoundry.config.wiring import read_intake_budget
+
+    for off in (None, 0, "0", "00"):
+        assert read_intake_budget(off, "intake_auth_rate_limit", "HTTP") == 0
+    assert read_intake_budget("12", "intake_auth_rate_limit", "HTTP") == 12
+    assert read_intake_budget(12, "intake_auth_rate_limit", "HTTP") == 12
+    for bad in [*_NOT_PLAIN_DIGITS, True, 2.5, -1]:
+        with pytest.raises(ValueError, match="intake_auth_rate_limit"):
+            read_intake_budget(bad, "intake_auth_rate_limit", "HTTP")
