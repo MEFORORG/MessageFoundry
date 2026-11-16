@@ -10,7 +10,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
-import { configDir, messageSetsDir, run, workspaceDir, writerPathSetting } from "./cli";
+import { configDir, run, workspaceDir, writerPathSetting } from "./cli";
 import { committedRelativePath } from "./workspaceContainment";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
@@ -140,15 +140,19 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   const notes: string[] = [];
   notes.push(`.gitignore: ${await scaffoldGitignore(ws)}`);
   notes.push(`.gitattributes: ${await scaffoldGitattributes(ws)}`);
-  notes.push(`hook: ${await scaffoldHook(bin, ws, hookPaths)}`);
-  notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
+  if (hookPaths.hook === undefined) {
+    notes.push("hook: not written (a path setting names a folder outside the workspace)");
+  } else {
+    notes.push(`hook: ${await scaffoldHook(bin, ws, hookPaths.hook)}`);
+    notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
+  }
 
   // Logged here, before the prompts below. Every line is time-stamped, so logging these after the
   // first commit would date the hook install later than the commit it came before.
   logChecks(["Set Up Version Control & Checks:", ...notes.map((n) => `  • ${n}`)].join("\n"));
 
   await maybeAddRemote(bin, ws);
-  await maybeFirstCommit(bin, ws);
+  await maybeFirstCommit(bin, ws, hookPaths.check);
 
   void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
 }
@@ -220,35 +224,44 @@ function shSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-/** The workspace-relative `configDir` and `messageSetsDir` the committed hook names, or undefined
- *  after a refusal. Each is read as a write (BACKLOG #5404): a dropped value refuses rather than
- *  bake the substitute into the hook. A path outside the folder, which a user setting can name,
- *  refuses too, because the hook is committed and every clone would run it against this machine's
- *  layout (see committedRelativePath). */
-function hookPathValues(ws: string): { configDir: string; messagesDir: string } | undefined {
+/** The two folders setup's `check` runs on. */
+interface CheckPaths {
+  readonly configDir: string;
+  readonly messagesDir: string;
+}
+
+/**
+ * The `configDir` and `messageSetsDir` setup uses, or undefined after a refusal. Each is read as a
+ * write (BACKLOG #5404): a dropped value refuses the whole setup rather than run on the substitute.
+ * `check` is the pair as set, for the first commit's pre-flight on this machine. `hook` is the same
+ * pair relative to the workspace for the committed hook, or undefined when either lies outside the
+ * folder, which a user setting can name: the hook is committed, so every clone would run it against
+ * this machine's layout (see committedRelativePath). Setup then writes no hook and says so.
+ */
+function hookPathValues(ws: string): { check: CheckPaths; hook: CheckPaths | undefined } | undefined {
   const cfg = writerPathSetting("configDir");
-  const msgs = cfg === undefined ? undefined : writerPathSetting("messageSetsDir");
-  if (cfg === undefined || msgs === undefined) {
+  if (cfg === undefined) {
     return undefined;
   }
+  const msgs = writerPathSetting("messageSetsDir");
+  if (msgs === undefined) {
+    return undefined;
+  }
+  const check = { configDir: cfg, messagesDir: msgs };
   const configRel = committedRelativePath(ws, cfg);
   const messagesRel = committedRelativePath(ws, msgs);
   if (configRel === undefined || messagesRel === undefined) {
     const key = configRel === undefined ? "configDir" : "messageSetsDir";
-    void vscode.window.showErrorMessage(
+    void vscode.window.showWarningMessage(
       `MessageFoundry: messagefoundry.${key} names a path outside the workspace folder. The commit hook is ` +
-        "committed to the repository, so it names folders inside the workspace only; nothing was set up.",
+        "committed to the repository, so it names folders inside the workspace only; no commit hook was set up.",
     );
-    return undefined;
+    return { check, hook: undefined };
   }
-  return { configDir: configRel, messagesDir: messagesRel };
+  return { check, hook: { configDir: configRel, messagesDir: messagesRel } };
 }
 
-async function scaffoldHook(
-  bin: string,
-  ws: string,
-  paths: { configDir: string; messagesDir: string },
-): Promise<string> {
+async function scaffoldHook(bin: string, ws: string, paths: CheckPaths): Promise<string> {
   // Function replacements (not string ones) — a string replacement would interpret `$`-sequences
   // (e.g. `$'`) in the quoted value, re-injecting unescaped text.
   const hook = PRE_COMMIT_TEMPLATE.replace(
@@ -536,7 +549,7 @@ async function stageBaseline(bin: string, ws: string): Promise<boolean> {
 // REQUIRED check failed — advisories (e.g. dead-config) print but never block (checks.py / __main__).
 // A required failure doesn't stop the baseline: the seed is conventionally exempt, so we offer to
 // commit it and fix forward, with the details one click away — never leading with --no-verify.
-async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
+async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Promise<void> {
   // Only a repository with no commits yet gets a baseline. In one with history, staging the whole
   // tree would sweep the user's work in progress into a commit named "Initial commit".
   if ((await git(bin, ["rev-parse", "--verify", "-q", "HEAD"], ws)).code === 0) {
@@ -555,7 +568,8 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   }
 
   logChecks("--- pre-flight: messagefoundry check ---");
-  const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
+  // The folders setup read at its start, so the pre-flight judges the ones the hook names.
+  const chk = await run(["check", "--config", paths.configDir, "--messages", paths.messagesDir], ws);
   logResult("", chk);
 
   if (chk.code === 0) {

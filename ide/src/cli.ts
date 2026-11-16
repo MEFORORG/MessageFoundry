@@ -125,10 +125,16 @@ const PATH_FALLBACK: Readonly<Record<PathSettingKey, string>> = {
   messageSetsDir: "samples/messages",
 };
 
-/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. A
- *  writer's refusal replaces the reader's once-per-value warning, so one cause shows one notice. */
+/** A path setting read for a writer's own check, without the reader's once-per-value warning, so
+ *  the writer's refusal is the notice its command shows. A reader elsewhere may still have warned
+ *  about the same value earlier in the session; that warning names the same cause. */
+export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
+  return pathSetting(key, PATH_FALLBACK[key], false);
+}
+
+/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. */
 function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
-  const s = pathSetting(key, PATH_FALLBACK[key], false);
+  const s = writerCheckSetting(key);
   if (s.dropped !== false) {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
     return undefined;
@@ -188,9 +194,10 @@ export function serviceConfigSetting(): ContainedPathSetting {
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
- *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). A workspace value the
- *  containment dropped still counts (BACKLOG #5404), so the file used in its place is NAMED to the
- *  CLI and a missing one is refused, rather than an edit being checked against no file. */
+ *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). For the readers only:
+ *  writers refuse a dropped value (writerConfigTarget). A value the containment dropped still counts
+ *  (BACKLOG #5404), so a reader that hands the CLI the file used in its place, such as ai-policy,
+ *  names it and a missing one is refused rather than read as the built-in default. */
 export function serviceConfigIsSet(): boolean {
   const s = serviceConfigSetting();
   return s.source !== "default" || s.dropped !== false;

@@ -243,6 +243,18 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.started, false);
   });
 
+  test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
+    stubWorkspace = undefined;
+    stubScope = "workspaceValue";
+    const run = await restart(LOOPBACK);
+
+    assert.deepStrictEqual(run.statted, []);
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.match(notices[0], /open your engine's project folder first/);
+    assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
+    assert.strictEqual(run.started, false);
+  });
+
   test("the same value planted in workspace settings is never statted, trusted and local (BACKLOG #5404)", async () => {
     stubScope = "workspaceValue";
     const run = await restart(LOOPBACK);

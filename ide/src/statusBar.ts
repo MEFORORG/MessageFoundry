@@ -782,12 +782,17 @@ export class EngineStatusBar implements vscode.Disposable {
     // The Start below would refuse a service config that names no file, so refuse BEFORE stopping
     // the running engine; otherwise a refused Restart acts as Stop (BACKLOG #5566).
     const ws = workspaceDir();
+    if (ws === undefined) {
+      // Start's own first refusal, here before the stop and before a setting is judged.
+      notify("open your engine's project folder first — the IDE runs `serve` in the workspace.");
+      return;
+    }
     // A dropped value refuses here too, before the stop, for the same reason (BACKLOG #5404).
     const launch = writerConfigTarget();
     if (launch === undefined) {
       return;
     }
-    const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, launch.serviceConfig);
+    const refusal = serviceConfigRefusal(ws, launch.serviceConfig);
     if (refusal !== undefined) {
       notify(refusal);
       return;
@@ -1099,12 +1104,13 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       const url = bar.currentUrl();
       const revoked = await signOut(context, url);
       logAction("sign out", revoked ? `${url} (session revoked)` : `${url} (local token cleared only)`);
-      // Say which actually happened. If the engine was unreachable we could not revoke, and the session
-      // stays alive there until it times out — claiming a clean "signed out" would be a lie.
+      // Say which actually happened. If the engine was unreachable, or signOut's target gate refused the
+      // address and sent nothing (BACKLOG #5407), the session was not revoked and stays alive there
+      // until it times out; claiming a clean "signed out" would be a lie.
       void vscode.window.showInformationMessage(
         revoked
           ? `MessageFoundry: signed out of ${url}.`
-          : `MessageFoundry: cleared the local token, but could not reach ${url} to revoke the session — it stays active there until it times out.`,
+          : `MessageFoundry: cleared the local token, but the session on ${url} was not revoked: the engine could not be reached, or its address was refused and nothing was sent. It stays active there until it times out.`,
       );
       await bar.recheck();
     }),

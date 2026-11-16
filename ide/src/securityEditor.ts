@@ -12,7 +12,7 @@
 // "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as fs from "node:fs";
 import * as vscode from "vscode";
-import { runJson, serviceConfigSetting, workspaceDir } from "./cli";
+import { runJson, workspaceDir, writerCheckSetting } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
 import {
@@ -99,7 +99,7 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
   // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
   // A value cli.ts's containment dropped (BACKLOG #5404) is checked as written; securityConfigInput.
-  const { value, fromWorkspace } = securityConfigInput(seen, serviceConfigSetting());
+  const { value, fromWorkspace } = securityConfigInput(seen, writerCheckSetting("serviceConfig"));
   const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,

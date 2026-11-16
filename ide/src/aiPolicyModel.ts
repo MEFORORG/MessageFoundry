@@ -184,7 +184,8 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
   // managed_endpoint is the engine-brokered path (ADR 0135): the ENGINE brokers the call to the
   // customer-managed / self-hosted LLM under central per-use audit, and chat.ts routes it there
   // instead of the local vscode.lm model.
-  // The permission comes first so an ai:assist deny is named as such whatever the mode says.
+  // The permission comes before the allow-list below, so an ai:assist deny is named as such for any
+  // mode that reaches here; off, unverified and the managed modes have already answered above.
   if (p.assistPermitted === false) {
     return { enabled: false, message: "Your role does not include the ai:assist permission." };
   }

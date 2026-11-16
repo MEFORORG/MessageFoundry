@@ -309,9 +309,9 @@ suite("connectionServiceConfig — which settings file a connection edit names",
 
 // The builders above pin the argv, but only if every writer uses them. Read the extension source and
 // pin that (1) no file but the model spells a `connection upsert|remove` argv by hand, and (2) every
-// call to a builder passes `serviceConfig()`, the workspace setting the alert, security and trust
-// editors pass, and `serviceConfigIsSet()` through connectionServiceConfig. A source scan, because
-// the callers import `vscode` and cannot run under plain mocha.
+// call to a builder passes the target writerConfigTarget read, which runs the service settings
+// through connectionServiceConfig and refuses a value the containment dropped (BACKLOG #5404). A
+// source scan, because the callers import `vscode` and cannot run under plain mocha.
 suite("connection writers — every upsert and remove names the service settings (BACKLOG #2908)", () => {
   const SRC = path.join(__dirname, "..", "..", "..", "src");
   // Every extension source file, subdirectories included, but not the test tree.

@@ -168,8 +168,11 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
           ),
         );
         if (res === undefined) {
+          // withAuth answers undefined for a cancelled sign-in and for a target its gate refused,
+          // which it has already named in an error (BACKLOG #5407), so name both here.
           stream.markdown(
-            "_Sign in to the MessageFoundry engine to use engine-brokered AI assistance._",
+            "_Nothing was sent: sign in to the MessageFoundry engine to use engine-brokered AI assistance, " +
+              "or, if an error said the engine address was refused, correct that address._",
           );
           return;
         }

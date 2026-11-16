@@ -169,13 +169,18 @@ export interface ContainedPathSetting {
  *  the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
 function droppedWhy(key: string, dropped: DroppedScope): string {
   return dropped === "workspace"
-    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder, or no folder is open`
+    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder, is not ` +
+        "text, or no folder is open"
     : `messagefoundry.${key}, set in user settings, is not text`;
 }
 
-/** The warning a READER shows once per dropped value: it goes on with the value used in its place. */
+/** The warning a READER shows once per dropped value: it goes on with the value used in its place.
+ *  Commands that write or start something refuse instead, while the workspace value is there. */
 export function droppedNotice(key: string, dropped: DroppedScope): string {
-  const use = dropped === "workspace" ? " To use a path elsewhere, set it in user settings." : "";
+  const use =
+    dropped === "workspace"
+      ? " Commands that write or start something refuse until it is removed; a path elsewhere goes in user settings."
+      : "";
   return `${droppedWhy(key, dropped)}, so it is not used.${use}`;
 }
 
@@ -184,10 +189,14 @@ export function droppedNotice(key: string, dropped: DroppedScope): string {
  * value the operator wrote was dropped (BACKLOG #5404). A reader may go on with the value used in
  * the dropped one's place; a writer must not, because the operator named a different file or folder,
  * and an alert rule, code set, connection, generated message, reload or engine Start aimed at the
- * substitute lands where nobody chose.
+ * substitute lands where nobody chose. A user value does not lift a workspace refusal, so the fix
+ * names the workspace value; a path elsewhere goes in user settings once that value is gone.
  */
 export function writerRefusal(key: string, dropped: DroppedScope): string {
-  const fix = dropped === "workspace" ? "Fix the workspace value, or set the path in user settings." : "Fix the user value.";
+  const fix =
+    dropped === "workspace"
+      ? "Correct or remove the workspace value; to use a path elsewhere, remove it and set the path in user settings."
+      : "Correct the user value.";
   return `MessageFoundry: ${droppedWhy(key, dropped)}, so nothing was written or started. ${fix}`;
 }
 

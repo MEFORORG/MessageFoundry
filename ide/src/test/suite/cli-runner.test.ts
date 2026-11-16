@@ -12,10 +12,28 @@ import { committedRelativePath, containedPathSetting, droppedNotice, writerRefus
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 
-/** A source file with its comments stripped, so a comment cannot satisfy or defeat a scan. */
-function code(file: string): string {
-  return fs.readFileSync(path.join(SRC, file), "utf8").replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+/** `src` with its comments stripped, so a comment cannot satisfy or defeat a scan. String and
+ *  template literals are matched first and kept, so a `/*` or `//` inside one (a glob, a URL) does
+ *  not start a comment. A template's `${...}` holding a backtick is not modelled. */
+function stripComments(src: string): string {
+  return src.replace(
+    /("(?:\\[\s\S]|[^"\\\n])*"|'(?:\\[\s\S]|[^'\\\n])*'|`(?:\\[\s\S]|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+    (m, literal: string | undefined) => literal ?? "",
+  );
 }
+
+/** A source file with its comments stripped; see {@link stripComments}. */
+function code(file: string): string {
+  return stripComments(fs.readFileSync(path.join(SRC, file), "utf8"));
+}
+
+test("control: the comment stripper keeps a `/*` inside a string and drops real comments", () => {
+  const src = 'const G = "{**/*.py}"; // gone\nconst after = 1; /* gone too */ const u = "http://x";';
+  const out = stripComments(src);
+  assert.ok(out.includes("const after = 1;"), out);
+  assert.ok(out.includes('"http://x"'), out);
+  assert.ok(!out.includes("gone"), out);
+});
 
 const CLI = code("cli.ts");
 
@@ -177,7 +195,8 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     assert.match(droppedNotice("serviceConfig", "user"), /set in user settings, is not text, so it is not used\.$/);
     const writer = body(CLI, "writerPathSetting");
     assert.match(writer, /^\s*return writerSetting\(key\)\?\.value;\s*$/);
-    assert.match(CLI, /function writerSetting\([^)]*\)[^{]*\{\s*const s = pathSetting\(key, PATH_FALLBACK\[key\], false\);\s*if \(s\.dropped !== false\) \{/);
+    assert.match(CLI, /function writerSetting\([^)]*\)[^{]*\{\s*const s = writerCheckSetting\(key\);\s*if \(s\.dropped !== false\) \{/);
+    assert.match(body(CLI, "writerCheckSetting"), /^\s*return pathSetting\(key, PATH_FALLBACK\[key\], false\);\s*$/);
   });
 
   test("a committed hook path is workspace-relative with forward slashes, or refused", () => {

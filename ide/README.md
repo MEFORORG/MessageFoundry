@@ -205,12 +205,13 @@ and uses your user value or the default instead, until you trust the workspace (
   `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
   settings whose spelling names a path outside the first workspace folder is not used, nor is a user
   value that is not text: the next value down applies instead, with a warning, in a trusted window
-  too. To use a path elsewhere, set it in user settings. A command that writes or starts something
-  under one of these settings refuses instead, with an error naming the setting, rather than act on
-  the value used in its place: at least the alert, code set and connection edits, Generate Samples,
-  Promote, Start, Restart, New Route, version-control setup and the security editor. Version-control
-  setup also refuses a path outside the folder from user settings, because the commit hook it writes
-  is committed. The check reads the spelling only, so it does not catch a link or junction inside
+  too. A command that writes or starts something under one of these settings refuses instead, with
+  an error naming the setting, rather than act on the value used in its place: at least the alert,
+  code set and connection edits, Generate Samples, Promote, Start, Restart, copying the start
+  command, New Route, version-control setup and the security editor. A user value does not lift
+  that refusal; to use a path elsewhere, remove the workspace value and set the path in user
+  settings. Version-control setup writes no commit hook when either folder lies outside the
+  workspace, because the hook is committed; it still sets up the rest. The check reads the spelling only, so it does not catch a link or junction inside
   the folder that leads out of it; the New Route wizard and the security editor make their own link
   checks before they write.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
