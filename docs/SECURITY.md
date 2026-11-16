@@ -788,7 +788,7 @@ bucket's own wait (owner ruling 2026-10-20).** The passkey sign-in's begin leg,
 address (users behind NAT or an untrusted proxy, or every client with no address, counted as
 `"unknown"`) share one bucket, so an exact wait would tell one of them when another's oldest
 attempt was made. The window discloses no per-bucket timing, though it does tell any caller the
-configured window, and it is never too early while nothing spends the bucket again or re-stamps one of its hits (a renew re-stamps a hit without spending): its oldest attempt
+configured window, and it is never too early while nothing spends the bucket again or re-stamps one of its hits (a renew re-stamps a hit without charging a new one): its oldest attempt
 leaves within it. A sign-in POST that moves a passkey begin leg's hit re-stamps it, in the begin
 leg's bucket and in the global window ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068),
 *The combined passkey sign-in*), so either can still be full when the window has passed; any other address's ordinary charge also
@@ -7144,8 +7144,8 @@ needs a begin leg charged before the ceiling filled and still in the window. A s
 refuses that begin leg too, so a username-only caller can still keep a TOTP-enrolled or passkey owner
 out, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
 requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27,* for the residual as it
-stood then; the paid-POST carve-out (added 2026-11-15, BACKLOG #3937 step 28, kept by owner ruling
-2026-11-15) is not covered by that acceptance. (5) The owner's own typos
+stood then; the paid-POST carve-out (shipped 2026-10-28, named here 2026-11-15 by BACKLOG #3937 step 28,
+kept by owner ruling 2026-11-15) is not covered by that acceptance. (5) The owner's own typos
 can reach the escalating second-step lock: a combined sign-in with one factor wrong counts there,
 including a code that missed its 30-second step or was already used. *Named after the ruling;
 mitigated by the notice's "if these attempts were your own" wording, which keeps it from telling an
