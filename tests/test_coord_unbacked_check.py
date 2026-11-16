@@ -65,9 +65,9 @@ def check(*paths: Path, extra: list[str] | None = None) -> subprocess.CompletedP
     return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
 
 
-def _bare(path: Path) -> Path:
+def _bare(path: Path, head: str = "main") -> Path:
     subprocess.run(
-        ["git", "init", "-q", "--bare", "-b", "main", str(path)], check=True, capture_output=True
+        ["git", "init", "-q", "--bare", "-b", head, str(path)], check=True, capture_output=True
     )
     return path
 
@@ -400,7 +400,10 @@ def test_a_landed_OLDEST_commit_does_not_clear_the_newer_unpushed_ones(repo: Pat
 
 
 def _add_backup_remote(repo: Path, tmp_path: Path) -> None:
-    git(repo, "remote", "add", "backup", str(_bare(tmp_path / "backup.git")))
+    """Its HEAD names ``trunk``, which nobody pushes -- what a plain ``git init --bare`` gives when
+    the pushed branch differs from the default. It answers, but advertises no HEAD, so a probe that
+    read ``ls-remote --exit-code HEAD``'s exit 2 as unreachable would stop trusting it."""
+    git(repo, "remote", "add", "backup", str(_bare(tmp_path / "backup.git", head="trunk")))
     git(repo, "push", "-q", "backup", "main")
 
 
@@ -437,7 +440,24 @@ def test_a_branch_backed_ONLY_by_an_unreachable_remote_is_counted(
     assert r.returncode == 1, r.stdout + r.stderr
     assert "UNVERIFIABLE" not in r.stdout
     assert "1 of 2 configured remote(s) answered" in r.stdout
+    # The remedy differs from an unpushed branch -- restore the remote -- so the remote is named.
+    assert "not trusted, did not answer: backup" in r.stdout
     assert "side" in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_tracking_ref_of_a_remote_no_longer_configured_does_not_back_a_branch(repo: Path) -> None:
+    """MUST TRIP. Every configured remote answers, but ``refs/remotes/gone/side`` belongs to no
+    configured remote -- a namespace a removed remote left behind. It is a local copy of a store
+    nobody can reach, so it must not clear the branch it points at."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "held only under an orphan namespace", "work")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "update-ref", "refs/remotes/gone/side", "side")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "1 of 1 configured remote(s) answered" in r.stdout
     assert "1 commits on 1 branch exist on no remote" in r.stdout
 
 
