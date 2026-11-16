@@ -184,6 +184,10 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
   // managed_endpoint is the engine-brokered path (ADR 0135): the ENGINE brokers the call to the
   // customer-managed / self-hosted LLM under central per-use audit, and chat.ts routes it there
   // instead of the local vscode.lm model.
+  // The permission comes first so an ai:assist deny is named as such whatever the mode says.
+  if (p.assistPermitted === false) {
+    return { enabled: false, message: "Your role does not include the ai:assist permission." };
+  }
   if (p.mode !== "byo" && p.mode !== "managed_endpoint") {
     // An ALLOW-list, not a deny-list (BACKLOG #5406): a mode this version does not name -- a newer
     // engine's, or a missing or malformed one -- disables assistance rather than falling through to
@@ -191,11 +195,8 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
     return {
       enabled: false,
       message:
-        "Your MessageFoundry policy names an AI mode this extension version does not recognize. Assistance is disabled.",
+        "Your MessageFoundry policy does not give an AI mode this extension version recognizes. Assistance is disabled.",
     };
-  }
-  if (p.assistPermitted === false) {
-    return { enabled: false, message: "Your role does not include the ai:assist permission." };
   }
   // byo or managed_endpoint with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
   return { enabled: true };

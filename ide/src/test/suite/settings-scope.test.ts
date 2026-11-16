@@ -45,15 +45,15 @@ const REVIEWED_NON_TARGET = [
 ];
 
 /** Window-scoped settings whose WORKSPACE value an untrusted workspace must not supply (BACKLOG
- *  #5404): the paths the extension reads and writes, the switch and rate of the live-status poll, and
- *  the bound on how much code leaves for the model provider. */
+ *  #5404): the paths the extension reads and writes, and the switch and rate of the live-status poll.
+ *  `ai.contextCharLimit` is deliberately NOT here: restricting it would also discard a workspace value
+ *  that TIGHTENS the bound (say `0`), sending more code in Restricted Mode than the repository allows. */
 const WORKSPACE_RESTRICTED = [
   "messagefoundry.configDir",
   "messagefoundry.serviceConfig",
   "messagefoundry.messageSetsDir",
   "messagefoundry.liveStatus.enabled",
   "messagefoundry.liveStatus.intervalSeconds",
-  "messagefoundry.ai.contextCharLimit",
 ];
 
 suite("settings scope (SEC-005)", () => {
@@ -147,7 +147,7 @@ suite("untrusted-workspace capability (SEC-004)", () => {
     // A family check over the hand list above, as the scope suite does for targets: a new path or
     // polling setting trips it until someone files it.
     const smells = (key: string): boolean =>
-      /dir|path|config|file|liveStatus|poll|interval|limit/i.test(key.replace(/^messagefoundry\./, ""));
+      /dir|path|config|file|liveStatus|poll|interval/i.test(key.replace(/^messagefoundry\./, ""));
     // Positive control: the pattern must at least catch the hand list, or the loop below proves nothing.
     for (const key of WORKSPACE_RESTRICTED) {
       assert.ok(smells(key), `the family pattern does not match ${key}`);
@@ -159,7 +159,7 @@ suite("untrusted-workspace capability (SEC-004)", () => {
     const workspaceSettable = (scope: string | undefined): boolean => scope !== "machine" && scope !== "application";
     for (const [key, prop] of Object.entries(props)) {
       if (workspaceSettable(prop.scope) && smells(key)) {
-        assert.ok(restricted.includes(key), `${key} names a path, polling or an egress bound; restrict it (BACKLOG #5404)`);
+        assert.ok(restricted.includes(key), `${key} names a path or polling; restrict it (BACKLOG #5404)`);
       }
     }
   });

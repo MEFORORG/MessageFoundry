@@ -20,9 +20,9 @@ import {
   carryDeniesOffline,
   carryDeniesOnline,
   evaluatedPermission,
-  narrowMode,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  narrowMode,
   pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineTargetIsSet, engineUrl, environments, runJson, workspaceDir } from "./cli";

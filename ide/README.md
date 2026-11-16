@@ -183,6 +183,10 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 
 ## Settings
 
+In an untrusted workspace (Restricted Mode), VS Code ignores the workspace's own values for
+`configDir`, `serviceConfig`, `messageSetsDir`, `liveStatus.enabled` and `liveStatus.intervalSeconds`,
+and uses your user value or the default instead, until you trust the workspace (BACKLOG #5404).
+
 - `messagefoundry.pythonPath` (default `python`) — interpreter used to run the CLI. When left at the
   default, the extension auto-detects a workspace `.venv` (`.venv/Scripts/python.exe` on Windows,
   `.venv/bin/python` elsewhere), so no setup is needed in a typical repo checkout. **Machine-scoped**, so
