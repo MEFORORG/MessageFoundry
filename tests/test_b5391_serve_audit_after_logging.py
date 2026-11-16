@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""BACKLOG #5391: ``serve`` logs its keyless and ``block_unlisted_outbound=false`` AUDIT records
+once ``configure_logging`` has installed the handlers, never before.
+
+Logged before it, a record reaches only the filtered lastResort on stderr, never ``[logging].file``,
+the structured stdout handler or the off-box collector. Each test records, for every AUDIT record,
+whether ``configure_logging`` had run when it was emitted.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from messagefoundry import __main__ as cli
+from messagefoundry.__main__ import main
+from messagefoundry.logging_setup import configure_logging
+
+SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+
+_SECURE = (
+    "security.delete_message_bodies_after_days = 30\n"
+    '[egress]\nallowed_mllp = ["10.0.0.5"]\n'
+    "[retention]\ndead_letter_days = 30\n"
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+    'email_to = ["ops@example.org"]\n'
+)
+
+
+class _Recorder(logging.Handler):
+    def __init__(self, configured: list[bool]) -> None:
+        super().__init__(logging.WARNING)
+        self.configured = configured
+        self.seen: list[tuple[str, bool]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.seen.append((record.getMessage(), bool(self.configured)))
+
+
+def _serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, *, env: str, key: bool
+) -> tuple[int, list[tuple[str, bool]]]:
+    monkeypatch.chdir(tmp_path)
+    if key:
+        monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    else:
+        monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    configured: list[bool] = []
+    real = configure_logging
+
+    def configure(*args: object, **kwargs: object) -> bool:
+        configured.append(True)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("messagefoundry.__main__.configure_logging", configure)
+    recorder = _Recorder(configured)
+    logger = logging.getLogger("messagefoundry.__main__")
+    logger.addHandler(recorder)
+    try:
+        rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
+    finally:
+        logger.removeHandler(recorder)
+    return rc, recorder.seen
+
+
+def _audit(seen: list[tuple[str, bool]], needle: str) -> list[bool]:
+    return [after for message, after in seen if message.startswith("AUDIT: ") and needle in message]
+
+
+def test_keyless_audit_is_logged_after_configure_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.allow_unencrypted_phi = true\n',
+        env="staging",
+        key=False,
+    )
+    assert rc == 0
+    assert _audit(seen, "starting keyless") == [True]
+
+
+def test_block_unlisted_outbound_audit_is_logged_after_configure_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = false\n' + _SECURE,
+        env="staging",
+        key=True,
+    )
+    assert rc == 0
+    assert _audit(seen, "block_unlisted_outbound=false") == [True]
+    # The control: a start that writes no keyless opt-out has no such record.
+    assert _audit(seen, "starting keyless") == []
+
+
+def test_a_start_refused_before_logging_is_configured_logs_no_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Under enforce with no collector, _start_logging refuses before configure_logging. The
+    # opt-out is still named on stderr, but no AUDIT record is logged ahead of the handlers.
+    rc, seen = _serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = false\n" + _SECURE,
+        env="prod",
+        key=True,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "block_unlisted_outbound=false on a production PHI instance" in err
+    assert "must forward its logs off-box" in err
+    assert _audit(seen, "") == []
+
+
+def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # One body for serve and supervise: neither may see the line logged before its handlers exist.
+    from messagefoundry.config.settings import load_settings
+
+    settings = load_settings(
+        environ={
+            "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND": "false",
+            "MEFOR_EGRESS_ALLOWED_MLLP": '["10.0.0.5"]',
+        },
+        default_file=False,
+    )
+    audit: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
+        refused = cli._forwarder_posture_refused(
+            settings, production=False, env_name="staging", enforcing=True, audit=audit
+        )
+    assert refused is False
+    assert len(audit) == 1 and audit[0].startswith("AUDIT: [security].block_unlisted_outbound")
+    assert not [r for r in caplog.records if "AUDIT" in r.getMessage()]

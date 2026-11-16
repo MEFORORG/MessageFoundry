@@ -1962,10 +1962,17 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
 
 
 def _forwarder_posture_refused(
-    settings: ServiceSettings, *, production: bool, env_name: str, enforcing: bool
+    settings: ServiceSettings,
+    *,
+    production: bool,
+    env_name: str,
+    enforcing: bool,
+    audit: list[str],
 ) -> bool:
     """The three posture steps ``serve`` takes last before it configures logging. Returns whether
-    the start is refused; the refusal is already on stderr.
+    the start is refused; the refusal is already on stderr. The AUDIT line is appended to
+    ``audit`` rather than logged, for the caller to log once its handlers are installed (BACKLOG
+    #5391).
 
     One body for ``serve`` and ``supervise`` (BACKLOG #2356), in serve's order: the open-egress
     gate (Q5b), the announcement or AUDIT line for ``[security].block_unlisted_outbound``, and the
@@ -2064,15 +2071,13 @@ def _forwarder_posture_refused(
         )
     elif not settings.egress.deny_by_default:
         # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
-        # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
-        # line is WARNING-level so `serve`'s filtered lastResort still surfaces it before
-        # configure_logging.
-        logging.getLogger(__name__).warning(
-            "AUDIT: [security].block_unlisted_outbound=false on a %sPHI instance (environment %r) — "
+        # the operator has chosen the allow-any (empty = unrestricted) egress posture. The caller
+        # logs this AUDIT line at WARNING once logging is configured; the warning below is stderr's.
+        audit.append(
+            "AUDIT: [security].block_unlisted_outbound=false on a "
+            f"{'production ' if production else ''}PHI instance (environment {env_name!r}) — "
             "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
-            "send to ANY destination of that type); the secure-by-default deny is opted out.",
-            "production " if production else "",
-            env_name,
+            "send to ANY destination of that type); the secure-by-default deny is opted out."
         )
         print(
             f"warning: [security].block_unlisted_outbound=false on a "
@@ -2966,6 +2971,12 @@ def _serve(args: argparse.Namespace) -> int:
     # that opt-out is set. A DPAPI-protected key
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
+    #
+    # BACKLOG #5391: the AUDIT records of deliberate weakenings taken before _start_logging below.
+    # They are logged once its handlers are installed, never before: logged here they would reach
+    # only the filtered lastResort on stderr, never [logging].file, the structured stdout handler
+    # or the collector. Each also prints a warning to stderr where it is decided.
+    _start_audit: list[str] = []
     if not _store_key_configured(settings):
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
         # below stays serve's own, because the remedy differs by command.
@@ -3018,24 +3029,17 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
-        # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
-        # never silent. (Logging isn't configured yet here, so this goes to the filtered
-        # lastResort, which emits >=WARNING to stderr through the filter chain — a durable startup
-        # audit line.) Under strict enforcement the second ack
+        # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning now AND a
+        # WARNING-level audit record once logging is configured (BACKLOG #5391), so the deliberate
+        # weakening is never silent. Under strict enforcement the second ack
         # ([security].allow_unencrypted_phi_under_strict_enforcement=true) was verified above, so
         # the AUDIT line names it too; the warn posture names the opt-out alone.
         # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
-        logging.getLogger(__name__).warning(
-            "AUDIT: starting keyless on a %sPHI instance (environment %r) because "
-            "%s%s — PHI is stored UNENCRYPTED at rest "
-            "(at-rest encryption opt-out override).",
-            "production " if production else "",
-            env_name,
-            opt_out_switches,
-            " + [security].allow_unencrypted_phi_under_strict_enforcement=true"
-            if enforcing
-            else "",
+        _start_audit.append(
+            f"AUDIT: starting keyless on a {'production ' if production else ''}PHI instance "
+            f"(environment {env_name!r}) because {opt_out_switches}"
+            f"{' + [security].allow_unencrypted_phi_under_strict_enforcement=true' if enforcing else ''}"
+            " — PHI is stored UNENCRYPTED at rest (at-rest encryption opt-out override)."
         )
         print(
             f"warning: {opt_out_switches} — starting a "
@@ -3084,7 +3088,11 @@ def _serve(args: argparse.Namespace) -> int:
     # of deny-by-default is deliberately unchanged: it cannot satisfy this gate on smtp/direct alone,
     # because there the other six transports stay allow-any.
     if _forwarder_posture_refused(
-        settings, production=production, env_name=env_name, enforcing=enforcing
+        settings,
+        production=production,
+        env_name=env_name,
+        enforcing=enforcing,
+        audit=_start_audit,
     ):
         return 2
 
@@ -3121,6 +3129,10 @@ def _serve(args: argparse.Namespace) -> int:
     if _logging_refused is not None:
         return _logging_refused
 
+    # BACKLOG #5391: the keyless and block_unlisted_outbound=false AUDIT records, first, as they
+    # were decided first.
+    for _audit_line in _start_audit:
+        logging.getLogger(__name__).warning("%s", _audit_line)
     # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
@@ -5492,8 +5504,13 @@ def _supervise(args: argparse.Namespace) -> int:
     # Last before it, the posture steps `serve` takes there: the open-egress gate, the AUDIT line
     # for the `block_unlisted_outbound` opt-out, and the production DEBUG refusal. The engine
     # shards read `[logging].level` from the same settings, so each would refuse on it.
+    posture_audit: list[str] = []
     if _forwarder_posture_refused(
-        settings, production=production, env_name=env_name, enforcing=enforcing
+        settings,
+        production=production,
+        env_name=env_name,
+        enforcing=enforcing,
+        audit=posture_audit,
     ):
         return 2
     forwarder_installed = False
@@ -5512,6 +5529,9 @@ def _supervise(args: argparse.Namespace) -> int:
     )
     if logging_refused is not None:
         return logging_refused
+    # BACKLOG #5391: logged once, now that the forwarder is up, so the collector gets it too.
+    for audit_line in posture_audit:
+        logging.getLogger(__name__).warning("%s", audit_line)
     _log_static_credential_outcome(sc_outcome)
     # BACKLOG #1125: the supervisor's own store open and pair renewal can go through it too.
     from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
