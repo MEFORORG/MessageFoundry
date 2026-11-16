@@ -3200,12 +3200,12 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     that build each filter's shapes and near misses. THE CONTROL: the filters do change a large
     share of the corpus, and the pattern does not simply match everything.
 
-    The filters are read with the ``\\b`` start this pattern keeps, which is its one stated
-    exception (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
+    The filters are read with the ``\\b`` start this pattern keeps, which is one of its stated
+    exceptions (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
     the escape start added must match each one, so the exception cannot hide any other shape, and
     there must be some, or the corpus no longer reaches it.
 
-    The connection-string member pass (BACKLOG #5030) is the second exception, read without it and
+    The connection-string member pass (BACKLOG #5030) is a source with no arm, read without it and
     counted apart the same way: each text only it changes must hold its match, and there must be
     some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why."""
     fragments = (

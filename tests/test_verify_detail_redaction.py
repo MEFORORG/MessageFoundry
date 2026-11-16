@@ -140,9 +140,9 @@ def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> No
 @pytest.mark.parametrize("sep", ["=", ": ", "='", " = "])
 def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str, sep: str) -> None:
     """The PHI name pass reads ``Login Password`` as a name and takes it. Run before any credential
-    pass that needs the label, the value printed; the credentials-first order hides it, and a word
-    prints only where both orders print it. The second control is the PHI-first order alone, which
-    prints the value on this text."""
+    pass that needs the label, the value printed; the credentials-first order hides it, and a fragment
+    the PHI-first order prints more often than the credentials-first order is hidden. The second
+    control is the PHI-first order alone, which prints the value on this text."""
     from messagefoundry.redaction import redact, safe_exc
     from messagefoundry.secretscrub import scrub_credentials
 
@@ -261,9 +261,9 @@ def test_a_name_after_a_credential_label_is_hidden_whole(text: str) -> None:
     ],
 )
 def test_a_word_either_order_hides_stays_hidden(text: str, hidden: tuple[str, ...]) -> None:
-    """Code review round 2 measured each of these print under one order of the two passes. A word
-    prints only where both orders print it now. Control: one order alone prints at least one of the
-    words, so the other order is what hides it."""
+    """Code review round 2 measured each of these print under one order of the two passes. A fragment
+    the PHI-first order prints more often than the credentials-first order is hidden now. Control:
+    one order alone prints at least one of the words, so the other order is what hides it."""
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
     from messagefoundry.verify.model import safe_detail_text

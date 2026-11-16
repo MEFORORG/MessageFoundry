@@ -249,8 +249,9 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
 #: in the log chain would lift it.
 #:
-#: **Each arm is a copy of its source, or wider, with ONE stated exception, and one source has no
-#: arm.** The label arm is
+#: **Each arm is a copy of its source, or wider, except where stated below, at least the label
+#: arm's start and the URL arm's user and password; and at least one source has no arm.** The label
+#: arm is
 #: ``secretscrub``'s own: the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and
 #: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
 #: right after a ``%XX`` escape (``_LABEL_START``), and this arm deliberately does not. Taking that
@@ -266,7 +267,7 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: the encoded run off and a PID run beside it is still hidden. The price is that run's own: where
 #: such a DSN sits in the run's token, the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
-#: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
+#: **A source with no arm: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
 #: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
 #: of that pattern's words (``password``, ``pass``, ``pwd``, ``token`` and the rest), ``;Bypass=1``
 #: among them, so an encoded PHI run beside one printed where the run hid it. Without the arm the

@@ -40,8 +40,9 @@ _PLACEHOLDER: Final = "[redacted]"
 
 
 def safe_detail_text(text: str, *, limit: int | None = None) -> str:
-    """``text`` for a :class:`CheckResult` detail: bounded, then a word printed only where both
-    orders of the PHI and credential passes print it, then the length bound (BACKLOG #5395).
+    """``text`` for a :class:`CheckResult` detail: bounded, then both orders of the PHI and
+    credential passes, comparing how often each prints a fragment, then the length bound (BACKLOG
+    #5395).
 
     A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
     leaves the box. The text a check quotes is a driver's, a config module's or the OS's: a store
@@ -52,10 +53,10 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
     log filter and wiring's own diagnostics use.
 
-    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run and a word prints only where
-    both print it. Credentials first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn:
-    MRN7712345`` as the token's value, the PHI pass then found no ``mrn:`` label, and the MRN printed.
-    PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
+    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment the
+    PHI-first order prints more often than the credentials-first order does is hidden. Credentials
+    first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's
+    value, the PHI pass then found no ``mrn:`` label, and the MRN printed. PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
     as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
     (``a|b^password= <value>``), and the value printed. The primary result is PHI first, then the
     credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
@@ -102,7 +103,12 @@ def _printed_by_both(primary: str, other: str) -> str:
     is the password is a position, and the first occurrence is the password when the label comes
     first (``Login Password: svcadmin for user svcadmin``). So a fragment ``primary`` prints more
     often than ``other`` is hidden at EVERY occurrence. That errs toward hiding: the user name goes
-    with the password it equals."""
+    with the password it equals.
+
+    It compares counts, never positions, so it is best-effort. Residuals, at least this one: a value
+    ``primary`` prints at one place while ``other`` prints the same fragment as often at another place
+    is kept, so a credential equal to a word only the credentials-first order printed elsewhere
+    prints. BACKLOG #5395 holds it open."""
     printed = Counter(piece for word in other.split() for piece in _fragments(word))
     shown = Counter(piece for word in primary.split() for piece in _fragments(word))
     return re.sub(
