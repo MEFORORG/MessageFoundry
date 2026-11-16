@@ -5,13 +5,13 @@
 The first pass on this row mapped fourteen fields (``tests/test_anon_b214_5533.py``). Fields of
 the same class stayed unmapped inside segments the default map already scrubbed: names, ids,
 phones, birth places, a death date and visit locations. At least some fields of these segments
-still have no rule; ``rules.py`` names them. Plain ``anonymize`` had no rule to scrub these
-twenty. ``anonymize_checked`` refused at least a dashed SSN, a dashed or bracketed phone, or an
-``MR``- or ``MRN``-typed id in them. Only ``require_full_coverage`` refused a message with any
-value in them. This pins each to a kind, checks on both adapters that a made-up value in each is
-gone from the output, and keeps a control that shows the same value survives when its rule is
-taken away. Every message here is synthetic (CLAUDE.md section 9),
-and no test prints a message body.
+still have no rule; ``rules.py`` names them. Plain ``anonymize`` passed these twenty through,
+apart from what the site-code pass rewrites. ``anonymize_checked`` refused at least a dashed SSN,
+a phone written ``NNN-NNN-NNNN`` or ``(NNN) NNN-NNNN``, or an ``MR``- or ``MRN``-typed id in them.
+Under the default rules, only ``require_full_coverage`` refused a message with any value in them.
+This pins each to a kind, checks on both adapters that a made-up value in each is gone from the
+output, and keeps a control that shows the same value survives when its rule is taken away. Every
+message here is synthetic (CLAUDE.md section 9), and no test prints a message body.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ _EACH_ADAPTER = pytest.mark.parametrize(
 
 # The fields this pass added to DEFAULT_RULES, with the kind each takes. An MRG field takes the
 # kind of the field it is the prior value of (MRG-2 with PID-4, MRG-5 with PV1-19, MRG-6 with
-# PV1-50), so a merge's linkage survives the surrogate mapping.
+# PV1-50), so a prior value gets the same surrogate as that value written identically in its pair.
 _NEW_DEFAULTS = {
     "GT1-4": SurrogateKind.NAME,
     "GT1-19": SurrogateKind.ID,

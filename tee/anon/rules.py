@@ -146,9 +146,10 @@ class FieldRule:
 # mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
 # that list still has no rule, and only the coverage report names it.
 #
-# An id or name surrogate is keyed on the dataset salt, its kind and the whole repetition's text.
-# So a prior value in MRG keeps a merge's prior-to-current link only where its kind matches its
-# pair's kind, and only when both are written identically. The kinds match for MRG-1 and PID-3
+# The ID, MRN and NAME kinds key a surrogate on the dataset salt, the kind and the whole
+# repetition's text (keying.Keyer.seed). So a prior value in MRG gets the same surrogate as that
+# value carried as current in its pair field of an earlier message only where the two kinds match,
+# and only when it is written identically in both. The kinds match for MRG-1 and PID-3
 # (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for MRG-7 and PID-5
 # (NAME). They do not match for two pairs. MRG-3, the prior account number, takes MRN, while
 # PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME.

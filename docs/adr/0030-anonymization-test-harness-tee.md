@@ -146,14 +146,15 @@
   (the guarantor's death date) as `DATE`, like `PID-29`; the birth places `GT1-56` and `NK1-38`,
   the organization names `GT1-21` and `GT1-51`, and `PV1-37` (a discharge location with its
   date) as `FREETEXT`; and `PV1-52` as `PROVIDER`. `MRG-2`, `MRG-5` and `MRG-6` take `ID`, the
-  kind of the field each is the prior value of (`PID-4`, `PV1-19`, `PV1-50`). An id or name
-  surrogate is keyed on the dataset salt, its kind and the whole repetition's text. So the merge
-  link survives for these three, as for `MRG-1` with `PID-3` and `MRG-7` with `PID-5`, when both
-  values are written identically. Two older rules keep no link, and this amendment leaves them as
-  they are. `MRG-3`, the prior account number, takes `MRN`, while `PID-18` takes `ID`. `MRG-4`,
-  the prior patient id, is a CX paired with `PID-2`, yet takes `NAME`. `PV1-37` is redacted whole, its table-coded location
-  with its date, because no kind rewrites one component of a field. **This adds to the §3 field
-  list; §3 named none of these fields.**
+  kind of the field each is the prior value of (`PID-4`, `PV1-19`, `PV1-50`). The `ID`, `MRN`
+  and `NAME` kinds key a surrogate on the dataset salt, the kind and the whole repetition's text.
+  So a prior value in one of these three gets the same surrogate as that value carried as current
+  in its pair field of an earlier message, as `MRG-1` does with `PID-3` and `MRG-7` with `PID-5`,
+  when it is written identically in both. Two older rules keep no such link, and this amendment
+  leaves them as they are. `MRG-3`, the prior account number, takes `MRN`, while `PID-18` takes
+  `ID`. `MRG-4`, the prior patient id, is a CX paired with `PID-2`, yet takes `NAME`. `PV1-37`
+  is redacted whole, its table-coded location with its date, because no kind rewrites one
+  component of a field. **This adds to the §3 field list; §3 named none of these fields.**
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
