@@ -95,6 +95,7 @@ __all__ = [
     "ensure_logger_sink",
     "install_filtered_last_resort",
     "scrub_log_text",
+    "sink_readings",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -471,6 +472,26 @@ def _shipped_reading(line: str) -> str | None:
     if out is not None and "\t" in out:
         out = _settled_reading(out.replace("\t", " "), filters)
     return out
+
+
+#: The most handlers :func:`configure_logging` installs: stdout, the file and the forwarder.
+SHIPPED_HANDLER_COUNT = 3
+
+
+def sink_readings(text: str, *, sinks: int = SHIPPED_HANDLER_COUNT) -> list[str]:
+    """What each of the first ``sinks`` shipped handlers writes for a record whose message is
+    ``text``: the Nth item is what N passes of the installed filters leave, since each handler
+    runs the whole chain over the one shared record, as :func:`_settled_reading` models. For a
+    caller that must hold a line to a bar on every sink, not just the first, as the audit tee
+    does (BACKLOG #3045)."""
+    filters = _shipped_filters()
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    readings = []
+    for _ in range(sinks):
+        for log_filter in filters:
+            log_filter.filter(record)
+        readings.append(record.getMessage())
+    return readings
 
 
 def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:

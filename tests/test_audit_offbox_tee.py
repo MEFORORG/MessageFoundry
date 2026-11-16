@@ -868,6 +868,120 @@ def test_a_value_over_the_window_ships_with_its_bound_note(capsys) -> None:
     assert detail.endswith(note) and "DOE" not in detail
 
 
+def _raw_tee_lines(cases: list[dict[str, str | None]], monkeypatch, *, scrub: bool) -> list[str]:
+    """Each case's tee line as ``emit_audit_tee`` hands it to the logger, before any handler, with
+    the field scrub on or switched off, which is the code before #3045."""
+    lines: list[str] = []
+
+    class _Capture:
+        def info(self, line: str) -> None:
+            lines.append(line)
+
+    defaults = {"action": "auth.login_failed", "actor": "alice", "detail": "ok"}
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "audit_logger", _Capture())
+        patch.setattr(audit_tee, "ensure_logger_sink", lambda _logger: None)
+        if not scrub:
+            patch.setattr(audit_tee, "_scrub_field", lambda value, **_kw: value)
+        for fields in cases:
+            emit_audit_tee(
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+                **{"channel_id": None, "client": None, **defaults, **fields},  # type: ignore[arg-type]
+            )
+    return lines
+
+
+def _unplaced(line: str) -> str:
+    """``line`` without the two placeholders the passes write, which are not text of a value."""
+    return line.replace("[redacted]", " ").replace("<redacted>", " ")
+
+
+def _shown_per_sink_that_main_hid(
+    cases: list[dict[str, str | None]], monkeypatch
+) -> list[tuple[int, str, list[str]]]:
+    """Each sink, case and word that this code's line shows on that sink, counted, more often
+    than the line before #3045 showed it on the same sink. The Nth sink runs the chain N times."""
+    from collections import Counter
+
+    from messagefoundry.logging_setup import sink_readings
+
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    shown = []
+    for case, old, new in zip(cases, before, after, strict=True):
+        for sink, (old_out, new_out) in enumerate(
+            zip(sink_readings(old), sink_readings(new), strict=True), start=1
+        ):
+            old_words = Counter(_WORD.findall(_ESCAPE_TEXT.sub(" ", _unplaced(old_out))))
+            new_words = Counter(_WORD.findall(_ESCAPE_TEXT.sub(" ", _unplaced(new_out))))
+            if extra := sorted(new_words - old_words):
+                shown.append((sink, ascii(case), extra))
+    return shown
+
+
+#: The Lander's counterexamples on engine PR 2864: on the second and third sinks, the forwarder
+#: among them, a bar over the first pass alone shipped words main's same sink hid.
+_LATER_SINK_LEAKS: tuple[dict[str, str | None], ...] = (
+    {"actor": "\x1bhunter2DOE\x7fsecret\t:x%7Cy%7Cz"},
+    {"client": '^abcdef0123456789abcd\x01password= ~secretpassword="'},
+)
+
+
+def test_no_sink_shows_a_word_the_line_before_3045_hid_there(monkeypatch) -> None:
+    """The Lander's hold on engine PR 2864 (B1): every handler re-runs the chain over the one
+    shared record, so the bar holds on each of the three sinks ``configure_logging`` installs,
+    not just the first. The Lander's counterexamples, then the single-control sweep and its
+    two-control pairs in ``actor`` and ``client``. Synthetic values."""
+    cases = list(_LATER_SINK_LEAKS)
+    for field in ("actor", "client"):
+        cases += [{field: value} for value in _corpus()[::7]]
+    assert len(cases) > 400
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, shown[:10]
+
+
+#: Pieces for the seeded per-sink fuzz: controls, the log alphabet's DEL and U+2028, and the
+#: label, name, token and delimiter shapes the counterexamples above are made of.
+_FUZZ_PIECES = (
+    "\x01", "\x1b", "\x00", "\t", "\n", "\r", "\x7f", " ", "%7C", "password=", "secret",
+    "hunter2", "DOE", "JANE", " ", "|", "^", "~", '"', ":", "Bearer ", "abcdef0123456789abcd",
+    "token=", "05/05/1980", "MRN ", "12345678", "x", "ABC|", "\\", "SMITH,", "=", "&",
+)  # fmt: skip
+
+
+def test_a_seeded_fuzz_shows_no_word_on_any_sink_the_line_before_3045_hid(monkeypatch) -> None:
+    """B1 again, over random joins of the pieces in every text field and in a JSON ``detail``.
+    Seeded, so a failure reproduces. 6,000 records of the same kind found none while building
+    this; the suite runs 1,000 to keep it cheap. Synthetic values."""
+    import random
+
+    rng = random.Random(3045)
+    cases: list[dict[str, str | None]] = []
+    for _ in range(1000):
+        value = "".join(rng.choice(_FUZZ_PIECES) for _ in range(rng.randint(2, 9)))
+        field = rng.choice(["actor", "client", "channel_id", "action", "detail", "detail-as-json"])
+        cases.append(_sweep_case(field, value))
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, shown[:10]
+
+
+def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> None:
+    """The Lander's hold on engine PR 2864 (B2): a fault while reading the sinks ships the old
+    line, which meets the bar by definition, never an unchecked candidate. Synthetic values."""
+
+    def boom(_text: str) -> list[str]:
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(audit_tee, "sink_readings", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+    before: dict[str, object] = {"actor": "\x01DOE JANE ABC|x", "seq": 1}
+    after: dict[str, object] = {"actor": "\x01[redacted] ABC|[redacted]", "seq": 1}
+    assert audit_tee._tee_line(before, after) == json.dumps(before, ensure_ascii=False)
+
+
 def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
     """Review of the PR 2864 repair: where the scrubbed line shows a word the old line hid,
     ``_tee_line`` hid a changed ``detail`` as bare ``[redacted]``, which is not the JSON a

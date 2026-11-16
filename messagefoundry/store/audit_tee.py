@@ -42,7 +42,12 @@ from collections import Counter
 from collections.abc import Callable
 from typing import overload
 
-from messagefoundry.logging_setup import AUDIT_LOGGER_NAME, ensure_logger_sink, scrub_log_text
+from messagefoundry.logging_setup import (
+    AUDIT_LOGGER_NAME,
+    ensure_logger_sink,
+    scrub_log_text,
+    sink_readings,
+)
 from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
 
 __all__ = [
@@ -295,8 +300,8 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         result = _encode_c0(first) if as_json else first
         if as_json and not _parses(result):
             return whole
-        # The handler chain alone, over the value as the line carries it, must hide every word
-        # this result hides. The plain pass can redact a span the chain read differently, a name
+        # This result must hide every word the handler chain alone hides, over the value as the
+        # line carries it. The plain pass can redact a span the chain read differently, a name
         # run that takes a ``Bearer`` label with it, and leave the credential the chain would have
         # caught. A stricter bar than the one that binds, which is :func:`_tee_line`'s.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
@@ -333,15 +338,17 @@ def _tee_line(
     its neighbours, so no check over a field alone can stand for it; an earlier version of this
     fix compared against one and shipped words the old line hid.
 
-    Each candidate is logged only if the chain over it shows no word, counted, that the chain over
-    the old line did not show: the line with every scrubbed field, then the old line with each
-    field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed ``detail`` as
-    ``whole_detail``, then the old line itself, which
-    meets the bar trivially and so ends the search. The last loses the C0 scrub for that record,
-    and is reached only where hiding the changed fields whole still shows a word the old line hid
-    elsewhere in it, and is logged once per process. The bar is the first handler's: a later handler runs the chain again over the
-    first one's escaped text, a residual :func:`emit_audit_tee` names. On a fault, the second
-    candidate ships unchecked, failing closed as :func:`_scrub_field` does."""
+    Each candidate is logged only if, on EVERY sink, what the handlers write for it shows no word,
+    counted, that the same sink wrote for the old line: the line with every scrubbed field, then
+    the old line with each field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed
+    ``detail`` as ``whole_detail``, then the old line itself, which meets the bar trivially and
+    so ends the search. Each handler runs the whole chain again over the one shared record, so
+    the Nth sink writes what N passes leave (:func:`~messagefoundry.logging_setup.sink_readings`),
+    and the forwarder, the copy that leaves the box, is the last of up to three; a bar taken over
+    the first pass alone let a later sink show words main's same sink hid. The last candidate
+    loses the C0 scrub for that record, and is reached only where hiding the changed fields
+    whole still shows a word the old line hid elsewhere in it, and is logged once per process.
+    On a fault, the old line ships, which meets the bar by definition."""
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
         return old_line
@@ -350,14 +357,15 @@ def _tee_line(
         for k, v in before.items()
     }
     try:
-        bar = _line_words(scrub_log_text(old_line))
+        bars = [_line_words(reading) for reading in sink_readings(old_line)]
         for candidate in (after,) if whole == after else (after, whole):
             line = json.dumps(candidate, ensure_ascii=False)
-            if _line_words(scrub_log_text(line)) <= bar:
+            readings = sink_readings(line)
+            if all(_line_words(r) <= bar for r, bar in zip(readings, bars, strict=True)):
                 return line
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)
-        return json.dumps(whole, ensure_ascii=False)
+        return old_line
     global _OLD_LINE_LOGGED
     if not _OLD_LINE_LOGGED:
         _OLD_LINE_LOGGED = True
@@ -466,8 +474,8 @@ def emit_audit_tee(
     ``action``, ``actor``, ``channel_id``, ``client`` and ``detail``, is first scrubbed by the same
     text passes before it is encoded, wherever it holds a C0 control; :func:`_scrub_field` says
     how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
-    chain hid of the whole record as it was encoded before #3045, so it redacts no less than that
-    line did on the first handler. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
+    chain hid of the whole record as it was encoded before #3045, on each of up to three sinks,
+    so on each sink it redacts no less than that line did there. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
     through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
     ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
     HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no
