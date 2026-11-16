@@ -585,6 +585,9 @@ def sanitize_filename(name: str | None) -> str:
     return base or "upload"
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
 class _MalformedSidecarError(ValueError):
     """A sidecar that reached the JSON parse but is not metadata this store would have written
     (BACKLOG #5387, #5388). Its message names only the defect, never a value from the sidecar."""
@@ -594,11 +597,16 @@ def _sidecar_text(d: dict[str, Any], key: str, default: str) -> str:
     value = d.get(key, default)
     if not isinstance(value, str):
         raise _MalformedSidecarError(f"field {key!r} is not a string")
+    # A JSON escape can carry a lone surrogate, which no response can serialize, so one such
+    # sidecar would fail every listing page it falls on.
+    if _SURROGATE_RE.search(value):
+        raise _MalformedSidecarError(f"field {key!r} holds a lone surrogate")
     return value
 
 
-#: The largest count a sidecar may carry, far past any upload the engine accepts. Larger is a plant:
-#: a 4000-digit ``size`` would bill an uploader out of quota and land in the audit detail.
+#: The largest count a sidecar may carry, far past any upload the engine accepts. It bounds the
+#: digits a plant can write into the audit detail. It does not stop a plant billing an uploader out
+#: of quota: any count near it does that, because ``size`` is not checked against the body on disk.
 _MAX_SIDECAR_COUNT = 2**53
 
 
@@ -622,10 +630,12 @@ def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
     another upload's ``file_id`` for the prune to delete, or carry a negative ``size`` that lifts a
     quota. So the ``file_id`` must be the path's own id, each count an integer from 0 to
     :data:`_MAX_SIDECAR_COUNT`, the timestamp a number from 0 to a day past now, and every text field
-    a string, and the filename is sanitized as :meth:`UploadStore.save` sanitizes it. A timestamp
-    further ahead is refused as :meth:`_UnsealableUpload.expired` treats an mtime: it would never age
-    out and would bill its uploader for good. Anything else, including JSON that does not parse or
-    nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388).
+    a string with no lone surrogate, and the filename is sanitized as :meth:`UploadStore.save`
+    sanitizes it. A timestamp further ahead would never age out and would bill its uploader for
+    good, so it is refused. Unlike :meth:`_UnsealableUpload.expired`, which prunes such an mtime,
+    that leaves the pair on disk; and a host clock stepped back more than a day hides genuine
+    uploads until wall time catches up. Anything else, including JSON that does not parse or nests
+    past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388).
 
     A refused sidecar is left out of the listing, the quota and the prune, so it stays on disk
     until an operator removes it."""
@@ -2283,9 +2293,14 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
-            except (UnicodeDecodeError, binascii.Error) as exc:
-                # Not UTF-8, or not the strict base64 the body is stored as.
-                defect = codec_safe_str(exc)
+            except ValueError as exc:
+                # Not UTF-8, or not the strict base64 the body is stored as: binascii.Error, or a
+                # plain ValueError for a non-ASCII character. Any other ValueError by type only.
+                defect = (
+                    codec_safe_str(exc)
+                    if isinstance(exc, (UnicodeError, binascii.Error))
+                    else type(exc).__name__
+                )
             raise UploadUnreadableError(_log_damaged(file_id, "body", defect))
 
         return await asyncio.to_thread(_read)
@@ -2337,9 +2352,10 @@ class UploadStore:
                 # Damaged, never trusted, and raised after the handler, so the error holding the
                 # file is on no chain. Classed only where the scan classes it too: a sidecar that is
                 # not UTF-8, on a cipher that refuses plaintext, may be the never-sealable kind.
-                refusal = _log_damaged(file_id, "sidecar", defect)
                 if not (classed and self._refuses_plaintext):
-                    raise UploadUnreadableError(refusal)
+                    raise UploadUnreadableError(_log_damaged(file_id, "sidecar", defect))
+                # Logged as a refusal only if the class check below refuses it too.
+                refusal = _DAMAGED.format(part="sidecar")
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
@@ -2351,6 +2367,8 @@ class UploadStore:
                         meta_path.lstat()
                     except FileNotFoundError as exc:
                         raise UploadNotFoundError(file_id) from exc
+                    if defect is not None:
+                        refusal = _log_damaged(file_id, "sidecar", defect)
                     raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the

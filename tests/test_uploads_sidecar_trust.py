@@ -76,6 +76,7 @@ async def test_a_sidecar_naming_another_upload_cannot_steer_the_prune(tmp_path: 
         {"uploaded_at": "now"},
         {"uploader_id": ["u-op"]},
         {"filename": {"x": 1}},
+        {"filename": "\ud800x.txt"},
     ],
     ids=lambda f: next(iter(f)),
 )
@@ -153,10 +154,25 @@ async def test_a_damaged_sidecar_on_a_keyed_store_is_refused_on_delete(tmp_path:
     assert _sidecar(store, meta.file_id).exists()
 
 
+async def test_a_never_sealable_sidecar_with_a_bad_tail_is_deleted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Plaintext, not UTF-8 only past the part the class check reads, over a missing body: the kind
+    # the scan classes, so delete removes it, and logs no refusal for it.
+    store = _keyed(tmp_path)
+    meta = await _saved(store)
+    (store._root / f"{meta.file_id}.blob").unlink()  # noqa: SLF001
+    _sidecar(store, meta.file_id).write_bytes(b" " * (4 * 64 * 1024) + b"\xff")
+    removed = await store.delete(meta.file_id)
+    assert removed.file_id == meta.file_id
+    assert not _sidecar(store, meta.file_id).exists()
+    assert not any("damaged, refused" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.parametrize(
     "raw",
-    [b"\xff\xfe not utf-8", b"not base64!", b"%%%%", b"abcd!"],
-    ids=["not-utf8", "bad-padding", "no-alphabet", "stray-char"],
+    [b"\xff\xfe not utf-8", b"not base64!", b"%%%%", b"abcd!", b"QUJ", "QUJDé".encode()],
+    ids=["not-utf8", "odd-alphabet", "no-alphabet", "stray-char", "bad-padding", "non-ascii"],
 )
 async def test_a_damaged_body_is_refused_on_read_bytes(tmp_path: Path, raw: bytes) -> None:
     store = _keyless(tmp_path)

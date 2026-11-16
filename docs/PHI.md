@@ -838,8 +838,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and gets 404. At least these are still outside retention, and the API cannot delete them: a
    blank sidecar, or one that is not UTF-8 within the part the class check reads, and a plaintext
    sidecar over a body that is oversized and not text, or is not a regular file. A plaintext
-   sidecar that is not UTF-8 only past that part is removed by the prune at expiry, but the API
-   cannot delete it either: its read fails before the class check.
+   sidecar that is not UTF-8 only past that part is removed by the prune at expiry, and since
+   BACKLOG #5388 the same override holder can delete it through the API too: the read's decode
+   error is refused as damaged, and the delete then classes it.
+   **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
+   #5388).** At least these are refused: one that is not UTF-8 or not a JSON object, one whose
+   `file_id` is not its own path id, a count that is negative or above 2^53, an `uploaded_at`
+   below zero or more than a day ahead, and a text field that is not a string or holds a lone
+   surrogate. A refused sidecar is left out of the listing, the quota and the prune, and the API
+   answers 404 to its owner and 423 to an override holder. Apart from the never-sealable kind
+   above, it stays on disk, outside retention, until an operator removes it by hand.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
    `rotate-key` refuses to run in that mode (BACKLOG #1165, #2109). So no command could ever seal the upload, and refusing it
    would strand the file for good. The transit cipher still refuses unmarked values in the store's own
