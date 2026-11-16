@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+from messagefoundry import uploads as uploads_mod
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import (
@@ -616,6 +617,34 @@ async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_pa
     assert set(json.loads(detail)) == {"reason"}  # no file name (vault BACKLOG #2619)
     assert "b.hl7" not in detail
     assert "MSH" not in detail and "MRN" not in detail  # never any body content
+
+
+async def test_an_account_name_past_the_sidecar_bound_answers_400_with_nothing_stored(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5387: the sidecar reader refuses a name past its bound, so the save refuses it first.
+    # Before, the upload was stored, then hidden from its owner and unbilled by the quota. The bound
+    # is lowered here, because local login caps a username well below the shipped one; a directory
+    # account is not capped there.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    name = "op-long-name"
+    monkeypatch.setitem(uploads_mod._MAX_SIDECAR_TEXT, "uploader", len(name) - 1)  # noqa: SLF001
+    service = await _make_user(engine, Role.OPERATOR, name=name)
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, name)
+        resp = await c.post(
+            "/uploads", files={"file": ("a.hl7", ADT, "application/octet-stream")}, headers=h
+        )
+        assert resp.status_code == 400, resp.text
+        assert name not in resp.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+    assert not list((tmp_path / "uploads").glob("*.meta"))
+    rej = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject"]
+    assert len(rej) == 1 and name not in (rej[0]["detail"] or "")
 
 
 async def test_browse_and_delete_path_traversal_404(engine: Engine, tmp_path: Path) -> None:

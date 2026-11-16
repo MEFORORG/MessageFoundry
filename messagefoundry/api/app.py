@@ -9223,7 +9223,8 @@ def create_app(
             )
             raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
-            # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
+            # ASVS 5.2.2: disallowed extension or content/extension mismatch, or (BACKLOG #5387,
+            # UploadFieldError) a field the sidecar reader would refuse. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
             # both POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
             await engine.store.record_audit(

@@ -843,19 +843,27 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    error is refused as damaged, and the delete then classes it.
    **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
    #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
-   whose `file_id` is not its own path id, a count that is negative or above 2^53, an
-   `uploaded_at` below zero or more than a day ahead, and a text field that is not a string, is
-   longer than any upload writes, or holds a lone surrogate. Apart from the never-sealable kind
-   above, which the quota still bills, a refused sidecar is left out of the listing and the quota,
-   and the API answers 404 to its owner and 423, naming the file as damaged, to an override
-   holder. It is not left out of retention: the prune removes the pair once the later of its
+   whose `file_id` is not its own path id, a count or an `uploaded_at` that is negative or above
+   2^53, and a text field that is not a string, is longer than the store allows, or holds a lone
+   surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
+   host clock is stepped back every genuine upload is dated ahead, so such an upload is still
+   listed, billed by the quota and readable by its owner. An upload never writes an over-long or
+   surrogate field: the save refuses one up front, and the API answers 400 with nothing stored.
+   Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
+   left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
+   override holder, with text naming the file as damaged. The web console's `/ui` page does not
+   pass that text on: it shows its one locked notice for every 423, which names `rotate-key` as
+   the conditional fix, and `rotate-key` does not repair a damaged file. It is not left out of
+   retention: the prune removes the pair once the later of its
    sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
-   claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, because a
-   genuine upload refused only after the host clock was stepped back is not damaged and is read
-   again once wall time catches up. So a damaged pair whose mtimes are set ahead stays on disk
-   until they pass, and `rotate-key`, which rewrites a pair it can decrypt, restarts that clock.
+   claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, so a damaged
+   pair whose mtimes are set ahead stays on disk until they pass, and `rotate-key`, which rewrites
+   a pair it can decrypt, restarts that clock.
    The prune logs each such removal as one of a refused sidecar, and its audit row carries blank
-   owner fields. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
+   owner fields. A sound sidecar whose `uploaded_at` is more than a day ahead of the prune's clock
+   is aged the same way, by its pair's mtimes and never by an mtime ahead of the clock, since that
+   stamp alone would never pass the window; its audit row carries the sidecar's own owner fields,
+   and the prune logs it as one whose `uploaded_at` is ahead of the clock. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
    that log line is its only record. A sidecar the cipher declines is not
    this kind: a key rotated away must not destroy data, so it waits for `rotate-key` as above. At
    least a sidecar that is a link or is not a regular file is still outside retention, and an

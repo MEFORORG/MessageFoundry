@@ -20,6 +20,8 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.uploads import (
     UploadDamagedError,
     UploadedFileMeta,
+    UploadFieldError,
+    UploadQuotaError,
     UploadStore,
     UploadUnreadableError,
     sanitize_filename,
@@ -33,9 +35,12 @@ def _keyless(tmp_path: Path) -> UploadStore:
     return UploadStore(tmp_path / "uploads", make_cipher(None), max_bytes=4096)
 
 
-def _keyed(tmp_path: Path) -> UploadStore:
+def _keyed(tmp_path: Path, *, max_files_per_user: int = 100) -> UploadStore:
     return UploadStore(
-        tmp_path / "uploads", make_cipher(generate_key(), write_v2=True), max_bytes=4096
+        tmp_path / "uploads",
+        make_cipher(generate_key(), write_v2=True),
+        max_bytes=4096,
+        max_files_per_user=max_files_per_user,
     )
 
 
@@ -76,7 +81,7 @@ async def test_a_sidecar_naming_another_upload_cannot_steer_the_prune(tmp_path: 
         {"uploaded_at": float("inf")},
         {"uploaded_at": -1.0},
         {"uploaded_at": 10**400},
-        {"uploaded_at": time.time() + 10 * 86_400},
+        {"uploaded_at": 2**53 + 1},
         {"size": 10**4000},
         {"uploaded_at": "now"},
         {"uploader_id": ["u-op"]},
@@ -261,13 +266,42 @@ async def test_a_fifo_in_place_of_a_file_is_refused_without_blocking(
 async def test_a_genuine_upload_dated_ahead_of_a_stepped_back_clock_is_not_pruned(
     tmp_path: Path,
 ) -> None:
-    # Its uploaded_at is more than a day ahead of the prune's clock, so it is refused, but it is
-    # not damaged: it must wait for wall time, not be pruned by its mtime, which is ahead too.
+    # Its uploaded_at is more than a day ahead of the prune's clock, but it is not damaged: it must
+    # wait for wall time, not be pruned by its mtime, which is ahead too.
     store = _keyed(tmp_path)
     meta = await _saved(store)
     result = await store.prune_expired(now=time.time() - 3 * 86_400, retention_days=30)
     assert result.pruned == []
     assert await store.get_meta(meta.file_id) == meta
+
+
+async def test_a_genuine_upload_under_a_stepped_back_clock_is_listed_billed_and_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Written while the clock read 400 days ahead, then the clock was stepped back to now. The
+    # shape check reads no clock (BACKLOG #5387), so the upload is not hidden or unbilled.
+    store = _keyed(tmp_path, max_files_per_user=1)
+    ahead = time.time() + 400 * _DAY
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: ahead)
+        meta = await _saved(store)
+    assert meta.uploaded_at == ahead
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    assert await store.get_meta(meta.file_id) == meta
+    assert await store.read_bytes(meta.file_id) == _BODY
+    # Counted by the quota: a second upload by the same owner is over the one-file cap.
+    with pytest.raises(UploadQuotaError):
+        await _saved(store, "second.txt")
+
+
+async def test_a_malformed_stamp_is_still_refused(tmp_path: Path) -> None:
+    # Control for the test above: the shape check still refuses a stamp out of shape.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _plant(store, meta.file_id, uploaded_at=-1.0)
+    with pytest.raises(UploadDamagedError):
+        await store.get_meta(meta.file_id)
+    assert await store.list_files() == []
 
 
 _DAY = 86_400
@@ -280,9 +314,7 @@ def _age(*paths: Path, days: float) -> None:
 
 
 _REFUSED_PLANTS = {
-    # A sidecar dated far ahead, which the shape check refuses, on a cipher that passes plaintext.
-    "far-future": (_keyless, b"plant"),
-    # One that is not JSON, on the same cipher.
+    # A sidecar that is not JSON, on a cipher that passes plaintext.
     "passthrough-not-json": (_keyless, b"{not json"),
     # One that is not UTF-8, on a keyed store, over a text body: not the never-sealable kind.
     "keyed-not-utf8": (_keyed, b"\xff\xfe not utf-8"),
@@ -296,10 +328,7 @@ async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
     factory, raw = _REFUSED_PLANTS[case]
     store = factory(tmp_path)
     meta = await _saved(store)
-    if case == "far-future":
-        _plant(store, meta.file_id, uploaded_at=time.time() + 400 * _DAY)
-    else:
-        _sidecar(store, meta.file_id).write_bytes(raw)
+    _sidecar(store, meta.file_id).write_bytes(raw)
     sidecar, body = _sidecar(store, meta.file_id), _blob(store, meta.file_id)
     assert await store.list_files() == []  # refused, so not trusted for the listing
     rows: list[UploadedFileMeta] = []
@@ -323,6 +352,53 @@ async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
         (meta.file_id, "", "", "")
     ]
     assert any("whose sidecar was refused" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_sound_sidecar_dated_far_ahead_is_aged_by_its_pair_on_disk(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Its stamp alone would never age out, so the prune reads the pair's mtimes instead, and never
+    # an mtime ahead of the clock. Its own metadata is trusted for the listing and the audit row.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _plant(store, meta.file_id, uploaded_at=time.time() + 400 * _DAY)
+    sidecar, body = _sidecar(store, meta.file_id), _blob(store, meta.file_id)
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    rows: list[UploadedFileMeta] = []
+
+    async def _audit(row: UploadedFileMeta) -> None:
+        rows.append(row)
+
+    assert (await store.prune_expired(retention_days=30, audit=_audit)).pruned == []
+    _age(sidecar, days=60)
+    assert (await store.prune_expired(retention_days=30, audit=_audit)).pruned == []
+    _age(sidecar, body, days=-400)  # ahead of the clock on disk too: never pruned
+    assert (await store.prune_expired(retention_days=30, audit=_audit)).pruned == []
+    _age(sidecar, body, days=60)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = await store.prune_expired(retention_days=30, audit=_audit)
+    assert [m.file_id for m in result.pruned] == [meta.file_id]
+    assert not sidecar.exists() and not body.exists()
+    assert [(r.file_id, r.uploader_id) for r in rows] == [(meta.file_id, "u-op")]
+    assert any("uploaded_at is ahead of the clock" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("key", ["uploader", "uploader_id"])
+async def test_save_refuses_an_account_field_the_reader_would_refuse(
+    tmp_path: Path, key: str
+) -> None:
+    # BACKLOG #5387: save and the reader share one bound, so no write is one the reader refuses.
+    store = _keyless(tmp_path)
+    at_bound = {"uploader": "op", "uploader_id": "u-op", key: "u" * 1024}
+    meta = await store.save(data=_BODY, filename="a.txt", **at_bound)
+    assert await store.get_meta(meta.file_id) == meta
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    for bad in ("u" * 1025, "op\ud800"):
+        with pytest.raises(UploadFieldError) as info:
+            await store.save(data=_BODY, filename="b.txt", **{**at_bound, key: bad})
+        assert bad not in str(info.value)
+    # Nothing was written by the refused saves.
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
 
 
 async def test_a_lone_damaged_sidecar_is_pruned_with_a_log_line(
