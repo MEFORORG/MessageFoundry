@@ -787,9 +787,9 @@ _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 #: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
 #: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
 #: reading did: the rewrites above found more, and missed some main caught, three review rounds
-#: running. Do not tighten them: a change here is a change to the floor. The floor is not every hit
-#: main reported: the pass runs this module's table model, so a blank line, or a quote-only line in a
-#: quoted table, between rows ends the table there and drops the marks main kept across it (step 9).
+#: running. Do not tighten them: a change here is a change to the floor. The pass runs this module's
+#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
+#: (_pr_loose_columns).
 _PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 _PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
@@ -822,7 +822,7 @@ def _pr_lines(body: str) -> tuple[list[str], list[int], list[int], set[int]]:
     (_pr_table_starts). A ">" then a no-break space is a quoted line with content, neither. A
     separator only str.splitlines reads (a form feed, U+2028) ends a line here but never makes a
     blank or quoted one: the line it ends, or the line it opens, lies inside a GFM line, so it ends
-    no table (step 9), and a ">" after it is content, not a quote marker."""
+    no GFM table, and a ">" after it is content, not a quote marker."""
     lines: list[str] = []
     blanks: list[int] = []
     quote_blanks: list[int] = []
@@ -1173,7 +1173,10 @@ def _pr_table_starts(
     GFM line with a quote marker GFM reads as one (at most three spaces before it, _PR_QUOTE_OPEN;
     the line numbers in ``quoted``). A ">" after a form feed or U+2028 is content, not one. Blank
     lines emit no unit, so that span reaches across them to a header above a blank line. Anywhere
-    else, a lone ">" between rows does not end the run, as main read no blank line at all."""
+    else, a lone ">" between rows does not end the run, as main read no blank line at all.
+
+    These runs bound only the GFM reading (_pr_table_columns), whose columns can only add marks; the
+    loose reading (_pr_loose_columns), which keeps every mark main kept, does not read them."""
 
     def between(found: list[int], above: int, below: int) -> bool:
         return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
@@ -1244,22 +1247,16 @@ def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
     return columns
 
 
-def _pr_loose_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
-    """For each unit, the ASVS columns read close to how engine PR 2893 read them, united with the GFM
-    reading above: every row above a dash-shaped unit is re-read as a header, and its cells are split
-    at every pipe. Unlike engine PR 2893, a blank line between data rows ends the reading (step 9,
-    which drops marks by design), and a blank line is counted as GFM counts one (_pr_lines). A blank
-    line right before or right after a dash-shaped row ends nothing, as main read none: between a
-    header and its delimiter, or between the delimiter and the first data row, the header still
-    marks the rows below."""
+def _pr_loose_columns(units: _PrUnits) -> list[set[int]]:
+    """For each unit, the ASVS columns as main read them, united with the GFM reading above: every
+    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe. Only
+    a unit that is not a row ends this reading, as on main, so a blank line or a quote-marker-only
+    line between rows ends nothing here and every mark main kept is kept. Step 9, which ended this
+    reading at such a line, was removed; the false positive it quieted stays open on BACKLOG #3364."""
     columns: list[set[int]] = []
     current: set[int] = set()
     for index, (_, text, is_row) in enumerate(units):
-        if not is_row or (
-            starts[index]
-            and not _pr_is_delimiter(text)
-            and not (index and units[index - 1][2] and _pr_is_delimiter(units[index - 1][1]))
-        ):
+        if not is_row:
             current = set()
         if (
             is_row
@@ -1374,7 +1371,7 @@ def _pr_scan_reading(
     # starts.
     starts = _pr_table_starts(units, *gfm)
     asvs = _pr_table_columns(units, starts)
-    loose = _pr_loose_columns(units, starts)
+    loose = _pr_loose_columns(units)
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
         _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
     # Where the body holds an invisible character, it is read again with each one deleted. A unit
@@ -1384,7 +1381,7 @@ def _pr_scan_reading(
         for unit, unit_asvs, unit_loose, plain, plain_asvs, plain_loose in zip(
             deleted,
             _pr_table_columns(deleted, starts),
-            _pr_loose_columns(deleted, starts),
+            _pr_loose_columns(deleted),
             units,
             asvs,
             loose,

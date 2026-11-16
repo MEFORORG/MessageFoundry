@@ -1231,6 +1231,22 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ),
     ("9", "verdict", f"> | ASVS | Note | Result |\n>\n> |---|---|---|\n> {_ROW}"),
     ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}\n> {_ROW}"),
+    # Step 9 is removed: a blank line, or a quote-marker-only line in a quoted table, between data
+    # rows ends nothing, so the header still marks the rows below it, as main reads it. The first
+    # body is the one step 9 quieted; its false positive stays open on BACKLOG #3364.
+    *(
+        ("9", "verdict", f"{_HEAD}| a | b | c |\n{blank}\n{_ROW}")
+        for blank in ("", "  ", "\n", "\r")
+    ),
+    ("9", "verdict", f"{_HEAD}| a | b | c |\r\n\r\n{_ROW}"),
+    *(
+        (
+            "9",
+            "verdict",
+            f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n{marker}\n> {_ROW}",
+        )
+        for marker in (">", "  >  ", "> >", ">\n>")
+    ),
     # Review round-b3037cd314's losses, each flagged by main: a quote-marker-only line ends a table
     # only where every row since the last non-row unit is quoted. An unquoted header above a blank
     # line, an unquoted header under a quoted pipe line, an unquoted delimiter or data row, and a
@@ -1441,8 +1457,7 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
         - set(_PR_2893_FALSE_POSITIVE_BODIES)
     ),
     # A PR 2893 row as a table's last row, under a header (a Requirement or Cell header, ASVS in
-    # another column, or ASVS over the row's own column), or after a blank line that ends an ASVS
-    # table (step 9), so the row reads unmarked, as the bare body does.
+    # another column, or ASVS over the row's own column), or after a blank line under an ASVS table.
     *(
         f"{header}\n|---|---|---|\n| 2.5.1 | parser | never fails |"
         for header in (
@@ -1455,15 +1470,12 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     f"{_HEAD}| a | b | c |\n\n| 2.5.1 | parser | never fails |",
 ]
 _PR_ROW_CLAUSE_MUST_FIRE = list(dict.fromkeys(_PR_ROW_CLAUSE_MUST_FIRE))
-#: Step 9's deliberate drop: a blank line ends an ASVS-headed table, so a headerless pipe block after
-#: it is unmarked.
-_STEP9_QUIET_BODY = f"{_HEAD}| a | b | c |\n\n{_ROW}"
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
     ("5", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n| - | - | - |\n{_ROW}"),
     # Step 6: the same rules after a table whose header does not name the column ASVS.
     ("6", f"| Version | Note | Result |\n|---|---|---|\n{_ROW}\n---"),
-    ("9", _STEP9_QUIET_BODY),
+    # A second table after a blank line takes its own header, as main reads it.
     ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
     # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
     ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
@@ -1531,15 +1543,8 @@ _FROZEN_MAIN_PATH = (
     Path(__file__).parent / "fixtures" / "scan_forbidden" / "scan_forbidden_main.py.txt"
 )
 _FROZEN_MAIN_BLOB = "ac2aa30e7a42c4ecaa388dab9a03326b51af74cc"
-#: The separators str.splitlines ends a line at and GFM does not. GFM's own ("\r" twice is a blank
-#: line) are step 9's to end a table at.
+#: The separators str.splitlines ends a line at and GFM does not.
 _SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
-#: The bodies main flags that the repairs quiet ON PURPOSE, keyed by the body itself, each with its
-#: ruled step. Every other hit main reports in the constructed set and the tracked corpus, head must
-#: report too, at the same line.
-_SUPERSET_EXCEPTIONS = {
-    _STEP9_QUIET_BODY: "9",
-}
 
 
 def _frozen_main_bytes() -> bytes:
@@ -1650,29 +1655,14 @@ def test_the_frozen_main_scanner_is_the_vendored_blob() -> None:
     assert blob == _FROZEN_MAIN_BLOB
 
 
-def test_every_superset_exception_names_a_body_main_flags_and_head_drops(
-    sf, sf_frozen_main
-) -> None:
-    """An exception that names no body, a body main does not flag, or a body where head now reports
-    every hit main reports, excuses nothing and is stale."""
-    listed = set(_SUPERSET_BODIES.values())
-    for body in _SUPERSET_EXCEPTIONS:
-        assert body in listed, body
-        main_hits = set(sf_frozen_main.scan_pr_body(body))
-        assert main_hits, body
-        assert main_hits - set(sf.scan_pr_body(body)), body
-
-
 @pytest.mark.parametrize("name", sorted(_SUPERSET_BODIES))
 def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
     sf, sf_frozen_main, name: str
 ) -> None:
     """BACKLOG #3364: on each constructed body, head reports every hit main reports, at main's line
-    number, except the deliberate step 9 drop named in _SUPERSET_EXCEPTIONS. A finite
-    set: it pins these bodies, and a loss on a body outside it is not caught here."""
+    number, with no exception. A finite set: it pins these bodies, and a loss on a body outside it
+    is not caught here."""
     body = _SUPERSET_BODIES[name]
-    if body in _SUPERSET_EXCEPTIONS:
-        pytest.skip(f"step {_SUPERSET_EXCEPTIONS[body]} drops this body's hits on purpose")
     lost = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
     assert not lost, (name, sorted(lost))
 
@@ -2614,15 +2604,11 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
 
 def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
     """The baseline is one pass of the union, but it runs the head's table model, so this is not true
-    by construction: step 9 drops marks main kept across a blank line between rows. The test pins it
-    against two oracles: the pre-BACKLOG #5582 reading rebuilt here, and the vendored origin/main
-    scanner with #5582's readings. A body in ``_SUPERSET_EXCEPTIONS`` is quieted on purpose and is left
-    out; its own test pins that main flags it."""
+    by construction. The test pins it, with no exception, against two oracles: the pre-BACKLOG #5582
+    reading rebuilt here, and the vendored origin/main scanner with #5582's readings."""
     harvested = set(_harvested_pr_bodies())
     fired_harvested = fired_generated = 0
     for body in [*harvested, *_generated_pr_bodies()]:
-        if body in _SUPERSET_EXCEPTIONS:
-            continue
         main_hits = set(_main_scan_pr_body(sf, body)) | set(sf_frozen_main.scan_pr_body(body))
         if main_hits:
             if body in harvested:
