@@ -53,6 +53,7 @@ __all__ = [
     "LIVE_INLINE_ROW",
     "QUEUE_TAG_COLUMNS",
     "QUEUE_TAG_SELECT",
+    "PROGRAMMING_ERRORS",
     "QUEUE_TAG_FAILED_ACTION",
     "TRANSIENT_OPEN_BACKOFF_SECONDS",
     "QueueTagError",
@@ -103,10 +104,16 @@ QUEUE_TAG_COLUMNS: Final = (
 #: :data:`QUEUE_TAG_COLUMNS` as a SELECT list.
 QUEUE_TAG_SELECT: Final = ", ".join(QUEUE_TAG_COLUMNS)
 
-#: How long a claim sets a row aside when opening it failed for a reason that is not the row
-#: (BACKLOG #5735): the row goes back to ``pending`` with ``next_attempt_at`` this far ahead, so a
-#: key-service outage is retried at this cadence rather than on every sweep.
+#: How long a per-lane claim sets a row aside when opening it failed for a reason that is not the
+#: row (BACKLOG #5735): the row goes back to ``pending`` with ``next_attempt_at`` this far ahead, so
+#: a key-service outage is retried at this cadence rather than on every sweep. The pooled claim
+#: (``claim_fifo_heads``) does not use it: it hands the fault to the dispatcher's ADR 0070 T17
+#: path, whose own backoff, ``infra_fault_policy`` and ``lane_stuck`` alert bound it.
 TRANSIENT_OPEN_BACKOFF_SECONDS: Final = 5.0
+
+#: The errors a claim never contains as a failed dead-letter write (BACKLOG #5735): each names a
+#: fault in the engine's own code, which must stay loud, never one in the store or the key service.
+PROGRAMMING_ERRORS: Final = (AssertionError, AttributeError, LookupError, NameError, TypeError)
 
 #: The audit action written when a queue row's payload does not open under its own tag.
 QUEUE_TAG_FAILED_ACTION: Final = "integrity.queue_tag_failed"
@@ -277,13 +284,17 @@ class _AuditSink(Protocol):
     ) -> None: ...
 
 
-async def report_queue_tag_failure(store: _AuditSink, cipher: object, row: Any) -> None:
+async def report_queue_tag_failure(
+    store: _AuditSink, cipher: object, row: Any, *, outcome: str = "was dead-lettered"
+) -> None:
     """Record that ``row`` failed its queue tag: a WARNING, a :data:`QUEUE_TAG_FAILED_ACTION` audit
     row and an ``integrity_drift`` alert through the cipher's tag-failure hook (BACKLOG #2593).
 
-    The caller has already dead-lettered the row, so the lane has moved on and the message is
-    ``ERROR``. Names the row by a short id prefix and its stage, never a row value. An audit or
-    alert failure is logged and swallowed: reporting must never undo the dead-letter."""
+    The caller has usually dead-lettered the row, so the lane has moved on and the message is
+    ``ERROR``. A caller whose dead-letter write failed reports the tag failure all the same, with
+    ``outcome`` saying so (BACKLOG #5735). Names the row by a short id prefix and its stage, never
+    a row value. An audit or alert failure is logged and swallowed: reporting must never undo the
+    dead-letter."""
     ref = str(row["id"])[:_ROW_REF_LEN]
     stage = row["stage"]
     try:
@@ -295,7 +306,7 @@ async def report_queue_tag_failure(store: _AuditSink, cipher: object, row: Any) 
         )
     except Exception:  # noqa: BLE001 -- the dead-letter stands whatever the audit write does
         _log.exception("the %s audit row could not be written", QUEUE_TAG_FAILED_ACTION)
-    alert_queue_tag_failure(cipher, row, outcome="was dead-lettered")
+    alert_queue_tag_failure(cipher, row, outcome=outcome)
 
 
 def alert_queue_tag_failure(cipher: object, row: Any, *, outcome: str) -> None:

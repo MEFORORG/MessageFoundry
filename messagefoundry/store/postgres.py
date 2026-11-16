@@ -181,6 +181,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     TRANSIENT_OPEN_BACKOFF_SECONDS,
@@ -5125,7 +5126,8 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                await self._dead_letter_unopenable(row, exc, tail=[row])
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed([row])
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5567,11 +5569,14 @@ class PostgresStore:
             items: list[OutboxItem] = []
             in_order = sorted(lane_rows, key=lambda r: r["seq"])
             for i, row in enumerate(in_order):
-                item, set_aside = await self._fifo_item_or_dead_letter(row, tail=in_order[i:])
-                if set_aside:
-                    break  # set aside with the rest of the lane: never deliver past it (#5735)
-                if item is not None:
-                    items.append(item)
+                try:
+                    items.append(self._outbox_item(row))
+                except CipherError as exc:
+                    fault = await self._dead_letter_unopenable(row, exc)
+                    if fault is not None:
+                        # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
+                        items.extend(self._unopened_item(r, fault) for r in in_order[i:])
+                        break
             if items:
                 by_lane[lane] = items
             else:
@@ -5678,43 +5683,52 @@ class PostgresStore:
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            return None, await self._dead_letter_unopenable(row, exc, tail=tail)
+            if await self._dead_letter_unopenable(row, exc) is None:
+                return None, False
+            await self._set_aside_claimed(tail)
+            return None, True
 
-    async def _dead_letter_unopenable(
-        self, row: Any, exc: CipherError, *, tail: Sequence[Any]
-    ) -> bool:
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> BaseException | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). Returns ``False`` then.
+        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
-        the row, so it is set aside instead (BACKLOG #5735), and so is a row whose dead-letter
-        write fails. ``tail`` (the row, then every later row of its lane in a FIFO claim) goes back
-        to ``pending`` with a durable backoff, and this returns ``True``, so a FIFO caller stops at
-        the row. The SQLite twin says more."""
+        the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
+        error of a dead-letter write that fails, after a tag failure is still reported. An error in
+        the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
+        the caller does with it."""
         if is_transient_open_failure(exc):
-            log.warning(
-                "setting aside %d claimed queue row(s) from %s: opening it failed with %s",
-                len(tail),
-                row["id"],
-                type(exc).__name__,
-            )
-            await self._set_aside_claimed(tail)
-            return True
+            return exc
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
-        except Exception:
-            log.exception("could not dead-letter queue row %s; setting it aside", row["id"])
-            await self._set_aside_claimed(tail)
-            return True
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                row["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return failed
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
-        return False
+        return None
 
     async def _set_aside_claimed(self, tail: Sequence[Any]) -> None:
-        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735). If
-        this write fails too, its error propagates out of the claim; the rows' lease and startup
-        recovery re-pend them."""
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735), for a
+        per-lane claim. If this write fails too, its error propagates out of the claim; the rows'
+        lease and startup recovery re-pend them."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: opening the first failed for a"
+            " reason that is not the row",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
         await self.reschedule_claimed(
             [r["id"] for r in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
         )
@@ -5757,6 +5771,23 @@ class PostgresStore:
             stage=row["stage"],
             handler_name=row["handler_name"],
             created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
+        )
+
+    @staticmethod
+    def _unopened_item(row: Any, fault: BaseException) -> OutboxItem:
+        """A claimed row whose body was not opened, carrying ``fault`` for the pooled dispatcher's
+        T17 path (BACKLOG #5735). ``payload`` is empty and must not be read."""
+        return OutboxItem(
+            id=row["id"],
+            message_id=row["message_id"],
+            channel_id=row["channel_id"],
+            destination_name=row["destination_name"],
+            payload="",
+            attempts=row["attempts"],
+            stage=row["stage"],
+            handler_name=row["handler_name"],
+            created_at=row["created_at"],
+            open_fault=fault,
         )
 
     def _open_inline_payload(self, row: Any) -> str:

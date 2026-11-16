@@ -178,6 +178,7 @@ from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import StorePrivilegeReport, sqlite_not_applicable
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     TRANSIENT_OPEN_BACKOFF_SECONDS,
@@ -1173,6 +1174,12 @@ class OutboxItem:
     # (ADR 0082 #134 — the batch delivery body needs the head's created_at for BHS-7 / the coalescing
     # deadline).
     created_at: float | None = None
+    # Set only by ``claim_fifo_heads``, on a row whose body could not be opened for a reason that
+    # is not the row (a key service that gave no verdict, a failed store read, a failed dead-letter
+    # write), and on every later row of its lane; ``payload`` is then empty and must not be read.
+    # The pooled dispatcher raises it before the item's body runs, so the row takes the ADR 0070
+    # T17 infra-fault path (BACKLOG #5735). Never set on an item any other claim returns.
+    open_fault: BaseException | None = field(default=None, compare=False, repr=False)
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row, payload: str) -> OutboxItem:
@@ -14556,7 +14563,8 @@ class MessageStore:
             except Exception as exc:
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                await self._dead_letter_unopenable(row, exc, tail=[row])
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed([row])
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -14602,46 +14610,56 @@ class MessageStore:
         return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     async def _dead_letter_unopenable(
-        self, row: aiosqlite.Row, exc: Exception, *, tail: Sequence[aiosqlite.Row]
-    ) -> bool:
+        self, row: aiosqlite.Row, exc: Exception
+    ) -> BaseException | None:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593). Returns ``False`` then.
+        (BACKLOG #2593). Returns ``None`` then.
 
-        A failure that says nothing about the row sets it aside instead (BACKLOG #5735): a key
-        service that gave no verdict (:func:`is_transient_open_failure`) or a failed read of the
-        store. So does a dead-letter write that fails, rather than leave the row ``inflight`` until
-        a restart. ``tail`` (the row, then every later row of its lane in a FIFO claim) goes back to
-        ``pending`` under :meth:`_set_aside_claimed`'s backoff, and this returns ``True``, so a FIFO
-        caller stops at the row and never delivers past it. Other lanes and rows of the claim go on
-        as before."""
+        A failure that says nothing about the row is returned instead, with nothing written
+        (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
+        a failed read of the store. So is the error of a dead-letter write that fails, after a tag
+        failure is still reported; an error in the engine's own code (:data:`PROGRAMMING_ERRORS`)
+        propagates. The caller keeps the row from being delivered past: ``claim_fifo_heads`` hands
+        it to the dispatcher's T17 path, and the other claims set it aside
+        (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
-            log.warning(
-                "setting aside %d claimed queue row(s) from %s: opening it failed with %s",
-                len(tail),
-                row["id"],
-                type(exc).__name__,
-            )
-            await self._set_aside_claimed(tail)
-            return True
+            return exc
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
-        except Exception:
-            log.exception("could not dead-letter queue row %s; setting it aside", row["id"])
-            await self._set_aside_claimed(tail)
-            return True
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                row["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return failed
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
-        return False
+        return None
 
     async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row]) -> None:
         """Re-pend claimed rows with a durable backoff (BACKLOG #5735): ``attempts`` loses the
         claim's increment, as for any fault that is not the message's, and ``next_attempt_at``
         moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead, so a sweep does not re-claim them at
-        once. If this write fails too, its error propagates out of the claim and the rows stay
-        ``inflight`` until ``reset_stale_inflight`` at the next start."""
+        once. The per-lane claims call it; the per-lane workers have no ``infra_fault_policy``
+        bound, so such a row is retried for as long as the fault lasts. If this write fails too,
+        its error propagates out of the claim and the rows stay ``inflight`` until
+        ``reset_stale_inflight`` at the next start."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: opening the first failed for a"
+            " reason that is not the row",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
         await self.reschedule_claimed(
             [r["id"] for r in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
         )
@@ -14766,7 +14784,8 @@ class MessageStore:
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
             # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            await self._dead_letter_unopenable(claimed, exc, tail=[claimed])
+            if await self._dead_letter_unopenable(claimed, exc) is not None:
+                await self._set_aside_claimed([claimed])
             return None
 
     async def claim_next_fifo_batch(
@@ -14845,7 +14864,8 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                if await self._dead_letter_unopenable(row, exc, tail=ordered[i:]):
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed(ordered[i:])
                     break  # set aside with the rest of the lane: never deliver past it (#5735)
         return items
 
@@ -14967,8 +14987,14 @@ class MessageStore:
                 try:
                     items.append(await self._outbox_item_from_row(row))
                 except Exception as exc:
-                    if await self._dead_letter_unopenable(row, exc, tail=lane_rows[i:]):
-                        break  # set aside with the rest of the lane: never deliver past it (#5735)
+                    fault = await self._dead_letter_unopenable(row, exc)
+                    if fault is not None:
+                        # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
+                        items.extend(
+                            replace(OutboxItem.from_row(r, ""), open_fault=fault)
+                            for r in lane_rows[i:]
+                        )
+                        break
             if items:
                 by_lane[lane] = items
             else:

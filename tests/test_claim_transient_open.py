@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A claim sets a row aside when opening it fails for a reason that is not the row (BACKLOG #5735).
+"""A claim does not dead-letter a row it could not open for a reason that is not the row (BACKLOG
+#5735).
 
 A key service that gave no verdict (a Vault Transit outage) or a failed read of the store says
-nothing about the claimed row, so the claim must not dead-letter it. It puts the row back to
-``pending`` with a durable backoff, and in a FIFO claim every later row of its lane with it, so the
-lane never delivers past it. A dead-letter write that itself fails sets the row aside too, rather
-than stranding it ``inflight``. A real tag failure is still dead-lettered and reported (the
-control). SQLite only; the server backends make the same change.
+nothing about the claimed row. A per-lane claim puts the row back to ``pending`` with a durable
+backoff, and in a FIFO claim every later row of its lane with it, so the lane never delivers past
+it. The pooled claim, ``claim_fifo_heads``, writes nothing: it returns the row and its lane tail
+carrying the fault, and the dispatcher's ADR 0070 T17 path re-pends them while holding the lane and
+bounds a lasting fault with ``infra_fault_policy`` and its alert. A dead-letter write that fails is
+treated the same way, and a tag failure behind it is still audited and alerted. A real tag failure
+is still dead-lettered and reported (the control). SQLite; the server backends make the same change.
 """
 
 from __future__ import annotations
@@ -72,9 +75,12 @@ async def _claim_fifo_heads(store: MessageStore) -> list[Any]:
     return [item for items in heads.by_lane.values() for item in items]
 
 
-_ALL = [_claim_ready, _claim_next_fifo, _claim_next_fifo_batch, _claim_fifo_heads]
-_IDS = ["claim_ready", "claim_next_fifo", "claim_next_fifo_batch", "claim_fifo_heads"]
-_CLAIMS = pytest.mark.parametrize("claim", _ALL, ids=_IDS)
+_PER_LANE = [_claim_ready, _claim_next_fifo, _claim_next_fifo_batch]
+_IDS = ["claim_ready", "claim_next_fifo", "claim_next_fifo_batch"]
+_CLAIMS = pytest.mark.parametrize("claim", _PER_LANE, ids=_IDS)
+_ALL_CLAIMS = pytest.mark.parametrize(
+    "claim", [*_PER_LANE, _claim_fifo_heads], ids=[*_IDS, "claim_fifo_heads"]
+)
 
 
 async def _open(tmp_path: pathlib.Path) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
@@ -176,24 +182,45 @@ async def test_a_store_read_error_sets_the_rows_aside(
 
 
 @_CLAIMS
-async def test_a_failed_dead_letter_write_does_not_strand_the_row(
+async def test_a_failed_dead_letter_write_still_reports_the_tag_failure(
     tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A tag failure whose dead-letter write fails is audited and alerted all the same, and the row
+    is set aside rather than left ``inflight``."""
     store, _cipher, db = await _open(tmp_path)
     try:
         _side(db, "UPDATE queue SET handler_name='MOVED' WHERE destination_name=?", (_DEST,))
 
         async def failing(*_a: Any, **_kw: Any) -> None:
-            raise RuntimeError("dead-letter write failed")
+            raise sqlite3.OperationalError("disk I/O error")
 
         monkeypatch.setattr(store, "dead_letter_now", failing)
         assert await claim(store) == []
         assert _rows(db) == [("pending", 0), ("pending", 0)]  # set aside, not left inflight
+        assert _audited(db) >= 1  # the integrity report did not wait on the dead-letter
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize("claim", _ALL[1:], ids=_IDS[1:])
+@_ALL_CLAIMS
+async def test_a_programming_error_in_the_dead_letter_write_stays_loud(
+    tmp_path: pathlib.Path, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _cipher, db = await _open(tmp_path)
+    try:
+        _tamper_head(db)
+
+        async def broken(*_a: Any, **_kw: Any) -> None:
+            raise TypeError("dead_letter_now() got an unexpected keyword argument")
+
+        monkeypatch.setattr(store, "dead_letter_now", broken)
+        with pytest.raises(TypeError):
+            await claim(store)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("claim", _PER_LANE[1:], ids=_IDS[1:])
 async def test_a_fifo_claim_stops_at_the_row_it_sets_aside(
     tmp_path: pathlib.Path, claim: Claim
 ) -> None:
@@ -204,7 +231,7 @@ async def test_a_fifo_claim_stops_at_the_row_it_sets_aside(
         await store.enqueue_message(channel_id="IB", raw="MSH|r", deliveries=[(_DEST, "B3")])
         _tamper_head(db)
         cipher.healthy_opens = 1  # row one's open runs (and fails its tag), then the outage
-        await claim(store)  # a single claim stops at the dead head; the batch claims go on
+        await claim(store)  # a single claim stops at the dead head; the batch claim goes on
         if claim is _claim_next_fifo:
             assert await claim(store) == []  # the next claim meets the outage on row two
         assert _rows(db) == [("dead", 1), ("pending", 0), ("pending", 0)]
@@ -213,7 +240,7 @@ async def test_a_fifo_claim_stops_at_the_row_it_sets_aside(
         await store.close()
 
 
-@_CLAIMS
+@_ALL_CLAIMS
 async def test_a_real_tag_failure_is_still_dead_lettered_and_reported(
     tmp_path: pathlib.Path, claim: Claim
 ) -> None:
@@ -228,3 +255,173 @@ async def test_a_real_tag_failure_is_still_dead_lettered_and_reported(
         assert _audited(db) == 1
     finally:
         await store.close()
+
+
+# --- the pooled claim hands the fault to the dispatcher's T17 path --------------------------------
+
+_LANE = "IB_T17"
+
+
+async def _open_ingress(
+    tmp_path: pathlib.Path, n: int
+) -> tuple[MessageStore, _OutageCipher, pathlib.Path]:
+    inner = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(inner, AesGcmCipher)
+    cipher = _OutageCipher(inner)
+    db = tmp_path / "heads.db"
+    store = await MessageStore.open(db, cipher=cipher)  # type: ignore[arg-type]
+    for t in range(n):
+        await store.enqueue_ingress(channel_id=_LANE, raw=f"MSH|{t}", now=100.0 + t)
+    return store, cipher, db
+
+
+def _ingress(db: pathlib.Path) -> list[tuple[str, int]]:
+    return [
+        (str(r[0]), int(r[1]))
+        for r in _side(
+            db,
+            "SELECT status, attempts FROM queue WHERE stage='ingress' AND channel_id=?"
+            " ORDER BY rowid",
+            (_LANE,),
+        )
+    ]
+
+
+async def test_the_pooled_claim_returns_the_fault_and_writes_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Row one opens; the outage hits row two. The claim returns row one's body, then row two and
+    row three carrying the fault with no body, and leaves all three ``inflight`` for the
+    dispatcher, which holds the lane until it has re-pended them."""
+    store, cipher, db = await _open_ingress(tmp_path, 3)
+    try:
+        cipher.healthy_opens = 1
+        heads = await store.claim_fifo_heads("ingress", [_LANE], per_lane_limit=10)
+        items = heads.by_lane[_LANE]
+        assert [i.payload for i in items] == ["MSH|0", "", ""]
+        assert items[0].open_fault is None
+        assert all(isinstance(i.open_fault, CipherUnavailableError) for i in items[1:])
+        assert _ingress(db) == [("inflight", 1)] * 3  # nothing set aside or dead-lettered here
+        assert _audited(db) == 0
+    finally:
+        await store.close()
+
+
+async def test_a_lasting_outage_stops_the_lane_through_t17(tmp_path: pathlib.Path) -> None:
+    """ADR 0070 end to end: a lane whose head the key service never answers for reaches STOPPED
+    after ``infra_fault_stop_after`` faults, with one ``connection_stopped`` alert. The body never
+    runs on an unopened row, nothing is dead-lettered, and the rows end ``pending`` with their
+    attempts intact."""
+    from tests.test_stage_dispatcher import (  # noqa: PLC0415
+        ManualClock,
+        RecordingAlertSink,
+        RecordingStub,
+        _drive_infra_faults_until_stop,
+        _make,
+    )
+
+    store, cipher, db = await _open_ingress(tmp_path, 2)
+    store._test_backend = "sqlite"  # type: ignore[attr-defined]
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    alert = RecordingAlertSink()
+    d = _make(store, stub, set(), clock=mc, alert_sink=alert, infra_fault_stop_after=3)
+    cipher.healthy_opens = 0
+    await d.start()
+    try:
+        d.mark_ready(_LANE)
+        await _drive_infra_faults_until_stop(d, mc, _LANE, budget=8)
+        assert d.infra_error_streak(_LANE) == 3
+        assert len(alert.stopped) == 1 and alert.stopped[0][0] == _LANE
+        assert stub.records == []  # the body never saw an unopened row
+        assert _ingress(db) == [("pending", 0), ("pending", 0)]
+        assert _audited(db) == 0
+    finally:
+        await d.stop()
+        await store.close()
+
+
+# --- the server backends' classifier, offline ------------------------------------------------------
+
+
+class _FakeServer:
+    """Stands in for the server store's dead-letter and audit writes on an instance built with no
+    pool, so the shared classifier runs with no database."""
+
+    def __init__(self, fail_with: BaseException | None) -> None:
+        self.fail_with = fail_with
+        self.dead_lettered: list[str] = []
+        self.audited: list[str] = []
+
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.dead_lettered.append(outbox_id)
+
+    async def record_audit(self, action: str, **_kw: Any) -> None:
+        self.audited.append(action)
+
+
+def _server_store(backend: str, fake: _FakeServer) -> Any:
+    if backend == "sqlserver":
+        from messagefoundry.store.sqlserver import SqlServerStore  # noqa: PLC0415
+
+        store: Any = SqlServerStore.__new__(SqlServerStore)
+    else:
+        from messagefoundry.store.postgres import PostgresStore  # noqa: PLC0415
+
+        store = PostgresStore.__new__(PostgresStore)
+    store._cipher = make_cipher(generate_key(), write_v2=True)
+    store.dead_letter_now = fake.dead_letter_now
+    store.record_audit = fake.record_audit
+    return store
+
+
+async def _classify(backend: str, store: Any, exc: Any) -> BaseException | None:
+    row = {"id": "row-1", "message_id": "m", "stage": "outbound", "channel_id": "IB"}
+    if backend == "sqlserver":
+        result: BaseException | None = await store._dead_letter_unopenable(row, "outbound", exc)
+        return result
+    result = await store._dead_letter_unopenable(row, exc)
+    return result
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
+    outage = CipherUnavailableError("down")
+    fake = _FakeServer(None)
+    assert await _classify(backend, _server_store(backend, fake), outage) is outage
+    assert fake.dead_lettered == [] and fake.audited == []  # an outage writes nothing
+
+    fake = _FakeServer(None)  # control: a tag failure is dead-lettered and reported
+    assert await _classify(backend, _server_store(backend, fake), QueueTagError("t")) is None
+    assert fake.dead_lettered == ["row-1"] and fake.audited == [QUEUE_TAG_FAILED_ACTION]
+
+    store_fault = OSError("connection reset")
+    fake = _FakeServer(store_fault)  # the dead-letter write fails: still reported, then returned
+    assert await _classify(backend, _server_store(backend, fake), QueueTagError("t")) is store_fault
+    assert fake.audited == [QUEUE_TAG_FAILED_ACTION]
+
+    fake = _FakeServer(TypeError("bug"))  # an engine bug stays loud
+    with pytest.raises(TypeError):
+        await _classify(backend, _server_store(backend, fake), QueueTagError("t"))
+
+
+def test_the_postgres_unopened_item_carries_the_fault() -> None:
+    from messagefoundry.store.postgres import PostgresStore  # noqa: PLC0415
+
+    fault = CipherUnavailableError("down")
+    row = {
+        "id": "r",
+        "message_id": "m",
+        "channel_id": "IB",
+        "destination_name": None,
+        "attempts": 1,
+        "stage": "ingress",
+        "handler_name": None,
+        "created_at": 1.0,
+    }
+    item = PostgresStore._unopened_item(row, fault)
+    assert item.open_fault is fault and item.payload == "" and item.id == "r"

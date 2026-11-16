@@ -1830,6 +1830,11 @@ class StageDispatcher:
         i = 0
         try:
             for i, item in enumerate(items):
+                if item.open_fault is not None:
+                    # The claim could not open this row for a reason that is not the row (a key
+                    # service with no verdict, a failed store read or dead-letter write), so it is
+                    # an infra fault at this item, never content poison (BACKLOG #5735).
+                    raise item.open_fault
                 result = await self._process_item(lane, item)
                 if result.kind is LaneResultKind.RESOLVED:
                     continue

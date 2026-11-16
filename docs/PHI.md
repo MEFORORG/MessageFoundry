@@ -119,9 +119,12 @@ refusal back into the cipher's own error, unaudited and unalerted. A queue paylo
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
 `vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure. An
 outage does not (BACKLOG #5765): a failure `gave_no_verdict` names, at least an unreachable Vault,
-a 5xx and a refused token, is no tag failure, and the claim sets the row aside for five seconds
-rather than dead-letter it (BACKLOG #5735). Such a row is retried with no cap and no alert of its
-own while the failure lasts. Transit
+a 5xx and a refused token, is no tag failure, and the claim does not dead-letter the row (BACKLOG
+#5735). Under the default `claim_mode = "pooled"` the row takes the ADR 0070 infra-fault path, so
+a fault that lasts stops the lane with a `connection_stopped` alert under `infra_fault_policy =
+"stop"`, or raises `lane_stuck` under `retry_forever`. Under `claim_mode = "per_lane"` the claim
+sets the row aside for five seconds, and it is retried with no cap and no alert of its own while
+the failure lasts. Transit
 gives the same AEAD refusal when the data key it is pointed at is not the one that sealed the cell,
 so a recreated key, or another Vault's key of the same name, would read as a moved cell for every
 such cell. An unmarked value refused in a message or saved-search cell is audited, and its alert is
