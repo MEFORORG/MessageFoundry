@@ -20,6 +20,7 @@ import { settingIsSet } from "./connectionWizardModel";
 import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
+import { containedPathSetting, type ContainedPathSetting } from "./workspaceContainment";
 
 // Parsing lives in cliJson.ts (no vscode, so the unit suite runs it). Every importer of CliResult
 // keeps importing it from here.
@@ -84,20 +85,48 @@ export function isExecGated(): boolean {
   return !vscode.workspace.isTrusted;
 }
 
-export function configDir(): string {
-  return config().get<string>("configDir", "samples/config");
+/** The path settings whose workspace value was dropped and already named to the user, so each is
+ *  named once a session rather than on every CLI call. */
+const droppedPathSettings = new Set<string>();
+
+/**
+ * A workspace-relative path setting, contained to the workspace folder by
+ * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder is dropped
+ * for the user's value or the default, and the user is told once.
+ */
+function pathSetting(
+  key: "configDir" | "serviceConfig" | "messageSetsDir",
+  fallback: string,
+): ContainedPathSetting {
+  const seen = config().inspect(key);
+  const contained = containedPathSetting(seen, workspaceDir(), fallback);
+  if (contained.dropped && !droppedPathSettings.has(key)) {
+    droppedPathSettings.add(key);
+    // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
+    void vscode.window.showWarningMessage(
+      `messagefoundry.${key}, set in workspace settings, names no path inside the workspace folder, ` +
+        "so the user or default value is used. To use a path elsewhere, set it in user settings.",
+    );
+  }
+  return contained;
 }
 
-/** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative;
- *  the `alert` CLI creates it on first `add` if absent. */
+export function configDir(): string {
+  return pathSetting("configDir", "samples/config").value;
+}
+
+/** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative,
+ *  and a workspace value is contained to the folder (BACKLOG #5404); the `alert` CLI creates it on
+ *  first `add` if absent. */
 export function serviceConfig(): string {
-  return config().get<string>("serviceConfig", "messagefoundry.toml");
+  return pathSetting("serviceConfig", "messagefoundry.toml").value;
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
- *  `settingIsSet` and `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). */
+ *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). A workspace value the
+ *  containment dropped does not count, so this agrees with {@link serviceConfig} (BACKLOG #5404). */
 export function serviceConfigIsSet(): boolean {
-  return settingIsSet(config().inspect("serviceConfig"));
+  return pathSetting("serviceConfig", "messagefoundry.toml").source !== "default";
 }
 
 /**
@@ -181,7 +210,7 @@ export function shardsOf(env: EnvironmentTarget): Shard[] {
 }
 
 export function messageSetsDir(): string {
-  return config().get<string>("messageSetsDir", "samples/messages");
+  return pathSetting("messageSetsDir", "samples/messages").value;
 }
 
 /**

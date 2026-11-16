@@ -44,13 +44,15 @@ const vscodeStub = {
     get isTrusted(): boolean {
       return stubTrusted;
     },
-    // The setting as a workspace's own settings.json sets it: a workspace value, so it counts as set.
+    // The setting as the user's own settings set it, so it counts as set. A workspace value naming
+    // a path outside the folder never reaches Restart: cli.ts's containment of the path settings
+    // drops it for the default (BACKLOG #5404), so it could not drive the stat this suite counts.
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown =>
         key === "serviceConfig" && stubSetting !== undefined ? stubSetting : fallback,
       inspect: (key: string) =>
         key === "serviceConfig"
-          ? { defaultValue: "messagefoundry.toml", workspaceValue: stubSetting }
+          ? { defaultValue: "messagefoundry.toml", globalValue: stubSetting }
           : undefined,
     }),
   },
@@ -59,6 +61,7 @@ const vscodeStub = {
       notices.push(message);
       return Promise.resolve(undefined);
     },
+    showWarningMessage: (): Promise<undefined> => Promise.resolve(undefined),
     onDidCloseTerminal: (listener: (t: unknown) => void) => {
       closeListeners.add(listener);
       return { dispose: (): void => void closeListeners.delete(listener) };

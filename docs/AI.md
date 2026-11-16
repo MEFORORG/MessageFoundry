@@ -193,7 +193,11 @@ success. On any error it falls back to that engine's cached authoritative policy
 local `messagefoundry ai-policy` CLI, but only for the default engine target, and only while the IDE
 has never held any engine's answer. The CLI is always given `--service-config`, naming
 `messagefoundry.serviceConfig` or, when that is unset or blank, `messagefoundry.toml`, so a missing
-or unreadable settings file is refused rather than read as the built-in default. If none of those can confirm a policy, it uses a fail-closed
+or unreadable settings file is refused rather than read as the built-in default. With no workspace
+folder open, the CLI is not asked unless that path is absolute, since a relative one would be read
+from the editor's own working directory. A workspace value of `messagefoundry.serviceConfig` that
+names a path outside the workspace folder is dropped for the user's value or the default. If none
+of those can confirm a policy, it uses a fail-closed
 built-in default (`mode: unverified`). That default **disables** assistance rather than re-enabling
 BYO, so a central *off* cannot be bypassed by taking the engine offline (SEC-022).
 

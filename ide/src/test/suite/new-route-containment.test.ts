@@ -109,6 +109,10 @@ const vscodeStub = {
     },
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown => (key === "configDir" ? stubConfigDir : fallback),
+      // User-set, so cli.ts's own containment (BACKLOG #5404) passes it through and this suite
+      // still drives newRoute's check on it.
+      inspect: (key: string): { globalValue?: unknown } | undefined =>
+        key === "configDir" ? { globalValue: stubConfigDir } : undefined,
     }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => fs.promises.stat(uri.fsPath),

@@ -9,6 +9,7 @@
 // the gating in engineStatusModel's EngineControlContext (WHETHER to offer Start), and the invocation
 // built here (WHAT Start runs): the exact command ADR 0110 blessed for the clipboard — `serve --config
 // <dir>` with NO --db/--env overrides, so the service TOML stays the sole authority on store + environment.
+import * as path from "node:path";
 
 /** The interpreter import used to preflight before launching `serve`. It is `serve`'s own early import
  *  chain (config.models imports pydantic), so it fails for BOTH "wrong interpreter, no messagefoundry"
@@ -70,10 +71,33 @@ function serviceConfigFlag(serviceConfig: string | undefined): string[] {
  * that file explicitly. Bound by {@link serviceConfigFlag}, as serve's own flag is.
  */
 export function aiPolicyCliArgs(setting: unknown, isSet: boolean): string[] {
-  return [
-    "ai-policy",
-    ...serviceConfigFlag(connectionServiceConfig(setting, isSet) ?? SERVE_DEFAULT_SERVICE_CONFIG),
-  ];
+  return ["ai-policy", ...serviceConfigFlag(aiPolicyServiceFile(setting, isSet))];
+}
+
+/** The service-settings file ai-policy is told to read: one rule for the argv and the plan's gate. */
+function aiPolicyServiceFile(setting: unknown, isSet: boolean): string {
+  return connectionServiceConfig(setting, isSet) ?? SERVE_DEFAULT_SERVICE_CONFIG;
+}
+
+/**
+ * The {@link aiPolicyCliArgs} argv and the directory it runs in, or undefined when it must not run
+ * (BACKLOG #5405). With no workspace folder the CLI would run in the extension host's own working
+ * directory, and a relative service-settings path would be read from there, where a stray file could
+ * enable assistance. So with no folder only an absolute path runs, the way engine trust's
+ * `cert inventory` asks the CLI only with a folder. Refused, the caller has no CLI answer and
+ * pickOfflinePolicy fails closed to the unverified policy.
+ */
+export function aiPolicyCliPlan(
+  setting: unknown,
+  isSet: boolean,
+  workspace: string | undefined,
+): { readonly args: string[]; readonly cwd: string | undefined } | undefined {
+  const file = aiPolicyServiceFile(setting, isSet);
+  // `!workspace`, not `=== undefined`: an empty string is no folder either.
+  if (!workspace && !path.isAbsolute(file)) {
+    return undefined;
+  }
+  return { args: ["ai-policy", ...serviceConfigFlag(file)], cwd: workspace || undefined };
 }
 
 /**

@@ -59,6 +59,9 @@ const vscodeStub = {
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown =>
         key in stubConfig ? (stubConfig as unknown as Record<string, unknown>)[key] : fallback,
+      // User-set, so cli.ts's containment of the path settings (BACKLOG #5404) returns it as written.
+      inspect: (key: string): { globalValue?: unknown } | undefined =>
+        key in stubConfig ? { globalValue: (stubConfig as unknown as Record<string, unknown>)[key] } : undefined,
     }),
     onDidChangeConfiguration: (listener: ConfigListener) => {
       configListener = listener;

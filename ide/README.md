@@ -197,7 +197,10 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
   that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
   and does not take these options.
-- `messagefoundry.configDir` (default `samples/config`) — config modules directory.
+- `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
+  `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
+  settings that names a path outside the folder is dropped for your user value or the default, with
+  a warning, in a trusted window too; to use a path elsewhere, set it in user settings.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder

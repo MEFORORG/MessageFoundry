@@ -25,7 +25,7 @@ import {
   pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineTargetIsSet, engineUrl, environments, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
-import { aiPolicyCliArgs } from "./engineControlModel";
+import { aiPolicyCliPlan } from "./engineControlModel";
 import { getJson } from "./engineClient";
 import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
@@ -120,8 +120,13 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
   url: aiPolicyEngineUrl,
   readToken: peekToken,
   getPolicy: (url, route, token) => getJson<AiPolicyWire>(url, route, token),
-  getCliPolicy: () =>
-    runJson<AiPolicyWire>(aiPolicyCliArgs(serviceConfig(), serviceConfigIsSet()), workspaceDir()),
+  getCliPolicy: () => {
+    const plan = aiPolicyCliPlan(serviceConfig(), serviceConfigIsSet(), workspaceDir());
+    // A rejection is "no CLI answer", which resolveAiPolicy turns into the unverified policy.
+    return plan === undefined
+      ? Promise.reject(new Error("no workspace folder for a relative messagefoundry.serviceConfig"))
+      : runJson<AiPolicyWire>(plan.args, plan.cwd);
+  },
   targetConfigured: engineTargetIsSet,
 };
 

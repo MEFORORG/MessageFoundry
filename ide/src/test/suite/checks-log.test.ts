@@ -88,7 +88,10 @@ const vscodeStub = {
       return stubWorkspace === undefined ? undefined : [{ uri: { fsPath: stubWorkspace } }];
     },
     isTrusted: true,
-    getConfiguration: () => ({ get: (_key: string, fallback: unknown): unknown => fallback }),
+    getConfiguration: () => ({
+      get: (_key: string, fallback: unknown): unknown => fallback,
+      inspect: (): undefined => undefined,
+    }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => fs.promises.stat(uri.fsPath),
       readFile: (uri: { fsPath: string }): Promise<Buffer> => fs.promises.readFile(uri.fsPath),
