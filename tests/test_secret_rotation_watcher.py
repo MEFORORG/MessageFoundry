@@ -23,9 +23,13 @@ from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import SecretRotationSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
+    DatabaseLookupSpec,
     EnvRef,
+    FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
+    ReferenceSourceSpec,
+    ReferenceSpec,
     Registry,
     Soap,
     connector_secret_env_values,
@@ -358,6 +362,79 @@ def test_connector_secret_env_values_includes_a_soap_body_secret() -> None:
     assert connector_secret_env_values(reg, {"iis_body_pw": "SYNTH-VAL"}) == {
         "iis_body_pw": "SYNTH-VAL"
     }
+
+
+def test_connector_secret_env_values_reads_lookups_and_references() -> None:
+    # BACKLOG #5513: a DatabaseLookup, a FhirLookup and a database reference source each open a hop
+    # with their own credential, so a rotation of it must be watched like a connection's.
+    reg = Registry()
+    reg.lookups["lk_db"] = DatabaseLookupSpec(
+        name="lk_db", settings={"password": EnvRef(key="lk_db_pw"), "server": "db.example.invalid"}
+    )
+    reg.fhir_lookups["lk_fhir"] = FhirLookupSpec(
+        name="lk_fhir", settings={"bearer_token": EnvRef(key="lk_fhir_tok")}
+    )
+    reg.references["ref_db"] = ReferenceSpec(
+        name="ref_db",
+        source=ReferenceSourceSpec("database", {"password": EnvRef(key="ref_db_pw")}),
+    )
+    values = {"lk_db_pw": "PW-LK", "lk_fhir_tok": "TOK-LK", "ref_db_pw": "PW-REF"}
+    assert connector_secret_env_values(reg, values) == values
+
+
+def test_connector_secret_env_values_skips_an_undeployed_connection() -> None:
+    # BACKLOG #5513: a deployed=False connection is never built and its values are never resolved
+    # (ADR 0111 AC-1), so the engine holds no credential of its to fingerprint.
+    reg = Registry()
+    for name, deployed in (("OB_LIVE", True), ("OB_DARK", False)):
+        reg.outbound[name] = OutboundConnection(
+            name=name,
+            spec=_spec(ConnectorType.REST, {"api_key": EnvRef(key=f"{name}_key")}),
+            deployed=deployed,
+        )
+    reg.inbound["IB_DARK"] = InboundConnection(
+        name="IB_DARK",
+        spec=_spec(ConnectorType.MLLP, {"api_key": EnvRef(key="IB_DARK_key")}),
+        router="r",
+        deployed=False,
+    )
+    values = {"OB_LIVE_key": "K1", "OB_DARK_key": "K2", "IB_DARK_key": "K3"}
+    assert connector_secret_env_values(reg, values) == {"OB_LIVE_key": "K1"}
+
+
+def _rest_with(settings: dict[str, object]) -> Registry:
+    reg = Registry()
+    reg.outbound["OB"] = OutboundConnection(name="OB", spec=_spec(ConnectorType.REST, settings))
+    return reg
+
+
+def test_connector_secret_env_values_reads_a_whole_headers_table() -> None:
+    # BACKLOG #5513: headers=env("all_headers") resolves to the table the connector sends. Its
+    # credential headers are fingerprinted; a table of harmless headers holds nothing to watch.
+    reg = _rest_with({"headers": EnvRef(key="hdrs")})
+    secret = {"X-Api-Key": "HDR-1", "Accept": "application/json"}
+    got = connector_secret_env_values(reg, {"hdrs": secret})
+    assert set(got) == {"hdrs"}
+    # A change to a harmless header is not a rotation; a change to the credential is.
+    assert connector_secret_env_values(reg, {"hdrs": {**secret, "Accept": "text/plain"}}) == got
+    assert connector_secret_env_values(reg, {"hdrs": {**secret, "X-Api-Key": "HDR-2"}}) != got
+    assert connector_secret_env_values(reg, {"hdrs": {"Accept": "application/json"}}) == {}
+
+
+def test_connector_secret_env_values_reads_a_credential_url() -> None:
+    # BACKLOG #5513: an env() URL that carries a credential query parameter or userinfo holds a
+    # secret; one that carries neither holds nothing to watch.
+    reg = _rest_with({"url": EnvRef(key="u")})
+    first = connector_secret_env_values(reg, {"u": "https://a.example.invalid/x?api_key=K1&q=1"})
+    assert set(first) == {"u"}
+    # A host or harmless-parameter change is not a rotation; a change to the credential is.
+    moved = connector_secret_env_values(reg, {"u": "https://b.example.invalid/x?api_key=K1&q=2"})
+    assert moved == first
+    rotated = connector_secret_env_values(reg, {"u": "https://a.example.invalid/x?api_key=K2"})
+    assert rotated != first
+    userinfo = connector_secret_env_values(reg, {"u": "https://svc:PW@a.example.invalid/x"})
+    assert set(userinfo) == {"u"}
+    assert connector_secret_env_values(reg, {"u": "https://a.example.invalid/x?q=1"}) == {}
 
 
 # --- live-by-default: DEK tracked via the stamp when operator date unset -----

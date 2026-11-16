@@ -39,6 +39,7 @@ import importlib.util
 import inspect
 import io
 import ipaddress
+import json
 import logging
 import math
 import ntpath
@@ -2166,29 +2167,86 @@ def connector_secret_env_values(
     each with the sealed keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
-    A setting is included when its key is a **rotatable** credential — recognised by
-    :func:`_is_secret_setting` (so the SOAP ``body_secret_value_<i>`` prefix class is covered, not only
-    the fixed :data:`_SECRET_SETTING_KEYS` names) and not a non-rotatable identifier in
-    :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
-    ref whose key resolves to a **non-empty string** in ``env_values``. Values are returned **transiently**
-    to be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
-    Connections sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
-    ``env()``) credentials are skipped: they carry no stable per-environment identity to fingerprint, and
-    the factories already forbid an inline value for a secret setting."""
+    It reads the settings of every deployed inbound and outbound connection, every ``DatabaseLookup``,
+    every ``FhirLookup`` and every reference source (BACKLOG #5513): each opens a hop with its own
+    credential. A ``deployed=False`` connection is skipped, because it is never built and its values
+    are never resolved (ADR 0111 AC-1), so the engine holds no credential of its to track.
+
+    A top-level ``env()`` ref is included when its key resolves in ``env_values`` and the setting is
+    one of three shapes (:func:`_env_secret_material`):
+
+    * a **rotatable** credential setting, recognised by :func:`_is_secret_setting` (so the SOAP
+      ``body_secret_value_<i>`` prefix class is covered, not only the fixed :data:`_SECRET_SETTING_KEYS`
+      names) and not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS`, whose
+      value is a non-empty string;
+    * a ``headers`` reference standing for the whole table, whose table holds a header
+      :func:`_is_secret_header` reads as a credential;
+    * a URL setting (:func:`_is_url_setting`) whose value carries userinfo or a query parameter
+      ``secretscrub`` reads as a credential.
+
+    For the last two the value MAC'd is the credential part alone, in a fixed encoding, so a change to
+    a harmless header or to the host is not read as a rotation. Values are returned **transiently** to
+    be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
+    Settings sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
+    ``env()``) credentials are skipped: they carry no stable per-environment identity to fingerprint,
+    and the factories already forbid an inline value for a secret setting. A header ``env()`` nested
+    inside a table is refused at load (:func:`_reject_envref_headers`), so it never reaches here."""
     out: dict[str, str] = {}
-    # Both connection kinds carry a ``.spec`` (ConnectionSpec); collect specs so the loop is typed to
-    # ConnectionSpec rather than the join of the two connection types.
-    specs: list[ConnectionSpec] = [c.spec for c in registry.inbound.values()]
-    specs += [c.spec for c in registry.outbound.values()]
-    for spec in specs:
-        for name, value in spec.settings.items():
-            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or not _is_secret_setting(name):
+    sources: list[Mapping[str, Any]] = [
+        c.spec.settings for c in registry.inbound.values() if c.deployed
+    ]
+    sources += [c.spec.settings for c in registry.outbound.values() if c.deployed]
+    sources += [spec.settings for spec in registry.lookups.values()]
+    sources += [spec.settings for spec in registry.fhir_lookups.values()]
+    sources += [spec.source.settings for spec in registry.references.values()]
+    for settings in sources:
+        for name, value in settings.items():
+            if not isinstance(value, EnvRef) or value.key not in env_values:
                 continue
-            if isinstance(value, EnvRef):
-                resolved = env_values.get(value.key)
-                if isinstance(resolved, str) and resolved:
-                    out[value.key] = resolved
+            material = _env_secret_material(name, env_values[value.key])
+            if material:
+                out[value.key] = material
     return out
+
+
+def _env_secret_material(name: str, resolved: object) -> str | None:
+    """The credential material setting ``name`` holds once resolved to ``resolved``, as the string
+    :func:`connector_secret_env_values` hands the rotation watcher, or ``None`` when it holds none."""
+    if name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
+        return None
+    if _is_secret_setting(name):
+        return resolved if isinstance(resolved, str) and resolved else None
+    if name == "headers":
+        if not isinstance(resolved, Mapping):
+            return None
+        held = sorted(
+            (str(key), str(value))
+            for key, value in resolved.items()
+            if _is_secret_header(str(key), value)
+        )
+        return json.dumps(held) if held else None
+    if _is_url_setting(name):
+        urls = [resolved] if isinstance(resolved, str) else resolved
+        if not isinstance(urls, (list, tuple)):
+            return None
+        parts = [
+            part for url in urls if isinstance(url, str) and (part := _url_credential_part(url))
+        ]
+        return json.dumps(parts) if parts else None
+    return None
+
+
+def _url_credential_part(url: str) -> list[object] | None:
+    """The userinfo and the credential query parameters of ``url``, or ``None`` when it has neither.
+    A value that does not parse holds nothing this can read."""
+    try:
+        split = urllib.parse.urlsplit(url)
+        pairs = urllib.parse.parse_qsl(split.query, keep_blank_values=True)
+    except ValueError:
+        return None
+    userinfo = split.netloc.rpartition("@")[0]
+    query = sorted([key, value] for key, value in pairs if _is_credential_param(key))
+    return [userinfo, query] if userinfo or query else None
 
 
 #: Settings whose value is a URL that may carry `user:password@` userinfo, by name suffix.
