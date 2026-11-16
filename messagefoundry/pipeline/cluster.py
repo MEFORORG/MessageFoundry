@@ -779,7 +779,7 @@ def log_epoch_change_demotion(node_id: str, held: int | None, prior: int | None)
     it led on, and it demotes (BACKLOG #5746)."""
     log.warning(
         "cluster: node %s demoted itself: its lease claim held at epoch %s, not the epoch %s it"
-        " led on, so another node led in between",
+        " led on, so the lease row changed hands or was recreated since its last renew",
         node_id,
         held,
         prior,
@@ -2002,10 +2002,14 @@ class DbCoordinator:
         """Demote a leader whose claim held at an epoch other than the one it led on (BACKLOG
         #5746), so the engine gets the demotion edge now and the promotion edge on the next tick.
 
-        The epoch moves only when a claim takes the row from another owner, so a leader that sees it
-        move was not the only leader since its last renew: another node took the row and lost it.
-        That needs a process pause longer than the lease TTL, and after one every due timer fires at
-        once, so this tick can run before the fence watchdog. Leading on would skip both edges: the
+        The epoch moves when a claim takes the row from another owner, and also when the INSERT arm
+        recreates a missing row at epoch 1. In the first case another node took the row and lost it
+        while this one was paused for longer than the lease TTL; after such a pause every due timer
+        fires at once, so this tick can run before the fence watchdog. The tick's opening heartbeat
+        check (BACKLOG #5710) already stands the node down when its last beat is older than
+        ``node_timeout_seconds``, so this branch is reached when a beat landed first after the pause
+        or the node timeout exceeds the pause. Either way the demotion is the conservative
+        direction. Leading on would skip both edges: the
         engine would neither tear down the graph the pause froze nor run the promotion recovery for
         the rows the other node left in flight. The row is this node's again, so the baseline the
         tick stamped stays, and the next tick renews it at the same epoch and promotes. The epoch is
@@ -2014,7 +2018,7 @@ class DbCoordinator:
         log_epoch_change_demotion(self.node_id, self._leader_epoch, prior_epoch)
         self._is_leader = False
         self._leader_epoch = None
-        self._alert_leadership_lost("another node held the lease in between")
+        self._alert_leadership_lost("lease epoch moved since the last renew")
         self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _refuse_late_hold(self, issued_at: float) -> None:

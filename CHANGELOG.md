@@ -46,10 +46,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
-- A cluster leader whose lease claim holds at a different epoch than the one it led on, because
+- A cluster leader whose lease claim holds at a different epoch than the one it led on, as when
   another node held the lease while it was paused, now demotes and promotes again on both
-  coordinators, so the engine tears its graph down and runs the promotion recovery instead of
-  carrying on as leader. (`BACKLOG #5746`)
+  coordinators, so the engine tears its graph down and runs the promotion recovery. Before, a
+  node whose heartbeat check did not already stand it down kept leading. (`BACKLOG #5746`)
 - With a leader epoch armed, the Postgres on-promotion recovery now carries the claim's
   fail-closed epoch guard, so a node that stalled between its leader check and the write no longer
   re-pends a successor's live rows. A recovery statement already running when the successor's

@@ -564,7 +564,7 @@ class SqlServerCoordinator:
         log_epoch_change_demotion(self.node_id, self._leader_epoch, prior_epoch)
         self._is_leader = False
         self._leader_epoch = None
-        self._alert_leadership_lost("another node held the lease in between")
+        self._alert_leadership_lost("lease epoch moved since the last renew")
         self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _refuse_late_hold(self, issued_at: float) -> None:
