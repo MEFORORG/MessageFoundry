@@ -25,13 +25,13 @@ from messagefoundry.api.validation import (
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.config.settings import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
 # The ITEM rules for the id-shaped lists below live in `api/validation.py`, with the rest of the
 # operator API's input rules (BACKLOG #1108, docs/API-INPUT-VALIDATION.md).
 _NAME_MAX = 256
-_PASSWORD_MAX = 1024
 _GROUP_MAX = 512
 #: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``).
 _MFA_CODE_MAX = 64

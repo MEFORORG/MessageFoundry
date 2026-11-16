@@ -241,7 +241,8 @@ async def test_a_stray_sign_in_code_does_not_refuse_an_account_with_no_factor(
 async def test_an_oversized_factor_code_never_reaches_verify_mfa(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ui_mfa_submit stops checking the code's length before it calls verify_mfa."""
+    """RED when: ui_mfa_submit stops checking the code's length before it calls verify_mfa,
+    measures the code as submitted rather than stripped, or passes on the padded code."""
     service = await _service(engine)
     await _add(service)
     await _enrol_totp(service)
@@ -250,13 +251,17 @@ async def test_an_oversized_factor_code_never_reaches_verify_mfa(
         assert (await c.post("/ui/login", data={"username": "op", "password": PW})).headers[
             "location"
         ] == "/ui/mfa"
-        r = await c.post("/ui/mfa", data={"code": "1" * (_MFA_CODE_MAX + 1)}, headers=SAME_ORIGIN)
-        assert r.status_code == 400 and "accepted. Try again." in r.text
+        oversized = "1" * (_MFA_CODE_MAX + 1)
+        for code in (oversized, " " * 40 + oversized + " " * 40):
+            r = await c.post("/ui/mfa", data={"code": code}, headers=SAME_ORIGIN)
+            assert r.status_code == 400 and "accepted. Try again." in r.text
         assert calls == []
-        # At the bound the code is checked, as the JSON route checks it.
-        r = await c.post("/ui/mfa", data={"code": "1" * _MFA_CODE_MAX}, headers=SAME_ORIGIN)
-        assert r.status_code == 400
-        assert len(calls) == 1
+        # At the bound the code is checked, as the JSON route checks it, and surrounding space
+        # neither refuses it nor reaches verify_mfa.
+        for code in ("1" * _MFA_CODE_MAX, " " * 60 + "1" * _MFA_CODE_MAX + " " * 60):
+            r = await c.post("/ui/mfa", data={"code": code}, headers=SAME_ORIGIN)
+            assert r.status_code == 400
+    assert [call[1] for call in calls] == ["1" * _MFA_CODE_MAX] * 2
 
 
 # --- BACKLOG #5399: POST /ui/reauth -----------------------------------------------------------
@@ -265,7 +270,8 @@ async def test_an_oversized_factor_code_never_reaches_verify_mfa(
 async def test_an_oversized_step_up_code_never_reaches_verify_mfa(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ui_reauth's code leg stops checking the code's length before verify_mfa."""
+    """RED when: ui_reauth's code leg stops checking the code's length before verify_mfa, measures
+    the code as submitted rather than stripped, or passes on the padded code."""
     service = await _service(engine)
     await _add(service)
     await _enrol_totp(service)
@@ -278,17 +284,17 @@ async def test_an_oversized_step_up_code_never_reaches_verify_mfa(
         )
         assert r.status_code == 200 and "Invalid code." in r.text
         assert calls == []
-        # The bound is on the value as submitted, as the JSON route's is, so trailing space the
-        # handler strips does not carry a code past it.
-        padded = "1" * _MFA_CODE_MAX + " "
+        # The bound is on the code with surrounding space stripped, so padding does not hide an
+        # oversized code, and does not refuse one within the bound.
+        padded = " " * 40 + "1" * (_MFA_CODE_MAX + 1) + " " * 40
         r = await c.post("/ui/reauth", data={**form, "code": padded}, headers=SAME_ORIGIN)
         assert "Invalid code." in r.text
         assert calls == []
-        r = await c.post(
-            "/ui/reauth", data={**form, "code": "1" * _MFA_CODE_MAX}, headers=SAME_ORIGIN
-        )
-        assert "Invalid code." in r.text
-        assert len(calls) == 1
+        for code in ("1" * _MFA_CODE_MAX, " " * 60 + "1" * _MFA_CODE_MAX + " " * 60):
+            r = await c.post("/ui/reauth", data={**form, "code": code}, headers=SAME_ORIGIN)
+            assert "Invalid code." in r.text
+    # Each reached verify_mfa as the stripped code.
+    assert [call[1] for call in calls] == ["1" * _MFA_CODE_MAX] * 2
 
 
 async def test_an_oversized_step_up_password_never_reaches_reauth(
@@ -334,8 +340,8 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: ui_mfa_verify stops checking the code against MfaConfirmRequest before it calls
-    confirm_mfa_enrollment, checks the stripped code rather than the one submitted, or cuts or
-    refuses the enrolment code instead of passing it on for the service to bound."""
+    confirm_mfa_enrollment, lets surrounding space hide an oversized code, or cuts or refuses the
+    enrolment code instead of passing it on for the service to bound."""
     service = await _service(engine)
     await _add(service)
     calls = _spy(monkeypatch, service, "confirm_mfa_enrollment")
@@ -346,7 +352,7 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
         assert staged.status_code == 200 and "Secret:" in staged.text
         for refused in (
             {"code": "1" * (_CONFIRM_CODE_MAX + 1)},
-            {"code": "1" * _CONFIRM_CODE_MAX + " "},
+            {"code": " " * 20 + "1" * (_CONFIRM_CODE_MAX + 1) + " " * 20},
         ):
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
             r = await c.post("/ui/account/mfa/verify", data=refused, headers=SAME_ORIGIN)
@@ -370,3 +376,76 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
         assert r.status_code == 400 and "Invalid code." in r.text
     assert len(calls) == 2 and calls[0][1] == "1" * _CONFIRM_CODE_MAX
     assert calls[1][-1]["enrolment_code"] == oversized
+
+
+# --- A correct code padded with space still counts on every form that takes one ------------------
+#
+# Main accepted these, because each route stripped the code before the service saw it; a bound on
+# the code as submitted refused one padded past the bound. Each control is the bare code.
+
+
+@pytest.mark.parametrize("pad", (0, 60), ids=("bare", "padded"))
+async def test_a_padded_correct_factor_code_still_satisfies_the_gate(
+    engine: Engine, pad: int
+) -> None:
+    """RED when: ui_mfa_submit measures the code as submitted, so a correct code padded past
+    MfaVerifyRequest's bound with space is refused (BACKLOG #5398)."""
+    service = await _service(engine)
+    await _add(service)
+    secret = await _enrol_totp(service)
+    with held_totp_code(secret, steps_ahead=1) as code:
+        async with ui_client(engine, service) as c:
+            await c.post("/ui/login", data={"username": "op", "password": PW})
+            r = await c.post(
+                "/ui/mfa", data={"code": " " * pad + code + " " * pad}, headers=SAME_ORIGIN
+            )
+    assert r.status_code == 303 and r.headers["location"] == "/ui", r.text
+
+
+@pytest.mark.parametrize("pad", (0, 60), ids=("bare", "padded"))
+async def test_a_padded_correct_step_up_code_still_steps_up(engine: Engine, pad: int) -> None:
+    """RED when: ui_reauth's code leg measures the code as submitted, so a correct code padded
+    past MfaVerifyRequest's bound with space is refused (BACKLOG #5399)."""
+    service = await _service(engine)
+    await _add(service)
+    secret = await _enrol_totp(service)
+    with held_totp_code(secret, steps_ahead=1) as code:
+        async with ui_client(engine, service) as c:
+            await c.post("/ui/login", data={"username": "op", "password": PW})
+            r = await c.post(
+                "/ui/reauth",
+                data={
+                    "next": "/ui/account/mfa/disable",
+                    "password": PW,
+                    "code": " " * pad + code + " " * pad,
+                },
+                headers=SAME_ORIGIN,
+            )
+    # No continuation was staged, so a verified step-up lands on the "Verified" page.
+    assert r.status_code == 200 and "<h1>Verified</h1>" in r.text, r.text
+
+
+@pytest.mark.parametrize("pad", (0, 20), ids=("bare", "padded"))
+async def test_a_padded_correct_enrolment_confirm_code_still_enrols(
+    engine: Engine, pad: int
+) -> None:
+    """RED when: ui_mfa_verify measures the code as submitted, so a correct code padded past
+    MfaConfirmRequest's bound with space is refused (BACKLOG #5399)."""
+    service = await _service(engine)
+    await _add(service)
+    async with ui_client(engine, service) as c:
+        await c.post("/ui/login", data={"username": "op", "password": PW})
+        await mint_bound_proof(c, "/ui/account/mfa/enroll")
+        assert (await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)).status_code == 200
+        user = await service.store.get_user_by_username("op")
+        assert user is not None
+        secret = await service.store.get_totp_secret(user.id)
+        assert secret
+        await mint_bound_proof(c, "/ui/account/mfa/confirm")
+        with held_totp_code(secret) as code:
+            r = await c.post(
+                "/ui/account/mfa/verify",
+                data={"code": " " * pad + code + " " * pad},
+                headers=SAME_ORIGIN,
+            )
+    assert r.status_code == 200 and "shown once" in r.text, r.text

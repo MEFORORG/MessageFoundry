@@ -87,8 +87,10 @@ this line.**
   still the two-step flow and a non-digit one within the bound is still passed to the engine, as
   before. A code past the bound refuses the whole sign-in, a passkey sign-in or one on an account
   with no factor included, as the JSON route refuses a `LoginRequest` carrying it; that is
-  intended. The enrolment code at the TOTP confirm and
-  at `POST /ui/account/webauthn/verify` is passed on uncut rather than cut, and the engine refuses
+  intended. The codes at `POST /ui/mfa`, `POST /ui/reauth` and the TOTP confirm are measured the
+  same way, with surrounding space stripped and by length only, and the stripped code is what the
+  engine receives, so a correct code padded with space still counts. The enrolment code at the
+  TOTP confirm and at `POST /ui/account/webauthn/verify` is passed on uncut rather than cut, and the engine refuses
   one past `MfaConfirmRequest`'s bound where it reads the code, as a refused enrolment code, so
   every refusal the service gave before that read still comes first. Needs the engine seam digest
   that lists those four models. (vault BACKLOG #5397, #5398, #5399)

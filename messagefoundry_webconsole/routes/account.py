@@ -63,7 +63,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _CEREMONY_RETRY_AFTER, _form_fits, _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _CODE_FIELD, _form_fits, _refusal_error
 
 _log = logging.getLogger(__name__)
 
@@ -630,19 +630,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
-        raw_code = form.get("code", "")
+        # Stripped once, and that value is both the one measured and the one sent, as at
+        # /ui/login: a correct code with surrounding space still counts.
+        code = form.get("code", "").strip()
         enrolment_code = form.get("enrolment_code", "")
         try:
-            # The JSON MfaConfirmRequest's bound on the code as submitted: an oversized one is
-            # refused, never cut, is never checked, and reads as a wrong code. The enrolment code
-            # goes on uncut; the service bounds it where it reads it (BACKLOG #5399), so the
-            # refusals it gives before that read still come first.
-            if not _form_fits(request, MfaConfirmRequest, code=raw_code):
+            # The JSON MfaConfirmRequest's bound, by length only: an oversized code is refused,
+            # never cut, is never checked, and reads as a wrong code. The enrolment code goes on
+            # uncut; the service bounds it where it reads it (BACKLOG #5399), so the refusals it
+            # gives before that read still come first.
+            if not _form_fits(request, MfaConfirmRequest, length_only=_CODE_FIELD, code=code):
                 elevation = Elevation()
             else:
                 elevation = await service.confirm_mfa_enrollment(
                     identity,
-                    raw_code.strip(),
+                    code,
                     token=token,
                     client=client,
                     enrolment_code=enrolment_code or None,

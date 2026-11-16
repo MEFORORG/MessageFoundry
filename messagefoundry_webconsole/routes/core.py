@@ -183,6 +183,8 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
 #: The pydantic error types that say a value is too long: on a ``length_only`` field of
 #: :func:`_form_fits`, the only refusals that count.
 _TOO_LONG_ERRORS = frozenset({"string_too_long", "bytes_too_long", "too_long"})
+#: The ``length_only`` set of a form whose second-factor field is named ``code``.
+_CODE_FIELD = frozenset({"code"})
 
 
 def _form_fits(
@@ -204,10 +206,11 @@ def _form_fits(
     it reads the code, so every refusal the service gave before that read still comes first. Any
     refusal by the model counts, except on a field named in ``length_only``, where only a too-long
     one does.
-    The sign-in authenticator code is that field, because ``LoginRequest``'s digit pattern would
-    refuse what the form has always passed on. The check only refuses and never normalises: what
-    the service receives is each caller's own reading of the submitted value, which at /ui/login,
-    /ui/reauth and the enrolment confirm is the code with surrounding space stripped.
+    Every caller names its second-factor code there, and the sign-in authenticator code must be,
+    because ``LoginRequest``'s digit pattern would refuse what the form has always passed on. The
+    check only refuses and never normalises: each caller strips its code of surrounding space
+    once, and passes that stripped value both here and to the service, so a correct code padded
+    with space is not refused for the padding.
 
     Each caller runs this after its rate limiter, so a refused value has already been charged
     whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
@@ -1952,13 +1955,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 429, "too many attempts", headers={"Retry-After": _CEREMONY_RETRY_AFTER}
             )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        code = form.get("code", "")
-        # BACKLOG #5398: the JSON MfaVerifyRequest's own bound. An oversized code never reaches
-        # verify_mfa, whose recovery-code leg hashes it once per slot, so it is not audited and it
-        # reads as a wrong code.
+        # Stripped once, and that value is both the one measured and the one sent, as at
+        # /ui/login: a correct code with surrounding space still counts. The engine strips it too.
+        code = form.get("code", "").strip()
+        # BACKLOG #5398: the JSON MfaVerifyRequest's own bound, by length only. An oversized code
+        # never reaches verify_mfa, whose recovery-code leg hashes it once per slot, so it is not
+        # audited and it reads as a wrong code.
         elevation = (
             await auth.verify_mfa(token, code, client=client)
-            if _form_fits(request, MfaVerifyRequest, code=code)
+            if _form_fits(request, MfaVerifyRequest, length_only=_CODE_FIELD, code=code)
             else Elevation()
         )
         if elevation.token is not None:
@@ -2161,13 +2166,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         mfa_enrolled = mfa.enabled
         if mfa_enrolled and not satisfied:
-            raw_code = form.get("code", "")
-            code = raw_code.strip()
-            # BACKLOG #5399: the JSON MfaVerifyRequest's bound, on the value as submitted. An
-            # oversized code is not checked or audited, and reads as a wrong one.
+            # Stripped once, measured and sent stripped, as at /ui/login; a blank one is no code.
+            code = form.get("code", "").strip()
+            # BACKLOG #5399: the JSON MfaVerifyRequest's bound, by length only. An oversized code
+            # is not checked or audited, and reads as a wrong one.
             code_elevation = (
                 await auth.verify_mfa(token, code, client=client)
-                if code and _form_fits(request, MfaVerifyRequest, code=raw_code)
+                if code
+                and _form_fits(request, MfaVerifyRequest, length_only=_CODE_FIELD, code=code)
                 else Elevation()
             )
             if code_elevation.session_lost:

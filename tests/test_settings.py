@@ -786,6 +786,23 @@ def test_security_notifications_required_default(tmp_path: Path) -> None:
     assert loaded.alerts.security_notifications_required is False
 
 
+def test_auth_password_min_length_may_not_exceed_the_password_bound() -> None:
+    """RED when: a password_min_length above the sign-in requests' password bound loads, so the
+    engine mints a temporary password at least that long that no sign-in surface accepts (BACKLOG
+    #5397), or the bound the settings check is not the one the requests apply."""
+    from messagefoundry.api.auth_models import LoginRequest, ReauthRequest
+    from messagefoundry.auth.service import _temporary_password_chars
+    from messagefoundry.config.settings import PASSWORD_MAX
+
+    with pytest.raises(ValidationError, match="password_min_length must be at most 1024"):
+        AuthSettings(password_min_length=PASSWORD_MAX + 1)
+    # At the bound it loads, and the longest temporary password it mints still fits the requests.
+    floor = AuthSettings(password_min_length=PASSWORD_MAX).password_min_length
+    minted = "a" * _temporary_password_chars(floor)
+    LoginRequest(username="op", password=minted)
+    ReauthRequest(password=minted)
+
+
 def test_auth_password_policy_defaults_are_asvs_aligned() -> None:
     a = ServiceSettings().auth  # WP-3: length-first, no mandatory composition, breach screening on
     assert a.password_min_length == 15

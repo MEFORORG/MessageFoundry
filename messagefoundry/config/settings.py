@@ -3365,6 +3365,12 @@ def _normalise_claim_value_list(v: object) -> object:
     return v
 
 
+#: The longest password, in characters, any sign-in, step-up or password-change request accepts
+#: (``messagefoundry.api.auth_models``); it also bounds argon2 work. ``password_min_length`` may not
+#: exceed it (BACKLOG #5397).
+PASSWORD_MAX = 1024
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
@@ -4021,6 +4027,20 @@ class AuthSettings(_Section):
                 "so no site term would be screened; turn the check on or remove the terms"
             )
         return self
+
+    @field_validator("password_min_length")
+    @classmethod
+    def _check_password_min_length(cls, value: int) -> int:
+        # BACKLOG #5397: every sign-in, step-up and password-change surface refuses a password
+        # longer than PASSWORD_MAX, and a temporary password is minted at least this long, so a
+        # floor above the bound would mint a credential no surface accepts and leave no password
+        # the policy and the forms both pass. Refused at load rather than lowered.
+        if value > PASSWORD_MAX:
+            raise ValueError(
+                f"password_min_length must be at most {PASSWORD_MAX}, the longest password the "
+                "sign-in and password-change requests accept"
+            )
+        return value
 
     @field_validator("mfa_recovery_code_count")
     @classmethod
