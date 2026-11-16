@@ -127,6 +127,29 @@ def client_network_allowed(host: str | None, allowlist: Sequence[str] | None) ->
     return peer_ip_allowed((host, 0), allowlist)
 
 
+#: What :func:`allowlist_restricts` accepts as an entry.
+_ALLOWLIST_ENTRY_TYPES: Final = (
+    str,
+    ipaddress.IPv4Network,
+    ipaddress.IPv6Network,
+    ipaddress.IPv4Address,
+    ipaddress.IPv6Address,
+)
+
+#: IPv6 ranges that carry an IPv4 address, each with the bit at which :func:`allowlist_restricts`
+#: takes the IPv4 address to start. Where the position varies (RFC 8215 local-use NAT64) or is
+#: obfuscated (Teredo's client address), the latest position, bit 96, is used: it demands the most
+#: fixed bits, so the guess can only fail closed.
+_IPV4_EMBEDDING_RANGES: Final = (
+    (ipaddress.IPv6Network("::ffff:0:0/96"), 96),  # IPv4-mapped, how a dual-stack socket reports
+    (ipaddress.IPv6Network("::/96"), 96),  # IPv4-compatible, deprecated but parseable
+    (ipaddress.IPv6Network("64:ff9b::/96"), 96),  # NAT64 well-known prefix, RFC 6052
+    (ipaddress.IPv6Network("64:ff9b:1::/48"), 96),  # NAT64 local-use prefix, RFC 8215
+    (ipaddress.IPv6Network("2001::/32"), 96),  # Teredo, RFC 4380
+    (ipaddress.IPv6Network("2002::/16"), 16),  # 6to4, RFC 3056
+)
+
+
 def allowlist_restricts(allowlist: Any) -> bool:
     """Whether a ``source_ip_allowlist`` actually limits who may connect, so a gate may count it as
     a peer control.
@@ -149,7 +172,7 @@ def allowlist_restricts(allowlist: Any) -> bool:
     if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
         return False
     for entry in allowlist:
-        if not isinstance(entry, (str, *_IP_OBJECT_TYPES)):
+        if not isinstance(entry, _ALLOWLIST_ENTRY_TYPES):
             return False
         try:
             net = ipaddress.ip_network(entry, strict=False)
@@ -169,25 +192,3 @@ def allowlist_restricts(allowlist: Any) -> bool:
             if net.prefixlen - ipv4_start < ALLOWLIST_MIN_PREFIX_V4:
                 return False
     return True
-
-
-#: What :func:`allowlist_restricts` accepts as an entry besides a string.
-_IP_OBJECT_TYPES: Final = (
-    ipaddress.IPv4Network,
-    ipaddress.IPv6Network,
-    ipaddress.IPv4Address,
-    ipaddress.IPv6Address,
-)
-
-#: IPv6 ranges that carry an IPv4 address, each with the bit at which :func:`allowlist_restricts`
-#: takes the IPv4 address to start. Where the position varies (RFC 8215 local-use NAT64) or is
-#: obfuscated (Teredo's client address), the latest position, bit 96, is used: it demands the most
-#: fixed bits, so the guess can only fail closed.
-_IPV4_EMBEDDING_RANGES: Final = (
-    (ipaddress.IPv6Network("::ffff:0:0/96"), 96),  # IPv4-mapped, how a dual-stack socket reports
-    (ipaddress.IPv6Network("::/96"), 96),  # IPv4-compatible, deprecated but parseable
-    (ipaddress.IPv6Network("64:ff9b::/96"), 96),  # NAT64 well-known prefix, RFC 6052
-    (ipaddress.IPv6Network("64:ff9b:1::/48"), 96),  # NAT64 local-use prefix, RFC 8215
-    (ipaddress.IPv6Network("2001::/32"), 96),  # Teredo, RFC 4380
-    (ipaddress.IPv6Network("2002::/16"), 16),  # 6to4, RFC 3056
-)
