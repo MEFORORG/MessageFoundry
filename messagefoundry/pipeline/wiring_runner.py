@@ -7754,16 +7754,20 @@ class RegistryRunner:
         respawned the worker and left the rows in flight. So such a death is retried at most that
         many times in a start, never on an endless backoff.
 
-        The write is a deferred one for a task that is gone, so it is not sent once another lease
-        than the dead task's is held (:meth:`RependFence.moved`): another node led since, and the
-        rows are its promotion recovery's, as :meth:`_release_tail_on_stop` says. A node that has
-        only stopped leading under the same lease goes into the hold, which waits on the not-leader
-        state as the fault arm's does, and resumes if this node leads again under that lease."""
+        The write is a deferred one for a task that is gone, so it is gated as a retry is, not as
+        a fault arm's first write: it is sent only while this node still leads under the lease the
+        dead task claimed under (:meth:`RependFence.may_write`, as the voided-STOP re-pend in
+        :meth:`_transform_worker` asks). A demoted node, whose ``current_epoch`` reads ``None``,
+        or one that leads under another lease, or one that no longer reports ``is_leader``, sends
+        nothing: the rows stay in flight for the leader's recovery, as
+        :meth:`_release_tail_on_stop` leaves its tail on a node that lost leadership, and the
+        replacement runs at once. With ``NullCoordinator`` this node always leads and keeps no
+        epoch, so the re-pend is always sent."""
         if dead is not None and dead.ids:
-            if dead.fence is not None and dead.fence.moved():
+            if dead.fence is not None and not dead.fence.may_write():
                 log.warning(
-                    "%s worker %r: the dead worker's %d held row(s) were claimed under a lease "
-                    "this node no longer holds; leaving them to the successor's recovery",
+                    "%s worker %r: this node no longer leads under the lease the dead worker "
+                    "claimed its %d held row(s) under; leaving them to the leader's recovery",
                     worker,
                     name,
                     len(dead.ids),
@@ -13663,8 +13667,11 @@ class RegistryRunner:
         so the respawn knows a row cap bounds the re-pend (:meth:`_recover_then_run`).
 
         **A pooled lane's serializer is not respawned**: that half of #4607 (its step 2) stays held
-        for the owner, so its lane claims nothing until a restart, and every death there fires
-        ``connection_stopped``.
+        for the owner, so its lane claims nothing until a restart. A death on a dispatcher-drained
+        lane that reaches this method fires ``connection_stopped``. Not every death there reaches
+        it: at least a death inside a dispatcher-drained batching outbound lane's
+        :meth:`_process_delivery_batch` is re-raised by that body's ``BaseException`` arm without
+        calling this method, so it fires no ``connection_stopped`` here and counts no death.
 
         Never raises: the caller re-raises the death, and a store or alert fault here must not
         replace it. Logs names, ids and the exception's type, never its text, which can carry the

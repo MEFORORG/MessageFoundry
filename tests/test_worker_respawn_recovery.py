@@ -580,3 +580,53 @@ async def test_a_death_after_a_failed_send_does_not_mark_the_row_failed_twice(
         assert (status, attempts) == ("done", 2)
     finally:
         await runner.stop()
+
+
+@pytest.mark.parametrize(
+    ("case", "leader_now", "epoch_now", "re_pends"),
+    [
+        ("still-leads", True, 7, True),
+        ("demoted", False, None, False),  # current_epoch clears on a demotion
+        ("gate-first", False, 7, False),  # the cached gate drops before the epoch clears
+        ("moved", True, 8, False),  # another node led since
+    ],
+)
+async def test_a_respawn_on_a_node_that_no_longer_leads_does_not_re_pend(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    leader_now: bool,
+    epoch_now: int | None,
+    re_pends: bool,
+) -> None:
+    """The dead task claimed its row leading under epoch 7. The respawn's re-pend is a deferred
+    write for a task that is gone, so it is sent only while this node still leads under that
+    lease; otherwise the row stays in flight for the leader's recovery and the replacement runs at
+    once. ``still-leads`` is the positive control. On the code before this check ``demoted`` and
+    ``gate-first`` re-pend: ``RependFence.moved`` reads False when ``current_epoch`` is ``None`` or
+    unchanged, and the hold always sends its first write."""
+    runner = RegistryRunner(
+        Registry(), store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False)
+    )
+    mid = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
+    item = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert item is not None
+    fence = stage_dispatcher.RependFence(lambda: leader_now, lambda: epoch_now, True, 7)
+    dead = wiring_runner._HeldRows([item.id], fence=fence, charged=True)
+    reschedules: list[list[str]] = []
+    real = store.reschedule_claimed
+
+    async def spy(ids: Any, *a: Any, **k: Any) -> Any:
+        reschedules.append(list(ids))
+        return await real(ids, *a, **k)
+
+    monkeypatch.setattr(store, "reschedule_claimed", spy)
+    ran: list[str] = []
+
+    async def work(name: str) -> None:
+        ran.append(name)
+
+    await runner._recover_then_run("router", "IB", dead, work)
+    assert ran == ["IB"]  # the replacement runs on every path
+    assert reschedules == ([[item.id]] if re_pends else [])
+    assert (await _row(store, mid, Stage.INGRESS))[0] == ("pending" if re_pends else "inflight")
