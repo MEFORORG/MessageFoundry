@@ -78,6 +78,8 @@ let checkCode = 1;
 let hasHead = false;
 /** What `git config --get core.hooksPath` prints; empty is unset, as git reports it. */
 let hooksPath = "";
+/** What `git rev-parse --show-toplevel` prints; undefined is the workspace folder itself. */
+let topLevel: string | undefined;
 /** The answer to the "required check hasn't passed" prompt. */
 let baselineAnswer: string | undefined = "Commit baseline anyway";
 /** Settings the stub reports as set in USER settings; everything else is left at its default. */
@@ -215,6 +217,7 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     checkCode = 1;
     hasHead = false;
     hooksPath = "";
+    topLevel = undefined;
     baselineAnswer = "Commit baseline anyway";
     userSettings = {};
     shown = [];
@@ -235,6 +238,8 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       } else if (args[0] === "rev-parse" && args.includes("HEAD")) {
         // An unborn branch fails this, as a freshly initialised repository does.
         done(hasHead ? null : Object.assign(new Error("stubbed"), { code: 1 }), hasHead ? "0000000\n" : "", "");
+      } else if (args.includes("--show-toplevel")) {
+        done(null, `${topLevel ?? ws}\n`, "");
       } else if (args[0] === "config" && args.includes("--get") && args.includes("core.hooksPath")) {
         done(hooksPath ? null : Object.assign(new Error("stubbed"), { code: 1 }), hooksPath ? `${hooksPath}\n` : "", "");
       } else if (args[0] === "commit") {
@@ -380,8 +385,27 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       for (const m of shown) {
         assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active/.test(m), m);
       }
-      assert.ok(shown.some((m) => m.includes("core.hooksPath does not point at")), JSON.stringify(shown));
+      assert.ok(shown.some((m) => m.includes("core.hooksPath does not point git at it")), JSON.stringify(shown));
     }
+  });
+
+  test("a workspace folder below the repository's top level sets no core.hooksPath and claims no checks", async () => {
+    // Git would resolve `.mefor-hooks` from the top level, a folder the hook was not written to.
+    topLevel = path.dirname(ws);
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    assert.ok(lines().some((l) => l.includes("core.hooksPath: not set (git resolves")), JSON.stringify(lines()));
+    assert.ok(!launches().some((a) => a[0] === "config" && !a.includes("--get")), JSON.stringify(launches()));
+    assert.strictEqual(commits()[0]?.[commits()[0].indexOf("-m") + 1], "Initial commit");
+    assert.ok(!shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
+  });
+
+  test("control: a core.hooksPath spelled './.mefor-hooks' already points at the hook", async () => {
+    hooksPath = "./.mefor-hooks";
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    assert.ok(lines().some((l) => l.includes("core.hooksPath: already set")), JSON.stringify(lines()));
+    assert.ok(shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
   });
 
   test("control: with the hook written, setup and the baseline commit say checks are enabled", async () => {

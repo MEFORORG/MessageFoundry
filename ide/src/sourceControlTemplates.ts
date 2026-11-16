@@ -117,7 +117,7 @@ export function setupText(hook: HookState): SetupText {
   const { done, what } =
     hook === "written"
       ? {
-          done: `MessageFoundry: version control is set up and ${HOOK_REL} was written, but core.hooksPath does not point at ${HOOKS_DIR}, so this setup did not turn on checks on commit. Point core.hooksPath at ${HOOKS_DIR} to turn them on; the 'MessageFoundry Checks' output says why it was left alone.`,
+          done: `MessageFoundry: version control is set up and ${HOOK_REL} was written, but core.hooksPath does not point git at it, so this setup did not turn on checks on commit. The 'MessageFoundry Checks' output says why core.hooksPath was not set.`,
           what: "did not wire its commit hook",
         }
       : {

@@ -288,13 +288,37 @@ async function scaffoldHook(bin: string, ws: string, paths: CheckPaths): Promise
   return "written (.mefor-hooks/pre-commit, +x)";
 }
 
+/** Whether `a` and `b` name one directory, compared by real path (case-folded on Windows). */
+function sameDir(a: string, b: string): boolean {
+  const norm = (p: string): string => {
+    let real: string;
+    try {
+      real = fs.realpathSync.native(p);
+    } catch {
+      real = path.resolve(p); // a folder that cannot be read: compare its spelling instead
+    }
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  return norm(a) === norm(b);
+}
+
 /**
  * Point git at the hook only if safe: don't clobber a user's existing hooksPath or real hook.
- * `wired` is true only when core.hooksPath names the hook's folder afterwards.
+ * `wired` is true only when core.hooksPath resolves to the hook's folder afterwards. Git resolves a
+ * relative core.hooksPath from the repository's top level, so a workspace folder below that top
+ * level is never wired: `.mefor-hooks` there would name a folder the hook was not written to.
  */
 async function wireHooksPath(bin: string, ws: string): Promise<{ note: string; wired: boolean }> {
+  const top = await git(bin, ["rev-parse", "--show-toplevel"], ws);
+  const topDir = top.code === 0 ? top.stdout.trim() : "";
+  if (!topDir || !sameDir(topDir, ws)) {
+    return {
+      note: "not set (git resolves core.hooksPath from the repository's top level, which is not this workspace folder)",
+      wired: false,
+    };
+  }
   const current = await getHooksPath(bin, ws);
-  if (current === HOOKS_DIR) {
+  if (current && sameDir(path.resolve(topDir, current), path.join(ws, HOOKS_DIR))) {
     return { note: "already set", wired: true };
   }
   if (current) {
