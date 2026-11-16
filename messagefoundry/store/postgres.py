@@ -334,6 +334,7 @@ from messagefoundry.store.store import (
     cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
+    decoded_rows,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -9948,7 +9949,8 @@ class PostgresStore:
         rows = await self._fetchall(
             "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=$1", user_id
         )
-        return [RoleGrant.from_mapping(dict(r)) for r in rows]
+        # A grant that does not parse is left out, so the account fails its seal alone.
+        return decoded_rows(rows, lambda r: RoleGrant.from_mapping(dict(r)))
 
     async def _read_user_record(
         self, conn: Any, user_id: str, *, lock: bool = True
@@ -10231,7 +10233,7 @@ class PostgresStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return [UserRecord.from_mapping(dict(r)) for r in rows]
+        return decoded_rows(rows, lambda r: UserRecord.from_mapping(dict(r)))
 
     async def count_users(self) -> int:
         return await self._count("users")
@@ -11429,7 +11431,7 @@ class PostgresStore:
                 now,
                 float(idle_seconds),
             )
-        return [SessionRecord.from_mapping(dict(r)) for r in rows]
+        return decoded_rows(rows, lambda r: SessionRecord.from_mapping(dict(r)))
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

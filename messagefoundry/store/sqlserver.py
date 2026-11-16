@@ -341,6 +341,7 @@ from messagefoundry.store.store import (
     cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
+    decoded_rows,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -14919,7 +14920,8 @@ class SqlServerStore:
         rows = await self._fetchall(
             "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
         )
-        return [RoleGrant.from_mapping(r) for r in rows]
+        # A grant that does not parse is left out, so the account fails its seal alone.
+        return decoded_rows(rows, RoleGrant.from_mapping)
 
     @staticmethod
     async def _fetch_dicts(cur: Any) -> list[dict[str, Any]]:
@@ -15159,7 +15161,7 @@ class SqlServerStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return [UserRecord.from_mapping(d) for d in rows]
+        return decoded_rows(rows, UserRecord.from_mapping)
 
     async def count_users(self) -> int:
         return await self._count("users")
@@ -16702,7 +16704,7 @@ class SqlServerStore:
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )
-        return [SessionRecord.from_mapping(r) for r in rows]
+        return decoded_rows(rows, SessionRecord.from_mapping)
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
