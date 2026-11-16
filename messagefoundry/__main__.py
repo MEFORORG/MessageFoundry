@@ -2214,31 +2214,45 @@ def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) 
         log.warning("%s", outcome.refusal)
 
 
-def _write_start_audit(lines: Sequence[str]) -> None:
-    """Log the start's deferred AUDIT lines to whatever handlers this process has now (BACKLOG
-    #5390, #5391).
+def _write_start_audit(lines: list[str]) -> None:
+    """Log the start's deferred AUDIT lines to whatever handlers this process has now, then empty
+    ``lines``, so a second call writes nothing (BACKLOG #5390, #5391).
 
-    Called once ``configure`` has installed the handlers, and also on a refused start, so a refusal
-    does not lose a record the old decision-time log call wrote: in ``supervise`` that reached its
-    stdout handler, and in ``serve`` before ``configure_logging`` it reaches ``main()``'s filtered
-    lastResort on stderr. Where the logger's level filters WARNING out, as ``[logging].level =
-    ERROR`` does in every handler, each line goes to stderr instead, through the same redaction and
-    control-character chain (:func:`build_stderr_handler`), so it is written once and never lost."""
+    Called once ``configure`` has installed the handlers, and on every other way out of
+    :func:`_start_logging`, a refusal or a raise, so a refused start does not lose a record the old
+    decision-time log call wrote: in ``supervise`` that reached its stdout handler, and in ``serve``
+    before ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr.
+
+    Where the logger's level filters WARNING out, as ``[logging].level = ERROR`` does, each line is
+    handed straight to the root's handlers, which carry the redaction and control-character chain,
+    so the application log, stdout and the collector still get it once. A root with no handler
+    gets the same chain on stderr (:func:`build_stderr_handler`)."""
     if not lines:
         return
+    pending = list(lines)
+    lines.clear()
     logger = logging.getLogger(__name__)
     if logger.isEnabledFor(logging.WARNING):
-        for line in lines:
+        for line in pending:
             logger.warning("%s", line)
         return
-    handler = build_stderr_handler()
+    records = [
+        logger.makeRecord(logger.name, logging.WARNING, __file__, 0, "%s", (line,), None)
+        for line in pending
+    ]
+    handlers = list(logging.getLogger().handlers)
+    if handlers:
+        for record in records:
+            for handler in handlers:
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        return
+    fallback = build_stderr_handler()
     try:
-        for line in lines:
-            handler.handle(
-                logger.makeRecord(logger.name, logging.WARNING, __file__, 0, "%s", (line,), None)
-            )
+        for record in records:
+            fallback.handle(record)
     finally:
-        handler.close()
+        fallback.close()
 
 
 def _start_logging(
@@ -2267,11 +2281,41 @@ def _start_logging(
     passed (``None`` with no collector). It stays at the call site because level, format and the
     application-log file are the caller's, and it runs only after every gate here has passed.
 
-    ``pending_audit`` holds AUDIT lines the caller decided before this call. They are logged first
-    once ``configure`` has returned, or, when this function refuses the start, to the handlers the
-    process has at the refusal, by :func:`_write_start_audit` either way (BACKLOG #5391). The
-    warn-mode hop's AUDIT line follows them on a start that passes, and is not logged on a refused
-    one, since no record would take that hop (BACKLOG #5390)."""
+    ``pending_audit`` holds AUDIT lines the caller decided before this call, and is emptied as they
+    are written. They are logged first once ``configure`` has returned, and on any other way out of
+    this function, a refusal or a raise, to the handlers the process has then, by
+    :func:`_write_start_audit` either way (BACKLOG #5391). The warn-mode hop's AUDIT line follows
+    them only where ``configure`` ran with forwarding still configured: not on a refused start, and
+    not where a refused collector CA turned forwarding off, since no record takes that hop then
+    (BACKLOG #5390)."""
+    pending = pending_audit if pending_audit is not None else []
+    try:
+        return _start_logging_gates(
+            settings,
+            env_name=env_name,
+            enforcing=enforcing,
+            spool_dir=spool_dir,
+            configure=configure,
+            deferred_ca_refusals=deferred_ca_refusals,
+            pending_audit=pending,
+        )
+    finally:
+        # A start that passed has written and emptied them already, so this writes nothing then.
+        _write_start_audit(pending)
+
+
+def _start_logging_gates(
+    settings: ServiceSettings,
+    *,
+    env_name: str | None,
+    enforcing: bool,
+    spool_dir: str,
+    configure: Callable[[SyslogForward | None], bool],
+    deferred_ca_refusals: list[TrustAnchorError] | None,
+    pending_audit: list[str],
+) -> int | None:
+    """:func:`_start_logging`'s body, which holds the contract; this only writes ``pending_audit``
+    on a start that passes, and the hop's AUDIT line after it."""
     from messagefoundry.config.settings import (
         SyslogProtocol,
         forward_hop_disposition,
@@ -2281,12 +2325,6 @@ def _start_logging(
     from messagefoundry.config.tls_policy import HopDisposition, InsecureHopRefused
     from messagefoundry.controlchars import scrub_control_chars
     from messagefoundry.keywrap import KeyWrapRefused
-
-    def _refused() -> int:
-        # BACKLOG #5391: a refused start still logs the caller's AUDIT lines, as the decision-time
-        # log call they replaced did. The hop line is not among them (BACKLOG #5390).
-        _write_start_audit(pending_audit or ())
-        return 2
 
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
     # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
@@ -2346,7 +2384,7 @@ def _start_logging(
                 "(BACKLOG #1966).",
                 file=sys.stderr,
             )
-            return _refused()
+            return 2
         if _forward_hop is HopDisposition.WARN:
             # Accepted, but never silent — the point of the fix. Warned on stderr now, and logged as
             # an AUDIT record only once `configure` below has installed the handlers, and the
@@ -2356,7 +2394,8 @@ def _start_logging(
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
                 f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so the "
-                "evidence stream would cross the network unprotected on a PHI instance. Set "
+                "evidence stream crosses the network unprotected on a PHI instance whenever the "
+                "forwarder is connected. Set "
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
                 "(ADR 0080) to a collector on another host."
             )
@@ -2398,7 +2437,7 @@ def _start_logging(
                 f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
                 file=sys.stderr,
             )
-            return _refused()
+            return 2
         print(
             f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
             f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
@@ -2423,7 +2462,7 @@ def _start_logging(
                 "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
                 file=sys.stderr,
             )
-            return _refused()
+            return 2
 
     # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
     # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
@@ -2452,7 +2491,7 @@ def _start_logging(
                 "log forwarder is built, so no record reached the collector.",
                 file=sys.stderr,
             )
-            return _refused()
+            return 2
         # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
         deferred_ca_refusals.append(_ca_refusal)
         log_forward = None
@@ -2469,7 +2508,7 @@ def _start_logging(
             "the path/permissions, or unset [logging].file to run stdout-only.",
             file=sys.stderr,
         )
-        return _refused()
+        return 2
     except InsecureHopRefused as exc:
         # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
         # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
@@ -2481,21 +2520,20 @@ def _start_logging(
         # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
         # which would have misled anyone reasoning about the guard's WARN arm at the same site.
         print(f"error: {exc}", file=sys.stderr)
-        return _refused()
+        return 2
     except KeyWrapRefused as exc:
         # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
         # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
-        return _refused()
+        return 2
     # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's while forwarding is
     # still configured (a refused collector CA above turned it off). The hop line records the
     # posture this start accepted, not that a record crossed: configure may have skipped a collector
     # that was down, and forwarder_live says whether it did.
-    _audit_lines = list(pending_audit or ())
     if _hop_warning is not None and log_forward is not None:
-        _audit_lines.append(f"AUDIT: {_hop_warning}")
-    _write_start_audit(_audit_lines)
+        pending_audit.append(f"AUDIT: {_hop_warning}")
+    _write_start_audit(pending_audit)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
     # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
@@ -5178,16 +5216,26 @@ def _serve(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         except (TrustAnchorError, OSError, ValueError) as exc:
-            # S19-28 (BACKLOG #5391 item 1): a refused [api].tls_client_ca_file anchor, or API TLS
-            # material OpenSSL cannot load (ssl.SSLError is an OSError), is a clean exit 2 with the
-            # reason, not the uncaught CRITICAL floor's exit 1. Scrubbed: the text can quote a
-            # configured path.
-            what = "refused" if isinstance(exc, TrustAnchorError) else "could not be loaded"
+            # S19-28 (BACKLOG #5391 item 1): a refused [api].tls_client_ca_file anchor, API TLS
+            # material OpenSSL cannot load (ssl.SSLError is an OSError), or a context a TLS policy
+            # check refused (a ValueError), is a clean exit 2 with the reason, not the uncaught
+            # CRITICAL floor's exit 1. The reason names the setting; the material may be the minted
+            # pair, so no operator setting is assumed here. A trust-anchor refusal is kept whole, as
+            # every other one is printed, because its later lines are the commands that fix the
+            # file; any other text is scrubbed, since it can quote a configured path. Logged too,
+            # through the handlers' own filters, so the log file and the collector keep the record
+            # the uncaught floor used to give them.
+            reason = (
+                str(exc) if isinstance(exc, TrustAnchorError) else scrub_control_chars(str(exc))
+            )
             print(
-                f"error: the API TLS context {what}: {scrub_control_chars(str(exc))}; refusing "
-                "to start. Fix [api].tls_cert_file / tls_key_file / tls_client_ca_file / "
-                "tls_client_crl_file.",
+                f"error: the API TLS context was not built: {reason}\nRefusing to start.",
                 file=sys.stderr,
+            )
+            logging.getLogger(__name__).error(
+                "the API TLS context was not built (%s): %s; refusing to start.",
+                type(exc).__name__,
+                exc,
             )
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx

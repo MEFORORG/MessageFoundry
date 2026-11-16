@@ -101,7 +101,9 @@ def test_hop_audit_is_logged_once_after_configure(
     assert rc is None
     assert _hop_audit(seen) == [True]
     # The record states the posture the start accepted, not that a record crossed.
-    assert "would cross the network unprotected" in next(m for m, _ in seen if "AUDIT:" in m)
+    assert "unprotected on a PHI instance whenever the forwarder is connected" in next(
+        m for m, _ in seen if "AUDIT:" in m
+    )
     err = capsys.readouterr().err
     assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
     # The handlers took it, so it is not written to stderr a second time.
@@ -119,11 +121,34 @@ def test_hop_audit_is_logged_when_the_collector_was_skipped(
     assert "AUDIT:" not in capsys.readouterr().err
 
 
-def test_hop_audit_reaches_stderr_through_the_filter_chain_when_warning_is_filtered(
+def test_hop_audit_reaches_the_root_handlers_when_the_logger_filters_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # [logging].level = ERROR leaves the logger disabled for WARNING. The record is handed to the
+    # root's handlers, which are the configured sinks after configure_logging, and not to stderr.
+    root_seen: list[str] = []
+
+    class _Root(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            root_seen.append(record.getMessage())
+
+    root_handler = _Root()
+    logging.getLogger().addHandler(root_handler)
+    try:
+        rc, seen = _start(_listed(), tmp_path, level=logging.ERROR)
+    finally:
+        logging.getLogger().removeHandler(root_handler)
+    assert rc is None
+    assert seen == []
+    assert len([m for m in root_seen if m.startswith("AUDIT: off-box")]) == 1
+    assert "AUDIT:" not in capsys.readouterr().err
+
+
+def test_hop_audit_reaches_stderr_through_the_filter_chain_with_no_root_handler(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # [logging].level = ERROR leaves the logger disabled for WARNING, so the record goes to stderr
-    # once, formatted and filtered like any MessageFoundry stderr sink, rather than to no handler.
+    # A filtered WARNING and a root with no handler: the record goes to stderr once, formatted and
+    # filtered like any MessageFoundry stderr sink, rather than to no handler.
     import messagefoundry.logging_setup as logging_setup
 
     chained: list[logging.Handler] = []
@@ -135,6 +160,7 @@ def test_hop_audit_reaches_stderr_through_the_filter_chain_when_warning_is_filte
         return handler
 
     monkeypatch.setattr(cli, "build_stderr_handler", build)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
     rc, seen = _start(_listed(), tmp_path, level=logging.ERROR)
     assert rc is None
     assert seen == []
@@ -186,3 +212,57 @@ def test_a_start_logging_refusal_logs_the_pending_audit_but_not_the_hop(
     assert [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()] == [
         "AUDIT: the posture line"
     ]
+
+
+def test_a_raise_out_of_configure_still_logs_the_pending_audit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An exception _start_logging does not catch, such as a ValueError from the forwarder's TLS
+    # context, still writes the caller's AUDIT lines on its way out, and no hop line.
+    def configure(forward: object) -> bool:
+        raise ValueError("synthetic configure failure")
+
+    pending = ["AUDIT: the posture line"]
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
+        assert_capture_sees(caplog, "messagefoundry.__main__")
+        with pytest.raises(ValueError, match="synthetic configure failure"):
+            cli._start_logging(
+                _listed(),
+                env_name="staging",
+                enforcing=False,
+                spool_dir=str(tmp_path / "spool"),
+                configure=configure,
+                deferred_ca_refusals=[],
+                pending_audit=pending,
+            )
+    assert pending == []
+    assert [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()] == [
+        "AUDIT: the posture line"
+    ]
+
+
+def test_a_refusal_on_an_empty_root_reaches_stderr_through_the_filtered_last_resort(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve's real shape before configure_logging: no handler anywhere, and main()'s filtered
+    # lastResort. A refused start's AUDIT line reaches stderr through it, once.
+    from messagefoundry.logging_setup import _FilteredLastResort
+
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+    monkeypatch.setattr(logging, "lastResort", _FilteredLastResort())
+
+    def configure(forward: object) -> bool:
+        raise AssertionError("configure must not run on a refused start")
+
+    rc = cli._start_logging(
+        _settings(),
+        env_name="staging",
+        enforcing=False,
+        spool_dir=str(tmp_path / "spool"),
+        configure=configure,
+        deferred_ca_refusals=[],
+        pending_audit=["AUDIT: the posture line"],
+    )
+    assert rc == 2
+    err = capsys.readouterr().err.splitlines()
+    assert len([line for line in err if "AUDIT: the posture line" in line]) == 1

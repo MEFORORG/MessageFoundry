@@ -161,11 +161,11 @@ def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
     assert not [r for r in caplog.records if "AUDIT" in r.getMessage()]
 
 
-def test_keyless_audit_reaches_stderr_when_the_level_filters_warning(
+def test_keyless_audit_reaches_the_configured_handlers_when_the_level_filters_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # [logging].level = ERROR drops WARNING in every handler, so the record is written to stderr,
-    # which no level filters, once logging is configured.
+    # [logging].level = ERROR filters WARNING at the logger, so the record is handed to the
+    # handlers configure_logging installed, the structured stdout one among them, once.
     rc, _seen = _serve(
         tmp_path,
         monkeypatch,
@@ -175,15 +175,35 @@ def test_keyless_audit_reaches_stderr_when_the_level_filters_warning(
         extra=("--log-level", "ERROR"),
     )
     assert rc == 0
-    err = capsys.readouterr().err.splitlines()
-    assert len([line for line in err if "AUDIT: starting keyless" in line]) == 1
+    captured = capsys.readouterr()
+    out = captured.out.splitlines()
+    assert len([line for line in out if "AUDIT: starting keyless" in line]) == 1
+    assert "AUDIT: starting keyless" not in captured.err
+
+
+def test_a_posture_refusal_in_serve_still_logs_the_egress_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Production refuses DEBUG after the block_unlisted_outbound=false AUDIT line was decided, so
+    # _forwarder_posture_refused refuses; serve still writes the line on its way out.
+    rc, seen = _serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = false\n" + _SECURE,
+        env="prod",
+        key=True,
+        extra=("--log-level", "DEBUG"),
+    )
+    assert rc == 2
+    assert "DEBUG" in capsys.readouterr().err
+    assert _audit(seen, "block_unlisted_outbound=false") == [False]
 
 
 @pytest.mark.parametrize(
-    ("raised", "said"),
+    ("raised", "whole"),
     [
-        (ssl.SSLError(9, "[SSL] PEM lib\nforged line"), "could not be loaded"),
-        (TrustAnchorError("[api].tls_client_ca_file pin mismatch"), "refused"),
+        (ssl.SSLError(9, "[SSL] PEM lib" + chr(10) + "forged line"), False),
+        (TrustAnchorError("pin mismatch" + chr(10) + "icacls fix-line"), True),
     ],
 )
 def test_api_tls_context_failure_is_a_clean_refusal(
@@ -191,10 +211,11 @@ def test_api_tls_context_failure_is_a_clean_refusal(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     raised: Exception,
-    said: str,
+    whole: bool,
 ) -> None:
     # S19-28 (#5391 item 1): bad API TLS material or a refused client-CA anchor is exit 2 with the
-    # reason, not the uncaught CRITICAL floor's exit 1.
+    # reason, not the uncaught CRITICAL floor's exit 1, and is logged as well as printed. A
+    # trust-anchor refusal keeps its fix lines; any other text is scrubbed.
     built: list[bool] = []
 
     def refuse(*args: object, **kwargs: object) -> ssl.SSLContext:
@@ -202,15 +223,17 @@ def test_api_tls_context_failure_is_a_clean_refusal(
         raise raised
 
     monkeypatch.setattr("messagefoundry.api.tls.build_api_ssl_context", refuse)
-    rc, _seen = _serve(
+    rc, seen = _serve(
         tmp_path,
         monkeypatch,
-        'security.enforcement = "warn"\n' + _SECURE,
+        'security.enforcement = "warn"' + chr(10) + _SECURE,
         env="staging",
         key=True,
     )
     assert built == [True]
     assert rc == 2
     err = capsys.readouterr().err
-    assert f"error: the API TLS context {said}:" in err
-    assert "\nforged line" not in err
+    assert "error: the API TLS context was not built:" in err
+    tail = "icacls fix-line" if whole else "forged line"
+    assert (chr(10) + tail in err) is whole
+    assert [m for m, _ in seen if "the API TLS context was not built" in m]
