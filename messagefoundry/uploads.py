@@ -48,7 +48,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
-from typing import Any, Literal, NamedTuple, Protocol
+from typing import Any, Literal, NamedTuple, Protocol, TypeGuard
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
 from messagefoundry.controlchars import (
@@ -326,7 +326,9 @@ class UploadNotTextError(UploadContentError):
 class UploadFieldError(UploadContentError):
     """A value :meth:`UploadStore.save` would store in the sidecar is one the sidecar reader refuses
     (BACKLOG #5387): an account name or id longer than :data:`_MAX_SIDECAR_TEXT` allows, or a field
-    that holds a lone surrogate. Refused before anything is written, so no upload is stored that
+    that holds a lone surrogate, or an engine clock that reads as no time after 1970
+    (:func:`_stamp_in_range`). That last is the host's fault, not the uploader's, and is still
+    answered 400. Refused before anything is written, so no upload is stored that
     its own owner could not see, and the quota would not bill. A subclass, so the API answers it
     as any other :class:`UploadContentError`: 400 and a metadata-only ``upload.reject`` audit.
     ``reason`` names the field and the defect, never the value."""
@@ -689,6 +691,25 @@ def _sidecar_count(d: dict[str, Any], key: str) -> int:
     return value
 
 
+def _stamp_in_range(value: object) -> TypeGuard[int | float]:
+    """Whether ``value`` is an ``uploaded_at`` the sidecar reader accepts: a number above 0 and no
+    larger than :data:`_MAX_SIDECAR_COUNT`. The one rule, which the reader applies and
+    :meth:`UploadStore.save` applies to its clock before it writes, so the two agree.
+
+    A missing stamp, and 0 or a negative one, are refused rather than read as the epoch: the prune
+    would take such a stamp as decades old and delete the body on its first pass, with no
+    retention window (BACKLOG #5387). Refused, the pair is aged by its age on disk instead
+    (:meth:`UploadStore._aged_on_disk_sync`)."""
+    # bool is an int subclass, and no stamp is ever written as one. An int compares with a float
+    # exactly, so a huge one is refused here rather than overflowing; NaN fails both bounds, and
+    # infinity the upper one.
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value <= _MAX_SIDECAR_COUNT
+    )
+
+
 def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
     """The metadata a decrypted sidecar holds, checked rather than trusted (BACKLOG #5387).
 
@@ -696,7 +717,8 @@ def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
     ``allow_unmarked_ciphertext``) the JSON is not bound to its path, so a planted one could name
     another upload's ``file_id`` for the prune to delete, or carry a negative ``size`` that lifts a
     quota. So the ``file_id`` must be the path's own id, each count an integer from 0 to
-    :data:`_MAX_SIDECAR_COUNT`, the timestamp a number in that range too, and every text field a
+    :data:`_MAX_SIDECAR_COUNT`, the timestamp present and a number above 0 in that range
+    (:func:`_stamp_in_range`), and every text field a
     string no longer than :data:`_MAX_SIDECAR_TEXT` allows with no lone surrogate, and the filename
     is sanitized as :meth:`UploadStore.save` sanitizes it. Anything else, including JSON that does
     not parse or nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG
@@ -719,14 +741,8 @@ def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
         raise _MalformedSidecarError("not a JSON object")
     if d.get("file_id") != file_id:
         raise _MalformedSidecarError("its file_id is not its own upload id")
-    uploaded_at = d.get("uploaded_at", 0.0)
-    # An int compares with a float exactly, so a huge one is refused here rather than overflowing,
-    # NaN fails both bounds, and infinity the upper one.
-    if (
-        not isinstance(uploaded_at, (int, float))
-        or isinstance(uploaded_at, bool)
-        or not 0 <= uploaded_at <= _MAX_SIDECAR_COUNT
-    ):
+    uploaded_at = d.get("uploaded_at")
+    if not _stamp_in_range(uploaded_at):
         raise _MalformedSidecarError("field 'uploaded_at' is not a time in range")
     stamp = float(uploaded_at)
     return UploadedFileMeta(
@@ -1592,6 +1608,14 @@ class UploadStore:
                 is not None
             ):
                 raise self._shard_refusal(uploader=uploader, observed=disk)
+            stamp = time.time()
+            # The reader's own rule for the stamp, so a clock before 1970 writes no sidecar the
+            # reader refuses (BACKLOG #5387). Refused, not clamped: a stamp clamped near the epoch
+            # would be read as decades old and pruned on the next pass.
+            if not _stamp_in_range(stamp):
+                raise UploadFieldError(
+                    display, "was not stored: the engine clock is not a time in range"
+                )
             meta = UploadedFileMeta(
                 file_id=file_id,
                 filename=display,
@@ -1600,7 +1624,7 @@ class UploadStore:
                 content_type=ctype,
                 size=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
-                uploaded_at=time.time(),
+                uploaded_at=stamp,
                 # Message count is derived once at save (bounded by max_bytes) so listing never re-splits.
                 message_count=len(split_batch(_decode_text(data))),
             )

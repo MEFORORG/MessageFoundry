@@ -843,12 +843,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    error is refused as damaged, and the delete then classes it.
    **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
    #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
-   whose `file_id` is not its own path id, a count or an `uploaded_at` that is negative or above
-   2^53, and a text field that is not a string, is longer than the store allows, or holds a lone
-   surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
+   whose `file_id` is not its own path id, a count that is negative or above 2^53, an
+   `uploaded_at` that is missing, not a number, 0 or less, or above 2^53, and a text field that
+   is not a string, is longer than the store allows, or holds a lone surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
    host clock is stepped back every genuine upload is dated ahead, so such an upload is still
-   listed, billed by the quota and readable by its owner. An upload never writes an over-long or
-   surrogate field: the save refuses one up front, and the API answers 400 with nothing stored.
+   listed, billed by the quota and readable by its owner. A missing or non-positive `uploaded_at`
+   is refused rather than read as 1970, which the prune would take as past every window and
+   delete on its first pass; refused, the pair is aged by its mtimes as below. An upload never
+   writes an over-long or surrogate field, or an `uploaded_at` the reader refuses, such as one
+   from a clock set before 1970: the save refuses it up front, and the API answers 400 with
+   nothing stored.
    Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
    left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
    override holder, with text naming the file as damaged and saying it is not served. That text

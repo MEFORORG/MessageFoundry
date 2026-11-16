@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -313,22 +314,47 @@ def _age(*paths: Path, days: float) -> None:
         os.utime(path, (stamp, stamp))
 
 
+def _overwrite(raw: bytes) -> Callable[[UploadStore, str], None]:
+    def damage(store: UploadStore, fid: str) -> None:
+        _sidecar(store, fid).write_bytes(raw)
+
+    return damage
+
+
+def _restamp(stamp: float | None) -> Callable[[UploadStore, str], None]:
+    # BACKLOG #5387: a missing or non-positive stamp, read as the epoch, was past every window,
+    # so the first prune deleted the body with no retention window.
+    def damage(store: UploadStore, fid: str) -> None:
+        path = _sidecar(store, fid)
+        d = json.loads(path.read_text(encoding="utf-8"))
+        d.pop("uploaded_at")
+        if stamp is not None:
+            d["uploaded_at"] = stamp
+        path.write_text(json.dumps(d), encoding="utf-8")
+
+    return damage
+
+
 _REFUSED_PLANTS = {
     # A sidecar that is not JSON, on a cipher that passes plaintext.
-    "passthrough-not-json": (_keyless, b"{not json"),
+    "passthrough-not-json": (_keyless, _overwrite(b"{not json")),
     # One that is not UTF-8, on a keyed store, over a text body: not the never-sealable kind.
-    "keyed-not-utf8": (_keyed, b"\xff\xfe not utf-8"),
+    "keyed-not-utf8": (_keyed, _overwrite(b"\xff\xfe not utf-8")),
+    # A stamp that is missing, 0 or negative, kept while fresh on disk however old it reads.
+    "stamp-missing": (_keyless, _restamp(None)),
+    "stamp-zero": (_keyless, _restamp(0)),
+    "stamp-negative": (_keyless, _restamp(-1)),
 }
 
 
-@pytest.mark.parametrize("case", list(_REFUSED_PLANTS), ids=list(_REFUSED_PLANTS))
+@pytest.mark.parametrize("case", list(_REFUSED_PLANTS))
 async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
     tmp_path: Path, case: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    factory, raw = _REFUSED_PLANTS[case]
+    factory, damage = _REFUSED_PLANTS[case]
     store = factory(tmp_path)
     meta = await _saved(store)
-    _sidecar(store, meta.file_id).write_bytes(raw)
+    damage(store, meta.file_id)
     sidecar, body = _sidecar(store, meta.file_id), _blob(store, meta.file_id)
     assert await store.list_files() == []  # refused, so not trusted for the listing
     rows: list[UploadedFileMeta] = []
@@ -352,6 +378,34 @@ async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
         (meta.file_id, "", "", "")
     ]
     assert any("whose sidecar was refused" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_genuine_upload_is_pruned_at_its_real_age(tmp_path: Path) -> None:
+    # Control for the test above: a sound stamp still ages by the stamp, whatever the mtimes say.
+    store = _keyless(tmp_path)
+    young = await _saved(store, "young.txt")
+    old = await _saved(store, "old.txt")
+    _plant(store, old.file_id, uploaded_at=time.time() - 31 * _DAY)
+    _plant(store, young.file_id, uploaded_at=time.time() - 29 * _DAY)
+    result = await store.prune_expired(retention_days=30)
+    assert [m.file_id for m in result.pruned] == [old.file_id]
+    assert [m.file_id for m in await store.list_files()] == [young.file_id]
+
+
+@pytest.mark.parametrize("clock", [0.0, -86_400.0])
+async def test_save_refuses_a_clock_the_reader_would_refuse(
+    tmp_path: Path, clock: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5387: a clock before 1970 would write a stamp the reader refuses, so save refuses
+    # it up front rather than clamping it to a stamp the prune would delete at once.
+    store = _keyless(tmp_path)
+    monkeypatch.setattr(time, "time", lambda: clock)
+    with pytest.raises(UploadFieldError):
+        await _saved(store)
+    monkeypatch.undo()
+    assert await store.list_files() == []
+    root = store._root  # noqa: SLF001 - nothing was written
+    assert not root.exists() or not any(root.iterdir())
 
 
 async def test_a_sound_sidecar_dated_far_ahead_is_aged_by_its_pair_on_disk(

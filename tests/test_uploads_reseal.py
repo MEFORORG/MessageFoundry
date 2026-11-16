@@ -445,7 +445,12 @@ async def test_the_scan_never_logs_a_decrypted_body(
     key = generate_key()
     store = _keyed_store(root, key)
     fid = "4" * 32
-    _write_sealed_meta(root, fid, key, json.dumps({"file_id": fid, "size": "MRN123-NOT-AN-INT"}))
+    _write_sealed_meta(
+        root,
+        fid,
+        key,
+        json.dumps({"file_id": fid, "uploaded_at": 1.0e9, "size": "MRN123-NOT-AN-INT"}),
+    )
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         assert await store.list_files() == []
