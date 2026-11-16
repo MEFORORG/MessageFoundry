@@ -698,8 +698,7 @@ NSSM environment.
   previous bullet's link says when and why).
   **Off Windows, no installer creates the directory.** In `docker/compose.yaml` the `engine`
   service's bind mount and its `MEFOR_SECRETS_DIRECTORY` line are both commented out, so uncomment
-  both. The `ha` profile's `engine-ha` and `engine-standby` services carry neither line, so add
-  both there to use the directory.
+  both. The `ha` profile's `engine-ha` and `engine-standby` services carry neither line.
   Where each platform's directory goes, a systemd unit's included, and what the engine refuses
   there are in [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
   Linux, on a host or in a container, is not a supported v1 deployment target

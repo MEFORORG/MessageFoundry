@@ -161,10 +161,11 @@ registered today are at least these. Read the `register_source(...)` calls in
 engine, so treat it as untrusted. `_process_response_item` holds it to the size ceiling
 (`reingress_size_error`), then to at least checks 2 to 4 and 6 in the table above
 (`reingress_body_error`, BACKLOG #5616): check 2 on any text type, checks 3 and 4 on `hl7v2`, and
-check 6 on any type but `hl7v2`, binary included, unless the reply is empty or all white space. An `hl7v2` reply over the engine's default ceiling skips checks 2 to 4 and is refused as
-oversize by check 7, `Peek.parse`, which every `hl7v2` reply meets, followed by the document handle
-marker check the HL7 v2 row further down names. Check 1 does not run, because the reply is already
-text, and check 8 does not run. A reply that fails is recorded with status `ERROR`.
+check 6 on any type but `hl7v2`, binary included. Check 6 skips a reply that is empty or all white
+space. An `hl7v2` reply over the engine's default ceiling skips checks 2 to 4 and is left to check
+7, `Peek.parse`, which refuses it. Every `hl7v2` reply meets check 7, and a reply it admits then
+meets the document handle marker check the HL7 v2 row further down names. Check 1 does not run,
+because the reply is already text, and check 8 does not run. A reply that fails is recorded with status `ERROR`.
 [ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 
 The two file sources run the type check themselves, before the shared handler. They call the same
@@ -324,17 +325,18 @@ It does hold them to a structure when it loads them. The rules live in
 [`config/wiring.py`](../messagefoundry/config/wiring.py), at least these:
 
 - The loader runs each top-level `.py` file whose name does not start with `_`. A `_` file is a
-  helper, loaded only when a sibling imports it. When a sibling imports a helper that has the name
-  of a module already there, the import is refused: a standard-library module, an installed module,
-  or one the process has already imported (`_refuse_shadowing_helper`, called by
-  `_HelperImporter._load`). A helper no sibling imports is not checked.
+  helper, loaded only when a sibling imports it. When a sibling's `import` statement names a helper
+  that has the name of a module already there, the import is refused: a standard-library module,
+  an installed module, or one the process has already imported (`_refuse_shadowing_helper`, called
+  by `_HelperImporter._load`). The name of a helper no sibling imports is not checked.
 - Before any module runs, `_assert_safe_config_source` refuses at least a path that
   `config_source_trust_paths` lists and that it reads as writable by another account, and on
   Windows one whose owner or access list it cannot read. That list is the configuration directory,
-  its top-level `*.py` files, helpers included, and, where they exist, its `__pycache__` folder and
-  the entries in it, `connections.toml`, and the `codesets` folder and the code-set tables the
-  loader reads from it. Any other path in the directory is not on it. A dev and test escape turns
-  the refusal into a warning; the conditions it needs are stated once, under *Dev/test escape* in
+  the top-level `*.py` files the loader may run or import (`config_py_files`, which skips a
+  dot-named file), helpers included, and, where they exist, its `__pycache__` folder and the
+  entries in it, `connections.toml`, and the `codesets` folder and the code-set tables the loader
+  reads from it. Any other path in the directory is not on it. A dev and test escape turns the
+  refusal into a warning; the conditions it needs are under *Dev/test escape* in
   [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
   check reads and what it leaves out.
 - A module declares nothing by being loaded. It registers objects by calling `inbound()`,
