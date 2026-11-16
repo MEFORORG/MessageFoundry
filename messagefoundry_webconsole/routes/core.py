@@ -2085,9 +2085,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         mfa_enrolled = mfa.enabled
         if mfa_enrolled and not satisfied:
-            code = form.get("code", "").strip()
+            code = form.get("code", "")
+            # BACKLOG #5399: the JSON MfaVerifyRequest's bound, on the value as submitted. An
+            # oversized code is not checked, and reads as a wrong one.
             code_elevation = (
-                await auth.verify_mfa(token, code, client=client) if code else Elevation()
+                await auth.verify_mfa(token, code.strip(), client=client)
+                if code.strip() and len(code) <= _MFA_CODE_MAX
+                else Elevation()
             )
             if code_elevation.session_lost:
                 # The session ended during the ceremony, whether or not the code was checked yet
@@ -2126,13 +2130,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         claim = claim_continuation(action, token, next_)
         continues = claim.continues
         pre_rotation = token
+        password = form.get("password", "")
         try:
-            pw_elevation = await auth.reauth(
-                identity,
-                form.get("password", ""),
-                token=token,
-                client=client,
-                purpose=action.action if continues else None,
+            # BACKLOG #5399: the JSON ReauthRequest's bound. An oversized password is neither
+            # hashed nor sent to the directory; it takes the wrong-password exit below.
+            pw_elevation = (
+                await auth.reauth(
+                    identity,
+                    password,
+                    token=token,
+                    client=client,
+                    purpose=action.action if continues else None,
+                )
+                if len(password) <= _PASSWORD_MAX
+                else Elevation()
             )
         except BaseException:
             claim.restore()
