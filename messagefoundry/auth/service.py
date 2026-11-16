@@ -4555,9 +4555,13 @@ class AuthService:
 
         A constant, never the bucket's own wait (owner ruling 2026-10-20). The sign-in surface is
         unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
-        one of them when another's oldest attempt was made. The whole window is never too early: a
-        per-address bucket clears within it once nothing else spends it. The authenticated
-        PHI-read 429 keeps the exact wait."""
+        one of them when another's oldest attempt was made. The whole window is that constant, not
+        a promise of admission, and it can be early: another caller's charge can refill the bucket
+        or the global window meanwhile,
+        and a paid passkey sign-in POST re-stamps its begin leg's hit to now
+        (:meth:`SlidingWindowRateLimiter.renew`), so the bucket or window it lands in can still be
+        full when the window has passed (docs/SECURITY.md, *The combined passkey sign-in*). The
+        authenticated PHI-read 429 keeps the exact wait."""
         # _settings, not the settings property: that returns a deep copy, and this runs per refusal.
         return max(1, math.ceil(self._settings.login_rate_limit_window_seconds))
 
@@ -18684,13 +18688,15 @@ class AuthService:
         second call finds nothing.
 
         ``POST /ui/login`` calls it BEFORE the sign-in limiter and skips its own charge only when
-        the result is ``paid``: the begin leg's control-2 hit for this sign-in was still in the
-        window, and this call MOVED it to now (``SlidingWindowRateLimiter.renew``), so the sign-in
+        the result is ``paid``. While the login limiter is on, ``paid`` means the begin leg's
+        control-2 hit for this sign-in was still in the window, and this call MOVED it to now
+        (``SlidingWindowRateLimiter.renew``), so the sign-in
         is counted once and from the moment it is spent (BACKLOG #3937 item 2, ADR 0197 Amendment
         A). A hit that had left the window is not renewed and the POST charges afresh, so begin
         legs cannot be banked and spent later. A forged or absent handle finds nothing and is
-        charged like any other request. The route passes the challenge to :meth:`login` as
-        ``passkey_challenge``."""
+        charged like any other request. With ``login_rate_limit_enabled = false`` there is no
+        limiter, so every staged challenge reads ``paid`` and nothing is charged. The route passes
+        the challenge to :meth:`login` as ``passkey_challenge``."""
         taken = self._preauth_challenges.pop(hash_token(handle))
         if taken is None:
             return None

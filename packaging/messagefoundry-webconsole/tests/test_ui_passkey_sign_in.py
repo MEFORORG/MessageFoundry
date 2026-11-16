@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import types
 from typing import Any
 
 import httpx
@@ -31,10 +32,19 @@ PW = "a-strong-test-passphrase"
 _COOKIE = "mf_passkey_signin"
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+def _client(
+    engine: Engine, service: AuthService, *, address: str | None = None
+) -> httpx.AsyncClient:
     # A browser connected directly to http://t: the request Host is its origin (BACKLOG #2219).
+    # ``address`` is the peer address the app sees; the limiter is the service's, so two clients
+    # over one service draw on one limiter.
     app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    transport = (
+        httpx.ASGITransport(app=app)
+        if address is None
+        else httpx.ASGITransport(app=app, client=(address, 51234))
+    )
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
 async def _service(engine: Engine, **overrides: Any) -> AuthService:
@@ -191,15 +201,16 @@ async def test_a_must_change_account_may_register_a_passkey_as_its_first_factor(
         assert r.status_code == 200 and "data-mf-webauthn-create" in r.text
 
 
-async def _counted_service(engine: Engine, budget: int) -> AuthService:
-    """A service whose sign-in limiter (control 2) admits ``budget`` attempts in all, whatever the
-    address, so a test reads what a request cost by spending the rest."""
+async def _counted_service(engine: Engine, budget: int, *, per_ip: int = 1000) -> AuthService:
+    """A service whose sign-in limiter (control 2) admits ``budget`` attempts in all, and ``per_ip``
+    from any one address, so a test reads what a request cost by spending the rest."""
     service = AuthService(
         engine.store,
         AuthSettings(
             mfa_verify_min_elapsed_seconds=0,
-            login_rate_limit_per_ip=1000,
+            login_rate_limit_per_ip=per_ip,
             login_rate_limit_global=budget,
+            login_rate_limit_window_seconds=60.0,
             admin_write_min_interval_seconds=0,
         ),
     )
@@ -208,9 +219,10 @@ async def _counted_service(engine: Engine, budget: int) -> AuthService:
 
 
 def _left(service: AuthService) -> int:
-    """Spend what is left of the sign-in budget, and say how much that was."""
+    """Spend what is left of the sign-in budget, and say how much that was. Each attempt comes
+    from an address of its own, so a per-address budget never stops the count short."""
     n = 0
-    while service.allow_login_attempt("probe") and n < 100:
+    while service.allow_login_attempt(f"probe-{n}") and n < 100:
         n += 1
     return n
 
@@ -270,6 +282,68 @@ async def test_a_staged_challenge_is_popped_by_the_sign_in_post_even_without_an_
     # The begin leg, the first POST waived by the staged challenge, the second charged.
     assert _left(service) == 3
     assert len(service._preauth_challenges) == 0
+
+
+@pytest.mark.parametrize("assertion", [None, "{}"], ids=["password-only", "with-assertion"])
+@pytest.mark.parametrize("b_state", ["throttled", "has-room", "global-full"])
+async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_another(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, assertion: str | None, b_state: str
+) -> None:
+    """BACKLOG #3937 step 28: pins the SHIPPED behaviour; a change requiring the two addresses to
+    match inverts this test rather than keeping it green. The begin leg charges control 2 under ITS
+    address, and ``POST /ui/login`` moves that hit without charging or consulting control 2 for the
+    POST, so a POST from B carrying a handle A's begin leg staged is admitted whether control 2
+    refuses B, has room for it, or is refusing everyone on the global ceiling, and B is not charged.
+    The skip is the route's, taken before any account is read, so it holds with or without an
+    assertion. A's hit is moved to the POST's moment, under A, and counts once in the global
+    budget; docs/SECURITY.md, *The combined passkey sign-in*, states why that gains a caller nothing
+    and what it costs A.
+
+    RED when: the skip charges or consults control 2 for B (a throttled or global-full POST is
+    refused, or B's bucket or the global window gains a hit); the renewal frees A's hit or leaves it
+    at the begin leg's moment, in A's bucket or the global window; or it counts A's hit twice."""
+    from messagefoundry.auth import webauthn as wa
+
+    clock = [1_000.0]
+    # The limiter's and the challenge pool's clocks only (the event loop keeps the real one), so
+    # no step can age out of the window or the challenge's TTL under load.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _counted_service(engine, budget=5, per_ip=1 if b_state == "throttled" else 2)
+    service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
+    limiter = service._login_limiter
+    assert limiter is not None
+    login = {"username": "nobody", "password": PW}
+    paying = login if assertion is None else {**login, "passkey_assertion": assertion}
+    a = _client(engine, service, address="192.0.2.10")
+    b = _client(engine, service, address="192.0.2.20")
+    async with a, b:
+        begun = await a.post("/ui/login/passkey", headers=SAME_ORIGIN)  # t=0
+        assert begun.status_code == 200
+        clock[0] += 10
+        assert (await b.post("/ui/login", data=login)).status_code == 303  # t=10, charged
+        if b_state == "throttled":
+            assert (await b.post("/ui/login", data=login)).status_code == 429
+        elif b_state == "global-full":
+            assert _left(service) == 3  # t=10: A's hit, B's, and these three fill the ceiling
+            assert (await b.post("/ui/login", data=login)).status_code == 429
+        # Only the handle cookie, exactly as the begin leg set it.
+        handle = [c for c in a.cookies.jar if c.name == _COOKIE]
+        assert len(handle) == 1, "the begin leg did not set exactly one handle cookie"
+        b.cookies.jar.set_cookie(handle[0])
+        clock[0] += 49
+        paid = await b.post("/ui/login", data=paying)  # t=59
+        assert paid.status_code == 303, "the shipped cross-address skip now asks B's address"
+        assert paid.headers["location"] == "/ui/login?e=bad"
+        assert b.cookies.get(_COOKIE) is None, "the refusal did not clear the handle cookie"
+    # A refusal is not counted, so B holds only its charged POST and A only its moved hit.
+    assert list(limiter._hits["192.0.2.20"]) == [1_010.0], "the paid POST charged B"
+    assert list(limiter._hits["192.0.2.10"]) == [1_059.0], "the renewal did not move A's hit"
+    probes = [1_010.0] * 3 if b_state == "global-full" else []
+    assert list(limiter._global_hits) == [1_010.0, *probes, 1_059.0], (
+        "global: not B, probes, moved A"
+    )
 
 
 async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_ui_login(
