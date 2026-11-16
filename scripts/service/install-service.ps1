@@ -2883,6 +2883,18 @@ function Stop-ServiceAndConfirm {
         [string]$NssmPath,
         [int]$TimeoutSeconds = 30
     )
+    # EXACTLY THIS SERVICE, NEVER ONE WHOSE DISPLAY NAME IS $ServiceName (BACKLOG #5402). Get-Service
+    # and Stop-Service -Name also match a service's DISPLAY name, and the name pattern every caller
+    # validates against allows a space, so 'Windows Time' passes it and -Name resolves it to W32Time.
+    # The pattern keeps wildcards out; only this filter keeps a display name out. -eq and not -ceq,
+    # because the SCM compares service names without case. What is stopped is the object this
+    # returned (-InputObject), never a name a cmdlet resolves again.
+    $exact = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+    $target = & $exact
+    # Nothing by that exact name means nothing to stop, so neither nssm nor the SCM is asked to stop
+    # anything: each would resolve the name again, and either can take it as a display name.
+    if (-not $target) { return $true }
     if ($NssmPath) {
         $launched = $true
         $global:LASTEXITCODE = $null
@@ -2890,24 +2902,24 @@ function Stop-ServiceAndConfirm {
             $launched = $false
             Write-Warning ("Could not run '$NssmPath' to stop '$ServiceName' " +
                 "($($_.Exception.Message)). Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         }
         $exit = $LASTEXITCODE
         if ($launched -and $null -eq $exit) {
             $launched = $false
             Write-Warning ("'$NssmPath' left no exit code, so nssm never ran and '$ServiceName' was " +
                 "not stopped by it. Falling back to the SCM.")
-            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
         } elseif ($launched -and $exit -ne 0) {
             Write-Warning ("nssm stop '$ServiceName' exited $exit (its message is above). " +
                 "The service may still be running; the status is checked below.")
         }
     } else {
-        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Stop-Service -InputObject $target -Force -ErrorAction SilentlyContinue
     }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ($true) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $svc = & $exact
         if (-not $svc) { return $true }
         if ($svc.Status -eq "Stopped") { return $true }
         if ((Get-Date) -ge $deadline) {
@@ -2922,8 +2934,10 @@ function Stop-ServiceAndConfirm {
 
 # If the service already exists, reconfigure it in place (idempotent install).
 # Detect via Get-Service rather than `nssm status` (which errors to stderr on a missing
-# service and would abort under ErrorActionPreference=Stop).
-$ServiceExisted = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+# service and would abort under ErrorActionPreference=Stop). Only the service whose NAME is
+# $ServiceName counts: -Name also matches a display name (BACKLOG #5402).
+$ServiceExisted = [bool](@(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName })
 if ($ServiceExisted) {
     Write-Host "Service '$ServiceName' exists - stopping and reconfiguring..."
     if (-not (Stop-ServiceAndConfirm -ServiceName $ServiceName -NssmPath $NssmPath)) {

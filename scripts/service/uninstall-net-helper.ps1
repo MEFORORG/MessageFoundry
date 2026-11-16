@@ -70,7 +70,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Removing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+# ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Get-Service and Stop-Service -Name
+# also match a DISPLAY name, which the pattern above cannot keep out because it allows a space, so
+# the lookup filters on Name and the stop below takes the object it found (-InputObject).
+$exactService = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+$existingService = & $exactService
+if (-not $existingService) {
     Write-Host "Service '$ServiceName' is not installed - nothing to do."
     return
 }
@@ -235,11 +241,11 @@ if ($ReleaseAddress) {
 # two things that function exists to do -- issue the stop, then confirm the status back from the SCM
 # rather than assuming it (BACKLOG #1558).
 Write-Host "Stopping '$ServiceName'..."
-Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+Stop-Service -InputObject $existingService -Force -ErrorAction SilentlyContinue
 $stopped = $false
 $deadline = (Get-Date).AddSeconds(30)
 while ($true) {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $svc = & $exactService
     if (-not $svc -or $svc.Status -eq "Stopped") { $stopped = $true; break }
     if ((Get-Date) -ge $deadline) { break }
     Start-Sleep -Milliseconds 500

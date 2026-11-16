@@ -669,13 +669,20 @@ $LogPath = Join-Path $InstallDir "net-helper.log"
 # function is the cost this avoids; what it must not cost is the property, so this loop does the
 # same two things that function exists to do: it issues the stop and then CONFIRMS from the SCM
 # rather than assuming (BACKLOG #1558).
-$serviceExists = [bool](Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)
+#
+# ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Get-Service and Stop-Service -Name
+# also match a DISPLAY name, which the name pattern cannot keep out because it allows a space, so
+# the lookup filters on Name and the stop takes the object it found (-InputObject).
+$exactService = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+    Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+$existingService = & $exactService
+$serviceExists = [bool]$existingService
 if ($serviceExists) {
     Write-Host "  Service '$ServiceName' exists - stopping it before the files are replaced."
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    Stop-Service -InputObject $existingService -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds(30)
     while ($true) {
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        $svc = & $exactService
         if (-not $svc -or $svc.Status -eq "Stopped") { break }
         if ((Get-Date) -ge $deadline) {
             throw ("'$ServiceName' is still '$($svc.Status)' 30 seconds after the stop. Its image " +
@@ -736,7 +743,7 @@ if ($problem) {
     if ($left.Count -gt 0) {
         $outcome = "Could not delete $($left -join ' and ')."
         if ($serviceExists) {
-            Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+            Set-Service -InputObject $existingService -StartupType Disabled -ErrorAction SilentlyContinue
             $outcome += " '$ServiceName' was set to Disabled so the registration cannot start them."
         }
     }

@@ -493,12 +493,18 @@ def _stop_arms(
     states: list[str],
     timeout: int = 1,
     chatter: str = "",
+    service: str = "MessageFoundry",
+    found_name: str | None = None,
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
     ``states`` is what the shadowed Get-Service reports on successive calls (the last value repeats);
     an empty list means the service is absent. ``nssm_exit`` of None runs the no-nssm branch, which
     is uninstall-service.ps1's third stop site. ``chatter`` makes the stub print to STDOUT.
+
+    ``service`` is the -ServiceName passed. ``found_name`` is the Name the shadowed Get-Service
+    reports for it, ``service`` itself when None: a different one is how the real cmdlet answers a
+    DISPLAY name (BACKLOG #5402).
 
     ``outputs`` counts the non-warning objects the helper emitted. It is reported rather than
     collapsed because the COUNT is the defect: the callers test one boolean.
@@ -513,27 +519,32 @@ def _stop_arms(
     prelude = _stub_control(stub, nssm_exit) if nssm_exit is not None else ""
     nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
     states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
+    found_ps = _psq(found_name) if found_name is not None else "$null"
     body = (
         prelude
         + rf"""
   $script:StopServiceCalls = 0
   $script:GetServiceCalls = 0
   $script:States = {states_ps}
+  $script:FoundName = {found_ps}
+  $script:StopTargets = @()
   function Get-Service {{
     param([string]$Name, $ErrorAction)
     $script:GetServiceCalls++
     if ($script:States.Count -eq 0) {{ return $null }}
     $i = [Math]::Min($script:GetServiceCalls - 1, $script:States.Count - 1)
-    return [pscustomobject]@{{ Status = $script:States[$i] }}
+    $found = if ($null -ne $script:FoundName) {{ $script:FoundName }} else {{ $Name }}
+    return [pscustomobject]@{{ Name = $found; Status = $script:States[$i] }}
   }}
   function Stop-Service {{
-    param([string]$Name, [switch]$Force, $ErrorAction)
+    param([string]$Name, $InputObject, [switch]$Force, $ErrorAction)
     $script:StopServiceCalls++
+    $script:StopTargets += $(if ($Name) {{ "name:$Name" }} else {{ "object:$($InputObject.Name)" }})
   }}
   $warnings = @()
   $result = $null
   $emitted = & {{
-    {_STOP_FN} -ServiceName 'MessageFoundry' -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
+    {_STOP_FN} -ServiceName {_psq(service)} -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
   }} 3>&1
   $outputs = 0
   foreach ($o in @($emitted)) {{
@@ -546,6 +557,7 @@ def _stop_arms(
     warnings         = @($warnings)
     stopServiceCalls = $script:StopServiceCalls
     getServiceCalls  = $script:GetServiceCalls
+    stopTargets      = @($script:StopTargets)
   }} | ConvertTo-Json -Depth 4 -Compress
 """
     )
@@ -638,6 +650,37 @@ def test_the_scm_fallback_stop_is_confirmed_too(tmp_path: Path) -> None:
         f"the no-nssm branch must still stop the service via the SCM (got {arms['stopServiceCalls']})"
     )
     assert arms["result"] is False, "the SCM fallback must confirm the stop, not assume it"
+    assert arms["stopTargets"] == ["object:MessageFoundry"], (
+        "the SCM stop must take the service object the exact-name lookup found, never a name "
+        f"Stop-Service resolves again (BACKLOG #5402); got {arms['stopTargets']}"
+    )
+
+
+@pytest.mark.parametrize("nssm_exit", [3, None], ids=["nssm", "scm"])
+def test_a_display_name_never_stops_the_service_it_names(
+    tmp_path: Path, nssm_exit: int | None
+) -> None:
+    """``-ServiceName 'Windows Time'`` passes the name pattern, and Get-Service -Name answers it
+    with W32Time, the service whose DISPLAY name it is (BACKLOG #5402). Nothing may be stopped:
+    not through the SCM, and not through nssm, which would warn about its exit 3 if it ran.
+
+    The positive control is the SCM-fallback arm above, which stops a service the lookup found
+    under its own name.
+    """
+    arms = _stop_arms(
+        tmp_path,
+        nssm_exit=nssm_exit,
+        states=["Running"],
+        service="Windows Time",
+        found_name="W32Time",
+    )
+    assert arms["stopServiceCalls"] == 0, (
+        f"a display name stopped the service it names: {arms['stopTargets']}"
+    )
+    assert arms["warnings"] == [], (
+        f"nssm was asked to stop a display name, or a warning fired: {arms['warnings']}"
+    )
+    assert arms["result"] is True, "no service by that exact name means nothing is left running"
 
 
 def test_no_unchecked_stop_site_survives_in_either_script(tmp_path: Path) -> None:
