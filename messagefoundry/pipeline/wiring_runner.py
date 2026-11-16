@@ -1838,6 +1838,18 @@ class _LaneSnapshot:
     gate_parked: bool
     schedule_parked: bool
 
+    @property
+    def untouched(self) -> bool:
+        """The lane had no state at all before step 3: no connector, no record, no park."""
+        return (
+            self.connector is None
+            and self.failed is _ABSENT
+            and self.filtered is _ABSENT
+            and not self.paused
+            and not self.gate_parked
+            and not self.schedule_parked
+        )
+
 
 @dataclass
 class _OutboundReconcile:
@@ -8936,18 +8948,22 @@ class RegistryRunner:
         and markers stand. A lane running now that was parked before is stopped the cooperative
         way, as :meth:`_dr_park_outbound` parks a live lane, so it reads quiesced only once a send
         in flight resolves. Step 2a's consumer decisions stay, for the reason its comment gives.
-        A lane only the refused graph declares, and that had no connector before, is left as step
-        3 built it, so rows queued to it drain, as a lane a reload drops does. Every connector step 3
-        retired that no lane holds after the restore is returned for closing."""
+        A lane only the refused graph declares, and that had no state at all before, is left as
+        step 3 built it, so rows queued to it drain, as a lane a reload drops does. Each lane's
+        restore is guarded, so one that raises stops neither the others nor the closes: every
+        connector step 3 built or retired that no lane holds after the restore is returned for
+        closing."""
         to_close: list[tuple[str, Any]] = []
         kept = {id(snap.connector) for snap in state.lanes.values() if snap.connector is not None}
         passive = self._dr_passive
         for name, snap in state.lanes.items():
-            if name not in old.outbound and snap.connector is None:
-                # Only the refused graph declares it, and it had no connector before: keep what
-                # step 3 built, so its rows drain. One that had a connector, a lane an earlier
-                # reload dropped and that was still draining, is put back below like any other.
+            if name not in old.outbound and snap.untouched:
+                # Only the refused graph declares it, and it had no state before: keep what step 3
+                # built, so its rows drain. A lane an earlier reload dropped, still draining or
+                # still parked or failed, is put back below like any other.
                 continue
+            # The connector first, outside the guard, so a lane whose restore raises below still
+            # hands its refused connector back for closing.
             current = self._destinations.get(name)
             if current is not snap.connector:
                 if snap.connector is None:
@@ -8956,49 +8972,62 @@ class RegistryRunner:
                     self._destinations[name] = snap.connector
                 if current is not None and id(current) not in kept:
                     to_close.append((name, current))
-            for attr, value in snap.policies:
-                mapping = getattr(self, attr)
-                if value is _ABSENT:
-                    mapping.pop(name, None)
-                else:
-                    mapping[name] = value
-            key: tuple[Direction, str] = ("outbound", name)
-            records: list[tuple[dict[tuple[Direction, str], Any], Any]] = [
-                (self._failed, snap.failed)
-            ]
-            if not passive:
-                records.append((self._filtered, snap.filtered))
-            for record, value in records:
-                if value is _ABSENT:
-                    record.pop(key, None)
-                else:
-                    record[key] = value
-            if passive:
-                continue
-            paused_now = name in self._outbound_paused
-            if snap.paused and not paused_now:
-                self._stop_outbound_unsafe(name)
-            elif not snap.paused and paused_now and not self._delivery_halted:
-                # So the unpark, which resumes only an engine park, runs.
-                self._gate_parked.add(name)
-                self._unpark_outbound_lane(name)
-            for members, was in (
-                (self._gate_parked, snap.gate_parked),
-                (self._schedule_parked, snap.schedule_parked),
-            ):
-                if was:
-                    members.add(name)
-                else:
-                    members.discard(name)
+            try:
+                self._restore_outbound_lane(name, snap, passive=passive)
+            except Exception:
+                # One lane's restore must not stop the others, or the closes below.
+                log.exception("rollback: could not put outbound %r back", name)
         if state.dr_unbuilt is not None:
             self._dr_unbuilt = dict(state.dr_unbuilt)
         # A connector step 3 retired that no lane holds again is closed too, never left open.
         closing = {id(connector) for _name, connector in to_close}
+        held = {id(connector) for connector in self._destinations.values()}
         for name, connector in state.retired:
-            if connector is not self._destinations.get(name) and id(connector) not in closing:
+            if id(connector) not in held and id(connector) not in closing:
                 closing.add(id(connector))
                 to_close.append((name, connector))
         return to_close
+
+    def _restore_outbound_lane(self, name: str, snap: _LaneSnapshot, *, passive: bool) -> None:
+        """One lane's policies, records and pause state, as :meth:`_restore_outbound_lanes` puts
+        them back (BACKLOG #5755)."""
+        for attr, value in snap.policies:
+            mapping = getattr(self, attr)
+            if value is _ABSENT:
+                mapping.pop(name, None)
+            else:
+                mapping[name] = value
+        key: tuple[Direction, str] = ("outbound", name)
+        records: list[tuple[dict[tuple[Direction, str], Any], Any]] = [(self._failed, snap.failed)]
+        if not passive:
+            records.append((self._filtered, snap.filtered))
+        for record, value in records:
+            if value is _ABSENT:
+                record.pop(key, None)
+            else:
+                record[key] = value
+        if passive:
+            return
+        paused_now = name in self._outbound_paused
+        if snap.paused and not paused_now:
+            if self.knows_outbound(name):
+                self._stop_outbound_unsafe(name)
+            else:
+                # A dropped lane the restore just took the connector from: nothing names it any
+                # more, so the cooperative stop refuses it; park it as an idle lane.
+                self._park_outbound_lane(name)
+        elif not snap.paused and paused_now and not self._delivery_halted:
+            # So the unpark, which resumes only an engine park, runs.
+            self._gate_parked.add(name)
+            self._unpark_outbound_lane(name)
+        for members, was in (
+            (self._gate_parked, snap.gate_parked),
+            (self._schedule_parked, snap.schedule_parked),
+        ):
+            if was:
+                members.add(name)
+            else:
+                members.discard(name)
 
     async def _close_retired(self, retired: list[tuple[str, Any]]) -> list[tuple[str, str]]:
         """Close the connectors a committed reload's step 3 took out of their lanes, in order, and
@@ -9472,8 +9501,8 @@ class RegistryRunner:
                 self._outbound_pass = None
                 # The connectors the refused graph built close detached, scheduled before any await
                 # so a second cancellation cannot skip them, and so a close that hangs does not
-                # hold the reload lock. Guarded, as each rollback step below is: a restore that
-                # raises must not stop the intake restore after it.
+                # hold the reload lock. Guarded, as the sandbox close and the inbound stops and
+                # starts below are: a restore that raises must not stop the intake restore.
                 try:
                     self._close_detached(self._restore_outbound_lanes(outbound_pass, old))
                 except Exception:
@@ -9513,44 +9542,48 @@ class RegistryRunner:
                 raise
             self._outbound_pass = None
 
-            # The swap committed, so nothing can put the previous graph's executor back any more.
-            self._retire_lookup_executor(old_lookup_executor)
-            # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
-            # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
-            for lane in anchors_passed:
-                self._anchor_refused.pop(lane, None)
-            self._forget_removed_anchor_lanes()
-            # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
-            # graph, so an added schedule starts, an edited one changes and a removed one stops
-            # (BACKLOG #2069). After the rollback point on purpose,
-            # so a failed reload leaves every scheduler running against the graph it restored.
+            # BACKLOG #5755: the closes of what step 3 retired run on every exit from here. A raise
+            # or a cancellation anywhere in the commit tail, synchronous or awaited, hands the ones
+            # not yet begun to a detached close rather than leaving them open with nothing holding
+            # them.
+            closes_begun = False
             try:
+                # The swap committed, so nothing can put the previous graph's executor back any more.
+                self._retire_lookup_executor(old_lookup_executor)
+                # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
+                # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
+                for lane in anchors_passed:
+                    self._anchor_refused.pop(lane, None)
+                self._forget_removed_anchor_lanes()
+                # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
+                # graph, so an added schedule starts, an edited one changes and a removed one stops
+                # (BACKLOG #2069). After the rollback point on purpose,
+                # so a failed reload leaves every scheduler running against the graph it restored.
                 await self._reconcile_schedulers()
-            except BaseException:
-                # The only await before the closes below: a raise or a cancellation here must not
-                # leave what step 3 retired open with nothing holding it (BACKLOG #5755).
-                self._close_detached(outbound_pass.retired)
-                raise
 
-            # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
-            # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
-            # always OMITTED response) for byte-identity; the ON branch ALSO wakes RESPONSE lanes, fixing
-            # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
-            # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
-            # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
-            # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
-            # would be a redundant notify_work broadcast).
-            if self._claim_mode != "pooled":
-                _reload_stages = (
-                    (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
-                    if self._per_lane_wake
-                    else (Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
-                )
-                self._wake_all(*_reload_stages)
-            # The swap committed: close what step 3 took out of its lanes (BACKLOG #5755). Last, so
-            # a cancellation that lands in a close finds the rest of the commit done; the closes it
-            # cut off run detached (:meth:`_close_retired`).
-            close_failures = await self._close_retired(outbound_pass.retired)
+                # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
+                # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
+                # always OMITTED response) for byte-identity; the ON branch ALSO wakes RESPONSE lanes, fixing
+                # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
+                # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
+                # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
+                # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
+                # would be a redundant notify_work broadcast).
+                if self._claim_mode != "pooled":
+                    _reload_stages = (
+                        (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+                        if self._per_lane_wake
+                        else (Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
+                    )
+                    self._wake_all(*_reload_stages)
+                # The swap committed: close what step 3 took out of its lanes (BACKLOG #5755). Last, so
+                # a cancellation that lands in a close finds the rest of the commit done; the closes it
+                # cut off run detached (:meth:`_close_retired`).
+                closes_begun = True
+                close_failures = await self._close_retired(outbound_pass.retired)
+            finally:
+                if not closes_begun:
+                    self._close_detached(outbound_pass.retired)
             log.info(
                 "wiring reloaded: %d inbound, %d outbound connection(s)",
                 len(new_registry.inbound),

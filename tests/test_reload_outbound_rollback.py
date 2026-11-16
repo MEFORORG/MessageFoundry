@@ -434,3 +434,87 @@ async def test_a_restore_that_raises_does_not_stop_the_rollback(
 
     assert runner.registry is old
     assert runner.inbound_running("file_in")
+
+
+async def test_a_synchronous_raise_after_the_swap_still_closes_the_retired_connectors(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raise in the commit tail's synchronous steps skipped the closes as an awaited one did."""
+    before = runner._destinations[_OB]
+    closed = _record_closes(runner, monkeypatch)
+
+    def forget_fails() -> None:
+        raise RuntimeError("retain_lanes failed")
+
+    monkeypatch.setattr(runner, "_forget_removed_anchor_lanes", forget_fails)
+    with pytest.raises(RuntimeError, match="retain_lanes"):
+        await runner.reload(_registry(tmp_path, "out_v2", second="out2"))
+    await _settle(runner)
+
+    assert before in closed
+
+
+async def test_a_lane_restore_that_raises_still_closes_the_refused_connectors(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refused graph takes the first lane out of deployment and rebuilds the second. The
+    first lane's restore raises in its unpark. The second lane is still put back, and the
+    connector the refused graph built for it is closed, not lost with the raise."""
+    before = {name: runner._destinations[name] for name in (_OB, "file_out_2")}
+    closed = _record_closes(runner, monkeypatch)
+    refused: list[Any] = []
+    real = runner._reconcile_outbounds
+
+    async def fail_after_forward(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
+        await real(*args, **kwargs)
+        refused.append(runner._destinations["file_out_2"])
+
+        def unpark_fails(name: str) -> None:
+            raise RuntimeError("dispatcher refused the resume")
+
+        monkeypatch.setattr(runner, "_unpark_outbound_lane", unpark_fails)
+        raise RuntimeError("step 3 failed after its last lane")
+
+    monkeypatch.setattr(runner, "_reconcile_outbounds", fail_after_forward)
+    with pytest.raises(RuntimeError, match="after its last lane"):
+        await runner.reload(_registry(tmp_path, "out", deployed=False, second="out2_v2"))
+    await _settle(runner)
+
+    assert refused and refused[0] is not before["file_out_2"]
+    assert runner._destinations["file_out_2"] is before["file_out_2"]
+    assert refused[0] in closed
+    assert runner.inbound_running("file_in")
+
+
+async def test_a_rollback_parks_again_a_dropped_lane_that_was_parked(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane an earlier reload dropped while ``auto_start=False`` parked it has no connector,
+    but it has state. A refused reload that re-adds it with ``auto_start`` on starts it; the
+    rollback parks it again rather than leave it delivering on the refused graph's connector."""
+    base = _registry(tmp_path, "out", second="out2")
+    base.outbound["file_out_2"] = dataclasses.replace(base.outbound["file_out_2"], auto_start=False)
+    rr = RegistryRunner(
+        base, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    await rr.start()
+    try:
+        await rr.reload(_registry(tmp_path, "out"))  # drops the parked file_out_2
+        assert "file_out_2" not in rr._destinations
+        # Dropped and unknown to the registry, so read the park itself.
+        assert "file_out_2" in rr._outbound_paused and "file_out_2" in rr._gate_parked
+        real = rr._reconcile_outbounds
+
+        async def fail_after_forward(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
+            await real(*args, **kwargs)
+            assert rr.outbound_running("file_out_2")  # the refused graph's step 3 started it
+            raise RuntimeError("step 3 failed after its last lane")
+
+        monkeypatch.setattr(rr, "_reconcile_outbounds", fail_after_forward)
+        with pytest.raises(RuntimeError, match="after its last lane"):
+            await rr.reload(_registry(tmp_path, "out", second="out2"))
+
+        assert "file_out_2" in rr._outbound_paused and "file_out_2" in rr._gate_parked
+        assert "file_out_2" not in rr._destinations
+    finally:
+        await rr.stop()
