@@ -5,8 +5,12 @@ refusal on the by-id reads, never an uncaught error (BACKLOG #5388). Synthetic d
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +18,7 @@ import pytest
 
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.uploads import (
+    UploadDamagedError,
     UploadedFileMeta,
     UploadStore,
     UploadUnreadableError,
@@ -77,6 +82,10 @@ async def test_a_sidecar_naming_another_upload_cannot_steer_the_prune(tmp_path: 
         {"uploader_id": ["u-op"]},
         {"filename": {"x": 1}},
         {"filename": "\ud800x.txt"},
+        {"filename": "a" * 300 + ".txt"},
+        {"uploader": "u" * 2000},
+        {"sha256": "0" * 65},
+        {"content_type": "x" * 65},
     ],
     ids=lambda f: next(iter(f)),
 )
@@ -86,9 +95,21 @@ async def test_a_sidecar_with_an_out_of_shape_field_is_left_out(
     store = _keyless(tmp_path)
     kept = await _saved(store, "kept.txt")
     bad = await _saved(store, "bad.txt")
-    _plant(store, bad.file_id, **fields)
-    assert [m.file_id for m in await store.list_files()] == [kept.file_id]
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        # Positive control: an untouched sidecar lists and logs no refusal.
+        assert len(await store.list_files()) == 2
+        assert not any("malformed metadata" in r.getMessage() for r in caplog.records)
+        _plant(store, bad.file_id, **fields)
+        assert [m.file_id for m in await store.list_files()] == [kept.file_id]
     assert any("malformed metadata" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_sidecar_at_the_text_bounds_still_reads(tmp_path: Path) -> None:
+    # The bounds sit past anything save writes, so a field at the bound is not refused.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _plant(store, meta.file_id, uploader="u" * 1024, sha256="0" * 64, filename="a" * 255)
+    assert (await store.get_meta(meta.file_id)).uploader == "u" * 1024
 
 
 async def test_a_planted_filename_is_sanitized(tmp_path: Path) -> None:
@@ -133,10 +154,11 @@ async def test_a_damaged_sidecar_is_refused_on_get_meta_and_delete(
     store = _keyless(tmp_path)
     meta = await _saved(store)
     _sidecar(store, meta.file_id).write_bytes(raw)
-    with pytest.raises(UploadUnreadableError):
-        await store.get_meta(meta.file_id)
-    with pytest.raises(UploadUnreadableError):
-        await store.delete(meta.file_id)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        with pytest.raises(UploadDamagedError):
+            await store.get_meta(meta.file_id)
+        with pytest.raises(UploadDamagedError):
+            await store.delete(meta.file_id)
     # Refused, so nothing was removed, and the scan leaves it out rather than failing.
     assert _sidecar(store, meta.file_id).exists()
     assert await store.list_files() == []
@@ -163,7 +185,13 @@ async def test_a_never_sealable_sidecar_with_a_bad_tail_is_deleted(
     meta = await _saved(store)
     (store._root / f"{meta.file_id}.blob").unlink()  # noqa: SLF001
     _sidecar(store, meta.file_id).write_bytes(b" " * (4 * 64 * 1024) + b"\xff")
-    removed = await store.delete(meta.file_id)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        # Positive control: the read refuses it and that refusal is captured.
+        with pytest.raises(UploadDamagedError):
+            await store.get_meta(meta.file_id)
+        assert any("damaged, refused" in r.getMessage() for r in caplog.records)
+        caplog.clear()
+        removed = await store.delete(meta.file_id)
     assert removed.file_id == meta.file_id
     assert not _sidecar(store, meta.file_id).exists()
     assert not any("damaged, refused" in r.getMessage() for r in caplog.records)
@@ -178,8 +206,116 @@ async def test_a_damaged_body_is_refused_on_read_bytes(tmp_path: Path, raw: byte
     store = _keyless(tmp_path)
     meta = await _saved(store)
     (store._root / f"{meta.file_id}.blob").write_bytes(raw)  # noqa: SLF001
-    with pytest.raises(UploadUnreadableError):
+    with pytest.raises(UploadDamagedError):
         await store.read_bytes(meta.file_id)
+
+
+def _blob(store: UploadStore, fid: str) -> Path:
+    return store._root / f"{fid}.blob"  # noqa: SLF001 - the test plants a file at the seam
+
+
+@pytest.mark.parametrize("part", ["meta", "blob"])
+async def test_a_directory_in_place_of_a_file_is_refused_on_every_by_id_read(
+    tmp_path: Path, part: str
+) -> None:
+    # It answered a server error: the read met IsADirectoryError, or PermissionError on Windows.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    path = _sidecar(store, meta.file_id) if part == "meta" else _blob(store, meta.file_id)
+    path.unlink()
+    path.mkdir()
+    reads = [store.delete, store.get_meta if part == "meta" else store.read_bytes]
+    for read in reads:
+        with pytest.raises(UploadDamagedError):
+            await read(meta.file_id)
+    assert path.is_dir()
+    # Positive control: the same read of a sound upload succeeds.
+    sound = await _saved(store, "sound.txt")
+    assert await store.read_bytes(sound.file_id) == _BODY
+    assert await store.get_meta(sound.file_id) == sound
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+@pytest.mark.parametrize("part", ["meta", "blob"])
+async def test_a_fifo_in_place_of_a_file_is_refused_without_blocking(
+    tmp_path: Path, part: str
+) -> None:
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    path = _sidecar(store, meta.file_id) if part == "meta" else _blob(store, meta.file_id)
+    path.unlink()
+    os.mkfifo(path)
+    read = store.get_meta if part == "meta" else store.read_bytes
+    for call in (read, store.delete):
+        with pytest.raises(UploadDamagedError):
+            # An open of the FIFO would block the worker thread for good.
+            await asyncio.wait_for(call(meta.file_id), timeout=10)
+
+
+_DAY = 86_400
+
+
+def _age(*paths: Path, days: float) -> None:
+    stamp = time.time() - days * _DAY
+    for path in paths:
+        os.utime(path, (stamp, stamp))
+
+
+_REFUSED_PLANTS = {
+    # A sidecar dated far ahead, which the shape check refuses, on a cipher that passes plaintext.
+    "far-future": (_keyless, b"plant"),
+    # One that is not JSON, on the same cipher.
+    "passthrough-not-json": (_keyless, b"{not json"),
+    # One that is not UTF-8, on a keyed store, over a text body: not the never-sealable kind.
+    "keyed-not-utf8": (_keyed, b"\xff\xfe not utf-8"),
+}
+
+
+@pytest.mark.parametrize("case", list(_REFUSED_PLANTS), ids=list(_REFUSED_PLANTS))
+async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
+    tmp_path: Path, case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    factory, raw = _REFUSED_PLANTS[case]
+    store = factory(tmp_path)
+    meta = await _saved(store)
+    if case == "far-future":
+        _plant(store, meta.file_id, uploaded_at=time.time() + 400 * _DAY)
+    else:
+        _sidecar(store, meta.file_id).write_bytes(raw)
+    sidecar, body = _sidecar(store, meta.file_id), _blob(store, meta.file_id)
+    assert await store.list_files() == []  # refused, so not trusted for the listing
+    rows: list[UploadedFileMeta] = []
+
+    async def _audit(row: UploadedFileMeta) -> None:
+        rows.append(row)
+
+    # Fresh on disk: not due.
+    assert (await store.prune_expired(retention_days=30, audit=_audit)).pruned == []
+    # Only the sidecar old: the body's mtime still holds it (the later of the two).
+    _age(sidecar, days=60)
+    assert (await store.prune_expired(retention_days=30, audit=_audit)).pruned == []
+    assert sidecar.exists() and body.exists()
+    _age(sidecar, body, days=60)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = await store.prune_expired(retention_days=30, audit=_audit)
+    assert [m.file_id for m in result.pruned] == [meta.file_id]
+    assert not sidecar.exists() and not body.exists()
+    # Nothing the sidecar claims reaches the permanent audit row.
+    assert [(r.file_id, r.uploader, r.uploader_id, r.filename) for r in rows] == [
+        (meta.file_id, "", "", "")
+    ]
+    assert any("whose sidecar was refused" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_sidecar_the_cipher_declines_is_still_not_pruned(tmp_path: Path) -> None:
+    # Control for the test above: a key rotated away must not destroy data, so a sidecar the cipher
+    # declines (a plaintext one over a text body, on a keyed store) is not aged on disk.
+    store = _keyed(tmp_path)
+    meta = await _saved(store)
+    _sidecar(store, meta.file_id).write_text(json.dumps(asdict(meta)), encoding="utf-8")
+    _age(_sidecar(store, meta.file_id), _blob(store, meta.file_id), days=60)
+    assert (await store.prune_expired(retention_days=30)).pruned == []
+    assert _sidecar(store, meta.file_id).exists()
 
 
 def _chain(exc: BaseException) -> list[BaseException]:
@@ -200,4 +336,4 @@ async def test_a_refusal_carries_no_file_content_on_its_chain(tmp_path: Path) ->
     for read in (store.get_meta, store.read_bytes, store.delete):
         with pytest.raises(UploadUnreadableError) as info:
             await read(meta.file_id)
-        assert [type(e) for e in _chain(info.value)] == [UploadUnreadableError]
+        assert [type(e) for e in _chain(info.value)] == [UploadDamagedError]

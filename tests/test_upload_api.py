@@ -1551,7 +1551,26 @@ async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
                     await c.delete(f"/uploads/{fid}", headers=headers),
                 ):
                     assert r.status_code == status, r.text
+                    if status == 423:
+                        # Its own text: rotate-key repairs nothing here (BACKLOG #5388).
+                        assert "damaged" in r.json()["detail"]
+                        assert "rotate-key" not in r.json()["detail"]
             assert (root / f"{fid}.meta").exists()
+        # A damaged body, under a sound sidecar, answers the damaged 423 to its own owner too, and
+        # a directory in place of the body does not answer a 500.
+        for damage in ("bytes", "dir"):
+            fid = (
+                await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+            ).json()["file_id"]
+            blob = root / f"{fid}.blob"
+            if damage == "bytes":
+                blob.write_bytes(b"not base64!")
+            else:
+                blob.unlink()
+                blob.mkdir()
+            r = await c.get(f"/uploads/{fid}/messages", headers=h)
+            assert r.status_code == 423, r.text
+            assert "damaged" in r.json()["detail"]
 
 
 @_BREAKS
