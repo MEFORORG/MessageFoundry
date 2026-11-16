@@ -17,11 +17,13 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 from __future__ import annotations
 
 import bisect
+import hashlib
 import importlib.util
 import io
 import json
 import random
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -1038,20 +1040,747 @@ def test_the_step_four_rules_leave_versions_and_other_tables_alone(
     assert sf.scan_pr_body(body) == [], (item, body)
 
 
+_HEADER_TABLE_ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
+_HEADER_TABLE_ONE = f"| ASVS | Note | Result |\n| --- | --- | --- |\n{_HEADER_TABLE_ROW}"
+#: The bodies of the header-table test below, by name, so the frozen-main guard reads them too.
+_PR_HEADER_TABLE_BODIES = {
+    "one": _HEADER_TABLE_ONE,
+    "two": _HEADER_TABLE_ONE
+    + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n"
+    + _HEADER_TABLE_ROW,
+    "placeholder": f"| ASVS | Note | Result |\n|---|---|---|\n| - | - | - |\n{_HEADER_TABLE_ROW}",
+    "wrong-column": (
+        f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
+    ),
+}
+
+
 def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
     """The ASVS header of one table must not mark the identifiers of the next one, or of prose below."""
-    row = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
-    one = f"| ASVS | Note | Result |\n| --- | --- | --- |\n{row}"
-    assert sf.scan_pr_body(one), "the control must fire, or the next two assert nothing"
-    two = one + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n" + row
-    assert sf.scan_pr_body(two) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
+    bodies = _PR_HEADER_TABLE_BODIES
+    assert sf.scan_pr_body(bodies["one"]), "the control must fire, or the next two assert nothing"
+    assert sf.scan_pr_body(bodies["two"]) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
     # A placeholder row of dashes is data, not a delimiter, and must not wipe the marked column.
-    placeholder = f"| ASVS | Note | Result |\n|---|---|---|\n| - | - | - |\n{row}"
-    assert sf.scan_pr_body(placeholder) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
-    wrong_column = (
-        f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
+    assert sf.scan_pr_body(bodies["placeholder"]) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
+    assert sf.scan_pr_body(bodies["wrong-column"]) == []
+
+
+#: BACKLOG #3364 steps 5 to 12, engine PR 2893's open review findings. Every body fires with the kind
+#: it is listed under. Most steps have a quiet control below: the same shape with what made it a record
+#: taken out. Step 8 has none: the loose column reading, which keeps main's column marks, still
+#: shifts a column at an escaped pipe where main did.
+_HEAD = "| ASVS | Note | Result |\n|---|---|---|\n"
+_ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
+_PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
+    # Step 5: a dash-only placeholder row after the first data row is data, not a delimiter, so the
+    # row above it is not re-read as a header and the ASVS column stays marked.
+    ("5", "verdict", f"{_HEAD}| a | b | c |\n| - | - | - |\n{_ROW}"),
+    ("5", "verdict", f"{_HEAD}| a | b | c |\n|---|---|---|\n{_ROW}"),
+    # Step 6: a rule or a dash-only paragraph after a table is not a delimiter, so the table's last row
+    # is not read as a header.
+    ("6", "verdict", f"{_HEAD}{_ROW}\n---"),
+    ("6", "verdict", f"{_HEAD}{_ROW}\n- - -"),
+    ("6", "verdict", f"{_HEAD}{_ROW}\n\n---"),
+    # Step 8: an escaped pipe inside a cell is not a cell edge, in the header or in the row.
+    # A spacer cell keeps the verdict away from the identifier, so only the column can mark it.
+    ("8", "verdict", f"| a \\| b | ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    ("8", "verdict", f"| x | ASVS | Note | Result |\n|---|---|---|---|\n| a \\| b {_ROW}"),
+    # Step 10's must-fire controls: the shapes of the six bodies engine PR 2893's review named, beside
+    # a marked identifier. Step 10 is open (_PR_2893_FALSE_POSITIVE_BODIES says why).
+    ("10", "verdict", f"| ASVS {_REQ} | the parser | never fails |"),
+    ("10", "verdict", f"ASVS {_REQ} is cited; the row is not failing now."),
+    ("10", "verdict", f"| ASVS {_REQ} | the parser | has never been failing |"),
+    # Step 11: emphasis on the relative pronoun after a comma.
+    ("11", "verdict", f"ASVS {_REQ}, _which_ stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ}, **that** is {_PARTIAL}."),
+    # Step 11: an ASVS major version between "ASVS" and the identifier.
+    ("11", "gap", f"ASVS v5 {_REQ} lacks a row-completeness pin."),
+    ("11", "gap", f"ASVS 5 {_REQ} lacks a row-completeness pin."),
+    # Step 11: header spellings that name the column ASVS.
+    ("11", "verdict", f"| ASVS: | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS reference | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| Requirement (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| OWASP ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS_ID | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS-ID | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS # | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| Control (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # "No." before "ASVS" is the abbreviation for "number", not a disclaimer.
+    ("11", "verdict", f"| Ref No. (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: underscore emphasis at the word-boundary sites that bind.
+    ("11", "verdict", f"_{_PARTIAL}_: {_REQ}"),
+    ("11", "verdict", f"For {_REQ} the _cell_ stays {_PARTIAL}."),
+    ("11", "verdict", f"For {_REQ} the vault _re-score_ to {_PASS} landed."),
+    ("11", "gap", f"The _gap_ keeps {_REQ} open."),
+    ("11", "map", f"{_REQ} is enforced in _pkg/example_guard.py_."),
+    ("11", "map", f"{_REQ} is enforced in _messagefoundry.example_guard_."),
+    ("11", "map", f"{_REQ} is enforced at _github.com/example/repo/blob/main/x.txt_"),
+    ("11", "map", f"{_REQ} is enforced in _scripts/example_guard_ now."),
+    # Step 11: a zero-width character around a cell, around the verdict or the identifier.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |\u200bisn't {_MET}\u200b|"),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |\ufeff{_PARTIAL}\u2060|"),
+    # Any invisible format character, not only a zero-width one: a left-to-right mark.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |{chr(0x200E)}stays {_PARTIAL}{chr(0x200E)}|"),
+    ("11", "verdict", f"| {chr(0x200B)}ASVS `{_REQ}`{chr(0x200B)} | the limb | {_PARTIAL} |"),
+    ("11", "verdict", f"|\u200b{_REQ}\u200b| the limb | stays {_PARTIAL} |"),
+    # A tag character from outside the Basic Multilingual Plane, and invisible characters inside a
+    # cell, a header cell or a prose word rather than around them.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |{chr(0xE0020)}stays {_PARTIAL}{chr(0xE0020)}|"),
+    ("11", "verdict", f"| ASVS{chr(0x200B)}{_REQ} | the limb | {_PASS.title()} (12 messages) |"),
+    ("11", "verdict", f"| AS{chr(0x200B)}VS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "gap", f"AS{chr(0x200D)}VS {_REQ} lacks a row-completeness pin."),
+    # Default-ignorable characters outside the format category: a combining grapheme joiner and
+    # variation selectors, inside a word.
+    ("11", "gap", f"AS{chr(0x034F)}VS {_REQ} lacks a row-completeness pin."),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xFE0F)}tial |"),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xE0100)}tial |"),
+    # Step 5: a pipe line above the header renders as a paragraph, and the table starts at the header.
+    ("5", "verdict", f"| Summary |\n{_HEAD}{_ROW}"),
+    # Step 8: a header whose first cell is empty keeps its columns where they render.
+    ("8", "verdict", f"|| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    # An unmarked verdict-state cell after "never", and "row" before a verdict state, bind.
+    ("10", "verdict", f"| {_REQ} | the parser | never {_MET} |"),
+    ("10", "verdict", f"The row stays {_PARTIAL} for {_REQ}."),
+    ("10", "verdict", f"The row is not {_PARTIAL} for {_REQ}."),
+    # Review round 3's three losses against main, each flagged by main. A header and delimiter pair
+    # GFM rejects (a cell-count mismatch, a delimiter cell that is not dashes) renders no table, so the
+    # valid ASVS header below it in the same run still marks its column.
+    ("5", "verdict", f"| Version | Note |\n|---|---|---|\n| a | b | c |\n{_HEAD}{_ROW}"),
+    (
+        "5",
+        "verdict",
+        f"| Version | Note | Result |\n| - - | - - | - - |\n| a | b | c |\n{_HEAD}{_ROW}",
+    ),
+    # A line holding only an invisible character is not blank, and one before "- " or "#" starts no
+    # list item or heading, so the paragraph stays whole.
+    ("11", "map", f"{_REQ} is enforced in\n{chr(0x200B)}\npkg/example_guard.py."),
+    ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}- in pkg/example_guard.py."),
+    ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}# in pkg/example_guard.py."),
+    # "the row" then a CI verb that is not negated binds an unmarked identifier too, so this body would
+    # bind with no mark and does not test _PR_MARK_AFTER; the negated body after it does.
+    ("10", "verdict", f"{_REQ}: the row is failing."),
+    # Punctuation binding the identifier to "the row" marks it (_PR_MARK_AFTER). Nothing exempts this
+    # body unmarked either, so it pins only that the marked form still binds.
+    ("10", "verdict", f"{_REQ}: the row is not failing."),
+    # Review pass 3's new loss: with no GFM-valid pair in the run, a mistyped delimiter under an
+    # ASVS header still marks the column, as main read it.
+    ("5", "verdict", f"| ASVS | Note | Result |\n|---|---|\n{_ROW}"),
+    ("5", "verdict", f"| ASVS | Note | Result |\n| - - | - - | - - |\n{_ROW}"),
+    # Review round-edb619bb's losses against main, restored by uniting each GFM reading with main's: an invisible
+    # character that is the only separator, a no-break-space line inside a table, and an ASVS table
+    # stacked under another with no blank line.
+    ("11", "map", f"{_REQ}{chr(0x200B)}is enforced in pkg/example_guard.py."),
+    ("11", "verdict", f"{_REQ}: {_PARTIAL}{chr(0x200B)}pending review."),
+    ("9", "verdict", f"{_HEAD}{chr(0xA0)}\n{_ROW}"),
+    ("5", "verdict", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n{_HEAD}{_ROW}"),
+    # A record verb after "the row" names a verdict even where the first one is a CI verb.
+    ("10", "verdict", f"{_REQ} is listed here; the row went from failing to {_PARTIAL}."),
+    ("10", "verdict", f"{_REQ} is listed here; the row re-scored as failing."),
+    # A cell opening with "unchanged" or a record verb states a verdict, "never" or not.
+    ("10", "verdict", f"| {_REQ} | x | unchanged, never failing. |"),
+    ("10", "verdict", f"| {_REQ} | x | stays never failing |"),
+    # A version-lead word in underscore emphasis is no lead, as main reads it, so the id stays one.
+    ("11", "gap", f"This applies _to_ {_REQ}, which is not yet implemented."),
+    ("11", "gap", f"_Section_ {_REQ} is not yet implemented."),
+    # Review round-6565ebbf's new loss: "row" with a CI verb that is not negated still binds an
+    # unmarked id, whether "the row" follows the id directly or a clause away.
+    ("10", "verdict", f"For {_REQ} the row is failing."),
+    ("10", "verdict", f"{_REQ} was reviewed; the row is still failing."),
+    # A blank line is a whole GFM line, between "\n", "\r\n" or "\r": a form feed or a line separator at
+    # a row's end opens no blank line, so the table stays whole. A ">" then a no-break space is a quoted
+    # line, not a blank one.
+    ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x0C)}\n{_ROW}"),
+    ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x2028)}\n{_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>{chr(0xA0)}\n> {_ROW}",
+    ),
+    # Review round-35a5429f's new loss: a table whose lines a bare separator joins, with no "\n", is
+    # still read as main read it, a line per separator.
+    ("5", "verdict", _HEAD.replace(chr(10), chr(0x2028)) + _ROW),
+    ("5", "verdict", _HEAD.replace(chr(10), chr(0x0C)) + _ROW),
+    # Review round-23e833d96f's new loss: two separators in a row open an empty line inside a GFM line
+    # with content, which is not a blank line, so the table is not ended there.
+    (
+        "9",
+        "verdict",
+        _HEAD.replace(chr(10), chr(0x2028)) + f"| a | b | c |{chr(0x0C)}{chr(0x2028)}{_ROW}",
+    ),
+    ("9", "verdict", f"Intro.{chr(0x85) * 2}" + _HEAD.replace(chr(10), chr(0x85) * 2) + _ROW),
+    # Review round-6926d71d81 finding 1, each flagged by main: a quote-marker-only line under a quoted
+    # row inside an unquoted ASVS table is not a blank line, lone, padded or doubled, with the row
+    # below it unquoted or quoted. Only a quoted table ends at one.
+    *(
+        ("9", "verdict", f"{_HEAD}> | a | b | c |\n{marker}\n{below}{_ROW}")
+        for marker in (">", "  >  ", "> >")
+        for below in ("", "> ")
+    ),
+    # A quoted table whose row below the quote-marker-only line is unquoted keeps the mark too.
+    ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n{_ROW}"),
+    # Finding 3, each flagged by main: a blank line between an ASVS header and its delimiter, or
+    # between the delimiter and the first data row, lone, padded or doubled, ends nothing, unquoted or
+    # quoted.
+    *(
+        ("9", "verdict", body)
+        for blank in ("", "  ", "\n")
+        for body in (
+            f"| ASVS | Note | Result |\n{blank}\n|---|---|---|\n{_ROW}",
+            f"{_HEAD}{blank}\n{_ROW}",
+        )
+    ),
+    ("9", "verdict", f"> | ASVS | Note | Result |\n>\n> |---|---|---|\n> {_ROW}"),
+    ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}\n> {_ROW}"),
+    # Step 9 is removed: a blank line, or a quote-marker-only line in a quoted table, between data
+    # rows ends nothing, so the header still marks the rows below it, as main reads it. The first
+    # body is the one step 9 quieted; its false positive stays open on BACKLOG #3364.
+    *(
+        ("9", "verdict", f"{_HEAD}| a | b | c |\n{blank}\n{_ROW}")
+        for blank in ("", "  ", "\n", "\r")
+    ),
+    ("9", "verdict", f"{_HEAD}| a | b | c |\r\n\r\n{_ROW}"),
+    *(
+        (
+            "9",
+            "verdict",
+            f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n{marker}\n> {_ROW}",
+        )
+        for marker in (">", "  >  ", "> >", ">\n>")
+    ),
+    # Review round-b3037cd314's losses, each flagged by main: a quote-marker-only line ends a table
+    # only where every row since the last non-row unit is quoted. An unquoted header above a blank
+    # line, an unquoted header under a quoted pipe line, an unquoted delimiter or data row, and a
+    # ">" behind four spaces or a tab (a code line, not a quote) each keep the mark.
+    ("9", "verdict", f"{_HEAD}\n> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"| ASVS | Note | Result |\n\n> |---|---|---|\n> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"> | Summary |\n{_HEAD}> | a | b | c |\n>\n> {_ROW}"),
+    ("9", "verdict", f"> | ASVS | Note | Result |\n|---|---|---|\n> | a | b | c |\n>\n> {_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"> | ASVS | Note | Result |\n> |---|---|---|\n| a | b | c |\n> | d | e | f |\n>\n> {_ROW}",
+    ),
+    *(
+        (
+            "9",
+            "verdict",
+            f"{lead}> | ASVS | Note | Result |\n{lead}> |---|---|---|\n{lead}> | a | b | c |\n"
+            f"{lead}>\n{lead}> {_ROW}",
+        )
+        for lead in ("    ", "\t")
+    ),
+    # Review round-25a1cb2995's losses, each flagged by main. A ">" after a separator only
+    # str.splitlines ends a line at lies inside a GFM line, so it is content, not a quote marker, and
+    # the table is not a quoted one, whether the separator leads the row below or the header.
+    *(
+        (
+            "9",
+            "verdict",
+            f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n{chr(code)}> {_ROW}",
+        )
+        for code in (0x0C, 0x85, 0x2028)
+    ),
+    *(
+        (
+            "9",
+            "verdict",
+            f"Intro{chr(code)}> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n> {_ROW}",
+        )
+        for code in (0x0C, 0x85, 0x2028)
+    ),
+    # A cell that goes on past "never failing" keeps the row bound.
+    ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
+    ("10", "verdict", f"| {_REQ} | the parser | is never failing; stays failing |"),
+    ("10", "verdict", f"| {_REQ} | the parser | is never failing; re-scored as failing |"),
+    # Review round-4aa302cd29's losses, each flagged by main: a verdict that never needed the clause
+    # stays, beside a version-lead word, "HL7" or a tight pair.
+    (
+        "10",
+        "verdict",
+        f"| Tool | Check | Requirement | Verdict |\n|---|---|---|---|\n| uv | never fails | {_REQ} | met |",
+    ),
+    (
+        "10",
+        "verdict",
+        f"| Job | CI | Req | Result |\n|---|---|---|---|\n| smoke-test | never passing | {_REQ} | not met |",
+    ),
+    ("10", "verdict", f"| unchanged, partial | na | smoke-test | never fails; | {_REQ_B} |"),
+    ("10", "verdict", f"Per Python row is not failing {_REQ} is met."),
+    ("10", "verdict", f"HL7 row is not failing V{_REQ} is met."),
+    ("10", "verdict", f"Build 3.14.0 | row is not failing pass, and\n{_REQ}: fail closed."),
+    ("10", "verdict", f"[{_REQ_B}] row is not failing pass and\n{_REQ}: fail closed."),
+    # A marked identifier is never exempt.
+    ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
+    ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
+]
+#: The six bodies engine PR 2893's review named as false positives: CI prose and a component row about
+#: HL7 v2.5.1. Main flags each. Step 10, which an earlier head of this branch built to drop them, was
+#: removed, because it dropped a verdict only from a body exactly equal to one of the six, which no
+#: real pull request body is. So each fires here as on main, and quieting them stays open on #3364.
+_PR_2893_FALSE_POSITIVE_BODIES = (
+    "| 2.5.1 | parser | never fails |",
+    "The row is not failing for 2.5.1 batches.",
+    "The row isn't passing for 2.5.1 batches.",
+    "| 2.5.1 | parser | is never failing. |",
+    "| 2.5.1 | parser | has never been failing |",
+    "Since 2.5.1 the row is not failing.",
+)
+#: Bodies main flags through a "row is not failing" or "never fails" clause, or beside one. Each must
+#: fire on main and on head, at main's lines, and a future repair of the PR 2893 false positives must
+#: not drop them. The first ten are the Lander's hold on engine PR 2980 (blocking points 1 to 3); the
+#: next nineteen are the bodies review rounds 4f580a28dd and b628ef8690 listed (the first two of them
+#: say "tests pass" or "will fail" after the clause); then review rounds cc2be34b's and df2d868b's;
+#: then the final round's on head 28bcdc34ef; then the six PR 2893 bodies, one-step edits of them,
+#: and tables whose last row is one of them. A body listed twice (an edit that is also hand-written)
+#: runs once.
+_PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
+    f"The row is not failing: {_REQ} here.",
+    f"| never fails: {_REQ} |",
+    f"| {_REQ} | x | never failing: {_REQ} |",
+    f"For {_REQ} the row is not failing, it is {_PARTIAL}.",
+    f"For {_REQ} the row is not failing, it is {_NA}.",
+    f"For {_REQ} the row is not failing; ASVS score is {_PARTIAL}.",
+    f"{_REQ} (the row is not failing) stays {_PARTIAL}.",
+    f"{_REQ}, where the row is not failing, stays {_PARTIAL}.",
+    f"{_REQ} -> the row is not failing.",
+    f"{_REQ} | the row is not failing.",
+    "The row is not failing for 2.5.1 batches; all twelve tests pass.",
+    "The row is not failing for 2.5.1 batches and the gate will fail.",
+    f"For {_REQ} the row is not failing but stays {_PARTIAL}.",
+    f"For {_REQ} the row is not failing: {_PARTIAL}.",
+    f"For {_REQ} the row is not passing yet, it remains {_PARTIAL}.",
+    f"For {_REQ} the row is not failing yet and remains at failing in the vault.",
+    f"| {_REQ} | parser | is never failing; remains at failing |",
+    f"| {_REQ} | x | has never been failing, remains at failing |",
+    f"| {_REQ} | the parser | is never failing; re-scored to failing |",
+    f"| {_REQ} | the parser | is never failing; the cell is failing |",
+    f"| {_REQ} | the parser | is never failing; the row is failing |",
+    f"| {_REQ} | is never failing | re-scored to failing |",
+    f"It stays {_PARTIAL} for now; see {_REQ}, where the row is not failing.",
+    f"{_PARTIAL.title()} - for {_REQ} the row is not failing.",
+    f"For {_REQ} the row is not failing on the nightly runner for the reasons in the follow-up"
+    f" thread, but it stays {_PARTIAL}.",
+    f"For {_REQ} the row is not failing: stays: failing.",
+    f"For {_REQ} the row is not failing - stays - failing.",
+    f"For {_REQ} the row is not failing -> failing.",
+    f"For {_REQ} the row is not failing; it reads failing.",
+    # Review round-cc2be34b: emphasis, a second sentence or line, record words that carry no verdict
+    # word, a second identifier on a later line, and a record word in a shape's free slot.
+    f"For {_REQ} the row is not failing, it is ___{_PARTIAL}___.",
+    f"| {_REQ} | never fails | it is ___{_PARTIAL}___ |",
+    f"For {_REQ} the row is not failing. It stays {_PARTIAL}.",
+    f"For {_REQ} the row is not failing.\nIt stays {_PARTIAL}.",
+    f"- For {_REQ} the row is not failing.\n  It stays {_PARTIAL}.",
+    "The row is not failing for 2.5.1 batches.\nAll twelve tests pass.",
+    f"For {_REQ} the row is not failing; it passed.",
+    f"For {_REQ} the row is not failing (re-scored last week).",
+    f"For {_REQ} the row is not failing; the verdict is unchanged.",
+    f"| {_REQ} | never fails | stays at the same grade |",
+    f"For {_REQ} the row is not failing for\nASVS {_REQ_B}.",
+    f"Since 2.5.1 the row is not failing for\nASVS {_REQ_B}.",
+    f"For {_REQ} the row is not failing:\n{_REQ_B} here.",
+    f"| {_REQ} | unchanged | never fails |",
+    f"| {_REQ} | {_PARTIAL} | never fails |",
+    f"| {_REQ} | graded | never fails |",
+    f"The row is not failing for {_REQ} {_PARTIAL}.",
+    f"The row is not failing for {_REQ} unchanged.",
+    f"The row is not failing for ASVS {_REQ} batches.",
+    f"The row is not failing for {_REQ}: batches.",
+    f"Since {_REQ} the row is not failing: {_PARTIAL}.",
+    f"Since **{_REQ}** the row is not failing.",
+    # Review round-df2d868b: a requirement-shaped number other than 2.5.1, a gap or record word in
+    # the component cell or after the number, and the shapes' near variants.
+    f"| {_REQ} | logging | never passes |",
+    f"| {_REQ_B} | session | is never passing |",
+    f"The row is not passing for {_REQ} yet.",
+    f"The row is no longer failing for {_REQ_B}.",
+    f"Since {_REQ}, the row is not failing.",
+    f"| {_REQ_B} | gap | never fails |",
+    "The row is not failing for 2.5.1 gaps.",
+    f"| {_REQ} | residual | is never passing |",
+    f"| {_REQ} | rescore | never fails |",
+    f"| {_REQ} | regraded | never fails |",
+    f"| {_REQ} | vault | never passes |",
+    f"The row is not passing for {_REQ} regrade.",
+    "| 2.5.1 | satisfied | never fails |",
+    "| 2.5.1 | meets | never fails |",
+    "The row is no longer passing for 2.5.1 batches.",
+    "Since 2.5.1, the row isn’t passing.",
+    "| 2.5.1 | parser | never passes |",
+    "| 2.5.1 | parser | is never passing |",
+    "The row is not failing for 2.5.1.",
+    "The row is not failing for 2.5.1 batches either.",
+    # The last, unrepaired review round on head 28bcdc34ef: an earlier draft matched the PR 2893
+    # shapes as two case-insensitive regular expressions against one rendered unit, so it dropped
+    # bodies not among the six. A cross product of the shapes' alternatives, other case, a heading or
+    # another unit around the shape, and rendering (a quote marker, an indent, a link, a wrapped line,
+    # surrounding whitespace).
+    "The row isn't failing for 2.5.1 batches.",
+    "The row is not passing for 2.5.1 batches.",
+    "Since 2.5.1 the row isn't failing.",
+    "the row is not failing for 2.5.1 batches.",
+    "THE ROW IS NOT FAILING FOR 2.5.1 BATCHES.",
+    "since 2.5.1 the row is not failing.",
+    "| 2.5.1 | Parser | never fails |",
+    "| 2.5.1 | PARSER | NEVER FAILS |",
+    f"## ASVS {_REQ}\n\nThe row is not failing for {_REQ} batches.",
+    f"ASVS {_REQ}\n\n| {_REQ} | parser | never fails |",
+    "> The row is not failing for 2.5.1 batches.",
+    "    The row is not failing for 2.5.1 batches.",
+    "> | 2.5.1 | parser | never fails |",
+    "  | 2.5.1 | parser | never fails |",
+    f"| [{_REQ}](https://example.com/asvs#{_REQ}) | parser | never fails |",
+    "The row is not failing\nfor 2.5.1 batches.",
+    "The row is not failing for 2.5.1 batches.\n",
+    " The row is not failing for 2.5.1 batches.",
+    *_PR_2893_FALSE_POSITIVE_BODIES,
+    # One-step edits of each PR 2893 body: case, a lead or trailing character, a quote marker, an
+    # indent, a second paragraph.
+    *sorted(
+        {
+            edit
+            for body in _PR_2893_FALSE_POSITIVE_BODIES
+            for edit in (
+                body.lower(),
+                body.upper(),
+                body.swapcase(),
+                f" {body}",
+                f"{body} ",
+                f"{body}\n",
+                f"\n{body}",
+                f"> {body}",
+                f"    {body}",
+                f"{body}\n\nMore.",
+                f"Intro.\n\n{body}",
+            )
+        }
+        - set(_PR_2893_FALSE_POSITIVE_BODIES)
+    ),
+    # A PR 2893 row as a table's last row, under a header (a Requirement or Cell header, ASVS in
+    # another column, or ASVS over the row's own column), or after a blank line under an ASVS table.
+    *(
+        f"{header}\n|---|---|---|\n| 2.5.1 | parser | never fails |"
+        for header in (
+            "| Requirement | Component | Result |",
+            "| Cell | Component | Result |",
+            "| Version | Component | ASVS |",
+            "| ASVS | Component | Result |",
+        )
+    ),
+    f"{_HEAD}| a | b | c |\n\n| 2.5.1 | parser | never fails |",
+]
+_PR_ROW_CLAUSE_MUST_FIRE = list(dict.fromkeys(_PR_ROW_CLAUSE_MUST_FIRE))
+_PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
+    # Step 5: the same placeholder rows under a header that does not name the column ASVS.
+    ("5", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n| - | - | - |\n{_ROW}"),
+    # Step 6: the same rules after a table whose header does not name the column ASVS.
+    ("6", f"| Version | Note | Result |\n|---|---|---|\n{_ROW}\n---"),
+    # A second table after a blank line takes its own header, as main reads it.
+    ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
+    ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
+    # Step 11: a header naming a requirement but not ASVS, or disclaiming ASVS, marks no column.
+    ("11", f"| Requirement | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Non-ASVS ref | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: a snake_case join is not emphasis, so these words stay inside their names.
+    ("11", "The `retry_gap` setting is read for 2.5.1 batches."),
+    ("11", "The example_row_is_failing flag is set for 2.5.1 batches."),
+    # Step 11: zero-width characters around a cell beside an unmarked HL7 version.
+    ("11", f"| 2.5.1 | ADT^A01 |\u200b{_PASS.title()} (12 messages)\u200b|"),
+    # Review round-23e833d96f's false positives against main, quiet on main: an emphasis underscore
+    # after "/" starts no code root mid-path, and a negation before "ASVS" in a header cell, however
+    # it is marked up or spaced, names no column.
+    ("11", f"ASVS {_REQ} notes live in site/_tests/notes for reviewers."),
+    ("11", f"{_REQ} notes: see site/_tests/notes."),
+    ("11", f"| Version (**not** ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not an ASVS id) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not  ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Not in ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
+]
+
+
+@pytest.mark.parametrize(
+    ("step", "kind", "body"),
+    _PR_FINDINGS_MUST_FIRE,
+    ids=[f"step{step}-{i}" for i, (step, _, _) in enumerate(_PR_FINDINGS_MUST_FIRE)],
+)
+def test_a_pr_body_shape_engine_pr_2893_review_found_is_flagged(
+    sf, step: str, kind: str, body: str
+) -> None:
+    """BACKLOG #3364 steps 5 to 12. Most bodies went through engine PR 2893's detector unflagged. The
+    rest are regression pins that main flags and an earlier round of this branch lost, or controls
+    beside a marked identifier; each is commented where it is listed."""
+    assert kind in _pr_kinds(sf, body), (step, body)
+
+
+@pytest.mark.parametrize("body", _PR_ROW_CLAUSE_MUST_FIRE)
+def test_a_row_clause_body_main_flags_fires_at_mains_lines(sf, sf_frozen_main, body: str) -> None:
+    """Each body fires on main and on head, and head reports every hit main reports, at main's line.
+    The six PR 2893 bodies are among them: nothing quiets them (_PR_2893_FALSE_POSITIVE_BODIES)."""
+    main_hits = set(sf_frozen_main.scan_pr_body(body))
+    assert main_hits, body
+    assert main_hits <= set(sf.scan_pr_body(body)), body
+
+
+@pytest.mark.parametrize(
+    ("step", "body"),
+    _PR_FINDINGS_MUST_STAY_QUIET,
+    ids=[f"step{step}-{i}" for i, (step, _) in enumerate(_PR_FINDINGS_MUST_STAY_QUIET)],
+)
+def test_the_review_finding_repairs_leave_versions_and_other_tables_alone(
+    sf, step: str, body: str
+) -> None:
+    assert sf.scan_pr_body(body) == [], (step, body)
+
+
+# --- the frozen-main superset guard ------------------------------------------------------------------
+#: origin/main's scanner before BACKLOG #3364's repairs, vendored byte for byte: blob ac2aa30e of
+#: scripts/security/scan_forbidden.py, last changed at main 73d9236f3b (BACKLOG #5582's readings). A
+#: vendored copy, not ``git show origin/main``: once this branch merges, origin/main IS the head, and a
+#: CI checkout need not hold that ref. Never edited; the blob id below pins it.
+_FROZEN_MAIN_PATH = (
+    Path(__file__).parent / "fixtures" / "scan_forbidden" / "scan_forbidden_main.py.txt"
+)
+_FROZEN_MAIN_BLOB = "ac2aa30e7a42c4ecaa388dab9a03326b51af74cc"
+#: The separators str.splitlines ends a line at and GFM does not.
+_SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
+
+
+def _frozen_main_bytes() -> bytes:
+    # A Windows checkout may hold the fixture with CRLF; git stores it with LF.
+    return _FROZEN_MAIN_PATH.read_bytes().replace(b"\r\n", b"\n")
+
+
+@pytest.fixture(scope="module")
+def sf_frozen_main():
+    spec = importlib.util.spec_from_loader("scan_forbidden_frozen_main", loader=None)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    # Its module-level paths resolve against the scanner's own location, as they did on main.
+    module.__file__ = str(_SCANNER_PATH)
+    exec(compile(_frozen_main_bytes(), str(_FROZEN_MAIN_PATH), "exec"), module.__dict__)  # noqa: S102
+    return module
+
+
+def _superset_bodies() -> dict[str, str]:
+    """The clean body, the bodies of every PR-body must-fire and must-stay-quiet list above (verdict,
+    gap, map, version, residue, cell markup, step 4, steps 5 to 12, and the row-clause list)
+    and of the header-table test,
+    the review rounds' bodies, and tables whose lines each separator joins, one and two in a row, with
+    and without a line ending after them. Bodies other tests build inline are not in it."""
+    bodies: dict[str, str] = {"clean": _PR_CLEAN_BODY}
+    plain = [
+        *_PR_VERDICT_MUST_FIRE,
+        *_PR_GAP_MUST_FIRE,
+        *_PR_MAP_MUST_FIRE,
+        *_PR_VERSION_MUST_STAY_QUIET,
+        *(body for _, body in _PR_RESIDUE_MUST_FIRE),
+        *_PR_RESIDUE_MUST_STAY_QUIET,
+        *_PR_CELL_MARKUP_MUST_FIRE,
+    ]
+    bodies.update({f"plain-{i}": body for i, body in enumerate(plain)})
+    bodies.update(
+        {f"step4-fire-{i}-{item}": body for i, (item, _, body) in enumerate(_PR_STEP4_MUST_FIRE)}
     )
-    assert sf.scan_pr_body(wrong_column) == []
+    bodies.update(
+        {
+            f"step4-quiet-{i}-{item}": body
+            for i, (item, body) in enumerate(_PR_STEP4_MUST_STAY_QUIET)
+        }
+    )
+    bodies.update({f"header-table-{name}": body for name, body in _PR_HEADER_TABLE_BODIES.items()})
+    bodies.update({f"row-clause-{i}": body for i, body in enumerate(_PR_ROW_CLAUSE_MUST_FIRE)})
+    bodies.update(
+        {f"must-fire-{i}-step{s}": body for i, (s, _, body) in enumerate(_PR_FINDINGS_MUST_FIRE)}
+    )
+    bodies.update(
+        {
+            f"stay-quiet-{i}-step{s}": body
+            for i, (s, body) in enumerate(_PR_FINDINGS_MUST_STAY_QUIET)
+        }
+    )
+    marked_head = "| x | ASVS | Note | Result |\n|---|---|---|---|\n"
+    bodies.update(
+        {
+            "reviewer-numbering": f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}.",
+            "reviewer-numbering-invisible": (
+                f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}.\n\n"
+                f"ASVS {_REQ} stays{chr(0x200B)} {_PARTIAL}."
+            ),
+            "reviewer-row-not-passing": f"{_REQ} is listed; the row is not passing yet.",
+            "reviewer-invisible-row": f"{marked_head}{chr(0x200B)}| {_REQ} | x | y | {_PASS} |",
+            # Review round-a924aac4a5: a tag right after a split's trailing space, and an earlier
+            # identifier a repair made bind in a hard-wrapped sentence.
+            "reviewer-tag-space-tag": (
+                f"<ul><li>Intro</li> <li>{_REQ} is not yet implemented</li></ul>"
+            ),
+            "reviewer-tag-space-tag-verdict": f"a -> b</p> <p>{_REQ} is {_PARTIAL}.",
+            "reviewer-wrapped-gap": (
+                f"This updates ASVS v5 {_REQ} and\n{_REQ_B}, which are not yet implemented."
+            ),
+            "reviewer-wrapped-verdict": (
+                f"{_REQ}, _which_ stays {_PARTIAL}, and\n{_REQ_B} stays {_PARTIAL}."
+            ),
+            # A quote-marker-only line inside an unquoted ASVS table is not a blank line: main read
+            # none, so it keeps the column marked, between rows, between the header and its
+            # delimiter, and padded with spaces.
+            "reviewer-quote-marker-line": f"{_HEAD}| a | b | c |\n>\n{_ROW}",
+            "reviewer-quote-marker-header": f"| ASVS | Note | Result |\n>\n|---|---|---|\n{_ROW}",
+            "reviewer-quote-marker-padded": f"{_HEAD}| a | b | c |\n  >  \n{_ROW}",
+            "reviewer-escaped-pipe": (
+                f"| Note | Version | ASVS | Result |\n|---|---|---|---|\n"
+                f"| x \\| y | {_REQ} | z | {_PASS.title()} (12 messages) |"
+            ),
+        }
+    )
+    table = f"{_HEAD}| a | b | c |\n{_ROW}"
+    for code in _SPLITLINES_ONLY:
+        for count in (1, 2):
+            join = chr(code) * count
+            name = f"join-{code:04X}x{count}"
+            bodies[name] = table.replace("\n", join)
+            bodies[f"{name}-intro"] = f"Intro.{join}" + table.replace("\n", join)
+            bodies[f"{name}-newline"] = table.replace("\n", join + "\n")
+            bodies[f"{name}-crlf"] = table.replace("\n", join + "\r\n")
+    return bodies
+
+
+_SUPERSET_BODIES = _superset_bodies()
+
+
+def test_the_frozen_main_scanner_is_the_vendored_blob() -> None:
+    data = _frozen_main_bytes()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+    assert blob == _FROZEN_MAIN_BLOB
+
+
+@pytest.mark.parametrize("name", sorted(_SUPERSET_BODIES))
+def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
+    sf, sf_frozen_main, name: str
+) -> None:
+    """BACKLOG #3364: on each constructed body, head reports every hit main reports, at main's line
+    number, with no exception. A finite set: it pins these bodies, and a loss on a body outside it
+    is not caught here."""
+    body = _SUPERSET_BODIES[name]
+    lost = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
+    assert not lost, (name, sorted(lost))
+
+
+def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
+    sf, sf_frozen_main
+) -> None:
+    """The same superset over every tracked Markdown file, read as a pull request body: its bytes
+    decoded with no newline translation, so a "\\r\\n" or "\\r" line ending reaches the scanner."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],  # noqa: S607
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    paths = [_REPO_ROOT / p.decode() for p in listed if p]
+    # A positive control: an empty listing would pass the loop below vacuously.
+    assert len(paths) > 100
+    main_hits = 0
+    lost: list[tuple[str, str]] = []
+    unread: list[str] = []
+    for path in paths:
+        try:
+            body = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            unread.append(str(path.relative_to(_REPO_ROOT)))
+            continue
+        before = set(sf_frozen_main.scan_pr_body(body))
+        main_hits += len(before)
+        lost += [
+            (str(path.relative_to(_REPO_ROOT)), h) for h in before - set(sf.scan_pr_body(body))
+        ]
+    # A second control: main flags the docs' ASVS tables, so a corpus main reads clean measured nothing.
+    assert main_hits > 0
+    # Every tracked Markdown file is read: a file skipped here would be a body the guard never read.
+    assert not unread, unread
+    assert not lost, lost[:20]
+
+
+#: Review round-7bf3e998ba's bodies, from an earlier windowed draft of the removed step 10, kept as
+#: regression pins: each is slid across every offset of the 80-character window, and head must report
+#: every hit main reports. Main flags each, through "failing: <id>" or "<id> stays partial".
+_WINDOW_EDGE_SHAPES = [
+    f"Then narrow is not{{pad}}failing: {_REQ} here.",
+    f"See `retry_row` is not{{pad}}failing: {_REQ} here.",
+    f"See x__row is not{{pad}}failing: {_REQ} here.",
+    f"The nar**row** is not failing:{{pad}}{_REQ} today.",
+    f"The nar`row` is not failing:{{pad}}{_REQ} today.",
+    f"The narrow is not failing: {_REQ} and then\nwe keep the outbound path under watch while{{pad}}"
+    f"{_REQ_B} stays partial.",
+    # Review round-e784ff8b27: a clause one candidate's window cuts before " over" is no clause in
+    # another candidate's window, which reads on, so it must not unbind that candidate's "is met".
+    f"Python {_REQ_B}, _which_ stays partial, as {{pad}}\nand {_REQ} is met row is not failing over to"
+    " the backup.",
+    f"ASVS:{{pad}}v5 {_REQ_B} x "
+    + "y" * 37
+    + f"\nand {_REQ} is met row is not failing over to the backup.",
+    f"Python {_REQ_B}, _which_ stays partial, as {{pad}}\nso {_REQ} x the cell is partial row is not"
+    " failing over to the backup.",
+]
+
+
+@pytest.mark.parametrize("shape", _WINDOW_EDGE_SHAPES)
+def test_no_hit_main_reports_is_lost_wherever_a_window_edge_falls(
+    sf, sf_frozen_main, shape: str
+) -> None:
+    lost = {}
+    for fill in (" ", "y"):
+        for size in range(0, 100):
+            body = shape.format(pad=fill * (size + 1))
+            missing = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
+            if missing:
+                lost[(fill, size)] = sorted(missing)
+    # A positive control: main flags the shape, or the loop compared nothing.
+    assert sf_frozen_main.scan_pr_body(shape.format(pad=" "))
+    assert not lost, lost
+
+
+def test_a_pr_body_hit_is_reported_once_at_mains_line_number(sf) -> None:
+    """Review round-23e833d96f: a separator only str.splitlines ends a line at no longer reports one
+    finding twice under two numberings, and every reading's hits come back in line order."""
+    body = f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}."
+    assert sf.scan_pr_body(body) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
+    hits = sf.scan_pr_body(f"{body}\n\nASVS {_REQ} stays{chr(0x200B)} {_PARTIAL}.")
+    assert hits == sorted(hits, key=lambda h: int(h.split(":")[1])) and len(hits) == len(set(hits))
+
+
+_CELL_CONNECTIVES = [
+    "until",
+    "pending",
+    "because",
+    "since",
+    "while",
+    "unless",
+    "once",
+    "after",
+    "awaiting",
+    "but",
+    "due",
+    "for",
+    "per",
+    "as",
+    "at",
+]
+
+
+@pytest.mark.parametrize("word", _CELL_CONNECTIVES)
+def test_every_cell_connective_binds_a_marked_row_only(sf, word: str) -> None:
+    """Step 12: each of _PR_CELL_GOES_ON's connectives, not a sample of them."""
+    marked = f"| ASVS {_REQ} | the outbound limb | {_PARTIAL} {word} the follow-up |"
+    assert "verdict" in _pr_kinds(sf, marked), marked
+    unmarked = f"| 2.5.1 | ADT^A01 | {_PASS.title()} {word} the nightly |"
+    assert sf.scan_pr_body(unmarked) == [], unmarked
+
+
+def test_the_cell_connective_list_is_the_one_tested(sf) -> None:
+    """Step 12: a connective added to _PR_CELL_GOES_ON without a case above fails here."""
+    assert sorted(sf._PR_CELL_GOES_ON.split("|")) == sorted(_CELL_CONNECTIVES)
 
 
 @pytest.mark.parametrize("line", _PR_RESIDUE_MUST_STAY_QUIET)
@@ -1074,9 +1803,24 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # Step 4: a header that marks a column, a run of dashes in a delimiter row, and a long list.
         "| ASVS | x |\n|---|---|\n| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
         "| ASVS | x |\n|" + "-" * 80000 + "x|\n| 1 | 2 |",
+        # Step 12: the same dash run in a GFM-valid delimiter row for the two-cell header, which the
+        # case above is not, so the strict header check times its delimiter-cell match over the run.
+        "| ASVS | x |\n|" + "-" * 80000 + "|---|\n| 1 | 2 |",
+        "| ASVS | x |\n|:" + "-" * 80000 + ":|:---:|\n| 1 | 2 |",
+        # Emphasis underscores inside one long word run: a code-path match may start only after a
+        # non-word character, not at every "messagefoundry" in the run.
+        f"| {_REQ} | " + "__messagefoundry" * 5000 + " |",
+        f"| {_REQ} | " + ("messagefoundry" + chr(0xE9)) * 5000 + " |",
         # Identifiers split by a word, so each one takes the column lookup.
         "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
+        # Review round-23e833d96f: an invisible character and a line separator, which once added
+        # two whole readings, and a long run of spaces, which the sentence split rescanned per space.
+        "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass" + chr(0x200B) + chr(0x2028),
+        _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
+        # A cell that goes on past "never failing", over a markup run.
+        f"| {_REQ} | x | is never failing; stays" + "*" * 80000 + " |",
+        f"| {_REQ} | x | is never failing; stays" + " " * 80000 + " |",
     ],
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
@@ -1086,6 +1830,40 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     began = time.perf_counter()
     sf.scan_pr_body(row)
     assert time.perf_counter() - began < 10
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"{_REQ} is partial and the row is not " + "_" * 16000,
+        f"{_REQ} is partial and the row is not " + "*" * 16000,
+        f"{_REQ} is partial and the row was " + "`" * 16000,
+        f"{_REQ} is partial and the cell is " + "_" * 16000,
+    ],
+    ids=["underscore", "star", "backtick", "cell-underscore"],
+)
+def test_a_long_markup_run_after_a_verdict_clause_scans_in_linear_time(sf, body: str) -> None:
+    """No reading may search _PR_PROSE_VERDICT over a whole sentence, where it backtracks
+    quadratically on a markup run: an earlier draft of the removed step 10 took 12 to 23 seconds on
+    these bodies. The bound is 1 second, loose for a slow runner."""
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 1
+
+
+def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(sf) -> None:
+    """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
+    reported at its own line, so finding that line must not scan every mark once per identifier.
+    24000 lines, one binding identifier each: about 1.4 seconds here, against about 25 seconds when
+    each lookup scanned every mark. The bound is 10 seconds, loose for a slow runner."""
+    lines = 24000
+    body = "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
+    began = time.perf_counter()
+    hits = sf.scan_pr_body(body)
+    elapsed = time.perf_counter() - began
+    # A positive control: each line's identifier is reported at its own line, so the lookup ran.
+    assert len(hits) == lines
+    assert elapsed < 10
 
 
 def _pr_kinds(sf, body: str) -> set[str]:
@@ -1387,8 +2165,8 @@ def test_the_second_reading_leaves_block_tags_documents_and_versions_alone(sf, l
 
 def test_a_mid_line_angle_bracket_is_not_read_as_a_quote(sf) -> None:
     """The quote marker was unanchored, so it deleted a line's first ``>`` wherever it sat."""
-    assert sf._pr_units("a -> b")[0][1] == "a -> b"
-    assert sf._pr_units("> quoted")[0][1] == "quoted"
+    assert sf._pr_units(["a -> b"], False, sf._PR_TEXT)[0][1] == "a -> b"
+    assert sf._pr_units(["> quoted"], False, sf._PR_TEXT)[0][1] == "quoted"
 
 
 def test_an_unreadable_file_fails_the_run_as_an_instrument(
@@ -1600,7 +2378,9 @@ def test_an_unquoted_or_second_tag_in_a_run_is_still_a_tag(sf, line: str) -> Non
 #
 # The oracle below is origin/main's PR-body reading, copied here verbatim rather than imported from the
 # scanner's own baseline pass, so a later edit to that pass cannot also move the yardstick. It reuses
-# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change.
+# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change and BACKLOG #3364
+# did, so it is not main's reading exactly; the header columns use the loose split, which counts row
+# pipes as the oracle does. The vendored origin/main scanner (``sf_frozen_main``) is the exact one.
 
 _MAIN_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _MAIN_QUOTE = re.compile(r"(?:>\s?)+")
@@ -1659,7 +2439,7 @@ def _main_scan_pr_body(sf, body: str) -> list[str]:
             and index + 1 < len(units)
             and sf._pr_is_delimiter(units[index + 1][1])
         ):
-            asvs_columns = sf._pr_asvs_columns(unit)
+            asvs_columns = sf._pr_asvs_columns(unit, loose=True)
         for start, sentence in _main_pr_sentences(unit, is_row):
             found: dict[str, int] = {}
             for p in sf._RECORD_PAIR:
@@ -1822,13 +2602,14 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
     return bodies
 
 
-def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf) -> None:
-    """The structural property: the baseline is one pass of the union, so this holds by construction,
-    and the test pins it against an oracle the scanner does not share."""
+def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
+    """The baseline is one pass of the union, but it runs the head's table model, so this is not true
+    by construction. The test pins it, with no exception, against two oracles: the pre-BACKLOG #5582
+    reading rebuilt here, and the vendored origin/main scanner with #5582's readings."""
     harvested = set(_harvested_pr_bodies())
     fired_harvested = fired_generated = 0
     for body in [*harvested, *_generated_pr_bodies()]:
-        main_hits = set(_main_scan_pr_body(sf, body))
+        main_hits = set(_main_scan_pr_body(sf, body)) | set(sf_frozen_main.scan_pr_body(body))
         if main_hits:
             if body in harvested:
                 fired_harvested += 1

@@ -428,6 +428,18 @@ _PR_REQ_ID = re.compile(
     # beside the identifier must not hide it.
     r"(?<![A-Za-z0-9.])(?P<lead>V|ASVS[ -]?)?(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?(?![A-Za-z0-9]|\.\d)"
 )
+#: A word boundary that markdown `_` emphasis does not defeat, as _PR_REQ_ID reads one.
+_PR_NB = r"(?<![A-Za-z0-9])"
+_PR_NA = r"(?![A-Za-z0-9])"
+#: The same edges, where an underscore joined to a letter or digit on its other side is a snake_case
+#: name, not emphasis: "_gap_" is the word "gap", "retry_gap" is not. Before the word, one or two
+#: emphasis underscores count only after a non-word character, so a match never starts inside a word
+#: run ("x__messagefoundry"), which kept _PR_CODE linear.
+_PR_EB = r"(?:(?<!\w)|(?<=(?<!\w)_)|(?<=(?<!\w)__))"
+_PR_EA = _PR_NA + r"(?!_[A-Za-z0-9])"
+#: _PR_EB where a path segment must not start mid-path: neither the word nor its emphasis underscores
+#: may follow a "/", "." or "-", so "site/_tests/notes" names no code root ("site/tests" never did).
+_PR_EB_PATH = r"(?:(?<![\w/.-])|(?<=(?<![\w/.-])_)|(?<=(?<![\w/.-])__))"
 #: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
 #: rephrase around; a lead never hides a verdict stated with a record verb (see _PR_STRONG_VERB).
 _PR_VERSION_LEAD = re.compile(
@@ -501,9 +513,6 @@ _PR_AUX = (
     r"|(?:is|was|are|were)n['\u2019]t|not|no longer|likely|probably|still|now|also|only|then"
     r"|already|so)" + _PR_SEP + r")*"
 )
-#: A word boundary that markdown `_` emphasis does not defeat, as _PR_REQ_ID reads one.
-_PR_NB = r"(?<![A-Za-z0-9])"
-_PR_NA = r"(?![A-Za-z0-9])"
 #: A modal or a negation bound to a bare verdict verb: "<id> cannot pass", "<id> would not be met",
 #: "<id> needs to pass", "<id> will remain partial". On an identifier the text does not mark as a
 #: requirement it binds only where the verdict ends the clause (_PR_VERDICT_END), because
@@ -517,8 +526,8 @@ _PR_MODAL = (
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
-    # A comma binds only before "which"/"that": "<id>, which stays partial".
-    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP}|,\s*(?=(?:which|that)\b))"
+    # A comma binds only before "which"/"that", emphasised or not: "<id>, which stays partial".
+    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP}|,\s*(?={_PR_FMT}(?:which|that){_PR_NA}))"
     rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_AUX}"
     rf"(?:(?P<strong>{_PR_STRONG_VERB})|(?P<modal>{_PR_MODAL})|{_PR_STATE_VERB}|(?P<as>as)"
     rf"|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
@@ -564,7 +573,9 @@ _PR_MARKED_MOVE_LEAD = re.compile(
     rf"(?i){_PR_NB}(?:update[sd]?|updating|mark(?:s|ed)?)" + _PR_MOVE_OBJECT
 )
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
-_PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
+_PR_VERDICT_BEFORE = re.compile(
+    rf"(?i){_PR_EB}{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$"
+)
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
 _PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
@@ -586,6 +597,36 @@ _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
 #: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
 #: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
+#: Unicode's Default_Ignorable_Code_Point ranges: the zero-width space and joiners, direction marks
+#: and controls, the byte-order mark, variation selectors, the Hangul fillers and the tag characters.
+#: They render as nothing, so where a body holds one, scan_pr_body reads it a second time with every
+#: one deleted, inside a word or a cell as well as around one, and keeps the hits of both readings.
+#: The deletion reaches the text the verdict, gap and map patterns read, not the line's kind:
+#: _pr_units decides a row, heading, list item or empty line from the line as written, so an
+#: invisible character before a row's first pipe makes it a paragraph in both readings (an open
+#: evasion). A fixed table, so an import pays nothing for it.
+_PR_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_PR_INVISIBLE = re.compile(
+    "[" + "".join(f"{chr(low)}-{chr(high)}" for low, high in _PR_DEFAULT_IGNORABLE) + "]"
+)
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
 _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
@@ -596,10 +637,10 @@ _PR_CELL_ID_LEAD = re.compile(r"(?i)(?<![A-Za-z0-9])(?:asvs[\s:-]*v?|v)(?=\d)")
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
 _PR_PROSE_VERDICT = re.compile(
-    rf"(?i)\b(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
+    rf"(?i){_PR_EB}(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
     rf"(?:{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
-    rf"|\bheld{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
-    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
+    rf"|{_PR_EB}held{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
+    rf"|{_PR_EB}re-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
     rf"(?:to|reach(?:es|ed)?){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 #: The verdict held with a pronoun or no object: "held it at partial", "holds partial". The same words
@@ -610,8 +651,8 @@ _PR_BARE_HOLD = re.compile(
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
 )
 _PR_GAP = re.compile(
-    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
-    r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
+    rf"(?i){_PR_EB}(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
+    rf"|not (?:yet )?(?:implemented|built|covered|met|reachable)){_PR_EA}"
 )
 #: Gap words the record uses that are also ordinary English ("on the grounds that", "incomplete
 #: reads", "the router omits it"), so they bind only an identifier the text marks as a requirement.
@@ -623,11 +664,12 @@ _PR_GAP_MARKED = re.compile(
 #: a file on GitHub. Docs are deliberately not code here: the ruled kind is a map to the code that
 #: implements a requirement.
 _PR_CODE = re.compile(
-    r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)\b"
-    r"|(?<![\w/.-])(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
+    r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)"
+    rf"{_PR_EA}|{_PR_EB_PATH}"
+    r"(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
     # A dotted engine module, also as a regular expression escapes it (`messagefoundry\.anon`).
-    r"|\bmessagefoundry\w*(?:\\?\.\w+)+"
-    r"|\bgithub\.com/[\w.-]+/[\w.-]+/(?:blob|tree)/\S+"
+    rf"|{_PR_EB}messagefoundry\w*(?:\\?\.\w+)+"
+    rf"|{_PR_EB}github\.com/[\w.-]+/[\w.-]+/(?:blob|tree)/\S+"
 )
 #: A code symbol in backticks rather than a path: a call, a private name, a snake_case name, or a dotted
 #: attribute carrying an underscore or a class name. A plain word, a version, a hyphenated label and a
@@ -644,27 +686,48 @@ _PR_SYMBOL = re.compile(
     r"[A-Za-z_]\w*)+)"
     r"(?:\s*->[^`\n]*)?)`"
 )
+#: "ASVS 5", "ASVS v5", "ASVS 5.0", "ASVS v5.0.0": the standard's own version, before an identifier.
+_PR_ASVS_VERSION = r"asvs[\s*`_:]+v?\d+(?:\.\d+){0,2}[\s*`_:]*"
+#: The same, ending where an identifier starts. "v5" there is the standard's version, not a word
+#: carrying a digit, so it does not make the identifier after it a version (_pr_requirement_ids).
+_PR_ASVS_VERSION_BEFORE = re.compile(rf"(?i){_PR_NB}{_PR_ASVS_VERSION}$")
 #: An identifier the text itself marks as a requirement: "ASVS <id>", "cell <id>", "<id> row". Weaker
 #: evidence may bind it. A bare `V` lead does not mark one: "V2.1.3" is also how a version is written,
 #: and so is a possessive ("2.5.1's segment grammar"). "ASVS" does, however it is set off from the
 #: identifier ("ASVS V<id>", "ASVS `<id>`", "ASVS: <id>", "asvs <id>").
 _PR_MARK_BEFORE = re.compile(
-    # "ASVS 5.0 <id>", "ASVS v5.0.0 V<id>", and the version-prefixed form "v5.0.0-<id>".
-    rf"(?i){_PR_NB}(?:(?:cells?|requirements?|asvs)[\s*`_:]*|asvs[\s*`_:]+v?\d+\.\d+(?:\.\d+)?[\s*`_:]*"
+    # "ASVS 5 <id>", "ASVS 5.0 <id>", "ASVS v5.0.0 V<id>", and the version-prefixed form "v5.0.0-<id>".
+    rf"(?i){_PR_NB}(?:(?:cells?|requirements?|asvs)[\s*`_:]*|{_PR_ASVS_VERSION}"
     r"|v\d\.\d\.\d-)$"
 )
 #: One separator class only: a markup class before _PR_SEP overlaps it and backtracks quadratically.
 _PR_MARK_AFTER = re.compile(
-    rf"(?i){_PR_SEP}(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?{_PR_NA}"
+    # A bind character may set the noun off, and after one "the" may lead it ("<id>: the row ...").
+    # Not after a plain space: "Since <version> the row is not failing" is CI prose.
+    rf"(?i)(?:{_PR_SEP}|(?:\s*[:=\u2013\u2014]\s*|\s+--?\s+)(?:the{_PR_SEP})?)"
+    r"(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?" + _PR_NA
 )
 #: Only a list separator, as the words between "ASVS <id>" and the next identifier of the same list.
 _PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
-#: A table header cell that names its column ASVS ("ASVS", "ASVS ID", "ASVS v5.0"), so a row under it
-#: has every identifier in that column marked as a requirement, though the row never says so itself.
-_PR_TABLE_ASVS_HEAD = re.compile(r"(?i)asvs(?:\s+(?:v?\d[\d.]*|id|ref|req|requirement|number))*")
+#: A table header cell that names its column ASVS, however it spells the rest ("ASVS", "ASVS ID",
+#: "ASVS v5.0", "ASVS:", "Requirement (ASVS)", "OWASP ASVS", "ASVS_ID"), so a row under it has every
+#: identifier in that column marked as a requirement, though the row never says so itself. Searched
+#: with the cell's markup read as a space, so "ASVS_ID" and "**ASVS**" both name it. A cell with a
+#: negation anywhere before "ASVS" disclaims it ("Version (not ASVS)", "Non-ASVS ref", "(**not** an
+#: ASVS id)", "Not in ASVS") and names no column, as main's whole-cell match named none.
+_PR_TABLE_ASVS_HEAD = re.compile(rf"(?i){_PR_NB}asvs{_PR_NA}")
+#: "No." is the abbreviation for "number" ("Ref No. (ASVS)"), not a negation.
+_PR_TABLE_ASVS_DISCLAIMER = re.compile(
+    rf"(?i){_PR_NB}(?:not|non|no(?!\s*\.)|never|without){_PR_NA}"
+)
 #: The characters of a markdown table's second line, which makes the line above it a header row. A set
 #: and not a pattern: a class holding "-" twice backtracks quadratically on a long run of dashes.
 _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
+#: A cell edge: a pipe markdown has not escaped. "a \| b" is one cell, so it must not shift the column
+#: a header names or the column an identifier sits in.
+_PR_CELL_PIPE = re.compile(r"(?<!\\)\|")
+#: One cell of a GFM delimiter row: dashes, with an optional alignment colon at either end.
+_PR_DELIMITER_CELL = re.compile(r":?-+:?")
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
@@ -692,6 +755,16 @@ _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
 #: Anchored: unanchored, it deleted the first `>` anywhere in a line, the close of the line's first tag.
 _PR_QUOTE = re.compile(r"^(?:>\s?)+")
+#: Quote markers as GFM reads them for a blank line: only a space or tab after each ">", so a ">" then
+#: a no-break space is a line with content, not a blank one.
+_PR_QUOTE_BLANK = re.compile(r"^(?:[ \t]*>[ \t]?)+")
+#: A line GFM opens with a quote marker: at most three spaces before the first ">". Four spaces or a
+#: tab make an indented code line at the top level, not a quote.
+_PR_QUOTE_OPEN = re.compile(r" {0,3}>")
+#: The line endings str.splitlines reads, as main numbered the body's lines: GFM's three ("\n", "\r\n",
+#: "\r") and the separators only str.splitlines ends a line at (a form feed, U+2028 and their kin).
+_PR_LINE_END = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+_PR_GFM_LINE_ENDS = frozenset(("\r\n", "\n", "\r"))
 #: A markdown link reads as its text: `[<id>](url) stays partial` is the identifier beside its verdict.
 #: The body is read a second time with each target kept after its text, so a link whose TARGET is the
 #: code path maps the identifier to code too (BACKLOG #5582).
@@ -712,9 +785,11 @@ _PR_INLINE_TAG = re.compile(
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 #: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
-#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reports at least every hit
-#: that reading reported: the rewrites above found more, and missed some main caught, three review
-#: rounds running. Do not tighten them: a change here is a change to the floor.
+#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
+#: reading did: the rewrites above found more, and missed some main caught, three review rounds
+#: running. Do not tighten them: a change here is a change to the floor. The pass runs this module's
+#: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
+#: (_pr_loose_columns).
 _PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 _PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
@@ -730,8 +805,56 @@ PR_BODY_REASONS = {
     "gap": "requirement gap (a requirement id beside a gap or residual)",
     "map": "requirement-to-code map (a requirement id beside a code path)",
 }
-#: Hits on one line sort in this order, so the union of the readings prints the same way every run.
-_PR_REASON_ORDER = {reason: i for i, reason in enumerate(PR_BODY_REASONS.values())}
+
+
+#: A unit's (offset, line) marks, its text, and whether it is a table row.
+_PrUnits = list[tuple[list[tuple[int, int]], str, bool]]
+
+
+def _pr_lines(body: str) -> tuple[list[str], list[int], list[int], set[int]]:
+    """The body's one line model: its lines as str.splitlines reads them, so a hit reports the line
+    number main reported; the numbers of its blank lines as GFM counts them, in two lists; and the
+    numbers of the lines that open a GFM line with a quote marker GFM reads as one.
+
+    A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs.
+    A quote blank is a whole GFM line that opens with a quote marker (_PR_QUOTE_OPEN) and holds only
+    quote markers besides, a blank line inside a quote; it ends only a quoted table
+    (_pr_table_starts). A ">" then a no-break space is a quoted line with content, neither. A
+    separator only str.splitlines reads (a form feed, U+2028) ends a line here but never makes a
+    blank or quoted one: the line it ends, or the line it opens, lies inside a GFM line, so it ends
+    no GFM table, and a ">" after it is content, not a quote marker."""
+    lines: list[str] = []
+    blanks: list[int] = []
+    quote_blanks: list[int] = []
+    quoted: set[int] = set()
+
+    def classify(line: str, gfm_end: bool) -> None:
+        opens_quote = _PR_QUOTE_OPEN.match(line) is not None
+        if opens_quote:
+            quoted.add(len(lines))
+        if not gfm_end:
+            return
+        if not line.strip(" \t"):
+            blanks.append(len(lines))
+        elif opens_quote and not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
+            quote_blanks.append(len(lines))
+
+    start = 0
+    # Whether the current line starts a GFM line: the body's start, or a GFM line ending before it.
+    whole = True
+    for end in _PR_LINE_END.finditer(body):
+        lines.append(body[start : end.start()])
+        gfm_end = end.group() in _PR_GFM_LINE_ENDS
+        if whole:
+            classify(lines[-1], gfm_end)
+        whole = gfm_end
+        start = end.end()
+    # A final line ending opens no line, as str.splitlines reads it.
+    if start < len(body):
+        lines.append(body[start:])
+        if whole:
+            classify(lines[-1], gfm_end=True)
+    return lines, blanks, quote_blanks, quoted
 
 
 def _pr_inline(line: str, targets: bool) -> str:
@@ -750,16 +873,30 @@ def _pr_inline(line: str, targets: bool) -> str:
     return _PR_MD_LINK.sub(link, _PR_INLINE_TAG.sub(tag, line))
 
 
-def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, int]], str, bool]]:
-    """Split a PR body into the units a sentence can live in, as markdown renders them.
+#: The three readings of a body (scan_pr_body). The baseline reads it as origin/main did before
+#: BACKLOG #5582; the text reading takes inline tags out and reads links as their text; the target
+#: reading also keeps each link target and inline tag attribute beside its text.
+_PrReading = Literal["base", "text", "targets"]
+_PR_BASE: _PrReading = "base"
+_PR_TEXT: _PrReading = "text"
+_PR_TARGETS: _PrReading = "targets"
+
+
+def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> _PrUnits:
+    """Split a PR body's lines into the units a sentence can live in, as markdown renders them.
 
     A blank line, a list item or a table row starts a new unit, and a heading is a unit of its own; any
     other line continues the paragraph above it, so a hard-wrapped sentence is read whole. A quote is
     read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
-    (offset, line) marks so a hit can be reported at the line its identifier sits on. ``targets`` is
-    :func:`_pr_inline`'s.
+    (offset, line) marks so a hit can be reported at the line its identifier sits on. ``reading`` is
+    one of the three readings: the baseline takes the first `>` run of a line out wherever it sits
+    and reads a link as its text, with the link pattern's linear-time equal on a long line (see
+    ``_PR_BASE_CAP``); the other two take only a leading quote marker out and read the line through
+    :func:`_pr_inline`, where a line that held only inline tags is transparent. The units, their
+    lines and their kinds are the same with delete_invisible or without it; only the text differs,
+    with its default-ignorable characters deleted.
     """
-    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    units: _PrUnits = []
     marks: list[tuple[int, int]] = []
     parts: list[str] = []
 
@@ -769,20 +906,31 @@ def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, in
             marks.clear()
             parts.clear()
 
-    for lineno, raw in enumerate(body.splitlines(), 1):
-        unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
-        line = _pr_inline(unquoted, targets).strip()
-        # A line that held only inline tags is transparent, not a paragraph break.
-        if unquoted and not line:
-            continue
-        if not line:
+    for lineno, raw in enumerate(lines, 1):
+        # The line's type (empty, row, heading, list item) is read before invisible characters are
+        # deleted, as GFM reads it: an invisible character is content there, so a line holding only
+        # one is not empty.
+        if reading == _PR_BASE:
+            unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
+            if len(unquoted) <= _PR_BASE_CAP:
+                structure = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
+            else:
+                structure = _pr_base_link_sub(unquoted)
+        else:
+            unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
+            structure = _pr_inline(unquoted, reading == _PR_TARGETS).strip()
+            # A line that held only inline tags is transparent, not a paragraph break.
+            if unquoted and not structure:
+                continue
+        line = _PR_INVISIBLE.sub("", structure).strip() if delete_invisible else structure
+        if not structure:
             flush()
             continue
-        if line.startswith("|") or _PR_HEADING.match(line):
+        if structure.startswith("|") or _PR_HEADING.match(structure):
             flush()
-            units.append(([(0, lineno)], line, line.startswith("|")))
+            units.append(([(0, lineno)], line, structure.startswith("|")))
             continue
-        if _PR_LIST_ITEM.match(line):
+        if _PR_LIST_ITEM.match(structure):
             flush()
         offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
         marks.append((offset, lineno))
@@ -877,45 +1025,11 @@ def _pr_base_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
     return sentences
 
 
-def _pr_base_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
-    """:func:`_pr_units` as origin/main had it, the baseline reading: links read as their text, the
-    first `>` of a line taken out wherever it sits, and every HTML tag left for the split to end a
-    sentence at. Nothing is cut: a long line takes the link pattern's linear-time equal (see
-    ``_PR_BASE_CAP``)."""
-    units: list[tuple[list[tuple[int, int]], str, bool]] = []
-    marks: list[tuple[int, int]] = []
-    parts: list[str] = []
-
-    def flush() -> None:
-        if parts:
-            units.append((list(marks), " ".join(parts), False))
-            marks.clear()
-            parts.clear()
-
-    for lineno, raw in enumerate(body.splitlines(), 1):
-        unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
-        if len(unquoted) <= _PR_BASE_CAP:
-            line = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
-        else:
-            line = _pr_base_link_sub(unquoted)
-        if not line:
-            flush()
-            continue
-        if line.startswith("|") or _PR_HEADING.match(line):
-            flush()
-            units.append(([(0, lineno)], line, line.startswith("|")))
-            continue
-        if _PR_LIST_ITEM.match(line):
-            flush()
-        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
-        marks.append((offset, lineno))
-        parts.append(line)
-    flush()
-    return units
-
-
 def _pr_line_at(marks: list[tuple[int, int]], offset: int) -> int:
-    return max(lineno for start, lineno in marks if start <= offset)
+    """The line of the last mark at or before the offset. Marks rise in offset and line together, so
+    a bisection finds it: a scan over every mark, once per binding identifier, is quadratic in a
+    hard-wrapped paragraph."""
+    return marks[bisect.bisect_right(marks, offset, key=lambda mark: mark[0]) - 1][1]
 
 
 def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:
@@ -927,7 +1041,10 @@ def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:
         if m.group("lead"):
             version = m.group("lead") == "V" and (tail or _PR_HL7_LEAD.search(before) is not None)
         else:
-            version = tail or _PR_VERSION_LEAD.search(before) is not None
+            version = tail or (
+                _PR_VERSION_LEAD.search(before) is not None
+                and _PR_ASVS_VERSION_BEFORE.search(before) is None
+            )
         found.append((m, version))
     return found
 
@@ -1008,6 +1125,10 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     a lead or a verdict reads beside its neighbour ("ASVS `<id>`", "unchanged, `partial`.")."""
     if not ids:
         return False
+    # Split at every pipe, escaped or not, as engine PR 2893 read cells and as the loose column reading
+    # counts them (the GFM column reading counts only unescaped pipes, _PR_CELL_PIPE). Splitting an
+    # escaped pipe here only adds cells to read; the backslash it leaves behind is not unescaped, so
+    # an id and a verdict joined by "\|" are not read as a pair.
     raw = row.strip().strip("|").split("|")
     cells = [c.strip(_PR_CELL_EDGE) for c in raw] + [
         _PR_CELL_MARKUP.sub("", c).strip() for c in raw
@@ -1017,6 +1138,9 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     def lists_ids(cell: str) -> bool:
         parts = [p for p in _PR_CELL_LIST.split(_PR_CELL_ID_LEAD.sub("", cell)) if p]
         return bool(parts) and all(p in keys for p in parts)
+
+    def is_verdict(cell: str) -> bool:
+        return _PR_CELL_VERDICT.fullmatch(cell) is not None
 
     def opens_with_verdict(cell: str) -> bool:
         lead = _PR_CELL_VERDICT_LEAD.match(cell)
@@ -1029,12 +1153,120 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
         return marked or lead.group("prefix") is not None
 
     return any(lists_ids(c) for c in cells) and any(
-        _PR_CELL_VERDICT.fullmatch(c) or opens_with_verdict(c) for c in cells
+        is_verdict(c) or opens_with_verdict(c) for c in cells
     )
 
 
 def _pr_is_delimiter(row: str) -> bool:
     return "-" in row and set(row) <= _PR_TABLE_DELIMITER_CHARS
+
+
+def _pr_table_starts(
+    units: _PrUnits, blanks: list[int], quote_blanks: list[int], quoted: set[int]
+) -> list[bool]:
+    """For each unit, whether it starts a run of rows: it is a row, and the unit above is not a row or
+    a blank line (only spaces and tabs, as GFM reads one) lies between them. A line holding only a
+    no-break space emits no unit either, but GFM does not count it blank, so it ends no table.
+
+    A quote blank (only quote markers) between two rows ends the run only inside a quoted table:
+    every row since the last unit that is not a row, through the row below the quote blank, opens a
+    GFM line with a quote marker GFM reads as one (at most three spaces before it, _PR_QUOTE_OPEN;
+    the line numbers in ``quoted``). A ">" after a form feed or U+2028 is content, not one. Blank
+    lines emit no unit, so that span reaches across them to a header above a blank line. Anywhere
+    else, a lone ">" between rows does not end the run, as main read no blank line at all.
+
+    These runs bound only the GFM reading (_pr_table_columns), whose columns can only add marks; the
+    loose reading (_pr_loose_columns), which keeps every mark main kept, does not read them."""
+
+    def between(found: list[int], above: int, below: int) -> bool:
+        return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
+
+    starts = []
+    # Whether every row since the last unit that is not a row opens with a quote marker.
+    block_quoted = True
+    for index, (marks, _, is_row) in enumerate(units):
+        above = units[index - 1] if index else None
+        line = marks[0][1]
+        block_quoted = not is_row or (block_quoted and line in quoted)
+        starts.append(
+            is_row
+            and (
+                above is None
+                or not above[2]
+                or between(blanks, above[0][0][1], line)
+                or (block_quoted and between(quote_blanks, above[0][0][1], line))
+            )
+        )
+    return starts
+
+
+def _pr_is_header(units: _PrUnits, starts: list[bool], index: int, strict: bool) -> bool:
+    """Whether a row is a header: a delimiter row comes next, in the same run of rows. A "---" rule
+    after a table is a unit of its own, not a row, so it makes no header. Strict, the pair must also
+    be one GFM renders as a table: one delimiter cell per header cell, each "-" with an optional ":"
+    at its ends."""
+    if index + 1 >= len(units) or not units[index + 1][2] or starts[index + 1]:
+        return False
+    header, delimiter = units[index][1], units[index + 1][1]
+    if _pr_is_delimiter(header) or not _pr_is_delimiter(delimiter):
+        return False
+    if not strict:
+        return True
+    header_cells, delimiter_cells = _pr_cells(header), _pr_cells(delimiter)
+    return len(header_cells) == len(delimiter_cells) and all(
+        _PR_DELIMITER_CELL.fullmatch(c.strip()) for c in delimiter_cells
+    )
+
+
+def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
+    """For each unit, the ASVS columns its table's header names, as GFM reads the table, or none.
+
+    A run of rows holds at most one table, and it starts at the run's first header GFM would render:
+    pipe lines above it render as a paragraph, and a dash-only row below it is data, not a second
+    delimiter. A run with no GFM-valid pair still takes its first header-shaped pair (a mistyped
+    delimiter still reads as a table to a person). A non-row unit or a blank line ends the run.
+    Columns here count unescaped pipes (_PR_CELL_PIPE)."""
+    columns: list[set[int]] = [set() for _ in units]
+    start = 0
+    while start < len(units):
+        end = start + 1
+        if units[start][2]:
+            while end < len(units) and units[end][2] and not starts[end]:
+                end += 1
+            run = range(start, end)
+            header = next((i for i in run if _pr_is_header(units, starts, i, strict=True)), None)
+            if header is None:
+                header = next(
+                    (i for i in run if _pr_is_header(units, starts, i, strict=False)), None
+                )
+            if header is not None:
+                names = _pr_asvs_columns(units[header][1])
+                for i in range(header, end):
+                    columns[i] = names
+        start = end
+    return columns
+
+
+def _pr_loose_columns(units: _PrUnits) -> list[set[int]]:
+    """For each unit, the ASVS columns as main read them, united with the GFM reading above: every
+    row above a dash-shaped unit is re-read as a header, and its cells are split at every pipe. Only
+    a unit that is not a row ends this reading, as on main, so a blank line or a quote-marker-only
+    line between rows ends nothing here and every mark main kept is kept. Step 9, which ended this
+    reading at such a line, was removed; the false positive it quieted stays open on BACKLOG #3364."""
+    columns: list[set[int]] = []
+    current: set[int] = set()
+    for index, (_, text, is_row) in enumerate(units):
+        if not is_row:
+            current = set()
+        if (
+            is_row
+            and not _pr_is_delimiter(text)
+            and index + 1 < len(units)
+            and _pr_is_delimiter(units[index + 1][1])
+        ):
+            current = _pr_asvs_columns(text, loose=True)
+        columns.append(current)
+    return columns
 
 
 def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
@@ -1043,14 +1275,35 @@ def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
     return _PR_ID_LIST_GAP.fullmatch(text, end, m.start()) is not None
 
 
-def _pr_asvs_columns(header: str) -> set[int]:
-    """The columns of a table header row whose cell names the column ASVS."""
-    cells = header.strip().strip("|").split("|")
-    return {
-        i
-        for i, c in enumerate(cells)
-        if _PR_TABLE_ASVS_HEAD.fullmatch(_PR_CELL_MARKUP.sub("", c).strip())
-    }
+def _pr_cells(row: str) -> list[str]:
+    """A header or delimiter row's cells, split at unescaped pipes. One edge pipe comes off each end,
+    not every one: "|| ASVS |" has an empty first cell."""
+    row = row.strip().removeprefix("|")
+    if row.endswith("|") and not row.endswith("\\|"):
+        row = row[:-1]
+    return _PR_CELL_PIPE.split(row)
+
+
+def _pr_asvs_columns(header: str, loose: bool = False) -> set[int]:
+    """The columns of a table header row whose cell names the column ASVS, with the cell's markup
+    read as a space and again deleted ("**ASVS**", "AS*VS*"). Loose, the cells split at every pipe and
+    lose every edge pipe, as engine PR 2893 split them."""
+    cells = header.strip().strip("|").split("|") if loose else _pr_cells(header)
+    return {i for i, c in enumerate(cells) if _pr_names_asvs(c)}
+
+
+def _pr_names_asvs(cell: str) -> bool:
+    """Whether a header cell names its column ASVS: a reading of its markup (as a space, or deleted)
+    finds "ASVS", and no reading that finds it has a negation word before it. Emphasis on the
+    negation, or extra space after it, does not hide it."""
+    found = [
+        (reading, head)
+        for reading in (_PR_CELL_MARKUP.sub(" ", cell), _PR_CELL_MARKUP.sub("", cell))
+        if (head := _PR_TABLE_ASVS_HEAD.search(reading)) is not None
+    ]
+    return bool(found) and not any(
+        _PR_TABLE_ASVS_DISCLAIMER.search(reading, 0, head.start()) for reading, head in found
+    )
 
 
 def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
@@ -1070,112 +1323,151 @@ def scan_pr_body(body: str) -> list[str]:
     Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
     restate a verdict on the same line report it once, rather than storming.
 
-    Read three times, and the hits are the union (BACKLOG #5582). The baseline is origin/main's reading
-    (:func:`_pr_base_units`, ``_PR_BASE_SENTENCE_SPLIT``), so no rewrite of the readings below it can
-    report less than it did. The second reads each link as its text and each inline tag as no edge, and the third keeps each link's
-    target beside it, so a code path only a target names is seen. Every reading keeps each line where
-    it was, so the hits merge by (line, kind), sorted by line and then in ``PR_BODY_REASONS`` order.
+    Read three times, and the hits are the union (BACKLOG #5582). The baseline reads the lines as
+    origin/main did before BACKLOG #5582 (``_PR_BASE_QUOTE``, ``_PR_BASE_MD_LINK``,
+    ``_PR_BASE_SENTENCE_SPLIT``). The second reads each link as its text and each inline tag as no
+    edge, and the third keeps each link's target beside it, so a code path only a target names is
+    seen; from the third only a map counts. Each reading builds its own units from one line model
+    (:func:`_pr_lines`), so every reading keeps each line where it was and the hits merge by (line,
+    kind), sorted by line and then in ``PR_BODY_REASONS`` order.
     """
-    base = _pr_base_units(body)
-    hits = _pr_unit_hits(base, _pr_base_sentences)
-    as_text = _pr_units(body)
+    found: set[tuple[int, int]] = set()
+    lines, blanks, quote_blanks, quoted = _pr_lines(body)
+    invisible = _PR_INVISIBLE.search(body) is not None
+    gfm = (blanks, quote_blanks, quoted)
+    every_kind = frozenset(PR_BODY_REASONS)
+    base = _pr_units(lines, False, _PR_BASE)
+    _pr_scan_reading(lines, gfm, _PR_BASE, base, invisible, every_kind, found)
+    as_text = _pr_units(lines, False, _PR_TEXT)
     # With no `<` the two splits are the same full-stop rule, so equal units would only repeat the
     # baseline's hits.
     if "<" in body or as_text != base:
-        hits += _pr_unit_hits(as_text, _pr_sentences)
+        _pr_scan_reading(lines, gfm, _PR_TEXT, as_text, invisible, every_kind, found)
     # No link and no tag means no target, so the third reading would only repeat the second.
-    with_targets = _pr_units(body, targets=True) if "](" in body or "<" in body else as_text
-    if with_targets != as_text:
-        # Only a map: the third reading exists so a target's code path counts, and a target's words
-        # are a URL's, not the body's own verdict or gap.
-        extra = _pr_unit_hits(with_targets, _pr_sentences)
-        hits += [h for h in extra if h.endswith(PR_BODY_REASONS["map"])]
-    return sorted(
-        dict.fromkeys(hits),
-        key=lambda h: (int(h.split(":", 2)[1]), _PR_REASON_ORDER[h.split(": ", 1)[1]]),
-    )
+    if "](" in body or "<" in body:
+        with_targets = _pr_units(lines, False, _PR_TARGETS)
+        if with_targets != as_text:
+            # Only a map: the third reading exists so a target's code path counts, and a target's
+            # words are a URL's, not the body's own verdict or gap.
+            only_map = frozenset({"map"})
+            _pr_scan_reading(lines, gfm, _PR_TARGETS, with_targets, invisible, only_map, found)
+    # One hit per kind per line, in line order, however many readings found it.
+    kinds = list(PR_BODY_REASONS)
+    return [f"pr-body:{line}: {PR_BODY_REASONS[kinds[kind]]}" for line, kind in sorted(found)]
 
 
-def _pr_unit_hits(
-    units: list[tuple[list[tuple[int, int]], str, bool]],
-    sentences: Callable[[str, bool], list[tuple[int, str]]],
-) -> list[str]:
-    hits: list[str] = []
-    asvs_columns: set[int] = set()
-    for index, (marks, unit, is_row) in enumerate(units):
-        if not is_row:
-            asvs_columns = set()
-        elif (
-            not _pr_is_delimiter(unit)
-            and index + 1 < len(units)
-            and _pr_is_delimiter(units[index + 1][1])
+def _pr_scan_reading(
+    lines: list[str],
+    gfm: tuple[list[int], list[int], set[int]],
+    reading: _PrReading,
+    units: _PrUnits,
+    invisible: bool,
+    kinds: frozenset[str],
+    found: set[tuple[int, int]],
+) -> None:
+    """Scan one reading of a body's lines, whose units are ``units``, adding each hit of ``kinds``."""
+    sentences = _pr_base_sentences if reading == _PR_BASE else _pr_sentences
+    # Both passes of a reading share the units' kinds and lines, so they share where each run of rows
+    # starts.
+    starts = _pr_table_starts(units, *gfm)
+    asvs = _pr_table_columns(units, starts)
+    loose = _pr_loose_columns(units)
+    for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):
+        _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+    # Where the body holds an invisible character, it is read again with each one deleted. A unit
+    # whose text and columns that leaves unchanged reads the same, so only the others are scanned.
+    if invisible:
+        deleted = _pr_units(lines, True, reading)
+        for unit, unit_asvs, unit_loose, plain, plain_asvs, plain_loose in zip(
+            deleted,
+            _pr_table_columns(deleted, starts),
+            _pr_loose_columns(deleted),
+            units,
+            asvs,
+            loose,
+            strict=True,
         ):
-            asvs_columns = _pr_asvs_columns(unit)
-        for start, sentence in sentences(unit, is_row):
-            found: dict[str, int] = {}
-            # The tree scan's tight pair, before the version filter can set its identifier aside: what
-            # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
-            # requirement shape, since the tree scan's own shape admits every dotted triple.
-            for p in _RECORD_PAIR:
-                pair = p.search(sentence)
-                if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
-                    found["verdict"] = pair.start()
-                    break
-            ids = _pr_requirement_ids(sentence)
-            # A table pairs an identifier cell with any other cell, so a row is one whole window, and
-            # its searches run once rather than once per identifier: a row is unbounded in length.
-            evidence: _PrEvidence | None = None
-            row_marked = False
-            previous: tuple[int, bool] | None = None
-            # Where the cell edges sit, found once for the row; an identifier's column is then a lookup.
-            pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if asvs_columns else []
-            for m, version in ids:
-                window = (
-                    sentence
-                    if is_row
-                    else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
-                )
-                marked = not version and (
-                    _pr_marked(sentence, m)
-                    or (
-                        previous is not None
-                        and previous[1]
-                        and _pr_in_list(sentence, previous[0], m)
-                    )
-                    or (
-                        bool(asvs_columns)
-                        and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns
-                    )
-                )
-                previous = (m.end(), marked)
-                row_marked = row_marked or marked
-                if "verdict" not in found and (
-                    _pr_verdict_bound(sentence, m, version, marked)
-                    or (not version and not is_row and _pr_prose_verdict(window, marked))
-                ):
-                    found["verdict"] = m.start()
-                if version or ("gap" in found and "map" in found):
-                    continue
-                if evidence is None or not is_row:
-                    evidence = _pr_evidence(window)
-                gap, marked_gap, code, symbol = evidence
-                if "gap" not in found and (gap or (marked_gap and marked)):
-                    found["gap"] = m.start()
-                if "map" not in found and (code or (symbol and marked)):
-                    found["map"] = m.start()
-            requirement_ids = {m.group(0) for m, version in ids if not version}
-            if (
-                is_row
-                and "verdict" not in found
-                and _pr_table_verdict(sentence, requirement_ids, row_marked)
-            ):
-                found["verdict"] = 0
-            for kind in PR_BODY_REASONS:
-                if kind in found:
-                    hit = f"pr-body:{_pr_line_at(marks, start + found[kind])}: {PR_BODY_REASONS[kind]}"
-                    if hit not in hits:
-                        hits.append(hit)
-    return hits
+            if unit[1] != plain[1] or unit_asvs != plain_asvs or unit_loose != plain_loose:
+                _pr_scan_unit(unit, unit_asvs, unit_loose, found, sentences, kinds)
+
+
+def _pr_scan_unit(
+    unit: tuple[list[tuple[int, int]], str, bool],
+    asvs_columns: set[int],
+    loose_columns: set[int],
+    hits: set[tuple[int, int]],
+    sentences: Callable[[str, bool], list[tuple[int, str]]],
+    kinds: frozenset[str],
+) -> None:
+    """Scan one unit of one reading of scan_pr_body, adding each hit of ``kinds`` to ``hits`` as
+    (line, kind)."""
+    marks, unit_text, is_row = unit
+    for start, sentence in sentences(unit_text, is_row):
+        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns)
+        for kind_index, kind in enumerate(PR_BODY_REASONS):
+            if kind in kinds:
+                hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
+
+
+def _pr_sentence_found(
+    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int]
+) -> dict[str, list[int]]:
+    """Every binding in one sentence of a unit, by kind, as offsets into it."""
+    # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
+    # earlier identifier bind must not move a hit off the line main reported it at.
+    found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
+    # The tree scan's tight pair, before the version filter can set its identifier aside: what
+    # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
+    # requirement shape, since the tree scan's own shape admits every dotted triple.
+    for p in _RECORD_PAIR:
+        pair = p.search(sentence)
+        if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
+            found["verdict"].append(pair.start())
+            break
+    ids = _pr_requirement_ids(sentence)
+    # A table pairs an identifier cell with any other cell, so a row is one whole window, and
+    # its searches run once rather than once per identifier: a row is unbounded in length.
+    evidence: _PrEvidence | None = None
+    row_marked = False
+    previous: tuple[int, bool] | None = None
+    # Where the cell edges sit, found once for the row; an identifier's column is then a lookup.
+    # The GFM reading counts unescaped pipes; the loose reading, every pipe. Either may mark.
+    pipes = [p.start() for p in _PR_CELL_PIPE.finditer(sentence)] if asvs_columns else []
+    all_pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if loose_columns else []
+    for m, version in ids:
+        window = (
+            sentence if is_row else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
+        )
+        marked = not version and (
+            _pr_marked(sentence, m)
+            or (previous is not None and previous[1] and _pr_in_list(sentence, previous[0], m))
+            or (bool(asvs_columns) and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns)
+            or (
+                bool(loose_columns)
+                and bisect.bisect_left(all_pipes, m.start()) - 1 in loose_columns
+            )
+        )
+        previous = (m.end(), marked)
+        row_marked = row_marked or marked
+        if _pr_verdict_bound(sentence, m, version, marked) or (
+            not version and not is_row and _pr_prose_verdict(window, marked)
+        ):
+            found["verdict"].append(m.start())
+        if version:
+            continue
+        if evidence is None or not is_row:
+            evidence = _pr_evidence(window)
+        gap, marked_gap, code, symbol = evidence
+        if gap or (marked_gap and marked):
+            found["gap"].append(m.start())
+        if code or (symbol and marked):
+            found["map"].append(m.start())
+    requirement_ids = {m.group(0) for m, version in ids if not version}
+    # A row's own verdict is read whether or not an identifier bound one, so the row's line keeps
+    # it however the identifiers read.
+    if is_row and _pr_table_verdict(sentence, requirement_ids, row_marked):
+        found["verdict"].append(0)
+    return found
 
 
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
