@@ -492,7 +492,30 @@ def test_an_EMPTY_remote_backs_nothing(repo: Path, tmp_path: Path) -> None:
     r = check(repo)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "UNVERIFIABLE" in r.stdout
+    assert "answered with no refs (an empty store): origin" in r.stdout
     assert "0 unbacked commits" not in r.stdout
+
+
+def test_a_TAGS_ONLY_durability_remote_answers_and_backs_what_it_holds(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST NOT TRIP. A durability store may hold only rescue tags, fetched into its own tracking
+    namespace. It answers, with tags and no branch, so it is trusted: a probe that asked for
+    branches alone read it as dead and reported the branch it rescued as unbacked."""
+    git(repo, "remote", "add", "dur", str(_bare(tmp_path / "dur.git")))
+    git(repo, "config", "remote.dur.fetch", "+refs/tags/rescue/*:refs/remotes/dur/rescuetags/*")
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "rescued as a tag only", "work")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "push", "-q", "dur", "side:refs/tags/rescue/side")
+    git(repo, "fetch", "-q", "dur")
+    # The premise: dur holds no branch at all.
+    assert git(repo, "ls-remote", "--heads", "dur").strip() == ""
+
+    r = check(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "2 of 2 configured remote(s) answered" in r.stdout
+    assert "0 unbacked commits" in r.stdout
 
 
 def test_a_repo_with_no_remote_counts_commits_an_orphan_tracking_ref_points_at(
@@ -530,3 +553,61 @@ def test_a_squash_landed_verdict_needs_a_REACHABLE_origin(repo: Path, tmp_path: 
     assert "UNVERIFIABLE" not in r.stdout
     assert "squash/rebase-landed" not in r.stdout
     assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_squash_landed_verdict_from_a_REACHABLE_second_remote_clears(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST NOT TRIP -- the twin of the test above, differing in one property: backup's main also
+    carries the squash. Origin still does not answer, so the verdict must come from backup."""
+    _add_backup_remote(repo, tmp_path)
+    _squash_land(repo, "landed on both")
+    git(repo, "push", "-q", "backup", "main")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    git(repo, "fetch", "-q", "--all")
+    git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    r = check(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "0 unbacked commits" in r.stdout
+    assert "patch already on backup/main (squash/rebase-landed)" in r.stdout
+
+
+@pytest.mark.parametrize("shares_history", [False, True], ids=["unrelated", "related"])
+def test_a_squash_landed_verdict_needs_SHARED_history(
+    repo: Path, tmp_path: Path, shares_history: bool
+) -> None:
+    """The ``unrelated`` case MUST TRIP; ``related`` is its must-not-trip twin. Origin does not
+    answer and backup holds no main, so the patch-id arm falls back to ``other``'s main. When that
+    main is another project's history that happens to hold an identical diff, ``git cherry``
+    compared the whole of both and marked the unbacked commit landed."""
+    git(repo, "remote", "add", "backup", str(_bare(tmp_path / "backup.git", head="trunk")))
+    git(repo, "push", "-q", "backup", "main:keep")  # backs local main; offers no main candidate
+    git(repo, "remote", "add", "other", str(_bare(tmp_path / "other.git")))
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "identical diff", "work")
+    git(repo, "checkout", "-q", "main")
+    if shares_history:
+        _commit(repo, "g.txt", "identical diff", "squashed: work")
+        git(repo, "push", "-q", "other", "main")
+        git(repo, "reset", "-q", "--hard", "HEAD~1")
+    else:
+        u = tmp_path / "unrelated"
+        u.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(u)], check=True, capture_output=True)
+        git(u, "config", "user.email", "t@example.invalid")
+        git(u, "config", "user.name", "t")
+        _commit(u, "other.txt", "another project", "unrelated root")
+        _commit(u, "g.txt", "identical diff", "same diff, unrelated history")
+        git(u, "push", "-q", str(tmp_path / "other.git"), "main")
+    git(repo, "fetch", "-q", "--all")
+    git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    r = check(repo)
+    if shares_history:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on other/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "squash/rebase-landed" not in r.stdout
+        assert "1 commits on 1 branch exist on no remote" in r.stdout

@@ -114,7 +114,8 @@
     remote-tracking ref is up to date with what the server has now (run `git fetch --prune` first if
     that matters). Reachability from a TRUSTED remote's tracking refs counts as backed, including a
     rescue tag fetched there -- durable is not the same as landed, and this measures durability only.
-    A remote is trusted when it answered the probe; with -SkipReachability, or when none answered
+    A remote is trusted when it answered the probe with at least one ref, branch or tag; with
+    -SkipReachability, or when none answered
     (UNVERIFIABLE), every remote-tracking ref still excludes; in the UNVERIFIABLE case no patch-id
     match is read from them, so a squash-landed branch counts in that floor.
 
@@ -246,13 +247,18 @@ foreach ($p in $Path) {
     # up" from "excluded by a local copy of a store that no longer answers".
     $reachable = @()
     $unreachable = @()
+    $emptyRemotes = @()
     if (-not $SkipReachability) {
         foreach ($rem in $remotes) {
-            # --heads, not HEAD: a bare repository whose HEAD names a branch nobody pushed advertises
-            # no HEAD (exit 2) while holding branches. Exit 2 here means it holds no branch at all --
-            # an empty or recreated store, which backs nothing, so it is not trusted either.
+            # A remote answers when it advertises ANY ref. Branches first, then tags, so a large
+            # remote's pull refs are never listed: a bare repository whose HEAD names a branch nobody
+            # pushed still holds branches, and a durability store may hold only rescue tags. Exit 2
+            # from both means it answered with no refs -- an empty or recreated store, which backs
+            # nothing, so it is untrusted and reported apart from one that did not answer.
             & git -C $p ls-remote --exit-code --quiet --heads $rem 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 2) { & git -C $p ls-remote --exit-code --quiet --tags $rem 2>$null | Out-Null }
             if ($LASTEXITCODE -eq 0) { $reachable += $rem } else { $unreachable += $rem }
+            if ($LASTEXITCODE -eq 2) { $emptyRemotes += $rem }
         }
     }
 
@@ -287,13 +293,20 @@ foreach ($p in $Path) {
             -not ($remotes | Where-Object { $rn.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) })
         }).Count
     }
-    # The patch-id arm reads the default branch of a TRUSTED remote, origin first. Without
-    # -SkipReachability that is a remote that answered, so with none answering (UNVERIFIABLE) the arm
-    # is off. Full ref names: a bare `origin/main` resolves a local branch or tag of that name first.
+    # The patch-id arm reads the default branch of a TRUSTED remote, origin first: its
+    # refs/remotes/<r>/HEAD target where that resolves, else main, else master. Without
+    # -SkipReachability a trusted remote is one that answered, so with none answering (UNVERIFIABLE)
+    # the arm is off. Full ref names: a bare `origin/main` resolves a local branch or tag of that name
+    # first. Each ref then takes the first candidate it shares history with (see the ref loop).
     $trustedNames = if ($SkipReachability) { $remotes } else { $reachable }
     $ordered = @($trustedNames | Where-Object { $_ -ceq 'origin' }) + @($trustedNames | Where-Object { $_ -cne 'origin' })
-    $upstream = @(foreach ($r in $ordered) { "refs/remotes/$r/main"; "refs/remotes/$r/master" }) |
-        Where-Object { & git -C $p rev-parse --verify --quiet $_ } | Select-Object -First 1
+    $upstreamCandidates = @()
+    foreach ($r in $ordered) {
+        $head = (& git -C $p symbolic-ref --quiet "refs/remotes/$r/HEAD" 2>$null)
+        $names = if ($head) { @($head) } else { @("refs/remotes/$r/main", "refs/remotes/$r/master") }
+        $hit = $names | Where-Object { & git -C $p rev-parse --verify --quiet $_ } | Select-Object -First 1
+        if ($hit) { $upstreamCandidates += $hit }
+    }
 
     $refs = @(& git -C $p for-each-ref --format='%(refname)' refs/heads 2>$null)
     $findings = @()
@@ -350,6 +363,15 @@ foreach ($p in $Path) {
             # upstream..ref, so a per-commit call whose FIRST line was taken as that commit's verdict
             # read the OLDEST commit's mark, and one landed commit at the base of a branch cleared
             # every unpushed commit on top of it.
+            # SHARED HISTORY FIRST: against a main the ref shares no history with -- another project
+            # fetched as a durability remote -- cherry compares the whole of both, and a diff that
+            # happens to be identical there would mark an unbacked commit landed. So the upstream is
+            # the first candidate `git merge-base` can join to this ref, and with none the arm is off.
+            $upstream = $null
+            foreach ($u in $upstreamCandidates) {
+                & git -C $p merge-base $u $ref 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $upstream = $u; break }
+            }
             $landed = @{}
             if ($upstream) {
                 foreach ($cl in @(& git -C $p cherry $upstream $ref 2>$null)) {
@@ -389,6 +411,7 @@ foreach ($p in $Path) {
         RemotesConfigured   = $remotes.Count
         RemotesReachable    = $reachable.Count
         RemotesUnreachable  = $unreachable
+        RemotesEmpty        = $emptyRemotes
         OrphanTrackingRefs  = $orphanRefs
         ReachabilityChecked = (-not $SkipReachability)
         # UNVERIFIABLE: remotes exist, none answered. Every "backed" verdict in this repo then rests
@@ -444,6 +467,9 @@ foreach ($r in $repos) {
     if ($r.Unverifiable) {
         Write-Host "UNVERIFIABLE  $($r.Repo)" -ForegroundColor Red
         Write-Host "              $($r.RemotesConfigured) remote(s) configured, NONE reachable: $($r.RemotesUnreachable -join ', ')" -ForegroundColor Red
+        if ($r.RemotesEmpty.Count -gt 0) {
+            Write-Host "              of those, answered with no refs (an empty store): $($r.RemotesEmpty -join ', ')" -ForegroundColor Red
+        }
         Write-Host "              This check reports $($r.Commits) unbacked across $($r.RefsScanned) refs, and that number" -ForegroundColor Red
         Write-Host "              is a FLOOR, not an answer. Everything it counted as backed was excluded by" -ForegroundColor Red
         Write-Host "              refs/remotes/* -- local copies of a store that did not answer. Restore the" -ForegroundColor Red
@@ -479,7 +505,13 @@ if ($SkipReachability) {
     # Named, because a branch held only by one of these reads as "exist on no remote" above, and
     # the remedy for that is restoring the remote, not a rescue push.
     foreach ($r in ($repos | Where-Object { $_.RemotesReachable -gt 0 -and $_.RemotesUnreachable.Count -gt 0 })) {
-        Write-Host "           not trusted, did not answer: $($r.RemotesUnreachable -join ', ') in $($r.Repo) -- a branch held only there counts as unbacked; restore or re-point it" -ForegroundColor Yellow
+        $silent = @($r.RemotesUnreachable | Where-Object { $r.RemotesEmpty -cnotcontains $_ })
+        if ($silent.Count -gt 0) {
+            Write-Host "           not trusted, did not answer: $($silent -join ', ') in $($r.Repo) -- a branch held only there counts as unbacked; restore or re-point it" -ForegroundColor Yellow
+        }
+        if ($r.RemotesEmpty.Count -gt 0) {
+            Write-Host "           not trusted, answered with no refs: $($r.RemotesEmpty -join ', ') in $($r.Repo) -- an empty store backs nothing" -ForegroundColor Yellow
+        }
     }
     foreach ($r in ($repos | Where-Object { $_.OrphanTrackingRefs -gt 0 })) {
         Write-Host "           not trusted, no configured remote: $($r.OrphanTrackingRefs) tracking ref(s) in $($r.Repo) -- a branch held only there counts as unbacked" -ForegroundColor Yellow
