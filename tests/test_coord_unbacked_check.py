@@ -767,6 +767,68 @@ def test_a_NON_ASCII_branch_name_does_not_break_the_scan(repo: Path, name: str) 
     assert "1 commits on 1 branch exist on no remote" in r.stdout
 
 
+def test_a_RELATIVE_path_after_set_location_reads_one_repository(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. With ``-Path .`` after a ``Set-Location``, ``& git -C .`` read PowerShell's
+    location while the directly started git read the process directory, which Set-Location does not
+    move. The listings and scans then came from the wrong repository and ``side`` was never named."""
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True)
+    git(other, "config", "user.email", "t@example.invalid")
+    git(other, "config", "user.name", "t")
+    _commit(other, "x.txt", "another repository", "base")
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+
+    cmd = f"Set-Location -LiteralPath '{repo}'; & '{CHECK}' -Path ."
+    r = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", cmd],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        cwd=other,
+    )
+    assert "NO-REMOTE" not in r.stdout, r.stdout + r.stderr
+    assert "side" in r.stdout, r.stdout + r.stderr
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_the_git_started_is_the_one_PATH_discovery_finds_and_its_failure_exits_2(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. The script starts the git PowerShell command discovery resolves -- here a
+    ``git.cmd`` placed first on PATH -- rather than handing a bare ``git`` to the process starter,
+    which searches pwsh's own folder and the current directory first and never finds a ``.cmd``.
+    That shim refuses every ``rev-list --stdin``, and the refusal must read as a scan failure,
+    exit 2, never as a clean run.
+
+    It does NOT reproduce a write to a closed stdin pipe: measured with the try/catch in Invoke-Git
+    removed, this test still passed, even with 4000 tracking refs in the exclusion set."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="rev-list" if "%4"=="--stdin" exit /b 128\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    env = dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+    r = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(CHECK), "-Path", str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=env,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "UNVERIFIABLE" in r.stdout
+    assert "git FAILED for:" in r.stdout
+
+
 @pytest.mark.parametrize("corrupt", [True, False], ids=["bad-packed-refs", "intact"])
 def test_a_FAILED_ref_listing_is_unverifiable_never_zero(repo: Path, corrupt: bool) -> None:
     """``bad-packed-refs`` MUST TRIP; ``intact`` is its control. A for-each-ref that dies lists

@@ -143,6 +143,7 @@
     Exit code 2 means the check could not run and therefore reports nothing -- never success. That
     includes a git listing or rev-list that failed partway (reported as UNVERIFIABLE).
 #>
+#Requires -Version 7
 [CmdletBinding()]
 param(
     [string[]]$Path,
@@ -152,6 +153,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Invoke-Git starts this exact file. Resolved once through PowerShell command discovery, which never
+# runs a binary from the current directory; a bare 'git' handed to ProcessStartInfo would let Windows
+# search pwsh's own folder and the current directory before PATH.
+$gitExe = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0].Source
+if (-not $gitExe) { Write-Error "git is not on PATH."; exit 2 }
 
 if (-not $Path -or $Path.Count -eq 0) {
     $root = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null)
@@ -188,8 +195,9 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 # The classification only ever moves a commit from AT-RISK to DURABLE. A commit that fails both arms
 # is reported exactly as before, so this cannot mask the case the script exists for.
 #
-# Every git call that reads refnames or asks "what is unbacked" goes through here. It starts git
-# directly rather than through a PowerShell pipeline, for three measured reasons:
+# At least these git calls go through here: the remote and ref listings, symbolic-ref, cat-file,
+# merge-base, cherry, and every rev-list that asks "what is unbacked". Others still use `& git`. It
+# starts git directly rather than through a PowerShell pipeline, for three measured reasons:
 #   - stdin is written as ONE pre-joined string. Piping a few thousand lines object by object cost
 #     710 ms a call on a synthetic 3000-ref repository, against 222 ms for the old `--not --remotes`
 #     glob and 45 ms for this.
@@ -199,7 +207,7 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 #     read a failed run's empty output as "nothing unbacked" (BACKLOG #5502).
 function Invoke-Git {
     param([string]$Repo, [string[]]$GitArgs, [string]$StdinText)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
     $psi.ArgumentList.Add('-C')
     $psi.ArgumentList.Add($Repo)
     foreach ($a in $GitArgs) { $psi.ArgumentList.Add($a) }
@@ -211,11 +219,18 @@ function Invoke-Git {
     $proc = [System.Diagnostics.Process]::Start($psi)
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $null = $proc.StandardError.ReadToEndAsync()
-    if ($StdinText) { $proc.StandardInput.Write($StdinText) }
-    $proc.StandardInput.Close()
+    # git can exit before reading its stdin -- a repository or worktree removed mid-run -- and the
+    # write then fails on a closed pipe. That is this call failing, never the whole run crashing.
+    $writeFailed = $false
+    try {
+        if ($StdinText) { $proc.StandardInput.Write($StdinText) }
+        $proc.StandardInput.Close()
+    } catch [System.IO.IOException] {
+        $writeFailed = $true
+    }
     $proc.WaitForExit()
     $lines = @($outTask.Result -split "`r?`n" | Where-Object { $_ })
-    return [pscustomobject]@{ Ok = ($proc.ExitCode -eq 0); Lines = $lines }
+    return [pscustomobject]@{ Ok = ((-not $writeFailed) -and $proc.ExitCode -eq 0); Lines = $lines }
 }
 
 # The trusted exclusion set arrives as '^<object id>' lines on stdin ($ExcludeText, joined once per
@@ -293,6 +308,10 @@ foreach ($p in $Path) {
         Write-Error "Path does not exist: $p"
         exit 2
     }
+    # ABSOLUTE, ONCE, BEFORE ANY GIT CALL. `& git -C .` resolves against PowerShell's location, and
+    # Invoke-Git's process resolves against the process directory, which a Set-Location does not
+    # move; with a relative path the two halves of a run would read different repositories.
+    $p = (Resolve-Path -LiteralPath $p).ProviderPath
     $inside = (& git -C $p rev-parse --is-inside-work-tree 2>$null)
     if ($inside -ne "true") {
         Write-Error "Not a git repository: $p"
