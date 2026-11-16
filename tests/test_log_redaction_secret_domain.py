@@ -1451,7 +1451,8 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
     Two controls. Main's shape -- the narrow pattern in both layers and no widened pass -- prints a
     superset of what ships on every line, so the change prints nothing main hid. The round-1 shape --
-    the widened pattern as the bundle's first pass -- prints the tail, so this test can fail."""
+    the widened pattern as the bundle's first pass, spelled as round 4 shipped it, since the one
+    that ships now stops at the label -- prints the tail, so this test can fail."""
     shipped = {line: _printed_pieces(line) for line in _DSN_GLUE_LINES}
     assert not any(shipped.values()), {k: v for k, v in shipped.items() if v}
 
@@ -1465,7 +1466,7 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
     )
 
     with monkeypatch.context() as m:
-        m.setattr(redact_mod, "_DSN_PASSWORD", redact_mod._WIDE_DSN_PASSWORD)
+        m.setattr(redact_mod, "_DSN_PASSWORD", _ROUND_FOUR_WIDE)
         round_one = [line for line in _DSN_GLUE_LINES if "Sec_B2" in _printed_pieces(line)]
     assert round_one, (
         "the widened first pass no longer prints the tail, so this test proves nothing"
@@ -1565,12 +1566,69 @@ def test_the_widened_dsn_reading_prints_nothing_main_hid_on_a_chained_path(
     assert secret not in run(), run()
     with monkeypatch.context() as m:
         if wide_in_narrow_place:
-            m.setattr(scrub_mod, "_DSN_PASSWORD", scrub_mod._WIDE_DSN_PASSWORD)
+            m.setattr(scrub_mod, "_DSN_PASSWORD", _ROUND_FOUR_WIDE)
         else:
             m.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", _ROUND_THREE_WIDE)
             m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", _ROUND_THREE_WIDE)
             m.setattr(scrub_mod, "_DSN_PASSWORD", _ROUND_THREE_WIDE)
         assert secret in run(), "round 3's shape no longer prints it, so this line tests nothing"
+
+
+#: The widened DSN pattern as round 4 shipped it, before its runs stopped at a label (BACKLOG #5386).
+_ROUND_FOUR_WIDE = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
+    r"(?:(?<=//:)[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]*+|(?<!//:)[^\s/@]++)"
+    r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
+)
+
+
+@pytest.mark.parametrize("key", scrub_mod._CREDENTIAL_QUERY_KEYS)
+@pytest.mark.parametrize("user", ["ops", ""])
+def test_the_widened_dsn_run_stops_at_a_query_key_on_the_store_error_path(
+    key: str, user: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 review of BACKLOG #5386: ``smtp://ops:pw@h:587:state=Tk9@Sec_x3`` through
+    ``redact_log_line(...)[:300]`` and then a handler printed ``Sec_x3``, where origin/main hid
+    ``state=<redacted>``. The widened run took ``state=`` and the query filter found no key. Each
+    key the query filter reads is read off its tuple, so a key added there is tested here.
+    Control: round 4's pattern, patched back in, prints the value on the keys no label pass reads."""
+    line = f"smtp://{user}:pw@h:587:{key}=Tk9@Sec_x3 end"
+
+    def run() -> str:
+        return _one_handler(redact_log_line(line)[:300])
+
+    assert "Sec_x3" not in run(), run()
+    if not key.endswith(scrub_mod._CAMEL_WORDS):  # a key no label pass reads
+        with monkeypatch.context() as m:
+            m.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", _ROUND_FOUR_WIDE)
+            m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", _ROUND_FOUR_WIDE)
+            assert "Sec_x3" in run(), "round 4's run no longer prints it, so this tests nothing"
+
+
+def test_the_widened_dsn_run_stops_where_its_stop_vocabularies_say() -> None:
+    """The stop is built from the query filter's keys and secretscrub's label words, not a copy:
+    the filter's tuple is secretscrub's own object, and every word in each stops the run, so the
+    match ends at the password's own "@". A DSN with no label in its run is still read whole."""
+    import messagefoundry.logging_setup as logging_setup_mod
+
+    assert logging_setup_mod._CREDENTIAL_QUERY_KEYS is scrub_mod._CREDENTIAL_QUERY_KEYS
+    words = scrub_mod._CREDENTIAL_QUERY_KEYS + scrub_mod._CAMEL_WORDS
+    for word in words:
+        for sep in ("=", ":"):
+            text = f"redis://ops:pw@h:5432.{word}{sep}v@tail"
+            m = scrub_mod._WIDE_DSN_PASSWORD.search(text)
+            assert m is not None and m.group(0) == "redis://ops:pw@", (word, sep, m)
+            assert scrub_mod._WIDE_DSN_PASSWORD.search(f"redis://:{word}{sep}v@tail") is None
+    assert scrub_mod._WIDE_DSN_PASSWORD.search("redis://ops:pw@h:MEFOR_X@tail").group(0) == (  # type: ignore[union-attr]
+        "redis://ops:pw@"
+    )
+    for text, hidden in (
+        ("redis://:p@ss@host/db", "p@ss"),
+        ("postgres://svc:p@ss@db/x", "p@ss"),
+        ("redis://:p=ss@host", "p=ss"),
+    ):
+        assert hidden not in scrub_credentials(text)
+        assert hidden not in redact_log_line(text)
 
 
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above

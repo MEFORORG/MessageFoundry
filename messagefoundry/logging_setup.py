@@ -85,6 +85,10 @@ from messagefoundry.redaction import (
 # about what a credential looks like. Stdlib ``re`` only, so no cycle. Deliberately NOT the engine's
 # credential REGISTRIES, which ``config/settings.py`` holds -- that module imports LOG_LEVELS from
 # here, so the dependency must not go the other way.
+# Query-string parameters that carry a credential: secretscrub's own tuple, re-exported, so the
+# widened DSN reading there stops at the keys this filter hides (BACKLOG #5386). The BACKLOG #1184
+# ruling is on the tuple there.
+from messagefoundry.secretscrub import _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
@@ -309,18 +313,6 @@ class RedactionFilter(logging.Filter):
             record.stack_info = None
         return True
 
-
-#: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
-#: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
-#: access logger emits the full request line *including* the query string.
-#:
-#: **``content`` and ``field_value`` are deliberately absent, and this tuple sits two tokens from
-#: containing them** (BACKLOG #1184, ASVS 14.2.1). That is a ruled state, not an omission; the ruling
-#: and its reasoning are ``docs/PHI.md`` §7 and this comment does not restate them. What stops the
-#: two-token edit landing quietly is
-#: ``tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line``.
-#: **Cite the ruling, not this sentence.**
-_CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
 
 #: The label words ``secretscrub`` redacts a value under: its credential, token and key-material
 #: words. A COPY, because those tuples are private to that module. ``tests/test_logging.py`` holds

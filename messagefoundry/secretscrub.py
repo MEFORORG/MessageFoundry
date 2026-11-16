@@ -245,6 +245,20 @@ _COMPOUND_KEY_WORDS = (
 #: Every word :data:`_KEY_MATERIAL` reads as a label.
 _KEY_LABEL_WORDS = _KEY_MATERIAL_WORDS + _COMPOUND_KEY_WORDS
 
+#: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
+#: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
+#: access logger emits the full request line *including* the query string. ``logging_setup``'s
+#: query filter reads this tuple, and :data:`_WIDE_DSN_PASSWORD` stops at each of these keys, so
+#: it lives here, where both can import it (BACKLOG #5386).
+#:
+#: **``content`` and ``field_value`` are deliberately absent, and this tuple sits two tokens from
+#: containing them** (BACKLOG #1184, ASVS 14.2.1). That is a ruled state, not an omission; the ruling
+#: and its reasoning are ``docs/PHI.md`` §7 and this comment does not restate them. What stops the
+#: two-token edit landing quietly is
+#: ``tests/test_logging.py::test_an_undeclared_phi_needle_is_not_scrubbed_from_the_access_line``.
+#: **Cite the ruling, not this sentence.**
+_CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
+
 #: The environment-variable prefix every MessageFoundry secret arrives under. ``resolve_env_settings``
 #: echoes the NAME and the VALUE together on a cast failure -- ``setting 'password' (env
 #: 'MEFOR_VALUE_PW'='<value>')`` -- and that error text reaches the general log.
@@ -1351,9 +1365,28 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
 # not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
 # reads no nested quantifier.
+#
+# NEITHER RUN CROSSES A LABEL ANOTHER PASS HIDES A VALUE UNDER (code review, round 5). A character
+# of the empty user's first segment, or of the run after the first segment, is taken only where no
+# :data:`_CREDENTIAL_QUERY_KEYS` key and no label word this module reads (:data:`_CAMEL_WORDS`),
+# followed by ":" or "=", starts, and no ``MEFOR_`` name starts. A review measured
+# ``smtp://ops:pw@h:587:state=Tk9@Sec_x3`` print ``Sec_x3``: the run reached the value's "@" and
+# took ``state=``, so the query filter, which runs after this module on the log chain and hid that
+# value on ``origin/main``, found no key. The stop is built from those tuples, not copied. It
+# matches inside a word too, so ``xstate=`` stops the run as well. Stopping early ends the match at
+# an earlier "@", which with a user is where ``_DSN_PASSWORD`` already ended it, or not at all; so
+# the stop makes this pass hide less, and never makes it take a value a later pass would hide.
+_DSN_RUN_STOP = (
+    r"(?!(?:"
+    + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
+    + r")[:=]|(?-i:"
+    + re.escape(_ENV_PREFIX)
+    + r"))"
+)
 _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]*+|(?<!//:)[^\s/@]++)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
+    r"(?:(?<=//:)(?:" + _DSN_RUN_STOP + r"[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22])*+|(?<!//:)[^\s/@]++)"
+    r"(?:" + _DSN_RUN_STOP + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

@@ -3157,7 +3157,8 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
     assert r"://[^\s:/@]*):" in wide
     tail = wide.split(r"(?<!//:)[^\s/@]++)", 1)[1]
-    assert tail.startswith(r"[^\s/") and tail.endswith("]*@"), tail
+    run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
+    assert tail.startswith(run_head) and tail.endswith("])*@"), tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:

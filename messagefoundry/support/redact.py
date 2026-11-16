@@ -24,9 +24,11 @@ pairs, key material (``private_key=``, ``encryption_key=``), an inline DSN passw
 run as the backstop. A credential label may carry a dotted/underscored/hyphenated prefix
 (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
 
-**The credential stage is two layers**: this module's own copy of the credential patterns, then
-:func:`messagefoundry.secretscrub.scrub_credentials` (BACKLOG #2694). What that buys, what it does not,
-and why the copy stays, are stated once, above :func:`redact_log_line`.
+**The credential stage reads two vocabularies**: this module's own copy of the credential patterns,
+then :func:`messagefoundry.secretscrub.scrub_credentials` (BACKLOG #2694). What that buys, what it
+does not, and why the copy stays, are stated once, above :func:`redact_log_line`. Two more of
+secretscrub's own patterns then run over the whole line, its connection-string member mask (BACKLOG
+#5030) and its widened DSN reading (BACKLOG #5386); :func:`redact_log_line` states the order.
 
 **The credential VOCABULARY is derived from the engine, not hand-chosen here.**
 ``tests/test_log_redaction_secret_domain.py`` reads the engine's own registry of credential settings —
@@ -531,12 +533,13 @@ _KEY_MATERIAL = re.compile(
 # whole line. Run here, first, a review measured its run after the password reach past a glued
 # ``\ndbPassword=`` label and print that value's tail on every glue it tried. After the shared
 # vocabulary a value it hid is a placeholder, and the widened run after the password, which stops
-# at "[" and "]", cannot cross it. A labelled value the shared pass leaves printing is the residual:
-# at least a label NEITHER vocabulary reads, such as an escaped line break glued to a lowercase
-# label (``5432\npassword=Tail@Sec``, read as ``npassword``), and a camelCase label on a line where
-# secretscrub's union falls back to the reading before it, which does not read that label. There
-# the widened run reaches that value's "@" and its tail prints, where the narrow pass alone printed
-# the whole value.
+# at "[" and "]", cannot cross it. Nor does the run cross a label: it stops where a key of the
+# write-time query filter, a label word secretscrub reads, or a ``MEFOR_`` name starts, followed by
+# ":" or "=" (``_DSN_RUN_STOP`` there says how, and why). So a value such a label holds is left to
+# the pass that reads it, as the narrow pass alone left it, including one this function never hides,
+# such as a ``state=`` query value, which the write-time query filter hides on the store error path.
+# What the run still crosses is a label that no pass reads, and there it hides more than the narrow
+# pass did, never less.
 #
 #: Both DSN readings are secretscrub's own objects, not copies. Assigned, not only imported, so
 #: strict mypy lets a test name each on this module; a test disables each here by that name.
@@ -662,9 +665,9 @@ def redact_log_line(line: str) -> str:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
     # a password holding an "@" that the narrow copy above cut at its first one. A value the passes
-    # above hid is a placeholder by now, and its run cannot reach past one. Not every labelled value
-    # is: at least a camelCase label whose value secretscrub's union keeps printing is not, and the
-    # comment on _DSN_PASSWORD states that residual.
+    # above hid is a placeholder by now, and its run cannot reach past one. Nor past a label a pass
+    # reads, a query key the write-time filter hides included, whether or not a pass above hid its
+    # value; the comment on _DSN_PASSWORD says which labels.
     if "@" in body and "://" in body:
         body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
