@@ -35,6 +35,13 @@ def _settings() -> ServiceSettings:
     )
 
 
+def _listed() -> ServiceSettings:
+    settings = _settings()
+    return settings.model_copy(
+        update={"egress": settings.egress.model_copy(update={"allowed_syslog": [_HOST]})}
+    )
+
+
 class _Recorder(logging.Handler):
     def __init__(self, configured: list[SyslogForward | None]) -> None:
         super().__init__(logging.WARNING)
@@ -45,17 +52,23 @@ class _Recorder(logging.Handler):
         self.seen.append((record.getMessage(), bool(self.configured)))
 
 
-def _start(settings: ServiceSettings, tmp_path: Path) -> tuple[int | None, list[tuple[str, bool]]]:
+def _start(
+    settings: ServiceSettings, tmp_path: Path, *, live: bool = True
+) -> tuple[int | None, list[tuple[str, bool]]]:
     configured: list[SyslogForward | None] = []
 
     def configure(forward: SyslogForward | None) -> bool:
         configured.append(forward)
-        return False
+        return live
 
     recorder = _Recorder(configured)
     logger = logging.getLogger("messagefoundry.__main__")
     logger.addHandler(recorder)
     try:
+        # The positive control for every absence check below: the recorder sees this logger.
+        logger.warning("recorder probe")
+        assert recorder.seen == [("recorder probe", False)]
+        recorder.seen.clear()
         rc = cli._start_logging(
             settings,
             env_name="staging",
@@ -80,14 +93,22 @@ def _hop_audit(seen: list[tuple[str, bool]]) -> list[bool]:
 def test_hop_audit_is_logged_once_after_configure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    settings = _settings()
-    settings = settings.model_copy(
-        update={"egress": settings.egress.model_copy(update={"allowed_syslog": [_HOST]})}
-    )
-    rc, seen = _start(settings, tmp_path)
+    rc, seen = _start(_listed(), tmp_path)
     assert rc is None
     assert _hop_audit(seen) == [True]
-    assert f"warning: off-box log/audit forwarding to {_HOST}:" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
+    assert f"AUDIT: off-box log/audit forwarding to {_HOST}:" in err
+
+
+def test_no_hop_audit_when_no_forwarder_came_up(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # configure skipped the collector, so no record crosses the hop and none is audited for it.
+    rc, seen = _start(_listed(), tmp_path, live=False)
+    assert rc is None
+    assert _hop_audit(seen) == []
+    assert "AUDIT: off-box" not in capsys.readouterr().err
 
 
 def test_a_later_refusal_logs_no_hop_audit(

@@ -43,7 +43,13 @@ class _Recorder(logging.Handler):
 
 
 def _serve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, *, env: str, key: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    toml: str,
+    *,
+    env: str,
+    key: bool,
+    extra: tuple[str, ...] = (),
 ) -> tuple[int, list[tuple[str, bool]]]:
     monkeypatch.chdir(tmp_path)
     if key:
@@ -57,15 +63,20 @@ def _serve(
     real = configure_logging
 
     def configure(*args: object, **kwargs: object) -> bool:
+        live = real(*args, **kwargs)  # type: ignore[arg-type]
         configured.append(True)
-        return real(*args, **kwargs)  # type: ignore[arg-type]
+        return live
 
     monkeypatch.setattr("messagefoundry.__main__.configure_logging", configure)
     recorder = _Recorder(configured)
     logger = logging.getLogger("messagefoundry.__main__")
     logger.addHandler(recorder)
     try:
-        rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env])
+        # The positive control for every absence check below: the recorder sees this logger.
+        logger.warning("recorder probe")
+        assert recorder.seen == [("recorder probe", False)]
+        recorder.seen.clear()
+        rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env, *extra])
     finally:
         logger.removeHandler(recorder)
     return rc, recorder.seen
@@ -144,3 +155,21 @@ def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
     assert refused is False
     assert len(audit) == 1 and audit[0].startswith("AUDIT: [security].block_unlisted_outbound")
     assert not [r for r in caplog.records if "AUDIT" in r.getMessage()]
+
+
+def test_keyless_audit_reaches_stderr_when_the_level_filters_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # [logging].level = ERROR drops WARNING in every handler, so the record is written to stderr,
+    # which no level filters, once logging is configured.
+    rc, _seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.allow_unencrypted_phi = true\n',
+        env="staging",
+        key=False,
+        extra=("--log-level", "ERROR"),
+    )
+    assert rc == 0
+    err = capsys.readouterr().err.splitlines()
+    assert [line for line in err if line.startswith("AUDIT: starting keyless")] != []

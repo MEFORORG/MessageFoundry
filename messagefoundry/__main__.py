@@ -2239,8 +2239,9 @@ def _start_logging(
     passed (``None`` with no collector). It stays at the call site because level, format and the
     application-log file are the caller's, and it runs only after every gate here has passed.
 
-    ``pending_audit`` holds the AUDIT lines the caller decided before this call. They are logged
-    first once ``configure`` has returned, and not at all on a refused start (BACKLOG #5391)."""
+    ``pending_audit`` holds AUDIT lines the caller decided before this call. They are written to
+    stderr and logged first once ``configure`` has returned, and not at all when this function
+    refuses the start (BACKLOG #5391). A refusal the caller makes later does not unwrite them."""
     from messagefoundry.config.settings import (
         SyslogProtocol,
         forward_hop_disposition,
@@ -2418,8 +2419,6 @@ def _start_logging(
         # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
         deferred_ca_refusals.append(_ca_refusal)
         log_forward = None
-        # No forwarder is built, so no record crosses the warned hop: it takes no AUDIT record.
-        _hop_warning = None
 
     try:
         forwarder_live = configure(log_forward)
@@ -2452,12 +2451,15 @@ def _start_logging(
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's, in the order they
-    # were decided.
-    for _audit_line in pending_audit:
+    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's when a forwarder came
+    # up to use it, in the order they were decided. Each goes to stderr as well as the handlers,
+    # because [logging].level can filter WARNING out of every handler and stderr is not filtered.
+    _audit_lines = [*pending_audit]
+    if _hop_warning is not None and forwarder_live:
+        _audit_lines.append(f"AUDIT: {_hop_warning}")
+    for _audit_line in _audit_lines:
+        print(scrub_control_chars(_audit_line), file=sys.stderr)
         logging.getLogger(__name__).warning("%s", _audit_line)
-    if _hop_warning is not None:
-        logging.getLogger(__name__).warning("AUDIT: %s", _hop_warning)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
     # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
@@ -2986,10 +2988,11 @@ def _serve(args: argparse.Namespace) -> int:
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     #
-    # BACKLOG #5391: the AUDIT records of deliberate weakenings taken before _start_logging below,
-    # which logs them once its handlers are installed, never before: logged here they would reach
+    # BACKLOG #5391: the keyless and block_unlisted_outbound=false AUDIT records, for
+    # _start_logging below to write once its handlers are installed. Logged here they would reach
     # only the filtered lastResort on stderr, never [logging].file, the structured stdout handler
-    # or the collector. Each also prints a warning to stderr where it is decided.
+    # or the collector. Each also prints a warning to stderr where it is decided. The #1989 and
+    # #2700 AUDIT lines take their own paths, after _start_logging.
     _start_audit: list[str] = []
     if not _store_key_configured(settings):
         # The refuse-or-proceed DECISION is shared with provision-admin (BACKLOG #1905); the wording
