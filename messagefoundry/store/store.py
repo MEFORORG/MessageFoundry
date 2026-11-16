@@ -2196,16 +2196,25 @@ def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
 
 async def session_seal_ok_async(sealer: AnyRowSealer | None, record: SessionRecord) -> bool:
     """:func:`session_seal_ok`, awaitable, for either sealer. A value the encoder cannot read fails
-    as :func:`_held_seal_ok` fails it: the encoding is tried first, so only the encoder's
-    ``TypeError`` reads as a failed seal (BACKLOG #5505)."""
+    as :func:`_held_seal_ok` fails it (:func:`_encodes`, BACKLOG #5505)."""
     if sealer is None:
         return True
     parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and await sealer.verify_async(
+        SESSION_KIND, parts, record.seal
+    )
+
+
+def _encodes(kind: str, parts: tuple[tuple[str, object], ...]) -> bool:
+    """Whether the seal encoder can read ``parts``. Tried on its own, so only the encoder's
+    ``TypeError`` reads as a failed seal; one raised past it, in the pool hand-off or the backend,
+    is a defect and propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write`
+    lets it."""
     try:
-        seal_bytes(SESSION_KIND, parts)
+        seal_bytes(kind, parts)
     except TypeError:
         return False
-    return await sealer.verify_async(SESSION_KIND, parts, record.seal)
+    return True
 
 
 async def session_sealed_by_retired_key_async(
@@ -2223,19 +2232,12 @@ async def _held_seal_ok(
     sealer: AnyRowSealer | None, kind: str, fields: Iterable[tuple[str, object]], stored: str
 ) -> bool:
     """The record read check every ``*_seal_ok_async`` shares: True with no sealer, else whether
-    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal.
-
-    The encoding is tried on its own first, so only the encoder's ``TypeError`` reads as a
-    failed seal; one raised past it, in the pool hand-off or the backend, is a defect and
-    propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write` lets it."""
+    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal
+    (:func:`_encodes`)."""
     if sealer is None:
         return True
     parts = tuple(fields)
-    try:
-        seal_bytes(kind, parts)
-    except TypeError:
-        return False
-    return await sealer.verify_held_async(kind, parts, stored)
+    return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
 
 
 def new_session_record(
@@ -2809,11 +2811,12 @@ _END_DECLINED_KEPT_SESSION_SQL: Final = (
 _CELL_PARSE_ERRORS: Final = (ValueError, TypeError, OverflowError, RecursionError)
 
 
-def decode_or_refuse[T](kind: str, subject: str, decode: Callable[[], T]) -> T:
-    """``decode()``, or :class:`RowSealError` ``(kind, subject)`` when a cell it reads does not
-    parse (BACKLOG #5505). A row someone wrote outside the store is answered as one that fails its
-    seal, the same way and through the same handlers, so one bad row is refused alone rather than
-    raising a parse error out of every listing and re-seal that reads it.
+def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
+    """``decode()``, or :class:`RowSealError` when a cell it reads does not parse (BACKLOG #5505).
+    A row someone wrote outside the store is answered as one that fails its seal, the same way and
+    through the same handlers, so one bad row is refused alone rather than raising a parse error
+    out of every listing and re-seal that reads it. ``ident`` is the row's stored id or token hash,
+    ``""`` when none is readable; the refusal's subject is its :func:`seal_row_ref`.
 
     The refusal is raised once the handler has ended, so the parse error, which can quote the cell,
     is on neither chain (``WebAuthnCredential.from_mapping`` says why ``from None`` is not
@@ -2823,6 +2826,7 @@ def decode_or_refuse[T](kind: str, subject: str, decode: Callable[[], T]) -> T:
         return decode()
     except _CELL_PARSE_ERRORS as exc:
         failure = type(exc).__name__
+    subject = seal_row_ref(kind, ident) if ident else ""
     log.warning(
         "a %s row (%s) holds a cell that does not parse (%s); it is refused as a failed seal",
         kind,
@@ -2832,16 +2836,27 @@ def decode_or_refuse[T](kind: str, subject: str, decode: Callable[[], T]) -> T:
     raise RowSealError(kind, subject)
 
 
-def _user_subject(d: Mapping[str, Any]) -> str:
-    """The stored account id, as a :class:`RowSealError` subject, when it reads as text."""
-    value = d.get("id")
+def _cell_text(d: Mapping[str, Any], column: str) -> str:
+    """``d[column]`` when it reads as text, else ``""``: the ``ident`` a decoder hands
+    :func:`decode_or_refuse`, read before the decode so a corrupt id cell cannot raise here."""
+    value = d.get(column)
     return value if isinstance(value, str) else ""
 
 
-def _session_subject(d: Mapping[str, Any]) -> str:
-    """The token hash's 12-character prefix, as a :class:`RowSealError` subject."""
-    value = d.get("token_hash")
-    return value[:12] if isinstance(value, str) else ""
+def parse_recovery_code_hashes(cell: str | None, user_id: str) -> list[str]:
+    """The recovery-code hashes a ``totp_recovery_codes`` cell holds, ``[]`` for ``None``. A cell
+    that is not a JSON list raises :class:`RowSealError` for the account (:func:`decode_or_refuse`,
+    BACKLOG #5505). Every reader of the column parses it here."""
+    if cell is None:
+        return []
+
+    def parse() -> list[str]:
+        hashes = json.loads(cell)
+        if not isinstance(hashes, list):  # ``null`` included
+            raise TypeError("totp_recovery_codes is not a list")
+        return [str(h) for h in hashes]
+
+    return decode_or_refuse(USER_KIND, user_id, parse)
 
 
 def decoded_rows[T](rows: Iterable[Any], decode: Callable[[Any], T]) -> list[T]:
@@ -3009,7 +3024,7 @@ class UserRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
         """The account ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(USER_KIND, _user_subject(d), lambda: cls._decode(d))
+        return decode_or_refuse(USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d))
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -3073,7 +3088,7 @@ class UserRecord:
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
             global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
-            row=UserRow.from_mapping(d),
+            row=UserRow._decode(d),  # inside this decode's own refusal
         )
 
 
@@ -3164,7 +3179,7 @@ class SessionRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(SESSION_KIND, _session_subject(d), lambda: cls._decode(d))
+        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -3400,7 +3415,7 @@ class UserRow:
         """Hard subscripts throughout: every reader is a ``SELECT *``, and a row missing a column
         must fail loudly rather than decode a default the seal was never made over. A cell that is
         there but does not parse raises :class:`RowSealError` (:func:`decode_or_refuse`)."""
-        return decode_or_refuse(USER_KIND, _user_subject(d), lambda: cls._decode(d))
+        return decode_or_refuse(USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d))
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> UserRow:
@@ -3446,19 +3461,9 @@ class UserRow:
         )
 
     def recovery_code_hashes(self) -> list[str]:
-        """The remaining single-use recovery-code hashes this row holds, or ``[]``. A cell that is
-        not a JSON list raises :class:`RowSealError` (:func:`decode_or_refuse`, BACKLOG #5505)."""
-        cell = self.totp_recovery_codes
-        if cell is None:
-            return []
-
-        def parse() -> list[str]:
-            hashes = json.loads(cell)
-            if not isinstance(hashes, list):  # ``null`` included
-                raise TypeError("totp_recovery_codes is not a list")
-            return [str(h) for h in hashes]
-
-        return decode_or_refuse(USER_KIND, self.id, parse)
+        """The remaining single-use recovery-code hashes this row holds, or ``[]``, as
+        :func:`parse_recovery_code_hashes` reads them."""
+        return parse_recovery_code_hashes(self.totp_recovery_codes, self.id)
 
     def write_params(self) -> tuple[object, ...]:
         """Every column but ``id``, in :class:`UserRow` field order, as the write statements bind
@@ -19911,9 +19916,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        if not row or row["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(row["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(row["totp_recovery_codes"] if row else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None

@@ -131,6 +131,22 @@ async def test_recovery_codes_that_do_not_parse_fail_the_seal(tmp_path: Path, ce
     assert caught.value.__context__ is None
 
 
+async def test_the_recovery_code_reader_refuses_a_corrupt_cell_too(tmp_path: Path) -> None:
+    path = tmp_path / "codes-reader.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-r")
+        _raw(path, "UPDATE users SET totp_recovery_codes=? WHERE id=?", ('["h1"]', "u-r"))
+        assert await store.get_recovery_code_hashes("u-r") == ["h1"]  # control
+        _raw(path, "UPDATE users SET totp_recovery_codes=? WHERE id=?", ("{not json", "u-r"))
+        with pytest.raises(RowSealError) as caught:
+            await store.get_recovery_code_hashes("u-r")
+        assert caught.value.args == (USER_KIND, "u-r")
+        assert caught.value.__context__ is None
+    finally:
+        await store.close()
+
+
 async def test_a_corrupt_account_leaves_the_other_accounts_listed(tmp_path: Path) -> None:
     path = tmp_path / "list.db"
     store = await MessageStore.open(path)

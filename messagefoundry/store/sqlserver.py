@@ -373,6 +373,7 @@ from messagefoundry.store.store import (
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
+    parse_recovery_code_hashes,
     passkey_digest,
     password_change,
     raise_account_epoch,
@@ -15404,9 +15405,7 @@ class SqlServerStore:
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
-        if not d or d["totp_recovery_codes"] is None:
-            return []
-        return [str(h) for h in json.loads(d["totp_recovery_codes"])]
+        return parse_recovery_code_hashes(d["totp_recovery_codes"] if d else None, user_id)
 
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None

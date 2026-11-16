@@ -106,14 +106,13 @@ def _jwk_alg(jwk: dict[str, object]) -> SignatureAlgorithm | None:
         return None
     if not isinstance(alg, str):
         raise JwksError("JWK alg must be a string")
-    try:
-        return SignatureAlgorithm(alg)
-    except ValueError:
-        pass
-    raise JwksError(
-        f"JWK alg {alg[:32]!r} is not a supported signature algorithm "
-        f"(expected one of {sorted(a.value for a in SignatureAlgorithm)})"
-    )
+    supported = sorted(a.value for a in SignatureAlgorithm)
+    if alg not in supported:
+        raise JwksError(
+            f"JWK alg {alg[:32]!r} is not a supported signature algorithm "
+            f"(expected one of {supported})"
+        )
+    return SignatureAlgorithm(alg)
 
 
 def jwk_to_public_key(jwk: dict[str, object]) -> _PublicKey:
