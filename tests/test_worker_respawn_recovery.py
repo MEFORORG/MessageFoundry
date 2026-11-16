@@ -38,7 +38,7 @@ from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 LIMIT = wiring_runner._WORKER_DEATH_LIMIT
 
@@ -630,3 +630,63 @@ async def test_a_respawn_on_a_node_that_no_longer_leads_does_not_re_pend(
     assert ran == ["IB"]  # the replacement runs on every path
     assert reschedules == ([[item.id]] if re_pends else [])
     assert (await _row(store, mid, Stage.INGRESS))[0] == ("pending" if re_pends else "inflight")
+
+
+async def test_a_death_after_a_row_is_handed_back_does_not_mark_it_failed(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KILL's send hits a permanent credential fault, so the body releases it un-errored and stops
+    the lane; then the worker dies in the stop alert, after the release. The row is unsent and
+    already PENDING, so the death must not send it through ``mark_failed``, which would add a
+    backoff and an error to it. The replacement meets the same fault and stops the lane again. On
+    the code before this guard the death marks the released row failed."""
+    recorder = _Recorder()
+
+    async def credential_fault(payload: str, **_: Any) -> None:
+        recorder.attempts.append(_control_id(payload))
+        raise NegativeAckError(
+            "simulated auth rejection", code="AR", permanent=True, credential_fault=True
+        )
+
+    recorder.send = credential_fault  # type: ignore[method-assign]
+    marked: list[str] = []
+    real_mark = store.mark_failed
+
+    async def spy(outbox_id: str, *a: Any, **k: Any) -> Any:
+        marked.append(outbox_id)
+        return await real_mark(outbox_id, *a, **k)
+
+    monkeypatch.setattr(store, "mark_failed", spy)
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=_hl7("KILL"), deliveries=[("OB", _hl7("KILL"))]
+    )
+    runner = await _started(_registry(tmp_path), store, recorder)
+    stops: list[str] = []
+    kills = [1]
+
+    def kill_once(name: str, *, detail: str = "") -> None:
+        stops.append(name)
+        if kills:
+            kills.pop()
+            raise _Kill
+
+    monkeypatch.setattr(runner._alert_sink, "connection_stopped", kill_once)
+    try:
+        runner.notify_work()
+
+        async def stopped_again() -> bool:
+            return len(stops) >= 2
+
+        await _until(stopped_again, timeout=5.0)
+        assert not kills  # the worker did die after the release
+        assert marked == []  # no failed send for a row nobody sent
+        assert recorder.attempts == ["KILL", "KILL"]
+        cur = await store._db.execute(
+            "SELECT status, attempts, last_error FROM queue WHERE message_id=? AND stage=?",
+            (mid, Stage.OUTBOUND.value),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 0, None)
+    finally:
+        await runner.stop()

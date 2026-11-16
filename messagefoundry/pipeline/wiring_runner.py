@@ -1609,12 +1609,16 @@ class _HeldRows:
     a failed send on an outbound row), so a row cap bounds the re-pend; a death no row was charged
     with is bounded per lane by :meth:`RegistryRunner._recover_then_run` instead. ``failed`` names
     the rows sent through ``mark_failed`` since the current claim, so a death after a failed send
-    does not count that row a second time (:meth:`RegistryRunner._record_worker_death`)."""
+    does not count that row a second time (:meth:`RegistryRunner._record_worker_death`).
+    ``released`` names the rows handed back unsent since the current claim (a release or a park,
+    no attempt spent), so a death below the cap after that hand-back does not send the row
+    through ``mark_failed``, which would add a backoff and an error to a row nobody sent."""
 
     ids: list[str]
     fence: RependFence | None = None
     charged: bool = False
     failed: set[str] = field(default_factory=set)
+    released: set[str] = field(default_factory=set)
 
 
 # Which direction's operator hold a STOPPED lane on each pooled stage belongs to. A RESPONSE lane is
@@ -7703,6 +7707,14 @@ class RegistryRunner:
         if held is not None:
             held.failed.update(ids)
 
+    def _note_released(self, ids: Iterable[str]) -> None:
+        """Record that ``ids`` were handed back unsent in this pass of a per-lane worker, so a
+        death that follows below the cap does not send them through ``mark_failed``. Called once
+        the write has returned, as :meth:`_note_marked_failed` is."""
+        held = self._current_held()
+        if held is not None:
+            held.released.update(ids)
+
     def _take_dead_rows(self, old: asyncio.Task[None] | None) -> _HeldRows | None:
         """Take the held rows of ``old``, the worker a spawn is about to replace, when it died by an
         exception, for the replacement to re-pend before it claims. Every spawn door takes them, not
@@ -10475,6 +10487,7 @@ class RegistryRunner:
                 # #1611: taken before anything else can raise, so the except arm re-pends THESE rows.
                 claimed[:] = [it.id for it in items]
                 holding.failed.clear()  # a re-claimed row may be failed again in this pass
+                holding.released.clear()  # and is in flight again until handed back
                 if self._delivery_phase_timing:
                     # One lane per claim in per_lane mode (this worker owns exactly `name`). Recorded
                     # synchronously; counts only, never the lane name (destination_name = PHI-adjacent).
@@ -11530,6 +11543,7 @@ class RegistryRunner:
         queue is intact when an operator fixes the connection and reloads or restarts. The caller
         returns :attr:`_ItemOutcome.STOPPED`."""
         await self.store.release_claimed(list(ids))
+        self._note_released(ids)
         if fault == "credential":
             log.error(
                 "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
@@ -13550,6 +13564,7 @@ class RegistryRunner:
         if self._delivery_halted or not self._coordinator.is_leader():
             return await self._refuse_claimed(name, ids)
         await self.store.release_claimed(ids)
+        self._note_released(ids)
         return _ItemOutcome.PROCESSED, time.time()
 
     async def _release_for_new_leader(self, name: str, ids: list[str]) -> None:
@@ -13557,6 +13572,7 @@ class RegistryRunner:
         (the L1 check; :meth:`_process_delivery_item` carries the reasoning). No attempt is spent.
         The caller then STOPs the lane."""
         await self.store.release_claimed(ids)
+        self._note_released(ids)
         log.warning(
             "delivery worker %r: leadership lost before send; released %d claimed row(s) "
             "un-errored (no attempt spent) and stopped the lane for the new leader",
@@ -13582,9 +13598,12 @@ class RegistryRunner:
         Both hand the rows back unsent, and a worker halted at its loop top claims nothing until a
         restart, by which time the backoff has passed."""
         if self._delivery_halted:
-            return await self._park_claimed(ids)
-        await self.store.release_claimed(ids)
-        return time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+            deadline = await self._park_claimed(ids)
+        else:
+            await self.store.release_claimed(ids)
+            deadline = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+        self._note_released(ids)
+        return deadline
 
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         if self._inbound_log_halted(lane):  # #122 claim gate, pooled half (BACKLOG #5704)
@@ -13662,6 +13681,8 @@ class RegistryRunner:
         (``max_attempts = None``) never dead-letters on a death. A row the dying per-lane worker
         already sent through ``mark_failed`` in this pass is not sent through it again: that failed
         send counted the attempt, and a second would repeat its event and restart its backoff.
+        Nor, below the cap, is a row that pass already handed back unsent (a release or a park);
+        that death is charged to no row.
 
         A per-lane worker's record is marked charged once a death is counted against a row here,
         so the respawn knows a row cap bounds the re-pend (:meth:`_recover_then_run`).
@@ -13721,6 +13742,20 @@ class RegistryRunner:
                         kind,
                         item.attempts,
                         "unlimited" if cap is None else cap,
+                    )
+                    return
+                if below and held is not None and item.id in held.released:
+                    # The dying pass already handed this row back unsent, un-errored and with its
+                    # attempt given back: a failed send here would add a backoff and an error to a
+                    # row nobody sent. Not charged, so the respawn's per-lane bound applies.
+                    log.error(
+                        "%s worker %r: row %s (message %s) killed the worker with %s after the "
+                        "row was handed back unsent; not counted as a failed send",
+                        worker,
+                        name,
+                        item.id,
+                        item.message_id,
+                        kind,
                     )
                     return
                 # Through _mark_failed_and_arm, so a re-pend arms the lane's retry wake where
