@@ -278,8 +278,9 @@ _RESEND_CODES: dict[int, str] = {
 }
 
 #: The same for a refused delete. 404 covers an absent file and an owner denial alike (ASVS 8.2.2).
-#: 423 reaches only a files:access_any holder: the engine answers everyone else 404 for a file whose
-#: sidecar it refuses, because the owner cannot be read.
+#: A refused sidecar's 423 reaches only a files:access_any holder: the engine answers everyone else
+#: 404 for a file whose sidecar it refuses, because the owner cannot be read. A damaged body's 423
+#: (BACKLOG #5388) can reach the file's owner too, since its sound sidecar names that owner.
 _DELETE_CODES: dict[int, str] = {
     404: DELETE_FAILED_CODE,
     _LOCKED_STATUS: DELETE_LOCKED_CODE,

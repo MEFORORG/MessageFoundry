@@ -1551,6 +1551,14 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         ]
 
 
+#: The damaged 423's text (BACKLOG #5388). It promises no removal, because at least a directory in
+#: a part's place is kept by the prune and refused by the delete.
+_DAMAGED_TEXT = (
+    "this uploaded file is damaged, so it was not read and is not served. No key and no command "
+    "repairs it. An operator may try to delete it, and the delete may be refused too"
+)
+
+
 async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -1582,8 +1590,7 @@ async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
                     assert r.status_code == status, r.text
                     if status == 423:
                         # Its own text: rotate-key repairs nothing here (BACKLOG #5388).
-                        assert "damaged" in r.json()["detail"]
-                        assert "rotate-key" not in r.json()["detail"]
+                        assert r.json()["detail"] == _DAMAGED_TEXT
             assert (root / f"{fid}.meta").exists()
         # A damaged body, under a sound sidecar, answers the damaged 423 to its own owner too, and
         # a directory in place of the body does not answer a 500.
@@ -1599,7 +1606,13 @@ async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
                 blob.mkdir()
             r = await c.get(f"/uploads/{fid}/messages", headers=h)
             assert r.status_code == 423, r.text
-            assert "damaged" in r.json()["detail"]
+            assert r.json()["detail"] == _DAMAGED_TEXT
+            if damage == "dir":
+                # The delete refuses a directory body, which is why the text promises no removal.
+                r = await c.delete(f"/uploads/{fid}", headers=h)
+                assert r.status_code == 423, r.text
+                assert r.json()["detail"] == _DAMAGED_TEXT
+                assert blob.is_dir() and (root / f"{fid}.meta").exists()
 
 
 @_BREAKS

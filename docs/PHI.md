@@ -851,7 +851,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    surrogate field: the save refuses one up front, and the API answers 400 with nothing stored.
    Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
    left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
-   override holder, with text naming the file as damaged. The web console's `/ui` page does not
+   override holder, with text naming the file as damaged and saying it is not served. That text
+   promises no removal, because at least the cases kept out of retention below are not removed,
+   and the delete it says may be refused does succeed for the non-UTF-8 never-sealable kind above.
+   The web console's `/ui` page does not
    pass that text on: it shows its one locked notice for every 423, which names `rotate-key` as
    the conditional fix, and `rotate-key` does not repair a damaged file. It is not left out of
    retention: the prune removes the pair once the later of its
@@ -862,11 +865,15 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    owner fields. A sound sidecar whose `uploaded_at` is more than a day ahead of the prune's clock
    is aged the same way, by its pair's mtimes and never by an mtime ahead of the clock, since that
    stamp alone would never pass the window; its audit row carries the sidecar's own owner fields,
-   and the prune logs it as one whose `uploaded_at` is ahead of the clock. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
+   and the prune logs it as one whose `uploaded_at` is ahead of the clock. Neither kind is
+   always removed once its mtimes pass the window: a `rotate-key` run that re-seals either half
+   writes it through an atomic replace, which resets that half's mtime, so a pair re-sealed at
+   least as often as the retention window is kept. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
    that log line is its only record. A sidecar the cipher declines is not
    this kind: a key rotated away must not destroy data, so it waits for `rotate-key` as above. At
-   least a sidecar that is a link or is not a regular file is still outside retention, and an
-   operator removes it by hand.
+   least a sidecar that is a link or is not a regular file, such as a directory or a FIFO, and a
+   body that is a directory, are still outside retention, and the API cannot delete them either,
+   so an operator removes them by hand, which leaves no audit row.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
    `rotate-key` refuses to run in that mode (BACKLOG #1165, #2109). So no command could ever seal the upload, and refusing it
    would strand the file for good. The transit cipher still refuses unmarked values in the store's own

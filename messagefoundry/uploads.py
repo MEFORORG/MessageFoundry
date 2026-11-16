@@ -479,8 +479,10 @@ def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
 
 def _refuse_unplain(file_id: str, part: str, path: Path) -> None:
     """Raise the damaged refusal when ``path`` is not a plain file (:func:`_not_a_plain_file`),
-    the check the listing scan makes (BACKLOG #5552), so a by-id read never opens a directory,
-    which answered a server error, or a FIFO, which blocked a worker thread for good. A path that
+    the check the listing scan makes (BACKLOG #5552), so a by-id read does not open a directory,
+    which answered a server error, or a FIFO, which blocked a worker thread for good, that is in
+    place when it looks. It guards against what is on disk then, not against a writer racing it: a
+    FIFO swapped in between this ``lstat`` and the open can still block a worker thread. A path that
     is absent passes, and the caller's read answers it as missing."""
     refused = _not_a_plain_file(path)
     if refused is not None:

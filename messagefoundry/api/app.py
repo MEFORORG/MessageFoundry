@@ -9031,11 +9031,13 @@ def create_app(
     )
     # BACKLOG #5388: a damaged file (UploadDamagedError) is refused with the same status but its
     # own text, because no key and no rotate-key repairs it, and a keyless store has no key at all.
+    # It promises no removal: at least a directory or FIFO in the sidecar's place, or a directory
+    # in the body's, is kept by the prune and refused by the delete, while a non-UTF-8 sidecar of
+    # the never-sealable kind, on a store that refuses plaintext, is deleted. So it says only what
+    # holds for every file that gets it.
     _UPLOAD_DAMAGED = (
-        "this uploaded file is damaged, so it was not read. No key and no command repairs it. An "
-        "operator may delete it, but a damaged sidecar refuses the delete too. The retention prune "
-        "removes a damaged file, with an audit row, once it is old on disk; removing it from the "
-        "uploads directory by hand leaves no audit row"
+        "this uploaded file is damaged, so it was not read and is not served. No key and no "
+        "command repairs it. An operator may try to delete it, and the delete may be refused too"
     )
 
     _UPLOAD_UNAVAILABLE = (
