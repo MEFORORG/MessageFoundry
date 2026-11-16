@@ -2346,8 +2346,8 @@ issuer. The engine applies a replaced file only when all three of these hold:
    the marker text out of the comment. The file carries no certificate the hop does not already
    trust. For `[api].tls_client_crl_file`, each CA the hop loaded from `[api].tls_client_ca_file`
    has a CRL of its own in it, as that setting's row says (vault BACKLOG #5627); a file that fails
-   this is refused as `fix_file`. An inbound connection's `tls_crl_file` on an MLLP, HTTP or DICOM
-   listener takes the same rule against its `tls_ca_file` (vault BACKLOG #5511).
+   this is refused as `fix_file`. For an inbound connection's `tls_crl_file`, see the
+   [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
    and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
@@ -2472,8 +2472,8 @@ these cases after that WARNING (the paragraph after this list says which). At le
 
 **`[api].tls_client_crl_file` refuses more at start (vault BACKLOG #5627).** That hop checks the
 whole client chain, so each CA loaded from `[api].tls_client_ca_file` needs a CRL of its own in
-the file; that setting's row says what counts. An inbound connection's `tls_crl_file` on an MLLP,
-HTTP or DICOM listener does the same against its `tls_ca_file` (vault BACKLOG #5511). So on each of
+the file; that setting's row says what counts. An inbound listener's `tls_crl_file` checks the
+whole chain too, as the [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md says. So on each of
 those hops at least the second bullet's case refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
 SHA-1 CRL with no key identifier among them. The SHA-1 trade-off above does not arise there for
 such a CRL, since it never loads. A CRL of the first bullet's kind can refuse too, at least where
@@ -2481,7 +2481,11 @@ its issuer differs from a loaded CA's name only in white space and that CA did n
 other hop, at least each outbound hop, loads all three cases with the WARNING.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
+it judged before the failure is proved badly signed, which refuses the file. On a hop that checks
+the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
+rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
+start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
+not logged. Where it loads, the
 CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
 and counts the rest; one it verified is not reported. The CRLs after
 the failure are not judged, so a bad one there loads (vault BACKLOG #3506).

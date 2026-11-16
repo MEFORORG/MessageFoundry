@@ -15133,7 +15133,8 @@ def check_inbound_revocation(
             "%sinbound requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
             "tls_crl_file (a PEM file holding a CRL from each CA in the client chain) on the "
-            "connection, or tls_revocation_attested=true with a tls_revocation_attested_reason if your PKI checks "
+            "connection, or tls_revocation_attested=true with a tls_revocation_attested_reason "
+            "if your PKI checks "
             "revocation outside the engine.",
             hop_name_prefix(inbound_record_name(name)),
         )
