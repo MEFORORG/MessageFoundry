@@ -79,12 +79,12 @@ this line.**
 - **The sign-in, MFA, step-up and enrolment-confirm forms check their credentials through the JSON
   routes' own models.** `POST /ui/login`, `POST /ui/mfa`, `POST /ui/reauth` and
   `POST /ui/account/mfa/verify` check at least their hand-parsed username, password and codes
-  through `LoginRequest`, `MfaVerifyRequest`, `ReauthRequest` and `MfaConfirmRequest`, so a value
-  one of those refuses is refused before it is hashed, audited or sent to the directory. Not every
-  form field is checked: `_form_fits` names the ones that are. The sign-in authenticator code is
-  now refused past `LoginRequest`'s length bound rather than cut to 16 characters; it is bounded
-  by length only, so a blank or space-only code is still the two-step flow and a non-digit one is
-  still passed on, as before. The enrolment code at the TOTP confirm and at
+  through `LoginRequest`, `MfaVerifyRequest`, `ReauthRequest` and `MfaConfirmRequest`. Not every
+  form field is checked, and not every field is checked against the whole model: `_form_fits`
+  names which. The sign-in authenticator code is now refused past `LoginRequest`'s length bound,
+  measured with surrounding space stripped, rather than cut to 16 characters; it is bounded by
+  length only, so a blank or space-only code is still the two-step flow and a non-digit one still
+  reaches the engine, which refuses it as a wrong code, as before. The enrolment code at the TOTP confirm and at
   `POST /ui/account/webauthn/verify` is refused past `MfaConfirmRequest`'s bound rather than cut.
   Needs the engine seam digest that lists those four models. (vault BACKLOG #5397, #5398, #5399)
 - **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`

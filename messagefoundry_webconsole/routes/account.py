@@ -919,12 +919,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=exc.status_code,
                 headers={"Retry-After": _CEREMONY_RETRY_AFTER},
             )
-        if enrolment_code is not None and not _form_within_lengths(
-            request, MfaConfirmRequest, enrolment_code=enrolment_code
+        if (
+            enrolment_code is not None
+            and not factor_refused
+            and not _form_within_lengths(request, MfaConfirmRequest, enrolment_code=enrolment_code)
         ):
             # BACKLOG #5399: the bound the JSON MfaConfirmRequest sets on the enrolment code. An
             # oversized one is refused, never cut, is not checked or audited, and gets the reply a
-            # refused enrolment code gets. The ceremony stays staged.
+            # refused enrolment code gets. The ceremony stays staged. A factor-refused request
+            # skips this, so the service still pops the ceremony and audits the refusal; it reads
+            # no enrolment code on that path, so it is passed none.
             return JSONResponse(
                 {"ok": False, "error": str(EnrolmentCodeRefused())}, status_code=400
             )
@@ -938,7 +942,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 rp_id=rp[0],
                 origin=rp[1],
                 factor_refused=factor_refused,
-                enrolment_code=enrolment_code,
+                enrolment_code=None if factor_refused else enrolment_code,
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or

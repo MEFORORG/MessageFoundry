@@ -143,13 +143,15 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
         await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
         assert len(calls) == 1 and calls[0][-1]["totp_code"] == "1" * MAX_DIGITS
         # Within the bound, content is not the form's to judge: each reaches auth.login unchanged.
-        passed = ("12345a", " 12345", "   ")
+        # The bound is on the code with surrounding space stripped, as the engine strips it, so a
+        # padded code at the bound and a long run of spaces both still pass.
+        passed = ("12345a", " 12345", "   ", " " + "1" * MAX_DIGITS + " ", " " * (MAX_DIGITS + 5))
         for code in passed:
             await c.post("/ui/login", data={**base, "totp_code": code})
         assert [call[-1]["totp_code"] for call in calls[1:]] == list(passed)
         # A blank code is the two-step flow, passed on as no code.
         await c.post("/ui/login", data={**base, "totp_code": ""})
-    assert len(calls) == 5 and calls[4][-1]["totp_code"] is None
+    assert len(calls) == 7 and calls[6][-1]["totp_code"] is None
 
 
 async def test_a_space_only_sign_in_code_is_still_the_two_step_flow(engine: Engine) -> None:
@@ -159,7 +161,7 @@ async def test_a_space_only_sign_in_code_is_still_the_two_step_flow(engine: Engi
     await _add(service)
     await _enrol_totp(service)
     async with ui_client(engine, service) as c:
-        for code in ("", "   "):
+        for code in ("", "   ", " " * (MAX_DIGITS + 5)):
             r = await c.post(
                 "/ui/login", data={"username": "op", "password": PW, "totp_code": code}
             )

@@ -156,6 +156,43 @@ async def test_the_route_refuses_a_finish_after_the_account_gained_a_factor(
     assert paths == ["finish_webauthn_registration"]
 
 
+async def test_a_factor_refused_finish_with_an_oversized_enrolment_code_is_still_the_factor_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: the route's enrolment-code bound answers a factor-refused finish
+    ahead of the service, so the ceremony is not ended and the refusal is not audited, or the
+    oversized code reaches the service. The control is the at-bound code, answered the same way."""
+    from messagefoundry.api.auth_models import _ENROLMENT_CODE_MAX
+
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    seen: list[object] = []
+    real = service.finish_webauthn_registration
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("enrolment_code"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", spy)
+    body = await _staged_body(service, identity, token)
+    await _enrol_totp_elsewhere(service)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        for code in ("e" * (_ENROLMENT_CODE_MAX + 1), "e" * _ENROLMENT_CODE_MAX):
+            refused = await c.post(
+                _VERIFY, json={**body, "enrolment_code": code}, headers=SAME_ORIGIN
+            )
+            assert refused.status_code == 400, refused.text
+            error = refused.json()["error"]
+            assert "already has a second factor" in error or "ceremony expired" in error, error
+    assert seen == [None, None]
+    paths = [
+        json.loads(r["detail"])["path"]
+        for r in await service.store.list_audit(action="auth.mfa_denied")
+    ]
+    assert paths == ["finish_webauthn_registration"]
+
+
 async def test_a_finish_the_route_left_uncharged_never_completes(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

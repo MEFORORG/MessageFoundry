@@ -188,9 +188,11 @@ def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bo
     #5399). Only the fields a caller passes are checked: at least the sign-in username and password,
     the MFA and step-up codes, the step-up password, and the enrolment-confirm code and enrolment
     code. A field a caller does not pass, such as the sign-in passkey assertion, is not. Any refusal
-    by the model counts, not only a length one. The sign-in authenticator code and the passkey
-    enrolment code are checked for length only, by :func:`_form_within_lengths`, because the model's
-    other rules would refuse what the form has always passed on. The check only refuses and never
+    by the model counts, not only a length one. Two fields are checked for length only, by
+    :func:`_form_within_lengths`: the sign-in authenticator code, because ``LoginRequest``'s digit
+    pattern would refuse what the form has always passed on, and the passkey enrolment code, because
+    ``MfaConfirmRequest`` also requires a ``code`` the passkey finish has none of. The check only
+    refuses and never
     normalises: what the service receives is each caller's own reading of the submitted value,
     which at /ui/reauth and the enrolment confirm is the code with surrounding space stripped.
 
@@ -209,8 +211,10 @@ def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bo
 
 def _form_within_lengths(request: Request, model: type[BaseModel], /, **fields: str) -> bool:
     """Whether each of these form values is within the ``max_length`` the JSON route's own request
-    ``model`` sets on that field, and nothing else of the model's. A field the model leaves unbounded
-    always fits. A refusal is logged as :func:`_form_fits` logs one, never with a value."""
+    ``model`` sets on that field, and nothing else of the model's. A field whose bound is not found
+    on the model's field metadata raises ``LookupError`` rather than fit, so a refactor that moves
+    the bound out of sight fails closed. A refusal is logged as :func:`_form_fits` logs one, never
+    with a value."""
     over = 0
     for name, value in fields.items():
         bounds = [
@@ -218,7 +222,9 @@ def _form_within_lengths(request: Request, model: type[BaseModel], /, **fields: 
             for m in model.model_fields[name].metadata
             if isinstance(getattr(m, "max_length", None), int)
         ]
-        if bounds and len(value) > min(bounds):
+        if not bounds:
+            raise LookupError(f"{model.__name__}.{name} declares no max_length")
+        if len(value) > min(bounds):
             over += 1
     if over:
         _log_form_refusal(request, over)
@@ -826,8 +832,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #5397: an oversized username, password or authenticator code is refused here,
         # before auth.login hashes or audits it, as the JSON route's 422 refuses it before the
         # engine sees it. That holds for provider "ad" too. Refused, never clamped: a truncated
-        # credential is a different one. The authenticator code is bounded by length only: a blank
-        # or space-only one is still the two-step flow, and a non-digit one is still passed on, as
+        # credential is a different one. The authenticator code is bounded by length only, with
+        # surrounding space stripped as the engine strips it: a blank or space-only one is still
+        # the two-step flow, a padded code still counts, and a non-digit one is still passed on, as
         # before. The passkey challenge was already popped, and the budget charged as _form_fits
         # says.
 
@@ -846,7 +853,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if (
             provider_value not in ("local", "ad")
             or not _form_fits(request, LoginRequest, username=username, password=password)
-            or not _form_within_lengths(request, LoginRequest, totp_code=totp_code)
+            or not _form_within_lengths(request, LoginRequest, totp_code=totp_code.strip())
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,

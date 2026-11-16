@@ -504,8 +504,8 @@ async def test_every_refused_combined_sign_in_answers_alike_on_the_json_and_cons
         assert set(redirects) == {(303, "/ui/login?e=bad")}, redirects
 
         # Non-ASCII digits are an ordinary refusal on both surfaces, never a 500 (ADR 0197). The
-        # JSON body is refused by shape, the same for every account, and the console refuses it by
-        # the same LoginRequest shape before auth.login runs (BACKLOG #5397).
+        # JSON body is refused by shape, the same for every account; the console treats the code as
+        # a wrong one.
         for odd in ("\u0660" * 6, "\uff11" * 6):
             r = await c.post(
                 "/auth/login", json={"username": "carol", "password": PW, "totp_code": odd}
