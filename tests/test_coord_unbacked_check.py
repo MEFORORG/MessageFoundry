@@ -737,19 +737,63 @@ def test_a_FAILED_scan_is_unverifiable_never_zero(repo: Path, corrupt: bool) -> 
         obj.unlink()
 
     r = check(repo)
-    assert r.returncode == 1, r.stdout + r.stderr
     assert "0 unbacked commits" not in r.stdout
     if corrupt:
+        # Exit 2, "could not run": a broken measurement is not work needing a rescue push.
+        assert r.returncode == 2, r.stdout + r.stderr
         assert "UNVERIFIABLE" in r.stdout
-        assert "git rev-list FAILED for: side" in r.stdout
+        assert "git FAILED for: side" in r.stdout
     else:
-        assert "rev-list FAILED" not in r.stdout
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "git FAILED" not in r.stdout
         assert "2 commits on 1 branch exist on no remote" in r.stdout
 
 
+@pytest.mark.parametrize("name", ["café", "cafe"], ids=["non-ascii", "ascii"])
+def test_a_NON_ASCII_branch_name_does_not_break_the_scan(repo: Path, name: str) -> None:
+    """``non-ascii`` MUST TRIP; ``ascii`` is its twin. PowerShell decoded git's output with the
+    console code page, so a branch named ``cafe`` with an accent came back garbled, every rev-list
+    fed that name failed, and the whole repository read UNVERIFIABLE instead of naming ``side``."""
+    git(repo, "branch", name)
+    git(repo, "push", "-q", "origin", name)
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "UNVERIFIABLE" not in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("corrupt", [True, False], ids=["bad-packed-refs", "intact"])
+def test_a_FAILED_ref_listing_is_unverifiable_never_zero(repo: Path, corrupt: bool) -> None:
+    """``bad-packed-refs`` MUST TRIP; ``intact`` is its control. A for-each-ref that dies lists
+    nothing, and nothing read as "no tracking refs" and "no branches"."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "pack-refs", "--all")
+    if corrupt:
+        with (repo / ".git" / "packed-refs").open("a", encoding="ascii") as f:
+            f.write("this line is not a packed ref\n")
+
+    r = check(repo)
+    assert "0 unbacked commits" not in r.stdout
+    if corrupt:
+        assert r.returncode == 2, r.stdout + r.stderr
+        assert "UNVERIFIABLE" in r.stdout
+        assert "git FAILED for:" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
 def test_a_BROKEN_tracking_ref_does_not_make_the_run_read_clean(repo: Path) -> None:
-    """MUST TRIP. A tracking ref naming a missing object made the ``--remotes=origin`` glob die for
-    every ref, and the empty output read as 0 unbacked commits."""
+    """MUST TRIP, and still measure. A tracking ref naming a missing object made the
+    ``--remotes=origin`` glob die for every ref, and the empty output read as 0 unbacked commits. It
+    backs nothing, so the run must neither read clean nor give up: ``side`` is named."""
     git(repo, "checkout", "-q", "-b", "side")
     _commit(repo, "g.txt", "this exists on exactly one disk", "work")
     git(repo, "checkout", "-q", "main")
@@ -760,6 +804,8 @@ def test_a_BROKEN_tracking_ref_does_not_make_the_run_read_clean(repo: Path) -> N
     r = check(repo)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "0 unbacked commits" not in r.stdout
+    assert "UNVERIFIABLE" not in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
 
 
 @pytest.mark.parametrize(
