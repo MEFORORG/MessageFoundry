@@ -184,6 +184,9 @@ _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
 # (:func:`_classify_db_error`). Class 28 is "invalid authorization specification"; class IM is the
 # ODBC driver manager's own; 01000 is how unixODBC reports a driver library it could not load.
 _CREDENTIAL_PREFIXES = ("28",)
+# BACKLOG #5748: SQLSTATE class 08 is "connection exception": the link failed, not the statement,
+# so the connection is discarded rather than lent again (:func:`_connection_lost`).
+_CONNECTION_LOST_PREFIXES = ("08",)
 _CONFIG_PREFIXES = ("IM",)
 _CONFIG_STATES = frozenset({"01000"})
 # BACKLOG #5714: nextset() states that end the walk rather than fail the write. IM001 and HYC00
@@ -2683,6 +2686,30 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     return _sqlstate(exc)
 
 
+def _connection_lost(exc: BaseException | None) -> bool:
+    """Whether ``exc``, or an exception in the chain a traceback would print under it, is a driver
+    error of SQLSTATE class 08, a connection exception (BACKLOG #5748).
+
+    Such a connection's handle is usually dead: a dropped link, a failover, a server that ended
+    the session. Returned to its pool, it would be lent again and fail the next poll, mark,
+    lookup or send the same way, until a restart. The chain is walked as ``traceback`` walks it,
+    ``__cause__`` first, then ``__context__`` unless suppressed, because every borrow site in this
+    module raises its own error ``from`` the driver's. A spurious match discards a live connection,
+    which costs one reconnect."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        state = _log_sqlstate(exc)
+        if state is not None and state[:2] in _CONNECTION_LOST_PREFIXES:
+            return True
+        exc = (
+            exc.__cause__
+            if exc.__cause__ is not None
+            else (None if exc.__suppress_context__ else exc.__context__)
+        )
+    return False
+
+
 #: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
 #: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
 _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
@@ -3485,8 +3512,20 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     and the next borrower's commit would commit it. The handle is dropped here, before any await,
     so no path below can lend the connection again; the job that closes the cursor then closes the
     handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
-    shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
+    shut down, no job runs, and the handle is left for pyodbc to close when it is collected.
+
+    **A connection-class failure discards the connection too (BACKLOG #5748).** When the exception
+    in flight through the caller's ``finally`` carries SQLSTATE class 08 (:func:`_connection_lost`),
+    the handle is presumed dead, so it is closed rather than lent to the next borrower. A caller
+    that has already handled its exception, as the login role probe does, passes ``discard``
+    itself."""
     cancelled = _unwinding_a_cancel()
+    if not discard and not cancelled and _connection_lost(sys.exc_info()[1]):
+        discard = True
+        logger.warning(
+            "DATABASE: a connection failure (SQLSTATE class 08) discards the connection rather "
+            "than returning it to its pool"
+        )
     gate = call_gate(conn)
     hand_to_gate = cancelled and gate is not None
     if cancelled and gate is None and getattr(conn, "_conn", None) is not None:
@@ -5150,11 +5189,13 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     except Exception as exc:
         return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     cur: Any = None
+    lost = False
     try:
         cur = await conn.cursor()
         await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
+        lost = _connection_lost(exc)  # handled here, so the release below cannot see it (#5748)
         reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     except BaseException:  # a cancellation: the connection still goes back, then it propagates
         await _close_and_release(pool, conn, cur)
@@ -5168,7 +5209,7 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     # Outside a finally, so a release that raises (a pool aclose() is closing, say) cannot escape
     # the never-raises promise; the reading it already holds still stands.
     try:
-        await _close_and_release(pool, conn, cur)
+        await _close_and_release(pool, conn, cur, discard=lost)
     except Exception as exc:
         logger.warning(
             "login role probe: its connection did not go back to the pool cleanly (%s)",
