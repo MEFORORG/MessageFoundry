@@ -325,6 +325,21 @@ async def test_a_refused_sidecar_is_pruned_once_old_on_disk_and_not_before(
     assert any("whose sidecar was refused" in r.getMessage() for r in caplog.records)
 
 
+async def test_a_lone_damaged_sidecar_is_pruned_with_a_log_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No body, so no audit row is written; the log line is the removal's only record.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _blob(store, meta.file_id).unlink()
+    _sidecar(store, meta.file_id).write_bytes(b"{not json")
+    _age(_sidecar(store, meta.file_id), days=60)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        await store.prune_expired(retention_days=30)
+    assert not _sidecar(store, meta.file_id).exists()
+    assert any("whose sidecar was refused" in r.getMessage() for r in caplog.records)
+
+
 async def test_a_sidecar_the_cipher_declines_is_still_not_pruned(tmp_path: Path) -> None:
     # Control for the test above: a key rotated away must not destroy data, so a sidecar the cipher
     # declines (a plaintext one over a text body, on a keyed store) is not aged on disk.

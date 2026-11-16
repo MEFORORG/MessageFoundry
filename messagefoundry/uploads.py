@@ -1393,8 +1393,7 @@ class UploadStore:
         body's modification times, read without following a link, so a pair is due only once both
         halves are old on disk. Unlike the never-sealable kind, one dated ahead is not pruned: a
         genuine sealed upload refused only because a clock was stepped back is not damaged and waits
-        for wall time. This is the one statement of the damaged kind's retention rule; the
-        other docstrings and ``docs/PHI.md`` §3 point here. ``size`` is the body's size on disk, ``0`` when it is gone. The owner is
+        for wall time. ``size`` is the body's size on disk, ``0`` when it is gone. The owner is
         blank, so the record bills nobody and the audit row names no owner. The record is the
         never-sealable kind's only in shape: :meth:`_scan_metas_sync` hands it to the prune alone."""
         try:
@@ -2960,6 +2959,15 @@ class UploadStore:
                 removed = self._prune_pair_sync(meta)
             finally:
                 sweep.end(removed)
+            # Logged once the pair is gone, a lone sidecar's included, which writes no audit row,
+            # so the log is that removal's only record. The row names no owner, so this says why.
+            if meta.file_id in refused_ids and (
+                removed or not os.path.lexists(self._paths_unfollowed(meta.file_id)[1])
+            ):
+                _log.warning(
+                    "uploaded-logs prune took %s, whose sidecar was refused, by its age on disk",
+                    meta.file_id,
+                )
             return removed
 
         def _orphans() -> int:
@@ -2975,12 +2983,6 @@ class UploadStore:
             removed = await asyncio.to_thread(_remove, meta)
             if removed is None:
                 break
-            if removed and meta.file_id in refused_ids:
-                # The audit row names no owner, so the log says why (BACKLOG #5387, #5388).
-                _log.warning(
-                    "uploaded-logs prune took %s, whose sidecar was refused, by its age on disk",
-                    meta.file_id,
-                )
             if removed and audit is not None:
                 try:
                     await audit(meta)

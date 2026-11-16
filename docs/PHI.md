@@ -852,8 +852,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
    claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, because a
    genuine upload refused only after the host clock was stepped back is not damaged and is read
-   again once wall time catches up. It logs that the sidecar
-   was refused, and the audit row carries blank owner fields. A sidecar the cipher declines is not
+   again once wall time catches up. So a damaged pair whose mtimes are set ahead stays on disk
+   until they pass, and `rotate-key`, which rewrites a pair it can decrypt, restarts that clock.
+   The prune logs each such removal as one of a refused sidecar, and its audit row carries blank
+   owner fields. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
+   that log line is its only record. A sidecar the cipher declines is not
    this kind: a key rotated away must not destroy data, so it waits for `rotate-key` as above. At
    least a sidecar that is a link or is not a regular file is still outside retention, and an
    operator removes it by hand.
