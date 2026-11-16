@@ -738,8 +738,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    uses, where the run prints a note naming the path it read. Before retiring the prior key, confirm
    the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp a
    changed key while the rotation record names it or cannot be read (BACKLOG
-   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
-   (the store open can already have written under the key) and closes it only when a run completes,
+   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` inside the store open,
+   before the open's first write under the key (BACKLOG #4936; only the open's schema step, which
+   writes nothing under the key, can run before it), and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. **A sealed record under a key the run
    was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
    seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell

@@ -279,8 +279,10 @@ async def open_rotation_record(
     meta_store: SecretRotationMetaStore, key_id: str, day: str, *, keep_another: bool = False
 ) -> bool:
     """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before either data
-    pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737). The store
-    open has run by then and can already have written under the key. A ``serve`` start calls it too,
+    pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737).
+    ``rotate-key`` calls it from the store open's ``before_first_write`` hook (BACKLOG #4936), so
+    before the open's first write under the key; only the open's schema step, which writes nothing
+    under the key, can have run before it. A ``serve`` start calls it too,
     for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
