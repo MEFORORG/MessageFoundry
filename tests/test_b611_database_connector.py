@@ -151,12 +151,40 @@ async def test_a_send_that_loses_its_link_discards_the_connection(
     assert rig.conn.closed and isinstance(pool, _WakingPool) and pool.wakes == 1
 
 
-async def test_a_refused_cursor_of_class_08_discards_the_connection(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+@pytest.mark.parametrize("raw_type", [_CursorRefused, _BusyCursorRefused])
+async def test_a_refused_cursor_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, raw_type: type[RawConn]
 ) -> None:
-    _aioodbc_serving(monkeypatch, rig, pool_type=_WakingPool, raw_type=_CursorRefused, blocks=never)
+    """A handle that cannot make a cursor is not lent again, whatever its SQLSTATE class."""
+    _aioodbc_serving(monkeypatch, rig, pool_type=_WakingPool, raw_type=raw_type, blocks=never)
     with pytest.raises(DeliveryError):
         await _destination().send('{"a": 1}')
+    assert rig.pools[0].free == [] and rig.conn.closed
+
+
+class _NoQueryTimeout(_CursorRefused):
+    state = "HYC00"
+
+
+async def test_a_driver_refusing_the_query_timeout_stops_the_lane(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A static driver-capability fault is a config_fault naming the setting, not a retry."""
+    _aioodbc_serving(monkeypatch, rig, raw_type=_NoQueryTimeout, blocks=never)
+    with pytest.raises(NegativeAckError) as caught:
+        await _destination().send('{"a": 1}')
+    assert caught.value.config_fault and "statement_timeout" in str(caught.value)
+
+
+async def test_the_connection_test_classifies_a_refused_cursor_as_send_does(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_BusyCursorRefused, blocks=never
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().test_connection()
+    assert not isinstance(caught.value, NegativeAckError)
     assert rig.pools[0].free == [] and rig.conn.closed
 
 
@@ -319,6 +347,29 @@ async def test_a_lookup_pool_borrows_with_its_statement_timeout(
     assert pool_executor is not None and not pool_executor._shutdown
     await executor.aclose()
     assert pool_executor._shutdown
+
+
+async def test_a_driver_refusing_the_timeout_attribute_does_not_fail_the_borrow(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """pyodbc's setter hands the value to the driver, which may refuse it. The borrow goes on, with
+    a warning, rather than raising out of _acquire and leaking the connection."""
+
+    class _RefusesTimeout(RawConn):
+        @property
+        def timeout(self) -> int:
+            return 0
+
+        @timeout.setter
+        def timeout(self, value: int) -> None:
+            if value:  # the fake's own __init__ writes 0
+                raise _DriverError("HYC00", "[HYC00] optional feature not implemented")
+
+    _aioodbc_serving(monkeypatch, rig, raw_type=_RefusesTimeout, blocks=never)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.database"):
+        await _destination().send('{"a": 1}')
+    assert "statement_timeout could not be applied" in caplog.text
+    assert rig.pools[0].free == [rig.conn]
 
 
 def test_the_factories_declare_the_statement_timeout() -> None:

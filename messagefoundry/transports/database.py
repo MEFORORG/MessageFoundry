@@ -3433,18 +3433,22 @@ def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None
 def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
-    pyodbc's ``Connection.timeout`` is a plain attribute the driver reads as each cursor is made,
-    so the write is safe on the loop, with no call running on a connection just lent. aioodbc
-    exposes it read-only, so it is set on the pyodbc connection (``_conn``), as the SQL Server store
-    sets ``[store].command_timeout``. Never raises: a connection the write cannot reach is logged
-    and used with no limit, since refusing it would fail every borrow on a driver shape this cannot
-    read."""
+    pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
+    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``), on the loop
+    with no call running on a connection just lent, as the SQL Server store sets
+    ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
+    connection attribute, so the write is skipped when the connection already holds the value: a
+    connection lent before, and ``0`` on a fresh one. Never raises: a connection the write cannot
+    reach, or whose driver refuses it, is logged and used with no limit, since refusing it would
+    fail every borrow and leak the connection this was handed."""
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
     if seconds is None:
         return
     try:
-        conn._conn.timeout = seconds
-    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raw = conn._conn
+        if raw.timeout != seconds:
+            raw.timeout = seconds
+    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; logged, never raised
         logger.warning(
             "DATABASE: the statement_timeout could not be applied to a pooled connection, so a "
             "statement on it runs with no time limit: %s",
@@ -3598,8 +3602,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     :func:`_return_when_settled` at once. Until the running call returns,
     the connection keeps its pool slot, and counts as held back, so a close of the pool stops
     waiting for it at a bound (:func:`_close_pool_bounded`). The connection's
-    ``statement_timeout`` bounds that time, unless it is ``0`` (BACKLOG #5756; ADR 0159, amendment
-    of 2026-10-30, recorded the connector before it had one).
+    ``statement_timeout`` bounds that time, unless it is ``0`` or the pool set none, as a
+    ``DatabaseRef`` sync's does not (BACKLOG #5756; ADR 0159, amendment of 2026-10-30, recorded the
+    connector before it had one).
 
     **The cancel paths the gate itself closes (BACKLOG #2394).** A cancellation during
     ``conn.cursor()`` reaches this function with no cursor. On a gated connection the rollback
@@ -3798,7 +3803,8 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
     tick, and one held back mid-wait ends the wait at the end of its tick. Such a connection goes back only once its
     cancelled call returns, which only the connection's ``statement_timeout`` bounds, and nothing
-    when that is ``0`` (BACKLOG #5756; ADR 0159, amendment of 2026-10-30), so a stop or a reload
+    when that is ``0`` or its pool set none (BACKLOG #5756; ADR 0159, amendment of 2026-10-30), so
+    a stop or a reload
     would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
     long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
@@ -3920,6 +3926,35 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
+#: Cursor-allocation states that are the driver refusing the query timeout ``statement_timeout``
+#: sets, ``SQL_ATTR_QUERY_TIMEOUT``: "optional feature not implemented" and "invalid attribute"
+#: (BACKLOG #5756). Static, so the lane stops on them rather than retrying for ever.
+_QUERY_TIMEOUT_REFUSED_STATES = frozenset({"HYC00", "HY092"})
+
+
+def _cursor_refused(exc: Exception) -> DeliveryError | None:
+    """The classified error for a ``conn.cursor()`` that raised ``exc``, or ``None`` when ``exc``
+    is no driver error, which the caller re-raises unchanged (BACKLOG #5749).
+
+    A cursor the driver cannot allocate is the connection's failure, before any statement ran, so
+    it is classified as a connect failure is: retried, or a stopped lane, never a dead-lettered
+    message. pyodbc sets the connection's query timeout on each cursor as it makes it, so a driver
+    that refuses that attribute refuses every cursor; that is a ``config_fault`` naming the
+    setting, not a retry."""
+    state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE, as _connect reads it
+    if state is None:
+        return None
+    if state in _QUERY_TIMEOUT_REFUSED_STATES:
+        return NegativeAckError(
+            f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
+            "timeout, set statement_timeout = 0 on this connection",
+            code=state,
+            permanent=True,
+            config_fault=True,
+        )
+    return _classify_db_error(state, str(exc), connecting=True)
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
@@ -3931,9 +3966,19 @@ async def _probe_db(
     the caller closes it with ``aclose()``."""
     pool, conn = await _connect(get_pool, timeout)
     cur: Any = None
+    discard = False
     try:
-        cur = await conn.cursor()
+        try:
+            cur = await conn.cursor()
+        except Exception as exc:
+            refused = _cursor_refused(exc)  # classified as send() classifies it (BACKLOG #5749)
+            if refused is None:
+                raise
+            discard = True
+            raise refused from exc
         await cur.execute("SELECT 1")
+    except DeliveryError:
+        raise
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
@@ -3942,7 +3987,7 @@ async def _probe_db(
             else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
         ) from exc
     finally:
-        await _close_and_release(pool, conn, cur)
+        await _close_and_release(pool, conn, cur, discard=discard)
 
 
 def _json_default(value: Any) -> Any:
@@ -4132,13 +4177,13 @@ class DatabaseDestination(DestinationConnector):
             try:
                 cur = await conn.cursor()
             except Exception as exc:
-                # BACKLOG #5749: a cursor the driver cannot allocate is the connection's failure,
-                # before the statement ran, so it is classified as a connect failure is: retried,
-                # or a stopped lane, never a dead-lettered message.
-                state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE, as _connect
-                if state is None:
-                    raise  # not a DB driver error → an internal/code error, as below
-                raise _classify_db_error(state, str(exc), connecting=True) from exc
+                refused = _cursor_refused(exc)
+                if refused is None:
+                    raise  # not a DB driver error, so an internal/code error, as below
+                discard = (
+                    True  # BACKLOG #5749: a handle that cannot make a cursor is not lent again
+                )
+                raise refused from exc
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
