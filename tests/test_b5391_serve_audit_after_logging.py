@@ -17,7 +17,9 @@ import pytest
 
 from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import load_settings
 from messagefoundry.logging_setup import configure_logging
+from tests._log_absence import assert_capture_sees
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -126,8 +128,6 @@ def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # One body for serve and supervise: neither may see the line logged before its handlers exist.
-    from messagefoundry.config.settings import load_settings
-
     settings = load_settings(
         environ={
             "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND": "false",
@@ -137,6 +137,7 @@ def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
     )
     audit: list[str] = []
     with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
+        assert_capture_sees(caplog, "messagefoundry.__main__")
         refused = cli._forwarder_posture_refused(
             settings, production=False, env_name="staging", enforcing=True, audit=audit
         )

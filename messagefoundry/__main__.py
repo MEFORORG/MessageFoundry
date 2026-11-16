@@ -1971,8 +1971,8 @@ def _forwarder_posture_refused(
 ) -> bool:
     """The three posture steps ``serve`` takes last before it configures logging. Returns whether
     the start is refused; the refusal is already on stderr. The AUDIT line is appended to
-    ``audit`` rather than logged, for the caller to log once its handlers are installed (BACKLOG
-    #5391).
+    ``audit`` rather than logged, for the caller to pass to :func:`_start_logging` as
+    ``pending_audit`` (BACKLOG #5391).
 
     One body for ``serve`` and ``supervise`` (BACKLOG #2356), in serve's order: the open-egress
     gate (Q5b), the announcement or AUDIT line for ``[security].block_unlisted_outbound``, and the
@@ -2071,8 +2071,8 @@ def _forwarder_posture_refused(
         )
     elif not settings.egress.deny_by_default:
         # Explicit, audited opt-out on any instance (mirrors allow_unencrypted_phi):
-        # the operator has chosen the allow-any (empty = unrestricted) egress posture. The caller
-        # logs this AUDIT line at WARNING once logging is configured; the warning below is stderr's.
+        # the operator has chosen the allow-any (empty = unrestricted) egress posture.
+        # _start_logging logs this AUDIT line once its handlers exist; the warning below is stderr's.
         audit.append(
             "AUDIT: [security].block_unlisted_outbound=false on a "
             f"{'production ' if production else ''}PHI instance (environment {env_name!r}) — "
@@ -2221,6 +2221,7 @@ def _start_logging(
     spool_dir: str,
     configure: Callable[[SyslogForward | None], bool],
     deferred_ca_refusals: list[TrustAnchorError] | None = None,
+    pending_audit: Sequence[str] = (),
 ) -> int | None:
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
@@ -2236,7 +2237,10 @@ def _start_logging(
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
-    application-log file are the caller's, and it runs only after every gate here has passed."""
+    application-log file are the caller's, and it runs only after every gate here has passed.
+
+    ``pending_audit`` holds the AUDIT lines the caller decided before this call. They are logged
+    first once ``configure`` has returned, and not at all on a refused start (BACKLOG #5391)."""
     from messagefoundry.config.settings import (
         SyslogProtocol,
         forward_hop_disposition,
@@ -2414,6 +2418,8 @@ def _start_logging(
         # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
         deferred_ca_refusals.append(_ca_refusal)
         log_forward = None
+        # No forwarder is built, so no record crosses the warned hop: it takes no AUDIT record.
+        _hop_warning = None
 
     try:
         forwarder_live = configure(log_forward)
@@ -2446,9 +2452,11 @@ def _start_logging(
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # BACKLOG #5390: the warn-mode hop's AUDIT record, first, as it was decided first. Not when the
-    # collector's CA was refused above: no forwarder was built, so no record crosses that hop.
-    if _hop_warning is not None and log_forward is not None:
+    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's, in the order they
+    # were decided.
+    for _audit_line in pending_audit:
+        logging.getLogger(__name__).warning("%s", _audit_line)
+    if _hop_warning is not None:
         logging.getLogger(__name__).warning("AUDIT: %s", _hop_warning)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
@@ -2978,8 +2986,8 @@ def _serve(args: argparse.Namespace) -> int:
     # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     #
-    # BACKLOG #5391: the AUDIT records of deliberate weakenings taken before _start_logging below.
-    # They are logged once its handlers are installed, never before: logged here they would reach
+    # BACKLOG #5391: the AUDIT records of deliberate weakenings taken before _start_logging below,
+    # which logs them once its handlers are installed, never before: logged here they would reach
     # only the filtered lastResort on stderr, never [logging].file, the structured stdout handler
     # or the collector. Each also prints a warning to stderr where it is decided.
     _start_audit: list[str] = []
@@ -3035,9 +3043,8 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning now AND a
-        # WARNING-level audit record once logging is configured (BACKLOG #5391), so the deliberate
-        # weakening is never silent. Under strict enforcement the second ack
+        # Explicit, audited override: start keyless on a PHI instance. A loud warning now and an
+        # AUDIT record in _start_audit, so the deliberate weakening is never silent. Under strict enforcement the second ack
         # ([security].allow_unencrypted_phi_under_strict_enforcement=true) was verified above, so
         # the AUDIT line names it too; the warn posture names the opt-out alone.
         # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
@@ -3131,14 +3138,11 @@ def _serve(args: argparse.Namespace) -> int:
             stop_on_write_failure=settings.logging.on_write_failure is LogWriteFailurePolicy.STOP,
         ),
         deferred_ca_refusals=_forward_ca_refusals,
+        pending_audit=_start_audit,
     )
     if _logging_refused is not None:
         return _logging_refused
 
-    # BACKLOG #5391: the keyless and block_unlisted_outbound=false AUDIT records, first, as they
-    # were decided first.
-    for _audit_line in _start_audit:
-        logging.getLogger(__name__).warning("%s", _audit_line)
     # BACKLOG #1989: the static-credential gate's settings-half audit lines, written to stderr where
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
@@ -5532,12 +5536,10 @@ def _supervise(args: argparse.Namespace) -> int:
         enforcing=enforcing,
         spool_dir=_supervisor_forward_spool_dir(settings, db_base),
         configure=configure_with_forwarder,
+        pending_audit=posture_audit,
     )
     if logging_refused is not None:
         return logging_refused
-    # BACKLOG #5391: logged once, now that the forwarder is up, so the collector gets it too.
-    for audit_line in posture_audit:
-        logging.getLogger(__name__).warning("%s", audit_line)
     _log_static_credential_outcome(sc_outcome)
     # BACKLOG #1125: the supervisor's own store open and pair renewal can go through it too.
     from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
