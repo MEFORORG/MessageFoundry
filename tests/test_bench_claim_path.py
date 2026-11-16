@@ -15,7 +15,7 @@ import json
 import sys
 import zlib
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -223,6 +223,52 @@ def test_compare_refuses_sides_that_did_not_measure_the_same_work(
     assert (emitted, refused) == (0, 1)
     assert why in table
     assert cp.main(["compare", *map(str, paths)]) == 1
+
+
+def test_compare_names_each_reports_keying(tmp_path: Path) -> None:
+    unkeyed = tmp_path / "unkeyed"
+    unkeyed.mkdir()
+    table, _, _ = cp._compare(
+        [_report(unkeyed, "before", 1, 10.0, store_keyed=False)], "before", "after"
+    )
+    assert f"- before={'before' * 5} on PostgreSQL 16, store unkeyed" in table
+    path = _report(tmp_path, "before", 1, 10.0)
+    rep = json.loads(path.read_text(encoding="utf-8"))
+    del rep["store_keyed"]  # a report written before the field existed
+    path.write_text(json.dumps(rep), encoding="utf-8")
+    table, _, _ = cp._compare([path], "before", "after")
+    assert f"- before={'before' * 5} on PostgreSQL 16, store keying unrecorded" in table
+
+
+def test_store_keyed_reads_the_opened_stores_audit_mac() -> None:
+    assert cp._store_keyed(SimpleNamespace(_audit_mac_key=b"k", _audit_mac_fn=None))
+    assert cp._store_keyed(SimpleNamespace(_audit_mac_key=None, _audit_mac_fn=len))
+    assert not cp._store_keyed(SimpleNamespace(_audit_mac_key=None, _audit_mac_fn=None))
+
+
+def test_open_store_goes_through_the_seam_with_the_requested_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.config.settings as settings_mod
+    import messagefoundry.store.base as base
+
+    seen: dict[str, Any] = {}
+
+    def fake_load_settings(*, environ: dict[str, str]) -> Any:
+        seen["backend_env"] = environ["MEFOR_STORE_BACKEND"]
+        return SimpleNamespace(store="the store settings")
+
+    async def fake_open_store(settings: Any, **kwargs: Any) -> str:
+        seen["open"] = (settings, kwargs)
+        return "the store"
+
+    monkeypatch.setattr(settings_mod, "load_settings", fake_load_settings)
+    monkeypatch.setattr(base, "open_store", fake_open_store)
+    assert asyncio.run(cp._open_store("sqlserver")) == "the store"
+    assert seen["backend_env"] == "sqlserver"
+    # create, as the backend open it replaced defaulted to; no keyless_chain_refusal, so the
+    # refusing default stands
+    assert seen["open"] == ("the store settings", {"create": True})
 
 
 def test_compare_names_a_missing_side_and_reports_no_rows(tmp_path: Path) -> None:

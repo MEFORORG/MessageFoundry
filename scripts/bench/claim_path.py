@@ -15,11 +15,16 @@ database whose name is not one of the bench's own (``mf_claim_*`` or ``MfClaim*`
 empties the queue tables of the database the ``MEFOR_STORE_*`` environment names. It opens the store
 through ``open_store``, the engine's one store-open seam, at its refusing keyless default, so a fresh
 bench database opens only with a store key in hand: claim_path.sh mints a throwaway
-``MEFOR_STORE_ENCRYPTION_KEY`` for the run, and each report records ``store_keyed``. It seeds synthetic
+``MEFOR_STORE_ENCRYPTION_KEY`` for the run, and each report records ``store_keyed``. A commit whose
+``open_store`` takes no ``create`` cannot be measured. It seeds synthetic
 ingress rows (one fixed, PHI-free HL7 message padded to ``--payload-bytes`` with seeded random
 base64, never printed), resets the queue table before each scenario, then times each
 ``claim_fifo_heads`` call alone. After every claim it calls ``release_claimed``, which puts the
 claimed rows back to pending with their attempts restored, so every iteration claims the same rows.
+
+On a keyed store the rows are sealed at rest, so each timed claim includes decrypting the rows it
+returns, on both sides, and the stored payload is larger than ``payload_bytes``, which is the
+plaintext size. A keyed figure is therefore not comparable with an unkeyed one.
 
 A claim that returns a different row count than the scenario expects, or reports a lock timeout, is
 not a sample: a timing over the wrong work is not a figure. It is released, counted by reason, and
@@ -34,7 +39,8 @@ whose two sides did not measure the same work (rows claimed, payload size, rows 
 iterations, store keyed) or whose sample count fell short, and exits
 non-zero if it refused any scenario or if no scenario has both sides.
 
-Only timings, counts, the backend's version line and the commit label reach the output.
+Only timings, counts, the backend's version line, the Python version, the commit label and whether
+the store was keyed reach the output.
 """
 
 from __future__ import annotations
@@ -181,21 +187,24 @@ def _check_bench_database(environ: dict[str, str] | os._Environ[str]) -> str:
     return name
 
 
-async def _open_store(backend: str) -> tuple[Any, bool]:
-    """The open store, and whether a store key was named for it.
-
-    Through ``open_store``, the engine's one store-open seam, at its refusing keyless default: a
-    fresh bench database has an empty audit chain, so the open is refused unless a key is in hand
-    (claim_path.sh mints a throwaway one). ``create=True`` is the default the backend ``open`` this
-    replaced ran with, so a new database gets its schema as before."""
-    from messagefoundry.config.settings import StoreBackend, load_settings
+async def _open_store(backend: str) -> Any:
+    """Open the bench database through ``open_store``, the engine's one store-open seam, at its
+    refusing keyless default: a fresh bench database has an empty audit chain, so the open is
+    refused unless a key is in hand (claim_path.sh mints a throwaway one). ``create=True`` is the
+    default the backend ``open`` this replaced ran with, so a new database gets its schema as
+    before. The backend is selected through the environment the settings are loaded from, so the
+    settings are validated for the backend that opens them."""
+    from messagefoundry.config.settings import load_settings
     from messagefoundry.store.base import open_store
 
-    settings = load_settings(environ=os.environ).store.model_copy(
-        update={"backend": StoreBackend(backend)}
-    )
-    store = await open_store(settings, create=True)
-    return store, bool(settings.encryption_key or settings.encryption_key_file)
+    settings = load_settings(environ={**os.environ, "MEFOR_STORE_BACKEND": backend}).store
+    return await open_store(settings, create=True)
+
+
+def _store_keyed(store: Any) -> bool:
+    """Whether the opened store holds a keying secret: ``open_store``'s own test, either audit MAC
+    present, read from the store rather than from which key setting was named."""
+    return store._audit_mac_key is not None or store._audit_mac_fn is not None
 
 
 async def _fetchval(store: Any, backend: str, query: str) -> Any:
@@ -268,8 +277,9 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
         "python": platform.python_version(),
         "scenarios": [],
     }
-    store, report["store_keyed"] = await _open_store(backend)
+    store = await _open_store(backend)
     try:
+        report["store_keyed"] = _store_keyed(store)
         version = await _fetchval(
             store, backend, "SELECT version()" if backend == "postgres" else "SELECT @@VERSION"
         )

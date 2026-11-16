@@ -91,11 +91,13 @@ else
   done
 fi
 
-# measure opens the store through open_store, which refuses to start a keyless audit chain, and each
-# bench database is new, so its chain is empty. Mint a throwaway AES-256 store key at runtime, never a
-# committed literal, once for the whole run so every round reopens the same keyed chain. Both sides
-# run keyed, and each report records it. Assigned before export: `export VAR="$(...)"` returns
-# export's status and hides a failed mint.
+# measure opens the store through open_store, which refuses to start a keyless audit chain, and in
+# the job each bench database is new (a fresh service container), so its chain is empty. Mint a
+# throwaway AES-256 store key at runtime, never a committed literal, once for the whole run so every
+# round reopens the same keyed chain. Both sides run keyed, and each report records it. A server that
+# kept the bench databases from an earlier run holds a chain keyed under that run's key, so drop
+# them before a rerun there. Assigned before export: `export VAR="$(...)"` returns export's status and
+# hides a failed mint.
 store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
 if [[ "${GITHUB_ACTIONS:-}" == true ]]; then echo "::add-mask::$store_key"; fi
 export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
