@@ -23,7 +23,7 @@ an instrument.
     repo root it never runs, the guard reads as enforced in the file, and nothing reports it. The
     fix is `${CLAUDE_PROJECT_DIR}` in exec form, and this file pins it.
   * **A deny rule anchored at `./` covers one directory.** Bare patterns follow gitignore semantics
-    and match at any depth; `Read(./.env)` matches `<cwd>/.env` and nothing below it. The `./` form
+    and match at any depth when they carry no slash before the end; `Read(./.env)` matches `<cwd>/.env` and nothing below it. The `./` form
     looks equivalent and is strictly narrower, which is the worst combination for a control whose
     whole job is to be broad.
   * **A matcher that reads as a regex may not be one.** Claude Code evaluates a matcher whose
@@ -154,8 +154,22 @@ def _dot_anchored_denies(settings: dict[str, Any]) -> list[str]:
     return [r for r in settings["permissions"]["deny"] if "(./" in r]
 
 
+def _keys_missing_from_gitignore(text: str) -> list[str]:
+    """The `_GITIGNORED_SECRETS` keys that are not a non-comment line of this `.gitignore` text."""
+    lines = {s for s in (line.strip() for line in text.splitlines()) if s and not s.startswith("#")}
+    return sorted(k for k in _GITIGNORED_SECRETS if k not in lines)
+
+
+def _keys_missing_from_planted_gitignore(_settings: dict[str, Any]) -> list[str]:
+    """Detector shim: a `.gitignore` holding every key but `*.pfx` must report that one key."""
+    return _keys_missing_from_gitignore("\n".join(k for k in _GITIGNORED_SECRETS if k != "*.pfx"))
+
+
 def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
-    """Every path pattern denied to Read that some other file tool may still write.
+    """Every pattern denied to Read with no Edit or Write rule spelled the same, string for string.
+
+    It compares pattern text, not path coverage: a broader rule for another tool does not count,
+    except a bare tool name.
 
     One way only: a path hidden from Read is secret enough not to overwrite, but a write-only deny,
     say on a gate file agents must read, is a legitimate rule on its own. A bare tool name in the
@@ -389,15 +403,12 @@ def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
 
 
 def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
-    """The mapping above is only honest while each key is still a `.gitignore` line."""
+    """The mapping above is only honest while each key is still a `.gitignore` line.
+
+    Line membership only: a later `!` negation of a key is not seen here.
+    """
     assert len(_GITIGNORED_SECRETS) >= 14, "the mapping lost entries; never shrink it"
-    lines = {
-        line.strip()
-        for line in (_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-    assert lines, ".gitignore read as empty"
-    gone = sorted(k for k in _GITIGNORED_SECRETS if k not in lines)
+    gone = _keys_missing_from_gitignore((_ROOT / ".gitignore").read_text(encoding="utf-8"))
     assert not gone, (
         f"{gone} no longer appear in .gitignore. Update _GITIGNORED_SECRETS to the line that now "
         "ignores each path, and keep its deny rules."
@@ -599,6 +610,11 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "deny pattern named for Read only",
         ),
         (
+            {"permissions": {"deny": []}, "hooks": {}},
+            _keys_missing_from_planted_gitignore,
+            "gitignored secret key missing from .gitignore",
+        ),
+        (
             # A settings document that wires NOTHING, checked against a root with no installers.
             # Every real hook script is then unaccounted for except the three on _KNOWN_UNWIRED, so
             # the detector must return a non-empty list. If it returns nothing here, it cannot see
@@ -644,6 +660,7 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
         "unanchored-shell-form-hook",
         "dot-anchored-deny",
         "unmirrored-file-deny",
+        "secret-key-not-ignored",
         "unwired-hook-script",
         "exact-list-matcher",
     ],
