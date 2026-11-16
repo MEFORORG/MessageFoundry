@@ -322,7 +322,9 @@ def _log_scrub_fault(exc: Exception) -> None:
         )
 
 
-def _tee_line(before: dict[str, object], after: dict[str, object]) -> str:
+def _tee_line(
+    before: dict[str, object], after: dict[str, object], whole_detail: str = _FIELD_REDACTED
+) -> str:
     """The line to log for a record whose fields the C0 scrub turned from ``before`` into
     ``after``. NO LESS THAN BEFORE, BY CONSTRUCTION (BACKLOG #3045): ``before`` is the record as
     the code before #3045 built it, and the bar is what the handler chain left of THAT LINE, the
@@ -333,7 +335,8 @@ def _tee_line(before: dict[str, object], after: dict[str, object]) -> str:
 
     Each candidate is logged only if the chain over it shows no word, counted, that the chain over
     the old line did not show: the line with every scrubbed field, then the old line with each
-    field the scrub changed shipped as :data:`_FIELD_REDACTED`, then the old line itself, which
+    field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed ``detail`` as
+    ``whole_detail``, then the old line itself, which
     meets the bar trivially and so ends the search. The last loses the C0 scrub for that record,
     and is reached only where hiding the changed fields whole still shows a word the old line hid
     elsewhere in it, and is logged once per process. The bar is the first handler's: a later handler runs the chain again over the
@@ -342,7 +345,10 @@ def _tee_line(before: dict[str, object], after: dict[str, object]) -> str:
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
         return old_line
-    whole = {k: (v if after[k] == v else _FIELD_REDACTED) for k, v in before.items()}
+    whole = {
+        k: v if after[k] == v else whole_detail if k == "detail" else _FIELD_REDACTED
+        for k, v in before.items()
+    }
     try:
         bar = _line_words(scrub_log_text(old_line))
         for candidate in (after,) if whole == after else (after, whole):
@@ -560,7 +566,11 @@ def emit_audit_tee(
             scrubbed["detail"] = (
                 old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
             )
-        line = _tee_line(record, {**record, **scrubbed})
+        # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
+        whole_detail = (
+            _bounded_detail(_FIELD_REDACTED, note, old_detail) if detail else _FIELD_REDACTED
+        )
+        line = _tee_line(record, {**record, **scrubbed}, whole_detail)
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.

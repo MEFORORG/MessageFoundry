@@ -868,6 +868,19 @@ def test_a_value_over_the_window_ships_with_its_bound_note(capsys) -> None:
     assert detail.endswith(note) and "DOE" not in detail
 
 
+def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
+    """Review of the PR 2864 repair: where the scrubbed line shows a word the old line hid,
+    ``_tee_line`` hid a changed ``detail`` as bare ``[redacted]``, which is not the JSON a
+    collector parsed before, and dropped any bound note. Synthetic values."""
+    before: dict[str, object] = {"actor": "a", "detail": '{"e": "ok"}'}
+    after: dict[str, object] = {"actor": "a", "detail": '{"e": "zebra"}'}
+    line = json.loads(audit_tee._tee_line(before, after, json.dumps("[redacted]")))
+    assert json.loads(line["detail"]) == "[redacted]"
+    note = " [redaction bound: dropped 9 more chars unscanned]"
+    whole = audit_tee._bounded_detail("[redacted]", note, "[redacted]")
+    assert whole == "[redacted]" + note
+
+
 def test_a_long_value_with_no_control_is_not_touched() -> None:
     """The window's own cut ends its note with a newline of its own, which is not the value's
     control (review round 1)."""

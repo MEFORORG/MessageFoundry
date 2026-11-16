@@ -41,9 +41,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   before it is encoded. Where that finds more than the plain filters, the whole field ships as
   `[redacted]`, so that record loses at least one of its `action`, `actor`, `channel_id`,
   `client` or `detail`. The line is then held to what the filters hid of the whole record as it
-  was encoded before this change, so it redacts no less than that line did; where it would, the
-  changed fields ship as `[redacted]`. The `emit_audit_tee` docstring says what is covered and
-  what is left, at least text that needs two controls read differently. (`BACKLOG #3045`)
+  was encoded before this change, so on the first handler it redacts no less than that line did;
+  where it would, the changed fields ship as `[redacted]`. A later handler, such as the
+  forwarder, runs the filters again and is not held to that bar. The `emit_audit_tee` docstring
+  says what is covered and what is left, at least text that needs two controls read differently
+  and a field longer than the 64 KiB window, which does not ship scrubbed. (`BACKLOG #3045`)
 
 ### Fixed
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
