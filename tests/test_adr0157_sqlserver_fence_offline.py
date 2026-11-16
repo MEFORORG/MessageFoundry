@@ -238,6 +238,14 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
         None,
         1,
     ),
+    # complete_with_response's read takes the update lock and the status (BACKLOG #5752).
+    "SELECT message_id, destination_name, handler_name, attempts, status FROM queue": (
+        "m1",
+        "OB1",
+        None,
+        1,
+        "inflight",
+    ),
     "SELECT message_id, destination_name, attempts FROM queue WHERE id=?": ("m1", "OB1", 3),
     # mark_failed's read takes the update lock and the status (vault BACKLOG #4607 step 6).
     "SELECT message_id, destination_name, attempts, status FROM queue": (

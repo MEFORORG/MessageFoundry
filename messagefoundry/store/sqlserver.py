@@ -8071,8 +8071,11 @@ class SqlServerStore:
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
+                # UPDLOCK (BACKLOG #5752): a second completion of the same row waits here and then
+                # reads the first one's committed DONE, so only one reply is ever captured.
                 await cur.execute(
-                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, handler_name, attempts, status"
+                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
@@ -8085,6 +8088,15 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
+                if row[4] != OutboxStatus.INFLIGHT.value:
+                    log.warning(
+                        "complete_with_response: outbound row %s is %s, not inflight;"
+                        " nothing written",
+                        outbox_id,
+                        row[4],
+                    )
+                    await self._commit(conn)
+                    return
                 # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
                 # response artifact, the re-ingress work-row, the ledger row and the finalize together.
                 # An artifact with no resolved queue row is the half-applied state C3 rejects.
@@ -8097,6 +8109,11 @@ class SqlServerStore:
                     (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
                     checked=bool(guard),
                 )
+                # BACKLOG #5752: two rows of one message to one destination (two handlers) would read
+                # the same MAX unlocked and collide on the response PK, rolling back a delivery the
+                # partner already accepted. The per-message finalize applock, which _maybe_finalize
+                # re-takes at the end as a no-op, serializes the read.
+                await self._applock(cur, f"mefor:finalize:{message_id}")
                 await cur.execute(
                     "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
                     " WHERE message_id=? AND destination_name=?",

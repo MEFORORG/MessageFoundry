@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Postgres leg of the outbound-completion contracts (BACKLOG #5752).
+
+**Gated** like ``tests/test_postgres_store.py``, whose clean-slate ``store`` fixture and pooled
+``(raw, fetch)`` adapters this reuses.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from tests import _response_completion_contract as completion
+from tests.test_postgres_store import _raw_adapters, pytestmark, store
+
+__all__ = ["pytestmark", "store"]
+
+
+@pytest.mark.parametrize("case", completion.CASES)
+async def test_response_completion_contract(store: Any, case: Any) -> None:
+    raw, fetch = _raw_adapters(store)
+    await case(store, fetch, raw)

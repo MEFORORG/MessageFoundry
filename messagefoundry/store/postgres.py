@@ -5948,8 +5948,20 @@ class PostgresStore:
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    # FOR UPDATE (BACKLOG #5752): a second completion of the same row waits here and
+                    # then reads the first one's committed DONE, so only one reply is ever captured.
+                    row = await conn.fetchrow(
+                        "SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id
+                    )
                     if row is None:
+                        return
+                    if row["status"] != OutboxStatus.INFLIGHT.value:
+                        log.warning(
+                            "complete_with_response: outbound row %s is %s, not inflight;"
+                            " nothing written",
+                            outbox_id,
+                            row["status"],
+                        )
                         return
                     message_id = row["message_id"]
                     destination_name = row["destination_name"]
@@ -5969,6 +5981,13 @@ class PostgresStore:
                         outbox_id,
                         *guard_args,
                         checked=bool(guard),
+                    )
+                    # BACKLOG #5752: two rows of one message to one destination (two handlers) would
+                    # read the same MAX unlocked and collide on the response PK, rolling back a
+                    # delivery the partner already accepted. The per-message finalize lock, which
+                    # _maybe_finalize_message re-takes at the end as a no-op, serializes the read.
+                    await self._advisory_lock(
+                        conn, _LOCK_CLASS_FINALIZE, f"{_FINALIZE_LOCK_PREFIX}{message_id}"
                     )
                     seq = await conn.fetchval(
                         "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"

@@ -15249,13 +15249,24 @@ class MessageStore:
 
         async def _body() -> None:
             cur = await self._db.execute(
-                "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
+                "SELECT message_id, destination_name, handler_name, attempts, status FROM queue"
+                " WHERE id=?",
                 (outbox_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
                 # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
+                raise _AbortMember(None)
+            if row["status"] != OutboxStatus.INFLIGHT.value:
+                # BACKLOG #5752: only a claimed row completes. A second completion of a row already
+                # DONE (or re-pended, cancelled, dead-lettered) would mint a second reply artifact
+                # and a second re-ingress child, so nothing is written, as for a vanished row.
+                log.warning(
+                    "complete_with_response: outbound row %s is %s, not inflight; nothing written",
+                    outbox_id,
+                    row["status"],
+                )
                 raise _AbortMember(None)
             message_id = row["message_id"]
             destination_name = row["destination_name"]
