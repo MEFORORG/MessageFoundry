@@ -7593,9 +7593,11 @@ its own rows. Past five subjects alerting from one detector inside one window, i
 shared `<prefix>:*` subject, so a spread of addresses cannot open an alert, and send a page, per
 address. Each detector counts at most `MAX_SUBJECTS` subjects one by one. A subject pushed out of that table
 carries its count inside the window into one shared sum, which raises under the same `<prefix>:*`
-subject at the detector's threshold, so a burst spread over more addresses than the table holds is
-still counted (BACKLOG #5508). A spread that fits the table, with every address below the
-threshold, still raises nothing. The notifier still keeps a little state per subject that did alert, as it does for every
+subject at the detector's threshold, so a burst spread over more addresses than the table holds
+inside one window is still counted (BACKLOG #5508). That alert's count is the carried sum alone, so
+the burst was at least that large: the refusals of addresses still in the table are not in it. A spread with every address below the threshold
+inside each window, whether it fits the table or its addresses age out before they are pushed out,
+still raises nothing. The notifier still keeps a little state per subject that did alert, as it does for every
 alert key. An alert carries a count and a fixed sentence. It never carries a message body, a message
 id, an audit row's detail or a typed username, which can be a password typed into the wrong box. The
 sign-in detector counts `auth.login_failed`, which is written once per refused local sign-in in every

@@ -320,16 +320,29 @@ def test_unwatched_actions_and_lock_rows_raise_nothing() -> None:
 
 
 def test_the_subject_table_is_bounded() -> None:
-    """The table holds MAX_SUBJECTS and the overflow fewer than twice the threshold. Ten evictions
-    at a threshold of 2 carry five raises under the shared subject (BACKLOG #5508)."""
+    """The table holds MAX_SUBJECTS. Ten evictions at a threshold of 2 carry five raises under the
+    shared subject (BACKLOG #5508)."""
     det, sink, _ = _detector(signin_failures=2)
     for i in range(MAX_SUBJECTS + 10):
         det.observe("auth.login_failed", None, None, f"addr-{i}", None)
     assert len(det._signin._seen) == MAX_SUBJECTS
-    assert len(det._signin._overflow) < 2 * 2
     assert [(s, n, c) for s, n, c, _d in sink.signals] == [
         ("signin_failure_burst", "signin:*", 2)
     ] * 5
+
+
+def test_the_overflow_stays_below_the_threshold_between_hits() -> None:
+    """The overflow's memory bound, checked after every hit: subjects of three entries each are
+    evicted into an overflow with a threshold of 7, so carries both stop short of it and pass it.
+    Its running total must match its entries throughout, and it must raise."""
+    window = security_signals._Window(7, 10.0**6)
+    raised = []
+    for i in range(MAX_SUBJECTS + 50):
+        for t in (1.0, 2.0, 3.0):
+            raised.append(window.hit(f"s-{i}", 1000.0 + i + t)[1])
+            assert len(window._overflow) < 7
+            assert window._overflow_total == sum(w for _t, w in window._overflow) < 7
+    assert [r for r in raised if r is not None], "the carries must raise"
 
 
 def test_a_signin_burst_spread_past_the_subject_table_still_raises() -> None:
@@ -345,6 +358,7 @@ def test_a_signin_burst_spread_past_the_subject_table_still_raises() -> None:
     ((signal, subject, count, detail),) = sink.signals
     assert (signal, subject, count) == ("signin_failure_burst", "signin:*", 20)
     assert "10." not in detail
+    assert detail.startswith("at least 20 refused sign-ins")
     assert f"the {MAX_SUBJECTS} this detector counts one by one" in detail
 
 

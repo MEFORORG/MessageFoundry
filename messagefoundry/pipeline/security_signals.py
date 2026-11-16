@@ -96,7 +96,8 @@ SECURITY_SIGNAL_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: The most subjects one windowed detector tracks. Past it the least recent subject is dropped.
+#: The most subjects one windowed detector tracks. Past it the least recent subject leaves the
+#: table, and its count inside the window is carried into the detector's overflow sum.
 MAX_SUBJECTS: Final = 4096
 #: The most alerts one windowed detector raises under their own subjects in one window.
 MAX_SUBJECT_ALERTS: Final = 5
@@ -176,13 +177,14 @@ class _Window:
 
     **An evicted subject's count is carried, not dropped (BACKLOG #5508).** Past
     :data:`MAX_SUBJECTS` the least recent subject leaves the table, and its in-window entries move
-    into one shared overflow sum, keeping their own times. :meth:`take_overflow` returns that sum
-    once it reaches the threshold. Dropping them instead would let a burst spread over more
-    subjects than the table holds raise nothing, since each subject would leave before reaching
-    the threshold. The overflow is one sum and holds fewer than twice ``threshold`` entries, so
-    memory stays bounded. It counts only what eviction would have dropped: subjects still in the
-    table are counted one by one, so a spread that fits the table, each below the threshold,
-    still raises nothing, as the per-subject design intends."""
+    into one shared overflow sum, keeping their own times. :meth:`hit` returns that sum too, once
+    it reaches the threshold, and starts it again. Dropping them instead would let a burst spread
+    over more subjects than the table holds inside one window raise nothing, since each subject
+    would leave before reaching the threshold. Between hits the overflow holds less than
+    ``threshold`` in weight, so fewer than ``threshold`` entries, and memory stays bounded. It
+    counts only what eviction would have dropped: subjects still in the table are counted one by
+    one, so a spread that fits the table, each below the threshold, still raises nothing, as the
+    per-subject design intends."""
 
     def __init__(self, threshold: int, window_seconds: float) -> None:
         self.threshold = threshold
@@ -194,16 +196,18 @@ class _Window:
         self._overflow: deque[tuple[float, int]] = deque()
         self._overflow_total = 0
 
-    def hit(self, subject: str, now: float, weight: int = 1) -> int | None:
+    def hit(self, subject: str, now: float, weight: int = 1) -> tuple[int | None, int | None]:
+        """``subject``'s sum when this hit took it to the threshold, and the overflow's sum when an
+        eviction this hit made took that to the threshold; None for each that did not."""
         if self.threshold <= 0 or weight <= 0:
-            return None
+            return None, None
         held = self._seen.get(subject)
         cutoff = now - self.window_seconds
+        carried = None
         if held is None:
             if len(self._seen) >= MAX_SUBJECTS:
-                # Carried into the overflow, which the caller reads with take_overflow().
                 _, (evicted, evicted_total) = self._seen.popitem(last=False)
-                self._carry(evicted, evicted_total[0] - _expire(evicted, cutoff), cutoff)
+                carried = self._carry(evicted, evicted_total[0] - _expire(evicted, cutoff), cutoff)
             held = self._seen[subject] = (deque(), [0])
         else:
             self._seen.move_to_end(subject)
@@ -212,27 +216,26 @@ class _Window:
         entries.append((now, weight))
         total[0] += weight
         if total[0] < self.threshold:
-            return None
+            return None, carried
         del self._seen[subject]
-        return total[0]
+        return total[0], carried
 
-    def _carry(self, evicted: deque[tuple[float, int]], weight: int, cutoff: float) -> None:
+    def _carry(self, evicted: deque[tuple[float, int]], weight: int, cutoff: float) -> int | None:
         """Add an evicted subject's in-window entries, summing ``weight``, to the overflow in time
-        order, so the overflow expires entry by entry exactly as a subject does. The evicted
-        subject was the least recent, so its newest entry is no older than any overflow entry, and
-        only its older entries can interleave: the common spread, one entry a subject, appends."""
-        self._overflow_total -= _expire(self._overflow, cutoff)
-        if self._overflow and evicted and evicted[0][0] < self._overflow[-1][0]:
-            self._overflow = deque(heapq.merge(self._overflow, evicted))
-        else:
-            self._overflow.extend(evicted)
-        self._overflow_total += weight
+        order, so the overflow expires entry by entry exactly as a subject does. Returns the sum
+        when that reached the threshold, and starts the overflow again.
 
-    def take_overflow(self) -> int | None:
-        """The overflow sum when it has reached the threshold, which starts it again; else None.
-        The sum can reach the threshold only in a :meth:`hit` that carried, which pruned it
-        first, so it is never stale here."""
-        if self.threshold <= 0 or self._overflow_total < self.threshold:
+        The evicted subject was the least recent, so its newest entry is no older than any overflow
+        entry. Only the overflow entries newer than its oldest are taken off and merged back: the
+        common spread, one entry a subject, just appends."""
+        self._overflow_total -= _expire(self._overflow, cutoff)
+        tail: list[tuple[float, int]] = []
+        while evicted and self._overflow and self._overflow[-1][0] > evicted[0][0]:
+            tail.append(self._overflow.pop())
+        tail.reverse()
+        self._overflow.extend(heapq.merge(tail, evicted))
+        self._overflow_total += weight
+        if self._overflow_total < self.threshold:
             return None
         total = self._overflow_total
         self._overflow.clear()
@@ -472,24 +475,25 @@ class SecuritySignalDetector:
         return until is not None and until > (self._clock() if now is None else now)
 
     def _on_burst(self, burst: _Burst, window: _Window, key: str | None, weight: int) -> bool:
-        """Count ``weight`` for ``key``; True when that raised an alert and the sink call
-        returned. False when the sink call raised, so a caller that goes quiet after a raise does
+        """Count ``weight`` for ``key``; True when ``key``'s own count raised an alert and the sink
+        call returned. An overflow alert this count carried does not make it True. False when the sink call raised, so a caller that goes quiet after a raise does
         not go quiet on that alert. A sink that takes the alert and then loses part of it still
         returns, so the caller goes quiet: the notifier's full queue drops only the page, after the
         ``alert_instance`` row is already scheduled, and a store fault loses that row."""
         key = key or "unknown"
         now = self._clock()
-        total = window.hit(key, now, weight)
+        total, carried = window.hit(key, now, weight)
         shared = f"{burst.prefix}:*"
-        spread = window.take_overflow()
-        if spread is not None:
+        if carried is not None:
             # Under the shared subject, like a spread past MAX_SUBJECT_ALERTS: no one key holds it.
+            # The count is the carried sum alone, so the sentence says the burst was at least that.
             self._raise(
                 burst.signal,
                 shared,
-                spread,
-                f"{spread} {burst.counted} within {self._window_label}, spread over more "
-                f"subjects than the {MAX_SUBJECTS} this detector counts one by one",
+                carried,
+                f"at least {carried} {burst.counted} within {self._window_label}, spread over "
+                f"more subjects than the {MAX_SUBJECTS} this detector counts one by one; the "
+                "subjects still counted one by one are not in this count",
             )
         if total is None:
             return False
