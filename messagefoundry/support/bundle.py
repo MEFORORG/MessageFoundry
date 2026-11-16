@@ -208,7 +208,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     into the tail text, not propagated.
 
     EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
-    ``phi_contract`` claim about this member true: that it is a redacted copy, never that it is clean. The two failure branches used to ``return`` ahead of
+    ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
     the redactor with the configured path, the file name and the OS error text inline, so a bundle's
     ``app-log.txt`` could carry an unredacted deployment path (BACKLOG #1571). They now report the
     branch, not the circumstances: the operator knows their own ``log_dir``, and the code says which
