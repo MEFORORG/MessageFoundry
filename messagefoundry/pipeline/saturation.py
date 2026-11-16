@@ -45,27 +45,20 @@ class SaturationSignal:
 class SaturationDetector:
     """A bounded per-lane depth-sample history that fires when the backlog is RISING SUSTAINED.
 
-    ``sustain_samples`` is how many consecutive non-decreasing steps, at least two of them rising, must
+    ``sustain_samples`` is how many consecutive non-decreasing steps (with a net rise end-to-end) must
     be observed before :meth:`observe` returns a :class:`SaturationSignal`. The history is capped at
     ``sustain_samples + 1`` samples (constant memory), so an old spike ages out of the window and a
     lane that has since drained stops firing on its own.
 
     The decision (evaluated over the full window once it is primed):
 
+    * **net rise** — the newest depth is strictly greater than the oldest in the window (``dN > d0``),
+      i.e. arrivals exceeded departures over the window (ingest > drain); and
     * **sustained** — no step in the window *decreased* (every ``d[i+1] >= d[i]``). A single drop means
       the worker drained at some point in the window, so the growth is a burst being cleared, not
-      saturation — and it does **not** fire. Flat steps are allowed: a lane sampled faster than its
-      arrivals, such as an outbound sampled on each retry, shows them while it still grows.
-    * **rising more than once** — at least two steps rose (BACKLOG #5768). One rise is what a primed
-      idle lane taking one message, ``[0, 0, 0, 1]``, or one tick's burst, ``[0, 0, 5, 5]``, looks
-      like, and neither is saturation. Two rises imply a net rise end to end (``dN > d0``), so
-      arrivals exceeded departures over the window (ingest > drain). It is the same floor the
-      ``sustain_samples >= 2`` check sets.
-    * **a measurable span** — the window's newest timestamp is after its oldest. A wall clock that
-      stepped back or stood still gives no rate to report, so the window does not fire.
+      saturation — and it does **not** fire.
 
-    A window with a falling step, fewer than two rising steps, or a non-positive span returns
-    ``None``.
+    A flat window (``dN == d0``) or a window with any decrease returns ``None``.
     """
 
     __slots__ = ("_sustain", "_samples")
@@ -85,19 +78,15 @@ class SaturationDetector:
             return None  # window not yet primed — need sustain_samples + 1 observations
         window = list(self._samples)
         depths = [d for _, d in window]
-        rises = 0
+        if depths[-1] <= depths[0]:
+            return None  # no net rise across the window → not becoming overloaded
         for prev, cur in zip(depths, depths[1:]):  # noqa: B905
             if cur < prev:
                 # A decrease anywhere in the window = the lane drained during it. That is a
                 # bursty-but-DRAINING lane, not saturation — do not fire (the key property).
                 return None
-            rises += cur > prev
-        if rises < 2:
-            return None  # one arrival or one burst, not sustained growth (BACKLOG #5768)
         span = window[-1][0] - window[0][0]
-        if span <= 0:
-            return None  # the clock stepped back or stood still: no rate to report
-        growth = (depths[-1] - depths[0]) / span
+        growth = (depths[-1] - depths[0]) / span if span > 0 else 0.0
         return SaturationSignal(
             depth=depths[-1],
             depth_start=depths[0],

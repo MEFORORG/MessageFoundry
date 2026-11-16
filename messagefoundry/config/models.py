@@ -551,8 +551,8 @@ class SaturationThreshold(BaseModel):
     bursty-but-DRAINING lane (which spikes then falls back) does not trip while a genuinely saturating
     one does — the point of the signal.
 
-    ``sustain_samples`` is how many consecutive non-decreasing depth steps, at least two of them
-    rising (BACKLOG #5768), must be observed before the alert fires (the detector keeps ``sustain_samples + 1`` samples, so it needs
+    ``sustain_samples`` is how many consecutive non-decreasing depth samples (with a net rise) must be
+    observed before the alert fires (the detector keeps ``sustain_samples + 1`` samples, so it needs
     that many observations to prime). ``None`` (the default) **disables** the saturation alert for the
     connection — deny-by-default/off unless an operator opts in (it overlaps ``queue_buildup``'s age
     dimension, so it is opt-in to avoid double-paging). Resolution mirrors the other per-lane policies:

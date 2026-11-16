@@ -5799,10 +5799,11 @@ def validate_alert_template(template: str, *, where: str) -> None:
             )
 
 
-#: Upper bound for ``[alerts].webhook_timeout`` and ``email_timeout`` (BACKLOG #5770). The alert
-#: worker handles one event at a time, so a send that hangs for its whole timeout holds every event
-#: queued behind it. Five minutes is a JUDGMENT with no measured anchor: ten times the larger default,
-#: and far past any healthy relay or webhook round trip.
+#: Upper bound for ``[alerts].webhook_timeout`` and ``email_timeout`` (BACKLOG #5770). Each is a
+#: socket timeout, so it bounds each wait on the peer, not a whole send: a peer that answers a little
+#: at a time can still hold a send longer. The alert worker handles one event at a time, so each wait
+#: holds every event queued behind it. Five minutes is a JUDGMENT with no measured anchor: ten times
+#: the larger default, and far past any healthy relay or webhook round trip.
 _ALERT_SEND_TIMEOUT_MAX_SECONDS = 300.0
 
 #: Upper bound for ``[alerts].realert_seconds`` and a rule's ``cooldown_seconds`` (BACKLOG #5770). A
