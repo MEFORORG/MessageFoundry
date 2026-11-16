@@ -1606,8 +1606,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def crl_reload_applied(self, name: str, *, path: str) -> None:
         # #2904: the INVERSE -- no page; auto-resolves the open crl_reload_refused via _AUTO_RESOLVE.
         # It also ends the cooldown for that file, so a refusal that follows this clear inside the
-        # cooldown pages at once and does not wait for the runner's next reminder.
-        self._last_sent.pop(f"crl_reload_refused:{name}", None)
+        # cooldown pages at once and does not wait for the runner's next reminder. With alert-state
+        # wired, _record_state ends it provisionally, as for every inverse (BACKLOG #5766); without
+        # it no resolve runs, so it ends here.
+        if self._store is None:
+            self._last_sent.pop(f"crl_reload_refused:{name}", None)
         self._record_state({"type": "crl_reload_applied", "connection": name}, "info")
 
     def secret_rotation_due(

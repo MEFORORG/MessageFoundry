@@ -12,35 +12,19 @@ provisional half: a resolve that fails leaves the row open, so the cooldown come
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import AlertRule
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-from tests.test_alert_state import _drain, _RecordingStore
+from tests.test_alert_control import _Control
+from tests.test_alert_state import _drain, _FlakyResolveStore, _RecordingStore
+from tests.test_alert_state import no_backoff as no_backoff  # the fixture, by name
 
 
-class _Control:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
-
-    async def __call__(self, action: str, target: str, *, default_target: bool) -> None:
-        self.calls.append((action, target))
-
-
-class _FailingResolveStore(_RecordingStore):
-    async def resolve_alert_instances_for(
-        self, *, event_type: str, connection: str, now: float | None = None
-    ) -> int:
-        raise sqlite3.OperationalError("synthetic: database is locked")
-
-
-@pytest.fixture
-def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    zeros = (0.0,) * len(NotifierAlertSink._INVERSE_RETRY_DELAYS)
-    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", zeros)
+def _failing_store() -> _FlakyResolveStore:
+    return _FlakyResolveStore(fail=10**6)  # every resolve fails
 
 
 def _sink(store: Any) -> tuple[NotifierAlertSink, list[dict[str, Any]], _Control]:
@@ -102,7 +86,7 @@ async def test_a_recurrence_after_an_operator_resolve_pages_and_restarts() -> No
 @pytest.mark.usefixtures("no_backoff")
 async def test_a_resolve_that_fails_brings_the_cooldown_back() -> None:
     # The row stayed open, so the incident did not end and the cooldown still holds.
-    sink, pages, control = _sink(_FailingResolveStore())
+    sink, pages, control = _sink(_failing_store())
     _fail(sink)
     await _settle(sink)
     sink.connection_restored("OB_X")
@@ -118,7 +102,7 @@ async def test_an_operator_resolve_during_a_failing_auto_resolve_keeps_the_coold
     None
 ):
     # forget lands between the clear and its failed write: what the operator closed stays closed.
-    sink, pages, _control = _sink(_FailingResolveStore())
+    sink, pages, _control = _sink(_failing_store())
     _fail(sink)
     await _settle(sink)
     sink.connection_restored("OB_X")
@@ -127,3 +111,24 @@ async def test_an_operator_resolve_during_a_failing_auto_resolve_keeps_the_coold
     _fail(sink)
     await _settle(sink)
     assert len(pages) == 2
+
+
+@pytest.mark.usefixtures("no_backoff")
+@pytest.mark.parametrize("lands", [True, False], ids=["resolve-lands", "resolve-fails"])
+async def test_a_crl_clear_ends_the_cooldown_only_once_its_resolve_lands(lands: bool) -> None:
+    # crl_reload_applied takes the shared provisional path once a store is wired.
+    sink, pages, _control = _sink(_RecordingStore() if lands else _failing_store())
+    name = "crl_reload:a"
+
+    def refuse() -> None:
+        sink.crl_reload_refused(
+            name, path="a.pem", remedy_class="fix_file", stale_contexts=1, remedy="fix it"
+        )
+
+    refuse()
+    await _settle(sink)
+    sink.crl_reload_applied(name, path="a.pem")
+    await _settle(sink)
+    refuse()
+    await _settle(sink)
+    assert len(pages) == (2 if lands else 1)
