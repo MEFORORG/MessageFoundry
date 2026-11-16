@@ -18,6 +18,7 @@ import {
   sweepStaleCaseDirs,
 } from "./collectionCaseFiles";
 import { CollectionStore, CollectionStoreError } from "./collectionStore";
+import { INTERPRETER_OPTIONS } from "./engineControlModel";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
@@ -548,6 +549,9 @@ export class TestBench {
       console: "integratedTerminal",
       justMyCode: false, // step into the config modules (Router/Handler)
       python: pythonPath(),
+      // The interpreter options Run takes through cliArgv, so Debug imports the same engine rather
+      // than a workspace-root module that shadows it (BACKLOG #5409).
+      pythonArgs: [...INTERPRETER_OPTIONS],
     });
   }
 

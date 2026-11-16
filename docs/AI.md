@@ -191,7 +191,9 @@ The IDE assistant ([ide/src/chat.ts](../ide/src/chat.ts)) resolves the policy **
 request. It first calls `GET /ai/policy`, which is authoritative and is cached per engine on
 success. On any error it falls back to that engine's cached authoritative policy. Next comes the
 local `messagefoundry ai-policy` CLI, but only for the default engine target, and only while the IDE
-has never held any engine's answer. If none of those can confirm a policy, it uses a fail-closed
+has never held any engine's answer. The CLI is always given `--service-config`, naming
+`messagefoundry.serviceConfig` or, when that is unset or blank, `messagefoundry.toml`, so a missing
+or unreadable settings file is refused rather than read as the built-in default. If none of those can confirm a policy, it uses a fail-closed
 built-in default (`mode: unverified`). That default **disables** assistance rather than re-enabling
 BYO, so a central *off* cannot be bypassed by taking the engine offline (SEC-022).
 

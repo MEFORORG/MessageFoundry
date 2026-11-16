@@ -20,8 +20,19 @@ export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
  *  its held wrapper) and serve. `-P` keeps the working directory off the import path, so all of
  *  them import the same engine; `-X disable-remote-debug` is what serve's enforce refusal names
  *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) takes them too,
- *  through `cliArgv` in cliJson.ts (BACKLOG #5409). */
+ *  through {@link cliArgv} (BACKLOG #5409), and the Test Bench Debug launch passes them as `pythonArgs`. */
 export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
+
+/**
+ * The argv after the interpreter for `python -m <module> <args>`, as cli.ts's `run` and
+ * `runWithStdin` launch it (BACKLOG #5409). The interpreter options come first: `-P` keeps the
+ * working directory, which is the workspace, off the import path, so at least a `messagefoundry.py`
+ * or a stdlib-named module in the workspace root no longer shadows the installed one through the
+ * cwd entry. It does not remove an empty or `.` entry an inherited PYTHONPATH supplies.
+ */
+export function cliArgv(module: string, args: readonly string[]): string[] {
+  return [...INTERPRETER_OPTIONS, "-m", module, ...args];
+}
 
 /** The argv for the preflight import check (`python <these>`). */
 export function preflightArgs(): string[] {

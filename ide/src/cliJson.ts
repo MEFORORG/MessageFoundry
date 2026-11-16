@@ -40,7 +40,8 @@
 // but not the whole text of a foreign exception it wraps (vault BACKLOG #3765), and the identifier
 // an import or name error or a bad call argument names. Every command that imports config modules
 // can print them, `connection upsert` and `remove` included.
-import { INTERPRETER_OPTIONS } from "./engineControlModel";
+import { connectionServiceConfig } from "./connectionWizardModel";
+import { SERVE_DEFAULT_SERVICE_CONFIG } from "./engineControlModel";
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {
@@ -59,15 +60,20 @@ export const ENGINE_MODULE: CliModule = "messagefoundry";
 export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
 
 /**
- * The argv after the interpreter for `python -m <module> <args>`, as cli.ts's `run` and
- * `runWithStdin` launch it (BACKLOG #5409). The interpreter options come first: `-P` keeps the
- * working directory, which is the workspace, off the import path, so a `messagefoundry.py` or a
- * stdlib-named module in the workspace root cannot shadow the one the interpreter has installed.
- * They are the engine lifecycle's own {@link INTERPRETER_OPTIONS}, so both paths import the same
- * engine.
+ * The `messagefoundry ai-policy` argv (sans the `--json` runJson appends) for the IDE's offline
+ * fallback (BACKLOG #5405). `setting` is `messagefoundry.serviceConfig` and `isSet` whether the
+ * operator set it. It always names a file: with no flag the CLI reads `./messagefoundry.toml` only
+ * if it exists and otherwise answers the built-in default, which can enable assistance. Named, a
+ * missing or unreadable file is refused, and pickOfflinePolicy then fails closed to the unverified
+ * policy.
+ *
+ * The file is the one Start hands serve: {@link connectionServiceConfig}, which reads an unset or
+ * blank setting as no flag, so serve reads `messagefoundry.toml`, named here explicitly. Bound with
+ * `=`, as serve's own flag is, so a path that starts with a dash stays a value.
  */
-export function cliArgv(module: CliModule, args: readonly string[]): string[] {
-  return [...INTERPRETER_OPTIONS, "-m", module, ...args];
+export function aiPolicyCliArgs(setting: unknown, isSet: boolean): string[] {
+  const file = connectionServiceConfig(setting, isSet) ?? SERVE_DEFAULT_SERVICE_CONFIG;
+  return ["ai-policy", `--service-config=${file}`];
 }
 
 /** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
@@ -113,7 +119,7 @@ export function explainMissingToolkit(res: CliResult): CliResult {
 
 /** The synthetic stderr cli.ts returns, without running anything, in an untrusted workspace. */
 export const UNTRUSTED_WORKSPACE_STDERR =
-  "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace";
+  "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace (in a window with no folder, trust the window: Manage Workspace Trust)";
 
 /**
  * A CLI result that could not become a value. Its `message` is fixed text plus at most a byte count;

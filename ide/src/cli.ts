@@ -11,13 +11,13 @@ import {
   ENGINE_MODULE,
   TOOLKIT_MODULE,
   UNTRUSTED_WORKSPACE_STDERR,
-  cliArgv,
   explainMissingToolkit,
   parseJsonResult,
   type CliModule,
   type CliResult,
 } from "./cliJson";
 import { settingIsSet } from "./connectionWizardModel";
+import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 
