@@ -323,7 +323,7 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 **Deterministic guardrails the model cannot bypass** — the `.claude/settings.json` deny-list and the PreToolUse hook:
 
 ```json
-// .claude/settings.json — deny-list (excerpt — abridged; the real file carries more deny rules, and denies each protected path to Read, Edit and Write alike)
+// .claude/settings.json — deny-list (excerpt — abridged; the real file carries more deny rules, and denies each protected path to the Read, Edit and Write file tools alike; none of these stops a shell command)
 "deny": [
   "Read(.env)", "Edit(.env)", "Write(.env)",
   "Read(secrets/**)", "Edit(secrets/**)", "Write(secrets/**)",
