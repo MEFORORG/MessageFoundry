@@ -96,10 +96,11 @@ $resolved = (& git --git-dir=$($GitCommonDir.Trim()) rev-parse --path-format=abs
 if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "-GitCommonDir '$GitCommonDir' is not a git directory." }
 $GitCommonDir = $resolved.Trim()
 
-# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+# coord-root.ps1 supplies only the record's host stamp now (Get-CoordHost, the name every reader
+# of a host field compares). Without it this refuses rather than stamp a host some other way.
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
-    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or written.")
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the record's host cannot be stamped and nothing was read or written.")
     exit 4
 }
 . $coordRootScript
@@ -110,8 +111,9 @@ $thisHost = Get-CoordHost
 # <common>/mefor-coord/alloc/backlog, which that document's migration keeps in place for this record.
 # This script used to resolve alloc through coord-root.ps1, so with a root configured it would have
 # written and checked the tombstone only on the share, which no stale copy reads, while -Check said
-# PRESENT. No allocator that still accepts -Kind backlog reads the share for this clone, and a share
-# another repository also names could carry the record to a LIVE allocator, so it stays off it.
+# PRESENT. The share helps no stale copy, and it can hurt: at least a share another repository also
+# names could carry the record to a LIVE allocator. So it stays off the share. (A vault worktree of
+# THIS clone shares the local registry instead; the header's ONE SHARED-REGISTRY CASE covers it.)
 $registry = Join-Path $GitCommonDir 'mefor-coord' 'alloc' 'backlog'
 $file = Join-Path $registry "$TombstoneNumber.json"
 

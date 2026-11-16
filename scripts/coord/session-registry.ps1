@@ -35,8 +35,9 @@
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
       (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
-                  or UNREADABLE when a possibly-live record that names no session is present and
-                  may be this one. The same record turns a matched DEAD or STALE into UNREADABLE.
+                  or UNREADABLE when a fresh, possibly-live record that names no session is present
+                  and may be this one. The same record turns a matched DEAD or STALE into
+                  UNREADABLE. Get-AnonymousSessionRecords says what fresh means.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
@@ -264,35 +265,88 @@ function Test-RecordLiveness {
     return @{ State = "LIVE"; Detail = "" }
 }
 
+# Records that name no session and whose own fence is not DEAD or STALE, each with Fresh set.
+#
+# WHY THEY MATTER (BACKLOG #5491). Such a record may be the session a caller asks about, caught
+# mid-write, so a gone answer beside one is not a gone answer. Under StrictMode the lookup used to
+# throw on it, which seat.ps1 refused on; skipping it silently would turn that refusal into a clear.
+#
+# WHY ONLY A FRESH ONE VETOES. A record that never gains its session id would otherwise block every
+# clear on the box until someone deleted it. Fresh means its startedAt, or the file's last write when
+# startedAt is unusable, is within $FreshHours. The default of 24 is box-activity.ps1's FreshHours,
+# which bounds its own veto over unparsed registry files: the same "may be this session mid-launch"
+# shape. An older one is returned with Fresh = $false, for the caller to report.
+function Get-AnonymousSessionRecords {
+    [CmdletBinding()]
+    param(
+        [object[]]$Records,
+        [double]$FreshHours = 24,
+        [int]$StartSkewMinutes = 15
+    )
+    $now = [DateTime]::UtcNow
+    $out = @()
+    foreach ($r in @($Records)) {
+        if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
+        $state = (Test-RecordLiveness -Record $r.Record -StartSkewMinutes $StartSkewMinutes).State
+        if ($state -in @('DEAD', 'STALE')) { continue }
+        $at = $null
+        $ms = 0.0
+        if ([double]::TryParse([string](Get-RecordField $r.Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
+                [cultureinfo]::InvariantCulture, [ref]$ms) -and
+            $ms -ge -62135596800000 -and $ms -le 253402300799999) {
+            $at = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
+        } else {
+            $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
+            # A file that vanished between the listing and this read is the shape of one being
+            # replaced right now, so it counts as fresh.
+            $at = if ($item) { $item.LastWriteTimeUtc } else { $now }
+        }
+        $ageH = ($now - $at).TotalHours
+        $out += [pscustomobject]@{ File = $r.File; State = $state; AgeHours = $ageH; Fresh = ($ageH -lt $FreshHours) }
+    }
+    return $out
+}
+
 # Look one session up by id (full or unique prefix) and fence it.
+#
+# -NoAnonymousVeto leaves out the veto Get-AnonymousSessionRecords describes, for a caller that
+# reports those records once on its own rather than once per session it asks about (fleet.ps1).
 function Get-SessionLiveness {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [string[]]$ConfigRoot,
-        [int]$StartSkewMinutes = 15
+        [int]$StartSkewMinutes = 15,
+        [double]$AnonymousFreshHours = 24,
+        [switch]$NoAnonymousVeto
     )
     $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
     $hit = @($records |
         Where-Object { $sid = [string](Get-RecordField $_.Record 'sessionId'); $sid -and $sid.StartsWith($SessionId, 'OrdinalIgnoreCase') })
 
-    # A record that names no session may be this one, caught mid-write, so a gone answer beside one
-    # that is possibly live is not a gone answer. Under StrictMode it used to throw, which seat.ps1
-    # refused on; skipping it silently would turn that refusal into a clear (BACKLOG #5491). One whose
-    # own fence reads DEAD or STALE cannot be a live session, so it does not veto.
-    $anonymous = @($records | Where-Object {
-            -not [string](Get-RecordField $_.Record 'sessionId') -and
-            (Test-RecordLiveness -Record $_.Record -StartSkewMinutes $StartSkewMinutes).State -notin @('DEAD', 'STALE')
-        }).Count
-    $anonymousDetail = "but $anonymous possibly-live record(s) name no session, and one may be it"
+    # Fenced only when the answer would be gone, the one case the anonymous records can change.
+    $anonymousVeto = {
+        if ($NoAnonymousVeto) { return @{ Veto = $false; Note = '' } }
+        $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes)
+        $fresh = @($anon | Where-Object { $_.Fresh } | ForEach-Object { $_.File })
+        $old = @($anon | Where-Object { -not $_.Fresh } | ForEach-Object { $_.File })
+        if ($fresh.Count -gt 0) {
+            return @{ Veto = $true; Note = "but $($fresh.Count) possibly-live record(s) written in the last ${AnonymousFreshHours}h name no session, and one may be it: $($fresh -join '; ')" }
+        }
+        if ($old.Count -gt 0) {
+            return @{ Veto = $false; Note = "; $($old.Count) older record(s) name no session and do not veto: $($old -join '; ')" }
+        }
+        return @{ Veto = $false; Note = '' }
+    }
 
     if ($hit.Count -eq 0) {
-        if ($anonymous -gt 0) {
-            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, $anonymousDetail"; Record = $null }
+        $a = & $anonymousVeto
+        if ($a.Veto) {
+            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, $($a.Note)"; Record = $null }
         }
         # Not registered. NOT proof it is gone -- a session that never registered looks identical to
         # one that exited cleanly, so callers must fall back to an independent signal.
-        return @{ Found = $false; State = "UNKNOWN"; Detail = "no registry record"; Record = $null }
+        return @{ Found = $false; State = "UNKNOWN"; Detail = "no registry record$($a.Note)"; Record = $null }
     }
     # More than one match on a prefix: fence them all and report the most-alive, because the caller is
     # about to decide whether it is safe to disturb something.
@@ -306,9 +360,14 @@ function Get-SessionLiveness {
             $best = @{ Found = $true; State = $l.State; Detail = $l.Detail; Record = $h.Record }
         }
     }
-    if ($anonymous -gt 0 -and $best.State -in @('DEAD', 'STALE')) {
-        $best.Detail = "its record reads $($best.State) ($($best.Detail)), $anonymousDetail"
-        $best.State = "UNREADABLE"
+    if ($best.State -in @('DEAD', 'STALE')) {
+        $a = & $anonymousVeto
+        if ($a.Veto) {
+            $best.Detail = "its record reads $($best.State) ($($best.Detail)), $($a.Note)"
+            $best.State = "UNREADABLE"
+        } elseif ($a.Note) {
+            $best.Detail = "$($best.Detail)$($a.Note)"
+        }
     }
     return $best
 }

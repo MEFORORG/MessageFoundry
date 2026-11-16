@@ -185,6 +185,15 @@ foreach ($row in $sessionRows) {
     }
 }
 
+# Fresh, possibly-live registry records that name no session (session-registry.ps1,
+# Get-AnonymousSessionRecords). Reported once here, by file, rather than as a veto on every seat.
+$anonymousLive = @()
+try {
+    $anonymousLive = @(Get-AnonymousSessionRecords -Records $sessionRows | Where-Object { $_.Fresh } | ForEach-Object { $_.File })
+} catch {
+    $anonymousLive = @("(the read failed: $($_.Exception.Message))")
+}
+
 $recordedSessionIds = @($records | ForEach-Object { [string]$_.Rec.sessionId } | Where-Object { $_ })
 $liveWithoutRecord = @($liveInRepo | Where-Object { $recordedSessionIds -notcontains $_.SessionId })
 
@@ -417,7 +426,9 @@ foreach ($r in $records) {
     $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
     if ($isHere -and $fenceAvailable -and $sid) {
-        try { $fence = (Get-SessionLiveness -SessionId $sid).State } catch { $fence = 'UNKNOWN' }
+        # Each seat's verdict comes from its own record. A fresh record naming no session would turn
+        # every gone seat UNREADABLE here, so it is reported once in the receipt instead.
+        try { $fence = (Get-SessionLiveness -SessionId $sid -NoAnonymousVeto).State } catch { $fence = 'UNKNOWN' }
     }
 
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
@@ -566,7 +577,9 @@ $receipt = [ordered]@{
     recordsUnreadable         = $unreadableRecords
     liveSessionsInRepo        = $liveInRepo.Count
     liveSessionsWithoutRecord = $liveWithoutRecord.Count
-    writerHeartbeatIn         = $heartbeats.Count
+    anonymousLiveRecords      = $anonymousLive.Count
+    anonymousLiveRecordFiles  = if ($anonymousLive.Count) { $anonymousLive -join '; ' } else { 'none' }
+    writerHeartbeatIn        = $heartbeats.Count
     writerErrorLines          = $writerErrors
     repoWorktrees             = $repoWorktrees.Count
     originMainSha             = $originMainSha
