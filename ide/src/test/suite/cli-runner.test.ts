@@ -6,7 +6,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
-import { ENGINE_MODULE, TOOLKIT_MODULE, cliArgv } from "../../cliJson";
+import { ENGINE_MODULE, TOOLKIT_MODULE, aiPolicyCliArgs, cliArgv } from "../../cliJson";
 import { INTERPRETER_OPTIONS } from "../../engineControlModel";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
@@ -46,6 +46,25 @@ suite("cli.ts launches the CLI with -P ahead of -m (BACKLOG #5409)", () => {
       // The control: the argv the runners carried before the fix.
       assert.ok(!/\[\s*"-m",\s*module/.test(b), `${name} still builds a bare -m argv`);
     }
+  });
+});
+
+suite("the AI-policy CLI fallback names the configured service settings (BACKLOG #5405)", () => {
+  test("aiPolicyCliArgs always passes --service-config with the setting's value", () => {
+    assert.deepStrictEqual(aiPolicyCliArgs("messagefoundry.toml"), ["ai-policy", "--service-config", "messagefoundry.toml"]);
+    assert.deepStrictEqual(aiPolicyCliArgs("conf/prod.toml"), ["ai-policy", "--service-config", "conf/prod.toml"]);
+  });
+
+  test("DEFAULT_AI_POLICY_IO.getCliPolicy runs ai-policy through aiPolicyCliArgs(serviceConfig())", () => {
+    const block = /DEFAULT_AI_POLICY_IO: AiPolicyIo = \{([\s\S]*?)\n\};/.exec(code("aiPolicy.ts"));
+    assert.ok(block, "DEFAULT_AI_POLICY_IO moved; re-point this scan before trusting it");
+    const lines = block[1].split(/\r?\n/).filter((l) => /^\s*getCliPolicy:/.test(l));
+    assert.strictEqual(lines.length, 1, "expected one getCliPolicy entry in DEFAULT_AI_POLICY_IO");
+    const namesSettings = (l: string): boolean =>
+      /runJson<AiPolicyWire>\(aiPolicyCliArgs\(serviceConfig\(\)\),\s*workspaceDir\(\)\)/.test(l);
+    assert.ok(namesSettings(lines[0]), `the fallback does not name the service settings: ${lines[0].trim()}`);
+    // The control: the line the file carried before the fix.
+    assert.ok(!namesSettings('  getCliPolicy: () => runJson<AiPolicyWire>(["ai-policy"], workspaceDir()),'));
   });
 });
 

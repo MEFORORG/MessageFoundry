@@ -70,6 +70,17 @@ export function cliArgv(module: CliModule, args: readonly string[]): string[] {
   return [...INTERPRETER_OPTIONS, "-m", module, ...args];
 }
 
+/**
+ * The `messagefoundry ai-policy` argv (sans the `--json` runJson appends) for the IDE's offline
+ * fallback (BACKLOG #5405). It always names `messagefoundry.serviceConfig`, set or not. With no
+ * flag the CLI reads `./messagefoundry.toml` only if it exists and otherwise answers the built-in
+ * default, which can enable assistance; named, a missing or unreadable file is refused, and the
+ * fallback then fails closed to the unverified policy (pickOfflinePolicy).
+ */
+export function aiPolicyCliArgs(serviceConfig: string): string[] {
+  return ["ai-policy", "--service-config", serviceConfig];
+}
+
 /** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
  *  module does not compile until it names its command. */
 const COMMAND_NAMES: Record<CliModule, string> = {
