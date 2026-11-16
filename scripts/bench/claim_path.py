@@ -39,8 +39,9 @@ whose two sides did not measure the same work (rows claimed, payload size, rows 
 iterations, store keyed) or whose sample count fell short, and exits
 non-zero if it refused any scenario or if no scenario has both sides.
 
-Only timings, counts, the backend's version line, the Python version, the commit label and whether
-the store was keyed reach the output.
+Neither the seeded message nor the store key reaches the output. What does includes at least the
+timings, counts, the run's parameters, the backend's version line, the Python version, the commit
+and whether the store was keyed.
 """
 
 from __future__ import annotations
@@ -202,9 +203,10 @@ async def _open_store(backend: str) -> Any:
 
 
 def _store_keyed(store: Any) -> bool:
-    """Whether the opened store holds a keying secret: ``open_store``'s own test, either audit MAC
-    present, read from the store rather than from which key setting was named."""
-    return store._audit_mac_key is not None or store._audit_mac_fn is not None
+    """Whether the opened store holds a keying secret, asked of the store itself (both server
+    backends' ``_audit_keyed_capable``, at both default commits) rather than inferred from which key
+    setting was named."""
+    return bool(store._audit_keyed_capable())
 
 
 async def _fetchval(store: Any, backend: str, query: str) -> Any:

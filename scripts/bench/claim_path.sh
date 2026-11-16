@@ -98,7 +98,7 @@ fi
 # kept the bench databases from an earlier run holds a chain keyed under that run's key, so drop
 # them before a rerun there. Assigned before export: `export VAR="$(...)"` returns export's status and
 # hides a failed mint.
-store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+store_key="$(python -I -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
 if [[ "${GITHUB_ACTIONS:-}" == true ]]; then echo "::add-mask::$store_key"; fi
 export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
 

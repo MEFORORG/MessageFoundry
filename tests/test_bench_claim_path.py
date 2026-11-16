@@ -240,10 +240,14 @@ def test_compare_names_each_reports_keying(tmp_path: Path) -> None:
     assert f"- before={'before' * 5} on PostgreSQL 16, store keying unrecorded" in table
 
 
-def test_store_keyed_reads_the_opened_stores_audit_mac() -> None:
-    assert cp._store_keyed(SimpleNamespace(_audit_mac_key=b"k", _audit_mac_fn=None))
-    assert cp._store_keyed(SimpleNamespace(_audit_mac_key=None, _audit_mac_fn=len))
-    assert not cp._store_keyed(SimpleNamespace(_audit_mac_key=None, _audit_mac_fn=None))
+def test_store_keyed_asks_the_opened_store() -> None:
+    assert cp._store_keyed(SimpleNamespace(_audit_keyed_capable=lambda: True))
+    assert not cp._store_keyed(SimpleNamespace(_audit_keyed_capable=lambda: False))
+    # The method the bench asks is the server backends' own; this checkout still defines it on both.
+    store_dir = _PATH.parents[2] / "messagefoundry" / "store"
+    for backend in ("postgres.py", "sqlserver.py"):
+        source = (store_dir / backend).read_text(encoding="utf-8")
+        assert "    def _audit_keyed_capable(self) -> bool:" in source, backend
 
 
 def test_open_store_goes_through_the_seam_with_the_requested_backend(
