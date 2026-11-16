@@ -174,6 +174,13 @@ MATCHER_FIELDS = {
 }
 # Claude Code adds a hook's plain exit-0 stdout as context for these events only.
 PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
+# A guard group is one whose hooks exist to refuse a tool call. A bridge fault blocks only where a
+# guard group could have run; see docs/CODEX.md, "Who decides a block".
+GUARD_SCRIPTS = ("scripts/hooks/shell-guard-dispatch.ps1",)
+
+
+class HookBlocked(Exception):
+    """A deliberate block: a hook exited 2, or failed with onFailure set to block."""
 
 
 def git_bash() -> str | None:
@@ -228,7 +235,7 @@ def hook_failed(result: dict, hook: dict, why: str) -> None:
     )
     message = f"Codex bridge: hook {why}: {label}"
     if hook.get("onFailure") == "block":
-        raise PermissionError(f"{message} (onFailure is block)")
+        raise HookBlocked(f"{message} (onFailure is block)")
     # On stderr and as a systemMessage, since a host may not show the stderr of an exit 0.
     print(f"{message} (not blocking)", file=sys.stderr)
     merge_output(result, {"systemMessage": f"{message} (not blocking)"})
@@ -239,10 +246,92 @@ def print_hook_stderr(text: str) -> None:
         print(text, file=sys.stderr, end="" if text.endswith("\n") else "\n")
 
 
+def read_settings(root: Path) -> dict:
+    config = json.loads((root / ".claude/settings.json").read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError(".claude/settings.json must hold a JSON object")
+    return config
+
+
+def discriminator_for(event: str, payload: dict) -> set[str] | None:
+    """The values a matcher is compared with, or None where Claude Code ignores the matcher."""
+    if event in TOOL_EVENTS:
+        names = {str(payload.get("tool_name", ""))}
+        if "Bash" in names:
+            names.add("PowerShell")
+        if "apply_patch" in names:
+            names.update(("Edit", "Write"))
+        return names
+    if event in MATCHER_FIELDS:
+        return {str(payload.get(MATCHER_FIELDS[event]) or "")}
+    return None
+
+
+def group_selected(group: dict, discriminator: set[str] | None) -> bool:
+    matcher = group.get("matcher", "")
+    return (
+        discriminator is None
+        or matcher in ("", "*")
+        or any(re.search(matcher, value) for value in discriminator)
+    )
+
+
+def is_guard(group: dict) -> bool:
+    for hook in group.get("hooks", []):
+        words = [str(hook.get("command", "")), *(str(arg) for arg in hook.get("args", []))]
+        if hook.get("onFailure") == "block" or any(
+            word.replace("\\", "/").endswith(script) for word in words for script in GUARD_SCRIPTS
+        ):
+            return True
+    return False
+
+
+def fault_blocks(root: Path, payload: object, event: str) -> bool:
+    """Whether a bridge fault must block: only on PreToolUse, and only where a guard could run."""
+    if isinstance(payload, dict):
+        event = str(payload.get("hook_event_name") or event)
+    if event != "PreToolUse":
+        return False  # A fault never stops Codex from stopping, starting or prompting.
+    if not isinstance(payload, dict):
+        return True  # No tool to judge, so a guard may have been skipped.
+    try:
+        discriminator = discriminator_for(event, payload)
+        groups = read_settings(root).get("hooks", {}).get(event, [])
+        return any(is_guard(group) and group_selected(group, discriminator) for group in groups)
+    except Exception:  # noqa: BLE001 - settings or a matcher that cannot be judged may hide a guard
+        return True
+
+
+def run_hook(root: Path, stdin_text: str, event: str = "") -> int:
+    """Decide one Codex hook event: exit 0 to proceed, or exit 2 to block, never anything else."""
+    payload: object = None
+    try:
+        payload = json.loads(stdin_text)
+        if not isinstance(payload, dict):
+            raise ValueError("the hook payload must be a JSON object")
+        result = dispatch(root, payload)
+    except HookBlocked as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - every bridge fault is decided here, not by a crash
+        message = f"Codex bridge fault: {type(exc).__name__}: {exc}"
+        if fault_blocks(root, payload, event):
+            print(
+                f"{message} (blocking: a guard hook could have run for this tool)", file=sys.stderr
+            )
+            return 2
+        print(f"{message} (not blocking)", file=sys.stderr)
+        print(json.dumps({"systemMessage": f"{message} (not blocking)"}))
+        return 0
+    if result:
+        print(json.dumps(result))
+    return 0
+
+
 def dispatch(root: Path, payload: dict) -> dict:
     event = payload["hook_event_name"]
     env = child_environment(root, payload.get("session_id", ""))
-    config = json.loads((root / ".claude/settings.json").read_text(encoding="utf-8-sig"))
+    config = read_settings(root)
     if config.get("disableAllHooks"):
         return {}
     result: dict = {}
@@ -261,22 +350,9 @@ def dispatch(root: Path, payload: dict) -> dict:
         merge_output(
             result, {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
         )
-    discriminator: set[str] | None = None
-    if event in TOOL_EVENTS:
-        discriminator = {str(payload.get("tool_name", ""))}
-        if "Bash" in discriminator:
-            discriminator.add("PowerShell")
-        if "apply_patch" in discriminator:
-            discriminator.update(("Edit", "Write"))
-    elif event in MATCHER_FIELDS:
-        discriminator = {str(payload.get(MATCHER_FIELDS[event]) or "")}
+    discriminator = discriminator_for(event, payload)
     for group in config.get("hooks", {}).get(event, []):
-        matcher = group.get("matcher", "")
-        if (
-            discriminator is not None
-            and matcher not in ("", "*")
-            and not any(re.search(matcher, value) for value in discriminator)
-        ):
+        if not group_selected(group, discriminator):
             continue
         for hook in group.get("hooks", []):
             if hook.get("type") != "command" or hook.get("async"):
@@ -310,7 +386,7 @@ def dispatch(root: Path, payload: dict) -> dict:
                 hook_failed(result, hook, f"could not start ({exc})")
                 continue
             if completed.returncode == 2:
-                raise PermissionError(completed.stderr.strip() or "Claude hook blocked this event")
+                raise HookBlocked(completed.stderr.strip() or "Claude hook blocked this event")
             print_hook_stderr(completed.stderr)
             if completed.returncode:
                 hook_failed(result, hook, f"exited {completed.returncode}")
@@ -345,6 +421,7 @@ def main() -> int:
     parser.add_argument("--session-id", default=os.environ.get("CODEX_THREAD_ID", ""))
     parser.add_argument("--migrate-copies", action="store_true")
     parser.add_argument("--include-user-skills", action="store_true")
+    parser.add_argument("--event", default="", help="hook mode: the event Codex registered")
     args, rest = parser.parse_known_args()
     if args.mode == "sync-skills":
         user_skills = user_skill_directory() if args.include_user_skills else None
@@ -363,11 +440,7 @@ def main() -> int:
         print(ROOT / child_environment(ROOT, args.session_id)["KORUS_STATE_REL"])
         return 0
     if args.mode == "hook":
-        payload = json.load(sys.stdin)
-        result = dispatch(ROOT, payload)
-        if result:
-            print(json.dumps(result))
-        return 0
+        return run_hook(ROOT, sys.stdin.read(), args.event)
     if args.mode == "doctor":
         config = json.loads((ROOT / ".claude/settings.json").read_text(encoding="utf-8-sig"))
         for event in config.get("hooks", {}):

@@ -24,14 +24,42 @@ matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
 `Write`. A future hook that needs Claude-specific input fields still needs an
 adapter; alias matching alone cannot translate an edit payload.
 
-New event types appear as unmapped at startup. Unsupported handler types and
-shells refuse the event. As in Claude Code, exit 2 blocks. Any other non-zero
-exit, a timeout, or a command that cannot start is a non-blocking error, unless
-the hook sets `"onFailure": "block"`. The bridge reports a non-blocking error on
-stderr and as a `systemMessage`, naming the hook, ignores that hook's output, and
-runs the remaining hooks. It does not silently claim a failed hook ran. A block
-leaves the bridge with exit 2, and the registered command and `invoke.ps1` pass
-that code on, because `pwsh -Command` would report it as 1.
+New event types appear as unmapped at startup. The bridge does not silently
+claim a failed hook ran.
+
+### Who decides a block
+
+The hooks decide first. As in Claude Code, a hook's exit 2 blocks. Any other
+non-zero exit, a timeout, or a command that cannot start is a non-blocking error,
+unless the hook sets `"onFailure": "block"`. The bridge reports a non-blocking
+error on stderr and as a `systemMessage`, naming the hook, ignores that hook's
+output, and runs the remaining hooks.
+
+The bridge decides its own faults, and exits only 0 or 2. A fault is anything
+that keeps it from running the hooks: settings that cannot be parsed, a matcher
+that is not a valid regex, an unsupported handler type or shell, a missing
+session id, an unreadable payload, or any other exception. A fault blocks only
+on `PreToolUse`, and only where a guard group could have run for the tool, or
+where that cannot be judged: settings or a payload that cannot be parsed, or a
+guard group's matcher that is not a valid regex. A guard group is one that runs
+`scripts/hooks/shell-guard-dispatch.ps1` or holds a hook with
+`"onFailure": "block"`; today that is the `^(Bash|PowerShell)$` group. Every other
+fault is reported on stderr and as a `systemMessage` and does not block, so a
+fault never stops Codex from stopping, starting or taking a prompt. The advisory
+`PreToolUse` hooks, such as `usage-headroom-inject.ps1` and
+`enter-worktree-check.ps1`, stay non-blocking. **A future guard on any other
+event must set `"onFailure": "block"`**, or its failures will not block.
+
+The launcher decides when the bridge returns no decision. Each command in
+`.codex/config.toml` names its event to `invoke.ps1`. A bridge exit other than 0
+or 2, a missing `.venv`, or a checkout `git` cannot find maps to exit 2 on the
+`PreToolUse` command and to a non-blocking exit 1 on every other event, never to
+0. `invoke.ps1` ends its process with that code, and the command line passes it
+on, because `pwsh -Command` would report an exit 2 as 1. This is tested with
+PowerShell, `cmd` and `sh` as the outer shell. Codex's documentation does not
+say which shell runs a hook command. One case is not covered: when `pwsh`
+itself cannot start. Under Windows PowerShell 5.1 the line would then exit 0,
+under `cmd` 9009, and under `sh` 127. This is reasoned, not measured.
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops

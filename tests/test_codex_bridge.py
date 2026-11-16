@@ -160,17 +160,17 @@ def test_unstartable_hook_is_reported_without_blocking(bridge, tmp_path):
 )
 def test_on_failure_block_turns_a_non_blocking_failure_into_a_block(bridge, tmp_path, failing):
     settings(tmp_path, [{**failing, "onFailure": "block"}, handler(json.dumps(DENIAL))])
-    with pytest.raises(PermissionError, match="onFailure is block"):
+    with pytest.raises(bridge.HookBlocked, match="onFailure is block"):
         bridge.dispatch(tmp_path, BASH_CALL)
 
 
 def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
     marker = tmp_path / "later-hook-ran"
     settings(tmp_path, [exits(2), python(f"open({str(marker)!r}, 'w').close()")])
-    with pytest.raises(PermissionError, match="hook says 2"):
+    with pytest.raises(bridge.HookBlocked, match="hook says 2"):
         bridge.dispatch(tmp_path, BASH_CALL)
     assert not marker.exists()
-    # The reason travels once, in the PermissionError main() prints, not also as raw stderr.
+    # The reason travels once, in the HookBlocked run_hook prints, not also as raw stderr.
     assert "hook says 2" not in capsys.readouterr().err
 
 
@@ -191,7 +191,7 @@ def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, comman
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
     settings(tmp_path, [hook])
     if outcome == "block":
-        with pytest.raises(PermissionError):
+        with pytest.raises(bridge.HookBlocked):
             bridge.dispatch(tmp_path, BASH_CALL)
         return
     result = bridge.dispatch(tmp_path, BASH_CALL)
@@ -500,7 +500,10 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
     root = tmp_path / "repo with spaces"
     scripts = root / "scripts/codex"
     scripts.mkdir(parents=True)
-    (scripts / "invoke.ps1").write_text("[Console]::Out.Write([Console]::In.ReadToEnd())\n")
+    # Like the real launcher in hook mode, it ends the process with its decision.
+    (scripts / "invoke.ps1").write_text(
+        "[Console]::Out.Write([Console]::In.ReadToEnd()); [Environment]::Exit(0)\n"
+    )
     subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
     config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
     assert set(config["hooks"]) == {
@@ -529,37 +532,197 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
     assert json.loads(completed.stdout) == {"probe": True}
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
-@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="invoke.ps1 needs a .venv to link")
-def test_every_registered_command_passes_the_bridge_exit_2_to_codex(tmp_path):
-    """pwsh -Command reports a script's exit 2 as 1, so a bridge block would reach Codex as 1.
+# --- Who decides a block: the bridge for its own faults, the launcher when there is no decision.
 
-    The real invoke.ps1 runs a stub bridge, through a link to this test's own virtualenv.
-    """
+GUARD_GROUP = {
+    "matcher": "^(Bash|PowerShell)$",
+    "hooks": [
+        {
+            "type": "command",
+            "command": "pwsh",
+            "args": ["-File", "${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1"],
+        }
+    ],
+}
+ADVISORY_GROUP = {"matcher": "^(Task|Agent|Workflow)$", "hooks": [handler("{}")]}
+UNSUPPORTED = {"type": "prompt", "prompt": "review"}
+
+
+def write_settings(root, hooks):
+    (root / ".claude").mkdir(exist_ok=True)
+    (root / ".claude/settings.json").write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+
+def run(bridge, root, payload, event=""):
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    return bridge.run_hook(root, text, event)
+
+
+@pytest.mark.parametrize(
+    ("tool", "code"),
+    [("Bash", 2), ("PowerShell", 2), ("Agent", 0)],
+    ids=["guarded-bash", "guarded-powershell", "advisory-agent"],
+)
+def test_a_bridge_fault_blocks_only_where_a_guard_could_have_run(
+    bridge, tmp_path, capsys, tool, code
+):
+    write_settings(tmp_path, {"PreToolUse": [ADVISORY_GROUP, GUARD_GROUP]})
+    payload = {"hook_event_name": "PreToolUse", "tool_name": tool}  # no session_id: a fault
+    assert run(bridge, tmp_path, payload) == code
+    captured = capsys.readouterr()
+    assert "Codex bridge fault: ValueError" in captured.err
+    if code == 0:
+        assert "(not blocking)" in json.loads(captured.out)["systemMessage"]
+    else:
+        assert "blocking: a guard hook could have run" in captured.err
+
+
+@pytest.mark.parametrize("event", ["Stop", "SubagentStop", "SessionStart", "UserPromptSubmit"])
+def test_a_bridge_fault_never_blocks_another_event(bridge, tmp_path, capsys, event):
+    """A fault on Stop must not stop Codex from stopping."""
+    write_settings(tmp_path, {event: [{"hooks": [UNSUPPORTED]}]})
+    assert run(bridge, tmp_path, {"session_id": "x", "hook_event_name": event}) == 0
+    assert "(not blocking)" in json.loads(capsys.readouterr().out)["systemMessage"]
+
+
+@pytest.mark.parametrize(("event", "code"), [("PreToolUse", 2), ("Stop", 0)])
+def test_settings_that_cannot_be_parsed_block_only_pretooluse(bridge, tmp_path, event, code):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/settings.json").write_text("{ not json", encoding="utf-8")
+    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Read"}
+    assert run(bridge, tmp_path, payload) == code
+
+
+@pytest.mark.parametrize(
+    ("event", "group", "code"),
+    [
+        ("PreToolUse", GUARD_GROUP, 2),
+        ("PreToolUse", ADVISORY_GROUP, 0),
+        ("SessionStart", GUARD_GROUP, 0),
+    ],
+    ids=["guard", "advisory", "other-event"],
+)
+def test_a_guard_matcher_that_cannot_be_judged_blocks_only_pretooluse(
+    bridge, tmp_path, event, group, code
+):
+    write_settings(tmp_path, {event: [{**group, "matcher": "(["}]})
+    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Read", "source": "x"}
+    assert run(bridge, tmp_path, payload) == code
+
+
+@pytest.mark.parametrize(
+    ("event", "code"), [("PreToolUse", 2), ("Stop", 0), ("", 0)], ids=["pre", "stop", "unknown"]
+)
+def test_a_payload_that_cannot_be_parsed_uses_the_registered_event(bridge, tmp_path, event, code):
+    write_settings(tmp_path, {})
+    assert run(bridge, tmp_path, "{ not json", event) == code
+
+
+def test_a_deliberate_block_and_a_clean_run_exit_2_and_0(bridge, tmp_path, capsys):
+    settings(tmp_path, [exits(2)])
+    assert run(bridge, tmp_path, BASH_CALL) == 2
+    settings(tmp_path, [handler(json.dumps(DENIAL))])
+    assert run(bridge, tmp_path, BASH_CALL) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == DENIAL
+
+
+@pytest.mark.parametrize(
+    ("tool", "code"),
+    [("Bash", 2), ("PowerShell", 2), ("Agent", 0), ("EnterWorktree", 0), ("Read", 0)],
+)
+def test_in_the_tracked_settings_only_the_shell_guard_makes_a_fault_block(
+    bridge, tmp_path, tool, code
+):
+    """Advisory PreToolUse hooks (usage-headroom-inject, enter-worktree-check) stay non-blocking."""
+    tracked = _tracked_settings()
+    guards = [g for g in tracked["hooks"]["PreToolUse"] if bridge.is_guard(g)]
+    assert [g["matcher"] for g in guards] == ["^(Bash|PowerShell)$"]
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/settings.json").write_text(json.dumps(tracked), encoding="utf-8")
+    # A payload with no session_id is a bridge fault before any hook runs.
+    assert run(bridge, tmp_path, {"hook_event_name": "PreToolUse", "tool_name": tool}) == code
+
+
+# --- The launcher and the registered commands: a missing decision blocks only on PreToolUse.
+
+_STUB_BRIDGE = "import os, sys\nsys.exit(int(os.environ['STUB_BRIDGE_EXIT']))\n"
+
+
+def _outer_shells():
+    shells = ["pwsh"]
+    if os.name == "nt":
+        shells.append("cmd")
+    if shutil.which("sh"):
+        shells.append("sh")
+    return shells
+
+
+def _outer_argv(shell, command):
+    # cmd takes the line verbatim, as a string: Python's argv quoting escapes quotes in a way
+    # cmd does not read.
+    if shell == "cmd":
+        return f"cmd /d /c {command}"
+    return ["pwsh", "-NoProfile", "-Command", command] if shell == "pwsh" else ["sh", "-c", command]
+
+
+def _link_python(root):
+    """Give the copied invoke.ps1 a .venv that reaches this test's own interpreter."""
+    if os.name == "nt":
+        if not (Path(sys.prefix) / "Scripts/python.exe").is_file():
+            pytest.skip("needs a virtualenv to junction on Windows")
+        link = ["cmd", "/c", "mklink", "/J", str(root / ".venv"), sys.prefix]
+        subprocess.run(link, check=True, capture_output=True)
+    else:
+        (root / ".venv/bin").mkdir(parents=True)
+        (root / ".venv/bin/python").symlink_to(sys.executable)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize("shell", _outer_shells())
+@pytest.mark.parametrize(
+    ("event", "setup", "expected"),
+    [
+        ("PreToolUse", "0", 0),
+        ("PreToolUse", "2", 2),
+        ("PreToolUse", "1", 2),
+        ("PreToolUse", "3", 2),
+        ("PreToolUse", "no-venv", 2),
+        ("PreToolUse", "no-repo", 2),
+        ("Stop", "0", 0),
+        ("Stop", "2", 2),
+        ("Stop", "1", 1),
+        ("Stop", "no-venv", 1),
+        ("Stop", "no-repo", 1),
+    ],
+)
+def test_a_registered_command_passes_a_decision_and_maps_no_decision(
+    tmp_path, shell, event, setup, expected
+):
+    """No decision (a crash, a missing .venv, no repo) blocks on PreToolUse and is a
+    non-blocking 1 elsewhere, never 0. The real invoke.ps1 runs a stub bridge."""
     import tomllib
 
     root = tmp_path / "repo"
     scripts = root / "scripts/codex"
     scripts.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts/codex/invoke.ps1", scripts / "invoke.ps1")
-    (scripts / "bridge.py").write_text("import sys\nsys.exit(2)\n")
-    if os.name == "nt":  # A junction needs no symlink privilege.
-        link = ["cmd", "/c", "mklink", "/J", str(root / ".venv"), sys.prefix]
-        subprocess.run(link, check=True, capture_output=True)
-    else:
-        (root / ".venv").symlink_to(sys.prefix, target_is_directory=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
-    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
-    for event, groups in config["hooks"].items():
-        for group in groups:
-            for hook in group["hooks"]:
-                completed = subprocess.run(
-                    ["pwsh", "-NoProfile", "-Command", hook["command"]],
-                    cwd=scripts,
-                    input="{}",
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=20,
-                )
-                assert completed.returncode == 2, (event, completed.stderr)
+    (scripts / "bridge.py").write_text(_STUB_BRIDGE)
+    if setup != "no-venv":
+        _link_python(root)
+    if setup != "no-repo":
+        subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    hooks = tomllib.loads((ROOT / ".codex/config.toml").read_text())["hooks"][event][0]["hooks"]
+    env = {**os.environ, "STUB_BRIDGE_EXIT": setup if setup.isdigit() else "0"}
+    if setup == "no-repo":
+        env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
+    completed = subprocess.run(
+        _outer_argv(shell, hooks[0]["command"]),
+        cwd=scripts,
+        env=env,
+        input="{}",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == expected, (shell, completed.stdout, completed.stderr)
