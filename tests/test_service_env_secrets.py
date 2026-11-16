@@ -349,6 +349,29 @@ def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> Non
     assert path.listed == ()
     inline = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY----- x"])
     assert inline.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+    # A whole inline key whose header starts on its second line is still the inline key.
+    later = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\r\n-----BEGIN PRIVATE KEY-----\r\nx"])
+    assert later.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+@pytest.mark.parametrize("brk", ["\r\n", "\n", "\r", "\0"])
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_a_store_key_on_a_later_line_of_one_value_refuses(key: str, brk: str) -> None:
+    """Vault BACKLOG #5394: one ``REG_SZ`` value can hold several ``NAME=value`` lines. A store
+    key on a line after the first is read as its own variable, whatever breaks the lines."""
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod{brk}{key}={_KEY_VALUE}{brk}"])
+    assert posture.listed_keys == (key,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert f"{key} (in Parameters\\AppEnvironmentExtra)" in refusal
+    assert _KEY_VALUE not in refusal
+
+
+def test_an_env_value_on_a_later_line_of_one_value_refuses() -> None:
+    posture = _service(["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_VALUE_PARTNER_HOST="])
+    assert posture.listed_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
+    assert posture.empty_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
+    assert service_env_refusal(posture) is not None
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:

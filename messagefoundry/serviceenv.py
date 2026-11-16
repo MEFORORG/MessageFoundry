@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -291,6 +292,27 @@ class _WindowsProbe:
         ]
 
 
+#: What splits one registry string into lines. A single ``REG_SZ`` value can hold several
+#: ``NAME=value`` lines, and one ``REG_MULTI_SZ`` item can too.
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\0]")
+
+
+def _lines(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Each entry whole, then each of its lines as an entry of its own when it has several, each
+    with the registry value it came from. The reader cannot tell whether NSSM takes a line or the
+    whole string as a variable, so it reads both (vault BACKLOG #5394): the whole string keeps an
+    inline key whose ``-----BEGIN`` starts on a later line, and the lines catch a store key a later
+    line sets. Reading too many only lists a name a later line spells, and a name outside the
+    secret classes refuses nothing."""
+    read: list[tuple[str, str]] = []
+    for where, entry in entries:
+        read.append((where, entry))
+        lines = _LINE_BREAK.split(entry)
+        if len(lines) > 1:
+            read.extend((where, line) for line in lines)
+    return read
+
+
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     """The upper-cased names of the variables that ``NAME=value`` entries set to a secret. The
     value is dropped here and never kept. An empty value carries no secret, so its name is not
@@ -372,8 +394,9 @@ def read_service_env_posture(
                 else str(exc)
             ),
         )
-    sources = _names(entries)
-    empty, unplain = _value_entry_shapes(entries)
+    lines = _lines(entries)
+    sources = _names(lines)
+    empty, unplain = _value_entry_shapes(lines)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
