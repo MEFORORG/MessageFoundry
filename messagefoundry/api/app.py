@@ -6259,17 +6259,23 @@ def create_app(
                 fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
             )
         oc = rr.registry.outbound[name]
+        failed, filtered = rr.outbound_failed(name), rr.outbound_filtered(name)
         return ConnectionMetadata(
             name=name,
             direction="out",
             method=oc.spec.type.value,
-            running=rr.running,
+            # BACKLOG #5762: this lane's own state, not the graph's, as the inbound branch reads. A
+            # lane that is stopped, STOP-held, log-halted, failed, DR-parked or not deployed
+            # delivers nothing, so it must not read running beside the fault that names why.
+            running=(
+                oc.deployed and failed is None and filtered is None and rr.outbound_running(name)
+            ),
             metadata=dict(oc.metadata) if oc.metadata else None,
             settings=redacted_settings(oc.spec.settings),
             simulated=rr.outbound_simulated(name),
             # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-            error=rr.outbound_failed(name) or rr.outbound_filtered(name),
-            fault=_fault(rr.outbound_failed(name), rr.outbound_filtered(name)),
+            error=failed or filtered,
+            fault=_fault(failed, filtered),
         )
 
     @app.post("/connections/{name}/test", response_model=ConnectionTestResult)

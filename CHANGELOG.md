@@ -46,6 +46,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
+- `GET /connections/{name}/metadata` reports an outbound's own state in `running`. It read the
+  graph's running flag, so an outbound that was stopped, STOP-held, log-halted, failed, DR-parked
+  or not deployed read `running: true` beside the `error` naming its fault. (`BACKLOG #5762`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

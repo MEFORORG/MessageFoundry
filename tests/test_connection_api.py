@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
     redacted_settings,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.wiring_runner import FailedLine
 from messagefoundry.transports import build_destination, build_source, wincred
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -639,6 +640,35 @@ async def test_metadata_outbound_simulated(
     body = (await client.get("/connections/OB_SIM/metadata")).json()
     assert body["direction"] == "out"
     assert body["simulated"] is True
+
+
+@pytest.mark.parametrize("down", ["paused", "failed", "filtered", "not_deployed", "graph_stopped"])
+async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path, down: str
+) -> None:
+    """BACKLOG #5762: the outbound row read the GRAPH's running flag, so a lane that delivers
+    nothing read running in the same payload whose error names why. The baseline proves the
+    running graph is what makes True reachable, so each False below is the lane's own state."""
+    reg = _registry(out_dir=str(tmp_path / "out"))
+    if down == "not_deployed":
+        reg.outbound["OB"] = OutboundConnection(
+            "OB", reg.outbound["OB"].spec, metadata={"tier": "gold"}, deployed=False
+        )
+    rr = engine.add_registry(reg)
+    rr._running = True  # the graph runs; only the lane state varies
+    if down != "not_deployed":
+        assert (await client.get("/connections/OB/metadata")).json()["running"] is True
+    if down == "paused":
+        rr._outbound_paused.add("OB")
+    elif down == "failed":
+        rr._failed[("outbound", "OB")] = FailedLine("build failed", False)
+    elif down == "filtered":
+        rr._filtered[("outbound", "OB")] = "below the DR priority threshold"
+    elif down == "graph_stopped":
+        rr._running = False
+    body = (await client.get("/connections/OB/metadata")).json()
+    assert body["running"] is False, body
+    rr._running = False
 
 
 async def test_metadata_404(engine: Engine, client: httpx.AsyncClient, tmp_path: Path) -> None:
