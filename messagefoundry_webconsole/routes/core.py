@@ -206,8 +206,8 @@ def _form_fits(
     one does.
     The sign-in authenticator code is that field, because ``LoginRequest``'s digit pattern would
     refuse what the form has always passed on. The check only refuses and never normalises: what
-    the service receives is each caller's own reading of the submitted value, which at /ui/reauth
-    and the enrolment confirm is the code with surrounding space stripped.
+    the service receives is each caller's own reading of the submitted value, which at /ui/login,
+    /ui/reauth and the enrolment confirm is the code with surrounding space stripped.
 
     Each caller runs this after its rate limiter, so a refused value has already been charged
     whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
@@ -830,11 +830,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #5397: an oversized username, password or authenticator code is refused here,
         # before auth.login hashes or audits it, as the JSON route's 422 refuses it before the
         # engine sees it. That holds for provider "ad" too. Refused, never clamped: a truncated
-        # credential is a different one. The authenticator code is bounded by length only, with
-        # surrounding space stripped as the engine strips it: a blank or space-only one is still
-        # the two-step flow, a padded code still counts, and a non-digit one is still passed on, as
-        # before. The passkey challenge was already popped, and the budget charged as _form_fits
-        # says.
+        # credential is a different one. The authenticator code is bounded by length only, and is
+        # measured and passed on with surrounding space stripped, as the engine strips it: a blank
+        # or space-only one is still the two-step flow, a padded code still counts, and a non-digit
+        # one is still passed on, as before. The passkey challenge was already popped, and the
+        # budget charged as _form_fits says.
 
         def _refused() -> Response:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -847,14 +847,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         password = form.get("password", "")
         # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
         # one is today's two-step flow.
-        totp_code = form.get("totp_code", "")
+        # Stripped once, and that value is both the one measured and the one sent, so a code padded
+        # past the form's body is never carried to the service. The engine strips it anyway.
+        totp_code = form.get("totp_code", "").strip()
         if provider_value not in ("local", "ad") or not _form_fits(
             request,
             LoginRequest,
             length_only=frozenset({"totp_code"}),
             username=username,
             password=password,
-            totp_code=totp_code.strip(),
+            totp_code=totp_code,
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,

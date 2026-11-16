@@ -69,8 +69,9 @@ def _spy(monkeypatch: pytest.MonkeyPatch, service: AuthService, name: str) -> li
     return calls
 
 
-async def _enrol_totp(service: AuthService) -> None:
-    """Activate a TOTP factor for "op" out-of-band, so a fresh browser sign-in is pending on it."""
+async def _enrol_totp(service: AuthService) -> str:
+    """Activate a TOTP factor for "op" out-of-band, so a fresh browser sign-in is pending on it.
+    Returns the factor's secret."""
     user = await service.store.get_user_by_username("op")
     assert user is not None
     identity = await service.identity_for_user_id(user.id)
@@ -81,6 +82,7 @@ async def _enrol_totp(service: AuthService) -> None:
     with held_totp_code(enrollment.secret) as code:
         confirmed = await service.confirm_mfa_enrollment(identity, code, token=outcome.token)
     assert confirmed.ok
+    return enrollment.secret
 
 
 # --- BACKLOG #5397: POST /ui/login ------------------------------------------------------------
@@ -144,16 +146,56 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
         # At the bound the code is passed on whole.
         await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
         assert len(calls) == 1 and calls[0][-1]["totp_code"] == "1" * MAX_DIGITS
-        # Within the bound, content is not the form's to judge: each reaches auth.login unchanged.
-        # The bound is on the code with surrounding space stripped, as the engine strips it, so a
-        # padded code at the bound and a long run of spaces both still pass.
-        passed = ("12345a", " 12345", "   ", " " + "1" * MAX_DIGITS + " ", " " * (MAX_DIGITS + 5))
+        # Within the bound, content is not the form's to judge. The bound is on the code with
+        # surrounding space stripped, as the engine strips it, and that stripped code is what
+        # reaches auth.login: a padded code at the bound passes as the bare code, and a run of
+        # spaces as no code.
+        passed = {
+            "12345a": "12345a",
+            " 12345": "12345",
+            "   ": None,
+            " " + "1" * MAX_DIGITS + " ": "1" * MAX_DIGITS,
+            " " * (MAX_DIGITS + 5): None,
+        }
         for code in passed:
             await c.post("/ui/login", data={**base, "totp_code": code})
-        assert [call[-1]["totp_code"] for call in calls[1:]] == list(passed)
+        assert [call[-1]["totp_code"] for call in calls[1:]] == list(passed.values())
         # A blank code is the two-step flow, passed on as no code.
         await c.post("/ui/login", data={**base, "totp_code": ""})
     assert len(calls) == 7 and calls[6][-1]["totp_code"] is None
+
+
+async def test_a_padded_sign_in_code_reaches_login_within_the_bound(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ui_login measures the stripped code but passes the submitted one on, so a code
+    padded with most of the 1 MiB body cap in space reaches auth.login whole (BACKLOG #5397)."""
+    service = await _service(engine)
+    calls = _spy(monkeypatch, service, "login")
+    pad = " " * 450_000
+    async with ui_client(engine, service) as c:
+        for code in (pad + "123456" + pad, pad):
+            await c.post("/ui/login", data={"username": "op", "password": PW, "totp_code": code})
+    assert [call[-1]["totp_code"] for call in calls] == ["123456", None]
+
+
+async def test_a_padded_correct_sign_in_code_still_signs_in(engine: Engine) -> None:
+    """RED when: ui_login refuses or loses a correct authenticator code padded with space, which the
+    combined sign-in has always accepted. The control is a blank code, which lands on the gate."""
+    service = await _service(engine)
+    await _add(service)
+    secret = await _enrol_totp(service)
+    # The next time step, so the code is not the one the enrolment confirm already consumed.
+    with held_totp_code(secret, steps_ahead=1) as code:
+        async with ui_client(engine, service) as c:
+            r = await c.post("/ui/login", data={"username": "op", "password": PW, "totp_code": ""})
+            assert r.headers["location"] == "/ui/mfa"
+            c.cookies.clear()
+            padded = " " * 50 + code + " " * 50
+            r = await c.post(
+                "/ui/login", data={"username": "op", "password": PW, "totp_code": padded}
+            )
+    assert r.status_code == 303 and r.headers["location"] == "/ui", r.headers
 
 
 async def test_a_space_only_sign_in_code_is_still_the_two_step_flow(engine: Engine) -> None:

@@ -82,9 +82,12 @@ this line.**
   through `LoginRequest`, `MfaVerifyRequest`, `ReauthRequest` and `MfaConfirmRequest`. Not every
   form field is checked, and not every field is checked against the whole model: `_form_fits`
   names which. The sign-in authenticator code is now refused past `LoginRequest`'s length bound,
-  measured with surrounding space stripped, rather than cut to 16 characters; it is bounded by
-  length only, so a blank or space-only code is still the two-step flow and a non-digit one within
-  the bound is still passed to the engine, as before. The enrolment code at the TOTP confirm and
+  measured with surrounding space stripped, rather than cut to 16 characters, and that stripped
+  code is what the engine receives; it is bounded by length only, so a blank or space-only code is
+  still the two-step flow and a non-digit one within the bound is still passed to the engine, as
+  before. A code past the bound refuses the whole sign-in, a passkey sign-in or one on an account
+  with no factor included, as the JSON route refuses a `LoginRequest` carrying it; that is
+  intended. The enrolment code at the TOTP confirm and
   at `POST /ui/account/webauthn/verify` is passed on uncut rather than cut, and the engine refuses
   one past `MfaConfirmRequest`'s bound where it reads the code, as a refused enrolment code, so
   every refusal the service gave before that read still comes first. Needs the engine seam digest
