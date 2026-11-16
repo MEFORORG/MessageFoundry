@@ -70,6 +70,11 @@ def _serve(
         return live
 
     monkeypatch.setattr("messagefoundry.__main__.configure_logging", configure)
+    return _recorded(["serve", "--config", str(SAMPLES_CONFIG), "--env", env, *extra], configured)
+
+
+def _recorded(argv: list[str], configured: list[bool]) -> tuple[int, list[tuple[str, bool]]]:
+    """``main(argv)``, and each record this module's logger handled during it."""
     recorder = _Recorder(configured)
     logger = logging.getLogger("messagefoundry.__main__")
     logger.addHandler(recorder)
@@ -78,7 +83,7 @@ def _serve(
         logger.warning("recorder probe")
         assert recorder.seen == [("recorder probe", False)]
         recorder.seen.clear()
-        rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", env, *extra])
+        rc = main(argv)
     finally:
         logger.removeHandler(recorder)
     return rc, recorder.seen
@@ -235,3 +240,100 @@ def test_api_tls_context_failure_is_a_clean_refusal(
     assert "error: the API TLS context was not built:" in err
     assert chr(10) + "forged line" not in err
     assert [m for m, _ in seen if "the TLS context of the API listener was not built" in m]
+
+
+def test_a_unicode_error_in_the_api_tls_context_is_not_quoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The TLS arm renders the reason through safe_exc (vault BACKLOG #3033), so the byte a
+    # UnicodeDecodeError failed on is not printed. Its str() quotes it, which is the control.
+    raised = UnicodeDecodeError("utf-8", b"\xfe-material", 0, 1, "invalid start byte")
+    assert "0xfe" in str(raised)
+
+    def refuse(*args: object, **kwargs: object) -> ssl.SSLContext:
+        raise raised
+
+    monkeypatch.setattr("messagefoundry.api.tls.build_api_ssl_context", refuse)
+    rc, seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"' + chr(10) + _SECURE,
+        env="staging",
+        key=True,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "error: the API TLS context was not built: UnicodeDecodeError" in err
+    assert "0xfe" not in err
+    logged = [m for m, _ in seen if "the TLS context of the API listener was not built" in m]
+    assert logged and all("0xfe" not in m for m in logged)
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_raise_between_the_audit_decision_and_start_logging_still_writes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # Finding 1 of the previous round: the spool directory is evaluated after the AUDIT line is
+    # queued and before _start_logging's own guard, so a raise there lost the line. The span that
+    # evaluates it now writes the queue on a raise.
+    name = "_forward_spool_dir" if command == "serve" else "_supervisor_forward_spool_dir"
+
+    def boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("spool directory evaluation failed")
+
+    monkeypatch.setattr(f"messagefoundry.__main__.{name}", boom)
+    toml = 'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = false\n' + _SECURE
+    if command == "serve":
+        rc, seen = _serve(tmp_path, monkeypatch, toml, env="staging", key=True)
+    else:
+        rc, seen = _supervise(tmp_path, monkeypatch, toml)
+    assert rc != 0
+    assert _audit(seen, "block_unlisted_outbound=false") == [False]
+
+
+def _supervise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str
+) -> tuple[int, list[tuple[str, bool]]]:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    return _recorded(["supervise", "--config", str(SAMPLES_CONFIG), "--env", "staging"], [])
+
+
+def test_the_static_credential_audit_lines_are_not_filtered_by_the_level() -> None:
+    # Finding 2 of the previous round: AUDIT lines bypass [logging].level, the #1989 ones too.
+    # The warn-mode refusal beside them is an ordinary WARNING, which the level governs.
+    from messagefoundry.config.static_credentials import StaticCredentialGateOutcome
+
+    recorder = _Recorder([])
+    logger = logging.getLogger("messagefoundry.__main__")
+    previous = logger.level
+    logger.addHandler(recorder)
+    logger.setLevel(logging.ERROR)
+    try:
+        cli._log_static_credential_outcome(
+            StaticCredentialGateOutcome(audit=("AUDIT: opt-out honoured",), refusal="a refusal")
+        )
+    finally:
+        logger.removeHandler(recorder)
+        logger.setLevel(previous)
+    assert [m for m, _ in recorder.seen] == ["AUDIT: opt-out honoured"]
+
+
+def test_the_remote_debug_audit_reaches_stdout_at_log_level_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The #2700 line, written after _start_logging, is not filtered by --log-level ERROR either.
+    line = "AUDIT: permitted to start with remote debugging enabled (test line)"
+    monkeypatch.setattr(cli, "_remote_debug_audit", lambda *a, **k: line)
+    rc, _seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n' + _SECURE,
+        env="staging",
+        key=True,
+        extra=("--log-level", "ERROR"),
+    )
+    assert rc == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len([o for o in out if line in o]) == 1
