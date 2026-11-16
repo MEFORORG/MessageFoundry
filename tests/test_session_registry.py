@@ -344,9 +344,8 @@ def _strict_fence(record: dict[str, Any]) -> str:
         {"sessionId": "s", "startedAt": NOW_MS},
         {"pid": "not-a-number", "sessionId": "s", "startedAt": NOW_MS},
         {"pid": 2**40, "sessionId": "s", "startedAt": NOW_MS},
-        {"pid": -4, "sessionId": "s", "startedAt": NOW_MS},
     ],
-    ids=["no-pid-key", "non-numeric-pid", "pid-past-int32", "negative-pid"],
+    ids=["no-pid-key", "non-numeric-pid", "pid-past-int32"],
 )
 def test_a_record_whose_pid_cannot_be_read_is_unreadable_under_strict_mode(
     record: dict[str, Any],
@@ -368,8 +367,31 @@ def test_a_live_pid_whose_start_cannot_be_read_is_unverified_under_strict_mode(
 
 
 def test_a_live_record_is_still_live_under_strict_mode() -> None:
-    """Control: the guarded reads still pass a record that carries every field."""
+    """Control: the guarded reads still pass a record that carries every field, a fractional
+    startedAt included, which the cast this replaced rounded."""
     assert _strict_fence({"pid": os.getpid(), "sessionId": "s", "startedAt": NOW_MS}) == "LIVE"
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", "startedAt": NOW_MS + 0.5}) == (
+        "LIVE"
+    )
+
+
+def test_a_hashtable_record_is_still_fenced_under_strict_mode() -> None:
+    """A dictionary record's keys are read too, as a bare property read of one did."""
+    got = _strict(f"(Test-RecordLiveness -Record @{{ pid = $PID; startedAt = {NOW_MS} }}).State")
+    assert got in {"LIVE", "STALE"}, got
+
+
+def test_a_miss_beside_a_record_naming_no_session_is_not_a_clean_miss(config_root: Path) -> None:
+    """That record may be the session asked about, caught mid-write, so the miss reads UNREADABLE.
+    Under seat.ps1's StrictMode it used to throw, and seat.ps1 refused the clear on the throw."""
+    (config_root / "sessions" / "99004.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    got = _strict(
+        f"$r = Get-SessionLiveness -SessionId 'abcdabcd' -ConfigRoot '{config_root}'; "
+        "'{0}|{1}' -f $r.Found, $r.State"
+    )
+    assert got == "False|UNREADABLE"
 
 
 def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(

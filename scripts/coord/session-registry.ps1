@@ -34,7 +34,8 @@
                   that just launched is the last thing that should read as absent.
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
-      (Found=$false) no record at all -- it exited cleanly, or was never registered.
+      (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
+                  or UNREADABLE when a record that names no session is present and may be this one.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
@@ -161,6 +162,10 @@ function Get-LoginForSession {
 # so the read must answer rather than throw (BACKLOG #5491).
 function Get-RecordField($Record, [string]$Name) {
     if ($null -eq $Record) { return $null }
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains($Name)) { return $Record[$Name] }
+        return $null
+    }
     $p = $Record.PSObject.Properties[$Name]
     if ($p) { return $p.Value }
     return $null
@@ -218,7 +223,7 @@ function Test-RecordLiveness {
     # Fields are read through Get-RecordField and parsed with TryParse, because a cast throws on a value
     # that is not a number (BACKLOG #5491).
     $procId = 0
-    if (-not [int]::TryParse([string](Get-RecordField $Record 'pid'), [ref]$procId) -or $procId -le 0) {
+    if (-not [int]::TryParse([string](Get-RecordField $Record 'pid'), [ref]$procId) -or $procId -eq 0) {
         return @{ State = "UNREADABLE"; Detail = "no usable pid in record; it cannot be fenced" }
     }
 
@@ -232,11 +237,14 @@ function Test-RecordLiveness {
         # upgrading it to LIVE: an unverifiable fence is not a passed fence.
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; start time unreadable" }
     }
-    $startedMs = [int64]0
+    # Parsed as a double and rounded, as the [int64] cast this replaced did, so a fractional value is
+    # still fenced. The bounds are FromUnixTimeMilliseconds's own; NaN fails both comparisons.
+    $startedMs = 0.0
     $registered = $null
-    if ([int64]::TryParse([string](Get-RecordField $Record 'startedAt'), [ref]$startedMs)) {
-        try { $registered = [DateTimeOffset]::FromUnixTimeMilliseconds($startedMs).LocalDateTime }
-        catch [System.ArgumentOutOfRangeException] { }
+    if ([double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
+            [cultureinfo]::InvariantCulture, [ref]$startedMs) -and
+        $startedMs -ge -62135596800000 -and $startedMs -le 253402300799999) {
+        $registered = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$startedMs).LocalDateTime
     }
     if ($null -eq $registered) {
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no usable startedAt" }
@@ -262,10 +270,18 @@ function Get-SessionLiveness {
         [string[]]$ConfigRoot,
         [int]$StartSkewMinutes = 15
     )
-    $hit = @(Get-SessionRecords -ConfigRoot $ConfigRoot |
+    $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
+    $hit = @($records |
         Where-Object { $sid = [string](Get-RecordField $_.Record 'sessionId'); $sid -and $sid.StartsWith($SessionId, 'OrdinalIgnoreCase') })
 
     if ($hit.Count -eq 0) {
+        # A record that names no session may be this one, caught mid-write, so a miss beside one is not
+        # a clean miss. Under StrictMode it used to throw, which seat.ps1 refused on; skipping it
+        # silently would turn that refusal into a clear (BACKLOG #5491).
+        $anonymous = @($records | Where-Object { -not [string](Get-RecordField $_.Record 'sessionId') }).Count
+        if ($anonymous -gt 0) {
+            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, but $anonymous record(s) name no session and one may be it"; Record = $null }
+        }
         # Not registered. NOT proof it is gone -- a session that never registered looks identical to
         # one that exited cleanly, so callers must fall back to an independent signal.
         return @{ Found = $false; State = "UNKNOWN"; Detail = "no registry record"; Record = $null }

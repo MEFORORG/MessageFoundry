@@ -246,8 +246,7 @@ class TestRefuses:
         raw = rp.read_text(encoding="utf-8-sig")
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
-            # startedAt is PRESENT and null for UNVERIFIED. An ABSENT one makes the registry's
-            # fence throw under StrictMode, which the next test pins as its own refusal.
+            # startedAt is PRESENT and null for UNVERIFIED; an ABSENT one reads UNVERIFIED too.
             entry: dict[str, Any] = {"pid": live.pid, "sessionId": DEAD, "cwd": "x"}
             entry["startedAt"] = int(time.time() * 1000) if started == "now" else None
             (home / ".claude" / "sessions" / f"{live.pid}.json").write_text(

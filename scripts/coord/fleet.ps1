@@ -173,7 +173,8 @@ foreach ($row in $sessionRows) {
     $l = Test-RecordLiveness -Record $row.Record
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
-            SessionId = [string]$row.Record.sessionId
+            # A LIVE record may name no session; a bare read throws under this file's StrictMode.
+            SessionId = [string](Get-RecordField $row.Record 'sessionId')
             Cwd       = $cwd
             Box       = (ConvertTo-BoxKey -Path ([string]$row.Record.cwd))
             Root      = $row.Root

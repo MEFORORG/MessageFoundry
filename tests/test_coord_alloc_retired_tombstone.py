@@ -308,18 +308,37 @@ def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
     shared.mkdir()
     # Every pwsh child inherits it; the stale copy ignores it, as a real one would.
     monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
+    assert _allocate_with_stale_copy(repo) == 1772, "the paired control"
 
     wrote = _tombstone(repo)
     assert wrote.returncode == 0, wrote.stdout + wrote.stderr
     local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
-    assert (shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json").is_file()
-    assert local.is_file(), wrote.stdout
+    for record in (local, shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"):
+        assert json.loads(record.read_text(encoding="utf-8"))["tombstone"] is True, record
     assert _allocate_with_stale_copy(repo) == _TOMBSTONE_NUMBER + 1
 
     local.unlink()
     absent = _tombstone(repo, "-Check")
     assert absent.returncode == 1, absent.stdout + absent.stderr
     assert f"ABSENT: {local}" in absent.stdout
+
+
+def test_an_unresolved_shared_root_still_tombstones_the_local_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local registry does not depend on the share, so a root that cannot be resolved still
+    lets it be written, and the run then refuses with exit 4, -Check included."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(tmp_path / "no-such-root"))
+
+    wrote = _tombstone(repo)
+    assert wrote.returncode == 4, wrote.stdout + wrote.stderr
+    local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    assert json.loads(local.read_text(encoding="utf-8"))["tombstone"] is True
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 4, checked.stdout + checked.stderr
+    assert f"PRESENT: {local}" in checked.stdout
 
 
 def test_the_tombstone_replaces_an_empty_record(tmp_path: Path) -> None:

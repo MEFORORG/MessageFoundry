@@ -111,17 +111,24 @@ $thisHost = Get-CoordHost
 # registry, <common>/mefor-coord/alloc/backlog, so that one carries the tombstone whatever is
 # configured: a tombstone on the shared root alone lifts no stale copy. The shared registry gets one
 # too, for the readers that resolve alloc through coord-root.ps1. With no root configured the two are
-# one path, written once. A shared root that cannot be resolved refuses rather than fall back, -Check
-# included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
+# one path, written once. A shared root that cannot be resolved is never replaced by the local one:
+# the local registry is still read or written, since it does not depend on the share, and the run
+# then refuses with an exit code of its own, -Check included, so a caller cannot read it as PRESENT
+# or ABSENT.
 $localRoot = Join-Path $GitCommonDir 'mefor-coord'
+$registries = @(Join-Path $localRoot 'alloc' 'backlog')
 $allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot $localRoot
-if ($allocDir.Error) {
-    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
+$sharedError = $allocDir.Error
+if (-not $sharedError) {
+    $sharedRegistry = Join-Path $allocDir.Path 'backlog'
+    if ($sharedRegistry -ne $registries[0]) { $registries += $sharedRegistry }
+}
+
+function Exit-IfSharedUnresolved {
+    if (-not $sharedError) { return }
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the shared allocation registry could not be resolved, so only the local one was read or written: $sharedError")
     exit 4
 }
-$registries = @(Join-Path $localRoot 'alloc' 'backlog')
-$sharedRegistry = Join-Path $allocDir.Path 'backlog'
-if ($sharedRegistry -ne $registries[0]) { $registries += $sharedRegistry }
 
 function Test-IsTombstone([string]$Path) {
     try { $c = Get-Content -LiteralPath $Path -Raw -EA Stop | ConvertFrom-Json -EA Stop }
@@ -146,6 +153,7 @@ if ($Check) {
             $code = 2
         }
     }
+    Exit-IfSharedUnresolved
     exit $code
 }
 
@@ -215,5 +223,6 @@ foreach ($registry in $registries) {
     Write-Host "WROTE TOMBSTONE: $file"
 }
 
+Exit-IfSharedUnresolved
 Write-Host "  A pre-retirement alloc.ps1 in any worktree of this clone now issues #$($TombstoneNumber + 1) or above."
 exit 0

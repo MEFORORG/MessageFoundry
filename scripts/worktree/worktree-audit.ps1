@@ -88,8 +88,9 @@ function Get-SeatLockReading {
         already read the registry, so a report over many locks reads it once.
     #>
     param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
-    # session-registry.ps1 reads `.sessionId`, `.pid` and `.startedAt` off records that may lack them.
-    # Under a caller's StrictMode (seat.ps1 runs Latest) a missing one throws instead of reading null.
+    # session-registry.ps1's fence reads its record fields without throwing under StrictMode since
+    # BACKLOG #5491. This stays off for any read below it that is still bare, under a caller's
+    # StrictMode (seat.ps1 runs Latest).
     Set-StrictMode -Off
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
