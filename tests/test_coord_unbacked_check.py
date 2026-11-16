@@ -611,3 +611,85 @@ def test_a_squash_landed_verdict_needs_SHARED_history(
         assert r.returncode == 1, r.stdout + r.stderr
         assert "squash/rebase-landed" not in r.stdout
         assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("landed", [True, False], ids=["landed", "not-landed"])
+def test_a_DANGLING_remote_HEAD_falls_back_to_main(repo: Path, landed: bool) -> None:
+    """``landed`` MUST NOT TRIP; ``not-landed`` is its must-trip twin. ``refs/remotes/origin/HEAD``
+    names a branch that was pruned -- a default branch renamed from master to main. Taking that
+    target alone left origin with no candidate, so a squash on origin/main stopped clearing."""
+    if landed:
+        _squash_land(repo, "landed")
+    else:
+        git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+        git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+
+    r = check(repo)
+    if landed:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on origin/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("inside", [False, True], ids=["outside", "inside"])
+def test_a_remote_HEAD_target_counts_only_inside_its_own_namespace(
+    repo: Path, inside: bool
+) -> None:
+    """``outside`` MUST TRIP; ``inside`` is its must-not-trip twin. When ``refs/remotes/origin/HEAD``
+    points at a LOCAL tag holding an unpushed squash, that content is on this disk only, so it must
+    not mark the branch landed. Pointed at ``refs/remotes/origin/main`` holding the same squash, it
+    does."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "squashed somewhere", "work")
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "g.txt", "squashed somewhere", "squashed: work")
+    if inside:
+        git(repo, "push", "-q", "origin", "main")
+        git(repo, "fetch", "-q", "origin")
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    else:
+        # A tag, so no branch scan sees the unpushed squash; local main goes back to what is pushed.
+        git(repo, "tag", "local-squash")
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/tags/local-squash")
+        git(repo, "reset", "-q", "--hard", "HEAD~1")
+
+    r = check(repo)
+    if inside:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on origin/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "squash/rebase-landed" not in r.stdout
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("on_backup", [True, False], ids=["squash-on-backup", "squash-nowhere"])
+def test_a_squash_on_a_SECOND_answering_remote_clears(
+    repo: Path, tmp_path: Path, on_backup: bool
+) -> None:
+    """``squash-on-backup`` MUST NOT TRIP; ``squash-nowhere`` is its must-trip twin. Both remotes
+    answer and origin/main lacks the squash. Reading only the first candidate that shares history,
+    origin, missed the squash on backup's main, where the content is just as durable."""
+    _add_backup_remote(repo, tmp_path)
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "landed on backup", "work")
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "g.txt", "landed on backup", "squashed: work")
+    if on_backup:
+        git(repo, "push", "-q", "backup", "main")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    git(repo, "fetch", "-q", "--all")
+
+    r = check(repo)
+    assert "2 of 2 configured remote(s) answered" in r.stdout
+    if on_backup:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on backup/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "1 commits on 1 branch exist on no remote" in r.stdout

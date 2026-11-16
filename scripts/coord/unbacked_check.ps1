@@ -187,16 +187,16 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 # The classification only ever moves a commit from AT-RISK to DURABLE. A commit that fails both arms
 # is reported exactly as before, so this cannot mask the case the script exists for.
 #
-# $Landed is the set of commits the caller's one `git cherry` per ref marked '-', against $Upstream.
+# $Landed maps each commit the caller's `git cherry` runs marked '-' to the upstream that marked it.
 # $NotArgs is the caller's exclusion set, so a parent counts as backed only by a remote this run trusts
-# (see $notArgs and $upstream below, BACKLOG #5502).
+# (see $notArgs and $upstreamCandidates below, BACKLOG #5502).
 function Test-CommitContentDurable {
-    param([string]$Repo, [string]$Commit, [hashtable]$Landed, [string]$Upstream, [string[]]$NotArgs)
+    param([string]$Repo, [string]$Commit, [hashtable]$Landed, [string[]]$NotArgs)
 
     # Arm 1: patch-id already upstream. `git cherry` marks '-' when an equivalent patch exists on the
     # upstream ref, which is precisely the squash/rebase-landed case a sha comparison cannot see.
     if ($Landed.ContainsKey($Commit)) {
-        return [pscustomobject]@{ Durable = $true; Why = "patch already on $($Upstream -replace '^refs/remotes/', '') (squash/rebase-landed)" }
+        return [pscustomobject]@{ Durable = $true; Why = "patch already on $($Landed[$Commit] -replace '^refs/remotes/', '') (squash/rebase-landed)" }
     }
 
     # Arm 2: a re-derivable merge over backed parents.
@@ -250,7 +250,7 @@ foreach ($p in $Path) {
     $emptyRemotes = @()
     if (-not $SkipReachability) {
         foreach ($rem in $remotes) {
-            # A remote answers when it advertises ANY ref. Branches first, then tags, so a large
+            # A remote answers when it advertises a branch or tag. Branches first, then tags, so a large
             # remote's pull refs are never listed: a bare repository whose HEAD names a branch nobody
             # pushed still holds branches, and a durability store may hold only rescue tags. Exit 2
             # from both means it answered with no refs -- an empty or recreated store, which backs
@@ -302,8 +302,16 @@ foreach ($p in $Path) {
     $ordered = @($trustedNames | Where-Object { $_ -ceq 'origin' }) + @($trustedNames | Where-Object { $_ -cne 'origin' })
     $upstreamCandidates = @()
     foreach ($r in $ordered) {
+        # The HEAD target is taken only inside this remote's own namespace, and not inside a nested
+        # remote's: a symref pointing at a local branch or tag would let unpushed content mark a
+        # commit landed. A dangling or refused target falls back to main, then master.
         $head = (& git -C $p symbolic-ref --quiet "refs/remotes/$r/HEAD" 2>$null)
-        $names = if ($head) { @($head) } else { @("refs/remotes/$r/main", "refs/remotes/$r/master") }
+        $names = @()
+        if ($head -and $head.StartsWith("refs/remotes/$r/", [StringComparison]::Ordinal) -and
+            -not ($remotes | Where-Object { $_.StartsWith("$r/", [StringComparison]::Ordinal) -and $head.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) })) {
+            $names += $head
+        }
+        $names += @("refs/remotes/$r/main", "refs/remotes/$r/master")
         $hit = $names | Where-Object { & git -C $p rev-parse --verify --quiet $_ } | Select-Object -First 1
         if ($hit) { $upstreamCandidates += $hit }
     }
@@ -365,23 +373,21 @@ foreach ($p in $Path) {
             # every unpushed commit on top of it.
             # SHARED HISTORY FIRST: against a main the ref shares no history with -- another project
             # fetched as a durability remote -- cherry compares the whole of both, and a diff that
-            # happens to be identical there would mark an unbacked commit landed. So the upstream is
-            # the first candidate `git merge-base` can join to this ref, and with none the arm is off.
-            $upstream = $null
+            # happens to be identical there would mark an unbacked commit landed. So only candidates
+            # `git merge-base` can join to this ref are read. EVERY such candidate is read, not the
+            # first: a squash that landed on a second answering remote is as durable as one on origin.
+            $landed = @{}
             foreach ($u in $upstreamCandidates) {
                 & git -C $p merge-base $u $ref 2>$null | Out-Null
-                if ($LASTEXITCODE -eq 0) { $upstream = $u; break }
-            }
-            $landed = @{}
-            if ($upstream) {
-                foreach ($cl in @(& git -C $p cherry $upstream $ref 2>$null)) {
-                    if ($cl -match '^- ([0-9a-f]+)$') { $landed[$Matches[1]] = $true }
+                if ($LASTEXITCODE -ne 0) { continue }
+                foreach ($cl in @(& git -C $p cherry $u $ref 2>$null)) {
+                    if ($cl -match '^- ([0-9a-f]+)$' -and -not $landed.ContainsKey($Matches[1])) { $landed[$Matches[1]] = $u }
                 }
             }
             $why = $null
             $allDurable = $true
             foreach ($c in $unbacked) {
-                $v = Test-CommitContentDurable -Repo $p -Commit $c -Landed $landed -Upstream $upstream -NotArgs $notArgs
+                $v = Test-CommitContentDurable -Repo $p -Commit $c -Landed $landed -NotArgs $notArgs
                 if (-not $v.Durable) { $allDurable = $false; break }
                 if (-not $why) { $why = $v.Why }
             }
@@ -501,7 +507,7 @@ if ($SkipReachability) {
 } else {
     $reach = ($repos | Measure-Object -Property RemotesReachable -Sum).Sum
     $conf = ($repos | Measure-Object -Property RemotesConfigured -Sum).Sum
-    Write-Host "           $reach of $conf configured remote(s) answered"
+    Write-Host "           $reach of $conf configured remote(s) answered$(if ($repos | Where-Object { $_.RemotesEmpty.Count -gt 0 }) { ' (a remote that answered with no refs is not counted)' })"
     # Named, because a branch held only by one of these reads as "exist on no remote" above, and
     # the remedy for that is restoring the remote, not a rescue push.
     foreach ($r in ($repos | Where-Object { $_.RemotesReachable -gt 0 -and $_.RemotesUnreachable.Count -gt 0 })) {
