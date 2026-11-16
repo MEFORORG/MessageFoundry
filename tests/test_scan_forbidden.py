@@ -1360,8 +1360,8 @@ _PR_ROW_CLAUSE_MUST_FIRE: list[str] = [
     f"For {_REQ} the row is not failing (re-scored last week).",
     f"For {_REQ} the row is not failing; the verdict is unchanged.",
     f"| {_REQ} | never fails | stays at the same grade |",
-    f"For {_REQ} the row is not failing for\nASVS 1.2.3.",
-    "Since 2.5.1 the row is not failing for\nASVS 1.2.3.",
+    f"For {_REQ} the row is not failing for\nASVS {_REQ_B}.",
+    f"Since 2.5.1 the row is not failing for\nASVS {_REQ_B}.",
     f"For {_REQ} the row is not failing:\n{_REQ_B} here.",
     f"| {_REQ} | unchanged | never fails |",
     f"| {_REQ} | {_PARTIAL} | never fails |",
@@ -2388,7 +2388,9 @@ def test_an_unquoted_or_second_tag_in_a_run_is_still_a_tag(sf, line: str) -> Non
 #
 # The oracle below is origin/main's PR-body reading, copied here verbatim rather than imported from the
 # scanner's own baseline pass, so a later edit to that pass cannot also move the yardstick. It reuses
-# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change.
+# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change and BACKLOG #3364
+# did, so it is not main's reading exactly; the header columns use the loose split, which counts row
+# pipes as the oracle does. The vendored origin/main scanner (``sf_frozen_main``) is the exact one.
 
 _MAIN_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _MAIN_QUOTE = re.compile(r"(?:>\s?)+")
@@ -2447,7 +2449,7 @@ def _main_scan_pr_body(sf, body: str) -> list[str]:
             and index + 1 < len(units)
             and sf._pr_is_delimiter(units[index + 1][1])
         ):
-            asvs_columns = sf._pr_asvs_columns(unit)
+            asvs_columns = sf._pr_asvs_columns(unit, loose=True)
         for start, sentence in _main_pr_sentences(unit, is_row):
             found: dict[str, int] = {}
             for p in sf._RECORD_PAIR:
@@ -2611,10 +2613,11 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
 
 
 def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
-    """The structural property: the baseline is one pass of the union, so this holds by construction,
-    and the test pins it against two oracles: the pre-BACKLOG #5582 reading rebuilt here, and the
-    vendored origin/main scanner with #5582's readings. A body in ``_SUPERSET_EXCEPTIONS`` is quieted
-    on purpose and is left out; its own test pins that main flags it."""
+    """The baseline is one pass of the union, but it runs the head's table model, so this is not true
+    by construction: step 9 drops marks main kept across a blank line between rows. The test pins it
+    against two oracles: the pre-BACKLOG #5582 reading rebuilt here, and the vendored origin/main
+    scanner with #5582's readings. A body in ``_SUPERSET_EXCEPTIONS`` is quieted on purpose and is left
+    out; its own test pins that main flags it."""
     harvested = set(_harvested_pr_bodies())
     fired_harvested = fired_generated = 0
     for body in [*harvested, *_generated_pr_bodies()]:

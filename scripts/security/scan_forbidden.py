@@ -785,9 +785,11 @@ _PR_INLINE_TAG = re.compile(
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 #: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
-#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reports at least every hit
-#: that reading reported: the rewrites above found more, and missed some main caught, three review
-#: rounds running. Do not tighten them: a change here is a change to the floor.
+#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
+#: reading did: the rewrites above found more, and missed some main caught, three review rounds
+#: running. Do not tighten them: a change here is a change to the floor. The floor is not every hit
+#: main reported: the pass runs this module's table model, so a blank line, or a quote-only line in a
+#: quoted table, between rows ends the table there and drops the marks main kept across it (step 9).
 _PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
 _PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
@@ -874,10 +876,13 @@ def _pr_inline(line: str, targets: bool) -> str:
 #: The three readings of a body (scan_pr_body). The baseline reads it as origin/main did before
 #: BACKLOG #5582; the text reading takes inline tags out and reads links as their text; the target
 #: reading also keeps each link target and inline tag attribute beside its text.
-_PR_BASE, _PR_TEXT, _PR_TARGETS = "base", "text", "targets"
+_PrReading = Literal["base", "text", "targets"]
+_PR_BASE: _PrReading = "base"
+_PR_TEXT: _PrReading = "text"
+_PR_TARGETS: _PrReading = "targets"
 
 
-def _pr_units(lines: list[str], delete_invisible: bool, reading: str = _PR_BASE) -> _PrUnits:
+def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> _PrUnits:
     """Split a PR body's lines into the units a sentence can live in, as markdown renders them.
 
     A blank line, a list item or a table row starts a new unit, and a heading is a unit of its own; any
@@ -1357,7 +1362,7 @@ def scan_pr_body(body: str) -> list[str]:
 def _pr_scan_reading(
     lines: list[str],
     gfm: tuple[list[int], list[int], set[int]],
-    reading: str,
+    reading: _PrReading,
     units: _PrUnits,
     invisible: bool,
     kinds: frozenset[str],
