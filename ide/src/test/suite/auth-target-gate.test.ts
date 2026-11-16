@@ -158,6 +158,17 @@ gateSuite("a cached bearer goes only to a target assertTargetAllowed passes (BAC
     assert.deepStrictEqual(seen, [TOKEN]);
   });
 
+  test("A4: a refused URL carrying a markdown command link is not shown as a link at sign-in", async () => {
+    // assertTargetAllowed quotes the URL in its reason; the notification would render the link.
+    assert.strictEqual(await auth.signIn(context, "[x](command:foo)"), undefined);
+    assert.deepStrictEqual(posts, []);
+    assert.strictEqual(errors.length, 1, "the refusal is shown");
+    assert.ok(!errors[0].includes("[x](command:foo)"), errors[0]);
+    assert.ok(!/\]\(command:/.test(errors[0]), errors[0]);
+    // Control: it is the target gate's refusal that was shown.
+    assert.match(errors[0], /^MessageFoundry: not a valid engine URL: /);
+  });
+
   test("A3: withStepUpAuth inherits the gate through withAuth", async () => {
     const seen: string[] = [];
     const result = await auth.withStepUpAuth(context, REFUSED, (token) => {

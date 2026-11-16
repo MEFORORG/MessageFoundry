@@ -987,13 +987,15 @@ function startServiceConfig(): string | undefined {
 }
 
 /** Why Start must not run with this `--service-config`, or undefined when it may: a set value that
- *  names no file in the workspace, which serve and provision-admin would refuse (BACKLOG #5566). */
+ *  names no file in the workspace, which serve and provision-admin would refuse (BACKLOG #5566).
+ *  The message names the setting and never the value: the value is workspace-controlled, and a
+ *  notification renders a markdown link in it, `command:` links included. */
 function serviceConfigRefusal(ws: string, serviceConfigArg: string | undefined): string | undefined {
   if (serviceConfigArg === undefined || isFile(path.resolve(ws, serviceConfigArg))) {
     return undefined;
   }
   return (
-    `messagefoundry.serviceConfig names "${serviceConfigArg}", which is not a file in this workspace — ` +
+    "messagefoundry.serviceConfig names a path which is not a file in this workspace — " +
     "serve would refuse it. Correct the setting, or clear it to use the default."
   );
 }

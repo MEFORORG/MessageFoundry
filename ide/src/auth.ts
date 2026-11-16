@@ -6,7 +6,7 @@
 // demand or after a 401.
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
-import { mustChangeProblem } from "./engineStatusModel";
+import { escapeMarkdown, mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
 import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
 import { type StepUpHost, withStepUp } from "./stepUp";
@@ -59,7 +59,9 @@ function secretKey(url: string): string {
 function refuseDisallowedTarget(url: string): boolean {
   const gate = assertTargetAllowed(url);
   if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    // The reason quotes the URL, which a workspace setting can supply, and a notification renders a
+    // markdown link in it, `command:` links included; escapeMarkdown breaks the link syntax.
+    void vscode.window.showErrorMessage(`MessageFoundry: ${escapeMarkdown(gate.reason)}`);
   }
   return !gate.ok;
 }

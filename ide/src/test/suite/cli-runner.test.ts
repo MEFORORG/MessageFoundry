@@ -201,7 +201,16 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     assert.match(writerRefusal("configDir", "workspace"), /messagefoundry\.configDir, set in workspace settings, is not a path inside/);
     assert.match(writerRefusal("serviceConfig", "user"), /messagefoundry\.serviceConfig, set in user settings, is not text/);
     assert.match(droppedNotice("configDir", "workspace"), /^messagefoundry\.configDir, set in workspace settings, is not a path inside .*so it is not used\./);
-    assert.match(droppedNotice("serviceConfig", "user"), /set in user settings, is not text, so it is not used\.$/);
+    assert.match(droppedNotice("serviceConfig", "user"), /set in user settings, is not text, so it is not used\. /);
+    // The notice says what each command does with the value: readers, the paths that still read the
+    // substitute among them, go on with it; writers and Start and Restart refuse, for either scope.
+    for (const scope of ["workspace", "user"] as const) {
+      const notice = droppedNotice("configDir", scope);
+      assert.match(notice, /Test Bench Run and Debug, Live Debug and validate-on-save, go on with the value used in its place\./);
+      assert.match(notice, /Commands that write, and Start and Restart, refuse until it is/);
+    }
+    assert.match(droppedNotice("configDir", "user"), /refuse until it is corrected\.$/);
+    assert.match(droppedNotice("configDir", "workspace"), /refuse until it is removed; a path elsewhere goes in user settings\.$/);
     const writer = body(CLI, "writerPathSetting");
     assert.match(writer, /^\s*return writerSetting\(key\)\?\.value;\s*$/);
     assert.match(CLI, /function writerSetting\([^)]*\)[^{]*\{\s*const s = writerCheckSetting\(key\);\s*if \(s\.dropped !== false\) \{/);

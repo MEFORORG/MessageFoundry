@@ -243,6 +243,19 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.started, false);
   });
 
+  test("a value carrying a markdown command link is never echoed into the refusal", async () => {
+    // A notification renders `[x](command:foo)` as a link; the refusal names the setting instead.
+    stubSetting = "[x](command:foo)";
+    const run = await restart(LOOPBACK);
+
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
+    assert.ok(!notices[0].includes("command:"), notices[0]);
+    // Control: the refusal fired for this value and names the setting.
+    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    assert.strictEqual(run.stopped, false);
+  });
+
   test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
     stubWorkspace = undefined;
     stubScope = "workspaceValue";

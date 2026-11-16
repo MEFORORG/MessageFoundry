@@ -174,14 +174,19 @@ function droppedWhy(key: string, dropped: DroppedScope): string {
     : `messagefoundry.${key}, set in user settings, is not text`;
 }
 
-/** The warning a READER shows once per dropped value: it goes on with the value used in its place.
- *  Commands that write or start something refuse instead, while the workspace value is there. */
+/** The warning a READER shows once per dropped value: it goes on with the value used in its place,
+ *  and so do the other readers, Test Bench Run and Debug, Live Debug and validate-on-save among them.
+ *  Writers, and Start and Restart, refuse instead (writerRefusal), for a workspace or a user value. */
 export function droppedNotice(key: string, dropped: DroppedScope): string {
-  const use =
+  const fix =
     dropped === "workspace"
-      ? " Commands that write or start something refuse until it is removed; a path elsewhere goes in user settings."
-      : "";
-  return `${droppedWhy(key, dropped)}, so it is not used.${use}`;
+      ? "until it is removed; a path elsewhere goes in user settings."
+      : "until it is corrected.";
+  return (
+    `${droppedWhy(key, dropped)}, so it is not used. Commands that read settings, at least Test Bench ` +
+    "Run and Debug, Live Debug and validate-on-save, go on with the value used in its place. Commands " +
+    `that write, and Start and Restart, refuse ${fix}`
+  );
 }
 
 /**
