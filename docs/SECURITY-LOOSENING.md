@@ -838,10 +838,13 @@ This section is kept rather than deleted, because the claim it used to make is t
 Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
 the next start may do.
 - **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
-  change. With it off, `serve` (and each `supervise` shard, and the supervisor before it records a
-  renewed API certificate) refuses to start when the store key differs from its stamp, or has none,
-  the chain has not been rolled to it, and the key the chain's current range is under is not
-  configured. With it on, that start goes ahead: its first audit row goes into that range under the
+  change. With it off, `serve` (and each `supervise` shard, and the supervisor before it renews the
+  API certificate) refuses to start when the store key differs from its stamp, or has none, the
+  chain has not been rolled to it, and the key the chain's current range is under is not
+  configured. A refused start renews no API certificate. The one exception is a store under
+  `[store].cipher_provider = "vault_transit"`: Transit holds that store's key, so the engine has no
+  local store key to compare with the stamp, the refusal never fires, and this setting changes
+  nothing there. With it on, that start goes ahead: its first audit row goes into that range under the
   new key, never verifies there, and the chain breaks at that row. `audit-verify` reports the break,
   and `rotate-key` cannot roll the chain afterwards.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,

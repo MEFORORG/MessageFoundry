@@ -287,29 +287,32 @@ def test_the_rows_after_a_refused_start_are_unchanged(tmp_path: Path) -> None:
     assert ROTATION_RECORD_ID not in rows
 
 
+def _mint_a_pair_due_for_renewal(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> bytes:
+    """A real generated API pair in ``state_dir``, reported due for renewal from now on, so the
+    next renewing start writes a new one. Returns the certificate's bytes as minted."""
+    from messagefoundry.api import tls
+    from messagefoundry.config.settings import ApiSettings
+
+    tls.ensure_api_tls_material(ApiSettings(), state_dir=state_dir)
+    monkeypatch.setattr(tls, "_renewal_due", tls._cert_facts)
+    return (state_dir / "api-generated-cert.pem").read_bytes()
+
+
 @pytest.mark.parametrize("allow_lost", [False, True])
-def test_supervise_refuses_before_it_records_a_renewed_api_pair(
+def test_a_refused_supervise_start_leaves_the_api_pair_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_lost: bool
 ) -> None:
-    """The supervisor writes an audit row for a renewed API pair before any shard starts, so it
-    takes the shards' refusal first, or a refused fleet would already have broken the chain. Under
-    the override it records the renewal, as the shards then start."""
+    """#4934: the refusal runs before the renewal, so a refused fleet start renews nothing on disk
+    and leaves no renewal without its audit row. Under the override the same start renews the pair
+    and records it, the positive control that the pair was due."""
     from messagefoundry import __main__ as cli
-    from messagefoundry.api import tls
+    from messagefoundry.api.tls import generated_state_dir
     from messagefoundry.config.settings import ServiceSettings
 
     db, key_a, key_b = tmp_path / "sup.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
-    recorded: list[object] = []
-
-    def renewed(*_args: object, replacements: list[object], **_kwargs: object) -> None:
-        replacements.append(object())
-
-    async def record(_store: object, replaced: list[object]) -> None:
-        recorded.extend(replaced)
-
-    monkeypatch.setattr(tls, "ensure_api_tls_material", renewed)
-    monkeypatch.setattr(tls, "record_generated_pair_replacements", record)
+    state_dir = generated_state_dir(str(db))
+    minted = _mint_a_pair_due_for_renewal(state_dir, monkeypatch)
     settings = ServiceSettings(
         store=StoreSettings(path=str(db), encryption_key=key_b),
         secret_rotation=SecretRotationSettings(allow_lost_audit_range_key=allow_lost),
@@ -317,12 +320,67 @@ def test_supervise_refuses_before_it_records_a_renewed_api_pair(
     before = _audit_rows(db)
     if allow_lost:
         cli._renew_api_tls_before_spawning(settings, str(db))
-        assert len(recorded) == 1
+        assert (state_dir / "api-generated-cert.pem").read_bytes() != minted
+        assert _audit_rows(db) == before + 1
         return
     with pytest.raises(UnrolledStoreKeyRefused):
         cli._renew_api_tls_before_spawning(settings, str(db))
-    assert recorded == []
+    assert (state_dir / "api-generated-cert.pem").read_bytes() == minted
     assert _audit_rows(db) == before
+
+
+def test_a_refused_serve_start_leaves_the_api_pair_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#4934: serve mints before its lifespan opens the store, so a start that would write the
+    pair takes the refusal first, exits 2 with the remedy, and renews nothing on disk."""
+    db, key_a, key_b = tmp_path / "messagefoundry.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    minted = _mint_a_pair_due_for_renewal(tmp_path, monkeypatch)
+    started: list[object] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
+    # The enforce-only start gates (an off-box log collector, ...) are not under test here.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: started.append(k))
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
+        "security.local_access_only = true\n",
+        encoding="utf-8",
+    )
+    samples = Path(__file__).resolve().parent.parent / "samples" / "config"
+    before = _audit_rows(db)
+    assert main(["serve", "--config", str(samples), "--env", "dev"]) == 2
+    err = capsys.readouterr().err
+    assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in err, err[-2000:]
+    assert started == []
+    assert (tmp_path / "api-generated-cert.pem").read_bytes() == minted
+    assert _audit_rows(db) == before
+
+
+def test_supervise_exits_2_with_the_remedy_on_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#4934: ``supervise`` catches the refusal, prints it in full and spawns no shard."""
+    from messagefoundry import __main__ as cli
+    from tests.test_remote_debug_start_refusal import (
+        _OFF,
+        _stand_down_the_gates_before_logging,
+        _supervise,
+    )
+
+    def refused(*_args: object, **_kwargs: object) -> Path:
+        raise UnrolledStoreKeyRefused("refusing to start: TEST REMEDY")
+
+    _stand_down_the_gates_before_logging(monkeypatch)
+    monkeypatch.setattr(cli, "_keyless_store_gate", lambda settings: None)
+    monkeypatch.setattr(cli, "_start_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", refused)
+    rc, spawned = _supervise(tmp_path, monkeypatch, _OFF)
+    err = capsys.readouterr().err
+    assert rc == 2 and not spawned, err[-2000:]
+    assert "error: refusing to start: TEST REMEDY" in err
 
 
 def _audit_rows(db: Path) -> int:

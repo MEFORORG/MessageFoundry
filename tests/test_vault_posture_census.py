@@ -309,6 +309,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
         ("__main__.py", "_provision_admin.server_store_found", "open_store", "posture"),
         ("__main__.py", "_renew_api_tls_before_spawning._audit", "open_store", "posture"),
+        ("__main__.py", "_refuse_unrolled_key_before_tls_write._check", "open_store", "posture"),
         ("__main__.py", "_rotate_key", "resolve_active_key", "posture"),
         ("__main__.py", "_rotate_key.run", "open_store", "posture"),
         ("__main__.py", "_store_transit_bound.run", "open_store", "posture"),
@@ -523,6 +524,7 @@ _DERIVATIONS = sorted(
         ("__main__.py", "_offline_security_notifier", "settings.security.enforcement"),
         ("__main__.py", "_provision_admin", "settings.security.enforcement"),
         ("__main__.py", "_renew_api_tls_before_spawning", "settings.security.enforcement"),
+        ("__main__.py", "_refuse_unrolled_key_before_tls_write", "settings.security.enforcement"),
         ("__main__.py", "_start_logging", "settings.security.enforcement"),
         ("__main__.py", "_store_provision_schema", "settings.security.enforcement"),
         # At warn, the store-opening commands' PostgreSQL revocation WARNING (BACKLOG #2532).

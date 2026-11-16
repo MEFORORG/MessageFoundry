@@ -699,7 +699,12 @@ def _supervise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[int, di
         return 0
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    # One key per test: supervise opens the store on every start, and a second start on another
+    # key over the first start's store takes the unrolled-key refusal (BACKLOG #4934).
+    key_file = tmp_path / "test-store-key.txt"
+    if not key_file.exists():
+        key_file.write_text(generate_key(), encoding="utf-8")
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_file.read_text(encoding="utf-8"))
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
     monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
     setenv_declared_egress(monkeypatch)

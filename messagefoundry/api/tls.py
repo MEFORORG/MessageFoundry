@@ -60,6 +60,7 @@ __all__ = [
     "api_tls_source",
     "build_api_ssl_context",
     "ensure_api_tls_material",
+    "generated_pair_may_be_replaced",
     "generated_state_dir",
     "off_loopback_certificate_remedy",
     "plan_api_tls_material",
@@ -626,6 +627,23 @@ def _let_local_users_read_cert(cert_path: Path) -> None:
     from messagefoundry.store.store import _grant_read
 
     _grant_read(cert_path, _LOCAL_USERS_SID)
+
+
+def generated_pair_may_be_replaced(
+    api: ApiSettings, *, state_dir: Path, renew: bool = True
+) -> bool:
+    """True when :func:`ensure_api_tls_material`, given the same arguments, may replace a generated
+    pair already on disk: a renewal, or the recovery of an unusable or half-written pair, each of
+    which it reports as a :class:`GeneratedPairReplaced`. A first-run mint replaces nothing and
+    answers ``False``. Read-only: it writes nothing and takes no lock, so a start can run a
+    refusal first and leave the pair as it found it on a refused start (BACKLOG #4934). A pair that
+    changes on disk between this call and the mint is decided again there."""
+    if plan_api_tls_material(api, state_dir=state_dir).source != "generated":
+        return False
+    cert_path, key_path = _generated_pair(state_dir)
+    if not (cert_path.exists() or key_path.exists()):
+        return False
+    return not _reusable_without_the_lock(cert_path, key_path, renew=renew)
 
 
 def ensure_api_tls_material(
