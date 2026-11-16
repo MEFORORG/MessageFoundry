@@ -16,15 +16,22 @@ Each arm drives a real call site against the faked ``aioodbc`` of
 
 from __future__ import annotations
 
+import sys
+import types
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import DEFAULT_DB_STATEMENT_TIMEOUT, ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.database import DatabaseDestination
 from tests._odbc_cancel_fakes import RawConn, RawCursor, never
 from tests.test_backlog2394_database_gate import (
+    _SQLSERVER,
     _aioodbc_serving,
     _destination,
     _Rig,
@@ -195,3 +202,129 @@ def test_connection_lost_reads_the_chain_a_traceback_prints() -> None:
     assert not database._connection_lost(suppressed)
     assert not database._connection_lost(_DriverError("23000", "dup"))
     assert not database._connection_lost(None)
+
+
+# --- BACKLOG #5756 -------------------------------------------------------------------------------
+
+
+def _recording_kwargs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Wrap the faked ``aioodbc.create_pool`` so each call's arguments are recorded."""
+    module = sys.modules["aioodbc"]
+    inner = module.create_pool
+    calls: list[dict[str, Any]] = []
+
+    async def create_pool(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return await inner(**kwargs)
+
+    monkeypatch.setattr(module, "create_pool", create_pool)
+    return calls
+
+
+def _with(settings: dict[str, Any]) -> DatabaseDestination:
+    return DatabaseDestination(
+        Destination(
+            name="OB_DB",
+            type=ConnectorType.DATABASE,
+            settings={**_SQLSERVER, "statement": "INSERT INTO t (a) VALUES (:a)", **settings},
+        )
+    )
+
+
+@pytest.mark.parametrize(("settings", "expected"), [({}, 30), ({"statement_timeout": 7}, 7)])
+async def test_a_send_borrows_with_the_statement_timeout(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, settings: dict[str, Any], expected: int
+) -> None:
+    """Red before #5756: the pyodbc connection's timeout stayed 0, so a hung statement held its
+    connection, its lane and any stop without bound."""
+    _aioodbc_serving(monkeypatch, rig, blocks=never)
+    await _with(settings).send('{"a": 1}')
+    raw = rig.pools[0]._conn._conn
+    assert raw is not None and raw.timeout == expected
+
+
+async def test_a_statement_timeout_of_zero_sets_no_limit(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    _aioodbc_serving(monkeypatch, rig, blocks=never)
+    await _with({"statement_timeout": 0}).send('{"a": 1}')
+    assert rig.pools[0]._conn._conn is not None and rig.pools[0]._conn._conn.timeout == 0
+
+
+async def test_a_source_borrows_with_the_statement_timeout(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    _aioodbc_serving(monkeypatch, rig, blocks=never)
+    await _source()._mark({"code": 1, "value": "x"})
+    raw = rig.pools[0]._conn._conn
+    assert raw is not None and raw.timeout == DEFAULT_DB_STATEMENT_TIMEOUT
+
+
+@pytest.mark.parametrize("bad", [True, 2.5, -1, "soon", 2**31])
+def test_a_bad_statement_timeout_is_refused_at_build(bad: object) -> None:
+    with pytest.raises(ValueError, match="statement_timeout") as caught:
+        _with({"statement_timeout": bad})
+    assert str(bad) not in str(caught.value).replace(str(2**31 - 1), "")
+
+
+async def test_each_pool_runs_on_its_own_executor_until_it_closes(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """Red before #5756: aioodbc was given no executor, so every DATABASE pool shared the event
+    loop's default one. The executor is sized to the pool and shut down once its close ends."""
+    _aioodbc_serving(monkeypatch, rig, blocks=never)
+    calls = _recording_kwargs(monkeypatch)
+    dest = _with({"pool_max": 3})
+    await dest.send('{"a": 1}')
+    executor = calls[0].get("executor")
+    assert isinstance(executor, ThreadPoolExecutor)
+    assert executor._max_workers == 3 + 4
+    assert not executor._shutdown
+    await dest.aclose()
+    assert executor._shutdown
+
+
+async def test_a_pool_that_never_opens_shuts_its_executor_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[ThreadPoolExecutor] = []
+
+    async def create_pool(**kwargs: Any) -> Any:
+        seen.append(kwargs["executor"])
+        raise _DriverError("28000", "login refused")
+
+    module = types.ModuleType("aioodbc")
+    module.create_pool = create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    monkeypatch.setitem(sys.modules, "pyodbc", None)
+    with pytest.raises(_DriverError):
+        await database._make_pool("DSN=x", 1, autocommit=False, login_timeout=5)
+    assert seen and seen[0]._shutdown
+
+
+async def test_a_lookup_pool_borrows_with_its_statement_timeout(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The lookup pool's first borrow, the login role probe, already carries the timeout."""
+    _aioodbc_serving(monkeypatch, rig, blocks=never)
+    executor = database.DatabaseLookupExecutor(
+        {"clarity": {**_SQLSERVER, "statement_timeout": 9}},
+        egress=EgressSettings(deny_by_default=False),
+    )
+    pool = await executor._get_pool("clarity")
+    assert database._tracked(database._STATEMENT_TIMEOUTS, pool) == 9
+    raw = rig.pools[0]._conn._conn
+    assert raw is not None and raw.timeout == 9
+    pool_executor = database._tracked(database._POOL_EXECUTORS, pool)
+    assert pool_executor is not None and not pool_executor._shutdown
+    await executor.aclose()
+    assert pool_executor._shutdown
+
+
+def test_the_factories_declare_the_statement_timeout() -> None:
+    from messagefoundry.config.wiring import Database, DatabasePoll
+
+    spec = Database(server="db.example", database="d", statement="SELECT 1", statement_timeout=5)
+    assert spec.settings["statement_timeout"] == 5
+    poll = DatabasePoll(server="db.example", database="d", poll_statement="SELECT a FROM q")
+    assert poll.settings["statement_timeout"] == DEFAULT_DB_STATEMENT_TIMEOUT

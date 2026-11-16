@@ -563,7 +563,9 @@ the next reader does not re-derive the wrong precedent from the same comment.
 
   **The trade-off.** The store reaches an unbounded wait only when `[store].command_timeout` is 0.
   The DATABASE connector has no statement timeout at all (`docs/CONNECTIONS.md`), so it is always
-  in that state. A cancelled borrow waits without bound for its running call before its cursor
+  in that state. **SUPERSEDED by BACKLOG #5756:** the connector now applies a `statement_timeout`
+  (default 30 s) to every borrow, so it reaches this state only when that is set to `0`, and each
+  pool runs its calls on its own executor. A cancelled borrow waits without bound for its running call before its cursor
   closes, and holds its pool slot for all of that time. The statement's own worker thread is held
   for that time too, as it was before the gate; the close adds no thread to it.
 
