@@ -3148,7 +3148,7 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         *secretscrub._KEY_MATERIAL_WORDS,
     }
     assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
-    url_arm = r"://[^\s:/@]*:[^\s/]+@"
+    url_arm = r"://[^\s:/]*:[^\s/]+@"
     assert url_arm in pattern
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
 

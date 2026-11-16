@@ -1107,9 +1107,9 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     # control that only ever shows this checker agreeing with the shipped pattern hides that.
     assert not _unbounded_scan_repeats(r"(?i)\b([a-z][a-z0-9+.\-]{0,63}://[^\s:/@]+):[^\s/@]+@")
     assert not _unbounded_scan_repeats(_LETTER_HEAD_DSN)
-    assert not _unbounded_scan_repeats(
-        r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
-    )
+    # Read off both modules rather than spelled here, so the control tracks what ships (BACKLOG #5386).
+    assert not _unbounded_scan_repeats(scrub_mod._DSN_PASSWORD.pattern)
+    assert not _unbounded_scan_repeats(redact_mod._DSN_PASSWORD.pattern)
     # THE LABEL START (BACKLOG #2999), both ways. Shipped, a word-only run after it is contained, as
     # after ``\b``. A lookbehind that can fire INSIDE a word run is not the same head, and is flagged.
     assert scrub_mod._LABEL_START == redact_mod._LABEL_START
@@ -1287,6 +1287,17 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             "store dsn postgres://svc:pw-At@Sign_Pw-72@db.invalid:5432/mefor",
             ("pw-At", "Sign_Pw-72"),
             "://svc:",
+        ),
+        # A user holding an "@": the hosted-database user@server login, and an e-mail address.
+        (
+            "store dsn postgres://svc@mydb:pw-Usr_At_Pw-74@mydb.db.invalid:5432/mefor",
+            ("pw-Usr_At_Pw-74",),
+            "://svc@mydb:",
+        ),
+        (
+            "alerts smtp://alerts@corp.invalid:pw-Smtp_Pw-75@smtp.invalid:587",
+            ("pw-Smtp_Pw-75",),
+            "smtp://alerts@corp.invalid:",
         ),
         # Both at once, two "@" signs in the password.
         (

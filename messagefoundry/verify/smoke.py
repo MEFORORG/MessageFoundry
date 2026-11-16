@@ -36,7 +36,7 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.mllpcodec import FrameEncodeError, FramePayloadError, frame_checked
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import CheckResult, Status, safe_exc_detail
 
 if TYPE_CHECKING:
     # Annotation only. A runtime import here would pull ``store.store`` (and so ``aiosqlite``) into
@@ -162,34 +162,6 @@ def _classify_self_smoke(disposition: MessageStatus, summary: str) -> CheckResul
     )
 
 
-#: ``safe_exc``'s limit when :func:`_exc_detail` bounds the text itself, after the credential passes.
-#: The redactor's own scan window still bounds the work.
-_UNBOUNDED: Final = 1 << 30
-
-
-def _exc_detail(exc: BaseException) -> str:
-    """``exc`` for a :class:`CheckResult` detail, with credentials as well as PHI redacted (BACKLOG
-    #5395).
-
-    A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
-    leaves the box the way a support bundle does. The exception text a check quotes is a driver's, a
-    config module's or the OS's: a store driver can quote its DSN or a ``password=`` / ``PWD=`` pair,
-    and a config module can raise anything. :func:`~messagefoundry.redaction.safe_exc` is a PHI pass,
-    and on such a text it left the DSN password and the ``PWD=`` and ``password=`` values in place
-    (``tests/test_verify_detail_redaction.py``). So its rendering then goes through
-    :func:`~messagefoundry.support.redact.redact_log_text`, the redactor the bundle already runs over
-    text it sends off the box, rather than another vocabulary. Callers pass this the EXCEPTION only,
-    never the engine's own prose around it, so the heuristic name pass cannot eat the words an
-    operator needs. Like the bundle's, it is best-effort: a single-token identifier can survive it.
-
-    The length bound comes LAST, so the credential passes read the whole text: cut first, a value
-    split from its label by a space could reach them as a fragment they no longer recognise."""
-    from messagefoundry.redaction import safe_exc, safe_text
-    from messagefoundry.support.redact import redact_log_text
-
-    return safe_text(redact_log_text(safe_exc(exc, limit=_UNBOUNDED)))
-
-
 def smoke_self(
     config_dir: str,
     *,
@@ -250,9 +222,13 @@ def smoke_self(
     except (OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # What the hop census reads as an unknown load, so the shared load's failure ends this row
         # rather than the verify run; a config module that exits at import is one (BACKLOG #3803).
-        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {_exc_detail(exc)}")
+        return CheckResult(
+            rid, title, Status.FAIL, f"config failed to load: {safe_exc_detail(exc)}"
+        )
     except Exception as exc:  # the run's shared load keeps whatever it raised; never crash the run
-        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {_exc_detail(exc)}")
+        return CheckResult(
+            rid, title, Status.FAIL, f"config failed to load: {safe_exc_detail(exc)}"
+        )
     msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
@@ -269,7 +245,7 @@ def smoke_self(
         return CheckResult(rid, title, Status.FAIL, str(exc))
     except Exception as exc:
         # Raised while the message was in flight, so its text can quote the message (BACKLOG #1779).
-        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {_exc_detail(exc)}")
+        return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {safe_exc_detail(exc)}")
 
     summary = (
         f"inbound={result.inbound}, disposition={result.disposition.value}, "
@@ -280,7 +256,10 @@ def smoke_self(
         # tickets, and the error quotes a Router/Handler's own `raise` (BACKLOG #1779). No `show_phi`
         # opt-in, on purpose, for the reason the `check` gate refuses one: both write their output
         # somewhere it is kept and passed on, so an opt-in would put PHI there on request.
-        return CheckResult(rid, title, Status.FAIL, f"{summary} — {safe_error(result.error)}")
+        # The credential pass too (BACKLOG #5395): a Handler's `raise` can quote a DSN as easily as
+        # a field value.
+        shown = scrub_credentials(safe_error(result.error) or "")
+        return CheckResult(rid, title, Status.FAIL, f"{summary} — {shown}")
     # Gate on what the run PRODUCED, never on "the call returned" (BACKLOG #1707). A postcondition
     # over the disposition the pipeline already computed cannot drift out of step with the pipeline;
     # re-deriving "did it deliver" here from the counts would be a second classifier to keep in sync.
@@ -383,14 +362,14 @@ def smoke_live(
             "smoke.live",
             "Live smoke (MLLP + ACK)",
             Status.FAIL,
-            f"TLS handshake with the engine inbound at {host}:{port} failed: {_exc_detail(exc)}",
+            f"TLS handshake with the engine inbound at {host}:{port} failed: {safe_exc_detail(exc)}",
         )
     except OSError as exc:
         return CheckResult(
             "smoke.live",
             "Live smoke (MLLP + ACK)",
             Status.FAIL,
-            f"could not reach the engine inbound at {host}:{port}: {_exc_detail(exc)}",
+            f"could not reach the engine inbound at {host}:{port}: {safe_exc_detail(exc)}",
         )
     code = _ack_code(reply)
     if code == "AA":
@@ -530,7 +509,7 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             rid,
             title,
             Status.FAIL,
-            f"{store.backend.value} store failed to open: {_exc_detail(exc)}",
+            f"{store.backend.value} store failed to open: {safe_exc_detail(exc)}",
         )
     caveat = (
         "NOT proof that this login can write it, that serve will accept it, or that the NSSM "
@@ -687,6 +666,6 @@ def check_smoke_disposition(
     try:
         status = run_guarded(_poll())
     except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
-        detail = f"could not read the store disposition: {_exc_detail(exc)}"
+        detail = f"could not read the store disposition: {safe_exc_detail(exc)}"
         return CheckResult(rid, title, Status.ERROR, detail)
     return _classify_disposition(status, control_id=control_id, timeout=timeout)

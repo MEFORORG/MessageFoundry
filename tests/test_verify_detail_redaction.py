@@ -20,8 +20,8 @@ import pytest
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.store import base as store_base
-from messagefoundry.verify import smoke
-from messagefoundry.verify.model import CheckResult
+from messagefoundry.verify import checks, runner, smoke
+from messagefoundry.verify.model import DETAIL_LIMIT, CheckResult, safe_exc_detail
 from messagefoundry.verify.report import render_json, render_markdown
 
 _PLANTED = "pw-V3rify_Det-81"
@@ -53,8 +53,8 @@ def test_config_load_failure_detail_hides_the_credential(
 
 
 def test_a_wiring_error_keeps_its_text_whole_around_the_redaction(tmp_path: Path) -> None:
-    """The engine's own wiring diagnostic is the fix an operator reads, so it is not cut to the
-    200 characters ``safe_exc`` keeps, and gets no type prefix."""
+    """The engine's own wiring diagnostic is the fix an operator reads, so it is not cut at all,
+    and gets no type prefix."""
     tail = "handler 'h' sends to unknown outbound 'ob_missing'"
     long_text = f"{_LEAKY}; " + "x" * 300 + f"; {tail}"
     r = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError(long_text)))
@@ -110,17 +110,85 @@ def test_store_disposition_poll_failure_detail_hides_the_credential(
 
 def test_control_safe_exc_alone_keeps_the_credential() -> None:
     """The positive control for every arm above: ``safe_exc`` by itself is a PHI pass and leaves
-    this text's credentials in place, so the arms are hidden by the credential passes, not by it.
-    If this goes red, ``safe_exc`` learned credentials and ``smoke._exc_detail``'s docstring is stale."""
+    this text's credentials in place, so the arms are hidden by the credential pass, not by it. If
+    this goes red, ``safe_exc`` learned credentials and ``model.safe_exc_detail``'s docstring is
+    stale."""
     from messagefoundry.redaction import safe_exc
 
     assert _PLANTED in safe_exc(RuntimeError(_LEAKY))
 
 
-def test_a_long_detail_is_bounded_after_the_credential_passes() -> None:
-    """The length bound runs after the redactor, so a credential past ``safe_exc``'s usual cut is
-    still read whole and the detail stays bounded."""
+def test_a_credential_past_safe_excs_usual_cut_is_kept_out_and_the_detail_bounded() -> None:
+    """A detail keeps up to ``DETAIL_LIMIT``, more than ``safe_exc``'s 200, so a driver's remedy at
+    the tail survives; a credential that far in is still hidden. The control shows the same text at
+    that length carries it without the credential pass."""
+    from messagefoundry.redaction import safe_exc
+
     padding = " ".join(["word"] * 60)
-    detail = smoke._exc_detail(RuntimeError(f"{padding} password= {_PLANTED} {_LEAKY}"))
+    exc = RuntimeError(f"{padding} {_LEAKY} " + "tail " * 400)
+    assert _PLANTED in safe_exc(exc, limit=DETAIL_LIMIT)  # control
+    detail = safe_exc_detail(exc)
     assert _PLANTED not in detail
-    assert len(detail) < 260, detail
+    assert "Server=db.invalid" in detail  # past 200 characters, still shown
+    assert len(detail) < DETAIL_LIMIT + 40, len(detail)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ssl.SSLCertVerificationError("certificate verify failed"),
+        PermissionError(13, "Permission denied", "/var/lib/messagefoundry/messagefoundry.db"),
+    ],
+)
+def test_the_words_an_operator_needs_survive(exc: BaseException) -> None:
+    """The class name and the path stay readable. The bundle's long-base64 sweep, tried first, blanked
+    both, since a 24-character run is either."""
+    detail = safe_exc_detail(exc)
+    assert detail.startswith(type(exc).__name__), detail
+    assert str(exc) in detail, detail
+
+
+def test_a_label_and_its_value_on_different_lines_are_read_together() -> None:
+    text = "\n".join(["line one", "password=", f"{_PLANTED} more"])
+    detail = safe_exc_detail(RuntimeError(text))
+    assert _PLANTED not in detail, detail
+
+
+def test_a_dry_run_error_detail_hides_the_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``result.error`` quotes a Router/Handler's own ``raise``, which can quote a DSN."""
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dryrun
+
+    reg = Registry()
+    monkeypatch.setattr(reg, "validate", lambda: None)
+    result = SimpleNamespace(
+        inbound="IB_X",
+        disposition=SimpleNamespace(value="ERROR"),
+        handlers=[],
+        deliveries=[],
+        error=f"router/handler error: RuntimeError: {_LEAKY}",
+    )
+    monkeypatch.setattr(dryrun, "dry_run", lambda *_a, **_k: result)
+    r = smoke.smoke_self(str(tmp_path), graph=lambda: reg)
+    _assert_hidden(r, "inbound=IB_X")
+
+
+def test_lockable_accounts_store_failure_detail_hides_the_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same store open as ``store.connect``, so the same driver text, in a sibling row."""
+    from messagefoundry.config.settings import AuthSettings
+
+    r = checks.check_lockable_accounts(_store_that_raises(tmp_path, monkeypatch), AuthSettings())
+    _assert_hidden(r, "could not read the accounts: ")
+
+
+def test_the_odbc_census_reason_hides_a_config_load_credential(tmp_path: Path) -> None:
+    """The run's shared config load is quoted again in the ODBC hop census, a sibling row."""
+    entries, reason = runner._buildable_entries(str(tmp_path), lambda: _raise(OSError(_LEAKY)))
+    assert entries == []
+    assert reason is not None and "did not load" in reason
+    assert _PLANTED not in reason, reason
