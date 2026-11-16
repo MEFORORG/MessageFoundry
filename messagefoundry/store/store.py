@@ -13454,9 +13454,9 @@ class MessageStore:
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
 
-        def _seal() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+        def _hash() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
@@ -13471,26 +13471,41 @@ class MessageStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards. The SELECT opens no write transaction (SQLite reads don't).
+        async with self._read() as conn:
+            cur = await conn.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+            if await cur.fetchone() is not None:
+                return ref
+        # BACKLOG #5753: reserve the whole burst in the persisted bound (ASVS 11.3.4) before the first
+        # seal, so the persisted total leads every chunk's invocation as the bound requires.
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
         now = time.time()
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-            if await cur.fetchone() is not None:
-                # Dedup: identical content already stored — reuse the single copy, write nothing. The
-                # SELECT opened no write transaction (SQLite reads don't), so there is nothing to commit.
-                return ref
-            await self._db.execute(
+            # A concurrent put of the same content may have stored it while this one sealed; its
+            # copy wins and this one's sealed chunks are dropped. Only the id conflict is ignored;
+            # OR IGNORE would also swallow a NOT NULL failure and return a ref with no row.
+            cur = await self._db.execute(
                 "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                " VALUES (?,?,?,0,?)",
+                " VALUES (?,?,?,0,?) ON CONFLICT(id) DO NOTHING",
                 (ref, content_type, total, now),
             )
+            if not cur.rowcount:
+                await self._commit()
+                return ref
             if sealed:
                 await self._db.executemany(
                     "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
@@ -15249,13 +15264,25 @@ class MessageStore:
 
         async def _body() -> None:
             cur = await self._db.execute(
-                "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
+                "SELECT message_id, destination_name, handler_name, attempts, status FROM queue"
+                " WHERE id=?",
                 (outbox_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
                 # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
+                raise _AbortMember(None)
+            if row["status"] == OutboxStatus.DONE.value:
+                # BACKLOG #5752: a DONE row does not complete again. A second completion would mint
+                # a second reply artifact and a second re-ingress child, so nothing is written, as
+                # for a vanished row. Any other row still completes, as mark_done would complete
+                # it: the partner accepted and its reply is real, so keeping it spares a resend.
+                log.warning(
+                    "complete_with_response: outbound row %s is already %s; nothing written",
+                    outbox_id,
+                    row["status"],
+                )
                 raise _AbortMember(None)
             message_id = row["message_id"]
             destination_name = row["destination_name"]

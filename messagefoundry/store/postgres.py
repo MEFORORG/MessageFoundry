@@ -5947,9 +5947,24 @@ class PostgresStore:
         guard, guard_args = self._resolve_guard(4)
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
-                async with conn.transaction():
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                # READ COMMITTED pinned: the MAX(response_seq) read after the lock must see the
+                # completion it waited on, which a repeatable-read server default would hide.
+                async with conn.transaction(isolation="read_committed"):
+                    # FOR UPDATE (BACKLOG #5752): a second completion of the same row waits here and
+                    # then reads the first one's committed DONE, so only one reply is ever captured.
+                    row = await conn.fetchrow(
+                        "SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id
+                    )
                     if row is None:
+                        return
+                    # A DONE row does not complete again (no second reply or re-ingress child);
+                    # any other still does, as on SQLite, and an armed H1 fence judges it below.
+                    if row["status"] == OutboxStatus.DONE.value:
+                        log.warning(
+                            "complete_with_response: outbound row %s is already %s; nothing written",
+                            outbox_id,
+                            row["status"],
+                        )
                         return
                     message_id = row["message_id"]
                     destination_name = row["destination_name"]
@@ -5969,6 +5984,13 @@ class PostgresStore:
                         outbox_id,
                         *guard_args,
                         checked=bool(guard),
+                    )
+                    # BACKLOG #5752: two rows of one message to one destination (two handlers) would
+                    # read the same MAX unlocked and collide on the response PK, rolling back a
+                    # delivery the partner already accepted. The per-message finalize lock, which
+                    # _maybe_finalize_message re-takes at the end as a no-op, serializes the read.
+                    await self._advisory_lock(
+                        conn, _LOCK_CLASS_FINALIZE, f"{_FINALIZE_LOCK_PREFIX}{message_id}"
                     )
                     seq = await conn.fetchval(
                         "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -7501,9 +7523,9 @@ class PostgresStore:
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
 
-        def _seal() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+        def _hash() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
@@ -7517,26 +7539,45 @@ class PostgresStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
-        now = time.time()
-        async with self._timed_acquire() as conn, conn.transaction():
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards; then reserve the whole burst in the persisted bound (ASVS 11.3.4).
+        async with self._timed_acquire() as conn:
             if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
-                return ref  # dedup: identical content already stored — write nothing
-            await conn.execute(
+                return ref
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
+        now = time.time()
+        # READ COMMITTED pinned, so the ON CONFLICT below waits out a concurrent put and inserts
+        # nothing, where repeatable read would raise a serialization failure instead.
+        async with (
+            self._timed_acquire() as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
+            # BACKLOG #5753: a concurrent put of the same content waits on the primary key here and
+            # then inserts nothing, rather than failing the upload on a duplicate key. The first
+            # put's copy wins and this one's sealed chunks are dropped.
+            inserted = await conn.fetchval(
                 "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                " VALUES ($1,$2,$3,0,$4)",
+                " VALUES ($1,$2,$3,0,$4) ON CONFLICT (id) DO NOTHING RETURNING 1",
                 ref,
                 content_type,
                 total,
                 now,
             )
+            if inserted is None:
+                return ref
             if sealed:
                 await conn.executemany(
                     "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
@@ -7617,27 +7658,29 @@ class PostgresStore:
 
     async def _release_message_attachments(self, conn: Any, where: str, params: list[Any]) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
-        attachment sibling of the SQLite retention seam). Tally each distinct attachment the matching
-        messages reference via the ``message_attachment`` linkage, decref each by how many of these
-        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even
-        if the purge re-runs. Runs in the CALLER's transaction. **Re-run is a no-op:** a re-run finds the
-        join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
-        an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
-        (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        attachment sibling of the SQLite retention seam). DELETE the matching messages'
+        ``message_attachment`` join rows, then decref each attachment by how many of those rows named
+        it (GC at 0), so the release is exactly-once even if the purge re-runs. Runs in the CALLER's
+        transaction. **Re-run is a no-op:** a re-run finds the join rows gone and decrefs nothing — no
+        double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
+        holds. ``where`` is a code-controlled ``$N`` fragment (numbered from ``$1``)."""
+        # BACKLOG #5740: ONE statement deletes the join rows and reports what it deleted, so the
+        # decref covers exactly the rows removed. A tally SELECT and a separate DELETE each took their
+        # own READ COMMITTED snapshot, so a row that came to match between them was deleted without
+        # its decref (the document kept past retention) or decreffed without its delete (a document
+        # collected while a link still names it). Deleting them makes a re-run decref nothing.
+        deleted = await conn.fetch(
+            f"DELETE FROM message_attachment WHERE {where} RETURNING attachment_id", *params
+        )
+        counts: dict[str, int] = {}
+        for r in deleted:
+            key = str(r["attachment_id"])
+            counts[key] = counts.get(key, 0) + 1
         # The decrefs take the header locks in content-address order, as the ingress and
         # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
         # in Python as those are, so the database collation does not decide the order.
-        rows = await conn.fetch(
-            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
-            *params,
-        )
-        if not rows:
-            return
-        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
-            await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
-        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
-        await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
+        for ref in sorted(counts):
+            await self._decref_attachment(conn, ref, counts[ref])
 
     @staticmethod
     def _attachment_still_referenced_sql(msg_col: str, inflight_ph: int, dead_ph: int) -> str:
@@ -11997,8 +12040,39 @@ class PostgresStore:
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
             "destination_name", older_than, connection_cutoffs, start=2
         )
+        # stage is $1 and status $2 for the store-once release; its cutoff numbers from $3.
+        ref_cutoff_sql, ref_cutoff_params, _ = _pg_cutoff_case(
+            "destination_name", older_than, connection_cutoffs, start=3
+        )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # BACKLOG #5740, as on SQLite: release the shared bodies these dead rows reference and
+                # NULL their body_ref BEFORE blanking. This backend writes no store-once row, but a
+                # restored one carries a body_ref, and a blanked payload left with it set still read as
+                # replayable: its shared body (PHI) and its message's attachment were never released.
+                # One statement NULLs and reports the old refs, so the decref covers exactly them.
+                released = await conn.fetch(
+                    "WITH r AS (SELECT id, body_ref FROM queue"
+                    " WHERE stage=$1 AND status=$2 AND body_ref IS NOT NULL"
+                    f" AND updated_at < {ref_cutoff_sql} FOR UPDATE)"
+                    " UPDATE queue q SET body_ref=NULL FROM r WHERE q.id=r.id RETURNING r.body_ref",
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DEAD.value,
+                    *ref_cutoff_params,
+                )
+                ref_counts: dict[str, int] = {}
+                for r in released:
+                    key = str(r["body_ref"])
+                    ref_counts[key] = ref_counts.get(key, 0) + 1
+                for body_hash in sorted(ref_counts):
+                    await conn.execute(
+                        "UPDATE shared_body SET refcount = GREATEST(0, refcount - $1) WHERE hash=$2",
+                        ref_counts[body_hash],
+                        body_hash,
+                    )
+                    await conn.execute(
+                        "DELETE FROM shared_body WHERE hash=$1 AND refcount<=0", body_hash
+                    )
                 # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
                     "UPDATE queue SET payload=''"
