@@ -1042,6 +1042,10 @@ def test_read_intake_budget_off_set_is_none_zero_and_digit_zero_text() -> None:
         assert read_intake_budget(off, "intake_auth_rate_limit", "HTTP") == 0
     assert read_intake_budget("12", "intake_auth_rate_limit", "HTTP") == 12
     assert read_intake_budget(12, "intake_auth_rate_limit", "HTTP") == 12
-    for bad in [*_NOT_PLAIN_DIGITS, True, 2.5, -1]:
+    # A float zero is not the integer 0, so it is refused rather than read as off.
+    for bad in [*_NOT_PLAIN_DIGITS, True, False, 2.5, -1, 0.0, -0.0]:
         with pytest.raises(ValueError, match="intake_auth_rate_limit"):
             read_intake_budget(bad, "intake_auth_rate_limit", "HTTP")
+    float_zero: dict[str, Any] = {"intake_auth_rate_limit": 0.0}
+    with pytest.raises(WiringError, match="not the integer 0"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **float_zero)

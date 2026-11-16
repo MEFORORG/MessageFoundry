@@ -14050,8 +14050,8 @@ def _intake_budget(
     factory applies at load, so the outcome does not depend on how the value arrived. The off set
     is ``None``, an integer ``0``, and plain-digit text that spells zero, such as an env() that
     resolves to ``"0"``; those return ``0``. Any other text (at least ``""``, whitespace,
-    ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits), a bool, a fraction and a
-    negative are refused. ``written`` is the inbound's settings as configured: where the budget was
+    ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits), a bool, a fraction, a
+    negative and a zero that is not the integer ``0`` (such as ``0.0``) are refused. ``written`` is the inbound's settings as configured: where the budget was
     an env() reference that resolved to ``None`` (an unset variable with ``default=None``) it is
     refused too rather than turning the bound off, as is one that resolved to ``""``.
     Refused as a ``WiringError`` naming the connection and the setting, with the value withheld."""

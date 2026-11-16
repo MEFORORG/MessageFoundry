@@ -3163,13 +3163,19 @@ def read_intake_budget(value: Any, knob: str, transport: str) -> int:
     spells zero, such as an uncast env() ``"0"``. Any other text is refused, at least ``""``,
     whitespace, ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits, so text cannot
     turn a budget off the way :func:`~messagefoundry.transports.base.cap_setting` alone would read
-    ``""`` or ``"0.0"``. A bool, a fraction and a negative are refused too; a negative budget would
-    refuse every request. Raises ``ValueError`` naming the setting, with the value withheld."""
+    ``""`` or ``"0.0"``. A bool, a fraction, a negative and a zero that is not the integer ``0``
+    (such as ``0.0``) are refused too; a negative budget would refuse every request. Raises ``ValueError`` naming the setting, with the value withheld."""
     from messagefoundry.transports.base import cap_setting
 
     if isinstance(value, str) and not _INTAKE_BUDGET_TEXT.fullmatch(value):
         raise ValueError(f"{transport} {knob} is text other than plain digits (value withheld)")
     read = cap_setting(value, int, knob=knob, transport=transport)
+    if read is None and value is not None and not isinstance(value, (int, str)):
+        # A float or other numeric zero is not the documented integer 0, so it does not disable.
+        raise ValueError(
+            f"{transport} {knob} is a zero that is not the integer 0 (value withheld); write 0 "
+            "or None to disable it"
+        )
     if read is not None and read < 0:
         raise ValueError(f"{transport} {knob} is negative (value withheld)")
     return read or 0
