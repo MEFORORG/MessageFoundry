@@ -1811,6 +1811,51 @@ class _FusedHandoffStore(Protocol):
 
 
 @dataclass(frozen=True)
+class _AnchorVerdict:
+    """A failing lane's CA check (:meth:`RegistryRunner._lane_anchor_verdict`): the fixed line to
+    raise, if any, and the mark it leaves, written only once the caller changes the lane."""
+
+    error: TrustAnchorError | None = None
+    #: The refusal's mark for :meth:`RegistryRunner._keeps_anchor_failure`; None when not refused.
+    refused_key: tuple[str, object] | None = None
+    #: The check ran and passed, so an old mark is dropped.
+    passed: bool = False
+
+
+@dataclass(frozen=True)
+class _LaneBuild:
+    """An outbound lane's connector built with the checks a start gives it, its CA check, its
+    build and its ``validate_startup``, before anything changes the lane
+    (:meth:`RegistryRunner._build_lane_destination`). ``outcome`` is the connector, or the
+    failure of one of them; a connector a failed check had built is closed."""
+
+    outcome: DestinationConnector | Exception
+    anchor: _AnchorVerdict
+
+
+@dataclass
+class _OutboundPlan:
+    """The connectors a reload's step 3 builds before it changes any outbound lane (BACKLOG
+    #5755): ``built`` for a lane it rebuilds or adds, ``started`` for one that leaves the passive
+    DR park, which is built as a start builds it. The apply takes each connector it puts in a
+    lane out of the plan, so what is left was never put in one."""
+
+    built: dict[str, DestinationConnector] = field(default_factory=dict)
+    started: dict[str, _LaneBuild] = field(default_factory=dict)
+
+    def take_all(self) -> list[tuple[str, DestinationConnector]]:
+        """Every connector still in the plan, which it then no longer holds, for the caller to
+        close. Emptied, so two owners that each clean up close nothing twice."""
+        held = list(self.built.items())
+        for n, b in self.started.items():
+            if not isinstance(b.outcome, Exception):
+                held.append((n, b.outcome))
+        self.built.clear()
+        self.started.clear()
+        return held
+
+
+@dataclass(frozen=True)
 class _FusedRouteResult:
     """The result record returned by :meth:`RegistryRunner._fused_route_and_handoff` (ADR 0071 B5). A
     single fused hop ran ``route_only`` (CPU) then ``route_handoff_sync`` (its own committed txn). The
@@ -1975,6 +2020,9 @@ class RegistryRunner:
                 "this graph has none: it never runs a Router or Handler in the engine process"
             )
         self._sandbox_sessions: dict[str, SandboxSession] = {}
+        # The running reload's step-3 connectors, built before its quiesce (BACKLOG #5755), set
+        # under ``_reload_lock`` only for the step-3 call that takes them.
+        self._outbound_plan: _OutboundPlan | None = None
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
         # get their own object, and a session matches its cached refusal by identity, so it would
@@ -4949,28 +4997,52 @@ class RegistryRunner:
         does not parse: the check refuses it before it writes any audit row."""
         if self._lane_anchor_check is None:
             return
+        if not fails_lane:
+            await self._lane_anchor_check(direction, name, settings)
+            return
+        verdict = await self._lane_anchor_verdict(direction, name, settings)
+        self._apply_anchor_verdict(direction, name, verdict)
+        if verdict.error is not None:
+            raise verdict.error
+
+    async def _lane_anchor_verdict(
+        self, direction: Direction, name: str, settings: Mapping[str, Any]
+    ) -> _AnchorVerdict:
+        """The CA check a failing lane takes (:meth:`_check_lane_anchor`), with its mark returned
+        rather than written, so a reload can check a lane before it changes any lane and write
+        the mark once it does (BACKLOG #5755). A no-op verdict when no check is wired."""
+        if self._lane_anchor_check is None:
+            return _AnchorVerdict()
         try:
             await self._lane_anchor_check(direction, name, settings)
         except (TrustAnchorError, ValueError) as exc:
-            if not fails_lane:
-                raise
-            self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
             # The setting's advice names both steps. The reload takes in the changed value. It
             # also rebuilds the lane when the CA path or the pin changed. A change to any other
             # value, such as the url, leaves the failure kept, and the start then builds the lane.
-            raise _lane_anchor_line(direction, name, settings, exc, passive=False) from exc
+            line = _lane_anchor_line(direction, name, settings, exc, passive=False)
+            line.__cause__ = exc
+            return _AnchorVerdict(error=line, refused_key=_anchor_key(settings))
         except AnchorStoreUnavailable as exc:
             # BACKLOG #3091: the store stopped the check; the file is not known to be bad. A
             # failing lane still fails with a fixed line, so an operator start reads `failed` and
             # the control route answers it, but nothing is marked refused, and the next start
             # checks the file again.
-            if not fails_lane:
-                raise
             # No WARNING here: the check logged the store's error once, and a scheduled poller
             # retries at every in-window tick.
-            raise _lane_anchor_line(direction, name, settings, exc, passive=False) from exc
-        if fails_lane:
+            line = _lane_anchor_line(direction, name, settings, exc, passive=False)
+            line.__cause__ = exc
+            return _AnchorVerdict(error=line)
+        return _AnchorVerdict(passed=True)
+
+    def _apply_anchor_verdict(
+        self, direction: Direction, name: str, verdict: _AnchorVerdict
+    ) -> None:
+        """Write the mark a :meth:`_lane_anchor_verdict` returned: a refusal marks the lane for
+        :meth:`_keeps_anchor_failure`, a pass drops an old mark, a store fault leaves it."""
+        if verdict.refused_key is not None:
+            self._anchor_refused[(direction, name)] = verdict.refused_key
+        elif verdict.passed:
             self._anchor_refused.pop((direction, name), None)
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
@@ -5080,7 +5152,11 @@ class RegistryRunner:
             self._lane_anchor_check.retain_lanes(lanes | lookups)
 
     def _reload_anchor_lanes(
-        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+        self,
+        old: Registry,
+        new: Registry,
+        old_inbound_names: Sequence[str],
+        now: datetime | None = None,
     ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
         """:meth:`_reload_anchor_candidates` with each lane's settings resolved."""
         return [
@@ -5089,7 +5165,7 @@ class RegistryRunner:
                 conn.name,
                 self._anchor_lane_settings(conn),
             )
-            for conn in self._reload_anchor_candidates(old, new, old_inbound_names)
+            for conn in self._reload_anchor_candidates(old, new, old_inbound_names, now=now)
         ]
 
     def _anchor_lane_settings(
@@ -5105,7 +5181,12 @@ class RegistryRunner:
         ).settings
 
     def _reload_anchor_candidates(
-        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+        self,
+        old: Registry,
+        new: Registry,
+        old_inbound_names: Sequence[str],
+        *,
+        now: datetime | None = None,
     ) -> list[InboundConnection | OutboundConnection]:
         """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running. It mirrors the gates of :meth:`_reconcile_outbounds` and of
         :meth:`reload`'s listener restart, read without their side effects. Left out: a lane not
@@ -5136,7 +5217,8 @@ class RegistryRunner:
         for ic in new.inbound.values():
             if (
                 not _inbound_lane_reads_ca(ic)
-                or self._listener_skip(ic, old_inbound_names, binding_now=False) is not None
+                or self._listener_skip(ic, old_inbound_names, binding_now=False, now=now)
+                is not None
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
                 continue
@@ -5144,7 +5226,11 @@ class RegistryRunner:
         return lanes
 
     async def _check_reload_lane_anchors(
-        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+        self,
+        old: Registry,
+        new: Registry,
+        old_inbound_names: Sequence[str],
+        now: datetime | None = None,
     ) -> list[tuple[Direction, str]]:
         """Check the CA of each lane a reload builds or keeps running (vault BACKLOG #2371, ADR
         0031 as amended 2026-10-06). A refusal refuses the whole reload, before anything changes,
@@ -5156,7 +5242,9 @@ class RegistryRunner:
             return []
         passed: list[tuple[Direction, str]] = []
         store_fault: AnchorStoreUnavailable | None = None
-        for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
+        for direction, name, settings in self._reload_anchor_lanes(
+            old, new, old_inbound_names, now
+        ):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
             except AnchorStoreUnavailable as exc:
@@ -5217,21 +5305,32 @@ class RegistryRunner:
         oc = self.registry.outbound.get(name)
         if oc is None or not oc.deployed:
             return None
+        if warn_query_credentials:
+            # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
+            warn_url_query_credentials_before_build(
+                f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+            )
+        return self._install_lane_destination(name, await self._build_lane_destination(name, oc))
+
+    async def _build_lane_destination(self, name: str, oc: OutboundConnection) -> _LaneBuild:
+        """The awaited half of :meth:`_ensure_destination_built`: check the lane's CA, build its
+        connector and run its ``validate_startup``, changing no lane, so a reload can run it before
+        it changes any (BACKLOG #5755). A failure is returned, not raised, with what it built
+        closed; :meth:`_install_lane_destination` records it. A cancellation closes the connector
+        and propagates."""
         connector: DestinationConnector | None = None
+        anchor = _AnchorVerdict()
         try:
-            if warn_query_credentials:
-                # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
-                warn_url_query_credentials_before_build(
-                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
-                )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371: the operator start of a lane the boot gates left unbuilt checks
             # its CA too, isolated with the build below.
-            await self._check_lane_anchor("outbound", name, dest.settings)
+            anchor = await self._lane_anchor_verdict("outbound", name, dest.settings)
+            if anchor.error is not None:
+                return _LaneBuild(anchor.error, anchor)
             # #200 (ADR 0092): stamp the derived instance posture, exactly as _start_outbound does —
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture. Off the event loop (engine PR 2815, hold F2).
-            # The step above has logged the warning, so the egress check does not repeat it.
+            # The caller has logged the warning, so the egress check does not repeat it.
             connector = await _build_off_loop(
                 self._hop_posture,
                 functools.partial(
@@ -5249,6 +5348,16 @@ class RegistryRunner:
             raise
         except Exception as exc:
             await self._aclose_quietly(connector, name)
+            return _LaneBuild(exc, anchor)
+        return _LaneBuild(connector, anchor)
+
+    def _install_lane_destination(self, name: str, built: _LaneBuild) -> Exception | None:
+        """Put a :meth:`_build_lane_destination` result in its lane, with no await: the connector,
+        or the failure recorded as ADR 0031 records one. Returns what
+        :meth:`_ensure_destination_built` returns."""
+        self._apply_anchor_verdict("outbound", name, built.anchor)
+        outcome = built.outcome
+        if isinstance(outcome, Exception):
             self._destinations.pop(name, None)
             # vault BACKLOG #2371: a CA refusal on a lane already recorded failed is not alerted
             # again. A calendar window open reaches here once per window, and the lane was
@@ -5260,12 +5369,12 @@ class RegistryRunner:
             # within its class: a refusal after a store fault's line, or a store fault after any
             # other line, replaces the line and alerts once (vault BACKLOG #5146).
             if not (
-                isinstance(exc, TrustAnchorError)
-                and self._repeats_failed_class("outbound", name, exc)
+                isinstance(outcome, TrustAnchorError)
+                and self._repeats_failed_class("outbound", name, outcome)
             ):
-                self._record_failed(name, exc, kind="outbound")
-            return exc if _is_store_fault(exc) else None
-        self._destinations[name] = connector
+                self._record_failed(name, outcome, kind="outbound")
+            return outcome if _is_store_fault(outcome) else None
+        self._destinations[name] = outcome
         self._failed.pop(("outbound", name), None)
         self._dr_unbuilt.pop(name, None)
         return None
@@ -8403,16 +8512,187 @@ class RegistryRunner:
         # first Reference(...) onto a backend with no snapshot store must fail 422 here, before the swap.
         check_reference_backend_supported(registry, self.store)
 
-    async def _reconcile_outbounds(self, old: Registry, new: Registry) -> list[tuple[str, str]]:
+    async def _reconcile_outbounds(
+        self, old: Registry, new: Registry
+    ) -> list[tuple[str, DestinationConnector]]:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
         worker (so its in-flight outbox batch keeps draining). A worker re-resolves its connector
-        per item, so a changed connector is swapped in place; the old one is closed. A send already
-        in flight on it is not cancelled; :meth:`_connector_retired` (BACKLOG #5718) says how its
-        delivery path settles it. An outbound dropped by ``new`` is
-        left running so rows already queued to it still drain. Connector builds here cannot fail —
-        :meth:`_build_check` already validated them before any quiesce. Returns the lanes whose
-        replaced connector failed to close (:meth:`_close_replaced`)."""
-        close_failures: list[tuple[str, str]] = []
+        per item, so a changed connector is swapped in place. An outbound dropped by ``new`` is
+        left running so rows already queued to it still drain. :meth:`_build_check` already
+        validated every connector build before any quiesce.
+
+        PREPARE, THEN APPLY (BACKLOG #5755). Every awaited step comes first and changes no lane:
+        :meth:`_prepare_outbound_reconcile` builds each connector the apply will need, into the
+        plan :meth:`reload` fills once before its quiesce and hands over in ``_outbound_plan``. A failure or a cancellation
+        there leaves every lane as it was, with nothing to put back; the connectors in the plan are
+        closed. :meth:`_apply_outbound_reconcile` then makes every lane change in one synchronous
+        pass, so no cancellation lands partway through it.
+
+        Returns the connectors the pass took out of a lane, or built and did not use, for the
+        caller to close once its swap commits (:meth:`_close_retired`). A send already in flight
+        on one is not cancelled; :meth:`_connector_retired` (BACKLOG #5718) says how its delivery
+        path settles it."""
+        plan = self._outbound_plan if self._outbound_plan is not None else _OutboundPlan()
+        retired: list[tuple[str, DestinationConnector]] = []
+        try:
+            await self._prepare_outbound_reconcile(old, new, plan)
+            self._apply_outbound_reconcile(old, new, plan, retired)
+        except BaseException:
+            # A raise from the apply, which awaits nothing, is one in its own synchronous code,
+            # not a fault a lane's build can raise; those are all in the prepare. The lanes it had
+            # reached stay as it left them. What it had not put in a lane, or had taken out of
+            # one, is closed rather than left open with nothing holding it.
+            held = {id(c) for c in self._destinations.values()}
+            self._close_detached(
+                [(n, c) for n, c in retired + plan.take_all() if id(c) not in held]
+            )
+            raise
+        return retired + plan.take_all()
+
+    async def _prepare_outbound_reconcile(
+        self, old: Registry, new: Registry, plan: _OutboundPlan
+    ) -> None:
+        """Build into ``plan`` every connector :meth:`_apply_outbound_reconcile` will put in a
+        lane, changing no lane (BACKLOG #5755). The apply's branch for a lane is judged again once
+        the builds return, since a worker may have died or the box gone passive while they
+        awaited, and a lane that now needs one is built in another round. Each round adds a build
+        and none is undone, so it ends. A plan already filled awaits nothing unless a lane needs
+        more, so the last judgement and the apply run with no await between them, and agree.
+
+        A failure or a cancellation propagates, and the plan's holder closes what it holds. A
+        connector a cancelled build was making is closed by the build itself."""
+        while True:
+            wanted = [
+                (name, kind)
+                for name, kind in self._outbound_builds_wanted(old, new)
+                if name not in (plan.built if kind == "build" else plan.started)
+            ]
+            if not wanted:
+                return
+            for name, kind in wanted:
+                oc = new.outbound[name]
+                if kind == "build":
+                    plan.built[name] = await self._build_reload_destination(oc)
+                else:
+                    # build_check already warned for this reload (vault BACKLOG #2910)
+                    plan.started[name] = await self._build_lane_destination(name, oc)
+
+    def _outbound_builds_wanted(
+        self, old: Registry, new: Registry
+    ) -> list[tuple[str, Literal["build", "start"]]]:
+        """The connectors :meth:`_apply_outbound_reconcile` would build, read from its gates in its
+        order with none of their side effects: ``"start"`` for a lane leaving the passive DR park,
+        ``"build"`` for one it adds or rebuilds. It may name more than the apply uses, never fewer.
+        It does not ask the #122 halt gate, whose probe has side effects, so a lane the halt holds
+        is still built. And since that probe can lift the halt partway through the apply, a lane's
+        rebuild is judged both ways while the halt holds."""
+        wanted: list[tuple[str, Literal["build", "start"]]] = []
+        for name, oc in new.outbound.items():
+            if not oc.deployed or (not oc.auto_start and not self._outbound_lane_live(name)):
+                continue
+            if self._leaves_passive_park(name, oc):
+                wanted.append((name, "start"))
+                continue
+            if self._dr_parks_outbound(oc.priority) or self._keeps_anchor_failure(
+                "outbound", name, old, oc
+            ):
+                continue
+            readings = (True, False) if self._delivery_halted else (False,)
+            if any(self._outbound_rebuild(name, oc, old, halted=h) for h in readings):
+                wanted.append((name, "build"))
+        return wanted
+
+    def _dr_parks_outbound(self, declared: Priority | None) -> bool:
+        """Whether :meth:`_dr_filters_out` would park an outbound of this tier, with no marker
+        written: a passive standby parks every outbound, an active profile one below it."""
+        return self._dr_passive or (
+            self._dr_threshold is not None and self._below_dr_threshold(declared)
+        )
+
+    def _outbound_rebuild(
+        self, name: str, oc: OutboundConnection, old: Registry, *, halted: bool
+    ) -> Literal["add", "swap"] | None:
+        """How a reload's step 3 rebuilds a lane past its gates, read with the #122 halt as
+        ``halted``: ``"add"`` builds it and spawns its worker, ``"swap"`` swaps a live worker's
+        connector, ``None`` leaves it as it is.
+
+        A lane with its OWN delivery worker is live iff that worker is alive — a dead one must be
+        respawned or the lane stops draining. A lane the pooled OUTBOUND dispatcher drains has no
+        worker to judge by, so it is live iff its connector is BUILT; judging that one by worker
+        presence would rebuild every connector on every reload (dropping every warm MLLP socket /
+        DB pool / SMART token). The spec-mismatch test below still rebuilds a genuinely-changed
+        connector in both cases. ADR 0066 D4: this is per-LANE, not per-mode — under pooled an
+        UNORDERED lane takes the worker-keyed arm and a FIFO lane the connector-keyed one.
+
+        CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason a dispatcher-drained lane is.
+        A lane's own worker RETURNS at :meth:`_delivery_worker`'s claim gate while
+        `_delivery_halted`, which is the halt's designed terminal state and not a crash -- the
+        resume doors respawn it through `_start_outbound_unsafe`. Reading `worker.done()` as 'not
+        live' there made every halted reload pop, `aclose()` and rebuild EVERY paused lane's
+        connector, and respawn a worker that dies at that gate on its first tick, for a reload
+        that changed nothing. MEASURED in both claim modes on a reload with the connector spec
+        identical: `same_connector` False in per_lane against True in pooled, and True in per_lane
+        once this disjunct was added. Besides the warm MLLP socket / DB pool / SMART token the
+        paragraph above is written to keep, that churn made the then-unguarded `stale.aclose()`
+        newly reachable for a halted lane, where a raising close propagated into `reload`'s own
+        except and rolled a routine reload's intake back (now :meth:`_close_replaced`).
+
+        ``"swap"``: a live worker but a missing/mismatched connector. `failed` covers an outbound
+        that failed to build at START (ADR 0031): its worker is alive with no connector, so a
+        reload once the cause is fixed self-heals the lane. `name not in self._destinations` makes
+        the test match "missing OR mismatched", which once tested only `failed` (a subset: every
+        site that records a failure has already popped the connector). MEASURED on a per_lane rig,
+        where `live` is WORKER-keyed and the boot gates spawn a worker without a connector: AC-4's
+        "flip the flag back with no other change" un-parked a lane that then had nothing to
+        deliver through, and its rows retried forever. A lane whose `live` is connector-keyed
+        cannot reach it with a missing connector, so for those the clause is inert — which is
+        every pooled FIFO lane (ADR 0066 D4)."""
+        worker = self._workers.get(name)
+        live = (
+            (worker is not None and not worker.done())
+            if self._per_lane_delivery(name) and not halted
+            else name in self._destinations
+        )
+        if not live:
+            return "add"
+        prior = old.outbound.get(name)
+        if (
+            self.outbound_failed(name) is not None
+            or name not in self._destinations
+            or prior is None
+            or prior.spec != oc.spec
+            or _hop_policy(prior) != _hop_policy(oc)
+        ):
+            return "swap"
+        return None
+
+    async def _build_reload_destination(self, oc: OutboundConnection) -> DestinationConnector:
+        """Build a lane's connector for a reload's step 3, off the event loop. #200 (ADR 0092):
+        stamped with the posture, as a start's is. build_check vetted the new registry against the
+        real posture, but the HTTP cells fail-closed when unstamped — so an unstamped rebuild would
+        raise InsecureHopRefused on a legit non-prod cleartext lane. Built off the event loop
+        (engine PR 2815, hold F2)."""
+        return await _build_off_loop(
+            self._hop_posture,
+            functools.partial(
+                build_destination,
+                _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
+                egress=self._egress,
+                # build_check already warned for this reload (vault BACKLOG #2910)
+                warn_query_credentials=False,
+            ),
+        )
+
+    def _apply_outbound_reconcile(
+        self,
+        old: Registry,
+        new: Registry,
+        plan: _OutboundPlan,
+        retired: list[tuple[str, DestinationConnector]],
+    ) -> None:
+        """Make every outbound lane change of a reload's step 3, with no await (BACKLOG #5755).
+        Each connector it puts in a lane is taken out of ``plan``; each it takes out of a lane is
+        appended to ``retired``, closed by the caller once the swap commits."""
         # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
         # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
         # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
@@ -8448,8 +8728,6 @@ class RegistryRunner:
             )  # BACKLOG #82 (see _start_outbound)
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
-            # ADR 0031: live worker, but no connector (start failed)
-            failed = self.outbound_failed(name) is not None
             # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
             # auto_start. Unconditional (NOT keyed on the lane's live state, as the auto_start gate
             # below is): an operator start is a legitimate override of auto_start, but there is no
@@ -8473,13 +8751,13 @@ class RegistryRunner:
                     self._gate_parked.add(name)
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
-                    await stale.aclose()
+                    retired.append((name, stale))
                 self._failed.pop(("outbound", name), None)
                 self._dr_unbuilt.pop(name, None)
                 # Not deployed outranks a DR park, so a door refuses it as not deployed.
                 self._filtered.pop(("outbound", name), None)
                 if not live:
-                    self._park_outbound_lane(name)
+                    self._park_paused_or_idle_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
             # no gate at all here, and in the DEFAULT pooled mode `live` below is keyed on the CONNECTOR
@@ -8490,15 +8768,15 @@ class RegistryRunner:
             # down (never started, started-then-stopped, or newly ADDED by this reload) stays parked with
             # no connector — its queued rows are retained PENDING, exactly like the DR park below.
             if not oc.auto_start and not self._outbound_lane_live(name):
-                # Closing before the park re-opens no claim here, unlike the deployed=False branch
-                # above: a lane that is not live and still has a connector is paused, so its gate is
-                # closed for the whole close (BACKLOG #5718).
+                # The park re-opens no claim here, unlike the deployed=False branch above: a lane
+                # that is not live and still has a connector is paused, so its gate is closed for
+                # the whole close, which runs once the swap commits (BACKLOG #5718, #5755).
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
-                    await stale.aclose()
+                    retired.append((name, stale))
                 self._failed.pop(("outbound", name), None)
                 self._dr_unbuilt.pop(name, None)
-                self._park_outbound_lane(name)
+                self._park_paused_or_idle_lane(name)
                 # The DR park is recorded here too, as at start (_start_outbound), so the doors
                 # refuse a start the profile would not allow (vault BACKLOG #3067).
                 self._dr_filters_out(name, oc.priority, kind="outbound")
@@ -8649,8 +8927,8 @@ class RegistryRunner:
                 # The lane leaves the passive standby's park, or its build failed when it did
                 # (vault BACKLOG #3263). So it is built as a start builds it: CA check, build and
                 # validate_startup, with a fault isolated to this lane (ADR 0031). BEFORE the
-                # unpark, as _start_outbound_unsafe orders it: the build awaits, and a lane
-                # unparked first claimed a held row with no connector and charged it an attempt.
+                # unpark, as _start_outbound_unsafe orders it: a lane unparked with no connector
+                # claimed a held row and charged it an attempt.
                 if self._passive_parked(name) or not self._dr_unbuilt.get(name, False):
                     # The first build since the lane left the park, at this activation. The
                     # failed record a passive start or an earlier activation may have left is
@@ -8658,21 +8936,28 @@ class RegistryRunner:
                     # own. A lane whose build already failed since this activation keeps its
                     # record, and a CA failure of the class that record holds, a store fault or
                     # not, is not alerted again (_ensure_destination_built,
-                    # _repeats_failed_class). Marked before the await, which a cancelled
-                    # reload can end there: the passive marker is gone, and this mark sends the
-                    # next reload down this path again. A build that succeeds drops it.
+                    # _repeats_failed_class). The mark sends the next reload down this path
+                    # again, and a build that succeeds drops it.
                     self._filtered.pop(("outbound", name), None)
                     self._failed.pop(("outbound", name), None)
                     self._dr_unbuilt[name] = False
-                # build_check already warned for this reload (vault BACKLOG #2910)
-                await self._ensure_destination_built(name, warn_query_credentials=False)
-                if self._dr_passive:
-                    # The box went passive while the build awaited: a failed activation hands
-                    # the threshold back without the reload lock. The lane stays parked, under
-                    # the passive marker again.
-                    self._dr_unbuilt.pop(name, None)
-                    self._dr_filters_out(name, oc.priority, kind="outbound")
-                elif name in self._destinations:
+                # Built in the prepare (BACKLOG #5755). A box that went passive while it
+                # awaited, as a failed activation hands the threshold back without the reload
+                # lock, does not reach here: `_leaves_passive_park` reads it false, and the lane
+                # takes the passive park below.
+                started = plan.started.pop(name, None)
+                if started is None:
+                    # The prepare's judgement disagreed with this one, which it reads from the
+                    # same state with no await between: a defect. The lane is held as a failed
+                    # build is, below.
+                    log.error("reload: outbound %r had no connector built for it", name)
+                elif name in self._destinations or ("outbound", name) in self._filtered:
+                    # `_ensure_destination_built`'s own guard: the lane takes nothing.
+                    if not isinstance(started.outcome, Exception):
+                        retired.append((name, started.outcome))
+                else:
+                    self._install_lane_destination(name, started)
+                if name in self._destinations:
                     self._unpark_outbound_lane(name)
                 else:
                     # The build failed, and the lane stays parked with its rows held: it reads
@@ -8699,7 +8984,7 @@ class RegistryRunner:
                 self._dr_park_outbound(name, live=self._outbound_lane_live(name))
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
-                    await stale.aclose()
+                    retired.append((name, stale))
                 self._failed.pop(("outbound", name), None)
                 self._dr_unbuilt.pop(name, None)
                 if worker is None or worker.done():
@@ -8712,94 +8997,31 @@ class RegistryRunner:
                 if worker is None or worker.done():
                     self._spawn_worker(name)
                 continue
-            # A lane with its OWN delivery worker is live iff that worker is alive — a dead one must be
-            # respawned or the lane stops draining. A lane the pooled OUTBOUND dispatcher drains has no
-            # worker to judge by, so it is live iff its connector is BUILT; judging that one by worker
-            # presence would rebuild every connector on every reload (dropping every warm MLLP socket /
-            # DB pool / SMART token). The spec-mismatch elif below still rebuilds a genuinely-changed
-            # connector in both cases. ADR 0066 D4: this is per-LANE, not per-mode — under pooled an
-            # UNORDERED lane takes the worker-keyed arm and a FIFO lane the connector-keyed one.
-            #
-            # CONNECTOR-KEYED WHILE THE HALT HOLDS, for the same reason a dispatcher-drained lane is.
-            # A lane's own worker RETURNS at :meth:`_delivery_worker`'s claim gate while
-            # `_delivery_halted`, which is the halt's designed terminal state and not a crash -- the
-            # resume doors respawn it through `_start_outbound_unsafe`. Reading `worker.done()` as 'not
-            # live' there made every halted reload pop, `aclose()` and rebuild EVERY paused lane's
-            # connector, and respawn a worker that dies at that gate on its first tick, for a reload
-            # that changed nothing. MEASURED in both claim modes on a reload with the connector spec
-            # identical: `same_connector` False in per_lane against True in pooled, and True in per_lane
-            # once this disjunct was added. Besides the warm MLLP socket / DB pool / SMART token the
-            # paragraph above is written to keep, that churn made the then-unguarded `stale.aclose()`
-            # below newly reachable for a halted lane, where a raising close propagated into `reload`'s
-            # own except and rolled a routine reload's intake back (now :meth:`_close_replaced`).
-            live = (
-                (worker is not None and not worker.done())
-                if self._per_lane_delivery(name) and not self._delivery_halted
-                else name in self._destinations
-            )
-            if not live:
-                # added (or replacing a crashed worker): build, swap in, close any stale connector,
-                # spawn. #200 (ADR 0092): stamp the posture for the reload rebuild too. build_check
-                # above vetted the new registry against the real posture, but the HTTP cells
-                # fail-closed when unstamped — so an unstamped rebuild here would raise
-                # InsecureHopRefused on a legit non-prod cleartext lane AFTER intake is quiesced (the
-                # "connector builds here cannot fail" invariant). Built off the event loop (engine PR
-                # 2815, hold F2) BEFORE the pop, so no await falls between the pop and the swap.
-                built = await _build_off_loop(
-                    self._hop_posture,
-                    functools.partial(
-                        build_destination,
-                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
-                        egress=self._egress,
-                        # build_check already warned for this reload (vault BACKLOG #2910)
-                        warn_query_credentials=False,
-                    ),
-                )
+            # :meth:`_outbound_rebuild` says how the lane is judged live, and when it is rebuilt.
+            rebuild = self._outbound_rebuild(name, oc, old, halted=self._delivery_halted)
+            if rebuild is None:
+                continue  # unchanged & live → leave the worker/connector as-is.
+            built = plan.built.pop(name, None)
+            if built is None:
+                # As for a lane leaving the passive park above: a defect. Left as it stood.
+                log.error("reload: outbound %r had no connector built for it", name)
+                continue
+            if rebuild == "add":
+                # added (or replacing a crashed worker): swap in, retire any stale connector, spawn.
                 stale = self._destinations.pop(name, None)
                 self._destinations[name] = built
                 if stale is not None:
-                    await self._close_replaced(name, stale, close_failures)
+                    retired.append((name, stale))
                 self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
-            elif (
-                failed
-                or name not in self._destinations
-                or old.outbound.get(name) is None
-                or old.outbound[name].spec != oc.spec
-                or _hop_policy(old.outbound[name]) != _hop_policy(oc)
-            ):
-                # live worker but a missing/mismatched connector → (re)build it in place, close any old
-                # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
-                # is alive with no connector, so a reload once the cause is fixed self-heals the lane
-                # (build_check above already re-validated the whole new registry, so this build can't
-                # fail here — a still-broken connector would have raised before any quiesce).
-                #
-                # `name not in self._destinations` makes the condition match that first line, which
-                # promised "missing OR mismatched" while only ever testing `failed` (a subset: every
-                # site that records a failure has already popped the connector). MEASURED on a
-                # per_lane rig, where `live` above is WORKER-keyed and the boot gates spawn a worker
-                # without a connector: AC-4's "flip the flag back with no other change" un-parked a
-                # lane that then had nothing to deliver through, and its rows retried forever. A lane
-                # whose `live` is connector-keyed cannot reach this elif with a missing connector, so
-                # for those the clause is inert — which is every pooled FIFO lane (ADR 0066 D4).
-                # #200 (ADR 0092): stamp the posture for the in-place rebuild too, off the event loop,
-                # and read the old connector only after it, so no await falls between that read and
-                # the swap (see the branch above).
-                built = await _build_off_loop(
-                    self._hop_posture,
-                    functools.partial(
-                        build_destination,
-                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
-                        egress=self._egress,
-                        warn_query_credentials=False,  # as in the branch above
-                    ),
-                )
+            else:
+                # live worker but a missing/mismatched connector → swap it in place, retire any
+                # old one (build_check above already re-validated the whole new registry).
                 old_conn = self._destinations.get(name)
                 self._destinations[name] = built
                 self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
-                    await self._close_replaced(name, old_conn, close_failures)
-            # else: unchanged & live → leave the worker/connector as-is.
+                    retired.append((name, old_conn))
         # A lane the new graph dropped has no spec to build again from.
         self._dr_unbuilt = {n: f for n, f in self._dr_unbuilt.items() if n in new.outbound}
         # Outbounds removed by ``new`` keep their worker so already-queued rows finish draining.
@@ -8815,7 +9037,50 @@ class RegistryRunner:
             ]:
                 self._filtered.pop(("outbound", name), None)
                 self._unpark_outbound_lane(name)
-        return close_failures
+
+    def _park_paused_or_idle_lane(self, name: str) -> None:
+        """Park a lane that is not live, for step 3's not-deployed and ``auto_start`` branches. A
+        lane an operator already stopped is only recorded as the engine's park: it keeps the
+        quiescence its stop left, since a send may still be in flight on its connector, which the
+        reload closes only once its swap commits (BACKLOG #5718, #5755). An idle lane is parked as
+        :meth:`_park_outbound_lane` parks one."""
+        if name in self._outbound_paused:
+            self._gate_parked.add(name)
+        else:
+            self._park_outbound_lane(name)
+
+    async def _close_retired(
+        self, retired: list[tuple[str, DestinationConnector]]
+    ) -> list[tuple[str, str]]:
+        """Close the connectors a committed reload's step 3 took out of their lanes or did not use,
+        in order, and return the ones that failed (:meth:`_close_replaced`). A cancellation hands
+        the ones not yet begun to a detached close (BACKLOG #5755); the one it cut off is not
+        closed twice."""
+        failures: list[tuple[str, str]] = []
+        for index, (name, connector) in enumerate(retired):
+            try:
+                await self._close_replaced(name, connector, failures)
+            except asyncio.CancelledError:
+                self._close_detached(retired[index + 1 :])
+                raise
+        return failures
+
+    def _close_detached(self, connectors: list[tuple[str, DestinationConnector]]) -> None:
+        """Close ``connectors`` in a task of their own, so a close that hangs cannot hold the
+        reload lock (BACKLOG #5755). The task joins the detached lookup-executor closes, so the
+        teardown waits for it under the same bound (:meth:`_teardown_body`). A failure is logged by
+        :meth:`_close_replaced`."""
+        if not connectors:
+            return
+
+        async def close_all() -> None:
+            failures: list[tuple[str, str]] = []
+            for name, connector in connectors:
+                await self._close_replaced(name, connector, failures)
+
+        task = asyncio.create_task(close_all())
+        self._lookup_close_tasks.add(task)
+        task.add_done_callback(self._lookup_close_tasks.discard)
 
     async def _close_replaced(
         self, name: str, replaced: DestinationConnector, failures: list[tuple[str, str]]
@@ -8959,7 +9224,8 @@ class RegistryRunner:
     ) -> tuple[tuple[str, str], ...]:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
-        Returns ``(outbound name, reason)`` for each connector step 3 replaced and could not close.
+        Returns ``(outbound name, reason)`` for each connector step 3 replaced or retired and could
+        not close.
         The swap stands for those lanes, so they are reported rather than raised; empty when there
         are none, and on a graph that is not running.
 
@@ -8991,8 +9257,10 @@ class RegistryRunner:
         (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails, or is cancelled
         (vault BACKLOG #2753), the previous graph's intake is restored before the error or the
         cancellation propagates, with its lookup executors and ADR 0057 inline eligibility, and steps
-        3a and 4 do not run. Restarting inbounds before reconciling outbounds means a slow/hung
-        outbound never blocks the engine's intake.
+        3a and 4 do not run. Step 3 changes no outbound lane until its last await has returned, so
+        a rolled-back reload finds every outbound lane as it was; the connectors it takes out of a
+        lane are closed only once the swap commits (BACKLOG #5755). Restarting inbounds before
+        reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
             if new_registry is None:
@@ -9060,17 +9328,27 @@ class RegistryRunner:
 
             old = self.registry
             old_inbound_names = list(self._sources)
+            # The connectors step 3 puts in its lanes, built before it changes any (BACKLOG #5755).
+            outbound_plan = _OutboundPlan()
             # vault BACKLOG #2371: before the quiesce, so a refused CA leaves the graph untouched.
             try:
+                # The reload's one schedule time, so this check judges a window as the build
+                # check and the listener loop do (BACKLOG #5755).
                 anchors_passed = await self._check_reload_lane_anchors(
-                    old, new_registry, old_inbound_names
+                    old, new_registry, old_inbound_names, now
                 )
                 if lookups.store_fault is not None:
                     # Vault BACKLOG #3582: a store fault in the lookup check refuses only once
                     # no lane CA is refused, as a lane's own does (BACKLOG #3091).
                     error = connection_anchor_failure(lookups.store_fault)
                     raise error from error.__cause__
+                # BACKLOG #5755: step 3's connector builds, before the quiesce and changing no
+                # lane, so a build that fails or is cancelled leaves the graph untouched, and step
+                # 3 itself awaits nothing unless a lane changed meanwhile. That keeps its lane
+                # changes in the same tick as step 2b's dispatcher nudge, as they were.
+                await self._prepare_outbound_reconcile(old, new_registry, outbound_plan)
             except BaseException:
+                self._close_detached(outbound_plan.take_all())
                 self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
                 raise
@@ -9135,10 +9413,10 @@ class RegistryRunner:
                 # mode a step early, for no gain. per_lane keeps `_worker_owned` empty by definition.
                 #
                 # NOT ROLLED BACK ON A FAILED RELOAD, DELIBERATELY, AND THAT IS THE SAFER DIRECTION.
-                # Step 3 already writes `_ordering` and resolves the consumer for every lane it reaches,
-                # with no rollback of its own, so a partial reconcile leaves sticky decisions either way.
+                # Step 3's apply writes `_ordering` and resolves the consumer for every lane it reaches,
+                # with no rollback of its own, so a reconcile leaves sticky decisions either way.
                 # Undoing step 2a's would be WORSE than keeping them: step 3 may already have spawned an
-                # added lane's delivery worker before a LATER lane's unguarded `aclose()` raised into the
+                # added lane's delivery worker before a LATER lane raised into the
                 # handler below, and un-deciding that lane returns it to `_pooled_lane_provider` — which
                 # puts the OUTBOUND dispatcher on a lane a live worker is draining, the exact ADR 0073
                 # two-claimer break this whole change exists to prevent. What a kept decision costs when
@@ -9226,8 +9504,17 @@ class RegistryRunner:
                 else:
                     for name in new_registry.inbound:
                         self._ensure_inbound_workers(name)
-                # 3. Reconcile outbound connectors/workers (intake already live).
-                close_failures = await self._reconcile_outbounds(old, new_registry)
+                # 3. Reconcile outbound connectors/workers (intake already live). It changes no
+                # lane until its last await has returned (BACKLOG #5755), so a failure or a
+                # cancellation that reaches the handler below finds every outbound lane as it was.
+                # What it took out of a lane is closed only once the swap commits, below. It
+                # takes the plan the prepare above filled from `_outbound_plan`, so a hook that
+                # stands in for it keeps the `(old, new)` call.
+                self._outbound_plan = outbound_plan
+                try:
+                    retired = await self._reconcile_outbounds(old, new_registry)
+                finally:
+                    self._outbound_plan = None
             except BaseException as exc:
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
@@ -9246,6 +9533,11 @@ class RegistryRunner:
                     )
                 self.registry = old
                 self._env_values = old_env_values
+                # BACKLOG #5755: step 3 changes no outbound lane before its last await returns,
+                # so the outbound lanes are as they were. The connectors its prepare built and no
+                # lane took are closed, scheduled before any await so a second cancellation
+                # cannot skip them.
+                self._close_detached(outbound_plan.take_all())
                 self._restore_dr_markers(cleared)
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
                 # the first await below, so no worker that reads them after the restore pairs the old
@@ -9259,12 +9551,20 @@ class RegistryRunner:
                 self._recompute_inline_ok()
                 # A session made after the swap holds a worker that loaded the NEW graph. Drop it,
                 # or that worker would go on answering for a graph the engine no longer serves.
-                await self._close_sandbox_sessions()
+                # Guarded, as each step below is: a refused hop here must not leave intake down
+                # (BACKLOG #5755).
+                try:
+                    await self._close_sandbox_sessions()
+                except Exception:
+                    log.exception("rollback: could not close the sandbox sessions")
                 # Step 2a's lane-partition decisions are deliberately NOT undone here — that comment
                 # carries why, and the short version is that un-deciding a lane step 3 has already given
                 # a worker to is how a rollback would create two claimers on one lane.
                 for name in list(self._sources):
-                    await self._stop_inbound_unsafe(name)
+                    try:
+                        await self._stop_inbound_unsafe(name)
+                    except Exception:
+                        log.exception("rollback: could not stop inbound %r", name)
                 for name in old_inbound_names:
                     try:
                         await self._checked_inbound_start(name)  # vault BACKLOG #2371
@@ -9272,34 +9572,48 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
-            # The swap committed, so nothing can put the previous graph's executor back any more.
-            self._retire_lookup_executor(old_lookup_executor)
-            # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
-            # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
-            for lane in anchors_passed:
-                self._anchor_refused.pop(lane, None)
-            self._forget_removed_anchor_lanes()
-            # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
-            # graph, so an added schedule starts, an edited one changes and a removed one stops
-            # (BACKLOG #2069). After the rollback point on purpose,
-            # so a failed reload leaves every scheduler running against the graph it restored.
-            await self._reconcile_schedulers()
+            # BACKLOG #5755: the closes of what step 3 retired run on every exit from here. A raise
+            # or a cancellation anywhere in the commit tail, synchronous or awaited, hands the ones
+            # not yet begun to a detached close rather than leaving them open with nothing holding
+            # them. A close that fails is reported, not raised: the swap has committed.
+            closes_begun = False
+            try:
+                # The swap committed, so nothing can put the previous graph's executor back any more.
+                self._retire_lookup_executor(old_lookup_executor)
+                # vault BACKLOG #2371: the swap committed, so a lane the pre-check passed loses any old
+                # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
+                for lane in anchors_passed:
+                    self._anchor_refused.pop(lane, None)
+                self._forget_removed_anchor_lanes()
+                # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
+                # graph, so an added schedule starts, an edited one changes and a removed one stops
+                # (BACKLOG #2069). After the rollback point on purpose,
+                # so a failed reload leaves every scheduler running against the graph it restored.
+                await self._reconcile_schedulers()
 
-            # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
-            # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
-            # always OMITTED response) for byte-identity; the ON branch ALSO wakes RESPONSE lanes, fixing
-            # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
-            # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
-            # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
-            # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
-            # would be a redundant notify_work broadcast).
-            if self._claim_mode != "pooled":
-                _reload_stages = (
-                    (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
-                    if self._per_lane_wake
-                    else (Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
-                )
-                self._wake_all(*_reload_stages)
+                # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
+                # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
+                # always OMITTED response) for byte-identity; the ON branch ALSO wakes RESPONSE lanes, fixing
+                # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
+                # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
+                # ADR 0066 pooled: the dispatchers were already nudged in _reload_pooled_dispatchers above,
+                # and so were the worker-drained lanes it wakes directly (D4), so skip the tail wake (it
+                # would be a redundant notify_work broadcast).
+                if self._claim_mode != "pooled":
+                    _reload_stages = (
+                        (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+                        if self._per_lane_wake
+                        else (Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
+                    )
+                    self._wake_all(*_reload_stages)
+                # The swap committed: close what step 3 took out of its lanes. Last, so a
+                # cancellation that lands in a close finds the rest of the commit done; the closes
+                # it cut off run detached (:meth:`_close_retired`).
+                closes_begun = True
+                close_failures = await self._close_retired(retired)
+            finally:
+                if not closes_begun:
+                    self._close_detached(retired)
             log.info(
                 "wiring reloaded: %d inbound, %d outbound connection(s)",
                 len(new_registry.inbound),
