@@ -9,16 +9,20 @@ both server backends, and asks whether that move costs Postgres an extra bufferi
 rows. This tool measures one commit at a time, so the same file times both sides of the change.
 
 ``measure`` imports ``messagefoundry`` from ``--code-root`` (an extracted tree of the commit under
-test, put first on ``sys.path``) and refuses to run if the import resolved anywhere else, so a
-figure is never credited to the wrong commit. It opens the server store that the ``MEFOR_STORE_*``
-environment names, empties its queue tables, seeds synthetic ingress rows (one fixed, PHI-free HL7
-line, never printed), and times each ``claim_fifo_heads`` call alone. After every timed claim it
-calls ``release_claimed``, which restores exactly what the claim changed, so every iteration claims
-the same rows from the same state. A claim that returns a different row count than the scenario
-expects stops the run: a timing over the wrong work is not a figure.
+test, put first on ``sys.path``) and refuses to run if the import resolved anywhere else, or if the
+root's ``CLAIM_PATH_COMMIT`` file (written at extraction) does not name ``--commit``. It refuses any
+database whose name is not one of the bench's own (``mf_claim_*`` or ``MfClaim*``), because it
+empties the queue tables of the database the ``MEFOR_STORE_*`` environment names. It seeds synthetic
+ingress rows (one fixed, PHI-free HL7 message padded to ``--payload-bytes``, never printed),
+refreshes the queue table's statistics, then times each ``claim_fifo_heads`` call alone. After every
+timed claim it calls ``release_claimed``, which puts the claimed rows back to pending with their
+attempts restored, so every iteration claims the same rows. A claim that returns a different row
+count than the scenario expects stops the run: a timing over the wrong work is not a figure.
 
-``compare`` reads the JSON reports ``measure`` wrote and prints one Markdown table per backend, the
-samples of every round of a label pooled, with the after/before ratio of each statistic.
+``compare`` reads the JSON reports ``measure`` wrote and prints one Markdown table per backend. A
+report keeps summary statistics, not samples, so rounds are not pooled: each cell is the median over
+rounds of that round's statistic, with each round's p50 listed in round order. It exits non-zero if
+no scenario has both sides.
 
 Only timings, counts, the backend's version line and the commit label reach the output.
 """
@@ -28,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import platform
 import statistics
@@ -37,14 +42,22 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-# One synthetic HL7 line; it is stored as the raw body of every seeded row and never printed.
-_RAW = "MSH|^~\\&|BENCH|BENCH|BENCH|BENCH|20260101||ADT^A01|BENCH1|P|2.5.1\r"
+_MSH = "MSH|^~\\&|BENCH|BENCH|BENCH|BENCH|20260101||ADT^A01|BENCH1|P|2.5.1\r"
 _STAGE = "ingress"
 _SEED_NOW = 100.0
 _CLAIM_NOW = 200.0
 # The queue tables a claim reads or a seed writes, emptied before a run (the same set the live
 # claim tests empty, so it exists at every commit this tool is pointed at).
 _TABLES = ("message_events", "queue", "response", "delivered_keys", "messages")
+_BENCH_DB_PREFIXES = ("mf_claim_", "MfClaim")
+# The server stores clamp one claim to this many lanes (_FIFO_HEADS_LANE_CHUNK).
+_MAX_LANES = 500
+
+
+def _raw(payload_bytes: int) -> str:
+    """One synthetic message: the MSH line plus an NTE segment padding it to ``payload_bytes``."""
+    pad = max(0, payload_bytes - len(_MSH) - len("NTE|1||\r"))
+    return f"{_MSH}NTE|1||{'X' * pad}\r"
 
 
 def _parse_scenarios(text: str) -> list[tuple[int, int]]:
@@ -54,14 +67,23 @@ def _parse_scenarios(text: str) -> list[tuple[int, int]]:
     for part in text.split(","):
         lanes_s, _, limit_s = part.strip().partition("x")
         lanes, limit = int(lanes_s), int(limit_s)
-        if lanes < 1 or limit < 0:
-            raise ValueError(f"bad scenario {part!r}: lanes must be >= 1 and the limit >= 0")
+        if not 1 <= lanes <= _MAX_LANES or limit < 0:
+            raise ValueError(
+                f"bad scenario {part!r}: lanes must be 1-{_MAX_LANES} and the limit >= 0"
+            )
         out.append((lanes, limit))
     return out
 
 
-def _import_engine(code_root: Path) -> Any:
-    """Import ``messagefoundry`` from ``code_root`` and nowhere else."""
+def _import_engine(code_root: Path, commit: str) -> Any:
+    """Import ``messagefoundry`` from ``code_root``, and only from a root that holds ``commit``."""
+    stamp = code_root / "CLAIM_PATH_COMMIT"
+    held = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+    if held != commit:
+        raise SystemExit(
+            f"--code-root {code_root} holds commit {held or 'unknown'!r}, not --commit {commit!r};"
+            " refusing to credit this run's figures to the wrong commit"
+        )
     sys.path.insert(0, str(code_root))
     import messagefoundry
 
@@ -72,6 +94,16 @@ def _import_engine(code_root: Path) -> Any:
             " credit this run's figures to the wrong commit"
         )
     return messagefoundry
+
+
+def _check_bench_database(environ: dict[str, str] | os._Environ[str]) -> str:
+    name = environ.get("MEFOR_STORE_DATABASE", "")
+    if not name.startswith(_BENCH_DB_PREFIXES):
+        raise SystemExit(
+            f"MEFOR_STORE_DATABASE={name!r} is not a bench database ({' or '.join(_BENCH_DB_PREFIXES)}"
+            "...); measure empties its queue tables, so it refuses any other"
+        )
+    return name
 
 
 async def _open_store(backend: str) -> Any:
@@ -87,34 +119,41 @@ async def _open_store(backend: str) -> Any:
     return await SqlServerStore.open(settings)
 
 
-async def _sql(store: Any, backend: str, statement: str) -> Any:
-    """Run one test-owned constant statement; return the first column of the first row, if any."""
+async def _fetchval(store: Any, backend: str, query: str) -> Any:
+    """First column of the first row of one test-owned constant query."""
     async with store._pool.acquire() as conn:
         if backend == "postgres":
-            if statement.lstrip().upper().startswith("SELECT"):
-                return await conn.fetchval(statement)
-            await conn.execute(statement)
-            return None
+            return await conn.fetchval(query)
         cur = await conn.cursor()
-        await cur.execute(statement)
-        row = await cur.fetchone() if statement.lstrip().upper().startswith("SELECT") else None
+        try:
+            await cur.execute(query)
+            rows = await cur.fetchall()  # drain, so no open result rides back into the pool
+        finally:
+            await cur.close()
+        return rows[0][0] if rows else None
+
+
+async def _execute(store: Any, backend: str, statements: list[str]) -> None:
+    """Run test-owned constant statements, in one connection, committed."""
+    async with store._pool.acquire() as conn:
+        if backend == "postgres":
+            for statement in statements:
+                await conn.execute(statement)
+            return
+        cur = await conn.cursor()
+        try:
+            for statement in statements:
+                await cur.execute(statement)
+        finally:
+            await cur.close()
         await conn.commit()
-        return row[0] if row else None
-
-
-async def _empty(store: Any, backend: str) -> None:
-    if backend == "postgres":
-        await _sql(store, backend, f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE")
-    else:
-        for table in _TABLES:
-            await _sql(store, backend, f"DELETE FROM {table}")
 
 
 def _stats(samples_ms: list[float]) -> dict[str, float]:
     ordered = sorted(samples_ms)
 
-    def pct(p: float) -> float:
-        return ordered[min(len(ordered) - 1, round(p * (len(ordered) - 1)))]
+    def pct(p: float) -> float:  # nearest rank: the ceil(p * n)-th smallest
+        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
 
     return {
         "n": float(len(ordered)),
@@ -128,34 +167,50 @@ def _stats(samples_ms: list[float]) -> dict[str, float]:
 
 
 async def _measure(args: argparse.Namespace) -> dict[str, Any]:
-    _import_engine(Path(args.code_root))
+    _check_bench_database(os.environ)
+    _import_engine(Path(args.code_root), args.commit)
     backend = args.backend
-    store = await _open_store(backend)
     scenarios = _parse_scenarios(args.scenarios)
-    max_lanes = max(lanes for lanes, _ in scenarios)
-    seeded = [f"IB_BENCH_{i:04d}" for i in range(max_lanes)]
-    unseeded = [f"IB_EMPTY_{i:04d}" for i in range(max_lanes)]
+    seeded_lanes = max((lanes for lanes, limit in scenarios if limit), default=0)
+    empty_lanes = max((lanes for lanes, limit in scenarios if not limit), default=0)
+    seeded = [f"IB_BENCH_{i:04d}" for i in range(seeded_lanes)]
+    unseeded = [f"IB_EMPTY_{i:04d}" for i in range(empty_lanes)]
+    raw = _raw(args.payload_bytes)
     report: dict[str, Any] = {
         "label": args.label,
         "commit": args.commit,
         "round": args.round,
         "backend": backend,
         "rows_per_lane": args.rows_per_lane,
+        "payload_bytes": len(raw),
         "warmup": args.warmup,
         "iterations": args.iterations,
         "python": platform.python_version(),
         "scenarios": [],
     }
+    store = await _open_store(backend)
     try:
-        version = await _sql(
+        version = await _fetchval(
             store, backend, "SELECT version()" if backend == "postgres" else "SELECT @@VERSION"
         )
         report["server"] = str(version).splitlines()[0] if version else "unknown"
-        await _empty(store, backend)
+        if backend == "postgres":
+            await _execute(
+                store, backend, [f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"]
+            )
+        else:
+            await _execute(store, backend, [f"DELETE FROM {table}" for table in _TABLES])
         for lane in seeded:
             for _ in range(args.rows_per_lane):
-                await store.enqueue_ingress(channel_id=lane, raw=_RAW, now=_SEED_NOW)
+                await store.enqueue_ingress(channel_id=lane, raw=raw, now=_SEED_NOW)
         for lanes, limit in scenarios:
+            # Refresh statistics before each scenario, so the planner sees the seeded table rather
+            # than the empty one, and so autoanalyze does not fire at a point that differs per run.
+            await _execute(
+                store,
+                backend,
+                ["ANALYZE queue" if backend == "postgres" else "UPDATE STATISTICS queue"],
+            )
             names = seeded[:lanes] if limit else unseeded[:lanes]
             per_lane = max(limit, 1)
             expected = lanes * min(limit, args.rows_per_lane)
@@ -191,10 +246,12 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def _compare(paths: list[Path], before: str, after: str) -> str:
-    # A report keeps summaries, not samples, so rounds cannot be pooled into one distribution. The
-    # table gives each round's p50 and the median of the rounds' statistics; the runs interleave
-    # before and after, so a drift across the job shows up as rounds that disagree.
+def _median(rows: list[dict[str, Any]], stat: str) -> float:
+    return float(statistics.median(float(r[stat]) for r in rows))
+
+
+def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int]:
+    """The before/after table, and how many scenario rows it holds."""
     grouped: dict[tuple[str, int, int], dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -204,36 +261,49 @@ def _compare(paths: list[Path], before: str, after: str) -> str:
         meta[rep["backend"]].add(f"{rep['label']}={rep['commit']} on {rep.get('server', '?')}")
         for sc in rep["scenarios"]:
             key = (rep["backend"], sc["lanes"], sc["per_lane_limit"])
-            grouped[key][rep["label"]].append(sc)
+            grouped[key][rep["label"]].append({**sc, "round": rep.get("round", 0)})
     lines: list[str] = []
+    emitted = 0
     for backend in sorted(meta):
         lines.append(f"### {backend}")
         lines.extend(f"- {m}" for m in sorted(meta[backend]))
         lines.append("")
         lines.append(
-            "| lanes x limit | rows | before p50 ms (rounds) | after p50 ms (rounds) |"
-            " p50 after/before | before p90 | after p90 | before p99 | after p99 |"
+            "| lanes x limit | rows | before p50 ms (r1, r2, ...) | after p50 ms (r1, r2, ...) |"
+            " p50 after/before | before p90 | after p90 | p90 after/before | before p99 |"
+            " after p99 |"
         )
-        lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|")
         for key in sorted(k for k in grouped if k[0] == backend):
-            by_label = grouped[key]
-            b, a = by_label.get(before, []), by_label.get(after, [])
+            b = sorted(grouped[key].get(before, []), key=lambda r: r["round"])
+            a = sorted(grouped[key].get(after, []), key=lambda r: r["round"])
             if not b or not a:
+                lines.append(f"| {key[1]}x{key[2]} | missing: {'before' if not b else 'after'} |")
                 continue
-
-            def med(rows: list[dict[str, Any]], stat: str) -> float:
-                return float(statistics.median(float(r[stat]) for r in rows))
-
-            ratio = med(a, "p50") / med(b, "p50") if med(b, "p50") else float("nan")
+            b50, a50, b90, a90 = (
+                _median(b, "p50"),
+                _median(a, "p50"),
+                _median(b, "p90"),
+                _median(a, "p90"),
+            )
             lines.append(
                 f"| {key[1]}x{key[2]} | {b[0]['rows_claimed']} |"
-                f" {med(b, 'p50'):.2f} ({', '.join(f'{r["p50"]:.2f}' for r in b)}) |"
-                f" {med(a, 'p50'):.2f} ({', '.join(f'{r["p50"]:.2f}' for r in a)}) |"
-                f" {ratio:.3f} | {med(b, 'p90'):.2f} | {med(a, 'p90'):.2f} |"
-                f" {med(b, 'p99'):.2f} | {med(a, 'p99'):.2f} |"
+                f" {b50:.2f} ({', '.join(f'{r["p50"]:.2f}' for r in b)}) |"
+                f" {a50:.2f} ({', '.join(f'{r["p50"]:.2f}' for r in a)}) |"
+                f" {a50 / b50 if b50 else float('nan'):.3f} | {b90:.2f} | {a90:.2f} |"
+                f" {a90 / b90 if b90 else float('nan'):.3f} |"
+                f" {_median(b, 'p99'):.2f} | {_median(a, 'p99'):.2f} |"
             )
+            emitted += 1
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines), emitted
+
+
+def _positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, not {value}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -246,9 +316,10 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--commit", required=True, help="the commit SHA the code root holds")
     m.add_argument("--round", type=int, default=1)
     m.add_argument("--scenarios", default="1x1,64x1,64x16,256x1,256x16,256x0")
-    m.add_argument("--rows-per-lane", type=int, default=16)
+    m.add_argument("--rows-per-lane", type=_positive, default=16)
+    m.add_argument("--payload-bytes", type=_positive, default=2048)
     m.add_argument("--warmup", type=int, default=10)
-    m.add_argument("--iterations", type=int, default=100)
+    m.add_argument("--iterations", type=_positive, default=100)
     m.add_argument("--out", required=True, type=Path)
     c = sub.add_parser("compare", help="print the before/after table from measure's reports")
     c.add_argument("reports", nargs="+", type=Path)
@@ -260,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return 0
-    print(_compare(args.reports, args.before, args.after))
+    table, emitted = _compare(args.reports, args.before, args.after)
+    print(table)
+    if not emitted:
+        print("no scenario has both a before and an after report", file=sys.stderr)
+        return 1
     return 0
 
 

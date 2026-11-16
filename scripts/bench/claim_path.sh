@@ -10,21 +10,28 @@
 # Environment: CLAIM_PATH_BEFORE and CLAIM_PATH_AFTER, two full 40-character commit SHAs;
 # CLAIM_PATH_ROUNDS, default 2; the job's MEFOR_STORE_* connection settings.
 #
-# Each commit's messagefoundry package is extracted with git archive into its own directory and gets
-# its own database, so neither commit's schema is applied over the other's. The rounds alternate the
-# order (before then after, then after then before) so a drift across the job does not land on one
-# side. Reports are metrics only and go to out/claimpath/, and the before/after table goes to the
-# job summary.
+# Each commit is extracted with git archive into its own directory, stamped with its SHA, and installed
+# editable into its own venv against its own constraints.lock, so each side runs on the dependencies
+# it shipped with (the before commit still needed python-hl7, which the branch no longer installs).
+# Each gets its own database, so neither commit's schema is applied over the other's. The rounds
+# alternate the order (before then after, then after then before), and the count must be even so
+# each order runs equally often. Reports are metrics only and go to out/claimpath/, and the
+# before/after table goes to the job summary.
 set -euo pipefail
 
 backend="${1:?usage: claim_path.sh <postgres|sqlserver>}"
 case "$backend" in postgres|sqlserver) ;; *) echo "::error::unknown backend: $backend"; exit 1 ;; esac
 rounds="${CLAIM_PATH_ROUNDS:-2}"
-[[ "$rounds" =~ ^[1-9][0-9]?$ ]] || { echo "::error::CLAIM_PATH_ROUNDS must be 1-99, not $rounds"; exit 1; }
+if [[ ! "$rounds" =~ ^[1-9][0-9]?$ ]] || (( rounds % 2 )); then
+  echo "::error::CLAIM_PATH_ROUNDS must be an even number from 2 to 98, not $rounds"
+  exit 1
+fi
+extra="$backend"
+[[ "$backend" == sqlserver ]] || extra=postgres
 out="out/claimpath"
 mkdir -p "$out"
 
-declare -A sha root db
+declare -A sha root db py
 sha[before]="${CLAIM_PATH_BEFORE:-}"
 sha[after]="${CLAIM_PATH_AFTER:-}"
 for label in before after; do
@@ -36,7 +43,12 @@ for label in before after; do
   root[$label]="$RUNNER_TEMP/claimpath-$label"
   rm -rf "${root[$label]}"
   mkdir -p "${root[$label]}"
-  git archive "${sha[$label]}" messagefoundry | tar -x -C "${root[$label]}"
+  git archive "${sha[$label]}" | tar -x -C "${root[$label]}"
+  echo "${sha[$label]}" > "${root[$label]}/CLAIM_PATH_COMMIT"
+  python -m venv "${root[$label]}/.venv"
+  py[$label]="${root[$label]}/.venv/bin/python"
+  "${py[$label]}" -m pip install --quiet --upgrade pip
+  "${py[$label]}" -m pip install --quiet --constraint "${root[$label]}/constraints.lock" -e "${root[$label]}[$extra]"
 done
 
 if [[ "$backend" == postgres ]]; then
@@ -81,7 +93,7 @@ fi
 for round in $(seq 1 "$rounds"); do
   if (( round % 2 )); then order=(before after); else order=(after before); fi
   for label in "${order[@]}"; do
-    MEFOR_STORE_DATABASE="${db[$label]}" python -I -X disable-remote-debug scripts/bench/claim_path.py measure \
+    MEFOR_STORE_DATABASE="${db[$label]}" "${py[$label]}" -I -X disable-remote-debug scripts/bench/claim_path.py measure \
       --code-root "${root[$label]}" --backend "$backend" --label "$label" --commit "${sha[$label]}" \
       --round "$round" --out "$out/$backend-$label-r$round.json"
   done
