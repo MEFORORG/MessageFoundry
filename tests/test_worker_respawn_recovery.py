@@ -38,6 +38,7 @@ from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus
+from messagefoundry.transports.base import DeliveryError
 
 LIMIT = wiring_runner._WORKER_DEATH_LIMIT
 
@@ -450,3 +451,132 @@ async def test_a_death_inside_a_batch_hands_the_extras_to_the_respawn(
     assert (str(row["status"]), int(row["attempts"])) == (
         ("pending", 1) if per_lane else ("inflight", 1)
     )
+
+
+async def test_a_repeated_death_no_row_is_charged_with_stops_re_pending_at_the_cap(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KILL kills the router every time, and the store fails every death count, so no row is
+    charged with the death and no row cap applies. The respawn re-pends KILL until the lane's
+    count of such deaths reaches ``LIMIT``; the death that reaches it leaves KILL in flight for the
+    next start, as main did, and the replacement goes on to OK. On the code before this bound KILL
+    is re-pended and re-claimed every backoff with no end, so OK is never routed."""
+    calls: list[str] = []
+
+    def router(m: Message) -> list[str]:
+        calls.append(m.control_id or "")
+        if m.control_id == "KILL":
+            raise _Kill
+        return ["h"]
+
+    async def count_fails(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("simulated store fault in record_worker_death")
+
+    monkeypatch.setattr(store, "record_worker_death", count_fails)
+    recorder = _Recorder()
+    runner = await _started(_registry(tmp_path, router=router), store, recorder)
+    try:
+        killer = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
+        after = await store.enqueue_ingress(channel_id="IB", raw=_hl7("OK"))
+        runner.notify_work()
+
+        async def after_sent() -> bool:
+            return "OK" in recorder.sent
+
+        await _until(after_sent, timeout=5.0)
+        await asyncio.sleep(0.2)  # a re-pend past the cap would re-claim KILL by now
+        assert calls == ["KILL"] * LIMIT + ["OK"]
+        assert (await _row(store, killer, Stage.INGRESS))[0] == "inflight"  # for the next start
+        assert await _status(store, after) == MessageStatus.PROCESSED.value
+    finally:
+        await runner.stop()
+
+
+async def test_a_repeated_death_outside_the_item_body_stops_re_pending_at_the_cap(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pacing wait kills the delivery worker, outside its per-item body, where no death is
+    recorded. The row is re-pended and re-claimed until ``LIMIT`` such deaths, then left in flight,
+    and the replacement claims nothing more. On the code before this bound the pace is re-run every
+    backoff with no end."""
+    paced: list[int] = []
+
+    async def always_kill(self: RegistryRunner, name: str) -> None:
+        paced.append(1)
+        raise _Kill
+
+    monkeypatch.setattr(RegistryRunner, "_pace_outbound", always_kill)
+    recorder = _Recorder()
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=_hl7("KILL"), deliveries=[("OB", _hl7("KILL"))]
+    )
+    runner = await _started(_registry(tmp_path), store, recorder)
+    try:
+        runner.notify_work()
+
+        async def capped() -> bool:
+            return len(paced) >= LIMIT
+
+        await _until(capped, timeout=5.0)
+        await asyncio.sleep(0.3)  # a re-pend past the cap would have paced again by now
+        assert len(paced) == LIMIT
+        assert (await _row(store, mid, Stage.OUTBOUND))[0] == "inflight"
+        assert recorder.attempts == []
+    finally:
+        await runner.stop()
+
+
+async def test_a_death_after_a_failed_send_does_not_mark_the_row_failed_twice(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KILL's first send fails, so the body sends it through ``mark_failed``; then the worker dies
+    after that, in the lane-health note. The death must not send the row through ``mark_failed``
+    a second time, which would repeat the failed event and restart the backoff. KILL is retried and
+    delivered. On the code before this guard ``mark_failed`` runs twice for that one death."""
+    recorder = _Recorder()
+    real_send = recorder.send
+    fails = {"KILL": 1}
+
+    async def fail_first(payload: str, **k: Any) -> None:
+        cid = _control_id(payload)
+        if fails.get(cid, 0) > 0:
+            fails[cid] -= 1
+            recorder.attempts.append(cid)
+            raise DeliveryError("simulated transport failure")
+        await real_send(payload, **k)
+
+    recorder.send = fail_first  # type: ignore[method-assign]
+    kills = [1]
+
+    def kill_once(self: RegistryRunner, name: str, message_id: str, exc: BaseException) -> None:
+        if kills:
+            kills.pop()
+            raise _Kill
+
+    monkeypatch.setattr(RegistryRunner, "_note_lane_unhealthy", kill_once)
+    marked: list[str] = []
+    real_mark = store.mark_failed
+
+    async def spy(outbox_id: str, *a: Any, **k: Any) -> Any:
+        marked.append(outbox_id)
+        return await real_mark(outbox_id, *a, **k)
+
+    monkeypatch.setattr(store, "mark_failed", spy)
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=_hl7("KILL"), deliveries=[("OB", _hl7("KILL"))]
+    )
+    runner = await _started(_registry(tmp_path), store, recorder)
+    try:
+        runner.notify_work()
+
+        async def delivered() -> bool:
+            return "KILL" in recorder.sent
+
+        await _until(delivered, timeout=5.0)
+        assert not kills  # the worker did die after the failed send
+        assert len(marked) == 1  # one failed send, one mark_failed
+        assert recorder.attempts == ["KILL", "KILL"]
+        status, attempts, _ = await _row(store, mid, Stage.OUTBOUND)
+        assert (status, attempts) == ("done", 2)
+    finally:
+        await runner.stop()

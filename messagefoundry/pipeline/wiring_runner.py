@@ -43,7 +43,7 @@ from collections.abc import (
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
 from pathlib import Path
@@ -1603,10 +1603,18 @@ class _HeldRows:
     ``ids`` may name rows the task already resolved, since a batch is cleared only once the whole
     pass resolves. That is harmless: ``reschedule_claimed`` touches only rows still ``inflight``,
     and every row named here is on the task's own lane, which has no other consumer (ADR 0059), so
-    an ``inflight`` row on it is this task's."""
+    an ``inflight`` row on it is this task's.
+
+    ``charged`` says whether the task's death was counted against a row (its ``worker_deaths``, or
+    a failed send on an outbound row), so a row cap bounds the re-pend; a death no row was charged
+    with is bounded per lane by :meth:`RegistryRunner._recover_then_run` instead. ``failed`` names
+    the rows sent through ``mark_failed`` since the current claim, so a death after a failed send
+    does not count that row a second time (:meth:`RegistryRunner._record_worker_death`)."""
 
     ids: list[str]
     fence: RependFence | None = None
+    charged: bool = False
+    failed: set[str] = field(default_factory=set)
 
 
 # Which direction's operator hold a STOPPED lane on each pooled stage belongs to. A RESPONSE lane is
@@ -2067,6 +2075,9 @@ class RegistryRunner:
         # by task, not lane, so a replacement never reads a live sibling's rows. An entry leaves at
         # the task's done-callback, or when a spawn that replaces the dead task takes it.
         self._held_rows_by_task: dict[asyncio.Task[Any], _HeldRows] = {}
+        # Deaths no row was charged with, per (worker, lane), this start. At _WORKER_DEATH_LIMIT the
+        # respawn stops re-pending the dead task's rows, so such a death stays bounded as on main.
+        self._uncharged_deaths: dict[tuple[str, str], int] = {}
         # --- outbound operator PAUSE (connection controls) ---------------------------------------
         # Operator-paused outbounds: delivery halted, queued rows RETAINED PENDING (never dropped/
         # reordered). The RELOAD-SURVIVING source of truth — outbound_running() reads it, a reload
@@ -6583,6 +6594,7 @@ class RegistryRunner:
                 # enters it.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
+            self._uncharged_deaths.clear()  # counted per start, as main retried such a row
             if self._dr_threshold is None:
                 # As in reload: with the profile off the threshold parks no outbound, and a
                 # marker left by a run under it would otherwise refuse doors until the next reload
@@ -7677,6 +7689,20 @@ class RegistryRunner:
             held = self._held_rows_by_task[task] = _HeldRows([])
         return held
 
+    def _current_held(self) -> _HeldRows | None:
+        """The current task's :class:`_HeldRows` if it is a per-lane worker that keeps one; never
+        creates one, so a pooled dispatcher task, which keeps none, gets ``None``."""
+        task = asyncio.current_task()
+        return None if task is None else self._held_rows_by_task.get(task)
+
+    def _note_marked_failed(self, ids: Iterable[str]) -> None:
+        """Record that ``ids`` went through ``mark_failed`` in this pass of a per-lane worker, so a
+        death that follows does not charge them a second failed send. Called once the write has
+        returned: a death inside the write leaves it uncertain, and the death charge then runs."""
+        held = self._current_held()
+        if held is not None:
+            held.failed.update(ids)
+
     def _take_dead_rows(self, old: asyncio.Task[None] | None) -> _HeldRows | None:
         """Take the held rows of ``old``, the worker a spawn is about to replace, when it died by an
         exception, for the replacement to re-pend before it claims. Every spawn door takes them, not
@@ -7722,8 +7748,11 @@ class RegistryRunner:
         on a per-lane lane, a batch head included, is already re-pended by
         :meth:`_record_worker_death` as a failed send, so its ``attempts`` count survives and the
         lane's own cap applies. A death no row is charged with (one outside the per-item bodies, or
-        one whose count the store failed to write) is retried on this backoff with no cap, as the
-        fault arm retries a persistent ``Exception``.
+        one whose count the store failed to write) is counted per worker and lane in this start,
+        and at :data:`_WORKER_DEATH_LIMIT` the dead task's rows are no longer re-pended: they stay
+        in flight for the next start's reset, and the replacement runs at once, as on main, which
+        respawned the worker and left the rows in flight. So such a death is retried at most that
+        many times in a start, never on an endless backoff.
 
         The write is a deferred one for a task that is gone, so it is not sent once another lease
         than the dead task's is held (:meth:`RependFence.moved`): another node led since, and the
@@ -7741,6 +7770,22 @@ class RegistryRunner:
                 )
                 await work(name)
                 return
+            if not dead.charged:
+                key = (worker, name)
+                count = self._uncharged_deaths[key] = self._uncharged_deaths.get(key, 0) + 1
+                if count >= _WORKER_DEATH_LIMIT:
+                    log.error(
+                        "%s worker %r: death %d this start that no row was charged with, the cap "
+                        "of %d; the dead worker's %d held row(s) are left in flight for the next "
+                        "start rather than re-pended",
+                        worker,
+                        name,
+                        count,
+                        _WORKER_DEATH_LIMIT,
+                        len(dead.ids),
+                    )
+                    await work(name)
+                    return
             # Taken over by this task first, so a death during the re-pend hands the same rows on.
             held = self._held_rows()
             held.ids[:] = dead.ids
@@ -10425,6 +10470,7 @@ class RegistryRunner:
                     )
                 # #1611: taken before anything else can raise, so the except arm re-pends THESE rows.
                 claimed[:] = [it.id for it in items]
+                holding.failed.clear()  # a re-claimed row may be failed again in this pass
                 if self._delivery_phase_timing:
                     # One lane per claim in per_lane mode (this worker owns exactly `name`). Recorded
                     # synchronously; counts only, never the lane name (destination_name = PHI-adjacent).
@@ -10884,6 +10930,7 @@ class RegistryRunner:
                     f"internal error (connection stopped): {safe_exc(exc)}",
                     retry,
                 )
+                self._note_marked_failed((item.id,))
                 _note_stop_dead_letter("delivery worker", name, failed, item.stage)
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering {item.id}"
@@ -11362,6 +11409,7 @@ class RegistryRunner:
                     _member_error(f"internal error (connection stopped): {safe_exc(exc)}", current),
                     retry,
                 )
+                self._note_marked_failed(ids)
                 _note_stop_dead_letter("delivery worker", name, failed, head.stage)
                 self._alert_sink.connection_stopped(
                     name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}{member}"
@@ -11510,7 +11558,9 @@ class RegistryRunner:
         ``next_attempt_at``, so one timer re-claims the identical prefix. A dispatcher-drained lane skips
         the arming (the dispatcher parks off the returned deadline); a worker-drained lane arms, exactly
         as the single row does."""
-        return self._arm_retry(lane, await self.store.mark_batch_failed(list(ids), error, retry))
+        failed = await self.store.mark_batch_failed(list(ids), error, retry)
+        self._note_marked_failed(ids)
+        return self._arm_retry(lane, failed)
 
     async def _router_worker(self, name: str) -> None:
         """Drain the **ingress** stage for one inbound — the router half of the split pipeline (ADR
@@ -13605,7 +13655,12 @@ class RegistryRunner:
         nothing is written. Where the store counted fewer attempts than the claim, ``mark_failed``
         takes its retry branch at the cap too, and :meth:`_arm_retry` arms its retry wake on a lane
         a per-lane worker drains while ``_per_lane_wake`` is on. A lane that retries forever
-        (``max_attempts = None``) never dead-letters on a death.
+        (``max_attempts = None``) never dead-letters on a death. A row the dying per-lane worker
+        already sent through ``mark_failed`` in this pass is not sent through it again: that failed
+        send counted the attempt, and a second would repeat its event and restart its backoff.
+
+        A per-lane worker's record is marked charged once a death is counted against a row here,
+        so the respawn knows a row cap bounds the re-pend (:meth:`_recover_then_run`).
 
         **A pooled lane's serializer is not respawned**: that half of #4607 (its step 2) stays held
         for the owner, so its lane claims nothing until a restart, and every death there fires
@@ -13628,6 +13683,19 @@ class RegistryRunner:
         error = f"{worker} worker killed by {kind}"
         outbound = stage is Stage.OUTBOUND
         retry = self._retry.get(name) or RetryPolicy()
+        held = self._current_held()
+        if outbound and held is not None and item.id in held.failed:
+            held.charged = True
+            log.error(
+                "%s worker %r: row %s (message %s) killed the worker with %s after mark_failed "
+                "already counted this attempt as a failed send; not counted again",
+                worker,
+                name,
+                item.id,
+                item.message_id,
+                kind,
+            )
+            return
         try:
             if outbound:
                 cap = retry.max_attempts
@@ -13654,6 +13722,8 @@ class RegistryRunner:
                 # backoff and keeps the claim's attempts, which the respawn's reschedule_claimed
                 # would undo, so the lane's cap is reached in-process (#1611 step 2).
                 failed = await self._mark_failed_and_arm(name, item.id, error, retry)
+                if held is not None:
+                    held.charged = True
                 if failed.retry_at is not None:
                     # mark_failed took its retry branch. Its retry_at comes back even when the
                     # status term skipped a row already resolved (ADR 0157 Amendment A), so it
@@ -13681,6 +13751,8 @@ class RegistryRunner:
             else:
                 counted = await self.store.record_worker_death(item.id, _WORKER_DEATH_LIMIT, error)
                 dead, deaths = counted.dead, counted.deaths
+                if held is not None and deaths:
+                    held.charged = True
         except Exception as fault:  # noqa: BLE001 - the death is re-raised by the caller; see above
             # No traceback: the fault's context is the death, whose text can carry the message.
             log.warning(
@@ -13759,7 +13831,9 @@ class RegistryRunner:
         its own exact park timer off the returned deadline) and taken for a lane a per-lane WORKER
         drains — which under pooled means an UNORDERED lane (ADR 0066 D4), whose retry would otherwise
         ride the idle backstop because no dispatcher parks on its behalf."""
-        return self._arm_retry(lane, await self.store.mark_failed(outbox_id, error, retry))
+        failed = await self.store.mark_failed(outbox_id, error, retry)
+        self._note_marked_failed((outbox_id,))
+        return self._arm_retry(lane, failed)
 
     def _arm_retry(self, lane: str, failed: FailOutcome) -> FailOutcome:
         """Arm the one-shot retry wake for ``failed``'s ``retry_at`` on a lane a per-lane WORKER
