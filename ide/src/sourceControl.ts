@@ -22,6 +22,8 @@ import {
   HOOK_REL,
   HOOKS_DIR,
   PRE_COMMIT_TEMPLATE,
+  setupText,
+  type SetupText,
 } from "./sourceControlTemplates";
 
 const DISMISS_KEY = "messagefoundry.scPromptDismissed";
@@ -152,9 +154,10 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   logChecks(["Set Up Version Control & Checks:", ...notes.map((n) => `  • ${n}`)].join("\n"));
 
   await maybeAddRemote(bin, ws);
-  await maybeFirstCommit(bin, ws, hookPaths.check);
+  const text = setupText(hookPaths.hook !== undefined);
+  await maybeFirstCommit(bin, ws, hookPaths.check, text);
 
-  void vscode.window.showInformationMessage("MessageFoundry: version control & checks are set up.");
+  void vscode.window.showInformationMessage(text.done);
 }
 
 async function guideGitInstall(): Promise<void> {
@@ -549,13 +552,11 @@ async function stageBaseline(bin: string, ws: string): Promise<boolean> {
 // REQUIRED check failed — advisories (e.g. dead-config) print but never block (checks.py / __main__).
 // A required failure doesn't stop the baseline: the seed is conventionally exempt, so we offer to
 // commit it and fix forward, with the details one click away — never leading with --no-verify.
-async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Promise<void> {
+async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths, text: SetupText): Promise<void> {
   // Only a repository with no commits yet gets a baseline. In one with history, staging the whole
   // tree would sweep the user's work in progress into a commit named "Initial commit".
   if ((await git(bin, ["rev-parse", "--verify", "-q", "HEAD"], ws)).code === 0) {
-    void vscode.window.showInformationMessage(
-      "MessageFoundry: this repository already has commits, so no baseline commit was made. Review and commit .gitignore, .gitattributes and .mefor-hooks/pre-commit yourself.",
-    );
+    void vscode.window.showInformationMessage(text.hasHistory);
     return;
   }
   const pick = await vscode.window.showInformationMessage(
@@ -576,7 +577,7 @@ async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Pro
     if (!(await stageBaseline(bin, ws))) {
       return;
     }
-    const res = await git(bin, ["commit", "-m", "Initial commit (MessageFoundry checks enabled)"], ws);
+    const res = await git(bin, ["commit", "-m", text.commitMessage], ws);
     logResult("--- baseline commit ---", res);
     if (res.code === 0) {
       void vscode.window.showInformationMessage(
@@ -584,9 +585,7 @@ async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Pro
       );
     } else {
       showChecks();
-      void vscode.window.showWarningMessage(
-        "MessageFoundry: the commit hook reported an issue — see the 'MessageFoundry Checks' output.",
-      );
+      void vscode.window.showWarningMessage(text.commitFailed);
     }
     return;
   }
@@ -595,7 +594,7 @@ async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Pro
   // exempted; every commit after it runs the hook.
   showChecks();
   const choice = await vscode.window.showWarningMessage(
-    "A required check hasn't passed yet. You can still commit this as your baseline snapshot — the checks run on every commit after it, so you can fix the flagged items next. Details are in the 'MessageFoundry Checks' output.",
+    text.offerBaseline,
     "Commit baseline anyway",
     "Show details",
     "Cancel",
@@ -608,14 +607,12 @@ async function maybeFirstCommit(bin: string, ws: string, paths: CheckPaths): Pro
     }
     const res = await git(
       bin,
-      ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
+      ["commit", "-m", text.commitMessage, "--no-verify"],
       ws,
     );
     logResult(`--- baseline commit (hooks skipped): git exit code ${res.code} ---`, res);
     if (res.code === 0) {
-      void vscode.window.showInformationMessage(
-        "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
-      );
+      void vscode.window.showInformationMessage(text.committedAnyway);
     } else {
       void vscode.window.showErrorMessage(`MessageFoundry: commit failed — ${res.stderr.trim()}`);
     }

@@ -12,6 +12,7 @@ import {
   LEGACY_AI_POLICY_KEY,
   aiPolicyCacheKey,
   assistantState,
+  brokeredNoReplyNotice,
   cachedPolicyOffline,
   carryDeniesOffline,
   carryDeniesOnline,
@@ -679,6 +680,31 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     assert.ok(read >= 0, "resolveAiPolicy must read whether an engine has answered from globalState");
     assert.ok(read < code.search(/return carryDeniesOffline\(/), "it must be read before the carrier runs");
     assert.ok(/targetConfigured: engineTargetIsSet,/.test(code), "the production io must read the settings");
+  });
+});
+
+suite("chat.ts no-reply notice for an engine-brokered request (BACKLOG #5407)", () => {
+  test("before the request goes out, it says nothing was sent", () => {
+    const notice = brokeredNoReplyNotice(false);
+    assert.ok(notice.includes("Nothing was sent"), notice);
+  });
+
+  test("after the request went out and a re-sign-in was cancelled, it says the request was sent", () => {
+    const notice = brokeredNoReplyNotice(true);
+    assert.ok(!notice.includes("Nothing was sent"), notice);
+    assert.ok(notice.includes("was sent to the MessageFoundry engine"), notice);
+    assert.ok(notice.includes("your prompt and the attached code"), notice);
+  });
+
+  test("chat.ts marks the request sent inside the call withAuth makes, and names that in the notice", () => {
+    // chat.ts imports vscode, so test:unit cannot run it; the flag's placement is what decides.
+    const chat = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "chat.ts"), "utf8");
+    assert.ok(
+      /withAuth\(context, url, \(token\) => \{\s*sent = true;\s*return postJson<AiChatReply>\(/.test(chat),
+      "the flag must be set inside the call, before the POST",
+    );
+    assert.ok(/brokeredNoReplyNotice\(sent\)/.test(chat));
+    assert.ok(!chat.includes("Nothing was sent"), "the notice text lives in aiPolicyModel.ts only");
   });
 });
 

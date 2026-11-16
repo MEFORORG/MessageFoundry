@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 
 import * as vscode from "vscode";
 
-import { engineUrl, environments, isExecGated, runJson, serviceConfig, workspaceDir } from "./cli";
+import { engineUrl, environments, isExecGated, runJson, workspaceDir, writerCheckSetting } from "./cli";
 import {
   clearEngineTrustAnchors,
   setEngineTrustAnchor,
@@ -16,6 +16,7 @@ import {
 } from "./engineClient";
 import { engineLog } from "./engineLog";
 import { isLocalEngine } from "./engineTarget";
+import { droppedSkipped } from "./workspaceContainment";
 import {
   engineHostKey,
   hostPinsOf,
@@ -508,13 +509,28 @@ async function askCli(
     inconclusive();
     return;
   }
+  // A value the containment dropped (BACKLOG #5404) is refused, as a writer refuses one: the file
+  // used in its place is not the one the operator named, so its `[api].tls_cert_file` must not
+  // become a trust anchor. No outcome is set, so any anchor this source registered earlier is
+  // dropped too; a caFile pin is read separately and still applies.
+  const setting = writerCheckSetting("serviceConfig");
+  if (setting.dropped !== false) {
+    engineLog().warn(
+      droppedSkipped(
+        "serviceConfig",
+        setting.dropped,
+        `\`cert inventory\` was not run and no engine certificate is trusted for ${url}`,
+      ),
+    );
+    return;
+  }
   let payload: unknown;
   try {
     // `cert inventory` is read-only and starts no server; --service-config alone is a valid source.
     // The path is workspace-relative (like every other messagefoundry.* path setting), so it runs
     // from the workspace the same way alertEditor.ts runs `alert list`.
     const call = runJson<unknown>(
-      ["cert", "inventory", "--service-config", serviceConfig()],
+      ["cert", "inventory", "--service-config", setting.value],
       workspace,
       { timeoutMs: CERT_INVENTORY_TIMEOUT_MS },
     );

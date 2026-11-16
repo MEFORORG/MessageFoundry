@@ -76,3 +76,46 @@ fi
 
 exec "$PY" -P -m messagefoundry check --config __CONFIG_DIR__ --messages __MESSAGES_DIR__
 `;
+
+/** The text setup shows and commits, which depends on whether it wrote the commit hook. */
+export interface SetupText {
+  readonly done: string;
+  readonly hasHistory: string;
+  readonly commitMessage: string;
+  readonly commitFailed: string;
+  readonly offerBaseline: string;
+  readonly committedAnyway: string;
+}
+
+/**
+ * {@link SetupText} for a setup that wrote the hook (`hookWritten`) or skipped it because a path
+ * setting names a folder outside the workspace. Without a hook, setup must not say checks run on
+ * commit or name a hook file it never wrote (BACKLOG #5404).
+ */
+export function setupText(hookWritten: boolean): SetupText {
+  const files = hookWritten ? `.gitignore, .gitattributes and ${HOOK_REL}` : ".gitignore and .gitattributes";
+  const hasHistory = `MessageFoundry: this repository already has commits, so no baseline commit was made. Review and commit ${files} yourself.`;
+  if (hookWritten) {
+    return {
+      done: "MessageFoundry: version control & checks are set up.",
+      hasHistory,
+      commitMessage: "Initial commit (MessageFoundry checks enabled)",
+      commitFailed: "MessageFoundry: the commit hook reported an issue — see the 'MessageFoundry Checks' output.",
+      offerBaseline:
+        "A required check hasn't passed yet. You can still commit this as your baseline snapshot — the checks run on every commit after it, so you can fix the flagged items next. Details are in the 'MessageFoundry Checks' output.",
+      committedAnyway:
+        "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
+    };
+  }
+  return {
+    done:
+      "MessageFoundry: version control is set up, but no commit hook was written, so commits are not checked. Set the path settings to folders inside the workspace and run setup again to add it.",
+    hasHistory,
+    commitMessage: "Initial commit",
+    commitFailed: "MessageFoundry: the commit failed — see the 'MessageFoundry Checks' output.",
+    offerBaseline:
+      "A required check hasn't passed yet. You can still commit this as your baseline snapshot. No commit hook was set up, so later commits are not checked; run the checks yourself after fixing the flagged items. Details are in the 'MessageFoundry Checks' output.",
+    committedAnyway:
+      "MessageFoundry: baseline committed. No commit hook was set up, so later commits are not checked — fix the flagged items in 'MessageFoundry Checks'.",
+  };
+}

@@ -197,8 +197,10 @@ or unreadable settings file is refused rather than read as the built-in default.
 folder open, the CLI is not asked unless that path is fully qualified, since a relative one would be
 read from the editor's own working directory. On Windows that means a drive-letter or UNC path: a
 root-relative `\svc\x.toml` takes the current drive and is refused too. A workspace value of `messagefoundry.serviceConfig` whose
-spelling names a path outside the workspace folder is not used, and the user's value or the
-default is named instead; the check reads the spelling only, not links inside the folder. If none
+spelling names a path outside the workspace folder is not used, and the CLI is then not asked at
+all: the file the user's value or the default would name in its place is not the one the workspace
+named, so its policy must not enable assistance. A user value that is not text is refused the same
+way. The check reads the spelling only, not links inside the folder. If none
 of those can confirm a policy, it uses a fail-closed
 built-in default (`mode: unverified`). That default **disables** assistance rather than re-enabling
 BYO, so a central *off* cannot be bypassed by taking the engine offline (SEC-022).

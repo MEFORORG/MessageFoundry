@@ -200,3 +200,9 @@ export function writerRefusal(key: string, dropped: DroppedScope): string {
   return `MessageFoundry: ${droppedWhy(key, dropped)}, so nothing was written or started. ${fix}`;
 }
 
+/** The log line a background reader writes when it refuses a dropped value rather than act on the
+ *  one used in its place (BACKLOG #5404). `skipped` says what did not happen. */
+export function droppedSkipped(key: string, dropped: DroppedScope, skipped: string): string {
+  return `${droppedWhy(key, dropped)}, so ${skipped}`;
+}
+

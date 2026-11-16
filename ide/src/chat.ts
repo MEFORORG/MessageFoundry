@@ -6,6 +6,7 @@
 // bodies / patient data — regardless of the chosen model.
 import * as vscode from "vscode";
 import { DEFAULT_AI_POLICY_IO, aiPolicyEngineUrl, assistantState, resolveAiPolicy } from "./aiPolicy";
+import { brokeredNoReplyNotice } from "./aiPolicyModel";
 import { withAuth } from "./auth";
 import { aiContextCharLimit } from "./cli";
 import { postJson } from "./engineClient";
@@ -159,21 +160,19 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
       // The engine whose policy said managed_endpoint (BACKLOG #5564), not a different one.
       const url = engine;
       try {
-        const res = await withAuth(context, url, (token) =>
-          postJson<AiChatReply>(
+        // Whether the POST went out at all, which withAuth's undefined cannot say (BACKLOG #5407).
+        let sent = false;
+        const res = await withAuth(context, url, (token) => {
+          sent = true;
+          return postJson<AiChatReply>(
             url,
             "/ai/chat",
             { prompt: parts.join("\n\n"), data_scope: "code_only" },
             token,
-          ),
-        );
-        if (res === undefined) {
-          // withAuth answers undefined for a cancelled sign-in and for a target its gate refused,
-          // which it has already named in an error (BACKLOG #5407), so name both here.
-          stream.markdown(
-            "_Nothing was sent: sign in to the MessageFoundry engine to use engine-brokered AI assistance, " +
-              "or, if an error said the engine address was refused, correct that address._",
           );
+        });
+        if (res === undefined) {
+          stream.markdown(brokeredNoReplyNotice(sent));
           return;
         }
         stream.markdown(res.reply);

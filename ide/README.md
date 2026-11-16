@@ -276,7 +276,10 @@ anything into your OS certificate store. If it cannot verify, the request fails 
 
 This happens at startup and again whenever you change `messagefoundry.engineUrl`,
 `messagefoundry.environments` or `messagefoundry.serviceConfig`. Every part of it fails soft — with no engine on `PATH`, an untrusted
-workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra.
+workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra. A
+workspace `serviceConfig` that names a path outside the workspace folder, or a user value that is not
+text, is not replaced by another file here: the extension runs no `cert inventory`, trusts no engine
+certificate from it, and says so in the MessageFoundry Engine output. A `caFile` pin still applies.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that

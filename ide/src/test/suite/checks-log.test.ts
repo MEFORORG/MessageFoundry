@@ -78,6 +78,10 @@ let checkCode = 1;
 let hasHead = false;
 /** The answer to the "required check hasn't passed" prompt. */
 let baselineAnswer: string | undefined = "Commit baseline anyway";
+/** Settings the stub reports as set in USER settings; everything else is left at its default. */
+let userSettings: Record<string, unknown> = {};
+/** Every notification setup showed, in order. */
+let shown: string[] = [];
 
 const CHECK_STDOUT = "FAIL dryrun\r\n  synthetic detail line\nPASS validate";
 
@@ -89,8 +93,9 @@ const vscodeStub = {
     },
     isTrusted: true,
     getConfiguration: () => ({
-      get: (_key: string, fallback: unknown): unknown => fallback,
-      inspect: (): undefined => undefined,
+      get: (key: string, fallback: unknown): unknown => (key in userSettings ? userSettings[key] : fallback),
+      inspect: (key: string): { globalValue: unknown } | undefined =>
+        key in userSettings ? { globalValue: userSettings[key] } : undefined,
     }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => fs.promises.stat(uri.fsPath),
@@ -104,13 +109,18 @@ const vscodeStub = {
   },
   window: {
     // The two prompts on the path under test are answered; every other prompt is dismissed.
-    showInformationMessage: (message: string): Promise<string | undefined> =>
-      Promise.resolve(message.startsWith("Make the first commit") ? "Run checks & commit" : undefined),
-    showWarningMessage: (message: string): Promise<string | undefined> =>
-      Promise.resolve(
-        message.startsWith("A required check hasn't passed") ? baselineAnswer : undefined,
-      ),
-    showErrorMessage: nothing,
+    showInformationMessage: (message: string): Promise<string | undefined> => {
+      shown.push(message);
+      return Promise.resolve(message.startsWith("Make the first commit") ? "Run checks & commit" : undefined);
+    },
+    showWarningMessage: (message: string): Promise<string | undefined> => {
+      shown.push(message);
+      return Promise.resolve(message.startsWith("A required check hasn't passed") ? baselineAnswer : undefined);
+    },
+    showErrorMessage: (message: string): Promise<undefined> => {
+      shown.push(message);
+      return Promise.resolve(undefined);
+    },
     showQuickPick: nothing,
     showInputBox: nothing,
     // `appendLine` and `show` only. A write that went around the stamper through `append` or
@@ -203,6 +213,8 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     checkCode = 1;
     hasHead = false;
     baselineAnswer = "Commit baseline anyway";
+    userSettings = {};
+    shown = [];
     // No process runs. git answers as an existing repository with no remote and no hooks path, and
     // `messagefoundry check` answers with `checkCode` and a multi-line block.
     childProcess.execFile = ((
@@ -312,6 +324,48 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     assert.ok(runs.some((a) => a[0] === "rev-parse" && a.includes("HEAD")), JSON.stringify(runs));
     assert.ok(!runs.some(isStageAll), JSON.stringify(runs));
     assert.ok(!runs.some((a) => a[0] === "commit" || a.includes("check")), JSON.stringify(runs));
+  });
+
+  /** A configDir outside the workspace, set in user settings: setup then writes no hook. */
+  const configDirOutside = (): void => {
+    userSettings = { configDir: path.join(os.tmpdir(), "mf-outside-config") };
+  };
+  const commits = (): string[][] => launches().filter((a) => a[0] === "commit");
+
+  test("with no hook written, nothing setup shows or commits says checks run on commit (BACKLOG #5404)", async () => {
+    configDirOutside();
+    for (const code of [0, 1]) {
+      checkCode = code;
+      events = [];
+      shown = [];
+      await sc.setupSourceControl({} as never);
+      assert.ok(lines().some((l) => l.includes("hook: not written")), JSON.stringify(lines()));
+      assert.ok(!launches().some((a) => a.includes("core.hooksPath")), JSON.stringify(launches()));
+      const made = commits();
+      assert.strictEqual(made.length, 1, JSON.stringify(launches()));
+      assert.strictEqual(made[0][made[0].indexOf("-m") + 1], "Initial commit");
+      for (const m of shown) {
+        assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active|pre-commit/.test(m), m);
+      }
+      assert.ok(shown.some((m) => m.includes("no commit hook was written")), JSON.stringify(shown));
+    }
+  });
+
+  test("with no hook written and existing history, the hook file is not named for commit", async () => {
+    configDirOutside();
+    hasHead = true;
+    await sc.setupSourceControl({} as never);
+    const history = shown.find((m) => m.includes("already has commits"));
+    assert.ok(history !== undefined, JSON.stringify(shown));
+    assert.ok(!history.includes("pre-commit"), history);
+  });
+
+  test("control: with the hook written, setup and the baseline commit say checks are enabled", async () => {
+    checkCode = 0;
+    await sc.setupSourceControl({} as never);
+    const made = commits();
+    assert.strictEqual(made[0]?.[made[0].indexOf("-m") + 1], "Initial commit (MessageFoundry checks enabled)");
+    assert.ok(shown.includes("MessageFoundry: version control & checks are set up."), JSON.stringify(shown));
   });
 
   test("control: when the check passes, the commit runs the hooks and no bypass is recorded", async () => {
