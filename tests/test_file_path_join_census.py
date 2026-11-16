@@ -1119,7 +1119,14 @@ IDE_SITES: dict[str, Site] = {
         "those two resolve to. Not guarded: the containment and link checks run on the joined path. "
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
-    "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/sourceControl.ts": Site(
+        10,
+        OPERATOR,
+        _IDE_WORKSPACE
+        + " Three more resolve the repository's top level and its core.hooksPath, both "
+        "read from the operator's own git, only to compare them with the hook's folder; nothing is "
+        "read or written at them.",
+    ),
     "ide/src/statusBar.ts": Site(
         5,
         REVIEWED,
