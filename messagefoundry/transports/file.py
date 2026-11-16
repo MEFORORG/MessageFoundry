@@ -18,6 +18,7 @@ about a config **Handler**: its return is routed like any other (and an inadmiss
 from __future__ import annotations
 
 import asyncio
+import codecs
 import ctypes
 import enum
 import errno
@@ -50,7 +51,13 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
+from messagefoundry.parsing.sniff import (
+    _LEADING_WS_STR,
+    _TEXT_SNIFF_HEAD_CHARS,
+    _content_matches_declared,
+    _looks_like_hl7,
+    text_sniff_head,
+)
 from messagefoundry.parsing.split import one_message_bytes, split_batch
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
@@ -784,6 +791,74 @@ class FileDestination(DestinationConnector):
             )
 
 
+#: Bytes decoded per step while looking for a file's first significant characters (BACKLOG #5684).
+_SNIFF_DECODE_CHUNK = 4096
+
+
+def _decoded_sniff_head(raw: bytes, encoding: str) -> bytes:
+    """The head of ``raw`` decoded with ``encoding``, as :func:`text_sniff_head` hands it to the
+    content sniff (BACKLOG #5684).
+
+    The runner decodes a file source's bytes with its configured ``encoding``, so the sniff must
+    read them the same way: a UTF-16 or UTF-32 drop leads with a BOM and NUL-interleaved
+    characters, never a bare ``MSH`` or ``{``, and a raw-byte sniff would quarantine every such
+    file. Decoded incrementally, a chunk at a time, only until the first significant characters
+    appear, so a large file is not decoded whole here; a character split at a chunk edge waits for
+    the next chunk. An undecodable byte becomes U+FFFD, which no magic matches. The caller tries
+    the raw-byte sniff first and this head only when that fails, so no file the raw sniff admits is
+    quarantined by it."""
+    try:
+        decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    except LookupError:
+        return b""  # no such codec: nothing decodes, so nothing matches (config load refuses one)
+    text = ""
+    for start in range(0, len(raw), _SNIFF_DECODE_CHUNK):
+        end = start + _SNIFF_DECODE_CHUNK
+        text += decoder.decode(raw[start:end], final=end >= len(raw))
+        text = text.lstrip(_LEADING_WS_STR)
+        if len(text) >= _TEXT_SNIFF_HEAD_CHARS:
+            break
+    return text_sniff_head(text)
+
+
+def _archive_subdir(directory: Path, value: object, knob: str) -> Path:
+    """The ``processed_subdir``/``error_subdir`` directory ``value`` names under ``directory``,
+    normalised, or ValueError for a value that would break the scan (BACKLOG #5682).
+
+    The scan skips a listed file whose parents hold either archive directory, comparing paths
+    lexically. A value that names the watch directory itself or one above it (``""``, ``"."``,
+    ``".."``, ``"a/.."``, or an absolute path to either) puts that directory among every drop's
+    parents, so every drop would be skipped and none counted. An unnormalised value (``"./a"``,
+    ``"a/../b"``) would never compare equal to a listed parent, so files moved there would be listed
+    and ingested again on every recursive scan. Purely lexical: no filesystem call, so it is safe on
+    the event loop. The value is withheld from the error, as the other setting refusals here do."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"file source {knob} must name a directory (value withheld)")
+    sub = Path(value)
+    if sub.is_absolute():
+        target = Path(os.path.normpath(sub))
+        # Absolute: compare against the absolute watch directory. abspath reads only the cwd.
+        base = Path(os.path.normpath(os.path.abspath(directory)))
+        if target == base or target in base.parents:
+            raise ValueError(
+                f"file source {knob} must not be the watch directory or a directory above it "
+                "(value withheld)"
+            )
+        if base in target.parents:
+            # Inside the watch tree: spell it from the watch directory as configured, which is how
+            # every listed path is spelled, so the lexical parent test matches.
+            return directory / target.relative_to(base)
+        return target
+    rel = os.path.normpath(sub)
+    parts = Path(rel).parts
+    if rel == os.curdir or all(part == os.pardir for part in parts):
+        raise ValueError(
+            f"file source {knob} must not be the watch directory or a directory above it "
+            "(value withheld)"
+        )
+    return directory / rel
+
+
 class FileSource(SourceConnector):
     """Poll a directory for files and feed each to the pipeline handler."""
 
@@ -794,10 +869,11 @@ class FileSource(SourceConnector):
         if "directory" not in s:
             raise ValueError("file source requires a 'directory' setting")
         self.directory = Path(s["directory"])
-        # Resolved watch root for path-confinement: every read and move walks down from it, so a
-        # recursive scan cannot be walked out of the configured directory through a link (BACKLOG
-        # #2507, #2535). resolve() is non-strict, so it's fine that the directory is created later.
-        self._root_real = self.directory.resolve()
+        # Resolved watch root for path-confinement, filled on first use by the _root_real property.
+        # Not resolved here: resolve() touches the filesystem, and this constructor runs on the event
+        # loop at build and reload, where a slow or unreachable share would stall the engine (BACKLOG
+        # #5683).
+        self._root_real_cache: Path | None = None
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = poll_interval(s, default=1.0, transport="file source")
         self.min_age_seconds: float = float_setting(
@@ -884,8 +960,12 @@ class FileSource(SourceConnector):
         # Caps the gzip members in one drop (BACKLOG #1129). Only consulted when `decompress` is set,
         # but read at build either way, like `max_decompressed_bytes`, so a typo fails early.
         self.max_decompressed_members: int = _member_cap(s.get("max_decompressed_members"))
-        self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
-        self.error_dir = self.directory / s.get("error_subdir", ".error")
+        self.processed_dir = _archive_subdir(
+            self.directory, s.get("processed_subdir", ".processed"), "processed_subdir"
+        )
+        self.error_dir = _archive_subdir(
+            self.directory, s.get("error_subdir", ".error"), "error_subdir"
+        )
         self._handler: InboundHandler | None = None
         # Leader-gate (Track B Step 4b): when set, this directory (a shared external resource) is
         # polled only while the gate returns True, so in a cluster exactly one node ingests its
@@ -922,6 +1002,30 @@ class FileSource(SourceConnector):
         if self._cred_ctx is not None:
             return await self._cred_ctx.run(fn, *args, **kwargs)
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    @property
+    def _root_real(self) -> Path:
+        """The resolved watch root every read and move walks down from, so a recursive scan cannot be
+        walked out of the configured directory through a link (BACKLOG #2507, #2535).
+
+        Resolved once, on first use. Every reader is a filesystem helper that runs through
+        :meth:`_run_fs`, so the resolve happens off the event loop and under the endpoint's identity
+        (BACKLOG #5683). resolve() is non-strict, so a directory created later is fine."""
+        root = self._root_real_cache
+        if root is None:
+            root = self._root_real_cache = self.directory.resolve()
+        return root
+
+    def _content_matches(self, raw: bytes) -> bool:
+        """Whether ``raw`` matches the declared content type (ASVS 5.2.2): the raw bytes first, then,
+        for a text type, the head decoded with this source's ``encoding`` (BACKLOG #5684), so a
+        UTF-16 or UTF-32 drop is not quarantined for its BOM and NULs. DICOM's magic is binary and
+        is only ever read from the raw bytes."""
+        if _content_matches_declared(self.content_type, raw):
+            return True
+        if self.content_type in (ContentType.DICOM, ContentType.BINARY, ContentType.TEXT):
+            return False
+        return _content_matches_declared(self.content_type, _decoded_sniff_head(raw, self.encoding))
 
     def _prepare_subdirs(self) -> None:
         """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
@@ -961,12 +1065,11 @@ class FileSource(SourceConnector):
         self._handler = handler
         self._leader_gate = leader_gate
         self._stop.clear()
-        # Create the subdirs under the endpoint's identity when a credential is configured (a UNC share
-        # the service account can't touch); otherwise inline, byte-identical to before #111.
-        if self._cred_ctx is None:
-            self._prepare_subdirs()
-        else:
-            await self._cred_ctx.run(self._prepare_subdirs)
+        # Create the subdirs off the event loop, under the endpoint's identity when a credential is
+        # configured (a UNC share the service account can't touch). The mkdirs and directory opens
+        # block for the OS timeout on an unreachable share, which inline would stall the whole engine
+        # at start or reload (BACKLOG #5683).
+        await self._run_fs(self._prepare_subdirs)
         self._task = asyncio.create_task(self._run())
 
     async def test_connection(self) -> None:
@@ -1276,7 +1379,7 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 return _Step.CHARGED
-        if not _content_matches_declared(self.content_type, raw):
+        if not self._content_matches(raw):
             # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
             # body on an x12 inbound, a headerless HL7 drop, …) — quarantine before its bytes reach
             # the pipeline (ASVS 5.2.2). Like the oversize reject above it never became a "received
@@ -1653,10 +1756,12 @@ class FileSource(SourceConnector):
 
     async def _leave_record(self, file_key: str) -> None:
         """Mark a leave-in-place file ingested: the durable ledger (a HASHED key, no cleartext filename)
-        plus the bounded in-process cache. Idempotent on the store side."""
-        self._seen_add(file_key)
+        plus the bounded in-process cache. Idempotent on the store side. The ledger goes first, so a
+        failed write leaves no cached key to short-circuit the ledger read and the file is handed
+        over again rather than never recorded durably (BACKLOG #5685, as the remote source)."""
         if self.processed_ledger is not None:
             await self.processed_ledger.mark_processed(file_key)
+        self._seen_add(file_key)
 
     async def _emit(self, raw: bytes) -> bool:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO). Returns
@@ -2052,7 +2157,13 @@ class FileSource(SourceConnector):
         if "directory" not in s:
             return ()
         directory = Path(s["directory"])
-        return directory, directory / s.get("error_subdir", ".error")
+        value = s.get("error_subdir", ".error")
+        try:
+            error_dir = _archive_subdir(directory, value, "error_subdir")
+        except ValueError:
+            # A value the constructor refuses never runs, but the guard still protects what it names.
+            error_dir = directory / str(value)
+        return directory, error_dir
 
     @property
     def archiving(self) -> bool:

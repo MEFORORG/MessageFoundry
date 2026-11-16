@@ -706,6 +706,40 @@ async def test_source_leave_durable_ledger_read_is_the_dedup(
     assert "/in/a.hl7" in client.files  # left in place
 
 
+async def test_source_leave_failed_ledger_write_is_retried_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5685: the durable ledger write goes before the seen cache. Red on the unfixed code:
+    # the key was cached first, so after a failed write the next poll skipped the file on the cache
+    # and the ledger never got its row, which a restart would then read as never ingested.
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+    real_mark = ledger.mark_processed
+    fail = [True]
+
+    async def mark(file_key: str) -> None:
+        if fail[0]:
+            raise OSError("synthetic ledger write failure")
+        await real_mark(file_key)
+
+    ledger.mark_processed = mark  # type: ignore[method-assign]
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    with pytest.raises(OSError):
+        await src._poll_once()
+    assert len(src._processed_seen) == 0, "a failed ledger write must leave nothing cached"
+    fail[0] = False
+    await _settle(src)  # the read file must settle again from a fresh sighting (BACKLOG #2071)
+    await src._poll_once()
+    assert h.bodies == [b"MSH|^~\\&|A", b"MSH|^~\\&|A"]  # handed over again (at-least-once)
+    assert len(ledger.keys) == 1, "the retry recorded the file durably"
+    await src._poll_once()
+    assert len(h.bodies) == 2, "once recorded, it is not read again"
+
+
 async def test_source_leave_untagged_ledger_row_still_skips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

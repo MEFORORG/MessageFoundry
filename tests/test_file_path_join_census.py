@@ -944,8 +944,11 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),
-    "messagefoundry/transports/file.py::FileSource.__init__": Site(
-        2, OPERATOR, "The operator's processed and error subdirectory settings."
+    "messagefoundry/transports/file.py::_archive_subdir": Site(
+        2,
+        OPERATOR,
+        "The operator's processed or error subdirectory setting, normalised, and refused when it "
+        "names the watch directory or one above it (BACKLOG #5682).",
     ),
     "messagefoundry/transports/file.py::FileSource.guarded_dirs": Site(
         1, OPERATOR, "The operator's error subdirectory setting, as `__init__` joins it."

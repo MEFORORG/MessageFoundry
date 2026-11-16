@@ -182,9 +182,13 @@ def test_an_archive_directory_holding_the_watch_directory_is_refused(
     """`processed_subdir = "."` would make every undelivered drop an 'archive'. Refused, and
     warned about on every pass, since while it holds the archive has no age bound at all.
 
-    Mutation: drop the overlap guard. Red: the waiting drop is deleted."""
+    Mutation: drop the overlap guard. Red: the waiting drop is deleted.
+
+    The constructor now refuses both values (BACKLOG #5682), so the archive directory is set on the
+    built source directly: the sweep's own guard stays a second line behind that refusal."""
     inbox = tmp_path / "in"
-    src = _source(inbox, processed_subdir=subdir)
+    src = _source(inbox)
+    src.processed_dir = inbox / subdir
     drop = _aged(inbox / "waiting.hl7", 90)
 
     assert _prune(src) is None

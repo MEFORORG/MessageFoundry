@@ -3439,11 +3439,15 @@ class RemoteFileSource(SourceConnector):
         return False
 
     async def _leave_record(self, file_key: str) -> None:
-        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key) + the bounded cache."""
-        self._seen_add(file_key)
+        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key), then the bounded
+        cache. The ledger goes first so a failed write leaves the cache without the key too: a cached
+        key short-circuits the ledger read, so the file would never be recorded durably and would be
+        ingested again after a restart or an eviction (BACKLOG #5685). With nothing cached, the next
+        poll finds no row and hands the file over again, which at-least-once allows."""
         if self.processed_ledger is not None:
             with self._stop_guard.store_call():
                 await self.processed_ledger.mark_processed(file_key)
+        self._seen_add(file_key)
 
     async def _after_processing(self, path: str, name: str, read_size: int) -> None:
         if self._after_read == "leave":
