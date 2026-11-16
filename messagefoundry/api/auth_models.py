@@ -32,6 +32,9 @@ from messagefoundry.auth.usernames import username_refusal
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
+#: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``). The browser /ui/mfa and
+#: /ui/reauth handlers refuse past the same bound (BACKLOG #5398, #5399).
+_MFA_CODE_MAX = 64
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
@@ -462,7 +465,7 @@ class PasswordResetResponse(CredentialReply):
 class MfaVerifyRequest(RequestModel):
     """Satisfy a session's second factor with a TOTP code **or** a single-use recovery code."""
 
-    code: str = Field(max_length=64)
+    code: str = Field(max_length=_MFA_CODE_MAX)
 
 
 class MfaEnrollResponse(CredentialReply):

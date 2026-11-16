@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.auth_models import _NAME_MAX, _PASSWORD_MAX
+from messagefoundry.api.auth_models import _MFA_CODE_MAX, _NAME_MAX, _PASSWORD_MAX
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
@@ -1879,7 +1879,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 429, "too many attempts", headers={"Retry-After": _CEREMONY_RETRY_AFTER}
             )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
+        code = form.get("code", "")
+        # BACKLOG #5398: the JSON MfaVerifyRequest's own bound. An oversized code never reaches
+        # verify_mfa, whose recovery-code leg hashes it once per slot; it reads as a wrong code.
+        elevation = (
+            await auth.verify_mfa(token, code, client=client)
+            if len(code) <= _MFA_CODE_MAX
+            else Elevation()
+        )
         if elevation.token is not None:
             # The session was re-keyed (ASVS 7.2.4), so the cookie this browser holds is now dead.
             # Re-set it on the redirect or the operator is signed out by their own correct code. A
