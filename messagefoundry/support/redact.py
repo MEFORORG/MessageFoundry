@@ -56,7 +56,8 @@ from messagefoundry.secretscrub import (
     _mask_member,
     scrub_credentials,
 )
-from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_DSN_PASSWORD
+from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_NARROW_DSN_PASSWORD
+from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
     "redact_log_line",
@@ -406,9 +407,9 @@ _MEFOR_SECRET = re.compile(
 # a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
 #
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``,
-# ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``, ``_DSN_PASSWORD`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated
-# in both files, though this ``_DSN_PASSWORD`` is the narrow reading and no longer equals
-# secretscrub's; the widened one is imported, as ``_WIDE_DSN_PASSWORD`` (BACKLOG #5386). This
+# ``_CREDENTIAL_KV``, ``_KEY_MATERIAL`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated in both files;
+# both DSN readings are secretscrub's own objects, imported, since neither uses a shared fragment
+# or this copy's case fold (BACKLOG #5386). This
 # module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
 # #2694), but it does not build this copy from that one's fragments. Doing so would change this
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as
@@ -524,19 +525,22 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# THIS COPY STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
-# an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's ``_DSN_PASSWORD``,
-# and :func:`redact_log_line` runs it LAST of the credential passes, over the whole line. Run here,
-# first, a review measured its run after the password reach past a glued ``\ndbPassword=`` label
-# and print that value's tail on every glue it tried. After the shared vocabulary a label it reads
-# holds a placeholder, and the widened run after the password, which stops at "[" and "]", cannot
-# cross it. A label NEITHER vocabulary reads is the residual, at least an escaped line break glued
-# to a lowercase label (``5432\npassword=Tail@Sec``, read as ``npassword``): the widened run reaches
-# that value's "@" and its tail prints, where the narrow pass alone printed the whole value.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
-
-#: The widened reading: secretscrub's own object, not a third copy. Assigned, not only imported,
-#: so strict mypy lets a test name it on this module; a test disables it here by that name.
+# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
+# an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's
+# ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it LAST of the credential passes, over the
+# whole line. Run here, first, a review measured its run after the password reach past a glued
+# ``\ndbPassword=`` label and print that value's tail on every glue it tried. After the shared
+# vocabulary a value it hid is a placeholder, and the widened run after the password, which stops
+# at "[" and "]", cannot cross it. A labelled value the shared pass leaves printing is the residual:
+# at least a label NEITHER vocabulary reads, such as an escaped line break glued to a lowercase
+# label (``5432\npassword=Tail@Sec``, read as ``npassword``), and a camelCase label on a line where
+# secretscrub's union falls back to the reading before it, which does not read that label. There
+# the widened run reaches that value's "@" and its tail prints, where the narrow pass alone printed
+# the whole value.
+#
+#: Both DSN readings are secretscrub's own objects, not copies. Assigned, not only imported, so
+#: strict mypy lets a test name each on this module; a test disables each here by that name.
+_DSN_PASSWORD = _SHARED_NARROW_DSN_PASSWORD
 _WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
@@ -657,8 +661,10 @@ def redact_log_line(line: str) -> str:
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
-    # a password holding an "@" that the narrow copy above cut at its first one. Every labelled value
-    # is a placeholder by now, so its run cannot reach past one; the comment on _DSN_PASSWORD says why.
+    # a password holding an "@" that the narrow copy above cut at its first one. A value the passes
+    # above hid is a placeholder by now, and its run cannot reach past one. Not every labelled value
+    # is: at least a camelCase label whose value secretscrub's union keeps printing is not, and the
+    # comment on _DSN_PASSWORD states that residual.
     if "@" in body and "://" in body:
         body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)

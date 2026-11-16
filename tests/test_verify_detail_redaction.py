@@ -21,7 +21,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.store import base as store_base
 from messagefoundry.verify import checks, runner, smoke
-from messagefoundry.verify.model import CheckResult, safe_exc_detail
+from messagefoundry.verify.model import CheckResult, Status, safe_exc_detail
 from messagefoundry.verify.report import render_json, render_markdown
 
 _PLANTED = "pw-V3rify_Det-81"
@@ -111,6 +111,44 @@ def test_store_disposition_poll_failure_detail_hides_the_credential(
     settings = _store_that_raises(tmp_path, monkeypatch)
     r = smoke.check_smoke_disposition(settings, control_id="C1", baseline_id=None, timeout=1.0)
     _assert_hidden(r, "could not read the store disposition: ")
+
+
+def test_the_pre_send_baseline_failure_detail_hides_the_credential_and_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The smoke.disposition row's pre-send baseline read opens the same store the sibling arms do,
+    so it takes their PHI and credential passes and the driver bound (BACKLOG #5395). Control: the
+    rendering it used before, ``codec_safe_line``, prints the planted value and the whole tail."""
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.redaction import codec_safe_line
+    from messagefoundry.verify.model import DRIVER_DETAIL_LIMIT
+
+    exc = RuntimeError(_LEAKY + " tail" * 2000)
+
+    def leaky_baseline(*_a: object, **_k: object) -> str | None:
+        raise exc
+
+    monkeypatch.setattr(smoke, "newest_message_id", leaky_baseline)
+    monkeypatch.setattr(
+        smoke,
+        "smoke_live",
+        lambda **_kw: CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.PASS, "AA"),
+    )
+    results = runner._run_live_smoke(
+        smoke.synthetic_message(),
+        host="127.0.0.1",
+        port=1,
+        settings=ServiceSettings(store=StoreSettings(path=str(tmp_path / "verify.db"))),
+        check_disposition=True,
+        disposition_timeout=1,
+    )
+    disp = [r for r in results if r.id == "smoke.disposition"]
+    assert disp, results
+    _assert_hidden(disp[0], "could not read the pre-send baseline from the store")
+    assert "RuntimeError" in disp[0].detail
+    assert len(disp[0].detail) < DRIVER_DETAIL_LIMIT + 200, len(disp[0].detail)
+    old = codec_safe_line(exc)
+    assert _PLANTED in old and len(old) > DRIVER_DETAIL_LIMIT + 200
 
 
 def test_control_safe_exc_alone_keeps_the_credential() -> None:
@@ -335,6 +373,24 @@ def test_a_cut_input_keeps_its_unscanned_note() -> None:
     detail = safe_detail_text(text)
     assert "unscanned" in detail, detail[-200:]
     assert "unscanned" not in safe_detail_text("word " * 10)
+
+
+def test_placeholders_past_the_window_do_not_call_scanned_text_unscanned() -> None:
+    """An input inside the window whose placeholders push the cleaned text past it: every character
+    was scanned, so the detail carries no unscanned note, and what the length bound held back is
+    counted. Control: ``safe_text`` over that cleaned text at its default window writes the note."""
+    from messagefoundry.redaction import _REDACT_WINDOW, safe_text
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify import model
+
+    text = "PWD=x; " * (_REDACT_WINDOW // 8)
+    assert len(text) < _REDACT_WINDOW
+    detail = model.safe_detail_text(text)
+    assert "unscanned" not in detail, detail[-200:]
+    assert "chars)" in detail and "PWD=[redacted]" in detail, detail[-200:]
+    expanded = scrub_credentials(text, placeholder=model._PLACEHOLDER)
+    assert len(expanded) > _REDACT_WINDOW
+    assert "unscanned" in safe_text(expanded), "the control no longer crosses the window"
 
 
 def test_the_credential_pass_reads_only_the_work_window(monkeypatch: pytest.MonkeyPatch) -> None:

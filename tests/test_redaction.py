@@ -3148,17 +3148,15 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         *secretscrub._KEY_MATERIAL_WORDS,
     }
     assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
-    # The arm is the DSN pattern's colon and first password segment, then the "@" every match reaches
-    # next. Its user takes ``+`` where the pattern's takes ``*`` since BACKLOG #5386, the exception
-    # ``_CREDENTIAL_AHEAD``'s comment states, so the user classes are held apart here.
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
-    assert r"://[^\s:/@]*):" in secretscrub._DSN_PASSWORD.pattern
-    # With a user, the first segment is the arm's class, and past it the pattern adds only a run
-    # that cannot hold whitespace or "/", then the "@": so every match it makes with a user and a
-    # first segment of one character or more, the arm makes. The pattern's segment may also be
-    # empty (a password starting with "@"), the second narrowing ``_CREDENTIAL_AHEAD`` states.
-    tail = secretscrub._DSN_PASSWORD.pattern.split(r"(?<!//:)[^\s/@]*+)", 1)[1]
+    assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+    # The widened reading (BACKLOG #5386) has no arm. With a user, its first segment is the arm's
+    # class taking one character or more, and past it the pattern adds only a run that cannot hold
+    # whitespace or "/", then the "@": so every text it rewrites with a user, the arm reads.
+    wide = secretscrub._WIDE_DSN_PASSWORD.pattern
+    assert r"://[^\s:/@]*):" in wide
+    tail = wide.split(r"(?<!//:)[^\s/@]++)", 1)[1]
     assert tail.startswith(r"[^\s/") and tail.endswith("]*@"), tail
 
 
@@ -3209,9 +3207,8 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     counted apart the same way: each text only it changes must hold its match, and there must be
     some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why.
 
-    The URL arm's narrowing (BACKLOG #5386: an empty user, or a password that is empty or starts
-    with "@") is not counted apart, and this corpus is not known to reach it, so this test does not
-    gate that narrowing."""
+    The widened DSN reading (BACKLOG #5386), a source with no arm, is not counted apart, and this
+    corpus is not known to reach it, so this test does not gate it."""
     fragments = (
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,

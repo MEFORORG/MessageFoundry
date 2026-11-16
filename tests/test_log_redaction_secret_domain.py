@@ -1110,6 +1110,7 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     # Read off both modules rather than spelled here, so the control tracks what ships (BACKLOG #5386).
     assert not _unbounded_scan_repeats(scrub_mod._DSN_PASSWORD.pattern)
     assert not _unbounded_scan_repeats(redact_mod._DSN_PASSWORD.pattern)
+    assert not _unbounded_scan_repeats(scrub_mod._WIDE_DSN_PASSWORD.pattern)
     # THE LABEL START (BACKLOG #2999), both ways. Shipped, a word-only run after it is contained, as
     # after ``\b``. A lookbehind that can fire INSIDE a word run is not the same head, and is flagged.
     assert scrub_mod._LABEL_START == redact_mod._LABEL_START
@@ -1288,9 +1289,9 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             ("pw-At", "Sign_Pw-72"),
             "://svc:",
         ),
-        # A password that STARTS with "@", and an empty user's that starts with "=" or "@": the
-        # first segment had to take a character, so these printed whole (code review, round 2).
-        ("store dsn postgres://svc:@Lead_At-74@db.invalid/m", ("Lead_At-74",), "://svc:"),
+        # An empty user's password that starts with "=" or "@": the first segment had to take a
+        # character, so these printed whole (code review, round 2). With a user, the residual test
+        # below pins the same shape printing.
         ("store dsn redis://:=Lead_Eq-75@db.invalid", ("Lead_Eq-75",), "redis://:"),
         ("store dsn redis://:@Lead_At-76@db.invalid", ("Lead_At-76",), "redis://:"),
         # Both at once, two "@" signs in the password.
@@ -1304,13 +1305,13 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
 def test_a_dsn_password_with_no_user_or_an_at_sign_is_hidden_whole(
     line: str, pieces: tuple[str, ...], kept: str
 ) -> None:
-    """BACKLOG #5386, on both copies of ``_DSN_PASSWORD`` and through both public entry points. The
-    scheme and the user (empty or not) survive, so an operator can still tell which store it was."""
+    """BACKLOG #5386, on the widened DSN reading and through both public entry points. The scheme
+    and the user (empty or not) survive, so an operator can still tell which store it was."""
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
         ("support.redact wide pattern", _sub_dsn(redact_mod._WIDE_DSN_PASSWORD, line)),
-        ("secretscrub pattern", _sub_dsn(scrub_mod._DSN_PASSWORD, line)),
+        ("secretscrub wide pattern", _sub_dsn(scrub_mod._WIDE_DSN_PASSWORD, line)),
     ):
         for piece in pieces:
             assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
@@ -1379,6 +1380,7 @@ def test_a_dsn_user_holding_no_password_is_not_read_as_one(
     for label, pattern in (
         ("support.redact pattern", redact_mod._DSN_PASSWORD),
         ("secretscrub pattern", scrub_mod._DSN_PASSWORD),
+        ("secretscrub wide pattern", scrub_mod._WIDE_DSN_PASSWORD),
     ):
         assert pattern.search(line) is None, f"{label} matched {line!r}"
     for label, out in (
@@ -1391,7 +1393,11 @@ def test_a_dsn_user_holding_no_password_is_not_read_as_one(
     # Positive control: the same shape with a password is still read, so the refusal above is the
     # user class and not a pattern that matches nothing.
     with_pw = line.replace("svc@", "svc:pw-Ctl_Pw-80@").replace("user@", "user:pw-Ctl_Pw-80@")
-    for pattern in (redact_mod._DSN_PASSWORD, scrub_mod._DSN_PASSWORD):
+    for pattern in (
+        redact_mod._DSN_PASSWORD,
+        scrub_mod._DSN_PASSWORD,
+        scrub_mod._WIDE_DSN_PASSWORD,
+    ):
         assert pattern.search(with_pw) is not None
     assert "pw-Ctl_Pw-80" not in scrub_credentials(with_pw)
 
@@ -1449,10 +1455,9 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
     shipped = {line: _printed_pieces(line) for line in _DSN_GLUE_LINES}
     assert not any(shipped.values()), {k: v for k, v in shipped.items() if v}
 
-    narrow = redact_mod._DSN_PASSWORD
     with monkeypatch.context() as m:
         m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", NEVER_MATCHES)
-        m.setattr(scrub_mod, "_DSN_PASSWORD", narrow)
+        m.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", NEVER_MATCHES)
         main_shape = {line: _printed_pieces(line) for line in _DSN_GLUE_LINES}
     assert all(shipped[line] <= main_shape[line] for line in _DSN_GLUE_LINES)
     assert any(main_shape.values()), (
@@ -1468,13 +1473,96 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
 
 def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
-    """The empty-user residual secretscrub's ``_DSN_PASSWORD`` comment states, pinned both ways. A
-    password-only DSN whose value holds "=" is read; one holding ";" is not, and prints whole, so a
-    red on the second line means the comment is stale, not that a leak opened."""
+    """The residuals secretscrub's ``_WIDE_DSN_PASSWORD`` comment states, pinned both ways. A
+    password-only DSN whose value holds "=" is read; one holding ";" or "|" is not, and prints whole;
+    and with a user, a password that starts with "@" prints, as it did before #5386. A red on a
+    residual line means the comment is stale, not that a leak opened."""
     for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
         for out in (redact_log_line(line), scrub_credentials(line)):
             assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out
     assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
+    assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
+    assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
+
+
+def _one_handler(text: str) -> str:
+    """``text`` after the filter chain ``_install_phi_filters`` puts on one handler, in order."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    record = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, text, None, None)
+    for handler_filter in handler.filters:
+        assert isinstance(handler_filter, logging.Filter)
+        handler_filter.filter(record)
+    return record.getMessage()
+
+
+#: The round-3 widened pattern, for the controls below: its user's first segment could be empty, and
+#: its empty user's first segment could hold "|". Spelled here, since nothing ships it now.
+_ROUND_THREE_WIDE = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
+    r"(?:(?<=//:)[^\s/@?#&=;,]*+|(?<!//:)[^\s/@]*+)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "secret", "store_path", "wide_in_narrow_place"),
+    [
+        # Store error text: the bundle's redactor, cut to 300, then one handler. Round 3 read the
+        # empty-user DSN to the value's "@", took the camelCase ``PWD=`` label, and printed the
+        # value origin/main's handler hid by that label.
+        (
+            "smtp://:pw@h:587PWD=x@y)postgres://svc:p@Qc7_Sec-03@h",
+            "Qc7_Sec-03",
+            True,
+            True,
+        ),
+        # Two handlers. Round 3 rewrote ``ops:@S...@`` to ``ops:<redacted>@``, which the PHI pass's
+        # URL arm reads, so the encoded run origin/main's second handler applied was switched off.
+        (
+            "x %7C;~+jdbc:sqlserver://ops:@S9466k2j@h:8765PWD=Tk9466x3q<PWD=pw9466Z4v;"
+            "jdbc:sqlserver://u@x:Qc9466_Sec-5w@h:8765\\n%7C",
+            "Qc9466_Sec-5w",
+            False,
+            False,
+        ),
+        # Two handlers. Round 3's empty-user password took the "|" a second handler's PHI pass read
+        # the token by, so an unlabelled value elsewhere in it printed.
+        (
+            "x ws://svc:Qc7728_Sec-0w@h:587&dbPassword=mrn7728y1t(redis://ops:S7728k2j@h\\Password: "
+            "Tk7728x3q;mrn7728y93t<http://a.b:Tk7728x4q@Qc7728_Sec-55w@h:8765+redis://:Tk7728x5q|"
+            "mrn7728y56t@Qc7728_Sec-57w:pw7728Z58v@h:587",
+            "mrn7728y93t",
+            False,
+            False,
+        ),
+    ],
+)
+def test_the_widened_dsn_reading_prints_nothing_main_hid_on_a_chained_path(
+    line: str,
+    secret: str,
+    store_path: bool,
+    wide_in_narrow_place: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 review repairs of BACKLOG #5386: each line printed ``secret`` on round 3's code where
+    origin/main hid it, on the store error path or through two handlers. Main hides each one, and
+    the code that ships must too. Control: round 3's shape, patched back in, prints it, so the line
+    still reaches the mechanism and this test can fail."""
+
+    def run() -> str:
+        if store_path:
+            return _one_handler(redact_log_line(line)[:300])
+        return _one_handler(_one_handler(line))
+
+    assert secret not in run(), run()
+    with monkeypatch.context() as m:
+        if wide_in_narrow_place:
+            m.setattr(scrub_mod, "_DSN_PASSWORD", scrub_mod._WIDE_DSN_PASSWORD)
+        else:
+            m.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", _ROUND_THREE_WIDE)
+            m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", _ROUND_THREE_WIDE)
+            m.setattr(scrub_mod, "_DSN_PASSWORD", _ROUND_THREE_WIDE)
+        assert secret in run(), "round 3's shape no longer prints it, so this line tests nothing"
 
 
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
@@ -1508,10 +1596,11 @@ def test_the_bundle_runs_the_narrow_dsn_copy_then_the_shared_widened_one() -> No
 
     Its first pass is the NARROW pattern, on purpose: widened and run first, its run after the
     password reached a glued label's value and printed that value's tail. The widened reading runs
-    last in ``redact_log_line`` and is secretscrub's own object, not a copy, so the two cannot drift.
+    last in ``redact_log_line``. Both are secretscrub's own objects, not copies, so none can drift.
     This is an interim shape, not the end state: BACKLOG #2694 retires the bundle's first layer, and
     with it this narrow copy and the extra whole-line pass."""
-    assert redact_mod._WIDE_DSN_PASSWORD is scrub_mod._DSN_PASSWORD
+    assert redact_mod._WIDE_DSN_PASSWORD is scrub_mod._WIDE_DSN_PASSWORD
+    assert redact_mod._DSN_PASSWORD is scrub_mod._DSN_PASSWORD
     narrow = r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
     assert redact_mod._DSN_PASSWORD.pattern == narrow, (
         "support/redact's first DSN pass was widened; the widened reading must run after the "
@@ -1995,9 +2084,11 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     )
 
     ran = _patterns_applied_during(scrub_mod, applied, partial(scrub_credentials, marked_run))
-    assert ran == Counter({"_DSN_PASSWORD": 1}), (
+    # The DSN gate opens two passes since BACKLOG #5386: the narrow pattern where it always ran, and
+    # the widened reading after the labels. Both are behind that one gate, so both count here.
+    assert ran == Counter({"_DSN_PASSWORD": 1, "_WIDE_DSN_PASSWORD": 1}), (
         f"one scrub_credentials call on the marked adversarial run applied {dict(ran)}, not "
-        "_DSN_PASSWORD exactly once, so the growth readings above are not about this pattern alone. "
+        "the DSN gate's two passes once each, so the growth readings above are not about them alone. "
         "Read it this way. AN EMPTY reading means the pass stopped running at all. A COUNT ABOVE ONE "
         "means one pattern is now walked repeatedly per call. A SECOND NAME, while the gate arm above "
         f"still sees only {opened} open, means that pattern is reached with no gate in front of it -- "

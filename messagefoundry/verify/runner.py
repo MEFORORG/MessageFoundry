@@ -24,7 +24,13 @@ from messagefoundry.verify.checks import (
     check_lockable_accounts,
     run_host_checks,
 )
-from messagefoundry.verify.model import CheckResult, Status, safe_detail_text
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    CheckResult,
+    Status,
+    safe_detail_text,
+    safe_exc_detail,
+)
 from messagefoundry.verify.smoke import (
     check_store_connectivity,
     smoke_self,
@@ -417,10 +423,10 @@ def _run_live_smoke(
                 # BACKLOG #1708: the read-only open refuses a store it cannot read as it is, such
                 # as another application's SQLite file. Never fall back to no baseline: the
                 # synthetic control id is fixed, so a prior run's message would then match.
-                # Class named, and a codec error never printed raw (vault BACKLOG #3185).
-                from messagefoundry.redaction import codec_safe_line
-
-                baseline_error = codec_safe_line(exc)
+                # Class named, a codec error never printed raw (vault BACKLOG #3185), and the PHI
+                # and credential passes with the driver bound, as the sibling arms that open the
+                # same store take (BACKLOG #5395).
+                baseline_error = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
                 _log.warning("verify: the pre-send baseline read failed: %s", baseline_error)
 
     ctx = live_smoke_ssl_context(ca_file=smoke_tls_ca) if smoke_tls else None

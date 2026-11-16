@@ -67,14 +67,16 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     other order spelled differently goes with its value.
 
     The input is cut to :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass
-    reads it, and its note is kept past the length bound.
+    reads it, and its note is kept past the length bound. That note is the only unscanned note the
+    detail carries: what the length bound then holds back was scanned, and is counted
+    as ``(+N chars)``.
 
     Not the support bundle's ``redact_log_line``: its long-base64 sweep blanked any 24-character run,
     which is an exception class name such as ``SSLCertVerificationError`` and the segments of a POSIX
     path, the words an operator needs here. This is best-effort, with at least the residuals
     ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
     capitalized two-word phrase such as ``Program Files``."""
-    from messagefoundry.redaction import clamp_untrusted, redact, safe_text
+    from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, clamp_untrusted, redact
     from messagefoundry.secretscrub import scrub_credentials
 
     bounded = clamp_untrusted(text)
@@ -84,7 +86,11 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     phi_first = scrub_credentials(redact(head), placeholder=_PLACEHOLDER)
     credentials_first = redact(scrub_credentials(head, placeholder=_PLACEHOLDER))
     cleaned = _printed_by_both(phi_first, credentials_first)
-    shown = safe_text(cleaned) if limit is None else safe_text(cleaned, limit=limit)
+    # Not safe_text: every character of ``cleaned`` was scanned above, but its placeholders can push
+    # it past safe_text's work window, whose note would then call scanned characters unscanned. So
+    # the PHI pass once more over the whole of it, which the placeholders at most multiply from a
+    # bounded head, then safe_text's length bound alone.
+    shown = _held_back(redact(cleaned).strip(), _DEFAULT_LIMIT if limit is None else limit)
     return f"{shown} {note}" if note else shown
 
 

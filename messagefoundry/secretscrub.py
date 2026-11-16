@@ -1284,11 +1284,20 @@ _KEY_MATERIAL = re.compile(
 # including the glued run above and the non-letter leading runs, so neither narrowing can come back
 # without a red -- and a differential arm that fails if either earlier head ever redacts something this
 # one does not.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+
+# THE WIDENED READING, A SECOND PASS AFTER THE LABELS (BACKLOG #5386). :func:`_run` applies the
+# narrow pattern above where it always did, then this one after every label pass and before the
+# member mask. Applied in the narrow one's place, it read ``smtp://:pw@h:587PWD=x@y)...`` as one
+# password running to the value's "@", took the ``PWD=`` label the label pass needed, and printed
+# the value that label hid (code review, round 4). After the label passes a value they read is a
+# placeholder, which the run after the password stops at; and every pass before this one is the
+# code ``origin/main`` ran, so on one call this pass only hides more.
 #
-# THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@" (BACKLOG #5386). The user was
+# THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@". The user was
 # ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
 # printed the password whole. The password was ``[^\s/@]+``, so it stopped at its own first "@": an
-# unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed. Now the user is
+# unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed. Here the user is
 # ``[^\s:/@]*``. The password is the old first segment, taken possessively, then a run that may hold
 # an "@", and the match ends at the last "@" in it.
 #
@@ -1310,30 +1319,36 @@ _KEY_MATERIAL = re.compile(
 # "@". With a user, the first segment is the old class, so every match the old pattern made, this
 # one makes.
 #
-# AN EMPTY USER'S FIRST SEGMENT ALSO STOPS AT ``? # & = ; ,``. Without the user the pattern reads
-# ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and a review measured the token's tail
-# print where the old pattern, matching nothing, left the query label to the member pass. The
-# lookbehind ``(?<=//:)`` is what tells the two cases apart. Residuals, at least these: a password
-# whose own "@" is followed, before the host's "@", by a character the run after the first segment
-# stops at (the class above: at least ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=")
-# is cut at that "@" and its tail prints, as the whole tail did before; and an empty user's
-# password holding one of ``? # & ; ,`` is not read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "="
-# is not one of those: the run after the first segment may hold it, so ``redis://:p=ss@host`` is
-# read and hidden.
+# AN EMPTY USER'S FIRST SEGMENT ALSO STOPS AT "=" AND AT EVERY CHARACTER THE RUN AFTER IT STOPS AT.
+# Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
+# a review measured the token's tail print where the old pattern, matching nothing, left the query
+# label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
+# pass of a second handler no longer read, so an unlabelled value elsewhere in the token, which that
+# pass had hidden, printed (code review, round 4). The lookbehind ``(?<=//:)`` is what tells the two
+# cases apart. Residuals, at least these: a password whose own "@" is followed, before the host's
+# "@", by a character the run after the first segment stops at (the class above: at least
+# ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=") is cut at that "@" and its tail
+# prints, as the whole tail did before; and an empty user's password holding one of those is not
+# read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "=" is not one of those:
+# the run after the first segment may hold it, so ``redis://:p=ss@host`` is read and hidden.
 #
-# THE FIRST SEGMENT MAY BE EMPTY (``*+``), so a password that STARTS with "@", or an empty user's
-# that starts with "=", is read: ``postgres://svc:@Pw@db`` and ``redis://:=Pw@db`` printed whole
-# while it had to take one character (code review of BACKLOG #5386). An empty password,
-# ``user:@host``, is then replaced by the placeholder too, which hides nothing and costs nothing.
+# AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
+# are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so
+# ``postgres://svc:@Pw@db``, a password that STARTS with "@", prints as it did before #5386, and that
+# is a residual. Read, it was rewritten to ``svc:<placeholder>@``, which the URL arm of
+# :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` reads where it did not read ``svc:@Pw@``. That
+# switched the PHI pass's percent-encoded run off on a second handler, and a value later in the
+# token that run had hidden printed (code review, round 4). An empty user's rewrite is not read by
+# that arm, whose user may not be empty.
 #
-# THE FIRST SEGMENT IS POSSESSIVE (``*+``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
+# THE FIRST SEGMENT IS POSSESSIVE (``*+``, ``++``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
 # not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
 # reads no nested quantifier.
-_DSN_PASSWORD = re.compile(
+_WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)[^\s/@?#&=;,]*+|(?<!//:)[^\s/@]*+)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
+    r"(?:(?<=//:)[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]*+|(?<!//:)[^\s/@]++)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
@@ -2057,14 +2072,21 @@ def has_credential_like_segment(text: str) -> bool:
     return False
 
 
-def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = None) -> str:
+def _run(
+    text: str, placeholder: str, folded: str | None, sub: _Sub | None = None, *, wide: bool = True
+) -> str:
     """The pass itself. Straight-line rather than a table, so a test monkeypatching one pattern on this
     module reaches the object this function reads -- a table would hold the pre-patch pattern by
     value and the mutation fixture would silently mutate nothing.
 
     ``sub`` applies each pattern: ``pattern.sub`` when it is None, and :func:`_union`'s tracing or
     pre-camelCase reading otherwise. Its last argument names the group a replacement writes back
-    masked at its end, which only the tracing reads."""
+    masked at its end, which only the tracing reads.
+
+    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union`'s reading before
+    does: it is the code ``origin/main`` ran, which had none, and with it the pass's run crossed a
+    camelCase label only the shipped reading reads, so the union hid that label (``_WIDE_DSN_PASSWORD``
+    says what printed)."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
@@ -2083,6 +2105,8 @@ def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = Non
         text = apply(_KEY_MATERIAL, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _DSN_HINT):
         text = apply(_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
+        if wide:
+            text = apply(_WIDE_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
     if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
@@ -2285,13 +2309,13 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), lambda pattern: pattern)
     try:
-        old = _run(text, placeholder, folded, before.sub)
+        old = _run(text, placeholder, folded, before.sub, wide=False)
         if old is text:
             # The reading before hid nothing, so the shipped one alone needs no trace.
             return _run(text, placeholder, folded)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
-        return _run(text, placeholder, folded, _pre_camel_sub)
+        return _run(text, placeholder, folded, _pre_camel_sub, wide=False)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
     old_masks: dict[int, str] = {}
