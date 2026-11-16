@@ -40,6 +40,7 @@
 // but not the whole text of a foreign exception it wraps (vault BACKLOG #3765), and the identifier
 // an import or name error or a bad call argument names. Every command that imports config modules
 // can print them, `connection upsert` and `remove` included.
+import { INTERPRETER_OPTIONS } from "./engineControlModel";
 import { looksLikeUnknownArgument } from "./stepsModel";
 
 export interface CliResult {
@@ -56,6 +57,18 @@ export interface CliResult {
 export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
 export const ENGINE_MODULE: CliModule = "messagefoundry";
 export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
+
+/**
+ * The argv after the interpreter for `python -m <module> <args>`, as cli.ts's `run` and
+ * `runWithStdin` launch it (BACKLOG #5409). The interpreter options come first: `-P` keeps the
+ * working directory, which is the workspace, off the import path, so a `messagefoundry.py` or a
+ * stdlib-named module in the workspace root cannot shadow the one the interpreter has installed.
+ * They are the engine lifecycle's own {@link INTERPRETER_OPTIONS}, so both paths import the same
+ * engine.
+ */
+export function cliArgv(module: CliModule, args: readonly string[]): string[] {
+  return [...INTERPRETER_OPTIONS, "-m", module, ...args];
+}
 
 /** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
  *  module does not compile until it names its command. */

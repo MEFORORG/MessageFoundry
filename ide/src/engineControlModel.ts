@@ -19,8 +19,8 @@ export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
 /** The interpreter options the pill's engine lifecycle takes: the preflight, provision-admin (and
  *  its held wrapper) and serve. `-P` keeps the working directory off the import path, so all of
  *  them import the same engine; `-X disable-remote-debug` is what serve's enforce refusal names
- *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) does not take
- *  them yet. */
+ *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) takes them too,
+ *  through `cliArgv` in cliJson.ts (BACKLOG #5409). */
 export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
 
 /** The argv for the preflight import check (`python <these>`). */

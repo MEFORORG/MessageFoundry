@@ -11,6 +11,7 @@ import {
   ENGINE_MODULE,
   TOOLKIT_MODULE,
   UNTRUSTED_WORKSPACE_STDERR,
+  cliArgv,
   explainMissingToolkit,
   parseJsonResult,
   type CliModule,
@@ -227,7 +228,7 @@ export function run(args: string[], cwd?: string, opts: RunOptions = {}): Promis
   return new Promise((resolve) => {
     execFile(
       pythonPath(),
-      ["-m", module, ...args],
+      cliArgv(module, args),
       { cwd, maxBuffer: 64 * 1024 * 1024, timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
@@ -269,7 +270,7 @@ export function runWithStdin(
   return new Promise((resolve) => {
     const child = execFile(
       pythonPath(),
-      ["-m", module, ...args],
+      cliArgv(module, args),
       { cwd, maxBuffer: 64 * 1024 * 1024, encoding: "utf8", timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
