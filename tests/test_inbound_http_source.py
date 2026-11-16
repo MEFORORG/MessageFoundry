@@ -324,18 +324,19 @@ async def test_an_empty_body_under_an_unusable_codec_name_is_not_a_configuration
 
 
 @pytest.mark.parametrize(
-    "fault",
+    ("fault", "status"),
     [
-        pytest.param(OSError("store volume went away"), id="oserror"),
-        pytest.param(TimeoutError("ingress commit timed out"), id="timeouterror"),
-        pytest.param(RuntimeError("unexpected handler fault"), id="other"),
+        pytest.param(OSError("store volume went away"), 503, id="oserror"),
+        pytest.param(TimeoutError("ingress commit timed out"), 503, id="timeouterror"),
+        pytest.param(RuntimeError("unexpected handler fault"), 500, id="other"),
     ],
 )
-async def test_a_handler_fault_is_handler_error_with_a_500_and_a_log_line(
-    fault: Exception, caplog: pytest.LogCaptureFixture
+async def test_a_handler_fault_is_handler_error_with_an_answer_and_a_log_line(
+    fault: Exception, status: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5680: a fault inside the inbound handler is engine-side. It must be recorded as
-    ``handler_error`` with an ERROR line and answered 503 with Retry-After, never read as the peer's ``peer_reset``
+    ``handler_error`` with an ERROR line and answered (503 with Retry-After for an I/O fault, 500
+    otherwise), never read as the peer's ``peer_reset``
     (an OSError, TimeoutError included) or ``framing_error`` (anything else)."""
     from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 
@@ -360,7 +361,8 @@ async def test_a_handler_fault_is_handler_error_with_a_500_and_a_log_line(
             resp = await _http(source.sockport, body=b"payload")
     finally:
         await source.stop()
-    assert resp.status == 503 and "retry-after" in resp.headers
+    assert resp.status == status
+    assert ("retry-after" in resp.headers) is (status == 503)  # only an I/O fault invites a re-send
     assert [e[0] for e in events] == ["established", "handler_error"]
     assert any("inbound handler" in r.getMessage() for r in caplog.records)
 
