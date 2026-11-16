@@ -180,7 +180,7 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
     return _DIRECTORY_UNCONFIRMED_ERROR
 
 
-def _form_fits(request: Request, model: type[BaseModel], **fields: str) -> bool:
+def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bool:
     """Whether the JSON route's own request ``model`` accepts these hand-parsed form values.
 
     The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
