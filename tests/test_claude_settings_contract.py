@@ -58,13 +58,13 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 # floor under the PHI, secret and local-store rules that CLAUDE.md section 5 and section 9 promise
 # are enforced, so prose and mechanism cannot drift apart without a red test.
 #
-# Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the deny patterns
-# that keep it away from an agent's file tools. A secret, credential or store file git is told
+# Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the patterns the
+# deny list names for Read and Edit. A secret, credential or store file git is told
 # never to hold is one an agent should neither read nor overwrite. Before BACKLOG #5495,
 # `/docker/secrets.env`, the leak scanner's real token list, files in `/docker/tls/` other than
 # `*.key`, `*.pem` and `*.pfx`, and the `*.db*` family beyond `*.db`, `*.db-wal` and `*.db-shm`
 # had no file-tool rule at all. `*.key`, `*.pem`, `*.pfx`, `*.db-wal`, `*.db-shm` and
-# `bootstrap-admin.txt` had a Read rule and no Edit rule; see `_FILE_TOOLS` for what that meant.
+# `bootstrap-admin.txt` had a Read rule and no Edit rule.
 # Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
 # red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
 # secret line added to `.gitignore` gets no deny rule until someone adds it here, which is how the
@@ -89,18 +89,21 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     "scripts/security/scan-tokens.local.txt": ("scan-tokens.local.txt",),
 }
 
-# The tool names each protected pattern carries a rule for. This is the one place this branch states
-# how the client treats them. https://code.claude.com/docs/en/permissions says `Edit` rules apply
-# to all built-in tools that edit files, and that a `Write(path)` rule is accepted but matches
-# nothing. Measured 2026-11-16: a Write to a new path matching only a Read deny rule was refused.
-# The Write rules are kept, as `Write(.env)` already was, for a client that honours them.
-_FILE_TOOLS = ("Read", "Edit", "Write")
+# The tool names each protected pattern carries a rule for. Claude Code's permissions page,
+# https://code.claude.com/docs/en/permissions, read 2026-11-16, says `Edit` rules apply to all
+# built-in tools that edit files, and that a `Write(path)` rule is accepted but matches nothing.
+# So no `Write(...)` rule is required here.
+_FILE_TOOLS = ("Read", "Edit")
 
 _REQUIRED_DENIES = frozenset(
-    f"{tool}({pattern})"
-    for patterns in _GITIGNORED_SECRETS.values()
-    for pattern in patterns
-    for tool in _FILE_TOOLS
+    {
+        f"{tool}({p})"
+        for patterns in _GITIGNORED_SECRETS.values()
+        for p in patterns
+        for tool in _FILE_TOOLS
+    }
+    # Pinned before BACKLOG #5495 and kept as they were.
+    | {"Write(.env)", "Write(secrets/**)"}
 )
 
 _FILE_RULE = re.compile(rf"\A({'|'.join(_FILE_TOOLS)})\((.+)\)\Z")
@@ -168,15 +171,13 @@ def _keys_missing_from_planted_gitignore(_settings: dict[str, Any]) -> list[str]
 
 
 def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
-    """Every pattern denied to Read with no Edit or Write rule spelled the same, string for string.
+    """Every pattern denied to Read with no Edit rule spelled the same, string for string.
 
-    It compares pattern text, not path coverage: a broader rule for another tool does not count,
-    except a bare tool name.
+    It compares pattern text, not path coverage: a broader Edit rule does not count, except a bare
+    `Edit`, which names the tool on every path.
 
-    One way only: a path hidden from Read is secret enough to deny by name to the writing tools
-    too, but a write-only deny,
-    say on a gate file agents must read, is a legitimate rule on its own. A bare tool name in the
-    deny list denies that tool on every path, so it covers every pattern.
+    One way only: a path hidden from Read is secret enough to deny to Edit by name too, but an
+    Edit-only deny, say on a gate file agents must read, is a legitimate rule on its own.
     """
     deny = settings["permissions"]["deny"]
     everywhere = {rule for rule in deny if rule in _FILE_TOOLS}
@@ -374,22 +375,22 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
     )
 
 
-def test_every_read_denied_path_is_denied_to_every_file_tool() -> None:
-    """Every Read-denied pattern also carries an Edit and a Write rule of its own.
+def test_every_read_denied_path_is_denied_to_edit_too() -> None:
+    """Every Read-denied pattern also carries an Edit rule of its own.
 
-    Stricter than the client needs; see `_FILE_TOOLS`. Red before BACKLOG #5495, when six
-    Read-denied patterns, listed above `_GITIGNORED_SECRETS`, had no Edit rule.
+    Red before BACKLOG #5495, when six Read-denied patterns, listed above `_GITIGNORED_SECRETS`,
+    had no Edit rule.
     """
     unmirrored = _unmirrored_file_denies(_load())
     assert not unmirrored, (
-        f"{len(unmirrored)} deny pattern(s) denied to Read miss another file tool: {unmirrored}.\n"
-        "Add the missing Edit or Write rule for the same pattern. Never resolve this by removing "
-        "the rule that is there."
+        f"{len(unmirrored)} pattern(s) denied to Read have no Edit rule: {unmirrored}.\n"
+        "Add the missing Edit rule for the same pattern. Never resolve this by removing the rule "
+        "that is there."
     )
 
 
 def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
-    """Exact output: a detector that also flagged a non-file rule or a write-only deny fails."""
+    """Exact output: a detector that also flagged a non-file rule or an Edit-only deny fails."""
     planted = {
         "permissions": {
             "deny": [
@@ -397,12 +398,15 @@ def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
                 "Bash(rm -rf:*)",
                 "Edit(gate.txt)",
                 "Read(x.pem)",
-                "Edit",
-                "Write(x.pem)",
+                "Edit(x.pem)",
+                "Read(y.pfx)",
+                "Write(y.pfx)",
             ]
         }
     }
-    assert _unmirrored_file_denies(planted) == ["*.key: missing Write"]
+    assert _unmirrored_file_denies(planted) == ["*.key: missing Edit", "y.pfx: missing Edit"]
+    bare = {"permissions": {"deny": ["Read(*.key)", "Edit"]}}
+    assert _unmirrored_file_denies(bare) == []
 
 
 def test_the_gitignore_detector_names_only_the_missing_key() -> None:
@@ -611,7 +615,7 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "dot-anchored deny rule",
         ),
         (
-            # The shape `*.key` had before BACKLOG #5495: a Read rule and no Edit or Write rule.
+            # The shape `*.key` had before BACKLOG #5495: a Read rule and no Edit rule.
             {"permissions": {"deny": ["Read(*.key)"]}, "hooks": {}},
             _unmirrored_file_denies,
             "deny pattern named for Read only",

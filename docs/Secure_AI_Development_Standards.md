@@ -323,12 +323,11 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 **Deterministic guardrails the model cannot bypass** — the `.claude/settings.json` deny-list and the PreToolUse hook:
 
 ```json
-// .claude/settings.json — deny-list (excerpt — abridged; the real file carries more deny rules)
+// .claude/settings.json — deny-list (excerpt — abridged; the real file carries 27 deny rules)
 "deny": [
-  "Read(.env)", "Edit(.env)", "Write(.env)",
-  "Read(*.db)", "Edit(*.db)", "Write(*.db)",
-  "Read(**/secrets/**)", "Edit(**/secrets/**)", "Write(**/secrets/**)",
-  "Read(*.key)", "Edit(*.key)", "Write(*.key)",
+  "Read(.env)", "Read(.env.*)", "Read(secrets/**)",
+  "Read(*.key)", "Read(*.pem)", "Read(*.pfx)", "Read(*.db)",
+  "Edit(secrets/**)", "Write(secrets/**)",
   "Bash(rm -rf:*)", "Bash(git push --force:*)", "Bash(git reset --hard:*)"
 ]
 ```
@@ -341,10 +340,7 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 >    semantics and match at **any depth**; the `./` form matches one directory and is strictly
 >    narrower, which is the worst combination for a control whose whole job is to be broad.
 >    `tests/test_claude_settings_contract.py::test_no_deny_rule_uses_the_narrow_dot_anchor`
->    asserts **zero** such rules, and the tracked file had zero of 27 when this was corrected.
->    **CORRECTED 2026-11-16:** this bullet read *"the tracked file has zero of 27"*. The file has
->    carried more deny rules since BACKLOG #5495, so the count of 27 is dated to the 2026-08-25
->    correction.
+>    asserts **zero** such rules, and the tracked file has zero of 27.
 > 2. **The hook path was bare** (`scripts/hooks/...`), which resolves against the session's working
 >    directory rather than the repo. `test_every_hook_resolves_through_the_project_dir_placeholder`
 >    requires `${CLAUDE_PROJECT_DIR}` in exec form. *(This one was not in the original report; it
