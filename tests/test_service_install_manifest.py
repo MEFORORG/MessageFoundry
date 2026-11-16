@@ -76,13 +76,21 @@ def _extract(path: Path, names: list[str], body: str) -> str:
 
     ``ParseFile`` parses; it never runs the file. Only the named function definitions are then
     executed, so no preflight, download, ACL call or service registration in the source script runs.
+
+    A file that does not parse throws, naming the parser's errors. ``ParseFile`` still returns a
+    partial tree for it, and a guard reading that tree can miss a call the parser dropped and pass.
     """
     lines = [
         "& {",
         "  $ErrorActionPreference = 'Stop'",
         f"  $src = {_psq(str(path))}",
+        "  $parseErrors = $null",
         "  $ast = [System.Management.Automation.Language.Parser]::ParseFile("
-        "$src, [ref]$null, [ref]$null)",
+        "$src, [ref]$null, [ref]$parseErrors)",
+        "  if ($parseErrors) {",
+        '    throw "$(Split-Path -Leaf $src) does not parse: $(@($parseErrors |'
+        ' ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Message)" }) -join \'; \')"',
+        "  }",
         "  foreach ($n in @(" + ", ".join(_psq(n) for n in names) + ")) {",
         "    $fn = $ast.Find({ $args[0] -is "
         "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
@@ -653,6 +661,7 @@ def test_no_unchecked_stop_site_survives_in_either_script(tmp_path: Path) -> Non
         body = """
   $tokens = $null
   [void][System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$tokens, [ref]$null)
+  # $ast above was parsed from the same file and threw on any parse error, so none is dropped here.
   (@($tokens | Where-Object { $_.Kind -ne 'Comment' } |
       ForEach-Object { $_.Text }) -join ' ')
 """
@@ -1060,15 +1069,7 @@ _PATH_PARAMS = [
 ]
 
 
-def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
-    """Assignments and command calls of install-service.ps1, with source offsets, by AST.
-
-    ``script`` reads another file the same way: the uninstaller, or a changed copy of the installer
-    that a guard must fail on.
-    """
-    path = script if script is not None else _SCRIPT
-    assert path is not None
-    body = """
+_FACTS_BODY = """
   $assigns = @(foreach ($a in $ast.FindAll({ $args[0] -is
       [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
     $lhs = $null
@@ -1109,8 +1110,42 @@ def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
   [pscustomobject]@{ assignments = @($assigns); commands = @($cmds) } |
       ConvertTo-Json -Depth 6 -Compress
 """
-    parsed: dict = json.loads(_ok(_extract(path, [], body), tmp_path).strip().splitlines()[-1])
-    return parsed
+_FACTS_MARK = "@@FACTS "
+
+
+def _preflight_facts_many(tmp_path: Path, scripts: list[Path]) -> list[dict]:
+    """``_preflight_facts`` for each of ``scripts``, in ONE PowerShell process.
+
+    Each process costs seconds to start, and a guard's control arms read one changed copy each. A
+    copy whose read throws, one that does not parse for instance, yields ``{"error": ...}`` in its
+    place rather than failing the copies beside it.
+    """
+    blocks = [
+        "try {\n"
+        f"  $out = {_extract(path, [], _FACTS_BODY)}\n"
+        f'  "{_FACTS_MARK}" + @($out)[-1]\n'
+        "} catch {\n"
+        f'  "{_FACTS_MARK}" + ([pscustomobject]@{{ error = "$_" }} | ConvertTo-Json -Compress)\n'
+        "}"
+        for path in scripts
+    ]
+    out = _ok("\n".join(blocks), tmp_path).splitlines()
+    facts = [json.loads(line[len(_FACTS_MARK) :]) for line in out if line.startswith(_FACTS_MARK)]
+    assert len(facts) == len(scripts), f"expected {len(scripts)} fact sets, read {len(facts)}"
+    return facts
+
+
+def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
+    """Assignments and command calls of install-service.ps1, with source offsets, by AST.
+
+    ``script`` reads another file the same way: the uninstaller, or a changed copy of the installer
+    that a guard must fail on.
+    """
+    path = script if script is not None else _SCRIPT
+    assert path is not None
+    [facts] = _preflight_facts_many(tmp_path, [path])
+    assert "error" not in facts, f"harness failed: {facts['error']}"
+    return facts
 
 
 def _sole_call(facts: dict, name: str) -> dict:
@@ -1916,6 +1951,60 @@ def _inherited(entries: list[str]) -> list[str]:
     return [e.replace(":(", ":(I)(", 1) for e in entries]
 
 
+# A line whose first word only prints or throws: its double-quoted text is a message, not a call.
+_MESSAGE_LINE = re.compile(r'(?i)^(?:throw\b|write-\w+\b|"|#)')
+_DACL_TOOL = re.compile(r"(?i)cacls|set-acl|takeown|system32")
+
+
+def _dacl_tool_lines(script: str) -> list[str]:
+    """The lines of ``script`` that name a DACL tool, each stripped.
+
+    Double-quoted text is blanked only on a line that starts with ``throw``, a ``Write-`` cmdlet,
+    a bare string or a comment, where it is a message. Anywhere else a quoted string can be the
+    call itself: ``& "C:\\Windows\\System32\\icacls.exe" ...`` or ``cmd /c "icacls ..."``, which
+    the stand-ins below would not intercept, so those lines stay in the census.
+    """
+    lines = []
+    for raw in script.splitlines():
+        line = raw.strip()
+        read = re.sub(r'"[^"]*"', '""', line) if _MESSAGE_LINE.match(line) else line
+        if _DACL_TOOL.search(read):
+            lines.append(read)
+    return lines
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        r'& "C:\Windows\System32\icacls.exe" $d /grant "x:(OI)(CI)F"',
+        'cmd /c "icacls $d /grant x:F"',
+        "& 'icacls.exe' $d /reset",
+        r'Start-Process -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList $d',
+    ],
+    ids=["quoted-full-path", "cmd-c", "single-quoted", "start-process"],
+)
+def test_the_dacl_tool_census_sees_a_quoted_call(extra: str) -> None:
+    """The census in front of the stand-ins must not read a quoted call as message text."""
+    script = _smoke_step(_DACL_STEP)
+    assert _dacl_tool_lines(script) == ["$acl = (& icacls $d | Out-String)"], (
+        "CONTROL FAILED: the step's own census changed"
+    )
+    assert extra in _dacl_tool_lines(f"{script}\n{extra}\n"), "the census missed a quoted call"
+
+
+def test_the_dacl_tool_census_ignores_message_text() -> None:
+    """A message naming icacls is not a call, so it does not trip the census."""
+    messages = [
+        'throw "icacls on $d failed"',
+        'Write-Host "icacls says:"',
+        '"===== icacls $d ====="',
+    ]
+    assert _dacl_tool_lines("\n".join(messages)) == []
+    assert _dacl_tool_lines("\n".join([*messages, "& icacls $d"])) == ["& icacls $d"], (
+        "CONTROL: a bare call beside the messages is still read"
+    )
+
+
 def _run_dacl_step(
     tmp_path: Path, *, account: str, data: list[str], logs: list[str]
 ) -> subprocess.CompletedProcess[str]:
@@ -1931,9 +2020,7 @@ def _run_dacl_step(
     if shell is None:
         pytest.skip("SKIP (nothing run): neither powershell nor pwsh on PATH")
     script = _smoke_step(_DACL_STEP)
-    # Message text is not a call, so double-quoted strings are blanked before the search.
-    unquoted = [re.sub(r'"[^"]*"', '""', line).strip() for line in script.splitlines()]
-    tools = [line for line in unquoted if re.search(r"(?i)cacls|set-acl|takeown|system32", line)]
+    tools = _dacl_tool_lines(script)
     assert tools == ["$acl = (& icacls $d | Out-String)"], (
         f"expected the step's one DACL-tool line to be the bare, read-only icacls call: {tools}"
     )
@@ -1960,10 +2047,12 @@ function icacls {{ param($Path) if ($args.Count) {{ throw "the step changed a DA
         + "\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n",
         encoding="utf-8",
     )
-    # Bypass for this process only: 5.1's default policy refuses to dot-source a script file.
+    # Read the file and dot-source it as a script block rather than as a script file. Execution
+    # policy governs script FILES, so this runs where a machine or user policy set by Group Policy
+    # would overrule a process-scope -ExecutionPolicy Bypass and refuse the file.
+    run = f". ([scriptblock]::Create([IO.File]::ReadAllText({_psq(str(f))})))"
     return subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
-        + [f". {_psq(str(f))}"],
+        [shell, "-NoProfile", "-NonInteractive", "-Command", run],
         capture_output=True,
         text=True,
         timeout=180,
@@ -2236,16 +2325,26 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 #
 # The rule pins the installer's real shape: it sets the account in three places, all inside one run-as
 # if/else, and locks down once, after that whole if/else. So a lockdown placed inside a run-as branch
-# reads red BY DESIGN, even after that branch's own Set-ServiceAccount, and so does one in any order
-# inside an if statement that also wraps the run-as if, such as a -WhatIf gate around the install
-# body. An ACL call nested in a Set-ServiceAccount argument sits inside that call, and reads red too.
-# An if statement that does not wrap the run-as if is not read at all: the real Set-SecureConfigAcl
-# sits in one after it, and a lockdown in one before it is simply earlier.
+# reads red BY DESIGN, even after that branch's own Set-ServiceAccount. So does one in any order
+# inside an if statement that also wraps the run-as if, and that one is a FALSE red: a -WhatIf gate
+# around the whole install body, account call first and lockdown after it, is in the right order and
+# still reads red. The installer has no such gate today. Whoever adds one changes this rule in the
+# same change, rather than reading the red as a wrong order. An ACL call nested in a
+# Set-ServiceAccount argument sits inside that call, and reads red too. Only the ifs around a
+# Set-ServiceAccount call are read. An if statement around no Set-ServiceAccount call changes
+# nothing: the real Set-SecureConfigAcl sits in one after the run-as if, and a lockdown in one before
+# it is simply earlier.
 #
 # It does NOT check, at least:
 #   * code that runs more than once around both, such as a loop, a switch over several values or a
 #     ForEach-Object block, where an earlier pass runs an ACL call written after a Set-ServiceAccount
-#     that only a later pass runs. One with an if around the account call inside it still reads red;
+#     that only a later pass runs. Inside such a loop, an ACL call in the same if as the account call,
+#     or written before that if, reads red; one written after that if, still inside the loop, reads
+#     green;
+#   * a branch that is not an if statement. Only an if statement's extent is read, so an account call
+#     in a try or catch block, a switch clause, either side of && or ||, a ternary operand, or the
+#     right side of -and or -or counts as the call alone, and an ACL call written after it in the
+#     same construct reads green;
 #   * an exit, return or throw between the run-as if and the lockdown, which leaves the account set
 #     and nothing locked;
 #   * whether each run-as branch actually sets the account.
@@ -2335,127 +2434,171 @@ def _commented(call: str) -> tuple[str, str]:
     return call, call.replace(_ACCOUNT_CALL, f"# {_ACCOUNT_CALL}")
 
 
-@pytest.mark.parametrize(
-    ("mutate", "expect"),
-    [
-        pytest.param(
-            _hoist(_LOCKDOWN), ("Set-SecureDataDirAcl at line", _NOT_AFTER), id="lockdown-hoisted"
+_ORDER_MUTATIONS = [
+    pytest.param(
+        _hoist(_LOCKDOWN), ("Set-SecureDataDirAcl at line", _NOT_AFTER), id="lockdown-hoisted"
+    ),
+    pytest.param(
+        _hoist(_CONFIG_LOCK),
+        ("Set-SecureConfigAcl at line", _NOT_AFTER),
+        id="config-lock-hoisted",
+    ),
+    pytest.param(
+        _hoist(_CONFIG_READ),
+        ("Set-ConfigReadAcl at line", _NOT_AFTER),
+        id="config-read-hoisted",
+    ),
+    # $null, not a comment: the read call shares its line with the closing brace of its if.
+    pytest.param(
+        _replace(_LOCKDOWN, "$null"),
+        ("Set-SecureDataDirAcl is not called",),
+        id="lockdown-deleted",
+    ),
+    pytest.param(
+        _replace(_CONFIG_LOCK, "$null"),
+        ("Set-SecureConfigAcl is not called",),
+        id="config-lock-deleted",
+    ),
+    pytest.param(
+        _replace(_CONFIG_READ, "$null"),
+        ("Set-ConfigReadAcl is not called",),
+        id="config-read-deleted",
+    ),
+    pytest.param(
+        _replace(_LOCKDOWN, "function Invoke-Lockdown {{ {call} }}"),
+        ("Set-SecureDataDirAcl at line", "is inside a function"),
+        id="lockdown-in-a-function",
+    ),
+    # The in-function check reads the account calls as well as the ACL calls.
+    pytest.param(
+        _replace(_PASSWORD_CALL, "function Invoke-RunAs {{ {call} }}"),
+        ("Set-ServiceAccount at line", "is inside a function"),
+        id="account-call-in-a-function",
+    ),
+    # Red BY DESIGN: after its own branch's account, yet inside the run-as if/else.
+    pytest.param(
+        _rewrite((_LOCKDOWN, "$null"), _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}")),
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-moved-into-a-run-as-branch",
+    ),
+    # With no account call in the else, only the OUTERMOST if puts this lockdown inside: the
+    # innermost if around each remaining call ends above it.
+    pytest.param(
+        _rewrite(
+            _commented(_LOCALSYSTEM_CALL),
+            (_LOCKDOWN, "$null"),
+            _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
         ),
-        pytest.param(
-            _hoist(_CONFIG_LOCK),
-            ("Set-SecureConfigAcl at line", _NOT_AFTER),
-            id="config-lock-hoisted",
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-in-the-named-branch-with-no-account-in-the-else",
+    ),
+    pytest.param(
+        _rewrite(
+            (_LOCKDOWN, "$null"),
+            _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
+            _after(_LOCALSYSTEM_CALL, f"    {_LOCKDOWN}"),
         ),
-        pytest.param(
-            _hoist(_CONFIG_READ),
-            ("Set-ConfigReadAcl at line", _NOT_AFTER),
-            id="config-read-hoisted",
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-moved-into-each-run-as-branch",
+    ),
+    # Red BY DESIGN: in order, but inside an if that also wraps the run-as if.
+    pytest.param(
+        _rewrite(
+            (_RUN_AS_ASSIGNMENT, f"if ($true) {{\n{_RUN_AS_ASSIGNMENT}"),
+            (_LOCKDOWN, f"{_LOCKDOWN}\n}}"),
         ),
-        # $null, not a comment: the read call shares its line with the closing brace of its if.
-        pytest.param(
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-and-run-as-if-in-one-wrapping-if",
+    ),
+    pytest.param(
+        _hoist(_LOCKDOWN, "if ($LockConfigDir) {{ {call} }}"),
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-in-an-unrelated-if-before-the-run-as-if",
+    ),
+    # At top level, so only the account call's own END puts the lockdown inside it.
+    pytest.param(
+        _then(
             _replace(_LOCKDOWN, "$null"),
-            ("Set-SecureDataDirAcl is not called",),
-            id="lockdown-deleted",
+            _ACCOUNT_CALL.replace("$RunAsObjectName", f"({_LOCKDOWN})"),
         ),
-        pytest.param(
-            _replace(_CONFIG_LOCK, "$null"),
-            ("Set-SecureConfigAcl is not called",),
-            id="config-lock-deleted",
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-in-a-run-as-argument",
+    ),
+    pytest.param(
+        _replace(
+            _LOCKDOWN,
+            "foreach ($step in 'acl', 'account') {{ if ($step -eq 'acl') {{ {call} }}"
+            f" else {{{{ {_ACCOUNT_CALL} }}}} }}}}",
         ),
-        pytest.param(
-            _replace(_CONFIG_READ, "$null"),
-            ("Set-ConfigReadAcl is not called",),
-            id="config-read-deleted",
-        ),
-        pytest.param(
-            _replace(_LOCKDOWN, "function Invoke-Lockdown {{ {call} }}"),
-            ("Set-SecureDataDirAcl at line", "is inside a function"),
-            id="lockdown-in-a-function",
-        ),
-        # Red BY DESIGN: after its own branch's account, yet inside the run-as if/else.
-        pytest.param(
-            _rewrite((_LOCKDOWN, "$null"), _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}")),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-moved-into-a-run-as-branch",
-        ),
-        # With no account call in the else, only the OUTERMOST if puts this lockdown inside: the
-        # innermost if around each remaining call ends above it.
-        pytest.param(
-            _rewrite(
-                _commented(_LOCALSYSTEM_CALL),
-                (_LOCKDOWN, "$null"),
-                _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
-            ),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-in-the-named-branch-with-no-account-in-the-else",
-        ),
-        pytest.param(
-            _rewrite(
-                (_LOCKDOWN, "$null"),
-                _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
-                _after(_LOCALSYSTEM_CALL, f"    {_LOCKDOWN}"),
-            ),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-moved-into-each-run-as-branch",
-        ),
-        # Red BY DESIGN: in order, but inside an if that also wraps the run-as if.
-        pytest.param(
-            _rewrite(
-                (_RUN_AS_ASSIGNMENT, f"if ($true) {{\n{_RUN_AS_ASSIGNMENT}"),
-                (_LOCKDOWN, f"{_LOCKDOWN}\n}}"),
-            ),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-and-run-as-if-in-one-wrapping-if",
-        ),
-        pytest.param(
-            _hoist(_LOCKDOWN, "if ($LockConfigDir) {{ {call} }}"),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-in-an-unrelated-if-before-the-run-as-if",
-        ),
-        # At top level, so only the account call's own END puts the lockdown inside it.
-        pytest.param(
-            _then(
-                _replace(_LOCKDOWN, "$null"),
-                _ACCOUNT_CALL.replace("$RunAsObjectName", f"({_LOCKDOWN})"),
-            ),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-in-a-run-as-argument",
-        ),
-        pytest.param(
-            _replace(
-                _LOCKDOWN,
-                "foreach ($step in 'acl', 'account') {{ if ($step -eq 'acl') {{ {call} }}"
-                f" else {{{{ {_ACCOUNT_CALL} }}}} }}}}",
-            ),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="lockdown-and-account-in-one-loop",
-        ),
-        pytest.param(
-            _rewrite(*map(_commented, (_PASSWORD_CALL, _NO_PASSWORD_CALL, _LOCALSYSTEM_CALL))),
-            ("no Set-ServiceAccount call sets the run-as account the ACLs name",),
-            id="no-set-serviceaccount",
-        ),
-        # A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it.
-        pytest.param(
-            _rewrite((_RUN_AS_ASSIGNMENT, f"{_LOCKDOWN.lower()}\n{_RUN_AS_ASSIGNMENT}")),
-            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
-            id="early-call-in-lower-case",
-        ),
-        # A further account call after every ACL call: the order swapped from the other side.
-        pytest.param(_then(_rewrite(), _ACCOUNT_CALL), (_NOT_AFTER,), id="account-set-last"),
-    ],
-)
-def test_the_acl_order_guard_fails_when_the_order_is_broken(
-    tmp_path: Path, mutate: Callable[[str], str], expect: tuple[str, ...]
-) -> None:
-    """THE CONTROL. Each mutation breaks the order, or the call, in a copy of the script, and the
-    guard must then name it, in one problem carrying every part of ``expect``. A guard that cannot
-    fail would pass on a script that locks nothing."""
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="lockdown-and-account-in-one-loop",
+    ),
+    pytest.param(
+        _rewrite(*map(_commented, (_PASSWORD_CALL, _NO_PASSWORD_CALL, _LOCALSYSTEM_CALL))),
+        ("no Set-ServiceAccount call sets the run-as account the ACLs name",),
+        id="no-set-serviceaccount",
+    ),
+    # A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it.
+    pytest.param(
+        _rewrite((_RUN_AS_ASSIGNMENT, f"{_LOCKDOWN.lower()}\n{_RUN_AS_ASSIGNMENT}")),
+        ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+        id="early-call-in-lower-case",
+    ),
+    # A further account call after every ACL call: the order swapped from the other side.
+    pytest.param(_then(_rewrite(), _ACCOUNT_CALL), (_NOT_AFTER,), id="account-set-last"),
+]
+
+
+@pytest.fixture(scope="module")
+def order_guard_facts(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
+    """The facts of every changed copy in ``_ORDER_MUTATIONS``, by arm id, read in one process.
+
+    A mutation whose CONTROL assertion fails yields ``{"error": ...}`` for its own arm alone.
+    """
     assert _SCRIPT is not None
-    mutated = tmp_path / "install-service.ps1"
-    mutated.write_text(mutate(_SCRIPT.read_text(encoding="utf-8")), encoding="utf-8")
-    problems = _acl_order_problems(_preflight_facts(tmp_path, script=mutated))
+    source = _SCRIPT.read_text(encoding="utf-8")
+    tmp = tmp_path_factory.mktemp("order-guard")
+    facts: dict[str, dict] = {}
+    copies: dict[str, Path] = {}
+    for arm in _ORDER_MUTATIONS:
+        assert arm.id is not None
+        mutate = arm.values[0]
+        assert callable(mutate)
+        try:
+            text = mutate(source)
+        except AssertionError as exc:
+            facts[arm.id] = {"error": str(exc)}
+            continue
+        copies[arm.id] = tmp / f"install-service-{arm.id}.ps1"
+        copies[arm.id].write_text(text, encoding="utf-8")
+    facts.update(zip(copies, _preflight_facts_many(tmp, list(copies.values())), strict=True))
+    return facts
+
+
+@pytest.mark.parametrize(("mutate", "expect"), _ORDER_MUTATIONS)
+def test_the_acl_order_guard_fails_when_the_order_is_broken(
+    request: pytest.FixtureRequest,
+    order_guard_facts: dict[str, dict],
+    mutate: Callable[[str], str],
+    expect: tuple[str, ...],
+) -> None:
+    """THE CONTROL. Each mutation (``mutate``, applied by the fixture) breaks the order, or the
+    call, in a copy of the script, and the guard must then name it, in one problem carrying every
+    part of ``expect``. A guard that cannot fail would pass on a script that locks nothing."""
+    facts = order_guard_facts[request.node.callspec.id]
+    assert "error" not in facts, facts["error"]
+    problems = _acl_order_problems(facts)
     assert any(all(part in p for part in expect) for p in problems), problems
+
+
+def test_a_script_that_does_not_parse_is_refused_not_read(tmp_path: Path) -> None:
+    """``ParseFile`` returns a partial tree for a file it cannot parse, and a guard reading that
+    tree passes on whatever calls survived. The harness throws instead, naming the error."""
+    broken = tmp_path / "install-service.ps1"
+    broken.write_text(_script_text() + "\nif ($true) {\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="does not parse"):
+        _preflight_facts(tmp_path, script=broken)
+    assert _preflight_facts(tmp_path)["commands"], "CONTROL: the real installer parses and is read"
 
 
 # --- the uninstaller's inventory of what it leaves (BACKLOG #1704) --------------------------------

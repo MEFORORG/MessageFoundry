@@ -52,7 +52,14 @@ from tests._restricted_token import (
     WRITE_RESTRICTED_SID,
     spawn_restricted,
 )
-from tests.test_service_install_manifest import _extract, _notice, _ok, _preflight_facts, _psq
+from tests.test_service_install_manifest import (
+    _extract,
+    _named,
+    _notice,
+    _ok,
+    _preflight_facts,
+    _psq,
+)
 
 _SCRIPT = svc.install_script_path()
 _UNINSTALL = svc.uninstall_script_path()
@@ -290,12 +297,26 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     commands = facts["commands"]
 
     def calls(name: str) -> list[dict[str, Any]]:
-        return [c for c in commands if c["name"] == name]
+        # PowerShell resolves a command name without regard to case, so the guard does too.
+        return [c for c in commands if _named(c, name)]
 
-    problems = []
+    names = (
+        "Set-ServiceTokenHardening",
+        "Set-ServiceAccount",
+        "Get-ServiceSidTypeChoice",
+        "Get-WriteGrantProblem",
+        "Set-SecureDataDirAcl",
+    )
+    # A call inside a function runs when the function is called, so its offset says nothing about
+    # its order. The order checks below read offsets.
+    problems = [
+        f"{c['name']} at line {c['line']} is inside a function, so its offset is not its run order"
+        for c in commands
+        if c["inFunction"] and any(_named(c, n) for n in names)
+    ]
     setters = calls("Set-ServiceTokenHardening")
     if len(setters) != 1:
-        return [f"expected one Set-ServiceTokenHardening call, found {len(setters)}"]
+        return [*problems, f"expected one Set-ServiceTokenHardening call, found {len(setters)}"]
     setter = setters[0]
     for needle in ("$SidChoice.SidType", "-Privileges $ServicePrivileges"):
         if needle not in setter["text"]:
@@ -333,6 +354,29 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
     assert _wiring_problems(_preflight_facts(tmp_path)) == []
 
 
+_SETTER_CALL = (
+    "Set-ServiceTokenHardening -ServiceName $ServiceName -SidType $SidChoice.SidType"
+    " -Privileges $ServicePrivileges"
+)
+
+
+def test_the_wiring_guard_reads_a_call_spelled_in_another_case(tmp_path: Path) -> None:
+    """PowerShell runs ``set-servicetokenhardening`` as the same command, so the guard must still
+    find the call, and still find nothing wrong with it."""
+    assert _SCRIPT is not None
+    source = _SCRIPT.read_text(encoding="utf-8")
+    assert source.count(f"\n{_SETTER_CALL}\n") == 1, "CONTROL FAILED: the call is not in the script"
+    mutated = tmp_path / "install-service.ps1"
+    mutated.write_text(
+        source.replace(
+            f"\n{_SETTER_CALL}\n",
+            f"\n{_SETTER_CALL.replace('Set-ServiceTokenHardening', 'set-servicetokenhardening')}\n",
+        ),
+        encoding="utf-8",
+    )
+    assert _wiring_problems(_preflight_facts(tmp_path, script=mutated)) == []
+
+
 @pytest.mark.parametrize(
     ("old", "new", "expect"),
     [
@@ -355,6 +399,11 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
             'if ($SidChoice.SidType -eq "restricted") {',
             "before the run-as account",
         ),
+        (
+            f"\n{_SETTER_CALL}\n",
+            f"\nfunction Invoke-Hardening {{ {_SETTER_CALL} }}\nInvoke-Hardening\n",
+            "is inside a function",
+        ),
     ],
     ids=[
         "call-removed",
@@ -363,6 +412,7 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
         "grant-not-read",
         "store-not-read",
         "account-set-after",
+        "call-in-a-function",
     ],
 )
 def test_the_wiring_guard_fails_when_a_piece_is_changed(
