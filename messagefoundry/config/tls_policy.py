@@ -374,9 +374,15 @@ def harden_crl_check(
 
     A sixth, since vault BACKLOG #2905 (owner ruling 2026-10-05): a CRL that is proven badly
     signed. :class:`~messagefoundry.pki.CrlSignature` says what counts as proof. The check is
-    :func:`_check_crl_signatures`. It runs last of all, once
-    OpenSSL is known to hold exactly the CRLs judged, so it hides none of the refusals above. A
-    signature it cannot confirm, short of proof, loads with one warning for the file.
+    :func:`_check_crl_signatures`. It runs once OpenSSL is known to hold exactly the CRLs judged,
+    so it hides none of the refusals above. A signature it cannot confirm, short of proof, loads
+    with one warning for the file.
+
+    A seventh, with ``chain`` only, since vault BACKLOG #5627 and #5511: a loaded CA with no CRL of
+    its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
+    is raised inside :func:`_check_crl_signatures`, after a proven bad signature refuses and before
+    the warning for a signature short of proof, so a refused start never first logs that the file
+    is loaded. The running-hop reload checks in the same order.
 
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
