@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 22 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 23 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -118,7 +118,9 @@ inert.
   a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
-- The VS Code extension's new-route command writes a new module into your config directory.
+- The VS Code extension's new-route command writes a new module into your config directory. It
+  writes only in a trusted workspace, and refuses a `messagefoundry.configDir` that resolves
+  outside the workspace folder, through a link included.
 
 Each writes code that runs with the engine's rights on its next start. Review what they wrote
 before you point the engine at it.
@@ -498,12 +500,14 @@ reach one:
 
 ## 5. Native library calls
 
-22 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+23 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Config edit owner check: `config/atomic_edit.py`, which calls at least `advapi32`'s
+  `ConvertStringSidToSidW`, on a SID string
 - Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
   a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
   `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own

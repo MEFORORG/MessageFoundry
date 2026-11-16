@@ -210,3 +210,16 @@ def test_check_still_reports_a_bad_expect_disposition(tmp_path: Path) -> None:
     result = _check_dryrun(config, fixtures)
     assert result.ok is False
     assert "invalid .expect disposition 'NOPE'" in result.detail
+
+
+def test_a_directory_yields_its_files_in_order_with_their_own_paths(tmp_path: Path) -> None:
+    """The IDE's collection run hands ``dryrun --messages`` one directory and maps each row back to
+    its case by the basename of ``path`` (BACKLOG #5415, ``ide/src/collectionCaseFiles.ts``), so the
+    directory form must keep each file's own path and the sorted file order."""
+    names = ["case_0002.hl7", "case_0000.hl7", "case_0001.hl7"]
+    for n in names:
+        (tmp_path / n).write_bytes(_MSG)
+    (tmp_path / "ignored.txt").write_bytes(_MSG)
+    got = dryrun.read_messages([str(tmp_path)])
+    assert [Path(p).name for _label, p, _content in got] == sorted(names)
+    assert [label for label, _p, _content in got] == sorted(names)

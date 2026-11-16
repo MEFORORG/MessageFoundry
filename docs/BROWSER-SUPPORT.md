@@ -30,9 +30,16 @@ browser does with them.
 > text says so. Two tests in the console package check parts of it on every run, and only those parts:
 >
 > - `test_ui_csp_canary.py` fails if the two tables under "What each absence does" stop naming a
->   response header, a `window.<Feature>` detect or a session-cookie attribute the code uses.
+>   response header, a `window.<Feature>` detect or a session-cookie attribute the code uses. It
+>   fails too if [the version table](#supported-browser-versions) has no row for one of those, or
+>   names neither as a row nor in its list of other directives a directive of the console's or the
+>   attachment download's policy, if it has no row for the in-page referrer tag or the two passkey
+>   options, if two rows are for one feature, if a row names no dataset entry, if a row leaves the
+>   floor without a reason the page states, if a cell with no version is added or removed, or if a
+>   browser's floor, its `Set by` column or its last column stops matching the rows.
 > - `test_browser_support_doc.py` fails if a `Sec-Fetch-*` or `Origin` header it finds read in the
->   console's code, or in the engine's WebSocket check, has no row, if a row's
+>   console's code, or in the engine's WebSocket check, has no row in the request-header table or
+>   in the version table, if a row's
 >   **Allowed** or **Refused** verdict stops matching what the code does without that header, if
 >   the opt-out cookie names or the HSTS conditions change, or if the list of IDE webviews or the
 >   one with a host-side startup check changes. It also fails if an IDE panel stops carrying the two
@@ -41,13 +48,18 @@ browser does with them.
 >
 > Nothing checks the middle column of the request-header table, the API pages' list of what they
 > load, or the IDE table's description of each panel. Those were read or measured when written.
+> Nothing checks a version number in the version table against its source either. Each was read
+> from the dataset its row names, at the version the table names, when written.
 
 ---
 
 ## One feature decides whether the console works: CSP nonce sources
 
 The console serves a per-response Content-Security-Policy of the form
-`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist and no inline script. A
+`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist. A script the page
+itself carries, inline or loaded from a file, runs only by carrying the nonce. In a browser that
+understands `'strict-dynamic'`, a script that an already running script adds to the page runs
+without one. A
 browser that enforces CSP but does not understand a `'nonce-...'` source therefore has no valid script
 source, and blocks every script on the page.
 
@@ -66,18 +78,11 @@ does not recognise it, ignores it, and matches the nonce instead, so the console
 Only nonce-source support decides the outcome. The two cases look identical in a smoke test, which is
 why the distinction is written down here rather than left to a tester.
 
-### Minimum browser versions are deliberately not stated
+### Minimum browser versions are derived from the features, not chosen
 
-**Unresolved.** MessageFoundry ships no pinned browser-compatibility dataset, so there is no version
-table here that anyone could check against a source. Naming engine versions without one would mean
-writing numbers chosen to match what already works, which tells you nothing about the feature the
-console actually needs.
-
-What would resolve it: pinning a versioned compatibility dataset into the repository and resolving
-each feature in the table below to a per-engine minimum from it. That work is not funded yet.
-
-Until then the floor is stated as a feature, and the console tells you at the moment of degradation.
-Both statements are checkable. A version number would be neither.
+Each browser's minimum version is in [Supported browser versions](#supported-browser-versions)
+below. Its CSP nonce-source row is the feature this section is about. That row's numbers are
+conservative, and one older browser does not get the banner: see note 4 there.
 
 ---
 
@@ -104,7 +109,7 @@ paired with a control that does not depend on the browser.
 | `Cross-Origin-Opener-Policy` | Process isolation for the console's browsing context. | `/ui` opens no cross-origin window and embeds no cross-origin content. The CSP's `frame-ancestors 'none'` still blocks framing. |
 | `Cross-Origin-Resource-Policy` | A cross-origin read block on console resources. | `/ui` serves no resource meant to be embedded elsewhere. |
 | `Reporting-Endpoints` | Delivery of CSP violation reports on the modern route. | Telemetry only, never a control. The legacy `report-uri` directive goes out alongside it, so most such browsers still deliver reports. |
-| `Clear-Site-Data` | Storage clearing when a session ends. Safari does not support it. | The session is revoked on the server, the cookie is deleted, every `/ui` page is `Cache-Control: no-store`, and the idle-logoff script blanks the page before it navigates away. |
+| `Clear-Site-Data` | Clearing the cache when a session ends. Some browsers apply the `"cache"` value only in part, and some versions not at all: see [the version table](#supported-browser-versions). | The session is revoked on the server, the cookie is deleted, every `/ui` page is `Cache-Control: no-store`, and the idle-logoff script blanks the page before it navigates away. |
 | `Cache-Control: no-store` | Cache and back-button suppression for console pages and PHI responses. | `Clear-Site-Data` on session end, the page blanking above, and the server refusing every request a restored page would make. |
 | `X-Content-Type-Options` | MIME-sniffing suppression. | The `/ui` static mount serves only `.css` and `.js`, from one fixed directory, with correct types. The one `/ui` route that serves stored message content as a file, the attachment download, also carries `Content-Disposition: attachment` and a sandbox policy (see its row below). |
 | `X-Frame-Options` | The legacy framing block. | Pure redundancy. `frame-ancestors 'none'` in the CSP is the modern control, and any browser that honours the nonce CSP honours it. |
@@ -125,9 +130,148 @@ unchecked by that rule.
 | `Sec-Fetch-Site` | On every `/ui` request, static files included, a value of `cross-site` or `same-site` is refused with a 403. The one exception is a safe top-level navigation, defined by the next three rows. Lines that carry different values are refused with a 403 on every `/ui` request, with no exception; a browser sends one line. Every state-changing `/ui` POST refuses those two values again, and refuses any other non-empty value that is not exactly `same-origin` or `none`. Only those two let the POST through on this header alone. The rule for one line of each header, by method, is the table in the `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which a test drives row by row and which also names what the table does not cover. | **Allowed** by the middleware, which passes the request. A page read then rests on the `SameSite=Strict` session cookie. A state-changing POST does not get through on this alone: the `Origin` check below takes over, and it refuses a POST that carries neither header. |
 | `Sec-Fetch-Mode` | A `cross-site` or `same-site` request passes only as a `navigate` GET or HEAD. The Kerberos and OIDC sign-in routes also reject, and audit, any mode other than `navigate`. | **Refused** by the middleware, which reads it only after `Sec-Fetch-Site` said `cross-site` or `same-site`. The sign-in routes allow a request without it. |
 | `Sec-Fetch-Dest` | That navigation must be for a `document`. This refuses cross-site framing before anything is served. | **Refused**, and read only after `Sec-Fetch-Site` said `cross-site` or `same-site`. |
-| `Sec-Fetch-User` | A `same-site` navigation must carry `?1`, meaning the user started it with a click or a key. A `cross-site` one is not asked for it, so an identity provider's redirect back to the console still works. | **Refused**, and read only for a `same-site` navigation. |
+| `Sec-Fetch-User` | A `same-site` navigation must carry `?1`, meaning the user started it with a click or a key. A `cross-site` one is not asked for it, so an identity provider's redirect back to the console still works when the provider is on another site; one on the same site is refused whenever the browser does not send `?1`, as [Federated sign-in and form-action](#federated-sign-in-and-form-action) says. | **Refused**, and read only for a `same-site` navigation. |
 | `Origin` on a form POST | On a POST, read only when `Sec-Fetch-Site` is missing or empty; on a GET that runs this check, also when it is any value other than the four the Fetch Metadata standard defines. It must equal `[security].web_console_public_address` when that is set, or else the request's `Host`. Behind a proxy in front of a loopback bind with no public address set, nothing matches and the POST is refused. | **Refused.** A state-changing `/ui` request that carries neither `Sec-Fetch-Site` nor `Origin` **fails closed** with a 403 that says so, and nothing is changed. That covers the sign-in POST, which has no session cookie yet for `SameSite=Strict` to withhold, and sign-out. A browser that sends neither header on its own form POST cannot sign in. **Three sign-in GETs are deliberately not blocked for missing fetch metadata**, under owner rulings R4 and R4b of 2026-09-28: `GET /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its "leaving this site" page is skipped. The first two never run this check. The third runs it as a GET, and a GET that carries neither header goes on to the identity provider; the GET rows of the docstring table named in the `Sec-Fetch-Site` row above say the rest. Not measured in a real browser: the console sends `Referrer-Policy: no-referrer`, and the Fetch standard then has a browser send `Origin: null` on a form POST, which this check refuses as a mismatch. Measured against the code, not a browser: a POST with no `Sec-Fetch-Site` and `Origin: null` was already refused before this rule existed, so nothing is new for a browser that sends `Origin` and no `Sec-Fetch-Site`. The rule is new only for a browser that sends neither header on its own form POST, and whether such a browser can run the console at all is unmeasured. If one exists and Kerberos or federated sign-in is on, one of those three GETs could still give it a session whose writes are refused, sign-out included; that session would end at least by expiry or by an administrator revoking it. At least one `/ui` POST is outside this rule, the CSP report sink `/ui/csp-report`: it reads `Sec-Fetch-Site` only, because a browser's reporting agent sends no fetch metadata, and it changes nothing. |
 | `Origin` on the `/ws/stats` WebSocket handshake | The console's cookie handshake must come from the console's own origin, by the same rule as a form POST, or it is refused. The engine's own handshake path accepts a browser `Origin` only if `[api].ws_allowed_origins` lists it, and that list is empty by default. | **Allowed** by the `Origin` rule. A handshake with no `Origin` is treated as a program's, and the next check wants an `Authorization` header that a browser cannot set, so a browser still gets no socket. The dashboard then keeps its table current by polling over HTTP, and its queue-count line stays empty. Only an app built with authentication explicitly turned off, an embedding or development case, accepts the handshake. |
+
+---
+
+## Supported browser versions
+
+**Each minimum version here is derived from the features this page names.** Every row is one
+browser feature the console uses, with the desktop version of each browser from which it supports
+the feature, by the rule under [Where the numbers come from](#where-the-numbers-come-from), and the
+dataset entry the number was read from. A browser's floor is the latest version in its column, over
+the rows that count toward it. No number was chosen to match what already works.
+
+**Nothing enforces these versions.** The console does not read a browser's version and refuses no
+browser for being older. A browser below its floor gets, for each feature it lacks, what that
+feature's row in the tables above says. At least these rows that count toward the floor have no row
+there, and the notes say what each costs: CSP `frame-ancestors`, `<meta name="referrer">`, and the
+two passkey options.
+
+### The floor
+
+| Browser | Supported from | Set by | No version fully supports, or not verified |
+|---|---|---|---|
+| Chrome | 89 | Passkey option `residentKey: "required"`. Passkey extension `credProps`. | `Clear-Site-Data` with `"cache"` (note 3). Session cookie `Secure` (not verified). |
+| Edge | 89 | Passkey option `residentKey: "required"`. Passkey extension `credProps`. | `Clear-Site-Data` with `"cache"` (note 3). Session cookie `Secure` (not verified). |
+| Firefox | 138 | `Clear-Site-Data` with `"cache"`. | Session cookie `Secure` (not verified). |
+| Safari | 17 | `Clear-Site-Data` with `"cache"`. | Passkey option `residentKey: "required"` (note 6). Passkey extension `credProps` (note 6). Session cookie `Secure` (not verified). `Sec-Fetch-User`. |
+
+So a floor is the first version that has every counted feature the browser's current releases
+have. It is not the version the console needs to work, which is the CSP nonce-source row. A
+feature in the last column does not raise the floor: either no version of that browser meets it,
+or neither dataset gives a number for it. Its row in the tables above, or its note, says what holds
+without it. At least two of them change what a user sees. Safari sends no `Sec-Fetch-User`, so under
+the `Sec-Fetch-User` row a link into the console from a same-site page, such as another port on the
+same host or another subdomain of the same domain, is refused. And in Chrome and Edge the `Clear-Site-Data` value can hang the page for
+seconds (note 3). Both were read from the code and the dataset, not measured in a browser.
+
+### Each feature
+
+| Feature the console uses | Chrome | Edge | Firefox | Safari | Counts toward the floor | Source |
+|---|---|---|---|---|---|---|
+| CSP nonce sources (`'nonce-...'` in `script-src`) | 40 | 79 | 45 | 10 | yes | caniuse `contentsecuritypolicy2` (note 4) |
+| `Content-Security-Policy`, enforced at all | 25 | 14 | 23 | 7 | yes | BCD `http.headers.Content-Security-Policy` |
+| CSP `frame-ancestors` | 40 | 15 | 58 | 10 | yes | BCD `http.headers.Content-Security-Policy.frame-ancestors` (note 5) |
+| CSP `sandbox`, on the attachment download | 25 | 14 | 50 | 7 | yes | BCD `http.headers.Content-Security-Policy.sandbox` |
+| CSP `'strict-dynamic'` | 52 | 79 | 52 | 15.4 | no: a browser without it ignores it and matches the nonce, as the floor section above says | BCD `http.headers.Content-Security-Policy.strict-dynamic` |
+| CSP `report-uri` | 25 | 14 | 23 | 7 | no: reporting is telemetry, never a control | BCD `http.headers.Content-Security-Policy.report-uri` |
+| CSP `report-to` | 70 | 79 | 149 | 16.4 | no: reporting is telemetry, never a control | BCD `http.headers.Content-Security-Policy.report-to` |
+| `Reporting-Endpoints` | 96 | 96 | 130 | 16.4 | no: reporting is telemetry, never a control | BCD `http.headers.Reporting-Endpoints` |
+| `Cross-Origin-Opener-Policy` | 83 | 83 | 79 | 15.2 | yes | BCD `http.headers.Cross-Origin-Opener-Policy` |
+| `Cross-Origin-Resource-Policy` | 73 | 79 | 74 | 12 | yes | BCD `http.headers.Cross-Origin-Resource-Policy` |
+| `Clear-Site-Data` with `"cache"` | none | none | 138 | 17 | yes | BCD `http.headers.Clear-Site-Data.cache` (note 3) |
+| `Cache-Control: no-store` | 1 | 12 | 1 | 1 | yes | BCD `http.headers.Cache-Control` |
+| `Referrer-Policy` | 56 | 79 | 50 | 11.1 | yes | BCD `http.headers.Referrer-Policy` |
+| `<meta name="referrer">` | 17 | 79 | 36 | 11.1 | yes | BCD `html.elements.meta.name.referrer` (note 7) |
+| `X-Content-Type-Options` | 64 | 12 | 50 | 11 | yes | BCD `http.headers.X-Content-Type-Options` |
+| `X-Frame-Options: DENY` | 4 | 12 | 4 | 4 | yes | BCD `http.headers.X-Frame-Options.DENY` |
+| `Strict-Transport-Security` | 4 | 12 | 4 | 7 | yes | BCD `http.headers.Strict-Transport-Security` |
+| Session cookie `HttpOnly` | 1 | 12 | 3 | 5 | yes | BCD `http.headers.Set-Cookie.HttpOnly` |
+| Session cookie `Secure` | not verified | not verified | not verified | not verified | yes | BCD has no entry for this attribute |
+| Session cookie `__Host-` prefix | 49 | 79 | 50 | 13 | yes | BCD `http.headers.Set-Cookie.host_secure_prefixes` |
+| Session cookie `SameSite=Strict` | 51 | 16 | 60 | 12 | yes | BCD `http.headers.Set-Cookie.SameSite.Strict` |
+| `window.isSecureContext` | 47 | 15 | 49 | 11.1 | yes | BCD `api.isSecureContext` |
+| `window.PublicKeyCredential` | 67 | 18 | 60 | 13 | yes | BCD `api.PublicKeyCredential` (note 2) |
+| Passkey option `residentKey: "required"` | 89 | 89 | 114 | none | yes | BCD `api.CredentialsContainer.create.publicKey_option.residentKey` (note 6) |
+| Passkey extension `credProps` | 89 | 89 | 119 | none | yes | BCD `api.CredentialsContainer.create.publicKey_option.extensions.credProps` (note 6) |
+| `Sec-Fetch-Site` | 76 | 79 | 90 | 16.4 | yes | BCD `http.headers.Sec-Fetch-Site` |
+| `Sec-Fetch-Mode` | 76 | 79 | 90 | 16.4 | yes | BCD `http.headers.Sec-Fetch-Mode` |
+| `Sec-Fetch-Dest` | 80 | 80 | 90 | 16.4 | yes | BCD `http.headers.Sec-Fetch-Dest` |
+| `Sec-Fetch-User` | 76 | 79 | 90 | none | yes | BCD `http.headers.Sec-Fetch-User` |
+| `Origin` on a form POST | 1 | 79 | 70 | 1 | yes | BCD `http.headers.Origin` (note 1) |
+
+The console's and the attachment download's policies have other directives: `default-src`,
+`script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `base-uri`, `form-action` and
+`object-src`. Each directive's own entry was read in the same dataset, and none has a later version
+than its browser's floor, so none has a row.
+
+### Federated sign-in and form-action
+
+BCD also records, under `form-action`, that Chrome, Edge and Safari apply it to the redirect that
+follows a form submission, and that Firefox does not. So at least the two console forms that lead to the
+identity provider, the "leaving this site" page's form (`POST /ui/oidc/start`) and the step-up form
+(`POST /ui/reauth/oidc`), are not answered with a redirect there. Each is answered with a page that
+navigates to the identity provider by meta refresh, with a Continue link as the fallback, and so is
+`GET /ui/oidc/start` when it skips that page. A meta refresh is not a form submission, so the
+console's `form-action 'self'` does not govern it, and the policy names no identity provider. The
+redirect these forms answered with before was measured blocked in headless Edge 157. No browser
+measurement of the page that replaced it is recorded.
+
+Read from the code and not measured: where the identity provider is on the same site as the
+console, such as another subdomain of the same domain, its redirect back to `/ui/oidc/callback` is
+a same-site navigation, so the `Sec-Fetch-User` row applies to it. Safari is then refused on every
+federated sign-in, and every browser that sends fetch metadata is refused when the identity
+provider signs the user in without a click.
+
+### Where the numbers come from
+
+- **BCD** is MDN's browser-compat-data, the npm package `@mdn/browser-compat-data` at version
+  **8.1.9**, published 2026-11-12. A cell is the `version_added` of the browser's open support
+  statement, one with no `version_removed`, that carries no flag, prefix, alternative name or
+  partial-implementation mark. **none** means BCD records no such statement.
+- **caniuse** is the npm package `caniuse-db` at version **1.0.30001826**, published 2026-11-11.
+  It is used for one row only. BCD 8.1.9 has no entry for a `'nonce-...'` source in `script-src`.
+  Its `html.global_attributes.nonce` entry is the HTML attribute, and its versions record when a
+  browser hides the nonce from page content, which is a different property.
+- An Edge number below 79 is the older EdgeHTML-based Edge.
+- **not verified** means neither dataset has an entry for the feature, so no number is given.
+
+Notes:
+
+1. Firefox before 70 and Edge 12 to 18 did not send `Origin` on a POST. BCD marks those versions
+   partial, so they do not count.
+2. BCD's note on the Firefox statement says it supports USB U2F tokens only. The statement is not
+   marked partial, so it counts.
+3. BCD marks every Chrome and Edge statement it has for this value partial. Its notes say some
+   requests may still be served from the cache until the tab is reloaded, and that the value can
+   cause seconds-long hangs. The console sends it at least on the sign-in redirect for a request
+   with no live session, on sign-out, and on the sign-in page shown after a session ends. Firefox applied it from 63 to 93, dropped it in 94, and applied it again from 138.
+4. The caniuse feature is CSP Level 2 as a whole, whose description names nonce sources. The cell
+   is the first version caniuse marks fully supported, which can be later than nonce support
+   alone: caniuse marks Chrome 36 to 39 and Firefox 31 to 44 partial for missing directives, not
+   for nonces. A browser older than the `Content-Security-Policy` row enforces no
+   policy, so it runs every script and shows the CSP-enforcement banner instead. Edge 15 to 18 are
+   marked partial because they ignore the nonce on a script loaded from a file. Read from the code
+   and not measured: there, the page's inline script runs and hides the scripts-blocked banner,
+   while the console's main script is refused, so the console would not work and would not say so.
+5. Firefox 33 to 57 are marked partial in BCD, because they ignored `frame-ancestors` in a
+   report-only policy. The console sends an enforced policy, but the rule above still counts from
+   58. Without `frame-ancestors`, `X-Frame-Options: DENY` still refuses framing.
+6. The console asks for a discoverable passkey, with `residentKey` set to `"required"` and the
+   older `requireResidentKey` beside it, and asks for `credProps` to learn what was made. BCD
+   records `requireResidentKey` from Chrome 89 and Edge 89 only, so it adds no earlier version.
+   Where a browser reports no `credProps`, the engine records the passkey as discoverable, because
+   that is what the options required. Whether such a passkey answers a sign-in that gives no
+   username depends on the authenticator, and that was not measured. BCD records no Safari version
+   for either option.
+7. Without the tag, the `Referrer-Policy` header still applies.
+
+What this table does not cover: browsers on phones and tablets; the JavaScript language features
+the console's scripts use and the CSS features its stylesheet uses, which set no number here; the IDE extension's webviews, whose browser is
+VS Code's own (see [below](#the-ide-extensions-webviews)); and the API documentation pages.
 
 ---
 

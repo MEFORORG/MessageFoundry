@@ -129,7 +129,7 @@ $ProvisionDecline = "already has an enabled Administrator"
 $OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
 # store.py logs these and carries on; each means that open did not restrict the trio as it tried to
 # (a DACL it could not read falls back to the owner-only rewrite, which is the Wave 0 lockout).
-$RestrictFailPattern = "could not restrict|could not determine current user|could not read the DACL|could not render the DACL|restricted owner-only"
+$RestrictFailPattern = "could not restrict|could not determine current user|could not read this process's account from its token|could not read the DACL|could not render the DACL|restricted owner-only"
 $EngineImages = @("python.exe", "pythonw.exe", "messagefoundry.exe")
 
 $Failures = New-Object System.Collections.ArrayList

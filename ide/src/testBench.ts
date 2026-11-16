@@ -7,10 +7,16 @@
 // Router/Handler lines ran + per-line time, from `dryrun --trace json`, see traceView.ts) and optional
 // step-through under the debugger.
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
+import {
+  caseDryRunArgs,
+  caseFileName,
+  materializeCases,
+  removeCaseDir,
+  sweepStaleCaseDirs,
+} from "./collectionCaseFiles";
 import { CollectionStore, CollectionStoreError } from "./collectionStore";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
@@ -106,6 +112,9 @@ export class TestBench {
       this.panel.reveal();
       return;
     }
+    // Only on panel creation, not on the reveal above. Which left-behind run directories it tries,
+    // and what stays, is in sweepStaleCaseDirs's docblock (collectionCaseFiles.ts).
+    sweepStaleCaseDirs();
     this.panel = vscode.window.createWebviewPanel(
       "messagefoundry.testBench",
       "MessageFoundry Test Bench",
@@ -279,6 +288,7 @@ export class TestBench {
       name: r.source,
       input: r.raw,
       expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
+      disposition: r.disposition,
     }));
     map[name] = { name, cases };
     this.dropRun();
@@ -310,9 +320,13 @@ export class TestBench {
 
   /**
    * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
-   * each case's stored input is materialized to a FRESH per-run temp dir, dry-run (`--show-phi`), and
-   * the temp dir is deleted in `finally` — transient PHI, always cleaned. Cases align to rows by the
-   * unique temp basename the CLI echoes back in `row.path` (robust to a case that yields no row).
+   * each case's stored input is materialized to a fresh per-run temp dir, owner-only on POSIX, the
+   * dir itself is dry-run (`--show-phi`), and the `finally` tries to delete it with removeCaseDir;
+   * if a case file fails to write, materializeCases tries to delete it before rethrowing instead.
+   * What that delete and the sweep before each run remove, and what can stay on disk, is in the
+   * deleteCaseDir and sweepStaleCaseDirs docblocks in collectionCaseFiles.ts (BACKLOG #5415). Cases
+   * align to rows by the unique temp basename the CLI echoes back in `row.path` (robust to a case
+   * that yields no row).
    */
   private async runCollection(name: string): Promise<void> {
     if (!this.panel) {
@@ -327,19 +341,11 @@ export class TestBench {
     if (!coll || !cwd) {
       return;
     }
-    const caseFile = (i: number): string => `case_${String(i).padStart(4, "0")}.hl7`;
+    sweepStaleCaseDirs();
     let tmpDir: string | undefined;
     try {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-testbench-"));
-      const files = coll.cases.map((c, i) => {
-        const file = path.join(tmpDir as string, caseFile(i));
-        fs.writeFileSync(file, c.input, "utf8");
-        return file;
-      });
-      const rows = await runJson<DryRunRow[]>(
-        ["dryrun", "--config", configDir(), "--show-phi", "--messages", ...files],
-        cwd,
-      );
+      tmpDir = materializeCases(coll.cases.map((c) => c.input));
+      const rows = await runJson<DryRunRow[]>(caseDryRunArgs(configDir(), tmpDir), cwd);
       const byBase = new Map<string, DryRunRow>();
       for (const row of rows) {
         if (row.path) {
@@ -350,7 +356,7 @@ export class TestBench {
         return; // the view moved on while the dry-run ran (see viewGen): hold nothing
       }
       const reruns = coll.cases.map((_c, i): CaseRerun | undefined => {
-        const row = byBase.get(caseFile(i));
+        const row = byBase.get(caseFileName(i));
         return row ? { disposition: row.disposition, error: row.error ?? null, deliveries: row.deliveries } : undefined;
       });
       const run = judgeCollectionRun(coll.cases, reruns);
@@ -367,12 +373,7 @@ export class TestBench {
       void vscode.window.showErrorMessage(`MessageFoundry: collection run failed — ${String(e)}`);
     } finally {
       if (tmpDir) {
-        // Best-effort cleanup of the transient PHI temp dir; never let a cleanup error mask the run.
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {
-          /* OS temp reaping bounds any residue */
-        }
+        removeCaseDir(tmpDir); // best effort: a cleanup error never masks the run
       }
     }
   }

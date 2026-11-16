@@ -1092,6 +1092,19 @@ _IDE_MEDIA = "The extension's install directory joined to fixed media or snippet
 IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
+    "ide/src/collectionCaseFiles.ts": Site(
+        6,
+        GUARDED,
+        "A temp directory the extension made and generated case-file names, plus names read back"
+        " from listing the shared OS temp directory, which another account can plant; the sweep"
+        " tries one only if it lstats as a directory this user owns (POSIX), and the delete refuses"
+        " a run directory the OS does not resolve to its own path. Names listed from a run"
+        " directory are unlinked only when they match the case-file name, lstat as a regular file"
+        " and resolve to their own path, and the directory goes only by rmdir, never a recursive"
+        " delete. The races that can get past these checks are in the deleteCaseDir and"
+        " sweepStaleCaseDirs docblocks.",
+        "ide/src/collectionCaseFiles.ts::st.uid !== uid",
+    ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
@@ -1117,12 +1130,22 @@ IDE_SITES: dict[str, Site] = {
         "for a breakpoint match.",
     ),
     "ide/src/newRoute.ts": Site(
-        2,
+        1,
         GUARDED,
-        "The wizard's inbound name is reduced to `[A-Za-z0-9_-]` before it names the new file.",
+        "The wizard's inbound name is reduced to `[A-Za-z0-9_-]` before it names the new file, "
+        "joined onto a config directory workspaceContainment.ts has held inside the workspace.",
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/securityEditorModel.ts": Site(
+        5,
+        OPERATOR,
+        "Every join runs only after securityConfigTarget has refused an untrusted workspace, so each "
+        "part is the workspace folder or its realpath, the messagefoundry.serviceConfig setting from "
+        "user settings or from a workspace the operator has trusted, or a component of the path "
+        "those two resolve to. Not guarded: the containment and link checks run on the joined path. "
+        "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
+    ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(
         5,
@@ -1137,12 +1160,15 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/symbolIndex.ts": Site(
         1, OPERATOR, "Names from listing the operator's config directory."
     ),
-    "ide/src/testBench.ts": Site(
-        3,
-        INTERNAL,
-        "A temp directory the extension made and generated case-file names, or the fixtures setting.",
-    ),
+    "ide/src/testBench.ts": Site(1, OPERATOR, "The fixtures setting, under the workspace."),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/workspaceContainment.ts": Site(
+        4,
+        GUARDED,
+        "The containment check itself: it refuses a workspace setting whose spelling, and then whose "
+        "real path, relative to the workspace climbs out or is absolute.",
+        "ide/src/workspaceContainment.ts::path.relative(root, target)",
+    ),
 }
 
 SCRIPT_SITES: dict[str, Site] = {

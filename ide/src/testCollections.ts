@@ -18,6 +18,12 @@ export interface TestCase {
   name: string; // label (the source, e.g. the original file name)
   input: string; // the raw received body (PHI — stored machine-local only; see ADR 0121)
   expected: ExpectedDelivery[];
+  /**
+   * The disposition the case had when it was saved (BACKLOG #5416). A rerun must reach the same one,
+   * so a case saved as FILTERED fails when it reruns as UNROUTED or errored. Absent on a case saved
+   * before this field existed; such a case fails on any errored rerun instead.
+   */
+  disposition?: string;
 }
 
 /** A named, self-contained regression collection. */
@@ -218,7 +224,9 @@ export interface CollectionRunResult {
  * Judge every case of a collection against its rerun, and split each result in two: summaries, which
  * carry no `before`/`after` value and no error text, and details, which carry both (ADR 0121, "Reveal
  * on click"). `reruns[i]` is case `i`'s rerun, or `undefined` when the dry-run produced no row for it,
- * which fails the case.
+ * which fails the case. The rerun must also end where the case did when saved (see
+ * rerunMatchesDisposition, BACKLOG #5416): an errored Router or Handler delivers nothing, so the
+ * delivery compare alone would pass a case that expects no delivery.
  */
 export function judgeCollectionRun(
   cases: readonly TestCase[],
@@ -230,17 +238,45 @@ export function judgeCollectionRun(
   cases.forEach((c, i) => {
     const rerun = reruns[i];
     const cmp = compareCase(c.expected, rerun ? rerun.deliveries : [], ignore);
+    const clean = rerun !== undefined && rerunMatchesDisposition(c, rerun);
+    const disposition = typeof rerun?.disposition === "string" ? rerun.disposition : "NO RESULT";
     summaries.push({
       name: c.name,
-      pass: rerun ? cmp.pass : false,
-      disposition: rerun?.disposition ?? "NO RESULT",
+      pass: clean && cmp.pass,
+      disposition,
     });
-    details.push({
-      error: rerun ? rerun.error : "no dry-run row produced for this case",
-      deliveries: cmp.deliveries,
-    });
+    let error = rerun ? rerun.error : "no dry-run row produced for this case";
+    if (rerun && !clean && error === null) {
+      // Say why a case with no delivery difference failed. Dispositions are fixed words, not PHI.
+      error = `disposition changed: saved as ${c.disposition ?? "(not recorded)"}, rerun ended ${disposition}`;
+    }
+    details.push({ error, deliveries: cmp.deliveries });
   });
   return { passed: summaries.filter((s) => s.pass).length, summaries, details };
+}
+
+/** A string read from stored or parsed JSON, lower-cased; `undefined` for anything else. */
+function lowerOrUndefined(v: unknown): string | undefined {
+  return typeof v === "string" ? v.toLowerCase() : undefined;
+}
+
+/**
+ * Whether `rerun` ended where case `c` did when it was saved (BACKLOG #5416). Both sides come from
+ * JSON with no runtime shape check, so a missing or non-string rerun disposition never matches. A
+ * case recorded as `error` passes an errored rerun, so a deliberate negative case stays green; any
+ * other recorded disposition needs the same one and no error text. A case with no recorded
+ * disposition (saved before the field existed) accepts any rerun that did not error.
+ */
+function rerunMatchesDisposition(c: TestCase, rerun: CaseRerun): boolean {
+  const actual = lowerOrUndefined(rerun.disposition);
+  if (actual === undefined) {
+    return false;
+  }
+  const recorded = lowerOrUndefined(c.disposition);
+  if (recorded === "error") {
+    return actual === "error";
+  }
+  return rerun.error === null && actual !== "error" && (recorded === undefined || actual === recorded);
 }
 
 /**

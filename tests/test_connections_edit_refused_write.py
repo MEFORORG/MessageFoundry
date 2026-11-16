@@ -220,7 +220,17 @@ def test_an_error_after_the_replace_is_never_converted(
     before = path.read_bytes()
     refusal = PermissionError(errno.EACCES, "Permission denied")
 
+    # The restriction of the replaced file: _secure_file on POSIX, a whole-list write on Windows.
+    # The Windows one also restricts the candidate before the replace, which is left to run.
+    real_restrict = atomic_edit._restrict_to_editor
+
+    def _restrict(target: Path, *, owner: str | None = None, editor_writes: bool = False) -> bool:
+        if target == path:
+            raise refusal
+        return real_restrict(target, owner=owner, editor_writes=editor_writes)
+
     monkeypatch.setattr(atomic_edit, "_secure_file", _raising(refusal))
+    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", _restrict)
 
     with pytest.raises(PermissionError) as caught:
         connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)

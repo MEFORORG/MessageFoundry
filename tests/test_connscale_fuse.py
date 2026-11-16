@@ -276,6 +276,77 @@ def test_no_go_when_b1_breaches_zero_loss() -> None:
     assert not cmp.ok  # a zero-loss breach fails the run's correctness fold
 
 
+def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed() -> None:
+    # BACKLOG #5574: a B1 reconcile that could not clear zero-loss but proved no loss used to read
+    # "B1 breached zero-loss". It is named INCONCLUSIVE now, and the run still fails. The proven
+    # breach above is the control: same arm, inconclusive=False, still NO-GO and "breached".
+    from dataclasses import replace
+
+    unsure = [
+        replace(r, no_loss=replace(r.no_loss, inconclusive=True))
+        # Everything was delivered: the arm only failed to clear itself (a reset, say).
+        for r in _trials(True, [120.0, 121.0, 119.0], no_loss_ok=False)
+    ]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + unsure, (False, True))
+    assert cmp is not None
+    (row,) = cmp.rows
+    assert row.verdict == FUSE_INCONCLUSIVE
+    assert "breached" not in row.reason and "INCONCLUSIVE" in row.reason
+    assert row.candidate_lost and not row.ok and not cmp.ok
+    guards = cmp.to_json_dict()["rows"][0]["guards"]  # type: ignore[index]
+    assert guards["b1_zero_loss_inconclusive"] is True
+    # One proven-lossy trial beside the inconclusive ones makes the arm a breach again.
+    mixed = [*unsure[:2], *_trials(True, [119.0], no_loss_ok=False, sink_received=900)]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + mixed, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "breached" in cmp.rows[0].reason
+    # An INCONCLUSIVE arm that also never drained is a definite NO-GO on the drain guard, which
+    # the INCONCLUSIVE label must not pre-empt.
+    undrained = [replace(r, drain_seconds=None) for r in unsure]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + undrained, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "did not fully drain" in cmp.rows[0].reason
+    # These trials sent traffic, so a None drain is a real await_drain timeout and keeps its
+    # specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
+    assert "await_drain timed out" in cmp.rows[0].reason
+    assert "rows stranded" in cmp.rows[0].reason and "never ran" not in cmp.rows[0].reason
+    # A failed cell (batchbox `_failed_cell_record`: a placeholder sent of 0) carries the same None
+    # drain, and no stall is asserted for it: whether it stranded rows is unknown.
+    failed_cells = [
+        replace(r, no_loss=replace(r.no_loss, inconclusive=True))
+        for r in _trials(
+            True, [0.0, 0.0, 0.0], sent=0, sink_received=0, no_loss_ok=False, drain_seconds=None
+        )
+    ]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + failed_cells, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
+    assert "did not fully drain" in cmp.rows[0].reason
+    assert "3 B1 trial(s) recorded no traffic and no drain time" in cmp.rows[0].reason
+    assert "whether rows were stranded is not asserted" in cmp.rows[0].reason
+    assert "rows stranded" not in cmp.rows[0].reason
+    assert "await_drain timed out" not in cmp.rows[0].reason
+    # Both at once: the timeout's reason stands, and the failed trial is named beside it.
+    cmp = build_fuse_comparison(
+        _trials(False, [100.0, 101.0, 99.0]) + undrained[:2] + failed_cells[:1], (False, True)
+    )
+    assert cmp is not None
+    assert "rows stranded" in cmp.rows[0].reason
+    assert "1 B1 trial(s) recorded no traffic" in cmp.rows[0].reason
+    # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
+    flat = [
+        replace(r, no_loss=replace(r.no_loss, inconclusive=True))
+        for r in _trials(True, [102.0, 103.0, 101.0], no_loss_ok=False)
+    ]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + flat, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "banked no worthwhile margin" in cmp.rows[0].reason
+    assert not cmp.ok
+
+
 def test_no_go_when_drain_time_grows() -> None:
     # B1's intake is higher but its post-load DRAIN TIME grew far past B0's ⇒ the higher intake rode a
     # larger backlog ⇒ NO-GO. Read from the AUTHORITATIVE drain signal, NOT the /stats-poller

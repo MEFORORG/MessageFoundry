@@ -21,8 +21,11 @@ at all and ``tests/golden/ui_routes.txt`` is unchanged — that unchanged golden
 Two deliberate departures a reviewer will want to check rather than "fix":
 
 * **No same-origin assertion on the CALLBACK leg**, and that carve-out is specific to it.
-  ``assert_same_origin`` rejects any request whose ``Sec-Fetch-Site`` is ``cross-site``, and the IdP's
-  redirect back here is *legitimately* a top-level cross-site navigation. Adding it there would 403
+  ``assert_same_origin`` rejects any request whose ``Sec-Fetch-Site`` is ``cross-site`` or
+  ``same-site``, and the IdP's redirect back here is *legitimately* one of them: a top-level
+  navigation that is cross-site unless the IdP is on the console's own site, where it is same-site
+  and the /ui fetch-metadata middleware demands ``Sec-Fetch-User: ?1`` of it
+  (``docs/BROWSER-SUPPORT.md``, federated sign-in). Adding it there would 403
   every real federated login while every hermetic test still passed (test clients send no
   ``Sec-Fetch`` headers). ``routes/sso.py`` does not call it either.
   ⛔ **The START legs are the opposite case and DO assert it** (ASVS 3.5.1). They are reached from our
@@ -582,7 +585,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 )
             # Consumed nothing, so the cookie stays for the real IdP return (BACKLOG #3198).
             return _fail(request, "oidc_failed", keep_flow=True)
-        # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site".
+        # NOTE: no assert_same_origin here. Sec-Fetch-Site on this leg is legitimately "cross-site",
+        # or "same-site" when the IdP is on the console's site; the middleware then demands
+        # Sec-Fetch-User: ?1 (docs/BROWSER-SUPPORT.md, federated sign-in).
 
         if not flow_id:
             # AC-7: without the browser-binding cookie the request is refused even when state and

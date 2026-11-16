@@ -5796,6 +5796,29 @@ async def test_user_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_notice_gate_seal_contract(store) -> None:
+    """BACKLOG #5629: the startup security-notice gate weighs only sealed records, the same
+    contract the SQLite suite runs, on a keyed handle. The fixture truncates the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._notice_gate_seal_contract import assert_notice_gate_reads_sealed_rows
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_notice_gate_reads_sealed_rows(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_role_seal_contract(store) -> None:
     """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
     contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the

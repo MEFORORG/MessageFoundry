@@ -324,6 +324,20 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     assert.deepStrictEqual(await store.load(), { good: coll("good") });
   });
 
+  test("a case whose recorded disposition is not a string drops its collection (BACKLOG #5416)", async () => {
+    const secrets = new FakeSecrets();
+    const withDisp = (name: string, disposition: unknown) => ({
+      name,
+      cases: [{ name: "c", input: BODY, expected: [], disposition }],
+    });
+    await secrets.store(
+      collectionsSecretKey("file:///ws/a"),
+      JSON.stringify({ ok: withDisp("ok", "filtered"), bad: withDisp("bad", 7) }),
+    );
+    const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
+    assert.deepStrictEqual(Object.keys(await store.load()), ["ok"]);
+  });
+
   test("a legacy value that is not a map is removed without blocking the store", async () => {
     const secrets = new FakeSecrets();
     const memento = new FakeMemento();

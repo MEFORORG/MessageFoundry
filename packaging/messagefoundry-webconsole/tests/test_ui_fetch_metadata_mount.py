@@ -23,7 +23,10 @@ tests exist so the rule is pinned where the rule lives:
 * **403, never 404** — ``tray/probe.py`` classifies 404 as ``DISABLED`` and everything else as
   ``ENABLED``, so a 404 here makes the shipped Windows tray report a healthy console as switched off.
 * **a cross-site top-level NAVIGATION is allowed** — an intranet link and the OIDC callback redirect
-  are both cross-site by construction. Refusing them breaks login while every hermetic test that
+  are cross-site unless they come from the console's own site (from an intranet page or an IdP on
+  a sibling subdomain they are same-site, and ``Sec-Fetch-User: ?1`` is demanded;
+  ``docs/BROWSER-SUPPORT.md``, federated sign-in). Refusing the cross-site case breaks login while
+  every hermetic test that
   omits the headers still passes, which is precisely how it got shipped into this branch once.
 """
 

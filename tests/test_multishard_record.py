@@ -58,7 +58,9 @@ def _record(**overrides: object) -> object:
         metrics=LiveMetrics(
             Counters(sent=2200, acked=2200, sink_received=2140), Histogram(), Histogram()
         ),
-        poller=cast(EnginePoller, SimpleNamespace(baseline=_BASE, final=_FINAL)),
+        poller=cast(
+            EnginePoller, SimpleNamespace(baseline=_BASE, final=_FINAL, samples=[_BASE, _FINAL])
+        ),
         samples=[_HOLD_END],
         drain_seconds=5.0,
         hold_start_iso="2026-07-02T00:00:00+00:00",
