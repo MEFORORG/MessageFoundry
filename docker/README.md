@@ -137,8 +137,7 @@ against one case that matters, described under
 
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo,
-  and export `MEFOR_TLS_REVOCATION_ATTESTED=1` only if your PKI enforces revocation (see topology A
-  below); without it every `docker compose` command refuses.
+  and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
