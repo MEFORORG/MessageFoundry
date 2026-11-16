@@ -111,6 +111,7 @@ __all__ = [
     "safe_exc",
     "safe_name",
     "safe_text",
+    "safe_text_bound",
     "safe_traceback",
 ]
 
@@ -2513,14 +2514,24 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way."""
-    head, dropped = _clamp(text, _REDACT_WINDOW)
+    head, note = safe_text_bound(text)
     message = redact(head).strip()
     if len(message) > limit:
         kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
         message = f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
-    if dropped:
-        message = f"{message} {_clamp_marker(dropped)}"
-    return message
+    return f"{message}{note}"
+
+
+def safe_text_bound(text: str) -> tuple[str, str]:
+    """``(head, note)``: the part of ``text`` that :func:`safe_text` scans, and the bound note it
+    appends to its result, with its leading space, or ``""`` when the text fit and ``head is text``.
+
+    For a caller that must scrub that part itself before :func:`safe_text` bounds it, as the
+    off-box audit tee does (BACKLOG #3045): ``safe_text(head) + note`` is ``safe_text(text)``, so
+    handing :func:`safe_text` a scrubbed ``head`` and appending ``note`` keeps both of its counts
+    exactly true."""
+    head, dropped = _clamp(text, _REDACT_WINDOW)
+    return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 
 
 def safe_error(error: str | None, *, show_phi: bool = False) -> str | None:

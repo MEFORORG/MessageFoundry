@@ -42,9 +42,8 @@ from collections import Counter
 from collections.abc import Callable
 from typing import overload
 
-from messagefoundry.controlchars import json_unicode_escape
 from messagefoundry.logging_setup import AUDIT_LOGGER_NAME, ensure_logger_sink, scrub_log_text
-from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text
+from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
 
 __all__ = [
     "AuditObserver",
@@ -171,9 +170,43 @@ def _decode_c0_escapes(text: str) -> str:
     )
 
 
+#: Each C0 control as ``json.dumps`` spells it inside a string.
+_C0_SPELLING = {chr(code): json.dumps(chr(code))[1:-1] for code in range(0x20)}
+
+
 def _encode_c0(text: str) -> str:
-    """The inverse of :func:`_decode_c0_escapes`, for a text that held no raw control before it."""
-    return _RAW_C0.sub(lambda m: json_unicode_escape(ord(m.group())), text)
+    """The inverse of :func:`_decode_c0_escapes`, for a text that held no raw control before it.
+    Each control is spelled as ``json.dumps`` spells it, ``\\n`` rather than ``\\u000a``, so a
+    re-encoded detail is no longer than its writer's and :func:`safe_text` cuts it no sooner."""
+    return _RAW_C0.sub(lambda m: _C0_SPELLING[m.group()], text)
+
+
+def _window(value: str, *, detail: bool) -> tuple[str, str]:
+    """``(head, note)``: the part of ``value`` the field scrub reads, and the note naming what it
+    left unread, ``""`` when the value fit and ``head is value``. A ``detail``'s window is
+    :func:`~messagefoundry.redaction.safe_text`'s, so the bound note and the ``(+N chars)`` count
+    it ships with are the ones ``safe_text`` gives the value; any other field's is the handler
+    chain's, :func:`~messagefoundry.redaction.clamp_untrusted`, and its note keeps that cut's
+    newline joiner."""
+    if detail:
+        return safe_text_bound(value)
+    clamped = clamp_untrusted(value)
+    if clamped is value:
+        return value, ""
+    cut = clamped.rfind("\n")  # the cut appends its note after a newline of its own
+    return clamped[:cut], clamped[cut:]
+
+
+def _bounded_detail(kept: str, note: str, old: str) -> str:
+    """``kept``, the scrubbed detail, bounded by :func:`~messagefoundry.redaction.safe_text` as
+    the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
+    own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
+    and the bounded result does not, because a redaction made it longer and the cut then landed
+    inside it, it ships as the JSON string ``"[redacted]"`` instead."""
+    shipped = safe_text(kept) + note
+    if _parses(old) and not _parses(shipped):
+        return json.dumps(_FIELD_REDACTED)
+    return shipped
 
 
 @overload
@@ -182,8 +215,8 @@ def _scrub_field(value: str, *, detail: bool = False) -> str: ...
 def _scrub_field(value: None, *, detail: bool = False) -> None: ...
 def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     """One tee field, scrubbed by the handlers' text passes before ``json.dumps`` escapes a C0
-    control in it (BACKLOG #3045). A value with no C0 control in the part the handler chain scans
-    (:func:`~messagefoundry.redaction.clamp_untrusted`'s window) is returned unchanged.
+    control in it (BACKLOG #3045). A value with no C0 control in the part it scans, the window
+    :func:`_window` names, is returned unchanged.
 
     Otherwise the value, cut to that window, is scrubbed as written, which the patterns read with
     a control as a break, as they read any non-word character. Then two readings, every control
@@ -207,6 +240,12 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     alone, is NOT what holds the tee line to the line before #3045: the chain over the whole
     record can hide more than over one field, and :func:`_tee_line` holds the line to that.
 
+    A value longer than the window ships with the note naming what was left unscanned: any field
+    but ``detail`` with the window's own note appended here, and a ``detail`` with the note
+    :func:`~messagefoundry.redaction.safe_text` gives the value, appended by
+    :func:`_bounded_detail` after the bound. A whole-field return below ships without the note,
+    except for a ``detail``, which gets it there too.
+
     So, at least, the whole field ships as :data:`_FIELD_REDACTED` where a reading found more,
     where the plain result shows a word the chain alone hides, and on a fault; a JSON ``detail``
     ships as the JSON string ``"[redacted]"`` in those cases and where the passes leave it
@@ -223,9 +262,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         return None
     as_json = False
     try:
-        probe = clamp_untrusted(value)
-        if probe is not value:  # the cut appends its note after a newline of its own
-            probe = probe[: probe.rfind("\n")]
+        probe, note = _window(value, detail=detail)
         as_json = (
             detail
             and _C0_ESCAPE.search(probe) is not None
@@ -264,7 +301,10 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         # caught. A stricter bar than the one that binds, which is :func:`_tee_line`'s.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
         shown = _line_words(json.dumps(result, ensure_ascii=False)[1:-1])
-        return result if shown <= _line_words(alone) else whole
+        if not shown <= _line_words(alone):
+            return whole
+        # A detail's note goes on after safe_text bounds it, in _bounded_detail.
+        return result if detail else result + note
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)
         return json.dumps(_FIELD_REDACTED) if as_json else _FIELD_REDACTED
@@ -420,10 +460,13 @@ def emit_audit_tee(
     text passes before it is encoded, wherever it holds a C0 control; :func:`_scrub_field` says
     how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
     chain hid of the whole record as it was encoded before #3045, so it redacts no less than that
-    line did on the first handler. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points, placed at least before,
-    after and inside a name, a ``password=`` or ``token=`` value, a date, a bearer token, an MRN
-    and an HL7-shaped run, in each of those fields, and ``detail`` as a JSON document too. It finds
-    no leak there, and no word the handler chain alone hid comes back. What that leaves, at least:
+    line did on the first handler. ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
+    through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
+    ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
+    HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no
+    leak there. Its comparison with the scrub switched off, over that sweep, two-control pairs and
+    the review values, runs for ``actor``, ``client`` and ``detail``, plain and as JSON, and finds
+    no word the line before #3045 hid. What that leaves, at least:
 
     * Every control in a value is read the same way, as a space or as nothing. Text that needs one
       control read as a space and another as nothing, such as a date split by two controls after a
@@ -444,6 +487,12 @@ def emit_audit_tee(
       attribute the attempt by. The ``client`` address and the rest of the record still ship.
       ``detail`` is scrubbed before ``safe_text`` bounds it, so that holds for a control
       anywhere in the scanned window, even in text past the 200 characters that would ship.
+    * A field holding a control and longer than the handler chain's 64 KiB window does not, in
+      practice, ship scrubbed. A ``detail`` is longer, encoded, than the window the per-field
+      check reads, so it ships whole as ``[redacted]``, with its bound note. Any other such field
+      ships as the line before #3045 did, losing the scrub: that line was cut inside the field,
+      so it hid every field after it, and hiding the field whole shows them. Its text beside a
+      control can then pass, as before #3045.
     * The comparisons that decide it count words, runs of letters and digits, so a redaction that
       hides only punctuation is not counted, and a reading of the plain result that hides some
       letters while showing others it hid is not seen.
@@ -480,6 +529,9 @@ def emit_audit_tee(
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
+    # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
+    head, note = safe_text_bound(detail) if detail else ("", "")
+    old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,
@@ -497,7 +549,7 @@ def emit_audit_tee(
         "seq": seq,
         "row_hash": row_hash,
         # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-        "detail": safe_text(detail) if detail else None,
+        "detail": old_detail if detail else None,
     }
     try:
         # Each text field is scrubbed before json.dumps escapes a C0 control in it (#3045), and
@@ -505,7 +557,9 @@ def emit_audit_tee(
         scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
         if detail:
             kept = _scrub_field(detail, detail=True)
-            scrubbed["detail"] = record["detail"] if kept is detail else safe_text(kept)
+            scrubbed["detail"] = (
+                old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
+            )
         line = _tee_line(record, {**record, **scrubbed})
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)

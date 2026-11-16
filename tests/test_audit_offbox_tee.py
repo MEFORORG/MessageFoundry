@@ -610,7 +610,7 @@ def test_a_serialised_detail_with_a_control_still_parses(value: str, capsys) -> 
     """A ``detail`` its writer ran through ``json.dumps`` parses after the field scrub, and the
     text beside the control is gone. Synthetic values."""
     (line,) = _tee_lines([{"detail": json.dumps({"error": value})}], capsys)
-    detail = json.loads(line.split("messagefoundry.audit: ", 1)[1])["detail"]
+    detail = _shipped_detail(line)
     json.loads(detail)
     for needle in ("JANE", "abcdefgh", "hunter2", "ter2"):
         assert needle not in detail, detail
@@ -816,7 +816,56 @@ def test_a_json_detail_with_an_escape_and_nothing_to_redact_ships_unchanged(
     cases: list[dict[str, str | None]] = [{"detail": detail}]
     before, after = _before_and_after(cases, capsys, monkeypatch)
     assert after == before
-    json.loads(json.loads(after[0].split("messagefoundry.audit: ", 1)[1])["detail"])
+    json.loads(_shipped_detail(after[0]))
+
+
+def _shipped_detail(line: str) -> str:
+    return json.loads(line.split("messagefoundry.audit: ", 1)[1])["detail"]
+
+
+def test_a_redacted_json_detail_is_re_encoded_no_longer_than_its_writer_wrote_it(capsys) -> None:
+    """Open finding 1 of engine PR 2864: the re-encode wrote ``\\u000a`` for each line break the
+    decode read, so a multi-line JSON detail with something to redact grew past the 200-character
+    bound and shipped cut. It is spelled as ``json.dumps`` spells it now. Synthetic values."""
+    assert audit_tee._encode_c0("a\nb\x01\t") == "a\\nb\\u0001\\t"
+    detail = json.dumps({"error": "step ok\n" * 19 + "DOE JANE"})
+    assert len(detail) < 200
+    (line,) = _tee_lines([{"detail": detail}], capsys)
+    error = json.loads(_shipped_detail(line))["error"]
+    assert error.startswith("step ok\n") and "DOE" not in error
+
+
+def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) -> None:
+    """Open finding 1 of engine PR 2864: a JSON detail that fit, and shipped parseable before
+    #3045, grows when the scrub redacts in it, so the 200-character cut landed inside it. It
+    ships as the JSON string ``"[redacted]"`` instead. Synthetic values."""
+    from messagefoundry.redaction import safe_text
+
+    detail = json.dumps({"e": "ok " * 59 + "\x01DOE JANE"})
+    assert len(detail) == 200 and audit_tee._parses(safe_text(detail))
+    # The control: the scrubbed detail, cut by safe_text alone, no longer parses.
+    kept = audit_tee._scrub_field(detail, detail=True)
+    assert not audit_tee._parses(safe_text(kept))
+    (line,) = _tee_lines([{"detail": detail}], capsys)
+    assert json.loads(_shipped_detail(line)) == "[redacted]"
+
+
+def test_a_value_over_the_window_ships_with_its_bound_note(capsys) -> None:
+    """Open finding 3 of engine PR 2864: a field over the 64 KiB window holding a control shipped
+    cut with no note saying so, and a ``detail``'s ``(+N chars)`` count was taken over a shorter
+    head than ``safe_text`` reads. Synthetic values."""
+    from messagefoundry.redaction import clamp_untrusted, safe_text, safe_text_bound
+
+    value = f"{chr(0x01)}DOE JANE " + "word " * 14000
+    clamped = clamp_untrusted(value)
+    scrubbed = audit_tee._scrub_field(value)
+    assert scrubbed.endswith(clamped[clamped.rfind("\n") :]) and "DOE" not in scrubbed
+    # A detail's note is the one safe_text gives the value, and its counts are safe_text's own.
+    head, note = safe_text_bound(value)
+    assert note and audit_tee._bounded_detail(head, note, safe_text(value)) == safe_text(value)
+    (line,) = _tee_lines([{"detail": value}], capsys)
+    detail = _shipped_detail(line)
+    assert detail.endswith(note) and "DOE" not in detail
 
 
 def test_a_long_value_with_no_control_is_not_touched() -> None:
