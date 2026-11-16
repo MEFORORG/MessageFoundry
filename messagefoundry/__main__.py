@@ -2292,10 +2292,10 @@ def _start_logging(
     ``pending_audit`` holds AUDIT lines the caller decided before this call, and is emptied as they
     are written. They are logged first once ``configure`` has returned, and on any other way out of
     this function, a refusal or a raise, to the handlers the process has then, by
-    :func:`_write_start_audit` either way (BACKLOG #5391). The warn-mode hop's AUDIT line follows
-    them only where ``configure`` ran with forwarding still configured: not on a refused start, and
-    not where a refused collector CA turned forwarding off, since no record takes that hop then
-    (BACKLOG #5390)."""
+    :func:`_write_start_audit` either way (BACKLOG #5391). The warn-mode hop's AUDIT line is queued
+    behind them once that gate decides it, so it is written on every way out, as the old
+    decision-time log call wrote it: a later refusal or raise included, and a refused collector CA
+    that turns forwarding off (BACKLOG #5390)."""
     pending = pending_audit if pending_audit is not None else []
     try:
         return _start_logging_gates(
@@ -2323,7 +2323,7 @@ def _start_logging_gates(
     pending_audit: list[str],
 ) -> int | None:
     """:func:`_start_logging`'s body, which holds the contract; this only writes ``pending_audit``
-    on a start that passes, and the hop's AUDIT line after it."""
+    on a start that passes, and queues the warn-mode hop's AUDIT line at its end."""
     from messagefoundry.config.settings import (
         SyslogProtocol,
         forward_hop_disposition,
@@ -2405,11 +2405,13 @@ def _start_logging_gates(
             )
             return 2
         if _forward_hop is HopDisposition.WARN:
-            # Accepted, but never silent — the point of the fix. Warned on stderr now, and logged as
-            # an AUDIT record only once `configure` below has installed the handlers, by
-            # _write_start_audit, so whatever [logging].level is, it reaches [logging].file, stdout
-            # and the forwarder where configure installed one. It is not logged when a later gate
-            # here refuses the start, since no record would take the hop then (BACKLOG #5390).
+            # Accepted, but never silent — the point of the fix. Warned on stderr now, and queued
+            # as an AUDIT record behind the caller's lines for _write_start_audit, so whatever
+            # [logging].level is, it reaches [logging].file, stdout and the forwarder where
+            # `configure` below installed one (BACKLOG #5390). A later refusal here writes it too,
+            # through _start_logging's guard, to the handlers the process has then: `supervise`'s
+            # stdout handler, or `serve`'s lastResort, where the old decision-time log call wrote
+            # it.
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
                 f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so on a PHI "
@@ -2418,6 +2420,7 @@ def _start_logging_gates(
                 "(ADR 0080) to a collector on another host."
             )
             print(f"warning: {scrub_control_chars(_hop_warning)}", file=sys.stderr)
+            pending_audit.append(f"AUDIT: {_hop_warning}")
     # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
     # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
     # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
@@ -2510,7 +2513,9 @@ def _start_logging_gates(
                 file=sys.stderr,
             )
             return 2
-        # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
+        # `serve`: no forwarder, and the caller hands the refusal to its audited preflight. The hop
+        # line stays queued, as the old decision-time log call had already written it here; it
+        # records the posture configured, and its text says what a forwarded record would cross.
         deferred_ca_refusals.append(_ca_refusal)
         log_forward = None
 
@@ -2545,12 +2550,9 @@ def _start_logging_gates(
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's while forwarding is
-    # still configured (a refused collector CA above turned it off). The hop line records the
-    # posture this start accepted, not that a record crossed: configure may have skipped a collector
-    # that was down, and forwarder_live says whether it did.
-    if _hop_warning is not None and log_forward is not None:
-        pending_audit.append(f"AUDIT: {_hop_warning}")
+    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's. The hop line
+    # records the posture this start accepted, not that a record crossed: configure may have
+    # skipped a collector that was down, and forwarder_live says whether it did.
     _write_start_audit(pending_audit)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
@@ -5258,9 +5260,11 @@ def _serve(args: argparse.Namespace) -> int:
             # S19-28 (BACKLOG #5391 item 1): a refused [api].tls_client_ca_file anchor, API TLS
             # material OpenSSL cannot load (ssl.SSLError is an OSError), or a context a TLS policy
             # check refused (a ValueError), is a clean exit 2 with the reason, not the uncaught
-            # CRITICAL floor's exit 1. The reason names the setting; the material may be the minted
-            # pair, so no operator setting is assumed here. Rendered through safe_exc, which keeps
-            # the type and never quotes the byte a UnicodeDecodeError failed on (vault BACKLOG
+            # CRITICAL floor's exit 1. The reason is the exception's own text, so it names a setting
+            # only where the raiser put one in it: an ssl.SSLError from loading the CA or setting
+            # the ciphers can name none. The material may be the
+            # minted pair, so no operator setting is assumed here. Rendered through safe_exc, which
+            # keeps the type and never quotes the byte a UnicodeDecodeError failed on (vault BACKLOG
             # #3033), and scrubbed, as the forwarder's CA refusal is, because the text can quote a
             # configured path. Logged too, with the traceback, which the log's own record filter
             # renders, so the log file and the collector keep the record the uncaught floor used to

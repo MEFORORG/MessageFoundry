@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5390: the warn-mode AUDIT record for an unverified off-box forwarding hop is logged by
-``_start_logging`` only once its ``configure`` has installed the handlers and the forwarder.
+``_start_logging`` once its ``configure`` has installed the handlers and the forwarder.
 
-Logged before it, the record missed ``[logging].file`` and the collector, and was logged even when
-a later gate in ``_start_logging`` refused the start. The stderr warning is still printed where
-the hop is decided, so a refused start names it.
+Logged before it, the record missed ``[logging].file`` and the collector. A start that a later
+gate refuses still logs it, once, to the handlers the process has then, as the old decision-time
+log call did: ``supervise``'s stdout handler, or ``serve``'s lastResort. The stderr warning is
+still printed where the hop is decided.
 """
 
 from __future__ import annotations
@@ -165,27 +166,29 @@ def test_a_filtered_warning_on_an_empty_root_reaches_the_filtered_last_resort(
     assert len(lines) == 1 and "WARNING" in lines[0]
 
 
-def test_a_later_refusal_logs_no_hop_audit(
+def test_a_later_refusal_still_logs_the_hop_audit_once(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The collector is not in [egress].allowed_syslog, so the egress gate refuses after the hop
-    # check. The hop is still warned on stderr, but no AUDIT record is logged.
+    # check. The hop is warned on stderr, and its AUDIT record is logged once, before any configure,
+    # to the handlers the process already has, as origin/main's decision-time log call wrote it.
     rc, seen = _start(_settings(), tmp_path)
     assert rc == 2
     err = capsys.readouterr().err
     assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
     assert "allowed_syslog" in err
+    # The handlers took it, so it is not written to stderr a second time.
     assert "AUDIT:" not in err
-    assert _hop_audit(seen) == []
+    assert _hop_audit(seen) == [False]
 
 
-def test_a_start_logging_refusal_logs_the_pending_audit_but_not_the_hop(
+def test_a_supervise_refusal_after_a_warn_hop_logs_the_hop_audit(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # supervise's path (no deferred CA refusals): a refused start writes the caller's AUDIT lines
-    # to the handlers the process has, as the decision-time log call did, and leaves out the
-    # warn-mode hop's, since no record took that hop. The collector is unlisted, so the egress
-    # gate refuses after the hop has warned.
+    # and then the warn-mode hop's, once each, to the handlers the process has (supervise's stdout
+    # handler), as origin/main's decision-time log call wrote the hop's. The collector is unlisted,
+    # so the egress gate refuses after the hop has warned.
     settings = _settings()
     configured: list[object] = []
 
@@ -205,16 +208,17 @@ def test_a_start_logging_refusal_logs_the_pending_audit_but_not_the_hop(
         )
     assert rc == 2
     assert configured == []
-    assert [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()] == [
-        "AUDIT: the posture line"
-    ]
+    audit = [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()]
+    assert len(audit) == 2
+    assert audit[0] == "AUDIT: the posture line"
+    assert audit[1].startswith(_HOP_AUDIT_PREFIX)
 
 
 def test_a_raise_out_of_configure_still_logs_the_pending_audit(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # An exception _start_logging does not catch, such as a ValueError from the forwarder's TLS
-    # context, still writes the caller's AUDIT lines on its way out, and no hop line.
+    # context, still writes the caller's AUDIT lines on its way out, then the hop line, once each.
     def configure(forward: object) -> bool:
         raise ValueError("synthetic configure failure")
 
@@ -232,9 +236,10 @@ def test_a_raise_out_of_configure_still_logs_the_pending_audit(
                 pending_audit=pending,
             )
     assert pending == []
-    assert [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()] == [
-        "AUDIT: the posture line"
-    ]
+    audit = [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()]
+    assert len(audit) == 2
+    assert audit[0] == "AUDIT: the posture line"
+    assert audit[1].startswith(_HOP_AUDIT_PREFIX)
 
 
 def test_a_refusal_on_an_empty_root_reaches_stderr_through_the_filtered_last_resort(
@@ -262,6 +267,8 @@ def test_a_refusal_on_an_empty_root_reaches_stderr_through_the_filtered_last_res
     assert rc == 2
     err = capsys.readouterr().err.splitlines()
     assert len([line for line in err if "AUDIT: the posture line" in line]) == 1
+    # serve's lastResort is where origin/main's decision-time call wrote the hop's record too.
+    assert len([line for line in err if _HOP_AUDIT_PREFIX in line]) == 1
 
 
 def _with_protocol(protocol: SyslogProtocol, *, verify: bool = True) -> ServiceSettings:
@@ -305,3 +312,41 @@ def test_hop_audit_names_how_each_protocol_crosses(
         # The control: the UDP clause is not carried onto a hop that is not UDP.
         assert "UDP" not in audit
         assert "no connection needed" not in audit
+
+
+def test_a_deferred_collector_ca_refusal_still_logs_the_hop_audit_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve's path: a refused collector CA turns forwarding off and hands the refusal to the
+    # audited preflight. The hop's AUDIT record is still written once, after configure, as
+    # origin/main's decision-time log call had written it.
+    from messagefoundry.auth import trust_anchors
+
+    sentinel = trust_anchors.TrustAnchorError("synthetic CA refusal")
+    monkeypatch.setattr(trust_anchors, "log_forward_anchor_spec", lambda _logging: object())
+    monkeypatch.setattr(trust_anchors, "anchor_refusal", lambda *_a, **_k: sentinel)
+    configured: list[SyslogForward | None] = []
+    deferred: list[trust_anchors.TrustAnchorError] = []
+
+    def configure(forward: SyslogForward | None) -> bool:
+        configured.append(forward)
+        return False
+
+    recorder = _Recorder(configured)
+    logger = logging.getLogger("messagefoundry.__main__")
+    logger.addHandler(recorder)
+    try:
+        rc = cli._start_logging(
+            _listed(),
+            env_name="staging",
+            enforcing=False,
+            spool_dir=str(tmp_path / "spool"),
+            configure=configure,
+            deferred_ca_refusals=deferred,
+        )
+    finally:
+        logger.removeHandler(recorder)
+    assert rc is None
+    assert deferred == [sentinel]
+    assert configured == [None]
+    assert _hop_audit(recorder.seen) == [True]
