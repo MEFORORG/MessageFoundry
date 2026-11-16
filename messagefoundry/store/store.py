@@ -6890,6 +6890,24 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
 
+#: The ``before_first_write`` hook of the store open in progress, set by ``store.base.open_store``
+#: around the backend open and run by :func:`run_open_store_hook` (BACKLOG #4936). A context
+#: variable for :data:`OPEN_STORE_PIN`'s reason; ``None`` for an open that passes no hook.
+OPEN_STORE_HOOK: ContextVar[Callable[[Any], Awaitable[None]] | None] = ContextVar(
+    "mefor_open_store_hook", default=None
+)
+
+
+async def run_open_store_hook(host: object) -> None:
+    """Run the open's ``before_first_write`` hook on the half-opened ``host`` (BACKLOG #4936). Each
+    backend's writable open calls this right after :func:`check_open_store_pin`, so once the schema
+    is in place and before it binds a salt, reserves a cipher block, seals a row or writes an audit
+    row. A read-only open never calls it. A no-op when no hook is set. What the hook raises fails
+    the open, which closes the handle."""
+    hook = OPEN_STORE_HOOK.get()
+    if hook is not None:
+        await hook(host)
+
 
 class PinCheck:
     """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
@@ -8105,6 +8123,32 @@ def audit_chain_rolled(store: object) -> bool | None:
         return False
     keys = getattr(store, "_audit_range_keys", None)
     return bool(isinstance(keys, list) and keys and keys[-1] == active)
+
+
+def audit_range_key_missing(store: object) -> bool:
+    """Whether the keyed audit chain's current range, as the open authenticated it, is keyed under
+    an audit key this store does not hold (BACKLOG #4934). The open then moves new rows to the
+    active key (:func:`settle_audit_ranges`), so the first row a start writes lands in a range keyed
+    under another key, and the chain breaks there; :func:`roll_audit_key_range` refuses the same
+    state. ``False`` with no keyed chain, and for ranges the open could not authenticate, which
+    say nothing about the current range's key. Read by attribute, as :func:`audit_chain_rolled`
+    reads; no I/O."""
+    if not getattr(store, "_audit_chain_keyed", False):
+        return False
+    if not getattr(store, "_audit_ranges_trusted", False):
+        return False
+    keys = getattr(store, "_audit_range_keys", None)
+    if not (isinstance(keys, list) and keys):
+        return False
+    mac_keys = getattr(store, "_audit_mac_keys", None)
+    return (
+        _audit_secret_for(
+            keys[-1],
+            mac_keys if isinstance(mac_keys, Mapping) else {},
+            getattr(store, "_audit_mac_fn", None),
+        )
+        is None
+    )
 
 
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
@@ -11568,6 +11612,7 @@ class MessageStore:
                 # has not bound, a failure before the bind included (BACKLOG #5720).
                 store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
+                await run_open_store_hook(store)  # BACKLOG #4936: after the pin, before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.

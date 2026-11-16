@@ -1138,6 +1138,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
+            # BACKLOG #4934: the start refusal compares the DEK key id with its stamp
+            # (dek_changed), and reads the audit chain's range keys the open settled.
+            "compare:via messagefoundry.pipeline.secret_rotation",
+            "hash:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/api/security.py": frozenset(

@@ -242,6 +242,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
+| | `[secret_rotation].allow_lost_audit_range_key` | `false` (`true` starts the engine on a changed store key the keyed audit chain has not rolled to while the key of the chain's current range is not configured; the chain breaks at that start's first audit row) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
@@ -276,7 +277,8 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].mfa_recovery_code_count`, `[auth].password_min_length`, the four other
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
-`[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
+`[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].allow_lost_audit_range_key`,
+`[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
 `security_window_seconds`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
