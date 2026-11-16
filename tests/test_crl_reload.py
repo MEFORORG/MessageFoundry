@@ -1295,10 +1295,30 @@ def test_a_reload_inside_the_skew_window_says_the_revocation_is_not_enforced_yet
     if early:
         assert line.levelno == logging.WARNING
         assert "a revocation only that CRL lists is not enforced" in line.getMessage()
-        assert "takes effect at" in line.getMessage()
+        assert "takes effect only at" in line.getMessage()
     else:
         assert line.levelno == logging.INFO
         assert "not enforced" not in line.getMessage()
+
+
+def test_a_reload_that_keeps_the_held_crl_beside_a_later_one_says_the_later_one_waits(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #5507, the case the issuer test alone misses: the file keeps the held CRL,
+    still in effect, beside a successor two minutes ahead. The reload applies it, OpenSSL keeps
+    choosing the held CRL, and the successor's revocation waits, so the applied line says so."""
+    hop = pki.outbound_hop()
+    held = pki.crl.read_bytes()
+    pki.crl.write_bytes(held + pki.crl_pem(issued=_in_minutes(2), lasts=60 * _DAY, revoke=True))
+
+    with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.crl_reload"):
+        outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
+    assert _accepts(hop, pki.server())  # the revocation is not enforced yet
+    (line,) = [r for r in caplog.records if "crl_reload: applied" in r.getMessage()]
+    assert line.levelno == logging.WARNING
+    assert "a revocation only that CRL lists is not enforced" in line.getMessage()
 
 
 def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:
