@@ -4555,9 +4555,12 @@ class AuthService:
 
         A constant, never the bucket's own wait (owner ruling 2026-10-20). The sign-in surface is
         unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
-        one of them when another's oldest attempt was made. The whole window is never too early: a
-        per-address bucket clears within it once nothing else spends it. The authenticated
-        PHI-read 429 keeps the exact wait."""
+        one of them when another's oldest attempt was made. The whole window is an estimate, and it
+        can be early: another caller's charge can refill the bucket or the global window meanwhile,
+        and a paid passkey sign-in POST re-stamps its begin leg's hit to now
+        (:meth:`SlidingWindowRateLimiter.renew`), so the bucket or window it lands in can still be
+        full when the window has passed (docs/SECURITY.md, *The combined passkey sign-in*). The
+        authenticated PHI-read 429 keeps the exact wait."""
         # _settings, not the settings property: that returns a deep copy, and this runs per refusal.
         return max(1, math.ceil(self._settings.login_rate_limit_window_seconds))
 
