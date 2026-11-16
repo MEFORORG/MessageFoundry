@@ -1928,8 +1928,9 @@ def test_a_relabel_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
         mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
         assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
     err = _refusal(capsys)
-    # The refusal names the file without promising a sweep that will never take the directory.
-    assert "which no sweep removes" in err and "the next sweep removes" not in err, err
+    # The refusal names the file and asks for its deletion by hand, and predicts no sweep.
+    (refusal,) = [line for line in err.splitlines() if line.startswith("error:")]
+    _assert_neutral_spare_refusal(refusal)
     assert marked_at_release and not any(marked_at_release), marked_at_release
     (leftover,) = dest.parent.glob("mefor-restore-*")
     staged = leftover / "extracted_store.db"
@@ -2349,10 +2350,22 @@ def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
     assert any("could not be relabelled" in m and str(staged) in m for m in errors.messages), (
         errors.messages
     )
-    # The refusal is worded after that withholding, so it promises no sweep.
     (refusal,) = [line for line in err.splitlines() if line.startswith("error:")]
-    assert "which no sweep removes" in refusal and "the next sweep removes" not in refusal, refusal
+    _assert_neutral_spare_refusal(refusal)
     shutil.rmtree(leftover)
+
+
+#: Wordings that predict what a sweep will or can do with a restore's spared file. A race can make
+#: any of them false, so no refusal on the spare path may carry one.
+_SWEEP_PREDICTIONS = ("no sweep removes", "next sweep removes", "sweep can", "kept from sweeps")
+
+
+def _assert_neutral_spare_refusal(refusal: str) -> None:
+    """The refusal names the spared staged store and asks for its deletion by hand, and predicts
+    nothing a sweep will or can do."""
+    assert "extracted_store.db (" in refusal and "delete it by hand" in refusal, refusal
+    found = [p for p in _SWEEP_PREDICTIONS if p in refusal]
+    assert not found, (found, refusal)
 
 
 def _hold_held_marker(mp: pytest.MonkeyPatch) -> None:
@@ -2371,10 +2384,9 @@ def _hold_held_marker(mp: pytest.MonkeyPatch) -> None:
 def test_a_withholding_that_fails_is_never_reported_as_landed(
     tmp_path, key_b64, capsys, relabel
 ) -> None:
-    # A relabel does not land, so the restore withholds the directory from every sweep by removing
-    # its `.lock-held`, and that removal is refused too. The directory is then NOT withheld: a
-    # sweep can still take it. The refusal used to say no sweep removes it whatever the removal
-    # did; it now keeps the next-sweep wording, and the failure is logged at ERROR.
+    # A relabel does not land, so the restore tries to remove the directory's `.lock-held`, and
+    # that removal is refused too. The refusal used to say no sweep removes the directory whatever
+    # the removal did. It now predicts no sweep at all, and the failed removal is logged at ERROR.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     store_refusals: list[Path] = []
@@ -2398,11 +2410,13 @@ def test_a_withholding_that_fails_is_never_reported_as_landed(
     err = _refusal(capsys)
     (refusal,) = [line for line in err.splitlines() if line.startswith("error:")]
     assert "member-count cap" in refusal, refusal
-    assert "which no sweep removes" not in refusal, refusal
-    assert "the next sweep removes this directory" in refusal, refusal
+    _assert_neutral_spare_refusal(refusal)
     (leftover,) = dest.parent.glob("mefor-restore-*")
     assert (leftover / ".lock-held").exists()
-    assert any("could not be kept from sweeps" in m for m in errors.messages), errors.messages
+    assert any(
+        "could not remove the .lock-held marker" in m and str(leftover) in m
+        for m in errors.messages
+    ), errors.messages
     shutil.rmtree(leftover)
 
 
@@ -2446,7 +2460,7 @@ def test_a_withholding_retried_under_the_lock_decides_the_refusal(
     (refusal,) = [line for line in _refusal(capsys).splitlines() if line.startswith("error:")]
     assert len(refused) == 1, refused
     assert held_at_unlock and held_at_unlock[-1] == [False], held_at_unlock
-    assert "which no sweep removes" in refusal, refusal
+    _assert_neutral_spare_refusal(refusal)
     (leftover,) = dest.parent.glob("mefor-restore-*")
     assert not (leftover / ".lock-held").exists()
     shutil.rmtree(leftover)
@@ -2506,12 +2520,12 @@ def test_a_teardown_never_rereads_and_remarks_what_the_release_withheld(
     # The release finds the spare unrecorded and withholds the directory under the lock. Every
     # marker read after the unlock then fails, as under a scanner without read sharing. The
     # teardown used to read the spare again, take it as recorded, and re-mark the directory,
-    # undoing the withholding while the refusal promised no sweep.
+    # undoing the withholding.
     refusal, leftover, _ = _rollback_failed_relabel_refused(
         tmp_path, key_b64, capsys, lambda in_release, unlocked: unlocked
     )
     assert not (leftover / ".lock-held").exists(), "the teardown re-marked a withheld directory"
-    assert "which no sweep removes" in refusal, refusal
+    _assert_neutral_spare_refusal(refusal)
     shutil.rmtree(leftover)
 
 
@@ -2520,13 +2534,11 @@ def test_a_withholding_made_after_the_lock_dropped_promises_no_outcome(
 ) -> None:
     # The release cannot read the marker while it holds the lock, so it withholds nothing; the
     # teardown's later read finds the spare unrecorded and withholds after the unlock, when a
-    # sweep can have taken the directory first. The refusal must say a sweep can still remove it,
-    # never that none will.
+    # sweep can have taken the directory first. The refusal must predict no sweep outcome.
     refusal, leftover, _ = _rollback_failed_relabel_refused(
         tmp_path, key_b64, capsys, lambda in_release, unlocked: in_release and not unlocked
     )
-    assert "which no sweep removes" not in refusal, refusal
-    assert "which a sweep can still remove" in refusal, refusal
+    _assert_neutral_spare_refusal(refusal)
     shutil.rmtree(leftover)
 
 
