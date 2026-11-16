@@ -298,19 +298,15 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n\0]")
 
 
 def _lines(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Each entry whole, then each of its lines as an entry of its own when it has several, each
-    with the registry value it came from. The reader cannot tell whether NSSM takes a line or the
+    """Each entry whole, then each of its lines as an entry of its own, each with the registry
+    value it came from. A one-line entry is read twice, which lists nothing new. The reader cannot tell whether NSSM takes a line or the
     whole string as a variable, so it reads both (vault BACKLOG #5394): the whole string keeps an
     inline key whose ``-----BEGIN`` starts on a later line, and the lines catch a store key a later
     line sets. Reading too many only lists a name a later line spells, and a name outside the
     secret classes refuses nothing."""
-    read: list[tuple[str, str]] = []
-    for where, entry in entries:
-        read.append((where, entry))
-        lines = _LINE_BREAK.split(entry)
-        if len(lines) > 1:
-            read.extend((where, line) for line in lines)
-    return read
+    return [
+        (where, part) for where, entry in entries for part in (entry, *_LINE_BREAK.split(entry))
+    ]
 
 
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
