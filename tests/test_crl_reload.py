@@ -65,6 +65,7 @@ from messagefoundry.config.tls_policy import (
     crl_not_in_effect,
     harden_crl_check,
     judge_crl_bytes,
+    relax_verify_expiry,
 )
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pipeline.cert_expiry import MonitoredCert, _ca_file_crl_refusal
@@ -1299,6 +1300,35 @@ def test_a_reload_inside_the_skew_window_says_the_revocation_is_not_enforced_yet
     else:
         assert line.levelno == logging.INFO
         assert "not enforced" not in line.getMessage()
+
+
+@pytest.mark.parametrize("relaxed", [False, True], ids=["checks-crl-time", "tls_allow_expired"])
+def test_a_reload_on_a_hop_that_skips_crl_time_does_not_say_the_revocation_waits(
+    pki: _Pki, caplog: pytest.LogCaptureFixture, relaxed: bool
+) -> None:
+    """Vault BACKLOG #5507. ``tls_allow_expired`` sets ``X509_V_FLAG_NO_CHECK_TIME``, so OpenSSL
+    skips the CRL time check and the newer CRL wins at once: the revocation is enforced, and a
+    "not enforced" line would be false there. The twin is the same reload on a hop that checks
+    CRL time, which still waits and still says so."""
+    hop = pki.outbound_hop()
+    if relaxed:
+        relax_verify_expiry(hop, host="partner.example")
+    held = pki.crl.read_bytes()
+    pki.crl.write_bytes(held + pki.crl_pem(issued=_in_minutes(2), lasts=60 * _DAY, revoke=True))
+
+    with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.crl_reload"):
+        outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
+    # What the hop does now is the measurement the line must agree with.
+    assert _accepts(hop, pki.server()) is not relaxed
+    (line,) = [r for r in caplog.records if "crl_reload: applied" in r.getMessage()]
+    if relaxed:
+        assert line.levelno == logging.INFO
+        assert "not enforced" not in line.getMessage()
+    else:
+        assert line.levelno == logging.WARNING
+        assert "a revocation only such a CRL lists is not enforced" in line.getMessage()
 
 
 def test_a_reload_that_keeps_the_held_crl_beside_a_later_one_says_the_later_one_waits(

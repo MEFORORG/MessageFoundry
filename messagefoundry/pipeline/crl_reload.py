@@ -140,6 +140,7 @@ from messagefoundry.config.tls_policy import (
     crl_not_in_effect,
     crl_scratch_context,
     judge_crl_bytes,
+    skips_validity_period,
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
@@ -777,7 +778,7 @@ def _reload_path(
     prior = reload_refusal(key, fingerprint)
     label = _label(key, fingerprint, stale, path, refused=prior is not None)
     refusals = _Refusals()
-    reloaded = 0
+    reloaded = timed = 0
     blocks: tuple[CrlBlock, ...] = ()  # stays empty when the bytes cannot be judged
     try:
         # A CRL not in effect yet is judged here, not refused there: a context at the cap, a held
@@ -813,7 +814,7 @@ def _reload_path(
             # OpenSSL's own reading of the file first: a file a start would refuse is a file to
             # fix, which outranks every verdict above.
             certificates = _certificates_in(copy, blocks, label=label)
-            reloaded = _load(
+            reloaded, timed = _load(
                 pem, copy, certificates, label, ready, refusals, fingerprint, facts, blocks
             )
     except _NotProvable as exc:
@@ -860,16 +861,18 @@ def _reload_path(
     # OpenSSL uses a CRL only once it is in effect, with no skew, so the applied line must say
     # when each CRL in the file not yet in effect starts to count (vault BACKLOG #5507). Any such
     # CRL, not only an issuer's sole one: a file that keeps the held CRL beside a successor not yet
-    # in effect is applied too, and the successor's revocations wait all the same.
+    # in effect is applied too, and the successor's revocations wait all the same. Only on a
+    # context that checks CRL time: one that skips it (tls_allow_expired) enforces the newer CRL
+    # at once, so the line would be false there.
     early = (
         sorted(
             (block for block in blocks if not crl_in_effect(block, now=now, skew=0.0)),
             key=lambda block: block.this_update,
         )
-        if reloaded
+        if timed
         else []
     )
-    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior, early)
+    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior, early, timed)
 
 
 def _load(
@@ -882,18 +885,19 @@ def _load(
     fingerprint: tuple[int, int],
     facts: CrlFacts,
     blocks: tuple[CrlBlock, ...],
-) -> int:
+) -> tuple[int, int]:
     """Load the staged ``copy`` into each context in ``ready`` that passes the per-context checks.
 
     A context paired with a verdict (a wait, a restart) gets the checks and then that verdict, so a
     file to fix is reported as one whatever else holds the context back. Returns how many contexts
-    now hold the file. A failure in one context is that context's refusal alone, retried next pass:
+    now hold the file, and how many of those check CRL time (:func:`skips_validity_period` reads
+    False; vault BACKLOG #5507). A failure in one context is that context's refusal alone, retried next pass:
     the contexts already loaded stay counted, and the rest are still tried.
 
     The check that stops a context decides whether these bytes are judged again
     (:attr:`_Refusals.sticky`). A context that fails a file check is stopped by it, wait or no
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
-    reloaded = 0
+    reloaded = timed = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
     unowned: dict[frozenset[bytes], str | None] = {}  # why the own-CRL rule refuses, if it does
     for ctx, held, held_back in ready:
@@ -948,7 +952,7 @@ def _load(
             )
             refusals.error = refusals.error or exc
             continue
-        reloaded += replace_held_copy(
+        replaced = replace_held_copy(
             ctx,
             held,
             replace(
@@ -959,7 +963,10 @@ def _load(
                 reloads=held.reloads + 1,
             ),
         )
-    return reloaded
+        reloaded += replaced
+        if replaced and not skips_validity_period(ctx):
+            timed += replaced
+    return reloaded, timed
 
 
 def _finish(
@@ -971,11 +978,13 @@ def _finish(
     refusals: _Refusals,
     prior: ReloadRefusal | None,
     early: Sequence[CrlBlock],
+    timed: int,
 ) -> ReloadOutcome:
     """Log and record what one file's reload did, and return it.
 
     ``early`` holds the applied file's CRLs that are not in effect yet with no clock skew
-    allowed, earliest first (vault BACKLOG #5507)."""
+    allowed, earliest first, and ``timed`` is how many of the ``reloaded`` contexts check CRL
+    time; ``early`` is empty when none does (vault BACKLOG #5507)."""
     if reloaded:
         if not early:
             log.info(
@@ -990,11 +999,11 @@ def _finish(
             # not enforced, and the INFO line alone would say it was applied.
             log.warning(
                 "crl_reload: applied %s to %d running TLS context(s) without a restart, but %d "
-                "CRL(s) in it take effect only after this host's clock reads now: %s. OpenSSL "
-                "uses a CRL only once it is in effect, so until then a revocation only such a CRL "
-                "lists is not enforced: each hop judges that issuer's peers by a CRL it holds "
-                "that is in effect, or refuses them with 'CRL is not yet valid' where it holds "
-                "none",
+                "CRL(s) in it take effect only after this host's clock reads now: %s. On the %d "
+                "of those contexts that check CRL time, OpenSSL uses a CRL only once it is in "
+                "effect, so until then a revocation only such a CRL lists is not enforced: each "
+                "such hop judges that issuer's peers by a CRL it holds that is in effect, or "
+                "refuses them with 'CRL is not yet valid' where it holds none",
                 label,
                 reloaded,
                 len(early),
@@ -1002,6 +1011,7 @@ def _finish(
                     f"from issuer {quoted_issuer(block.issuer)} at {log_timestamp(block.this_update)}"
                     for block in early
                 ),
+                timed,
             )
     if refusals.strongest is None:
         clear_reload_refusal(path)

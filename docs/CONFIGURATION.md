@@ -2544,13 +2544,14 @@ lapse before the new CRL takes effect. Waiting then leaves a gap in which its pe
 the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
 effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
-engine logs a WARNING that says so. A reload applies it too, but OpenSSL allows no skew, so a
-revocation only that CRL lists is not enforced until its `thisUpdate` passes, and where the hop
-holds no CRL in effect from that issuer, the hop refuses every peer that CRL judges until then, as
-at a start. The reload's applied
-line is then a WARNING that says so and names the time (vault BACKLOG #5507). It says the same of
-any CRL in the applied file that is not in effect yet, such as a successor kept beside the CRL the
-hop holds.
+engine logs a WARNING that says so. A reload applies it too. On a hop that checks CRL time,
+OpenSSL allows no skew, so a revocation only that CRL lists is not enforced until its `thisUpdate`
+passes, and where the hop holds no CRL in effect from that issuer, the hop refuses every peer that
+CRL judges until then, as at a start. The reload's applied line is then a WARNING that says so and
+names the time (vault BACKLOG #5507). It says the same of any CRL in the applied file that is not
+in effect yet, such as a successor kept beside the CRL the hop holds. A hop that sets
+`tls_allow_expired` skips the CRL time check, so there the newer CRL is used at once and the
+reload logs no such WARNING for it.
 
 A reload changes what the next full TLS handshake checks. An established connection is not checked
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays
