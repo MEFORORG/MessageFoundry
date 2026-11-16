@@ -7,13 +7,14 @@ must stay data in MSH-7 and MSH-10 rather than add fields or segments downstream
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("pydicom")
 
-from messagefoundry.config.wiring import Send, load_config  # noqa: E402
+from messagefoundry.config.wiring import Registry, Send, load_config  # noqa: E402
 from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.message import Message  # noqa: E402
 from tests._dicom_sample import make_sr_part10  # noqa: E402
@@ -21,8 +22,13 @@ from tests._dicom_sample import make_sr_part10  # noqa: E402
 SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 
+@functools.cache
+def _registry() -> Registry:
+    return load_config(SAMPLES)
+
+
 def _oru(*, sop_instance_uid: str, study_date: str) -> Message:
-    reg = load_config(SAMPLES)
+    reg = _registry()
     part10 = make_sr_part10(sop_instance_uid=sop_instance_uid, study_date=study_date)
     raw = RawMessage.from_bytes(part10, "dicom")
     out = reg.handlers["sr_to_oru"](raw)
@@ -51,4 +57,4 @@ def test_delimiters_and_line_breaks_stay_data() -> None:
     assert oru.field("MSH-7.1") == "2026|06 ZZZ|1"
     assert oru.field("MSH-10.1") == "1.2|EVIL^X~Y&Z"
     # No segment was injected: MSH, PID, OBR, then one OBX per measurement.
-    assert [s.split("|", 1)[0] for s in oru.segments()] == ["MSH", "PID", "OBR", "OBX", "OBX"]
+    assert oru.segments() == ["MSH", "PID", "OBR", "OBX", "OBX"]
