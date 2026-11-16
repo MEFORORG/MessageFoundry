@@ -11,12 +11,14 @@ whether ``configure_logging`` had run when it was emitted.
 from __future__ import annotations
 
 import logging
+import ssl
 from pathlib import Path
 
 import pytest
 
 from messagefoundry import __main__ as cli
 from messagefoundry.__main__ import main
+from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.config.settings import load_settings
 from messagefoundry.logging_setup import configure_logging
 from tests._log_absence import assert_capture_sees
@@ -116,11 +118,12 @@ def test_block_unlisted_outbound_audit_is_logged_after_configure_logging(
     assert _audit(seen, "starting keyless") == []
 
 
-def test_a_start_refused_before_logging_is_configured_logs_no_audit(
+def test_a_start_refused_before_logging_is_configured_still_logs_the_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Under enforce with no collector, _start_logging refuses before configure_logging. The
-    # opt-out is still named on stderr, but no AUDIT record is logged ahead of the handlers.
+    # refusal does not lose the record: it goes to the handlers the process has then, here the
+    # recorder (in a real serve, main()'s filtered lastResort on stderr).
     rc, seen = _serve(
         tmp_path,
         monkeypatch,
@@ -133,7 +136,7 @@ def test_a_start_refused_before_logging_is_configured_logs_no_audit(
     assert "block_unlisted_outbound=false on a production PHI instance" in err
     assert "must forward its logs off-box" in err
     assert "AUDIT:" not in err
-    assert _audit(seen, "") == []
+    assert _audit(seen, "block_unlisted_outbound=false") == [False]
 
 
 def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
@@ -173,4 +176,41 @@ def test_keyless_audit_reaches_stderr_when_the_level_filters_warning(
     )
     assert rc == 0
     err = capsys.readouterr().err.splitlines()
-    assert len([line for line in err if line.startswith("AUDIT: starting keyless")]) == 1
+    assert len([line for line in err if "AUDIT: starting keyless" in line]) == 1
+
+
+@pytest.mark.parametrize(
+    ("raised", "said"),
+    [
+        (ssl.SSLError(9, "[SSL] PEM lib\nforged line"), "could not be loaded"),
+        (TrustAnchorError("[api].tls_client_ca_file pin mismatch"), "refused"),
+    ],
+)
+def test_api_tls_context_failure_is_a_clean_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raised: Exception,
+    said: str,
+) -> None:
+    # S19-28 (#5391 item 1): bad API TLS material or a refused client-CA anchor is exit 2 with the
+    # reason, not the uncaught CRITICAL floor's exit 1.
+    built: list[bool] = []
+
+    def refuse(*args: object, **kwargs: object) -> ssl.SSLContext:
+        built.append(True)
+        raise raised
+
+    monkeypatch.setattr("messagefoundry.api.tls.build_api_ssl_context", refuse)
+    rc, _seen = _serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n' + _SECURE,
+        env="staging",
+        key=True,
+    )
+    assert built == [True]
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"error: the API TLS context {said}:" in err
+    assert "\nforged line" not in err

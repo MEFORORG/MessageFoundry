@@ -34,8 +34,8 @@ from messagefoundry.remotedebug import (
 # and what stays open. Anything that imports this module gets the hook too, for the life of its
 # process: the test suite does, and so does `api/tls.py` inside an engine that already has it.
 #
-# `_serve` and `_supervise` still make the same call first. Their comments describe the window
-# as it was before this call existed; with this one in place theirs normally adds nothing.
+# `_serve` and `_supervise` still make the same call first; with this one in place theirs
+# normally adds nothing.
 # `install_remote_debug_guard` says why a later call adds no second copy, this one run again too.
 install_remote_debug_guard()
 
@@ -84,6 +84,7 @@ from messagefoundry.logging_setup import (  # noqa: E402
     PRODUCTION_DEBUG_REFUSED,
     LogFile,
     SyslogForward,
+    build_stderr_handler,
     configure_logging,
     install_filtered_last_resort,
     level_refused_on_production,
@@ -2213,6 +2214,33 @@ def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) 
         log.warning("%s", outcome.refusal)
 
 
+def _write_start_audit(lines: Sequence[str]) -> None:
+    """Log the start's deferred AUDIT lines to whatever handlers this process has now (BACKLOG
+    #5390, #5391).
+
+    Called once ``configure`` has installed the handlers, and also on a refused start, so a refusal
+    does not lose a record the old decision-time log call wrote: in ``supervise`` that reached its
+    stdout handler, and in ``serve`` before ``configure_logging`` it reaches ``main()``'s filtered
+    lastResort on stderr. Where the logger's level filters WARNING out, as ``[logging].level =
+    ERROR`` does in every handler, each line goes to stderr instead, through the same redaction and
+    control-character chain (:func:`build_stderr_handler`), so it is written once and never lost."""
+    if not lines:
+        return
+    logger = logging.getLogger(__name__)
+    if logger.isEnabledFor(logging.WARNING):
+        for line in lines:
+            logger.warning("%s", line)
+        return
+    handler = build_stderr_handler()
+    try:
+        for line in lines:
+            handler.handle(
+                logger.makeRecord(logger.name, logging.WARNING, __file__, 0, "%s", (line,), None)
+            )
+    finally:
+        handler.close()
+
+
 def _start_logging(
     settings: ServiceSettings,
     *,
@@ -2239,9 +2267,11 @@ def _start_logging(
     passed (``None`` with no collector). It stays at the call site because level, format and the
     application-log file are the caller's, and it runs only after every gate here has passed.
 
-    ``pending_audit`` holds AUDIT lines the caller decided before this call. They are written to
-    stderr and logged first once ``configure`` has returned, and not at all when this function
-    refuses the start (BACKLOG #5391). A refusal the caller makes later does not unwrite them."""
+    ``pending_audit`` holds AUDIT lines the caller decided before this call. They are logged first
+    once ``configure`` has returned, or, when this function refuses the start, to the handlers the
+    process has at the refusal, by :func:`_write_start_audit` either way (BACKLOG #5391). The
+    warn-mode hop's AUDIT line follows them on a start that passes, and is not logged on a refused
+    one, since no record would take that hop (BACKLOG #5390)."""
     from messagefoundry.config.settings import (
         SyslogProtocol,
         forward_hop_disposition,
@@ -2251,6 +2281,12 @@ def _start_logging(
     from messagefoundry.config.tls_policy import HopDisposition, InsecureHopRefused
     from messagefoundry.controlchars import scrub_control_chars
     from messagefoundry.keywrap import KeyWrapRefused
+
+    def _refused() -> int:
+        # BACKLOG #5391: a refused start still logs the caller's AUDIT lines, as the decision-time
+        # log call they replaced did. The hop line is not among them (BACKLOG #5390).
+        _write_start_audit(pending_audit or ())
+        return 2
 
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
     # so evidence survives a host compromise. PHI redaction + control-char scrubbing apply to the
@@ -2310,17 +2346,17 @@ def _start_logging(
                 "(BACKLOG #1966).",
                 file=sys.stderr,
             )
-            return 2
+            return _refused()
         if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. Warned on stderr now, and logged as
-            # an AUDIT record only once `configure` below has installed the handlers and the
-            # forwarder, so a level that admits WARNING sends it to [logging].file and the
-            # collector, and it is not logged at all when a later gate here refuses the start
-            # (BACKLOG #5390).
+            # Accepted, but never silent — the point of the fix. Warned on stderr now, and logged as
+            # an AUDIT record only once `configure` below has installed the handlers, and the
+            # forwarder when it comes up, so a level that admits WARNING sends it to [logging].file
+            # and the collector. It is not logged when a later gate here refuses the start, since no
+            # record would take the hop then (BACKLOG #5390).
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
                 f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so the "
-                "evidence stream crosses the network unprotected on a PHI instance. Set "
+                "evidence stream would cross the network unprotected on a PHI instance. Set "
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
                 "(ADR 0080) to a collector on another host."
             )
@@ -2362,7 +2398,7 @@ def _start_logging(
                 f"start under [security].enforcement=enforce (ASVS 16.4.3). {_forwarding_fix}",
                 file=sys.stderr,
             )
-            return 2
+            return _refused()
         print(
             f"warning: a PHI instance ({env_name!r}) does not forward its logs off-box over verified "
             f"TLS: {_forwarding_gap}. Under enforcement=enforce this refuses to start (ASVS 16.4.3). "
@@ -2387,7 +2423,7 @@ def _start_logging(
                 "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
                 file=sys.stderr,
             )
-            return 2
+            return _refused()
 
     # BACKLOG #3470: the collector's CA takes the trust-anchor checks before the forwarder loads
     # it. In `serve` the audited preflight runs only in the API lifespan, after the forwarder has
@@ -2416,7 +2452,7 @@ def _start_logging(
                 "log forwarder is built, so no record reached the collector.",
                 file=sys.stderr,
             )
-            return 2
+            return _refused()
         # `serve`: no forwarder, and the caller hands the refusal to its audited preflight.
         deferred_ca_refusals.append(_ca_refusal)
         log_forward = None
@@ -2433,7 +2469,7 @@ def _start_logging(
             "the path/permissions, or unset [logging].file to run stdout-only.",
             file=sys.stderr,
         )
-        return 2
+        return _refused()
     except InsecureHopRefused as exc:
         # BACKLOG #1498 (ADR 0173 §4.3): the TLS forwarder's own revocation guard refused, inside
         # _build_tls_context where the finished context (and hence its CRL flag) exists. Rendered here
@@ -2445,23 +2481,21 @@ def _start_logging(
         # guard — only the forwarder is missing. An earlier version of this comment claimed otherwise,
         # which would have misled anyone reasoning about the guard's WARN arm at the same site.
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return _refused()
     except KeyWrapRefused as exc:
         # BACKLOG #1352 / #1171: [logging].forward_tls_client_cert holds a weakly wrapped or an
         # encrypted key (that setting takes no passphrase). A clean exit 2, like the refusal above;
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
-        return 2
-    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's when its forwarder
-    # was built (a refused collector CA above builds none). Each goes to stderr as well as the
-    # handlers, because [logging].level can filter WARNING out of every handler and stderr is not
-    # filtered.
+        return _refused()
+    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's while forwarding is
+    # still configured (a refused collector CA above turned it off). The hop line records the
+    # posture this start accepted, not that a record crossed: configure may have skipped a collector
+    # that was down, and forwarder_live says whether it did.
     _audit_lines = list(pending_audit or ())
     if _hop_warning is not None and log_forward is not None:
         _audit_lines.append(f"AUDIT: {_hop_warning}")
-    for _audit_line in _audit_lines:
-        print(scrub_control_chars(_audit_line), file=sys.stderr)
-        logging.getLogger(__name__).warning("%s", _audit_line)
+    _write_start_audit(_audit_lines)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
     # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
@@ -2735,11 +2769,12 @@ _UVICORN_DRAIN_SECONDS = 3.0
 
 
 def _serve(args: argparse.Namespace) -> int:
-    # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
-    # because a script injected before the hook is in place runs. It is NOT first in the process:
-    # this module's own imports and argument parsing come before it, and that window stays open.
-    # A no-op where the interpreter was started with remote debugging disabled, which is every
-    # engine shard under `supervise`.
+    # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
+    # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
+    # this module's other imports and argument parsing; this one covers a caller that reached
+    # `_serve` some other way, and adds no second copy otherwise (`install_remote_debug_guard` says
+    # why). A no-op where the interpreter was started with remote debugging disabled, which is
+    # every engine shard under `supervise`.
     install_remote_debug_guard()
 
     import uvicorn
@@ -2991,7 +3026,8 @@ def _serve(args: argparse.Namespace) -> int:
     # at startup with the DPAPI error. A key counts only when [store].key_provider reads it (#2077).
     #
     # BACKLOG #5391: the keyless and block_unlisted_outbound=false AUDIT records, for
-    # _start_logging below to write once its handlers are installed. Logged here they would reach
+    # _start_logging below to write once its handlers are installed, or for _write_start_audit on a
+    # refused start. Logged here they would reach
     # only the filtered lastResort on stderr, never [logging].file, the structured stdout handler
     # or the collector. Each also prints a warning to stderr where it is decided. The #1989 and
     # #2700 AUDIT lines take their own paths, after _start_logging.
@@ -3068,8 +3104,10 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # The store key file is checked BEFORE it is used (vault BACKLOG #2601).
+    # The store key file is checked BEFORE it is used (vault BACKLOG #2601). A refusal here or at
+    # the posture steps below still logs the keyless AUDIT line (BACKLOG #5391).
     if not _store_key_file_gate(settings, enforcing=enforcing):
+        _write_start_audit(_start_audit)
         return 2
 
     # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY
@@ -3112,6 +3150,7 @@ def _serve(args: argparse.Namespace) -> int:
         enforcing=enforcing,
         audit=_start_audit,
     ):
+        _write_start_audit(_start_audit)
         return 2
 
     # #122 (ADR 0162): the OPT-IN engine-managed application-log file + the fail-closed write guard.
@@ -3532,7 +3571,7 @@ def _serve(args: argparse.Namespace) -> int:
     # direct NIC bind did. Backwards: the operators taking the safest path got the least verification.
     # The loopback arm WARNS rather than refuses (owner decision): the engine cannot distinguish
     # "loopback behind a declared proxy" from "loopback and genuinely unexposed" beyond the declaration
-    # itself, and refusing would hard-stop working deployments on upgrade. The off-loopback arm keeps
+    # itself, so a refusal there would also stop the recommended topology. The off-loopback arm keeps
     # refusing exactly as before, so this change is additive — it can only add a warning, never a new
     # refusal.
     # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
@@ -3839,7 +3878,7 @@ def _serve(args: argparse.Namespace) -> int:
     # weakens them. Ordered refusals first, then warnings, then advisories.
     if settings.api.serve_ui and settings.api.tls_terminated_upstream:  # noqa: SIM102
         if not settings.api.public_origin:
-            # Deliberate upgrade-time behavior change (owner-confirmed, ADR 0068 §7): with a
+            # Deliberate behavior change (owner-confirmed, ADR 0068 §7): with a
             # DECLARED reverse proxy the request Host header is client-forwardable — without the
             # exact origin, the /ui same-origin CSRF check degrades to Host comparison and the
             # WebAuthn rp_id would have anchored to attacker-influenceable input.
@@ -4672,8 +4711,7 @@ def _serve(args: argparse.Namespace) -> int:
     #     can: ADR 0152, Amendment 2026-10-17).
     # A default refusal would therefore leave an operator on such a host two choices: do not start,
     # or declare a property the host does not have. ADR 0151 scoped its companion refusal to its own
-    # opt-in ("only fire on the opt-in, so it cannot break an existing deployment"), and the same
-    # rule applies here: the warning is the default; the refusal
+    # opt-in, and the same rule applies here: the warning is the default; the refusal
     # requires [security].require_memory_encryption_declaration = true, which nothing has set. The
     # ADR 0148 refuse/warn dial then applies on top of the opt-in, as it does everywhere else.
     #
@@ -5129,12 +5167,28 @@ def _serve(args: argparse.Namespace) -> int:
         # tls_min_version floor is enforced exactly.
         # #285: build_api_ssl_context preflights [api].tls_client_ca_file (at least its pin, DACL
         # and path) at construction; enforcing is the [security].enforcement refuse/warn dial.
+        from messagefoundry.auth.trust_anchors import TrustAnchorError
+        from messagefoundry.controlchars import scrub_control_chars
+
         try:
             ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
         except KeyWrapRefused as exc:
             # BACKLOG #1352 / #1171: a weak or unreadable [api].tls_key_file wrap, or an encrypted
             # key with no MEFOR_API_TLS_KEY_PASSWORD. A clean exit 2, as for the forwarder's key.
             print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except (TrustAnchorError, OSError, ValueError) as exc:
+            # S19-28 (BACKLOG #5391 item 1): a refused [api].tls_client_ca_file anchor, or API TLS
+            # material OpenSSL cannot load (ssl.SSLError is an OSError), is a clean exit 2 with the
+            # reason, not the uncaught CRITICAL floor's exit 1. Scrubbed: the text can quote a
+            # configured path.
+            what = "refused" if isinstance(exc, TrustAnchorError) else "could not be loaded"
+            print(
+                f"error: the API TLS context {what}: {scrub_control_chars(str(exc))}; refusing "
+                "to start. Fix [api].tls_cert_file / tls_key_file / tls_client_ca_file / "
+                "tls_client_crl_file.",
+                file=sys.stderr,
+            )
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
@@ -5527,6 +5581,8 @@ def _supervise(args: argparse.Namespace) -> int:
         enforcing=enforcing,
         audit=posture_audit,
     ):
+        # BACKLOG #5391: the opt-out's AUDIT line still reaches the stdout handler.
+        _write_start_audit(posture_audit)
         return 2
     forwarder_installed = False
 

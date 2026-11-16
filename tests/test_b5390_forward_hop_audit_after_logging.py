@@ -18,6 +18,7 @@ import pytest
 from messagefoundry import __main__ as cli
 from messagefoundry.config.settings import ServiceSettings, load_settings
 from messagefoundry.logging_setup import SyslogForward
+from tests._log_absence import assert_capture_sees
 
 _HOST = "10.0.0.9"
 
@@ -53,7 +54,7 @@ class _Recorder(logging.Handler):
 
 
 def _start(
-    settings: ServiceSettings, tmp_path: Path, *, live: bool = True
+    settings: ServiceSettings, tmp_path: Path, *, live: bool = True, level: int = logging.NOTSET
 ) -> tuple[int | None, list[tuple[str, bool]]]:
     configured: list[SyslogForward | None] = []
 
@@ -64,11 +65,13 @@ def _start(
     recorder = _Recorder(configured)
     logger = logging.getLogger("messagefoundry.__main__")
     logger.addHandler(recorder)
+    previous = logger.level
     try:
         # The positive control for every absence check below: the recorder sees this logger.
         logger.warning("recorder probe")
         assert recorder.seen == [("recorder probe", False)]
         recorder.seen.clear()
+        logger.setLevel(level)
         rc = cli._start_logging(
             settings,
             env_name="staging",
@@ -78,6 +81,7 @@ def _start(
             deferred_ca_refusals=[],
         )
     finally:
+        logger.setLevel(previous)
         logger.removeHandler(recorder)
     return rc, recorder.seen
 
@@ -96,9 +100,12 @@ def test_hop_audit_is_logged_once_after_configure(
     rc, seen = _start(_listed(), tmp_path)
     assert rc is None
     assert _hop_audit(seen) == [True]
+    # The record states the posture the start accepted, not that a record crossed.
+    assert "would cross the network unprotected" in next(m for m, _ in seen if "AUDIT:" in m)
     err = capsys.readouterr().err
     assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
-    assert f"AUDIT: off-box log/audit forwarding to {_HOST}:" in err
+    # The handlers took it, so it is not written to stderr a second time.
+    assert "AUDIT:" not in err
 
 
 def test_hop_audit_is_logged_when_the_collector_was_skipped(
@@ -109,7 +116,31 @@ def test_hop_audit_is_logged_when_the_collector_was_skipped(
     rc, seen = _start(_listed(), tmp_path, live=False)
     assert rc is None
     assert _hop_audit(seen) == [True]
-    assert "AUDIT: off-box" in capsys.readouterr().err
+    assert "AUDIT:" not in capsys.readouterr().err
+
+
+def test_hop_audit_reaches_stderr_through_the_filter_chain_when_warning_is_filtered(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # [logging].level = ERROR leaves the logger disabled for WARNING, so the record goes to stderr
+    # once, formatted and filtered like any MessageFoundry stderr sink, rather than to no handler.
+    import messagefoundry.logging_setup as logging_setup
+
+    chained: list[logging.Handler] = []
+    real = logging_setup.build_stderr_handler
+
+    def build() -> logging.Handler:
+        handler = real()
+        chained.append(handler)
+        return handler
+
+    monkeypatch.setattr(cli, "build_stderr_handler", build)
+    rc, seen = _start(_listed(), tmp_path, level=logging.ERROR)
+    assert rc is None
+    assert seen == []
+    assert len(chained) == 1 and chained[0].filters
+    lines = [line for line in capsys.readouterr().err.splitlines() if "AUDIT: off-box" in line]
+    assert len(lines) == 1 and "WARNING" in lines[0]
 
 
 def test_a_later_refusal_logs_no_hop_audit(
@@ -124,3 +155,34 @@ def test_a_later_refusal_logs_no_hop_audit(
     assert "allowed_syslog" in err
     assert "AUDIT:" not in err
     assert _hop_audit(seen) == []
+
+
+def test_a_start_logging_refusal_logs_the_pending_audit_but_not_the_hop(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # supervise's path (no deferred CA refusals): a refused start writes the caller's AUDIT lines
+    # to the handlers the process has, as the decision-time log call did, and leaves out the
+    # warn-mode hop's, since no record took that hop. The collector is unlisted, so the egress
+    # gate refuses after the hop has warned.
+    settings = _settings()
+    configured: list[object] = []
+
+    def configure(forward: object) -> bool:
+        configured.append(forward)
+        return True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
+        assert_capture_sees(caplog, "messagefoundry.__main__")
+        rc = cli._start_logging(
+            settings,
+            env_name="staging",
+            enforcing=False,
+            spool_dir=str(tmp_path / "spool"),
+            configure=configure,
+            pending_audit=["AUDIT: the posture line"],
+        )
+    assert rc == 2
+    assert configured == []
+    assert [r.getMessage() for r in caplog.records if "AUDIT" in r.getMessage()] == [
+        "AUDIT: the posture line"
+    ]
