@@ -39,9 +39,9 @@
 #>
 [CmdletBinding()]
 param(
-    # The name install-service.ps1 accepts, and no other (BACKLOG #5402). It feeds Get-Service and
-    # Stop-Service -Force, which expand wildcards in -Name, and the service's registry path, so an
-    # unvalidated "*" would force-stop every service on the host. The pattern is a literal copy,
+    # The name install-service.ps1 accepts, and no other (BACKLOG #5402). It feeds Get-Service,
+    # which expands wildcards in -Name, and the service's registry path, so the pattern refuses a
+    # wildcard character such as "*" before either is read. The pattern is a literal copy,
     # pinned to messagefoundry/service_status.py by tests/test_net_helper_install_scripts.py.
     # THE PATTERN IS NOT THE WHOLE GUARD. It allows a space, so a DISPLAY name such as
     # 'Windows Time' passes it, and -Name matches a display name too. The exact-name filter below,

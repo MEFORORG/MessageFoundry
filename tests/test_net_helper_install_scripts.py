@@ -320,8 +320,8 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
             "Options = 'None', and a case-insensitive [A-Za-z] matches U+212A (BACKLOG #1680)."
         )
         assert row["wildcard"] is False and row["bracket"] is False, (
-            f"{key} accepts a PowerShell wildcard. Get-Service and Stop-Service -Force expand one in "
-            "-Name, so uninstall-service.ps1 would force-stop every service it matches (BACKLOG #5402)."
+            f"{key} accepts a PowerShell wildcard. Get-Service expands one in -Name, so the "
+            "exact-name filter would be the only guard left against another service (BACKLOG #5402)."
         )
 
 

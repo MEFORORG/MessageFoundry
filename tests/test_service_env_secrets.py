@@ -424,6 +424,33 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
 
 
+def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
+    """``main`` stripped the name, so a blank first line moved the first name down. The secrets
+    directory below one is set, and the refusal must not tell the operator to add it."""
+    posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+
+
+@pytest.mark.parametrize("key", KEY_CLASS_NAMES)
+def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str) -> None:
+    """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line, so an empty later
+    ``KEY=`` above it stays empty and nothing refuses, as on ``main``."""
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
+    assert posture.listed_keys == ()
+    assert service_env_refusal(posture) is None
+
+
+def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses() -> None:
+    """The control: the widened ordinary name does not hide a real secret-class line below it."""
+    key = KEY_CLASS_NAMES[0]
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\nProgramFiles(x86)=C:\\x\n{key}={_KEY_VALUE}"])
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
+
+
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_empty_store_key_above_another_variable_still_refuses(key: str) -> None:
     """Vault BACKLOG #5394: an empty ``KEY=`` line, then another variable's line. The key is

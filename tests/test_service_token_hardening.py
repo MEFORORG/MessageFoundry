@@ -115,7 +115,11 @@ _TOKEN_STUBS = r"""
   $scSetsExit = $true
   $scCalls = [Collections.Generic.List[string]]::new()
   $disabled = [Collections.Generic.List[string]]::new()
-  function Set-Service { param($Name, $StartupType, $ErrorAction) $disabled.Add("$Name=$StartupType") }
+  function Get-Service { param($Name, $ErrorAction) [pscustomobject]@{ Name = $Name } }
+  function Set-Service {
+    param($Name, $InputObject, $StartupType, $ErrorAction)
+    $disabled.Add("$($InputObject.Name)=$StartupType")
+  }
   function Get-ItemProperty {
     param($LiteralPath, $ErrorAction)
     $name = Split-Path -Leaf $LiteralPath

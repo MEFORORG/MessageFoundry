@@ -298,13 +298,14 @@ class _WindowsProbe:
 #: ``REG_SZ`` at its first one and splits a ``REG_MULTI_SZ`` on them, so none reaches here.
 _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 
-#: A later line that sets an ordinary variable: an environment name, an equals sign, then a value
-#: holding something other than equals signs and blanks. Such a line ends the variable above it.
-#: A line of base64 does not match, since its only equals signs are the padding at its end, and
-#: neither does a line of PEM armour, which starts with a dash. So ``OTHER=`` with an empty value
-#: does not match either, and is read as part of the value above it: a store key left empty above
-#: it then reads as set, an error toward refusing.
-_ORDINARY_LINE = re.compile(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*=(?!=*\s*\Z)")
+#: A later line that sets an ordinary variable: a name Windows allows in an environment block,
+#: which is any non-blank text without an equals sign (``ProgramFiles(x86)`` among them), then an
+#: equals sign, then a value holding something other than equals signs and blanks. Such a line
+#: ends the variable above it. A line of base64 does not match, since its only equals signs are
+#: the padding at its end, and neither does a line of PEM armour, which holds no equals sign. So
+#: ``OTHER=`` with an empty value does not match either, and is read as part of the value above
+#: it: a store key left empty above it then reads as set, an error toward refusing.
+_ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?!=*\s*\Z)")
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
 _REFUSED_CLASS_NAMES = frozenset((*KEY_CLASS_NAMES, *DIRECTORY_CLASS_NAMES))
@@ -339,9 +340,11 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     """The variables each registry string sets, read a line at a time (vault BACKLOG #5394).
 
     The reader cannot tell whether NSSM takes a line or the whole string as a variable, so it
-    keeps what either reading would refuse. Each string's first line is a variable when it holds
-    an equals sign. A later line is one when it sets a name the refusal is about, so a store key
-    on a later line still refuses. A later line that sets an ordinary variable
+    keeps what either reading would refuse. Each string's first non-blank line is a variable when
+    it holds an equals sign: blank lines above it are skipped, as ``main``'s strip of the name
+    skipped them, so a secrets directory set below a blank first line is still read as set. A
+    later line is one when it sets a name the refusal is about, so a store key on a later line
+    still refuses. A later line that sets an ordinary variable
     (:data:`_ORDINARY_LINE`) ends the value above it under the line reading, and is not kept:
     under the whole-string reading it sets nothing, so the secrets directory's name is never taken
     as set by a later line. Any other line, such as one of key material, belongs to the value
@@ -357,14 +360,17 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     describe the same variable and it is counted once."""
     read: list[_Variable] = []
     for where, entry in entries:
-        first, *rest_lines = _LINE_BREAK.split(entry)
+        lines = _LINE_BREAK.split(entry)
+        # ``skip`` keeps the later lines' numbers counted from the string's real first line.
+        skip = next((i for i, line in enumerate(lines) if line.strip()), len(lines) - 1)
+        first, *rest_lines = lines[skip:]
         first_written, first_equals, first_rest = first.partition("=")
         first_written = first_written.strip()
         first_parts = [first_rest]
         # A later line kept as a variable: its line number, name as written and value parts.
         later: list[tuple[int, str, list[str]]] = []
         parts = first_parts  # the value the current line belongs to
-        for number, line in enumerate(rest_lines, 2):
+        for number, line in enumerate(rest_lines, skip + 2):
             written, equals, rest = line.partition("=")
             if not equals:
                 parts.append(line)
