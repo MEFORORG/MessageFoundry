@@ -7855,11 +7855,12 @@ class PostgresStore:
         ``_EPOCH_GUARD_CLAIM``, so it matches nothing once the successor's acquire has bumped
         ``leader_lease.leader_epoch``. ADR 0157 C1 says never to guard a write that returns a claimed
         row to PENDING, and this guard departs from its letter; that departure awaits an owner ruling
-        and is not settled by this docstring. The reading it rests on: C1's reason is that a fenced
-        re-pend strands the row, and here it does not, since the successor runs this same recovery
-        on its own promotion and the lease-gated ``reclaim_expired_leases`` sweep re-pends whatever
-        a declined write leaves, so a declined recovery costs latency. A declined write returns 0,
-        as an empty recovery does. The guard is read in this statement's snapshot, so a
+        and is not settled by this docstring. C1 prices a fenced re-pend as a recovery delay on
+        Postgres and a strand on SQL Server, and forbids it on both. The reading this guard rests
+        on is narrower: C1's re-pend is the writer's own claimed row, which only that writer would
+        hand back, whereas here the successor runs this same recovery on its own promotion and the
+        lease-gated ``reclaim_expired_leases`` sweep re-pends whatever a declined write leaves. A
+        declined write returns 0, as an empty recovery does, and logs nothing. The guard is read in this statement's snapshot, so a
         write already executing when the successor's acquire commits is not fenced; it closes the
         stall before the write, which is the window the row names."""
         now = time.time() if now is None else now
