@@ -19,10 +19,8 @@ starts no server. Contents (each a small text/JSON member):
 HARD RULE (do not break): no raw message bodies, and no secret this module puts in itself. The config
 summary emits counts/names only; the status snapshot is the metadata-only status models; the log tail is
 run through the redaction pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
-**That rule is a goal for the code, not a claim about the archive.** The log tail's redaction is
-best-effort: a single-token identifier, an operator username included, can survive it, so a bundle is
-NOT secret-free or PHI-free as a whole. The manifest's ``phi_contract`` says so in words rather than
-opening with "no secrets" (BACKLOG #5385), as the CLI help does (BACKLOG #1475), and ``docs/PHI.md``
+**That rule is a goal for the code, not a claim about the archive.** What the archive does and does
+not hold is stated once, in the manifest's ``phi_contract`` (BACKLOG #5385), and ``docs/PHI.md``
 stream 14 is the record.
 
 That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
@@ -278,15 +276,14 @@ def build_bundle(
         "members": sorted(members),
         # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
         # is machine-readable and a reviewer may rely on it, so it claims no more than every member
-        # meets: the app-log tail's redaction is best-effort, so the bundle as a whole is NOT
-        # secret-free or PHI-free, and the string says so rather than opening with "no secrets"
-        # (BACKLOG #5385; the CLI help made the same repair under BACKLOG #1475).
+        # meets, and it is the one place the log tail's residual is stated (BACKLOG #5385; the CLI
+        # help made the same repair under BACKLOG #1475).
         "phi_contract": (
             "no raw message bodies by design; config summary is counts/names only and holds no "
             "secret; status is the metadata-only status models; the app-log tail is a BEST-EFFORT "
-            "redacted copy of the app log, so a single-token identifier, an operator username "
-            "included, can survive it, and the bundle is to be handled as a copy of the app log, not "
-            "as secret-free or PHI-free; a section that failed reports a fixed MF-BUNDLE-* code plus "
+            "redacted copy of the app log, and values survive it, at least a single-token identifier "
+            "such as an operator username, so the bundle is to be handled as a copy of the app log, "
+            "not as secret-free or PHI-free; a section that failed reports a fixed MF-BUNDLE-* code plus "
             "the exception type, never the exception message"
         ),
     }

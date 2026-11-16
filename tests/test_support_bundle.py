@@ -71,6 +71,7 @@ def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: P
     assert "no secrets" not in contract.lower()
     assert "best-effort" in contract.lower()
     assert "username" in contract
+    assert "at least" in contract  # a residual is a floor, not an enumeration (SDS-3.6)
     assert "not as secret-free or phi-free" in contract.lower()
 
 

@@ -121,7 +121,7 @@ def test_control_safe_exc_alone_keeps_the_credential() -> None:
 def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> None:
     """The detail keeps ``safe_text``'s bound, and a credential sitting just inside it is hidden. No
     order control: ``safe_text`` cuts at whole tokens, so neither order was measured to print a
-    value at the cut; the credential pass runs first for the label reason in the next test."""
+    value at the cut."""
     exc = RuntimeError(" ".join(["word"] * 37) + f" PWD={_PLANTED}" + " tail" * 80)
     detail = safe_exc_detail(exc)
     assert _PLANTED not in detail, detail
@@ -132,14 +132,95 @@ def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> No
 @pytest.mark.parametrize(
     "label", ["Login Password", "Access Token", "Client Secret", "Bind Password"]
 )
-def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str) -> None:
-    """The PHI name pass reads ``Login Password`` as a name. Run first, it took the label away from
-    the credential pass and the value printed; the credential pass runs first now."""
-    from messagefoundry.redaction import safe_exc
+@pytest.mark.parametrize("sep", ["=", ": ", "='", " = "])
+def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str, sep: str) -> None:
+    """The PHI name pass reads ``Login Password`` as a name and takes it. Run before any credential
+    pass that needs the label, the value printed; the value is masked before the PHI pass now. The
+    second control is the PHI-first order with no pre-mask, the order the review of BACKLOG #5395
+    asked for, which prints the value on this text."""
+    from messagefoundry.redaction import _REDACTED, redact, safe_exc
+    from messagefoundry.secretscrub import scrub_credentials
 
-    exc = RuntimeError(f"{label}={_PLANTED}")
+    close = "'" if sep.endswith("'") else ""
+    text = f"{label}{sep}{_PLANTED}{close} more"
+    exc = RuntimeError(text)
     assert _PLANTED in safe_exc(exc)  # control: the PHI pass alone keeps it
+    if sep == "=":
+        bare = _REDACTED.join(scrub_credentials(x) for x in redact(text).split(_REDACTED))
+        assert _PLANTED in bare, bare  # control: PHI first with no pre-mask keeps it
     assert _PLANTED not in safe_exc_detail(exc)
+
+
+_MRN = "MRN7712345"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"token=tk-1,mrn: {_MRN}",
+        f"session=s-1,mrn: {_MRN}",
+        f"Access Token=tk-1,mrn: {_MRN}",
+        f"password=pw-1,mrn: {_MRN} rest",
+    ],
+)
+def test_a_credential_value_does_not_swallow_a_phi_label(text: str) -> None:
+    """The review of BACKLOG #5395 measured ``token=tk-1,mrn: MRN7712345`` print its MRN: the shared
+    credential vocabulary, run first, read ``tk-1,mrn:`` as the token's value, and the PHI pass then
+    found no ``mrn:`` label. The PHI pass runs before that vocabulary now. Controls: the PHI pass
+    alone hides the MRN, so the label is what it reads; the credential-first order prints it on at
+    least the first text."""
+    from messagefoundry.redaction import safe_text
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify.model import safe_detail_text
+
+    assert _MRN not in safe_text(text)
+    if text.startswith("token="):
+        assert _MRN in safe_text(scrub_credentials(text))
+    detail = safe_detail_text(text)
+    assert _MRN not in detail, detail
+    assert "tk-1" not in detail and "s-1" not in detail and "pw-1" not in detail, detail
+
+
+@pytest.mark.parametrize(
+    "text",
+    [f"Authorization: Bearer {_PLANTED} q", f"Access Token: Bearer {_PLANTED} q"],
+)
+def test_a_scheme_word_after_a_token_label_does_not_shield_the_token(text: str) -> None:
+    """The pre-mask takes an auth-scheme word with the value. Without that it masked the word
+    ``Bearer`` and the token after it printed (simplify pass on BACKLOG #5395)."""
+    from messagefoundry.verify.model import safe_detail_text
+
+    assert _PLANTED not in safe_detail_text(text)
+
+
+def test_the_credential_pass_reads_only_the_work_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The input is cut to ``clamp_untrusted``'s window before the credential vocabulary reads it,
+    so a peer sizing the text buys no unbounded scan. Control: the input is past the window."""
+    import messagefoundry.secretscrub as secretscrub
+    from messagefoundry.redaction import _REDACT_WINDOW
+    from messagefoundry.verify.model import safe_detail_text
+
+    seen: list[int] = []
+    real = secretscrub.scrub_credentials
+
+    def spy(text: str, **kwargs: str) -> str:
+        seen.append(len(text))
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(secretscrub, "scrub_credentials", spy)
+    text = f"PWD={_PLANTED} " + "word " * (_REDACT_WINDOW // 2)
+    assert len(text) > _REDACT_WINDOW
+    detail = safe_detail_text(text)
+    assert seen and max(seen) <= _REDACT_WINDOW, seen
+    assert _PLANTED not in detail, detail
+
+
+def test_a_unicode_error_detail_takes_the_limit() -> None:
+    """``limit`` bounds the ``UnicodeError`` branch too. Control: the same error is longer than the
+    limit without it."""
+    exc = UnicodeDecodeError("utf-8", bytes([0xFF]) * 10, 0, 1, "invalid start byte " * 30)
+    assert len(safe_exc_detail(exc)) > 60
+    assert len(safe_exc_detail(exc, limit=40)) < 60
 
 
 @pytest.mark.parametrize(
