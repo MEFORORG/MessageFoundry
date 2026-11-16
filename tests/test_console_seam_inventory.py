@@ -289,7 +289,9 @@ _OPERAND_LOADS = _SINGLE_LOADS | {"LOAD_CONST", "LOAD_SMALL_INT"}
 def _after(ins: list[dis.Instruction], j: int) -> str:
     """The opcode that consumes the chain ending before ``ins[j]``. ``core.x is other`` loads
     ``other`` between the chain and ``IS_OP``, so a lone operand load followed by ``IS_OP`` reads
-    as ``IS_OP`` too, and the comparison is excluded in either operand order."""
+    as ``IS_OP`` too, and that comparison is excluded in either operand order. At least
+    ``core.x is a.b``, ``core.x is f()`` and the branch form ``if core.x is None`` are still read
+    as reaches: the safe direction, since a false reach asks for a carrier rather than hiding one."""
     if j >= len(ins):
         return ""
     if ins[j].opname in _OPERAND_LOADS and j + 1 < len(ins) and ins[j + 1].opname == "IS_OP":
@@ -406,7 +408,8 @@ class Field(NamedTuple):
     """One seam field's class. ``carrier`` is what carries the console's use once it sub-requests:
     JSON operations, or for a ``helper`` an ``ADD``, ``MOVE``, ``DROP`` or ``KEEP`` line. ``also``,
     for a ``core``, names each other JSON route that runs it without carrying the console's use (a
-    sign-in leg that resolves the caller, say), so every route reaching it is named and reviewed."""
+    sign-in leg that resolves the caller, say), so every route whose endpoint reaches it in this
+    app's configuration is named. A route reaching it only through a dependency is not seen."""
 
     kind: FieldKind
     carrier: tuple[str, ...]
@@ -1127,12 +1130,18 @@ def _is_op(text: str) -> bool:
 
 
 def _segment_matches(template: str, segment: str) -> bool:
-    return (template.startswith("{") and template.endswith("}")) or template == segment
+    if template.startswith("{") and template.endswith("}"):
+        return bool(segment)
+    return template == segment
 
 
 def _served(op: str, json: Mapping[str, Any]) -> bool:
     """Whether the app serves ``op``: by name, or through a templated path that matches it, so a
-    ``GET /auth/check/{permission}`` route serves the ``ADD GET /auth/check/users:manage`` line."""
+    ``GET /auth/check/{permission}`` route serves the ``ADD GET /auth/check/users:manage`` line,
+    and that line then stands without ``ADD``. One segment per parameter: a ``{p:path}`` converter
+    is not read. A templated sibling such as ``GET /connections/{name}`` would also match an
+    ``ADD GET /connections/quiesced`` line; that shadowing is worth the reclassification it asks
+    for, since the sibling could serve that request, depending on registration order."""
     if op in json:
         return True
     method, _, path = op.partition(" ")
@@ -1164,7 +1173,9 @@ def _carrier_problems(where: str, carriers: tuple[str, ...], json: Mapping[str, 
                 )
         elif carrier.startswith(_PROSE_CARRIERS):
             continue
-        elif carrier not in json:
+        elif carrier not in json and not (
+            carrier.startswith(f"{_CHECK}/") and _served(carrier, json)
+        ):
             problems.append(f"{where}: carrier {carrier!r} is not a JSON operation of the app")
     return problems
 
@@ -1222,9 +1233,14 @@ def _field_problems(
                     )
             if not reaching:
                 problems.append(f"{name}: classed core, but names no JSON route")
-            # Every JSON route that runs it is named, so a narrowed list cannot leave out a
-            # stronger carrier the field shares.
-            problems += _carrier_problems(f"{name} also", entry.also, json)
+            # Every JSON route whose endpoint runs it is named, as a carrier or in also, so none
+            # goes unreviewed. Which list a route belongs in is the reviewer's call: no gate
+            # strength is compared here.
+            for op in entry.also:
+                if op not in json:
+                    problems.append(f"{name}: also names {op!r}, which is no JSON operation")
+                elif op in entry.carrier:
+                    problems.append(f"{name}: names {op} as a carrier and in also")
             for op in sorted(set(json) - set(entry.carrier) - set(entry.also)):
                 if id(obj) in _engine_reach(json[op].endpoint):
                     problems.append(f"{name}: classed core, but {op} also reaches it unnamed")
@@ -1642,7 +1658,13 @@ def _named_reads() -> set[str]:
         for m in _source_attributes(_AUTH_RECEIVERS)
         if m in _AUTH_SERVICE and _AUTH_SERVICE[m].kind == "read"
     }
-    store = {f"service.store.{n}" for n in _source_attributes(_AUTH_RECEIVERS, through="store")}
+    # Only classified store reads: the reach records no other, and an unclassified one already
+    # fails test_every_store_and_engine_object_read_is_classified with the right message.
+    store = {
+        f"service.store.{n}"
+        for n in _source_attributes(_AUTH_RECEIVERS, through="store")
+        if n in _STORE_READS
+    }
     engine = {f"{r}.{a}" for r in _ENGINE_RECEIVERS for a in _source_attributes(frozenset({r}))}
     return members | store | engine
 
@@ -1707,6 +1729,9 @@ def test_a_wrong_seam_field_class_is_reported(live: _Live) -> None:
         "admin.current_user": _core("GET /auth/me"),
         "admin.my_mfa": Field("core", ("GET /me/mfa",), also=("GET /status",)),
         "admin.list_roles": Field("endpoint", ("GET /roles",), also=("GET /status",)),
+        "admin.disable_my_mfa": Field(
+            "core", ("DELETE /me/mfa",), also=("KEEP: reviewed", "DELETE /me/mfa")
+        ),
     }
     problems = "\n".join(_field_problems(fields, json, planted))
     assert "core.get_message: classed core, but it is the endpoint" in problems
@@ -1721,6 +1746,10 @@ def test_a_wrong_seam_field_class_is_reported(live: _Live) -> None:
     )
     assert "admin.my_mfa: names GET /status in also, whose endpoint does not reach it" in problems
     assert "admin.list_roles: only a core names also" in problems
+    assert "admin.disable_my_mfa: also names 'KEEP: reviewed', which is no JSON operation" in (
+        problems
+    )
+    assert "admin.disable_my_mfa: names DELETE /me/mfa as a carrier and in also" in problems
 
 
 def test_a_removed_or_added_ui_route_is_reported(facts: _UiFacts) -> None:
@@ -1808,6 +1837,12 @@ def test_an_added_route_a_templated_route_now_serves_is_reported() -> None:
     assert problems == [
         "planted: GET /auth/check/users:manage now exists, so reclassify the entry that adds it "
         "('ADD GET /auth/check/users:manage')"
+    ]
+    # Reclassified without ADD, the check line stands; an empty segment matches no parameter.
+    assert _carrier_problems("planted", ("GET /auth/check/users:manage",), json) == []
+    assert not _served("GET /auth/check/", json)
+    assert _carrier_problems("planted", ("GET /users/someone",), json) == [
+        "planted: carrier 'GET /users/someone' is not a JSON operation of the app"
     ]
 
 
