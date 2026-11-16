@@ -207,7 +207,6 @@ def smoke_self(
         dry_run,
     )
     from messagefoundry.redaction import codec_safe_str
-    from messagefoundry.secretscrub import scrub_credentials
 
     try:
         if graph is None:
@@ -219,14 +218,16 @@ def smoke_self(
             # allow_empty comes to suppress.
             reg.validate()
     except WiringError as exc:
-        # The engine's own wiring diagnostic, which names what to fix, so it keeps its full length, its
-        # wording and no type prefix: credentials only, the scrub wiring's own diagnostics take, and
-        # no name pass to blank a handler name (BACKLOG #5395).
+        # The engine's own wiring diagnostic, which names what to fix, so it keeps its wording and no
+        # type prefix, and takes the driver arms' longer bound rather than 200. It takes the same
+        # bounded, square-bracket path as every other arm (BACKLOG #5395): the bare credential scrub
+        # it took before wrote an unbounded detail with ``<redacted>``, which an HTML sink drops.
         return CheckResult(
             rid,
             title,
             Status.FAIL,
-            f"config failed to load: {scrub_credentials(codec_safe_str(exc))}",
+            "config failed to load: "
+            f"{safe_detail_text(codec_safe_str(exc), limit=DRIVER_DETAIL_LIMIT)}",
         )
     except (OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # What the hop census reads as an unknown load, so the shared load's failure ends this row

@@ -1315,8 +1315,10 @@ _KEY_MATERIAL = re.compile(
 # print where the old pattern, matching nothing, left the query label to the member pass. The
 # lookbehind ``(?<=//:)`` is what tells the two cases apart. Residuals, at least these: a password
 # whose own "@" is followed by one of those characters before the host's "@" is cut at that "@" and
-# its tail prints, as the whole tail did before; and an empty user's password holding one of the
-# empty-user stops is not read at all, as before #5386.
+# its tail prints, as the whole tail did before; and an empty user's password holding one of
+# ``? # & ; ,`` is not read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "="
+# is not one of those: the run after the first segment may hold it, so ``redis://:p=ss@host`` is
+# read and hidden.
 #
 # THE FIRST SEGMENT IS POSSESSIVE (``++``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives

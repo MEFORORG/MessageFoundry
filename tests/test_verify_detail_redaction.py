@@ -21,7 +21,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.store import base as store_base
 from messagefoundry.verify import checks, runner, smoke
-from messagefoundry.verify.model import CheckResult, safe_exc_detail
+from messagefoundry.verify.model import DRIVER_DETAIL_LIMIT, CheckResult, safe_exc_detail
 from messagefoundry.verify.report import render_json, render_markdown
 
 _PLANTED = "pw-V3rify_Det-81"
@@ -53,14 +53,18 @@ def test_config_load_failure_detail_hides_the_credential(
 
 
 def test_a_wiring_error_keeps_its_text_whole_around_the_redaction(tmp_path: Path) -> None:
-    """The engine's own wiring diagnostic is the fix an operator reads, so it is not cut at all,
-    and gets no type prefix."""
+    """The engine's own wiring diagnostic is the fix an operator reads, so it takes the driver arms'
+    longer bound rather than 200, and gets no type prefix."""
     tail = "handler 'h' sends to unknown outbound 'ob_missing'"
     long_text = f"{_LEAKY}; " + "x" * 300 + f"; {tail}"
     r = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError(long_text)))
     assert _PLANTED not in r.detail
     assert r.detail.endswith(tail), r.detail
     assert "WiringError" not in r.detail
+    # The same bounded, square-bracket path as the other arms: no ``<redacted>``, and a bound.
+    assert "[redacted]" in r.detail and "<redacted>" not in r.detail, r.detail
+    huge = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError("y " * 5000)))
+    assert len(huge.detail) < DRIVER_DETAIL_LIMIT + 100, len(huge.detail)
 
 
 @pytest.mark.parametrize(
@@ -272,6 +276,43 @@ def test_a_word_either_order_hides_stays_hidden(text: str, hidden: tuple[str, ..
     detail = safe_detail_text(text)
     for word in hidden:
         assert word not in detail, detail
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "login failed for svcadmin Login Password: svcadmin",
+        "user svcadmin Login Password: svcadmin",
+        # The label first: here the FIRST occurrence is the password, so keeping the first of as
+        # many as the other order prints would print it (code review of the Counter draft).
+        "Login Password: svcadmin for user svcadmin",
+    ],
+)
+def test_a_password_equal_to_another_printed_word_is_hidden_at_every_occurrence(text: str) -> None:
+    """Code review round 3 of BACKLOG #5395: against a SET of the other order's words, a password
+    equal to a word printed elsewhere on the line survived, so both copies printed. A fragment the
+    primary order prints more often than the other order is now hidden everywhere. Control: the
+    set the code used before prints the word twice."""
+    import re
+
+    from messagefoundry.redaction import redact
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify import model
+
+    def count(out: str) -> int:
+        return len(re.findall(r"\bsvcadmin\b", out))
+
+    ph = model._PLACEHOLDER
+    phi_first = scrub_credentials(redact(text), placeholder=ph)
+    credentials_first = redact(scrub_credentials(text, placeholder=ph))
+    printed = {p for w in credentials_first.split() for p in model._fragments(w)}
+    as_a_set = re.sub(
+        r"\S+",
+        lambda m: m[0] if all(p in printed for p in model._fragments(m[0])) else ph,
+        phi_first,
+    )
+    assert count(as_a_set) == 2, as_a_set
+    assert count(model.safe_detail_text(text)) == 0, model.safe_detail_text(text)
 
 
 def test_the_placeholder_is_not_an_html_tag() -> None:

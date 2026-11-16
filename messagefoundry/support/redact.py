@@ -56,6 +56,7 @@ from messagefoundry.secretscrub import (
     _mask_member,
     scrub_credentials,
 )
+from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
     "redact_log_line",
@@ -521,12 +522,20 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# Why the user may be empty and the password may hold an "@", and why the user still may not hold one
-# (BACKLOG #5386), is stated on the same pattern in ``messagefoundry/secretscrub.py``.
-_DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)[^\s/@?#&=;,]++|(?<!//:)[^\s/@]++)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
-)
+# THIS COPY STAYS NARROW: a user, and a password that stops at its first "@". The widened reading,
+# an empty user and a password holding an "@" (BACKLOG #5386), is secretscrub's ``_DSN_PASSWORD``,
+# and :func:`redact_log_line` runs it LAST of the credential passes, over the whole line. Run here,
+# first, a review measured its run after the password reach past a glued ``\ndbPassword=`` label
+# and print that value's tail on every glue it tried. After the shared vocabulary a label it reads
+# holds a placeholder, and the widened run after the password, which stops at "[" and "]", cannot
+# cross it. A label NEITHER vocabulary reads is the residual, at least an escaped line break glued
+# to a lowercase label (``5432\npassword=Tail@Sec``, read as ``npassword``): the widened run reaches
+# that value's "@" and its tail prints, where the narrow pass alone printed the whole value.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+
+#: The widened reading: secretscrub's own object, not a third copy. Assigned, not only imported,
+#: so strict mypy lets a test name it on this module; a test disables it here by that name.
+_WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
@@ -644,6 +653,11 @@ def redact_log_line(line: str) -> str:
     # this line read the same separators; secretscrub's comment on the pattern says why that matters.
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
+    # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
+    # a password holding an "@" that the narrow copy above cut at its first one. Every labelled value
+    # is a placeholder by now, so its run cannot reach past one; the comment on _DSN_PASSWORD says why.
+    if "@" in body and "://" in body:
+        body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

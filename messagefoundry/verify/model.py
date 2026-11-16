@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
@@ -90,12 +91,22 @@ def _fragments(word: str) -> list[str]:
 
 
 def _printed_by_both(primary: str, other: str) -> str:
-    """``primary`` with each word replaced by the placeholder where it holds a fragment ``other``
-    does not. Linear: one split of each text and set lookups."""
-    printed = {piece for word in other.split() for piece in _fragments(word)}
+    """``primary`` with each word replaced by the placeholder where it holds a fragment ``primary``
+    prints more often than ``other`` does. Linear: one split of each text and counter lookups.
+
+    COUNTS, NOT A SET (BACKLOG #5395). Against a set, a password equal to another word the line
+    prints survived: in ``user svcadmin ... Login Password: svcadmin`` the credentials-first order
+    hid the second ``svcadmin`` and printed the first, so the word was "printed by both" and both
+    printed. Keeping only as many occurrences as ``other`` prints would not do either: which of them
+    is the password is a position, and the first occurrence is the password when the label comes
+    first (``Login Password: svcadmin for user svcadmin``). So a fragment ``primary`` prints more
+    often than ``other`` is hidden at EVERY occurrence. That errs toward hiding: the user name goes
+    with the password it equals."""
+    printed = Counter(piece for word in other.split() for piece in _fragments(word))
+    shown = Counter(piece for word in primary.split() for piece in _fragments(word))
     return re.sub(
         r"\S+",
-        lambda m: m[0] if all(p in printed for p in _fragments(m[0])) else _PLACEHOLDER,
+        lambda m: m[0] if all(shown[p] <= printed[p] for p in _fragments(m[0])) else _PLACEHOLDER,
         primary,
     )
 

@@ -371,7 +371,7 @@ FAMILIES: tuple[Family, ...] = (
         name="dsn_inline_password",
         line="store dsn postgres://svc:pw-D5n_Pass-55@db.invalid:5432/mefor",
         secret="pw-D5n_Pass-55",
-        patterns=("_DSN_PASSWORD",),
+        patterns=("_DSN_PASSWORD", "_WIDE_DSN_PASSWORD"),
     ),
     Family(
         # The exact shape resolve_env_settings emits on a cast failure. The producer is fixed too, but
@@ -1304,7 +1304,7 @@ def test_a_dsn_password_with_no_user_or_an_at_sign_is_hidden_whole(
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
-        ("support.redact pattern", _sub_dsn(redact_mod._DSN_PASSWORD, line)),
+        ("support.redact wide pattern", _sub_dsn(redact_mod._WIDE_DSN_PASSWORD, line)),
         ("secretscrub pattern", _sub_dsn(scrub_mod._DSN_PASSWORD, line)),
     ):
         for piece in pieces:
@@ -1415,6 +1415,63 @@ def test_the_widened_dsn_pattern_does_not_reach_past_a_separator(line: str, secr
         assert "E1" not in scrub_credentials(control) and "At-E2" not in scrub_credentials(control)
 
 
+#: Glue a log line can put between a DSN's port and a camelCase credential label after it. The
+#: escaped forms are the two characters a JSON or repr'd line carries, a backslash and a letter.
+_DSN_LABEL_GLUES = (":", "=", ".", "!", "*", "+", "$", "\\", "-", "_", "\\n", "\\t", "\\r", "~")
+_DSN_GLUE_LINES = tuple(
+    f"{head}{glue}dbPassword=Tail@Sec_B2"
+    for head in ("postgres://svc:pw-G1@db:5432", "postgres://:pw-G1@db:5432")
+    for glue in _DSN_LABEL_GLUES
+)
+_DSN_GLUE_PIECES = ("pw-G1", "Tail", "Sec_B2")
+
+
+def _printed_pieces(line: str) -> set[str]:
+    out = redact_log_line(line)
+    return {piece for piece in _DSN_GLUE_PIECES if piece in out}
+
+
+def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Code review of BACKLOG #5386 measured the bundle print ``Sec_B2`` on all 28 of these when its
+    first DSN pass was the widened one: that run reached past the glued label to the value's "@".
+    The widened reading now runs after the shared vocabulary, so the label is masked first.
+
+    Two controls. Main's shape -- the narrow pattern in both layers and no widened pass -- prints a
+    superset of what ships on every line, so the change prints nothing main hid. The round-1 shape --
+    the widened pattern as the bundle's first pass -- prints the tail, so this test can fail."""
+    shipped = {line: _printed_pieces(line) for line in _DSN_GLUE_LINES}
+    assert not any(shipped.values()), {k: v for k, v in shipped.items() if v}
+
+    narrow = redact_mod._DSN_PASSWORD
+    with monkeypatch.context() as m:
+        m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", NEVER_MATCHES)
+        m.setattr(scrub_mod, "_DSN_PASSWORD", narrow)
+        main_shape = {line: _printed_pieces(line) for line in _DSN_GLUE_LINES}
+    assert all(shipped[line] <= main_shape[line] for line in _DSN_GLUE_LINES)
+    assert any(main_shape.values()), (
+        "main's shape hid everything, so the empty-user rows test nothing"
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(redact_mod, "_DSN_PASSWORD", redact_mod._WIDE_DSN_PASSWORD)
+        round_one = [line for line in _DSN_GLUE_LINES if "Sec_B2" in _printed_pieces(line)]
+    assert round_one, (
+        "the widened first pass no longer prints the tail, so this test proves nothing"
+    )
+
+
+def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
+    """The empty-user residual secretscrub's ``_DSN_PASSWORD`` comment states, pinned both ways. A
+    password-only DSN whose value holds "=" is read; one holding ";" is not, and prints whole, so a
+    red on the second line means the comment is stale, not that a leak opened."""
+    for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
+        for out in (redact_log_line(line), scrub_credentials(line)):
+            assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out
+    assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
+
+
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
 #: to build the differential corpus. The empty entry is the control, and the claim has to be made about
 #: the PAIR rather than the head alone: a LETTER-headed scheme behind it is a shape every spelling of
@@ -1441,28 +1498,19 @@ def _sub_dsn(pattern: re.Pattern[str], line: str) -> str:
     return pattern.sub(lambda m: f"{m.group(1)}:<pw>@", line)
 
 
-def test_both_copies_of_the_dsn_pattern_are_the_same_source() -> None:
-    """The two surfaces carry this regex by hand, and a one-sided edit must red HERE.
+def test_the_bundle_runs_the_narrow_dsn_copy_then_the_shared_widened_one() -> None:
+    """The bundle's DSN readings, pinned so a one-sided edit reds HERE (BACKLOG #1547, #5386).
 
-    ``secretscrub`` scrubs at WRITE time and ``support/redact`` at READ time, and both keep their own
-    literal copy of ``_DSN_PASSWORD``. That duplication is deliberate -- the modules are neutral leaves
-    and neither imports the other's patterns -- but it has now been edited by hand twice under BACKLOG
-    #1547, and a narrowing shipped in BOTH copies both times.
-
-    NOTHING ELSE IN THIS FILE CATCHES A ONE-SIDED FIX DIRECTLY. The differential arm runs over both
-    modules, so it would red -- but only for corpus rows the earlier head happens to reach, and only
-    while that corpus keeps its shape. An equality on the source is one line, cannot go vacuous, and
-    names the real invariant: these are one pattern stored twice, not two patterns that happen to
-    agree."""
-    assert redact_mod._DSN_PASSWORD.pattern == scrub_mod._DSN_PASSWORD.pattern, (
-        "the read-time and write-time copies of _DSN_PASSWORD have diverged:\n"
-        f"  support/redact: {redact_mod._DSN_PASSWORD.pattern!r}\n"
-        f"  secretscrub   : {scrub_mod._DSN_PASSWORD.pattern!r}\n"
-        "A fix applied to one surface leaves the other leaking. Apply it to both, or state in both "
-        "files why they must differ and widen this guard."
-    )
-    assert redact_mod._DSN_PASSWORD.flags == scrub_mod._DSN_PASSWORD.flags, (
-        "the two copies compile with different flags, so the same source does not mean the same match."
+    Its first pass is the NARROW pattern, on purpose: widened and run first, its run after the
+    password reached a glued label's value and printed that value's tail. The widened reading runs
+    last in ``redact_log_line`` and is secretscrub's own object, not a copy, so the two cannot drift.
+    This is an interim shape, not the end state: BACKLOG #2694 retires the bundle's first layer, and
+    with it this narrow copy and the extra whole-line pass."""
+    assert redact_mod._WIDE_DSN_PASSWORD is scrub_mod._DSN_PASSWORD
+    narrow = r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
+    assert redact_mod._DSN_PASSWORD.pattern == narrow, (
+        "support/redact's first DSN pass was widened; the widened reading must run after the "
+        "shared vocabulary (BACKLOG #5386), not before it"
     )
 
 
