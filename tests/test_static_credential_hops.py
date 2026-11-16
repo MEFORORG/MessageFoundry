@@ -982,3 +982,110 @@ def test_a_ws_security_password_with_no_user_stamps_no_token() -> None:
     assert "WS-Security UsernameToken" in _http_static(
         ConnectorType.SOAP, {**base, "ws_username": "u"}, False
     )
+
+
+# --- a credential in the headers table or the url query (BACKLOG #5510) ---------------------------
+
+LITERAL_MODULE = """
+from messagefoundry import FHIR, FhirLookup, Rest, env, outbound
+from messagefoundry.transports.smart import with_smart_backend
+
+outbound("OB_HDR_KEY", Rest(url="https://a.example.invalid/x", headers={"X-Api-Key": "HDRSECRET"}))
+outbound("OB_HDR_VALUE", Rest(url="https://b.example.invalid/x",
+                              headers={"X-Opaque": "Bearer VALSECRET"}))
+outbound("OB_QUERY", FHIR(url="https://c.example.invalid/fhir?api_key=QSECRET"))
+outbound("OB_ENV_TABLE", Rest(url="https://d.example.invalid/x", headers=env("hdrs")))
+outbound("OB_ENV_URL", Rest(url=env("qurl")))
+outbound("OB_SMART_KEY", with_smart_backend(
+    Rest(url="https://e.example.invalid/x", headers={"X-Api-Key": "SMARTSECRET"}),
+    token_url="https://e.example.invalid/token", client_id="c", private_key=env("key")))
+FhirLookup("lk_query", url="https://f.example.invalid/fhir?access_token=LKSECRET")
+
+# --- QUIET twins ----------------------------------------------------------------------------------
+outbound("OB_HDR_PLAIN", Rest(url="https://g.example.invalid/x",
+                              headers={"Accept": "application/json", "X-Request-Id": "r1"}))
+outbound("OB_SMART_AUTHZ", with_smart_backend(
+    Rest(url="https://h.example.invalid/x", headers={"authorization": "Bearer DISPLACED"}),
+    token_url="https://h.example.invalid/token", client_id="c", private_key=env("key")))
+outbound("OB_DARK", Rest(url="https://i.example.invalid/x", headers={"X-Api-Key": "DARK"}),
+         deployed=False)
+"""
+
+#: Values the env() table and url resolve to on a running instance. Synthetic.
+LITERAL_VALUES: dict[str, object] = {
+    "hdrs": {"Private-Token": "ENVSECRET"},
+    "qurl": "https://j.example.invalid/x?token=URLSECRET",
+    "key": "not-a-real-key",
+}
+
+#: No secret, and no header or parameter name, may reach a detail: each label is fixed text.
+LITERAL_SECRETS = (
+    "HDRSECRET",
+    "VALSECRET",
+    "QSECRET",
+    "ENVSECRET",
+    "URLSECRET",
+    "SMARTSECRET",
+    "LKSECRET",
+    "X-Api-Key",
+    "Private-Token",
+    "api_key",
+    "access_token",
+)
+
+
+@pytest.fixture(scope="module")
+def literal_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
+    cfg = tmp_path_factory.mktemp("literal_hops") / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(LITERAL_MODULE, encoding="utf-8")
+    return load_config(cfg, allow_empty=True)
+
+
+def _by_name(
+    registry: Registry, env_values: dict[str, object] | None
+) -> dict[str, StaticCredentialHop]:
+    hops = static_credential_hops(registry=registry, settings=None, env_values=env_values)
+    return {h.name: h for h in hops}
+
+
+def test_a_header_or_query_credential_is_a_static_hop(literal_registry: Registry) -> None:
+    hops = _by_name(literal_registry, LITERAL_VALUES)
+    headers = "a credential in the headers table"
+    query = "a credential in the url query"
+    expected = {
+        "OB_HDR_KEY": headers,  # by the header's name
+        "OB_HDR_VALUE": headers,  # by the value's auth-scheme shape, under a neutral name
+        "OB_QUERY": query,
+        "OB_ENV_TABLE": headers,  # an env() table, read from the running values
+        "OB_ENV_URL": query,  # an env() url, the same
+        "OB_SMART_KEY": headers,  # a minted bearer does not displace a non-Authorization header
+        "fhir_lookup:lk_query": query,
+    }
+    for name, reason in expected.items():
+        assert hops[name].credential == "static", hops[name]
+        assert reason in hops[name].detail, hops[name]
+
+
+def test_the_header_and_query_quiet_twins_stay_quiet(literal_registry: Registry) -> None:
+    hops = _by_name(literal_registry, LITERAL_VALUES)
+    # Harmless headers leave the hop presenting nothing, so the reader does not list every table.
+    assert hops["OB_HDR_PLAIN"].credential == "none", hops["OB_HDR_PLAIN"]
+    # The connector writes the minted bearer over a static Authorization, so that one never leaves.
+    assert "OB_SMART_AUTHZ" not in hops
+    # A connection that is never built is not a hop.
+    assert "OB_DARK" not in hops
+
+
+def test_an_env_table_or_url_with_no_value_is_not_read(literal_registry: Registry) -> None:
+    # With no values the reference cannot be resolved, and query_credential_hops leaves it the same
+    # way; the serve-time guard passes the running values, so the gate reads it there.
+    hops = _by_name(literal_registry, None)
+    assert hops["OB_ENV_TABLE"].credential == "none", hops["OB_ENV_TABLE"]
+    assert hops["OB_ENV_URL"].credential == "none", hops["OB_ENV_URL"]
+
+
+def test_no_header_or_query_secret_reaches_a_detail(literal_registry: Registry) -> None:
+    for hop in _by_name(literal_registry, LITERAL_VALUES).values():
+        for secret in LITERAL_SECRETS:
+            assert secret not in hop.detail, hop
