@@ -77,6 +77,9 @@ import {
   type ProbePlanEntry,
 } from "./engineStatusModel";
 
+/** The config dir and service config a launch runs with, as {@link writerConfigTarget} judged them. */
+type LaunchTarget = NonNullable<ReturnType<typeof writerConfigTarget>>;
+
 /** How often (ms) to re-probe. Modest — this is a liveness hint, not a monitor (that's the Console). */
 const POLL_INTERVAL_MS = 15_000;
 
@@ -542,21 +545,23 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Start the local engine, guarding against a double-launch from a rapid second invocation (the
    *  confirm/preflight awaits leave a window before the terminal exists to be seen by engineAlive). */
-  async startEngine(): Promise<void> {
+  async startEngine(prior?: LaunchTarget): Promise<void> {
     if (this.starting) {
       this.provisionTerminal?.show();
       return;
     }
     this.starting = true;
     try {
-      await this.launchEngine();
+      await this.launchEngine(prior);
     } finally {
       this.starting = false;
     }
   }
 
-  /** The actual launch — only ever entered through {@link startEngine}'s reentrancy guard. */
-  private async launchEngine(): Promise<void> {
+  /** The actual launch — only ever entered through {@link startEngine}'s reentrancy guard. `prior` is
+   *  the launch target a Restart already judged before its stop, so the Start after the stop does not
+   *  read the settings again and refuse on a value that changed meanwhile, leaving the engine down. */
+  private async launchEngine(prior?: LaunchTarget): Promise<void> {
     const url = this.currentUrl();
     const ws = workspaceDir();
     if (!ws) {
@@ -580,7 +585,7 @@ export class EngineStatusBar implements vscode.Disposable {
     // value, so a settings change while a prompt or the provisioning terminal is open cannot split them.
     // Read as a launch (BACKLOG #5404): a dropped workspace or user value refuses rather than start
     // serve on the folder or file used in its place.
-    const launch = writerConfigTarget();
+    const launch = prior ?? writerConfigTarget();
     if (launch === undefined) {
       return;
     }
@@ -765,8 +770,8 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Restart: stop the engine we own (waiting for the process to actually exit so the port frees), then start. */
   async restartEngine(): Promise<void> {
-    // Start's target and trust refusals, with its messages, before anything else here (Start checks
-    // for a workspace first; Restart's service config check skips when there is none). That check
+    // Start's target and trust refusals, with its messages, before anything else here, then its
+    // folder refusal, then the service config check, all before the stop. That check
     // stats a path the workspace's settings name, and in an untrusted workspace that path is the
     // repository's choice: a UNC value opens SMB, with NTLM, to a host it names. Nothing may touch the
     // filesystem before these two refusals.
@@ -807,7 +812,9 @@ export class EngineStatusBar implements vscode.Disposable {
         await delay(500); // let the OS release the listening port before serve rebinds it
       }
     }
-    await this.startEngine();
+    // The target judged above, so a setting changed during the stop cannot refuse the Start and leave
+    // the engine down.
+    await this.startEngine(launch);
   }
 
   /** Bootstrap a Python environment (create `.venv` + install) for a workspace whose interpreter cannot

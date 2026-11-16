@@ -194,10 +194,10 @@ export function serviceConfigSetting(): ContainedPathSetting {
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
- *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). For the readers only:
- *  writers refuse a dropped value (writerConfigTarget). A value the containment dropped still counts
- *  (BACKLOG #5404), so a reader that hands the CLI the file used in its place, such as ai-policy,
- *  names it and a missing one is refused rather than read as the built-in default. */
+ *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). For the readers only, at
+ *  least the status bar's control context: writers and the offline ai-policy refuse a dropped value
+ *  (writerConfigTarget, aiPolicy.ts). A value the containment dropped still counts (BACKLOG #5404),
+ *  so the file a reader judges in its place is the one named explicitly. */
 export function serviceConfigIsSet(): boolean {
   const s = serviceConfigSetting();
   return s.source !== "default" || s.dropped !== false;

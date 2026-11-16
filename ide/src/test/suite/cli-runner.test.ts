@@ -122,8 +122,10 @@ suite("the AI-policy CLI fallback names the configured service settings (BACKLOG
     });
   });
 
+  // A dropped value gives no plan (BACKLOG #5404), so the fallback fails closed to unverified.
   const wired = (entry: string): boolean =>
-    /aiPolicyCliPlan\(\s*serviceConfig\(\),\s*serviceConfigIsSet\(\),\s*workspaceDir\(\)\s*\)/.test(entry) &&
+    /const s = writerCheckSetting\("serviceConfig"\);/.test(entry) &&
+    /s\.dropped === false\s*\?\s*aiPolicyCliPlan\(\s*s\.value,\s*s\.source !== "default",\s*workspaceDir\(\)\s*\)\s*:\s*undefined/.test(entry) &&
     /plan === undefined\s*\?\s*Promise\.reject\(/.test(entry) &&
     /runJson<AiPolicyWire>\(\s*plan\.args,\s*plan\.cwd\s*\)/.test(entry);
 
@@ -139,6 +141,13 @@ suite("the AI-policy CLI fallback names the configured service settings (BACKLOG
     assert.ok(!wired(' () => runJson<AiPolicyWire>(["ai-policy"], workspaceDir())'));
     assert.ok(
       !wired(" () => runJson<AiPolicyWire>(aiPolicyCliArgs(serviceConfig(), serviceConfigIsSet()), workspaceDir())"),
+    );
+    // The round-1 entry, which ran the CLI on the file used in place of a dropped value.
+    assert.ok(
+      !wired(
+        " () => { const plan = aiPolicyCliPlan(serviceConfig(), serviceConfigIsSet(), workspaceDir()); " +
+          "return plan === undefined ? Promise.reject(new Error()) : runJson<AiPolicyWire>(plan.args, plan.cwd); }",
+      ),
     );
   });
 });
