@@ -76,7 +76,7 @@ $report = @{{}}
 
 # ParseFile parses; it never runs the file.
 $parse = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1')) {{
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1', 'uninstall-service.ps1')) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $errs = $null
   $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
@@ -88,7 +88,7 @@ $report['parse'] = $parse
 # ACTUALLY binds. The two are asked separately on purpose -- matching text is not a matching
 # decision, and `param(...)` is the only thing that can answer the second question.
 $names = @{{}}
-foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1')) {{
+foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'install-service.ps1', 'uninstall-service.ps1')) {{
   $path = Join-Path {_psq(str(_DIR))} $name
   $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
   foreach ($p in $ast.ParamBlock.Parameters) {{
@@ -102,7 +102,9 @@ foreach ($name in @('install-net-helper.ps1', 'uninstall-net-helper.ps1', 'insta
         @{{ key = 'spaced'; value = 'MessageFoundry Prod' }},
         @{{ key = 'quoted'; value = "MessageFoundry'" }},
         @{{ key = 'trailing_lf'; value = "MessageFoundry`n" }},
-        @{{ key = 'kelvin'; value = "MessageFoundr$([char]0x212A)" }})) {{
+        @{{ key = 'kelvin'; value = "MessageFoundr$([char]0x212A)" }},
+        @{{ key = 'wildcard'; value = 'Message*' }},
+        @{{ key = 'bracket'; value = 'MessageFoundr[a-z]' }})) {{
       $sb = [scriptblock]::Create("param($($p.Extent.Text))`n`$$pname")
       $splat = @{{ $pname = $probe.value }}
       try {{ $null = & $sb @splat; $row[$probe.key] = $true }}
@@ -252,12 +254,13 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
     """Whatever one script accepts as a service name, the others must accept too.
 
     ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and literal copies
-    of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680),
+    of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680)
+    and ``uninstall-service.ps1``'s (BACKLOG #5402),
     so the engine installer cannot register a name the helper scripts, the tray or the CLI refuse.
     The copies cannot be dot-sourced away: a PowerShell attribute argument must be a compile-time
     constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
     *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
-    instead, which is what makes them one definition rather than four.
+    instead, which is what makes them one definition rather than five.
 
     The pattern is there because the helper names are interpolated into a WQL filter, where a single
     quote ends the literal. A space cannot, and a space is legal in a Windows service name -- so an
@@ -277,6 +280,7 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
         "install-net-helper.ps1::EngineServiceName",
         "uninstall-net-helper.ps1::ServiceName",
         "install-service.ps1::ServiceName",
+        "uninstall-service.ps1::ServiceName",
     }, (
         "CONTROL FAILED: the harness found a different set of service-name parameters than this "
         f"guard was aimed at ({sorted(rows)}) -- re-aim it, do not relax it"
@@ -305,10 +309,20 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
             f"{key} accepts a name ending in the Kelvin sign. ValidatePattern ignores case unless "
             "Options = 'None', and a case-insensitive [A-Za-z] matches U+212A (BACKLOG #1680)."
         )
+        assert row["wildcard"] is False and row["bracket"] is False, (
+            f"{key} accepts a PowerShell wildcard. Get-Service and Stop-Service -Force expand one in "
+            "-Name, so uninstall-service.ps1 would force-stop every service it matches (BACKLOG #5402)."
+        )
 
 
 @pytest.mark.parametrize(
-    "name", ["install-net-helper.ps1", "uninstall-net-helper.ps1", "install-service.ps1"]
+    "name",
+    [
+        "install-net-helper.ps1",
+        "uninstall-net-helper.ps1",
+        "install-service.ps1",
+        "uninstall-service.ps1",
+    ],
 )
 def test_the_script_parses(ast_report: dict[str, object], name: str) -> None:
     # No CI leg runs these scripts, so a syntax error would first show up on an operator's node

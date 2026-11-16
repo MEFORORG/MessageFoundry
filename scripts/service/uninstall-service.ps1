@@ -39,7 +39,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ServiceName = "MessageFoundry",
+    # The name install-service.ps1 accepts, and no other (BACKLOG #5402). It feeds Get-Service and
+    # Stop-Service -Force, which expand wildcards in -Name, and the service's registry path, so an
+    # unvalidated "*" would force-stop every service on the host. The pattern is a literal copy,
+    # pinned to messagefoundry/service_status.py by tests/test_net_helper_install_scripts.py.
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundry",
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
     # Opt-in: take the "Log on as a service" right back off the run-as account. Default OFF because
     # a SHARED account (a gMSA running several services, a dedicated user reused elsewhere) needs
@@ -645,14 +649,14 @@ $appStdout = ""
 $secretsDir = ""
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
-    $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
+    $objectName = [string](Get-ItemProperty -LiteralPath $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
 } catch {
     $unreadable += ("the run-as account of '$ServiceName' ($($_.Exception.Message)) - check " +
         "'$DataDir' and your config directory for an orphaned entry, and secpol.msc for a stray " +
         "'Log on as a service' grant")
 }
 try {
-    $params = Get-ItemProperty -Path (Join-Path $svcKey "Parameters") -ErrorAction Stop
+    $params = Get-ItemProperty -LiteralPath (Join-Path $svcKey "Parameters") -ErrorAction Stop
     $appParameters = [string]$params.AppParameters
     $appExe = [string]$params.Application
     $appStdout = [string]$params.AppStdout
@@ -693,7 +697,7 @@ if (-not $PSBoundParameters.ContainsKey('DataDir')) {
 # removal, because the registration is where the path lives.
 $cachedNssm = ""
 try {
-    $imagePath = [string](Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
+    $imagePath = [string](Get-ItemProperty -LiteralPath $svcKey -Name ImagePath -ErrorAction Stop).ImagePath
     $imageExe = if ($imagePath.Trim().StartsWith('"')) { ($imagePath.Trim() -split '"')[1] }
                 else { $imagePath.Trim() }
     if ($imageExe -and (Test-Path -LiteralPath $imageExe)) { $cachedNssm = $imageExe }
