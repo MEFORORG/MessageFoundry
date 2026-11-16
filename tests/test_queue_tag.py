@@ -272,3 +272,64 @@ def test_a_key_or_format_problem_is_not_a_tag_failure() -> None:
     assert not isinstance(unmarked.value, QueueTagError)
     with pytest.raises(QueueTagError):  # control: the held key, the wrong row
         open_queue_cell(sealer, {**row, "channel_id": "IB_B", "payload": sealed})
+
+
+def _raising_transit() -> tuple[Any, Any]:
+    """A real :class:`TransitCipher` over a fake hvac client whose decrypt raises what it is set."""
+    from messagefoundry.store.crypto_transit import TransitCipher  # noqa: PLC0415
+
+    class _Transit:
+        error: Exception | None = None
+
+        def decrypt_data(self, **_kw: Any) -> Any:
+            assert self.error is not None
+            raise self.error
+
+    class _Client:
+        def __init__(self, transit: _Transit) -> None:
+            self.secrets = type("S", (), {"transit": transit})()
+
+    transit = _Transit()
+    return TransitCipher(_Client(transit), "mefor-store"), transit
+
+
+def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
+    """BACKLOG #5765: Vault Transit cannot name its keys, so ``is_tag_failure`` counts every marked
+    value as held. A transient outage on open (an unreachable Vault, a 5xx, a refused token) must
+    raise the cipher's own error, never :class:`QueueTagError`, so a claim does not dead-letter the
+    row with a false ``integrity_drift`` alert. Control: Vault's AEAD refusal of a moved cell is
+    still a tag failure."""
+    pytest.importorskip("hvac")
+    import requests  # noqa: PLC0415
+    from hvac.exceptions import (  # type: ignore[import-untyped]  # noqa: PLC0415
+        Forbidden,
+        InternalServerError,
+        InvalidRequest,
+    )
+
+    from messagefoundry.store.crypto import CipherUnavailableError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import is_transient_open_failure  # noqa: PLC0415
+
+    cipher, transit = _raising_transit()
+    row = {**_row(), "payload": "mfenc:v3:vault:v1:AAAA"}
+    outages: list[Exception] = [
+        requests.exceptions.ConnectionError("connection refused"),
+        requests.exceptions.ReadTimeout("read timed out"),
+        InternalServerError("upstream"),
+        Forbidden(errors=["permission denied"]),
+    ]
+    for exc in outages:
+        transit.error = exc
+        with pytest.raises(CipherError) as refused:
+            open_queue_cell(cipher, row)
+        assert not isinstance(refused.value, QueueTagError), exc
+        assert is_transient_open_failure(refused.value), exc
+    assert is_transient_open_failure(CipherUnavailableError("down"))
+    assert not is_transient_open_failure(QueueTagError("integrity"))
+    assert not is_transient_open_failure(OSError("not a cipher error"))
+
+    # Control: Transit's AEAD refusal of a cell moved to another row is still a tag failure.
+    transit.error = InvalidRequest(errors=["cipher: message authentication failed"])
+    with pytest.raises(QueueTagError) as moved:
+        open_queue_cell(cipher, row)
+    assert not is_transient_open_failure(moved.value)

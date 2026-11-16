@@ -40,6 +40,7 @@ from messagefoundry.store.crypto import (
     CipherError,
     UnauthenticatedCipherError,
     cell_aad,
+    gave_no_verdict,
 )
 from messagefoundry.store.row_seal import seal_bytes
 
@@ -56,6 +57,7 @@ __all__ = [
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
+    "is_transient_open_failure",
     "open_queue_cell",
     "queue_payload_aad",
     "queue_row_aad",
@@ -168,11 +170,27 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
 
     An unmarked value is the cipher's own refusal, which raises its own alert, and a value under a
     key that is not configured is a key-configuration fault. Neither is a tag failure. A cipher that
-    cannot say which keys it holds (Vault Transit) counts every marked value as held."""
+    cannot say which keys it holds (Vault Transit) counts every marked value as held. This reads the
+    VALUE only: whether a given failed open was the key service failing instead is the caller's
+    question, :func:`is_transient_open_failure` (BACKLOG #5765)."""
     if not cipher.is_encrypted(stored):
         return False
     holds = getattr(cipher, "holds_key_for", None)
     return bool(holds(stored)) if callable(holds) else True
+
+
+def is_transient_open_failure(exc: BaseException) -> bool:
+    """Whether a failed open was the key service giving no verdict on the value, an outage rather
+    than anything about the cell (BACKLOG #5765, #5735).
+
+    :func:`~messagefoundry.store.crypto.gave_no_verdict` decides it: a
+    :class:`~messagefoundry.store.crypto.CipherUnavailableError`, or a Transit error caused by an
+    unreachable Vault or a refusal of the service's own (a token refused, a 5xx). Such a failure is
+    never a tag failure, and a claim hands the row back rather than dead-lettering it. A
+    :class:`QueueTagError` is never transient: it is raised only after this check passed."""
+    return (
+        isinstance(exc, CipherError) and not isinstance(exc, QueueTagError) and gave_no_verdict(exc)
+    )
 
 
 def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | None:
@@ -199,7 +217,8 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     ``shared_body`` key for a ``ref`` row.
 
     Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
-    :func:`is_tag_failure`; a key or format problem raises the cipher's own error), when a keyed
+    :func:`is_tag_failure`; a key or format problem raises the cipher's own error, and so does a key
+    service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
     differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
@@ -215,8 +234,10 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
-        if not is_tag_failure(cipher, payload):
-            raise  # a key or format problem, which the cipher's own error names
+        # An outage says nothing about the cell. Vault Transit cannot name its keys, so without
+        # this check a transient outage would read as every marked cell failing its tag (#5765).
+        if is_transient_open_failure(exc) or not is_tag_failure(cipher, payload):
+            raise  # a key, format or key-service problem, which the cipher's own error names
         raise QueueTagError(
             f"integrity: the queue row's payload does not open under its own tag ({exc})"
         ) from exc
