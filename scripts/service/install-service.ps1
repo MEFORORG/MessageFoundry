@@ -1690,40 +1690,41 @@ function Set-ServiceLogonRight {
     $inf = Join-Path $work "grant.inf"
     $sdb = Join-Path $work "grant.sdb"
     try {
+        # A native command that never ran leaves $LASTEXITCODE as it was, often 0 from an earlier
+        # call, so it is cleared first and $null read as "did not run".
+        $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
             Write-Warning "secedit export failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
             return
         }
-        $lines = Get-Content -LiteralPath $inf
-        $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' } | Select-Object -First 1
-        if ($row) {
+        $lines = @(Get-Content -LiteralPath $inf)
+        $at = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*SeServiceLogonRight\s*=') { $at = $i; break }
+        }
+        if ($at -ge 0) {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
             # already-granted SID (RID 110 vs 1100) would false-positive under -match and skip the grant,
             # so the service could fail to start (error 1069). Split the value on ',' and match each
-            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form).
-            $value = ($row -replace '^\s*SeServiceLogonRight\s*=', '')
-            $held = $value -split ',' | ForEach-Object { $_.Trim() } | Where-Object {
-                $_ -eq ("*" + $sid) -or $_ -eq $sid
-            }
-            if ($held) {
+            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form). Blank tokens are
+            # dropped, so an empty row or a stray comma writes no empty holder (BACKLOG #5401).
+            $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
+            $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid }) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."
                 return
             }
-        }
-        if ($row) {
-            # An exported row can be present and empty. Appending ",*SID" to it would write a value
-            # that starts with a comma (BACKLOG #5401), so an empty row takes the SID alone. The
-            # replacement is built here and escaped, since a held account name may carry a '$'.
-            $kept = $value.Trim()
-            $joined = if ($kept) { "$kept,*$sid" } else { "*$sid" }
-            $new = $lines -replace '^\s*SeServiceLogonRight\s*=.*$',
-                ("SeServiceLogonRight = " + $joined.Replace('$', '$$'))
+            # Only the row read is rewritten, as plain text rather than a -replace replacement, so a
+            # '$' in a held account name is written as itself.
+            $new = $lines.Clone()
+            $new[$at] = "SeServiceLogonRight = " + (@($holders + "*$sid") -join ',')
         } else {
             # No existing row: inject one under [Privilege Rights].
             $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
         }
         Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
+        $global:LASTEXITCODE = $null
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "secedit configure failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."

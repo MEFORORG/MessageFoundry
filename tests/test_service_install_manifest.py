@@ -2968,10 +2968,14 @@ def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
 
 
-def _grant_configured(tmp_path: Path, row: str | None) -> str:
+def _grant_configured(tmp_path: Path, row: str | None, *, configure_runs: bool = True) -> str:
     """The policy install-service.ps1's Set-ServiceLogonRight hands ``secedit /configure`` when the
     export holds ``row`` (``None``: no SeServiceLogonRight row at all), granting the right to
-    BUILTIN\\Administrators (S-1-5-32-544). secedit is a stub; nothing is configured."""
+    BUILTIN\\Administrators (S-1-5-32-544). secedit is a stub; nothing is configured.
+
+    With ``configure_runs=False`` the configure call sets no exit code, as a command that never
+    ran, and what the function said is returned instead of the policy."""
+    runs = "$true" if configure_runs else "$false"
     assert _SCRIPT is not None
     parent = tmp_path / "grant-parent"
     parent.mkdir(exist_ok=True)
@@ -2987,18 +2991,24 @@ def _grant_configured(tmp_path: Path, row: str | None) -> str:
     $a = @($args)
     $cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
     if ($a -contains '/export') {{ Set-Content -LiteralPath $cfg -Value {inf_ps} -Encoding Unicode }}
-    elseif ($a -contains '/configure') {{ $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ') }}
+    elseif ($a -contains '/configure') {{
+      $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ')
+      if (-not {runs}) {{ return }}
+    }}
     $global:LASTEXITCODE = 0
   }}
-  Set-ServiceLogonRight -Account 'BUILTIN\Administrators' 3>$null 6>$null
-  'CONFIGURED=' + $script:Configured
+  $said = @(Set-ServiceLogonRight -Account 'BUILTIN\Administrators' 3>&1 6>&1 |
+    ForEach-Object {{ "$_" }})
+  if ({runs}) {{ 'OUT=' + $script:Configured }} else {{ 'OUT=' + ($said -join ' / ') }}
 """
     out = _ok(_extract(_SCRIPT, ["Set-ServiceLogonRight", _WORKDIR_FN], body), tmp_path)
-    return out.strip().splitlines()[-1].removeprefix("CONFIGURED=")
+    return out.strip().splitlines()[-1].removeprefix("OUT=")
 
 
 @_windows_only
-@pytest.mark.parametrize("row", ["SeServiceLogonRight =", "SeServiceLogonRight =   "])
+@pytest.mark.parametrize(
+    "row", ["SeServiceLogonRight =", "SeServiceLogonRight =   ", "SeServiceLogonRight = ,"]
+)
 def test_the_grant_to_an_empty_exported_row_has_no_leading_comma(tmp_path: Path, row: str) -> None:
     """BACKLOG #5401: an exported SeServiceLogonRight row can be present and empty. Appending
     ``,*SID`` to it wrote a value that starts with a comma."""
@@ -3010,11 +3020,28 @@ def test_the_grant_to_an_empty_exported_row_has_no_leading_comma(tmp_path: Path,
 @_windows_only
 def test_the_grant_keeps_every_holder_and_a_dollar_in_a_held_name(tmp_path: Path) -> None:
     """POSITIVE CONTROL for the row above: a row with holders keeps them, in order, with the SID
-    appended, and a ``$`` in a held account name is written as itself, not as a backreference."""
-    configured = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\gmsa$1")
-    assert "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\gmsa$1,*S-1-5-32-544 |" in configured, (
-        configured
+    appended, and a ``$`` in a held account name is written as itself. ``$0`` and ``$&`` are
+    what a regex replacement would expand into the whole matched row."""
+    configured = _grant_configured(
+        tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&"
     )
+    want = "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&,*S-1-5-32-544 |"
+    assert want in configured, configured
+
+
+@_windows_only
+def test_the_grant_after_a_trailing_comma_writes_no_empty_holder(tmp_path: Path) -> None:
+    configured = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,")
+    assert "SeServiceLogonRight = *S-1-5-80-4001,*S-1-5-32-544 |" in configured, configured
+
+
+@_windows_only
+def test_a_configure_that_never_ran_is_not_reported_as_a_grant(tmp_path: Path) -> None:
+    """The stub's export left ``$LASTEXITCODE`` at 0 and its configure sets none. Read uncleared,
+    that stale 0 reports a grant that never happened."""
+    said = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001", configure_runs=False)
+    assert "granted SeServiceLogonRight" not in said, said
+    assert "secedit configure failed" in said, said
 
 
 @_windows_only
