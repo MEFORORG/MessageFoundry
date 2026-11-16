@@ -562,3 +562,49 @@ async def test_a_build_step_3_adds_after_the_quiesce_that_fails_restores_every_l
     assert runner._destinations == before
     assert len(made) == 1 and made[0] in closed
     assert runner.inbound_running("file_in")
+
+
+async def test_a_cancel_after_the_commit_does_not_raise_out_of_the_reload(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    """The retired connector's close suspends, and the caller is cancelled while it does. The
+    reload has committed, so it returns rather than raise; the close runs on in its tracked task,
+    and its failure is logged from there. Red before the fix: the reload awaited the close under
+    a shield, so the cancellation raised out of a committed reload, and the engine then skipped
+    its fingerprint and convergence bookkeeping and a DR activation rolled its latch back."""
+    stale: Any = runner._destinations[_OB]
+    real_close = type(stale).aclose
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def close(self: Any) -> None:
+        if self is stale:
+            started.set()
+            await release.wait()
+            raise OSError("synthetic close failure")
+        await real_close(self)
+
+    monkeypatch.setattr(type(stale), "aclose", close)
+    new = _registry(tmp_path, "out_v2", second="out2")
+    task = asyncio.create_task(runner.reload(new))
+    await asyncio.wait_for(started.wait(), 10)
+    task.cancel()
+    with caplog.at_level("WARNING", logger="messagefoundry.pipeline.wiring_runner"):
+        try:
+            # The close failed after its task first suspended, so the result does not name it.
+            assert await task == ()
+            assert runner.registry is new
+            assert runner._lookup_close_tasks  # teardown waits for it
+        finally:
+            release.set()  # or the fixture's stop() waits on the hung close
+        await _settle(runner)
+
+    assert not runner._lookup_close_tasks
+    assert "closing the replaced connector of outbound 'file_out' failed" in caplog.text
+    assert "synthetic close failure" in caplog.text
+
+
+async def test_nothing_retired_makes_no_close_task(runner: RegistryRunner) -> None:
+    """Red before the fix: an empty retired list still made a task, and a caller awaited it."""
+    before = set(runner._lookup_close_tasks)
+    assert runner._close_retired([]) == []
+    assert runner._lookup_close_tasks == before

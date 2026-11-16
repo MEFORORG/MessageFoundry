@@ -8896,25 +8896,7 @@ class RegistryRunner:
                     # threshold gets its marker here too, so that door refuses it. A no-op
                     # with no DR profile.
                     if self._passive_parked(name) and self._leaves_passive_park(name, oc):
-                        # The lane leaves the passive park unbuilt, and is marked so, or the
-                        # marker change below would leave it no record of that. The reload or
-                        # the start that builds it then takes the isolated first build, and a
-                        # start whose build fails holds it rather than resume it with no
-                        # connector. No build has run, so none has failed. A failed record the
-                        # passive start wrote stays, so the lane still reads failed, in words
-                        # that no longer ask for the activation that has run.
-                        self._dr_unbuilt[name] = False
-                        passive_line = self._failed.get(("outbound", name))
-                        if passive_line is not None:
-                            # New words, the passive check's class (vault BACKLOG #5146).
-                            self._failed[("outbound", name)] = passive_line._replace(
-                                reason=(
-                                    f"outbound connection '{name}' failed its check at the passive "
-                                    "start, and the log halt held the activation's build of it. "
-                                    "Repair the log and the cause, then reload or start the "
-                                    "connection; the server log says why"
-                                )
-                            )
+                        self._mark_left_passive_park_unbuilt(name)
                     self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
             if (
@@ -8938,7 +8920,22 @@ class RegistryRunner:
                 # validate_startup, with a fault isolated to this lane (ADR 0031). BEFORE the
                 # unpark, as _start_outbound_unsafe orders it: a lane unparked with no connector
                 # claimed a held row and charged it an attempt.
-                if self._passive_parked(name) or not self._dr_unbuilt.get(name, False):
+                # The prepare left it unbuilt while the #122 halt held it, and this reload's
+                # probe has lifted the halt since. Decided before the first-build block below,
+                # which would drop the records this lane keeps: it is held as the halt-held
+                # branch above holds it. No build has run, so none has failed, an earlier
+                # failed-build mark stands, and the next reload or an operator start builds it.
+                held_by_halt = name not in plan.started
+                if held_by_halt:
+                    if self._passive_parked(name):
+                        self._mark_left_passive_park_unbuilt(name)
+                        self._filtered.pop(("outbound", name), None)
+                    log.warning(
+                        "reload: outbound %r left the DR park during a log halt; the next "
+                        "reload or a start builds it",
+                        name,
+                    )
+                elif self._passive_parked(name) or not self._dr_unbuilt.get(name, False):
                     # The first build since the lane left the park, at this activation. The
                     # failed record a passive start or an earlier activation may have left is
                     # dropped, so a fault still there is recorded and alerted as this build's
@@ -8953,25 +8950,11 @@ class RegistryRunner:
                 # Built in the prepare (BACKLOG #5755). A box that went passive while it
                 # awaited, as a failed activation hands the threshold back without the reload
                 # lock, does not reach here: `_leaves_passive_park` reads it false, and the lane
-                # takes the passive park below.
-                held_by_halt = False
-                if ("outbound", name) in self._filtered:
-                    # `_ensure_destination_built`'s own guard: the lane takes nothing, and what
-                    # the prepare built is closed with the plan.
-                    pass
-                elif (started := plan.started.pop(name, None)) is None:
-                    # The prepare left it unbuilt while the #122 halt held it, and this reload's
-                    # probe has lifted the halt since. Held below, as the halt-held branch above
-                    # holds it: no build has run, so none has failed, and the next reload or an
-                    # operator start builds it.
-                    held_by_halt = True
-                    log.warning(
-                        "reload: outbound %r left the DR park during a log halt; the next "
-                        "reload or a start builds it",
-                        name,
-                    )
-                else:
-                    self._install_lane_destination(name, started)
+                # takes the passive park below. A filtered lane takes nothing, by
+                # `_ensure_destination_built`'s own guard, and what the prepare built is closed
+                # with the plan.
+                if not held_by_halt and ("outbound", name) not in self._filtered:
+                    self._install_lane_destination(name, plan.started.pop(name))
                 if name in self._destinations:
                     self._unpark_outbound_lane(name)
                 else:
@@ -8980,7 +8963,8 @@ class RegistryRunner:
                     # or dead-lettered for a fault found at the takeover (ADR 0048). Its mark
                     # keeps the scheduler and an alert rule's restart off it. The next reload,
                     # or an operator start, builds it again and resumes it once that succeeds.
-                    self._dr_unbuilt[name] = not held_by_halt
+                    if not held_by_halt:
+                        self._dr_unbuilt[name] = True
                     if name in self._schedule_parked:
                         # A closed window passed the park to the calendar above, and the
                         # calendar leaves this lane alone. The engine holds it, so it pages.
@@ -9060,6 +9044,26 @@ class RegistryRunner:
                 self._filtered.pop(("outbound", name), None)
                 self._unpark_outbound_lane(name)
 
+    def _mark_left_passive_park_unbuilt(self, name: str) -> None:
+        """Mark outbound ``name`` as leaving the passive DR park unbuilt while the #122 halt held
+        its build, or the marker change that follows would leave it no record of that. The reload
+        or the start that builds it then takes the isolated first build, and a start whose build
+        fails holds it rather than resume it with no connector. No build has run, so none has
+        failed. A failed record the passive start wrote stays, so the lane still reads failed, in
+        words that no longer ask for the activation that has run."""
+        self._dr_unbuilt[name] = False
+        passive_line = self._failed.get(("outbound", name))
+        if passive_line is not None:
+            # New words, the passive check's class (vault BACKLOG #5146).
+            self._failed[("outbound", name)] = passive_line._replace(
+                reason=(
+                    f"outbound connection '{name}' failed its check at the passive "
+                    "start, and the log halt held the activation's build of it. "
+                    "Repair the log and the cause, then reload or start the "
+                    "connection; the server log says why"
+                )
+            )
+
     def _unbuilt_by_prepare(
         self, name: str, retired: list[tuple[str, DestinationConnector]]
     ) -> None:
@@ -9089,31 +9093,39 @@ class RegistryRunner:
 
     def _close_retired(
         self, retired: list[tuple[str, DestinationConnector]]
-    ) -> asyncio.Task[list[tuple[str, str]]]:
-        """Close ``retired`` in order, in a task of their own, and return it; its result is the
-        closes that failed (:meth:`_close_replaced`). Synchronous, so nothing can cut a reload off
-        between its commit and the closes being owned (BACKLOG #5755). The task joins the detached
-        lookup-executor closes, so :meth:`_teardown_body` waits for it under the same bound, and a
-        close that hangs holds neither the reload lock nor the closes queued behind a caller that
-        stopped waiting."""
+    ) -> list[tuple[str, str]]:
+        """Close ``retired`` in order, in a task of their own, and return the list that task
+        records each failed close in (:meth:`_close_replaced`). Synchronous, so nothing can cut a
+        reload off between its commit and the closes being owned, and the caller awaits nothing,
+        so a cancellation delivered after the commit cannot raise out of a committed reload
+        (BACKLOG #5755). The task starts eagerly: it runs at once, inside this call, up to the
+        first close that suspends, so the returned list already names every close that failed
+        before that point. A close that fails after it is logged from the task and appended to
+        the list, which the caller has by then read.
 
-        async def close_all() -> list[tuple[str, str]]:
-            failures: list[tuple[str, str]] = []
-            for name, connector in retired:
-                await self._close_replaced(name, connector, failures)
+        With nothing retired, no task is made. The task joins the detached lookup-executor
+        closes, so :meth:`_teardown_body` waits for it: under DEMOTE within its budget, under
+        SHUTDOWN with no bound, so a retired close that hangs holds up a stop. It holds neither
+        the reload lock nor any later reload or operator door."""
+        failures: list[tuple[str, str]] = []
+        if not retired:
             return failures
 
-        task = asyncio.create_task(close_all())
-        self._lookup_close_tasks.add(task)
-        task.add_done_callback(self._lookup_close_tasks.discard)
-        task.add_done_callback(self._abandoned_lookup_closes.discard)
-        return task
+        async def close_all() -> None:
+            for name, connector in retired:
+                await self._close_replaced(name, connector, failures)
+
+        task: asyncio.Task[object] = asyncio.create_task(close_all(), eager_start=True)
+        if not task.done():
+            self._lookup_close_tasks.add(task)
+            task.add_done_callback(self._lookup_close_tasks.discard)
+            task.add_done_callback(self._abandoned_lookup_closes.discard)
+        return failures
 
     def _close_detached(self, connectors: list[tuple[str, DestinationConnector]]) -> None:
-        """Close ``connectors`` as :meth:`_close_retired` does, with no one waiting: a close that
-        fails is logged by :meth:`_close_replaced`."""
-        if connectors:
-            self._close_retired(connectors)
+        """Close ``connectors`` as :meth:`_close_retired` does, with no one reading its result: a
+        close that fails is logged by :meth:`_close_replaced`."""
+        self._close_retired(connectors)
 
     async def _close_replaced(
         self, name: str, replaced: DestinationConnector, failures: list[tuple[str, str]]
@@ -9257,8 +9269,9 @@ class RegistryRunner:
     ) -> tuple[tuple[str, str], ...]:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
-        Returns ``(outbound name, reason)`` for each connector step 3 replaced or retired and could
-        not close.
+        Returns ``(outbound name, reason)`` for each connector step 3 replaced or retired whose
+        close failed before the close task first suspended (:meth:`_close_retired`). A close that
+        fails after that is logged from its task, and is not in the result.
         The swap stands for those lanes, so they are reported rather than raised; empty when there
         are none, and on a graph that is not running.
 
@@ -9293,8 +9306,9 @@ class RegistryRunner:
         3a and 4 do not run. Step 3 changes no outbound lane until its last await has returned, so
         a fault or cancellation in a step or a connector build leaves the outbound lanes as they
         were; a raise inside its synchronous apply is the exception (:meth:`_reconcile_outbounds`).
-        The connectors it takes out of a lane are closed only once the swap commits, after the
-        reload lock is released (BACKLOG #5755). Restarting inbounds before
+        The connectors it takes out of a lane are closed only once the swap commits, in a task
+        the reload starts and never awaits, so a cancellation delivered after the commit does not
+        raise out of it (BACKLOG #5755); teardown waits for that task. Restarting inbounds before
         reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
@@ -9646,10 +9660,11 @@ class RegistryRunner:
                     )
                     self._wake_all(*_reload_stages)
                 # BACKLOG #5755: the swap committed, so close what step 3 took out of its lanes.
-                # Started here, the tail's last step, so no later raise can drop them; awaited
-                # below, outside the reload lock, so a close that hangs holds up no later reload,
-                # operator door or stop().
-                closing = self._close_retired(retired)
+                # Started here, the tail's last step, so no later raise can drop them. Never
+                # awaited: a cancellation of the caller cannot then raise out of a reload whose
+                # graph has committed, and a close that hangs holds up no later reload or operator
+                # door. Teardown still waits for it (:meth:`_close_retired`).
+                close_failures = self._close_retired(retired)
             except BaseException:
                 self._close_detached(retired)
                 raise
@@ -9666,9 +9681,8 @@ class RegistryRunner:
         report = asyncio.create_task(self._warn_stranded_by_dropped_inbounds(old, new_registry))
         self._reload_report_tasks.add(report)
         report.add_done_callback(self._reload_report_tasks.discard)
-        # Shielded: a cancellation of the caller here stops only the wait, and the closes run on
-        # in their tracked task. The cancellation still propagates, as asyncio requires.
-        return tuple(await asyncio.shield(closing))
+        # The closes that failed before their task first suspended (:meth:`_close_retired`).
+        return tuple(close_failures)
 
     # --- inbound path --------------------------------------------------------
 

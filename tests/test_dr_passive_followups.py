@@ -808,6 +808,87 @@ async def test_a_lane_an_activation_under_a_log_halt_left_unbuilt_keeps_its_isol
         await runner.stop()
 
 
+def _repair_the_log_after_the_prepare(
+    runner: RegistryRunner, guard: _DeadLogGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk is repaired once the reload's last prepare has read the #122 halt, so the
+    prepare leaves the lanes it holds unbuilt and the apply's probe then lifts the halt (BACKLOG
+    #5755). The apply awaits nothing, so the repair lands between the two."""
+    real_apply = runner._apply_outbound_reconcile
+
+    def repair_then_apply(*args: Any) -> None:
+        guard.writable = True
+        real_apply(*args)
+
+    monkeypatch.setattr(runner, "_apply_outbound_reconcile", repair_then_apply)
+
+
+async def _halt(runner: RegistryRunner, guard: _DeadLogGuard, monkeypatch: Any) -> None:
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: guard)
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+
+async def test_a_halt_lifted_inside_an_activation_keeps_the_passive_starts_ca_record(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prepare left the lane unbuilt under the halt, and the apply's probe lifted it. Red
+    before the fix: the first-build block dropped the passive start's CA failure record before
+    the lane was found held, so the lane read healthy with no connector."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        assert _PASSIVE_REFUSED in (runner.outbound_failed(_OB_CA) or "")
+        await _halt(runner, guard, monkeypatch)
+        _repair_the_log_after_the_prepare(runner, guard, monkeypatch)
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+
+        assert not runner._delivery_halted  # the apply's probe lifted it
+        assert _OB_CA not in runner._destinations
+        assert runner.outbound_filtered(_OB_CA) is None
+        held = runner.outbound_failed(_OB_CA) or ""
+        assert "passive start" in held and "POST /dr/activate needs it" not in held
+        assert not runner.outbound_dr_failed(_OB_CA)  # no build ran, so none failed
+    finally:
+        await runner.stop()
+
+
+async def test_a_halt_lifted_inside_a_reload_keeps_an_earlier_failed_build_mark(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane's build failed at the activation, then a reload found it held by the halt the
+    apply's probe lifted. Red before the fix: that path wrote the lane's mark False, so it no
+    longer read as a failed build and its pages went silent."""
+    ca, pin = _swapped_ca(tmp_path)
+    guard = _DeadLogGuard()
+    runner = _runner(
+        store, _graph(tmp_path, ca, pin), dr_standby=Priority.CRITICAL, alert_sink=_LogPageSink()
+    )
+    await runner.start()
+    try:
+        runner.set_dr_threshold(Priority.CRITICAL, standby=None)  # the activation
+        await runner.reload()
+        assert runner.outbound_dr_failed(_OB_CA)
+        failed = runner.outbound_failed(_OB_CA)
+
+        await _halt(runner, guard, monkeypatch)
+        _repair_the_log_after_the_prepare(runner, guard, monkeypatch)
+        await runner.reload()
+
+        assert not runner._delivery_halted  # the apply's probe lifted it
+        assert _OB_CA not in runner._destinations
+        assert runner.outbound_dr_failed(_OB_CA)
+        assert runner.outbound_failed(_OB_CA) == failed
+    finally:
+        await runner.stop()
+
+
 async def test_a_refused_restart_keeps_an_operator_stop_of_a_lane_a_log_halt_left_unbuilt(
     store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
