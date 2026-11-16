@@ -138,6 +138,7 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
+    ENROLMENT_CODE_MAX,
     credential_id_hash_is_current,
     credential_id_hash_scheme,
     enrolment_code_digest,
@@ -18106,13 +18107,19 @@ class AuthService:
     ) -> str:
         """The digest of ``presented`` when it matches the code on ``user``'s row, has not expired
         and the account is enabled; otherwise the refusal (:meth:`_refuse_enrolment_code`). ``user``
-        is the row the directory lookup returned (Amendment A, A3). Spends nothing."""
+        is the row the directory lookup returned (Amendment A, A3). Spends nothing. A ``presented``
+        longer than :data:`ENROLMENT_CODE_MAX` is refused as a wrong code without being normalised
+        or hashed, never cut (BACKLOG #5399)."""
         if presented is None or not presented.strip():
             await self._refuse_enrolment_code(
                 identity, "not_presented", ceremony=ceremony, client=client
             )
         expires_at = user.enrolment_code_expires_at
-        digest = enrolment_code_matches(user.enrolment_code_digest, presented)
+        digest = (
+            None
+            if len(presented) > ENROLMENT_CODE_MAX
+            else enrolment_code_matches(user.enrolment_code_digest, presented)
+        )
         if (
             digest is not None
             and expires_at is not None

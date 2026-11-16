@@ -180,21 +180,34 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
     return _DIRECTORY_UNCONFIRMED_ERROR
 
 
-def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bool:
+#: The pydantic error types that say a value is too long: on a ``length_only`` field of
+#: :func:`_form_fits`, the only refusals that count.
+_TOO_LONG_ERRORS = frozenset({"string_too_long", "bytes_too_long", "too_long"})
+
+
+def _form_fits(
+    request: Request,
+    model: type[BaseModel],
+    /,
+    *,
+    length_only: frozenset[str] = frozenset(),
+    **fields: str,
+) -> bool:
     """Whether the JSON route's own request ``model`` accepts these hand-parsed form values.
 
     The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
     route's model does. Asking the model keeps one definition of each bound (BACKLOG #5397, #5398,
-    #5399). Only the fields a caller passes are checked: at least the sign-in username and password,
-    the MFA and step-up codes, the step-up password, and the enrolment-confirm code and enrolment
-    code. A field a caller does not pass, such as the sign-in passkey assertion, is not. Any refusal
-    by the model counts, not only a length one. Two fields are checked for length only, by
-    :func:`_form_within_lengths`: the sign-in authenticator code, because ``LoginRequest``'s digit
-    pattern would refuse what the form has always passed on, and the passkey enrolment code, because
-    ``MfaConfirmRequest`` also requires a ``code`` the passkey finish has none of. The check only
-    refuses and never
-    normalises: what the service receives is each caller's own reading of the submitted value,
-    which at /ui/reauth and the enrolment confirm is the code with surrounding space stripped.
+    #5399). Only the fields a caller passes are checked: at least the sign-in username, password
+    and authenticator code, the MFA and step-up codes, the step-up password, and the
+    enrolment-confirm code. A field a caller does not pass, such as the sign-in passkey assertion,
+    is not. Nor is the enrolment code at either binding step, which the engine bounds at the point
+    it reads the code, so every refusal the service gave before that read still comes first. Any
+    refusal by the model counts, except on a field named in ``length_only``, where only a too-long
+    one does.
+    The sign-in authenticator code is that field, because ``LoginRequest``'s digit pattern would
+    refuse what the form has always passed on. The check only refuses and never normalises: what
+    the service receives is each caller's own reading of the submitted value, which at /ui/reauth
+    and the enrolment confirm is the code with surrounding space stripped.
 
     Each caller runs this after its rate limiter, so a refused value has already been charged
     whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
@@ -204,31 +217,16 @@ def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bo
     try:
         model(**fields)
     except ValidationError as exc:
-        _log_form_refusal(request, exc.error_count())
-        return False
-    return True
-
-
-def _form_within_lengths(request: Request, model: type[BaseModel], /, **fields: str) -> bool:
-    """Whether each of these form values is within the ``max_length`` the JSON route's own request
-    ``model`` sets on that field, and nothing else of the model's. A field whose bound is not found
-    on the model's field metadata raises ``LookupError`` rather than fit, so a refactor that moves
-    the bound out of sight fails closed. A refusal is logged as :func:`_form_fits` logs one, never
-    with a value."""
-    over = 0
-    for name, value in fields.items():
-        bounds = [
-            m.max_length
-            for m in model.model_fields[name].metadata
-            if isinstance(getattr(m, "max_length", None), int)
+        counted = [
+            error
+            for error in exc.errors(include_url=False, include_input=False)
+            if error["type"] in _TOO_LONG_ERRORS
+            or not (error["loc"] and error["loc"][0] in length_only)
         ]
-        if not bounds:
-            raise LookupError(f"{model.__name__}.{name} declares no max_length")
-        if len(value) > min(bounds):
-            over += 1
-    if over:
-        _log_form_refusal(request, over)
-    return not over
+        if counted:
+            _log_form_refusal(request, len(counted))
+            return False
+    return True
 
 
 def _log_form_refusal(request: Request, errors: int) -> None:
@@ -850,10 +848,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
         # one is today's two-step flow.
         totp_code = form.get("totp_code", "")
-        if (
-            provider_value not in ("local", "ad")
-            or not _form_fits(request, LoginRequest, username=username, password=password)
-            or not _form_within_lengths(request, LoginRequest, totp_code=totp_code.strip())
+        if provider_value not in ("local", "ad") or not _form_fits(
+            request,
+            LoginRequest,
+            length_only=frozenset({"totp_code"}),
+            username=username,
+            password=password,
+            totp_code=totp_code.strip(),
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,

@@ -83,10 +83,12 @@ this line.**
   form field is checked, and not every field is checked against the whole model: `_form_fits`
   names which. The sign-in authenticator code is now refused past `LoginRequest`'s length bound,
   measured with surrounding space stripped, rather than cut to 16 characters; it is bounded by
-  length only, so a blank or space-only code is still the two-step flow and a non-digit one still
-  reaches the engine, which refuses it as a wrong code, as before. The enrolment code at the TOTP confirm and at
-  `POST /ui/account/webauthn/verify` is refused past `MfaConfirmRequest`'s bound rather than cut.
-  Needs the engine seam digest that lists those four models. (vault BACKLOG #5397, #5398, #5399)
+  length only, so a blank or space-only code is still the two-step flow and a non-digit one within
+  the bound is still passed to the engine, as before. The enrolment code at the TOTP confirm and
+  at `POST /ui/account/webauthn/verify` is passed on uncut rather than cut, and the engine refuses
+  one past `MfaConfirmRequest`'s bound where it reads the code, as a refused enrolment code, so
+  every refusal the service gave before that read still comes first. Needs the engine seam digest
+  that lists those four models. (vault BACKLOG #5397, #5398, #5399)
 - **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`
   records on the handshake whether it admitted the caller, which the engine's accept gate reads,
   the latest recorded answer standing. A handshake with no Origin is not this gate's to judge, so it

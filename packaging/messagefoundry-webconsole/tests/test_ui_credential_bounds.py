@@ -21,13 +21,13 @@ from _ui_clients import PW, SAME_ORIGIN, held_totp_code, mint_bound_proof, provi
 
 from messagefoundry.api.auth_models import (
     _CONFIRM_CODE_MAX,
-    _ENROLMENT_CODE_MAX,
     _MFA_CODE_MAX,
     _NAME_MAX,
     _PASSWORD_MAX,
 )
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -136,8 +136,10 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
     calls = _spy(monkeypatch, service, "login")
     async with ui_client(engine, service) as c:
         base = {"username": "op", "password": PW}
-        r = await c.post("/ui/login", data={**base, "totp_code": "1" * (MAX_DIGITS + 1)})
-        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
+        # A non-digit one too: only the pattern is waived on this field, never the length.
+        for oversized in ("1" * (MAX_DIGITS + 1), "a" * (MAX_DIGITS + 1)):
+            r = await c.post("/ui/login", data={**base, "totp_code": oversized})
+            assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
         assert calls == []
         # At the bound the code is passed on whole.
         await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
@@ -289,9 +291,9 @@ async def test_an_oversized_step_up_password_never_reaches_reauth(
 async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ui_mfa_verify stops checking the code or the enrolment code against
-    MfaConfirmRequest before it calls confirm_mfa_enrollment, checks the stripped code rather than
-    the one submitted, or cuts the enrolment code instead of refusing it."""
+    """RED when: ui_mfa_verify stops checking the code against MfaConfirmRequest before it calls
+    confirm_mfa_enrollment, checks the stripped code rather than the one submitted, or cuts or
+    refuses the enrolment code instead of passing it on for the service to bound."""
     service = await _service(engine)
     await _add(service)
     calls = _spy(monkeypatch, service, "confirm_mfa_enrollment")
@@ -303,8 +305,6 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
         for refused in (
             {"code": "1" * (_CONFIRM_CODE_MAX + 1)},
             {"code": "1" * _CONFIRM_CODE_MAX + " "},
-            # The enrolment code is refused past MfaConfirmRequest's bound too, never cut to it.
-            {"code": "123456", "enrolment_code": "e" * (_ENROLMENT_CODE_MAX + 1)},
         ):
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
             r = await c.post("/ui/account/mfa/verify", data=refused, headers=SAME_ORIGIN)
@@ -316,4 +316,15 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
             "/ui/account/mfa/verify", data={"code": "1" * _CONFIRM_CODE_MAX}, headers=SAME_ORIGIN
         )
         assert r.status_code == 400 and "Invalid code." in r.text
-    assert len(calls) == 1 and calls[0][1] == "1" * _CONFIRM_CODE_MAX
+        # The enrolment code is not the route's to bound: it goes on uncut, and the service bounds
+        # it where it reads one (a local account owes none, so this one is ignored).
+        oversized = "e" * (ENROLMENT_CODE_MAX + 1)
+        await mint_bound_proof(c, "/ui/account/mfa/confirm")
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "123456", "enrolment_code": oversized},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 400 and "Invalid code." in r.text
+    assert len(calls) == 2 and calls[0][1] == "1" * _CONFIRM_CODE_MAX
+    assert calls[1][-1]["enrolment_code"] == oversized

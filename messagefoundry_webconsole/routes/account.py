@@ -63,7 +63,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _CEREMONY_RETRY_AFTER, _form_fits, _form_within_lengths, _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _form_fits, _refusal_error
 
 _log = logging.getLogger(__name__)
 
@@ -633,11 +633,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         raw_code = form.get("code", "")
         enrolment_code = form.get("enrolment_code", "")
         try:
-            # The JSON MfaConfirmRequest's bounds, on both codes as submitted: an oversized one is
-            # refused, never cut, is never checked, and reads as a wrong code.
-            if not _form_fits(
-                request, MfaConfirmRequest, code=raw_code, enrolment_code=enrolment_code
-            ):
+            # The JSON MfaConfirmRequest's bound on the code as submitted: an oversized one is
+            # refused, never cut, is never checked, and reads as a wrong code. The enrolment code
+            # goes on uncut; the service bounds it where it reads it (BACKLOG #5399), so the
+            # refusals it gives before that read still come first.
+            if not _form_fits(request, MfaConfirmRequest, code=raw_code):
                 elevation = Elevation()
             else:
                 elevation = await service.confirm_mfa_enrollment(
@@ -919,20 +919,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=exc.status_code,
                 headers={"Retry-After": _CEREMONY_RETRY_AFTER},
             )
-        if (
-            enrolment_code is not None
-            and not factor_refused
-            and not _form_within_lengths(request, MfaConfirmRequest, enrolment_code=enrolment_code)
-        ):
-            # BACKLOG #5399: the bound the JSON MfaConfirmRequest sets on the enrolment code. An
-            # oversized one is refused, never cut, is not checked or audited, and gets the reply a
-            # refused enrolment code gets. The ceremony stays staged. A factor-refused request
-            # skips this, so the service still pops the ceremony and audits the refusal; it reads
-            # no enrolment code on that path, so it is passed none.
-            return JSONResponse(
-                {"ok": False, "error": str(EnrolmentCodeRefused())}, status_code=400
-            )
         try:
+            # BACKLOG #5399: the enrolment code goes on as submitted, never cut. The service bounds
+            # it where it reads it, after every refusal that comes before that read, and refuses
+            # an oversized one as a refused code, audited.
             elevation = await service.finish_webauthn_registration(
                 identity,
                 response_json,
@@ -942,7 +932,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 rp_id=rp[0],
                 origin=rp[1],
                 factor_refused=factor_refused,
-                enrolment_code=None if factor_refused else enrolment_code,
+                enrolment_code=enrolment_code,
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or
