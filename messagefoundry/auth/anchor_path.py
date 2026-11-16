@@ -431,7 +431,9 @@ def _strip_win_prefix(path: str) -> str | None:
     Neither is read as the nearest plain path: which object the kernel reaches there is not
     emulated, so it is refused. A device prefix written with a forward slash is returned as
     written, unless it climbs out; :func:`windows_chain` names it a device path after its
-    normpath, except a volume GUID path, which it walks."""
+    normpath, except a ``//?/Volume{`` path, which it walks. A drive letter or volume GUID with no
+    separator after it is returned too, since a ``subst`` target of that form is joined to the
+    rest of a path; :func:`windows_chain` refuses one the open would reach as the volume device."""
     # A normalized device prefix: ``\\.\`` or ``\\?\`` in any mix of slashes, but not the verbatim
     # all-backslash ``\\?\``.
     head = path[:4]
@@ -454,6 +456,19 @@ def _strip_win_prefix(path: str) -> str | None:
                 return "\\\\?\\" + rest
             return None
     return path
+
+
+def _strip_nt_target(target: str) -> str | None:
+    """A link or ``subst`` target, which is an NT path the kernel reads as written, in the form
+    the walk reads, or ``None`` where :func:`_strip_win_prefix` would apply Win32's normalization
+    to it. Any device prefix but an all-backslash ``\\\\?\\`` or ``\\??\\`` is refused, and so is a
+    rest that prefix's verbatim check would refuse (vault BACKLOG #5515)."""
+    head = target[:4].replace("/", "\\")
+    if head in ("\\\\.\\", "\\\\?\\", "\\??\\") and not (
+        target[:4] in ("\\\\?\\", "\\??\\") and _verbatim_rest_is_plain(target[4:])
+    ):
+        return None
+    return _strip_win_prefix(target)
 
 
 #: A probe answers ``(kind, link target or None)`` for one path, without following a final link.
@@ -600,12 +615,17 @@ def windows_chain(
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
     link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
     dot, which Win32 strips; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
-    device prefix written with forward slashes (``//?/S:/x``); a verbatim path, or a ``..`` that
-    climbs out of a device prefix, that the walk's normpath would read as another object
-    (:func:`_strip_win_prefix`, vault BACKLOG #5515); and a stream name after a link. A path that
-    reaches a share ends with :data:`SHARE_CAUSE`."""
+    device prefix written with forward slashes (``//?/S:/x``); a verbatim path, or a ``.`` or
+    ``..`` that reaches or climbs out of a device prefix's first name, that the walk's normpath
+    would read as another object (:func:`_strip_win_prefix`, vault BACKLOG #5515), a ``..`` that
+    climbs out of a prefixed working directory, a drive or volume GUID with no separator after
+    it, and a link or ``subst`` target with a ``\\\\.\\`` or non-verbatim prefix
+    (:func:`_strip_nt_target`); and a stream name after a link. A path that reaches a share ends
+    with :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
-    if full is None:
+    # A prefixed drive with no separator after it (``\\?\C:``, ``\\.\C:``) is the volume device,
+    # not a drive-relative path.
+    if full is None or (full != path and _drive_relative(full)):
         return [], WalkCause.plain(_DEVICE_PATH)
     if _drive_relative(full):
         return [], WalkCause.plain(_DRIVE_RELATIVE)
@@ -613,8 +633,11 @@ def windows_chain(
         # A working directory may itself carry a \\?\ prefix, which the loop below would refuse.
         # It is stripped before the join, not after: Win32 normalizes a relative name joined to
         # it, so the joined text is not verbatim, and the verbatim check must not read it as such.
-        base = _strip_win_prefix(cwd() if callable(cwd) else cwd)
-        if base is None:
+        cwd_text = cwd() if callable(cwd) else cwd
+        base = _strip_win_prefix(cwd_text)
+        # A `..` that climbs past a prefixed working directory's first name may be collapsed
+        # against the prefix, as in a device path, where normpath stops at the drive.
+        if base is None or (base != cwd_text and _climbs_out_of_device(cwd_text[4:] + "\\" + full)):
             return [], WalkCause.plain(_DEVICE_PATH)
         full = ntpath.join(base, full)
     chain: list[tuple[str, str]] = []
@@ -642,6 +665,9 @@ def windows_chain(
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
             return chain, WalkCause.plain("the path has no drive or volume")
+        if len(drive) != 2 and not rest:
+            # A volume GUID with no separator after it (``//?/Volume{x}``) opens the volume device.
+            return chain, WalkCause.plain(_DEVICE_PATH)
         try:
             substituted = drive_target(drive) if len(drive) == 2 else None
         except OSError as exc:
@@ -654,7 +680,7 @@ def windows_chain(
             hops += 1
             if hops > MAX_LINK_HOPS:
                 return chain, WalkCause.plain(_TOO_MANY_HOPS)
-            target = _strip_win_prefix(substituted)
+            target = _strip_nt_target(substituted)
             if not target:
                 return chain, WalkCause(
                     f"the drive {drive} stands for a path this check does not read",
@@ -697,7 +723,7 @@ def windows_chain(
                 hops += 1
                 if hops > MAX_LINK_HOPS:
                     return chain, WalkCause.plain(_TOO_MANY_HOPS)
-                spliced_target = _strip_win_prefix(target or "")
+                spliced_target = _strip_nt_target(target or "")
                 if not spliced_target:
                     return chain, WalkCause(
                         f"the link {child!r} points at a path this check does not read",

@@ -519,6 +519,14 @@ def _probe(links: dict[str, str] | None = None) -> ap.WinProbe:
         r"\\.\C:\certs\..",
         r"\\.\C:\.",
         r"\\.\Volume{0000}\certs\..",
+        # A forward-slash climb from one volume GUID into another: was walked under the first.
+        "//?/Volume{0000}/x/../../Volume{1111}/certs/ca.pem",
+        # A drive letter or volume GUID with no separator after it opens the volume device.
+        r"\\?\C:",
+        r"\\.\C:",
+        r"\\?\Volume{0000}",
+        r"\\.\Volume{0000}",
+        "//?/Volume{0000}",
     ],
 )
 def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path: str) -> None:
@@ -528,9 +536,11 @@ def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path:
     assert (chain, cause) == ([], "the path is a device path this check does not read")
 
 
-def test_a_link_to_a_verbatim_path_normpath_would_change_is_not_walked() -> None:
-    """A junction or symlink target is an NT path, read as written. Red as above."""
-    links = {"C:\\certs\\lnk": "\\??\\C:\\real\\..\\other"}
+@pytest.mark.parametrize("target", [r"\??\C:\real\..\other", r"\\.\C:\real\..\other"])
+def test_a_link_to_a_device_path_normpath_would_change_is_not_walked(target: str) -> None:
+    """A junction or symlink target is an NT path, read as written, so not even a ``\\\\.\\``
+    target is normalized. Red as above."""
+    links = {"C:\\certs\\lnk": target}
     _chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(links))
     assert cause is not None and cause.kind == "a link points at a path this check does not read"
 
@@ -561,6 +571,16 @@ def test_a_relative_anchor_under_a_verbatim_working_directory_is_still_walked(an
     as a verbatim path. Red under: running the verbatim check over the joined text."""
     _chain, cause = windows_chain(anchor, r"\\?\C:\svc", _probe())
     assert cause is None
+
+
+@pytest.mark.parametrize("cwd", [r"\\.\C:\svc", r"\\?\C:\svc"])
+def test_a_relative_anchor_climbing_out_of_a_prefixed_working_directory_is_not_walked(
+    cwd: str,
+) -> None:
+    """Joined to a device-prefixed working directory, a `..` past the drive may be collapsed
+    against the prefix and reach a share. Red under: normpath clamping it at C:\\."""
+    chain, cause = windows_chain(r"..\..\..\UNC\files.test\share\ca.pem", cwd, _probe())
+    assert (chain, cause) == ([], "the path is a device path this check does not read")
 
 
 @pytest.mark.parametrize(
