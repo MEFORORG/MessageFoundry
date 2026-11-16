@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from messagefoundry.store.crypto import (
@@ -58,6 +59,7 @@ __all__ = [
     "TRANSIENT_OPEN_BACKOFF_SECONDS",
     "QueueOpenFault",
     "queue_open_fault",
+    "release_unreturned",
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
@@ -132,6 +134,30 @@ class QueueOpenFault(Exception):
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:
     """:class:`QueueOpenFault` naming ``exc`` by its type and its own text only."""
     return QueueOpenFault(f"{type(exc).__name__}: {exc}")
+
+
+class _Releaser(Protocol):
+    async def release_claimed(self, ids: Sequence[str], now: float | None = None) -> None: ...
+
+
+async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -> None:
+    """Return every row of ``lanes`` that ``claim_fifo_heads`` claimed but will not return to
+    ``pending``, through ``store.release_claimed``, before the claim re-raises an error in the
+    engine's own code (:data:`PROGRAMMING_ERRORS`, BACKLOG #5735). The claim committed before it
+    decoded, so without this every lane's rows stay ``inflight`` and the next claim delivers past
+    them. A row the claim already settled (dead-lettered) is not ``inflight``, and the release
+    leaves it as it is. A failed release is logged and swallowed, so the caller re-raises the
+    original error; the rows then stay ``inflight`` until ``reset_stale_inflight``."""
+    ids = [str(row["id"]) for rows in lanes for row in rows]
+    try:
+        await store.release_claimed(ids)
+    except Exception as failed:  # noqa: BLE001 -- the engine error being re-raised must stay loud
+        _log.error(
+            "could not release %d claimed queue row(s) after an engine error (%s);"
+            " they stay inflight until the next start",
+            len(ids),
+            type(failed).__name__,
+        )
 
 
 #: The audit action written when a queue row's payload does not open under its own tag.

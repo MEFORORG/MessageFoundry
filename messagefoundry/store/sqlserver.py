@@ -185,6 +185,7 @@ from messagefoundry.store.queue_tag import (
     queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
 )
@@ -11626,56 +11627,68 @@ class SqlServerStore:
         by_lane_rows: dict[str, list[dict[str, Any]]] = {}
         for d in claimed_rows:
             by_lane_rows.setdefault(d[lane_col], []).append(d)
-        by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in by_lane_rows.items():
-            items: list[OutboxItem] = []
-            in_order = sorted(lane_rows, key=lambda r: r["seq"])
-            for i, d in enumerate(in_order):
-                try:
-                    payload = self._open_claimed(d, stage)
-                except CipherError as exc:
-                    fault = await self._dead_letter_unopenable(d, stage, exc)
-                    if fault is not None:
-                        # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
-                        items.extend(
-                            OutboxItem(
-                                id=r["id"],
-                                message_id=r["message_id"],
-                                channel_id=r["channel_id"],
-                                destination_name=r["destination_name"],
-                                handler_name=r["handler_name"],
-                                payload="",
-                                attempts=r["attempts"],
-                                stage=stage,
-                                created_at=r["created_at"],
-                                open_fault=fault,
-                            )
-                            for r in in_order[i:]
-                        )
-                        break
-                    continue
-                items.append(
-                    OutboxItem(
-                        id=d["id"],
-                        message_id=d["message_id"],
-                        channel_id=d["channel_id"],
-                        destination_name=d["destination_name"],
-                        handler_name=d["handler_name"],
-                        payload=payload,
-                        attempts=d["attempts"],
-                        stage=stage,
-                        # #134 (ADR 0082): the batch delivery body reads the head's created_at for the
-                        # deterministic BHS-7 + the coalescing deadline. The single claim was patched to
-                        # project it; the pooled multi-lane claim must too, else pooled-mode batches on
-                        # SQL Server get an empty BHS-7 and a claim-time (not ingest-time) window.
-                        created_at=d["created_at"],
-                    )
-                )
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        by_lane = await self._open_claimed_heads(by_lane_rows, stage, rearm)
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
+
+    async def _open_claimed_heads(
+        self, by_lane_rows: dict[str, list[dict[str, Any]]], stage: str, rearm: set[str]
+    ) -> dict[str, list[OutboxItem]]:
+        """Open each lane's committed ``claim_fifo_heads`` rows, oldest first (see the caller)."""
+        by_lane: dict[str, list[OutboxItem]] = {}
+        try:
+            for lane, lane_rows in by_lane_rows.items():
+                items: list[OutboxItem] = []
+                in_order = sorted(lane_rows, key=lambda r: r["seq"])
+                for i, d in enumerate(in_order):
+                    try:
+                        payload = self._open_claimed(d, stage)
+                    except CipherError as exc:
+                        fault = await self._dead_letter_unopenable(d, stage, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
+                            items.extend(
+                                OutboxItem(
+                                    id=r["id"],
+                                    message_id=r["message_id"],
+                                    channel_id=r["channel_id"],
+                                    destination_name=r["destination_name"],
+                                    handler_name=r["handler_name"],
+                                    payload="",
+                                    attempts=r["attempts"],
+                                    stage=stage,
+                                    created_at=r["created_at"],
+                                    open_fault=fault,
+                                )
+                                for r in in_order[i:]
+                            )
+                            break
+                        continue
+                    items.append(
+                        OutboxItem(
+                            id=d["id"],
+                            message_id=d["message_id"],
+                            channel_id=d["channel_id"],
+                            destination_name=d["destination_name"],
+                            handler_name=d["handler_name"],
+                            payload=payload,
+                            attempts=d["attempts"],
+                            stage=stage,
+                            # #134 (ADR 0082): the batch delivery body reads the head's created_at for the
+                            # deterministic BHS-7 + the coalescing deadline. The single claim was patched to
+                            # project it; the pooled multi-lane claim must too, else pooled-mode batches on
+                            # SQL Server get an empty BHS-7 and a claim-time (not ingest-time) window.
+                            created_at=d["created_at"],
+                        )
+                    )
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except PROGRAMMING_ERRORS:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the bug.
+            await release_unreturned(self, by_lane_rows.values())
+            raise
+        return by_lane
 
     async def list_fifo_lanes(
         self,

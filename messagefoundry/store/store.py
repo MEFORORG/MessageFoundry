@@ -190,6 +190,7 @@ from messagefoundry.store.queue_tag import (
     queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
 )
@@ -14984,24 +14985,29 @@ class MessageStore:
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload must not blow up the whole
         # claim — dead-letter the bad row STANDALONE and deliver the rest (mirrors the batch claim).
         by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in claimed_by_lane.items():
-            items: list[OutboxItem] = []
-            for i, row in enumerate(lane_rows):
-                try:
-                    items.append(await self._outbox_item_from_row(row))
-                except Exception as exc:
-                    fault = await self._dead_letter_unopenable(row, exc)
-                    if fault is not None:
-                        # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
-                        items.extend(
-                            replace(OutboxItem.from_row(r, ""), open_fault=fault)
-                            for r in lane_rows[i:]
-                        )
-                        break
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        try:
+            for lane, lane_rows in claimed_by_lane.items():
+                items: list[OutboxItem] = []
+                for i, row in enumerate(lane_rows):
+                    try:
+                        items.append(await self._outbox_item_from_row(row))
+                    except Exception as exc:
+                        fault = await self._dead_letter_unopenable(row, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (#5735).
+                            items.extend(
+                                replace(OutboxItem.from_row(r, ""), open_fault=fault)
+                                for r in lane_rows[i:]
+                            )
+                            break
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except PROGRAMMING_ERRORS:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the bug.
+            await release_unreturned(self, claimed_by_lane.values())
+            raise
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))
 
     async def list_fifo_lanes(

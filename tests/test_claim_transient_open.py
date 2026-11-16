@@ -15,6 +15,7 @@ is still dead-lettered and reported (the control). SQLite; the server backends m
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import sqlite3
 import time
@@ -23,9 +24,10 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, OutboxItem
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    CipherError,
     CipherUnavailableError,
     generate_key,
     make_cipher,
@@ -439,3 +441,164 @@ def test_the_postgres_unopened_item_carries_the_fault() -> None:
     }
     item = PostgresStore._unopened_item(row, fault)
     assert item.open_fault is fault and item.payload == "" and item.id == "r"
+
+
+# --- the fault T17 logs holds no claimed row's plaintext (BACKLOG #6706) --------------------------
+
+
+def _frames(exc: BaseException) -> list[Any]:
+    frames = []
+    tb = exc.__traceback__
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    return frames
+
+
+def _payloads_in(value: Any) -> set[str]:
+    values = value if isinstance(value, (list, tuple)) else [value]
+    return {v.payload for v in values if isinstance(v, OutboxItem) and v.payload}
+
+
+async def test_the_fault_t17_logs_holds_no_claimed_payload(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Row one opens and its body runs; the outage hits row two. The exception T17 logs is a fresh
+    fault with no chain, and no frame in its traceback holds row one's plaintext."""
+    from messagefoundry.pipeline.stage_dispatcher import _LanePhase  # noqa: PLC0415
+    from tests.test_stage_dispatcher import (  # noqa: PLC0415
+        ManualClock,
+        RecordingAlertSink,
+        RecordingStub,
+        _make,
+        _wait_lane,
+    )
+
+    store, cipher, _db = await _open_ingress(tmp_path, 2)
+    store._test_backend = "sqlite"  # type: ignore[attr-defined]
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    d = _make(store, stub, set(), clock=mc, alert_sink=RecordingAlertSink())
+    cipher.healthy_opens = 1
+    caplog.set_level(logging.ERROR, logger="messagefoundry.pipeline.stage_dispatcher")
+    await d.start()
+    try:
+        d.mark_ready(_LANE)
+        await _wait_lane(d, _LANE, _LanePhase.PARKED, _LanePhase.STOPPED)
+        assert len(stub.records) == 1  # row one's body ran on its plaintext
+        seen = [
+            r.exc_info[1]
+            for r in caplog.records
+            if "T17 infra fault" in r.getMessage() and r.exc_info is not None
+        ]
+        assert len(seen) == 1
+        fault = seen[0]
+        assert isinstance(fault, QueueOpenFault)
+        assert (fault.__cause__, fault.__context__) == (None, None)
+        leaked = {p for f in _frames(fault) for v in f.f_locals.values() for p in _payloads_in(v)}
+        assert leaked == set(), "a frame in the logged fault's traceback holds claimed plaintext"
+    finally:
+        await d.stop()
+        await store.close()
+
+
+# --- an engine error in the pooled claim leaves no lane stranded (BACKLOG #5735) ------------------
+
+
+class _RefusingCipher(_OutageCipher):
+    """Refuses the row itself (a plain :class:`CipherError`) once ``healthy_opens`` opens ran."""
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        if self.healthy_opens is not None:
+            if self.healthy_opens <= 0:
+                raise CipherError("bad cell")
+            self.healthy_opens -= 1
+        return self._inner.decrypt(stored, aad=aad)
+
+
+async def _broken_dead_letter(*_a: Any, **_kw: Any) -> None:
+    raise TypeError("dead_letter_now() got an unexpected keyword argument")
+
+
+async def test_an_engine_error_in_the_pooled_claim_releases_every_lane(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two lanes are claimed in one commit. Lane A's two rows open; lane B's head is refused and
+    its dead-letter write hits an engine bug, which the claim re-raises. Every claimed row is back
+    to ``pending`` with its attempts undone, and the next claim returns each lane's head first."""
+    inner = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(inner, AesGcmCipher)
+    cipher = _RefusingCipher(inner)
+    db = tmp_path / "strand.db"
+    store = await MessageStore.open(db, cipher=cipher)  # type: ignore[arg-type]
+    lanes = ["IB_A", "IB_B"]
+    try:
+        for t, lane in enumerate(lanes):
+            for k in range(2):
+                await store.enqueue_ingress(channel_id=lane, raw=f"MSH|{lane}{k}", now=100.0 + t)
+        cipher.healthy_opens = 2  # lane A's two rows open, then lane B's head is refused
+        monkeypatch.setattr(store, "dead_letter_now", _broken_dead_letter)
+        with pytest.raises(TypeError):
+            await store.claim_fifo_heads("ingress", lanes, per_lane_limit=10)
+        rows = _side(db, "SELECT status, attempts FROM queue WHERE stage='ingress' ORDER BY rowid")
+        assert [(str(s), int(a)) for s, a in rows] == [("pending", 0)] * 4
+
+        cipher.healthy_opens = None
+        monkeypatch.undo()
+        heads = await store.claim_fifo_heads("ingress", lanes, per_lane_limit=10)
+        assert [i.payload for i in heads.by_lane["IB_A"]] == ["MSH|IB_A0", "MSH|IB_A1"]
+        assert [i.payload for i in heads.by_lane["IB_B"]] == ["MSH|IB_B0", "MSH|IB_B1"]
+    finally:
+        await store.close()
+
+
+def _server_row(lane: str, seq: int) -> dict[str, Any]:
+    return {
+        "id": f"{lane}-{seq}",
+        "message_id": "m",
+        "channel_id": lane,
+        "destination_name": None,
+        "handler_name": None,
+        "attempts": 1,
+        "stage": "ingress",
+        "created_at": 1.0,
+        "seq": seq,
+    }
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_pooled_claim_releases_every_lane_on_an_engine_error(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server twins of the test above, offline: the decode step that runs after the claim
+    commits hands every claimed row of every lane, lane A's opened rows included, to the backend's
+    own ``release_claimed`` before it re-raises an engine bug. That release's ``inflight`` guard is
+    what puts them back to ``pending``; it is covered on each backend by test_claim_fifo_heads."""
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
+    store = _server_store(backend, _FakeServer(TypeError("bug")))
+    released: list[str] = []
+
+    async def release_claimed(ids: Any, now: float | None = None) -> None:
+        released.extend(ids)
+
+    store.release_claimed = release_claimed
+    by_lane_rows = {
+        "A": [_server_row("A", 1), _server_row("A", 2)],
+        "B": [_server_row("B", 3), _server_row("B", 4)],
+    }
+
+    def opened(r: Any, *_a: Any) -> Any:
+        if r["channel_id"] == "B":
+            raise QueueTagError("t")
+        return "body" if backend == "sqlserver" else OutboxItem.from_row(r, "body")
+
+    if backend == "sqlserver":
+        monkeypatch.setattr(store, "_open_claimed", opened)
+        with pytest.raises(TypeError):
+            await store._open_claimed_heads(by_lane_rows, "ingress", set())
+    else:
+        monkeypatch.setattr(store, "_outbox_item", opened)
+        with pytest.raises(TypeError):
+            await store._open_claimed_heads(by_lane_rows, set())
+    assert sorted(released) == ["A-1", "A-2", "B-3", "B-4"]

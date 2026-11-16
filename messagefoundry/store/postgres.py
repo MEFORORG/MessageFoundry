@@ -193,6 +193,7 @@ from messagefoundry.store.queue_tag import (
     queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
 )
@@ -5566,24 +5567,36 @@ class PostgresStore:
         by_lane_rows: dict[str, list[Any]] = {}
         for row in kept_rows:
             by_lane_rows.setdefault(row[lane_col], []).append(row)
-        by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in by_lane_rows.items():
-            items: list[OutboxItem] = []
-            in_order = sorted(lane_rows, key=lambda r: r["seq"])
-            for i, row in enumerate(in_order):
-                try:
-                    items.append(self._outbox_item(row))
-                except CipherError as exc:
-                    fault = await self._dead_letter_unopenable(row, exc)
-                    if fault is not None:
-                        # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
-                        items.extend(self._unopened_item(r, fault) for r in in_order[i:])
-                        break
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        by_lane = await self._open_claimed_heads(by_lane_rows, rearm)
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
+
+    async def _open_claimed_heads(
+        self, by_lane_rows: dict[str, list[Any]], rearm: set[str]
+    ) -> dict[str, list[OutboxItem]]:
+        """Open each lane's committed ``claim_fifo_heads`` rows, oldest first (see the caller)."""
+        by_lane: dict[str, list[OutboxItem]] = {}
+        try:
+            for lane, lane_rows in by_lane_rows.items():
+                items: list[OutboxItem] = []
+                in_order = sorted(lane_rows, key=lambda r: r["seq"])
+                for i, row in enumerate(in_order):
+                    try:
+                        items.append(self._outbox_item(row))
+                    except CipherError as exc:
+                        fault = await self._dead_letter_unopenable(row, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (#5735).
+                            items.extend(self._unopened_item(r, fault) for r in in_order[i:])
+                            break
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except PROGRAMMING_ERRORS:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the bug.
+            await release_unreturned(self, by_lane_rows.values())
+            raise
+        return by_lane
 
     async def list_fifo_lanes(
         self,
