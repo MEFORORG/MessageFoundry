@@ -333,7 +333,7 @@ class TestNotesCapReadsTheCollapsedLength:
         return record(repo)
 
     def test_short_notes_with_a_whitespace_run_are_collapsed_and_written(self, repo: Path) -> None:
-        assert self.declare(repo, "a    b		c")["notes"] == "a b c"
+        assert self.declare(repo, "a    b\t\tc")["notes"] == "a b c"
 
     def test_long_notes_are_capped_at_2000_after_collapsing(self, repo: Path) -> None:
         # 3001 characters collapse to 2001 ("a " * 1000 + "b"), so the cap still bites, at 2000.

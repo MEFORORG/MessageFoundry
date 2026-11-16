@@ -790,6 +790,20 @@ def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     return rr.outbound_status(name) if rr.running else "stopped"
 
 
+def _outbound_display_status(rr: RegistryRunner, name: str) -> str:
+    """One declared outbound's display state, the per-lane facts first: ``not_deployed``,
+    ``failed``, ``filtered``, then :func:`_live_outbound_status`. Its ``"running"`` is the only
+    state in which the lane delivers, so the metadata row's ``running`` reads it (BACKLOG #5762)
+    and the graph node's status is it."""
+    if not rr.registry.outbound[name].deployed:
+        return "not_deployed"
+    if rr.outbound_failed(name):
+        return "failed"
+    if rr.outbound_filtered(name):
+        return "filtered"
+    return _live_outbound_status(rr, name)
+
+
 def _backlog(depth: int, recent: int) -> float | None:
     """Estimated seconds to clear the queue: 0 if empty, None if queued but nothing draining."""
     if depth == 0:
@@ -6246,6 +6260,7 @@ def create_app(
         rr, direction = await _guarded_direction(engine, identity, name, client_ip(request))
         if direction == "in":
             ic = rr.registry.inbound[name]
+            in_failed, in_filtered = rr.inbound_failed(name), rr.inbound_filtered(name)
             return ConnectionMetadata(
                 name=name,
                 direction="in",
@@ -6255,8 +6270,8 @@ def create_app(
                 metadata=dict(ic.metadata) if ic.metadata else None,
                 settings=redacted_settings(ic.spec.settings),
                 # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
-                error=rr.inbound_failed(name) or rr.inbound_filtered(name),
-                fault=_fault(rr.inbound_failed(name), rr.inbound_filtered(name)),
+                error=in_failed or in_filtered,
+                fault=_fault(in_failed, in_filtered),
             )
         oc = rr.registry.outbound[name]
         failed, filtered = rr.outbound_failed(name), rr.outbound_filtered(name)
@@ -6264,12 +6279,9 @@ def create_app(
             name=name,
             direction="out",
             method=oc.spec.type.value,
-            # BACKLOG #5762: this lane's own state, not the graph's, as the inbound branch reads. A
-            # lane that is stopped, STOP-held, log-halted, failed, DR-parked or not deployed
-            # delivers nothing, so it must not read running beside the fault that names why.
-            running=(
-                oc.deployed and failed is None and filtered is None and rr.outbound_running(name)
-            ),
+            # BACKLOG #5762: the lane's display state, as the graph node reads it, not the graph's
+            # running flag alone, which read running for a lane that delivers nothing.
+            running=_outbound_display_status(rr, name) == "running",
             metadata=dict(oc.metadata) if oc.metadata else None,
             settings=redacted_settings(oc.spec.settings),
             simulated=rr.outbound_simulated(name),
@@ -10061,15 +10073,8 @@ def create_app(
             return "running" if rr.inbound_running(name) else "stopped"
 
         def _outbound_status(name: str) -> str:
-            oc = reg.outbound[name]
-            if not oc.deployed:
-                return "not_deployed"
-            if rr.outbound_failed(name):
-                return "failed"
-            if rr.outbound_filtered(name):
-                return "filtered"
             # Gated (#1814): the inbound node beside it already reads "stopped" on a down graph.
-            return _live_outbound_status(rr, name)
+            return _outbound_display_status(rr, name)
 
         # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
         nodes: dict[tuple[str, str], GraphNode] = {}

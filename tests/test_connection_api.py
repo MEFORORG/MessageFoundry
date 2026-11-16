@@ -642,7 +642,10 @@ async def test_metadata_outbound_simulated(
     assert body["simulated"] is True
 
 
-@pytest.mark.parametrize("down", ["paused", "failed", "filtered", "not_deployed", "graph_stopped"])
+@pytest.mark.parametrize(
+    "down",
+    ["paused", "stop_held", "log_halted", "failed", "filtered", "not_deployed", "graph_stopped"],
+)
 async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
     engine: Engine,
     client: httpx.AsyncClient,
@@ -650,21 +653,28 @@ async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
     monkeypatch: pytest.MonkeyPatch,
     down: str,
 ) -> None:
-    """BACKLOG #5762: the outbound row read the GRAPH's running flag, so a lane that delivers
-    nothing read running in the same payload whose error names why. The baseline proves the
-    running graph is what makes True reachable, so each False below is the lane's own state."""
+    """BACKLOG #5762: the outbound row read only the graph's running flag, so a lane that delivers
+    nothing read running. Each case first reads running with the graph up, the positive control,
+    then turns on one down state and reads it False. For not_deployed the control is the lane's
+    own outbound_running, since the deployed flag is fixed when the graph is built."""
     reg = _registry(out_dir=str(tmp_path / "out"))
     if down == "not_deployed":
         reg.outbound["OB"] = OutboundConnection(
             "OB", reg.outbound["OB"].spec, metadata={"tier": "gold"}, deployed=False
         )
     rr = engine.add_registry(reg)
-    # The graph runs, and only the lane state varies; monkeypatch restores it for the teardown.
+    # The graph runs; monkeypatch restores the flag for the teardown.
     monkeypatch.setattr(rr, "_running", True)
-    if down != "not_deployed":
+    if down == "not_deployed":
+        assert rr.outbound_running("OB") is True
+    else:
         assert (await client.get("/connections/OB/metadata")).json()["running"] is True
     if down == "paused":
         rr._outbound_paused.add("OB")
+    elif down == "stop_held":
+        rr._stop_held.add(("outbound", "OB"))
+    elif down == "log_halted":
+        monkeypatch.setattr(rr, "_log_write_stopped", True)
     elif down == "failed":
         rr._failed[("outbound", "OB")] = FailedLine("build failed", False)
     elif down == "filtered":
