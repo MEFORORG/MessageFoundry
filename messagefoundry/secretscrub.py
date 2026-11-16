@@ -1292,7 +1292,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # password running to the value's "@", took the ``PWD=`` label the label pass needed, and printed
 # the value that label hid (code review, round 4). After the label passes a value they read is a
 # placeholder, which the run after the password stops at; and every pass before this one is the
-# code ``origin/main`` ran, so on one call this pass only hides more.
+# code ``origin/main`` ran, so on one call this pass only hides more. It does not run at all on a
+# line where :func:`_union` keeps the reading before whole; :func:`_run` names those.
 #
 # THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@". The user was
 # ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
@@ -1330,7 +1331,11 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=") is cut at that "@" and its tail
 # prints, as the whole tail did before; and an empty user's password holding one of those is not
 # read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "=" is not one of those:
-# the run after the first segment may hold it, so ``redis://:p=ss@host`` is read and hidden.
+# the run after the first segment may hold it, so ``redis://:p=ss@host`` is read and hidden. Both
+# count a character an earlier filter wrote: on the log chain the PHI pass runs first, so a
+# password holding a date- or name-shaped run reaches this pass holding ``[redacted]``, and
+# ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and ``-Kv9x`` (code review, round 4). A
+# percent-encoded password-only DSN holds a "%", so ``redis://:p%40Kv9x@host`` is not read either.
 #
 # AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
 # are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so
@@ -2086,7 +2091,10 @@ def _run(
     ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union`'s reading before
     does: it is the code ``origin/main`` ran, which had none, and with it the pass's run crossed a
     camelCase label only the shipped reading reads, so the union hid that label (``_WIDE_DSN_PASSWORD``
-    says what printed)."""
+    says what printed). So where :func:`_union` returns that reading whole, on a line where the
+    shipped one would hide a member key's ";" and on an untraceable one, the widened pass does not
+    run, and a password-only DSN, or the tail of a password holding an "@", prints there as it did
+    before #5386. The support bundle's own last pass still reads it."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)

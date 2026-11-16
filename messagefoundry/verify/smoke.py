@@ -219,8 +219,9 @@ def smoke_self(
             reg.validate()
     except WiringError as exc:
         # The engine's own wiring diagnostic, so no type prefix. It wraps whatever a config module
-        # raised, so it takes the config-load arms' bound and the same square-bracket path as every
-        # other arm (BACKLOG #5395); before that it printed the exception text raw and unbounded.
+        # raised, so it takes the config-load arms' bound and the same square-bracket path as the
+        # other config-load and dry-run arms (BACKLOG #5395); before that it printed the exception
+        # text raw and unbounded.
         return CheckResult(
             rid,
             title,
