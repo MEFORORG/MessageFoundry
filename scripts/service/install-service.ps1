@@ -1696,7 +1696,7 @@ function Set-ServiceLogonRight {
             return
         }
         $lines = Get-Content -LiteralPath $inf
-        $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' }
+        $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' } | Select-Object -First 1
         if ($row) {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
             # already-granted SID (RID 110 vs 1100) would false-positive under -match and skip the grant,
@@ -1712,7 +1712,13 @@ function Set-ServiceLogonRight {
             }
         }
         if ($row) {
-            $new = $lines -replace '^\s*SeServiceLogonRight\s*=(.*)$', "SeServiceLogonRight =`$1,*$sid"
+            # An exported row can be present and empty. Appending ",*SID" to it would write a value
+            # that starts with a comma (BACKLOG #5401), so an empty row takes the SID alone. The
+            # replacement is built here and escaped, since a held account name may carry a '$'.
+            $kept = $value.Trim()
+            $joined = if ($kept) { "$kept,*$sid" } else { "*$sid" }
+            $new = $lines -replace '^\s*SeServiceLogonRight\s*=.*$',
+                ("SeServiceLogonRight = " + $joined.Replace('$', '$$'))
         } else {
             # No existing row: inject one under [Privilege Rights].
             $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"

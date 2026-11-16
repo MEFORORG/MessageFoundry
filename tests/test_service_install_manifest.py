@@ -2968,6 +2968,61 @@ def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
 
 
+def _grant_configured(tmp_path: Path, row: str | None) -> str:
+    """The policy install-service.ps1's Set-ServiceLogonRight hands ``secedit /configure`` when the
+    export holds ``row`` (``None``: no SeServiceLogonRight row at all), granting the right to
+    BUILTIN\\Administrators (S-1-5-32-544). secedit is a stub; nothing is configured."""
+    assert _SCRIPT is not None
+    parent = tmp_path / "grant-parent"
+    parent.mkdir(exist_ok=True)
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]"]
+    if row is not None:
+        inf.append(row)
+    inf.append("[Version]")
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+{_workdir_seam(parent)}
+  $script:Configured = ''
+  function secedit {{
+    $a = @($args)
+    $cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{ Set-Content -LiteralPath $cfg -Value {inf_ps} -Encoding Unicode }}
+    elseif ($a -contains '/configure') {{ $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ') }}
+    $global:LASTEXITCODE = 0
+  }}
+  Set-ServiceLogonRight -Account 'BUILTIN\Administrators' 3>$null 6>$null
+  'CONFIGURED=' + $script:Configured
+"""
+    out = _ok(_extract(_SCRIPT, ["Set-ServiceLogonRight", _WORKDIR_FN], body), tmp_path)
+    return out.strip().splitlines()[-1].removeprefix("CONFIGURED=")
+
+
+@_windows_only
+@pytest.mark.parametrize("row", ["SeServiceLogonRight =", "SeServiceLogonRight =   "])
+def test_the_grant_to_an_empty_exported_row_has_no_leading_comma(tmp_path: Path, row: str) -> None:
+    """BACKLOG #5401: an exported SeServiceLogonRight row can be present and empty. Appending
+    ``,*SID`` to it wrote a value that starts with a comma."""
+    configured = _grant_configured(tmp_path, row)
+    assert "SeServiceLogonRight = *S-1-5-32-544 |" in configured, configured
+    assert "=," not in configured.replace(" ", ""), configured
+
+
+@_windows_only
+def test_the_grant_keeps_every_holder_and_a_dollar_in_a_held_name(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the row above: a row with holders keeps them, in order, with the SID
+    appended, and a ``$`` in a held account name is written as itself, not as a backreference."""
+    configured = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\gmsa$1")
+    assert "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\gmsa$1,*S-1-5-32-544 |" in configured, (
+        configured
+    )
+
+
+@_windows_only
+def test_the_grant_with_no_exported_row_adds_one(tmp_path: Path) -> None:
+    configured = _grant_configured(tmp_path, None)
+    assert "[Privilege Rights] | SeServiceLogonRight = *S-1-5-32-544 |" in configured, configured
+
+
 # --- the secedit files live in a folder only administrators can change (BACKLOG #5563) -------------
 # The export and the database sat at $env:TEMP\mefor-secedit-remove-<PID>.inf/.sdb. The uninstaller
 # runs elevated, but the user's TEMP belongs to the user, so a same-user process at medium integrity
