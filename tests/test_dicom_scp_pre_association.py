@@ -567,9 +567,10 @@ async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing()
             # never sends it.
             closed = [await asyncio.to_thread(_closed_within, sock, 8.0) for sock in held]
             assert all(closed), f"{closed.count(False)} of {len(held)} peers not closed within 8 s"
-            # Why the thread count alone is not awaited: _until_ended. The 16 s is the two 8 s waits
-            # this test held before they were one.
-            await _until_ended(scp, baseline, within=16.0)
+            # The slot alone gets 8 s, the bound this test always held it to; then both the slot
+            # and the threads get 8 s more. Why the thread count alone is not awaited: _until_ended.
+            await _until(lambda: scp._server.active_associations == [], within=8.0)
+            await _until_ended(scp, baseline, within=8.0)
             assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
                 True,
                 0x0000,
