@@ -478,15 +478,24 @@ class _Section(_InputHidingModel):
         except ValidationError as exc:
             # A bool read as 0 can then fail the number's own bound (``gt=0``), and that message
             # would hide the coercion: name the bool instead.
-            for err in exc.errors(include_url=False):
-                if err["type"] in _NUMBER_BOUND_ERRORS and (
-                    found := _bool_at(value, err["loc"], where)
-                ):
-                    raise ValueError(_bool_on_a_number_refusal(found)) from None
-            raise
-        if (found := _bool_read_as_number(value, validated, where)) is not None:
-            raise ValueError(_bool_on_a_number_refusal(found))
-        return validated
+            found = next(
+                (
+                    path
+                    for err in exc.errors(include_url=False)
+                    if err["type"] in _NUMBER_BOUND_ERRORS
+                    and (path := _bool_at(value, err["loc"], where))
+                ),
+                None,
+            )
+            if found is None:
+                raise
+        else:
+            found = _bool_read_as_number(value, validated, where)
+            if found is None:
+                return validated
+        # Raised outside the handler, so the bound error, whose input a nested plain model does not
+        # hide, is not chained onto the refusal (BACKLOG #1796).
+        raise ValueError(_bool_on_a_number_refusal(found))
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
