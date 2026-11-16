@@ -460,9 +460,12 @@ $cmdType = [System.Management.Automation.Language.CommandAst]
 $parType = [System.Management.Automation.Language.CommandParameterAst]
 $rig = $L::ParseFile($RigPath, [ref]$null, [ref]$null)
 $installer = $L::ParseFile($InstallerPath, [ref]$null, [ref]$null)
-$f = @($installer.EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq 'Set-ServiceAccount' })
-if ($f.Count -ne 1) { throw "Set-ServiceAccount is defined $($f.Count) times at top level" }
-. ([scriptblock]::Create($f[0].Extent.Text))
+# Set-ServiceAccount disables a service it could not set through Disable-RefusedService.
+foreach ($fn in 'Set-ServiceAccount', 'Disable-RefusedService') {
+  $f = @($installer.EndBlock.Statements | Where-Object { $_ -is $fnType -and $_.Name -eq $fn })
+  if ($f.Count -ne 1) { throw "$fn is defined $($f.Count) times at top level" }
+  . ([scriptblock]::Create($f[0].Extent.Text))
+}
 # The rig's account names, from its own top-level assignments, in the order it makes them.
 $top = @($rig.EndBlock.Statements | Where-Object { $_ -is $assign })
 $rhs = { param($n) @($top | Where-Object { $_.Left.Extent.Text -eq $n })[0].Right.Extent.Text }

@@ -156,6 +156,7 @@ _FUNCTIONS = {
         "Get-ServiceImageProblem",
         "Set-ServiceImage",
         "Set-ServiceAccount",
+        "Disable-RefusedService",
         "Set-AdminOnlyAcl",
         "New-AdminOnlyFolder",
         "Get-NssmHomeProblem",

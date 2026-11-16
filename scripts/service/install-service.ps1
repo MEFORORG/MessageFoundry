@@ -375,12 +375,7 @@ function Set-ServiceAccount {
     )
     $fail = {
         param([string]$Why)
-        # ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
-        # DISPLAY name, so the service is found by Name and disabled as the object (-InputObject).
-        $exact = @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
-            Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
-        if ($exact) { Set-Service -InputObject $exact -StartupType Disabled -ErrorAction SilentlyContinue }
-        throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
+        throw "$Why $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start as the wrong account')"
     }
     $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
         Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
@@ -428,7 +423,6 @@ function Set-ServiceAccount {
             "reported success.")
     }
 }
-# END pinned-hash check
 
 function Disable-RefusedService {
     <#
@@ -451,9 +445,10 @@ function Disable-RefusedService {
     } catch {
         return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
             "it may start at the next boot. Disable it by hand: sc.exe config `"$ServiceName`" " +
-            "start= disabled")
+            "start= disabled.")
     }
 }
+# END pinned-hash check
 
 function Set-AdminOnlyAcl {
     <#
