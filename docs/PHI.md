@@ -118,8 +118,10 @@ either project's source at a commit, so a release that wraps or prefixes the tex
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
 `vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure. An
-outage does not (BACKLOG #5765): a failure `gave_no_verdict` names, at least an unreachable Vault,
-a 5xx and a refused token, is no tag failure, and the claim does not dead-letter the row (BACKLOG
+outage does not (BACKLOG #5765): a connection failure, a timeout, an HTTP 5xx, an HTTP 429, or a
+sealed or standby Vault (its 503), and nothing else, is no tag failure, and the claim does not
+dead-letter the row. Every other HTTP 4xx, a 403, a 404 or a 413 among them, is a verdict and is
+dead-lettered and alerted as before (`is_transient_open_failure` in `store/queue_tag.py`, BACKLOG
 #5735). Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
 infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
 under `infra_fault_policy = "stop"`, or raises `lane_stuck` under `retry_forever`. That covers the

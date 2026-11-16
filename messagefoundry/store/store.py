@@ -1180,8 +1180,9 @@ class OutboxItem:
     # Set only by ``claim_fifo_heads``, on a row whose body could not be opened for a reason that
     # is not the row (a key service that gave no verdict, a failed store read, a failed dead-letter
     # write), and on every later row of its lane; ``payload`` is then empty and must not be read.
-    # The pooled dispatcher raises it before the item's body runs, so the row takes the ADR 0070
-    # T17 infra-fault path (BACKLOG #5735). Never set on an item any other claim returns.
+    # The pooled dispatcher checks it before the item's body runs and, finding it set, never runs
+    # the body and never raises it: it hands a fresh, never-raised copy of it to the ADR 0070 T17
+    # infra-fault path (BACKLOG #5735, #6706). Never set on an item any other claim returns.
     open_fault: QueueOpenFault | None = field(default=None, compare=False, repr=False)
 
     @classmethod
@@ -15004,8 +15005,9 @@ class MessageStore:
                     by_lane[lane] = items
                 else:
                     rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        except PROGRAMMING_ERRORS:
-            # Nothing is returned, so no lane's claimed rows may stay inflight behind the bug.
+        except BaseException:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error,
+            # whatever it is: a bug, any other escaping error, or a cancellation (#5735).
             await release_unreturned(self, claimed_by_lane.values())
             raise
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm))

@@ -15,6 +15,7 @@ is still dead-lettered and reported (the control). SQLite; the server backends m
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pathlib
 import sqlite3
@@ -48,6 +49,10 @@ class _OutageCipher:
     def __init__(self, inner: AesGcmCipher) -> None:
         self._inner = inner
         self.healthy_opens: int | None = None
+        #: The error a failing decrypt raises; an outage unless a test sets another.
+        self.fault: Callable[[], CipherError] = lambda: CipherUnavailableError(
+            "Transit decrypt failed (key='k'): ConnectionError"
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -55,7 +60,7 @@ class _OutageCipher:
     def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
         if self.healthy_opens is not None:
             if self.healthy_opens <= 0:
-                raise CipherUnavailableError("Transit decrypt failed (key='k'): ConnectionError")
+                raise self.fault()
             self.healthy_opens -= 1
         return self._inner.decrypt(stored, aad=aad)
 
@@ -259,6 +264,79 @@ async def test_a_real_tag_failure_is_still_dead_lettered_and_reported(
         assert all(i.payload != "B1" for i in items)
         assert _rows(db)[0][0] == "dead"
         assert _audited(db) == 1
+    finally:
+        await store.close()
+
+
+def _transit_error(kind: str) -> Callable[[], CipherError]:
+    """The error the Transit cipher's decrypt raises for the reply or failure ``kind`` names, built
+    by its own classifier from the error hvac or requests raises, with the reply status the store's
+    client records (BACKLOG #8222)."""
+    pytest.importorskip("hvac")
+    import requests  # noqa: PLC0415
+    from hvac import exceptions as hv  # type: ignore[import-untyped]  # noqa: PLC0415
+
+    from messagefoundry.store.crypto_transit import _transit_failure  # noqa: PLC0415
+
+    def unexpected(status: int) -> Exception:
+        exc = hv.UnexpectedError(f"status {status}")
+        exc.mefor_reply_status = status
+        return exc
+
+    raw: dict[str, Callable[[], Exception]] = {
+        "403": lambda: hv.Forbidden(errors=["permission denied"]),
+        "404": lambda: hv.InvalidPath(errors=["no handler for route"]),
+        "413": lambda: unexpected(413),
+        "429": lambda: hv.RateLimitExceeded(errors=["rate limited"]),
+        "501": lambda: hv.VaultNotInitialized(errors=["not initialized"]),
+        "503": lambda: hv.VaultDown(errors=["Vault is sealed"]),
+        "504": lambda: unexpected(504),
+        "timeout": lambda: requests.exceptions.ReadTimeout("read timed out"),
+        "connection": lambda: requests.exceptions.ConnectionError("connection refused"),
+    }
+
+    def build() -> CipherError:
+        cause = raw[kind]()
+        error = _transit_failure("decrypt", "k", cause)
+        error.__cause__ = cause  # as the cipher's ``raise ... from`` sets it
+        return error
+
+    return build
+
+
+@_ALL_CLAIMS
+@pytest.mark.parametrize("kind", ["403", "404", "413"])
+async def test_a_4xx_verdict_is_still_dead_lettered_and_reported(
+    tmp_path: pathlib.Path, claim: Claim, kind: str
+) -> None:
+    """BACKLOG #5765: a 4xx other than a 429 is Vault's verdict on the request for the row, so the
+    claim dead-letters and reports it as before, never sets it aside to retry with no cap."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.fault = _transit_error(kind)
+        cipher.healthy_opens = 0
+        assert all(i.payload != "B1" for i in await claim(store))
+        assert _rows(db)[0][0] == "dead"
+        assert _audited(db) >= 1
+    finally:
+        await store.close()
+
+
+@_CLAIMS
+@pytest.mark.parametrize("kind", ["503", "429", "501", "504", "timeout", "connection"])
+async def test_a_key_service_with_no_verdict_sets_the_rows_aside(
+    tmp_path: pathlib.Path, claim: Claim, kind: str
+) -> None:
+    """BACKLOG #5765: a 5xx, a 429 (503 is also a sealed or standby node), a timeout and a
+    connection failure give no verdict on the row, so the claim sets it aside unaudited."""
+    store, cipher, db = await _open(tmp_path)
+    try:
+        cipher.fault = _transit_error(kind)
+        cipher.healthy_opens = 0
+        assert await claim(store) == []
+        assert _rows(db) == [("pending", 0), ("pending", 0)]
+        assert _deferred(db)
+        assert _audited(db) == 0
     finally:
         await store.close()
 
@@ -618,3 +696,92 @@ async def test_the_server_pooled_claim_releases_every_lane_on_an_engine_error(
         with pytest.raises(TypeError):
             await store._open_claimed_heads(by_lane_rows, set())
     assert sorted(released) == ["A-1", "A-2", "B-3", "B-4"]
+
+
+#: Errors that are not an engine bug and still escape the pooled claim's decode (BACKLOG #5735).
+_ESCAPING = pytest.mark.parametrize(
+    "error", [ValueError("not a bug"), asyncio.CancelledError()], ids=["ValueError", "cancelled"]
+)
+
+
+@_ESCAPING
+async def test_any_escaping_error_in_the_pooled_claim_releases_every_lane(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """Lane A's two rows open; lane B's head is refused and handling it raises ``error``, which
+    the claim re-raises unchanged. Every claimed row of both lanes is back to ``pending``."""
+    inner = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(inner, AesGcmCipher)
+    cipher = _RefusingCipher(inner)
+    db = tmp_path / "escape.db"
+    store = await MessageStore.open(db, cipher=cipher)  # type: ignore[arg-type]
+    lanes = ["IB_A", "IB_B"]
+    try:
+        for t, lane in enumerate(lanes):
+            for k in range(2):
+                await store.enqueue_ingress(channel_id=lane, raw=f"MSH|{lane}{k}", now=100.0 + t)
+        cipher.healthy_opens = 2
+
+        async def escaping(*_a: Any, **_kw: Any) -> None:
+            raise error
+
+        monkeypatch.setattr(store, "_dead_letter_unopenable", escaping)
+        with pytest.raises(type(error)) as raised:
+            await store.claim_fifo_heads("ingress", lanes, per_lane_limit=10)
+        assert raised.value is error
+        rows = _side(db, "SELECT status, attempts FROM queue WHERE stage='ingress' ORDER BY rowid")
+        assert [(str(s), int(a)) for s, a in rows] == [("pending", 0)] * 4
+    finally:
+        await store.close()
+
+
+@_ESCAPING
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_pooled_claim_releases_every_lane_on_any_escaping_error(
+    backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """The server twins of the test above, offline: lane B's open raises ``error``, which is not
+    a :class:`CipherError`, so it escapes the decode, and every claimed row of every lane is handed
+    to ``release_claimed`` before the claim re-raises it unchanged."""
+    store = _server_store(backend, _FakeServer(None))
+    released: list[str] = []
+
+    async def release_claimed(ids: Any, now: float | None = None) -> None:
+        released.extend(ids)
+
+    store.release_claimed = release_claimed
+    by_lane_rows = {
+        "A": [_server_row("A", 1), _server_row("A", 2)],
+        "B": [_server_row("B", 3), _server_row("B", 4)],
+    }
+
+    def opened(r: Any, *_a: Any) -> Any:
+        if r["channel_id"] == "B":
+            raise error
+        return "body" if backend == "sqlserver" else OutboxItem.from_row(r, "body")
+
+    if backend == "sqlserver":
+        monkeypatch.setattr(store, "_open_claimed", opened)
+        with pytest.raises(type(error)) as raised:
+            await store._open_claimed_heads(by_lane_rows, "ingress", set())
+    else:
+        monkeypatch.setattr(store, "_outbox_item", opened)
+        with pytest.raises(type(error)) as raised:
+            await store._open_claimed_heads(by_lane_rows, set())
+    assert raised.value is error
+    assert sorted(released) == ["A-1", "A-2", "B-3", "B-4"]
+
+
+async def test_a_failed_id_list_does_not_replace_the_claims_error() -> None:
+    """``release_unreturned`` builds its id list inside its own guard, so a row it cannot read
+    is logged and the caller still re-raises its own error."""
+    from messagefoundry.store.queue_tag import release_unreturned  # noqa: PLC0415
+
+    called: list[Any] = []
+
+    async def release_claimed(ids: Any, now: float | None = None) -> None:
+        called.append(ids)
+
+    store = type("S", (), {"release_claimed": staticmethod(release_claimed)})()
+    await release_unreturned(store, [[{"no_id": 1}]])  # must not raise
+    assert called == []

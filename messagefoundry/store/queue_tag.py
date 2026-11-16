@@ -39,9 +39,9 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
     CipherError,
+    CipherUnavailableError,
     UnauthenticatedCipherError,
     cell_aad,
-    gave_no_verdict,
 )
 from messagefoundry.store.row_seal import seal_bytes
 
@@ -142,18 +142,20 @@ class _Releaser(Protocol):
 
 async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -> None:
     """Return every row of ``lanes`` that ``claim_fifo_heads`` claimed but will not return to
-    ``pending``, through ``store.release_claimed``, before the claim re-raises an error in the
-    engine's own code (:data:`PROGRAMMING_ERRORS`, BACKLOG #5735). The claim committed before it
+    ``pending``, through ``store.release_claimed``, before the claim re-raises whatever error
+    escaped its decode, a cancellation included (BACKLOG #5735). The claim committed before it
     decoded, so without this every lane's rows stay ``inflight`` and the next claim delivers past
     them. A row the claim already settled (dead-lettered) is not ``inflight``, and the release
-    leaves it as it is. A failed release is logged and swallowed, so the caller re-raises the
-    original error; the rows then stay ``inflight`` until ``reset_stale_inflight``."""
-    ids = [str(row["id"]) for rows in lanes for row in rows]
+    leaves it as it is. A failed release, building the id list included, is logged and swallowed,
+    so the caller re-raises the original error; the rows then stay ``inflight`` until
+    ``reset_stale_inflight``."""
+    ids: list[str] = []
     try:
+        ids = [str(row["id"]) for rows in lanes for row in rows]
         await store.release_claimed(ids)
-    except Exception as failed:  # noqa: BLE001 -- the engine error being re-raised must stay loud
+    except Exception as failed:  # noqa: BLE001 -- the error being re-raised must stay the caller's
         _log.error(
-            "could not release %d claimed queue row(s) after an engine error (%s);"
+            "could not release %d claimed queue row(s) after an error in the claim (%s);"
             " they stay inflight until the next start",
             len(ids),
             type(failed).__name__,
@@ -237,18 +239,59 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
     return bool(holds(stored)) if callable(holds) else True
 
 
+#: The ``hvac`` error classes for a reply of HTTP 429 or 5xx, as hvac 2.4.0's
+#: ``VaultError.from_status`` maps them: 429 ``RateLimitExceeded``, 500 ``InternalServerError``,
+#: 501 ``VaultNotInitialized``, 502 ``BadGateway`` and 503 ``VaultDown``, which a sealed or standby
+#: node answers. Named rather than imported, so ``hvac`` stays imported in ``keyprovider_vault``
+#: only (BACKLOG #2337).
+_NO_VERDICT_HVAC_ERRORS: Final = frozenset(
+    {"RateLimitExceeded", "InternalServerError", "VaultNotInitialized", "BadGateway", "VaultDown"}
+)
+
+#: The attribute the store's Vault client sets on an hvac error to the reply's HTTP status
+#: (``keyprovider_vault._REPLY_STATUS_ATTR``, BACKLOG #8222). hvac raises one ``UnexpectedError``
+#: for every status it does not name, a 413 and a 504 alike, so only this tells them apart.
+_REPLY_STATUS_ATTR: Final = "mefor_reply_status"
+
+
+def _key_service_gave_no_verdict(exc: CipherError) -> bool:
+    """Whether ``exc`` was the key service failing to answer, and so says nothing about the row.
+
+    True for exactly these: a :class:`CipherUnavailableError`, which the Transit cipher's single
+    decrypt raises only for a connection that failed, timed out or was dropped and for an HTTP 429,
+    500, 502 or 503 (``keyprovider_vault.is_vault_unavailable``); and a cipher error caused by an
+    ``hvac`` error for an HTTP 429 or 5xx, read from its class or from the status the store's
+    client recorded on it (a 501 or a 504, which that classifier leaves as a plain error). Every other HTTP
+    4xx, at least a 400, 401, 403, 404 and 413, is the service's verdict on the request for this
+    row, and so is an ``UnexpectedError`` with no recorded status. That is deliberately narrower
+    than :func:`~messagefoundry.store.crypto.gave_no_verdict`, which reads any hvac error but a 400,
+    and any ``OSError`` cause, as an outage: a row refused for its own content must still be
+    dead-lettered and alerted, not set aside and retried with no cap."""
+    if isinstance(exc, CipherUnavailableError):
+        return True
+    cause = exc.__cause__
+    if cause is None or type(cause).__module__.split(".")[0] != "hvac":
+        return False
+    if type(cause).__name__ in _NO_VERDICT_HVAC_ERRORS:
+        return True
+    status = getattr(cause, _REPLY_STATUS_ATTR, None)
+    return type(status) is int and (status == 429 or 500 <= status <= 599)
+
+
 def is_transient_open_failure(exc: BaseException) -> bool:
     """Whether a failed open was the key service giving no verdict on the value, an outage rather
     than anything about the cell (BACKLOG #5765, #5735).
 
-    :func:`~messagefoundry.store.crypto.gave_no_verdict` decides it: a
-    :class:`~messagefoundry.store.crypto.CipherUnavailableError`, or a Transit error caused by an
-    unreachable Vault or a refusal of the service's own (a token refused, a 5xx). Such a failure is
-    never a tag failure, and a claim sets the row aside with a backoff rather than dead-lettering
-    it (:data:`TRANSIENT_OPEN_BACKOFF_SECONDS`). A
-    :class:`QueueTagError` is never transient: it is raised only after this check passed."""
+    :func:`_key_service_gave_no_verdict` decides it, and counts only a connection failure, a
+    timeout, an HTTP 5xx, an HTTP 429, and a Vault sealed or standby node (its 503). Such a failure
+    is never a tag failure, and a claim sets the row aside with a backoff rather than
+    dead-lettering it (:data:`TRANSIENT_OPEN_BACKOFF_SECONDS`). Every other refusal, every other
+    HTTP 4xx among them, classifies as it did before BACKLOG #5765. A :class:`QueueTagError` is
+    never transient: it is raised only after this check passed."""
     return (
-        isinstance(exc, CipherError) and not isinstance(exc, QueueTagError) and gave_no_verdict(exc)
+        isinstance(exc, CipherError)
+        and not isinstance(exc, QueueTagError)
+        and _key_service_gave_no_verdict(exc)
     )
 
 

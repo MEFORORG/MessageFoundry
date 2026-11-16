@@ -11684,8 +11684,9 @@ class SqlServerStore:
                     by_lane[lane] = items
                 else:
                     rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
-        except PROGRAMMING_ERRORS:
-            # Nothing is returned, so no lane's claimed rows may stay inflight behind the bug.
+        except BaseException:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error,
+            # whatever it is: a bug, any other escaping error, or a cancellation (#5735).
             await release_unreturned(self, by_lane_rows.values())
             raise
         return by_lane

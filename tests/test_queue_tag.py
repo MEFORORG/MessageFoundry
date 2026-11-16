@@ -295,10 +295,10 @@ def _raising_transit() -> tuple[Any, Any]:
 
 def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
     """BACKLOG #5765: Vault Transit cannot name its keys, so ``is_tag_failure`` counts every marked
-    value as held. A transient outage on open (an unreachable Vault, a 5xx, a refused token) must
-    raise the cipher's own error, never :class:`QueueTagError`, so a claim does not dead-letter the
-    row with a false ``integrity_drift`` alert. Control: Vault's AEAD refusal of a moved cell is
-    still a tag failure."""
+    value as held. A transient outage on open (an unreachable Vault, a timeout, a 5xx) must raise
+    the cipher's own error, never :class:`QueueTagError`, so a claim does not dead-letter the row
+    with a false ``integrity_drift`` alert. Every other 4xx, a refused token (403) among them, is a
+    verdict and still a tag failure. Control: Vault's AEAD refusal of a moved cell is still one."""
     pytest.importorskip("hvac")
     import requests  # noqa: PLC0415
     from hvac.exceptions import (  # type: ignore[import-untyped]  # noqa: PLC0415
@@ -316,7 +316,6 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
         requests.exceptions.ConnectionError("connection refused"),
         requests.exceptions.ReadTimeout("read timed out"),
         InternalServerError("upstream"),
-        Forbidden(errors=["permission denied"]),
     ]
     for exc in outages:
         transit.error = exc
@@ -324,6 +323,10 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
             open_queue_cell(cipher, row)
         assert not isinstance(refused.value, QueueTagError), exc
         assert is_transient_open_failure(refused.value), exc
+    transit.error = Forbidden(errors=["permission denied"])  # a verdict, not an outage
+    with pytest.raises(QueueTagError) as forbidden:
+        open_queue_cell(cipher, row)
+    assert not is_transient_open_failure(forbidden.value)
     assert is_transient_open_failure(CipherUnavailableError("down"))
     assert not is_transient_open_failure(QueueTagError("integrity"))
     assert not is_transient_open_failure(OSError("not a cipher error"))
@@ -340,3 +343,11 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
     with pytest.raises(QueueTagError) as moved:
         open_queue_cell(cipher, row)
     assert not is_transient_open_failure(moved.value)
+
+
+def test_the_reply_status_attribute_is_the_one_the_vault_client_records() -> None:
+    """BACKLOG #5765: the queue classifier reads a 5xx that hvac raises as ``UnexpectedError`` by
+    the status the store's Vault client records, under the name ``keyprovider_vault`` sets."""
+    from messagefoundry.store import keyprovider_vault, queue_tag  # noqa: PLC0415
+
+    assert queue_tag._REPLY_STATUS_ATTR == keyprovider_vault._REPLY_STATUS_ATTR
