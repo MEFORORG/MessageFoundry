@@ -644,7 +644,16 @@ async def test_metadata_outbound_simulated(
 
 @pytest.mark.parametrize(
     "down",
-    ["paused", "stop_held", "log_halted", "failed", "filtered", "not_deployed", "graph_stopped"],
+    [
+        "stopping",
+        "stopped",
+        "stop_held",
+        "log_halted",
+        "failed",
+        "filtered",
+        "not_deployed",
+        "graph_stopped",
+    ],
 )
 async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
     engine: Engine,
@@ -669,8 +678,10 @@ async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
         assert rr.outbound_running("OB") is True
     else:
         assert (await client.get("/connections/OB/metadata")).json()["running"] is True
-    if down == "paused":
-        rr._outbound_paused.add("OB")
+    if down in ("stopping", "stopped"):
+        rr._outbound_paused.add("OB")  # paused, its in-flight head still resolving
+        if down == "stopped":
+            rr._mark_outbound_quiesced("OB")  # paused and drained: the operator-stopped state
     elif down == "stop_held":
         rr._stop_held.add(("outbound", "OB"))
     elif down == "log_halted":

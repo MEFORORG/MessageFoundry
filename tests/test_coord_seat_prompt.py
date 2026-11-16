@@ -339,3 +339,8 @@ class TestNotesCapReadsTheCollapsedLength:
         # 3001 characters collapse to 2001 ("a " * 1000 + "b"), so the cap still bites, at 2000.
         got = self.declare(repo, "a  " * 1000 + "b")["notes"]
         assert got == ("a " * 1000)[:2000]
+
+    def test_the_cap_does_not_split_a_surrogate_pair(self, repo: Path) -> None:
+        # 1999 code units, then an astral (non-BMP) character whose two halves sit at 1999 and 2000.
+        got = self.declare(repo, "x" * 1999 + chr(0x10400) + "tail")["notes"]
+        assert got == "x" * 1999

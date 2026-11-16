@@ -418,6 +418,7 @@ from messagefoundry.config.wiring import (
     ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
+    OutboundConnection,
     Registry,
     WiringError,
     accepted_cleartext_hops,
@@ -790,12 +791,16 @@ def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     return rr.outbound_status(name) if rr.running else "stopped"
 
 
-def _outbound_display_status(rr: RegistryRunner, name: str) -> str:
+def _outbound_display_status(rr: RegistryRunner, name: str, oc: OutboundConnection) -> str:
     """One declared outbound's display state, the per-lane facts first: ``not_deployed``,
     ``failed``, ``filtered``, then :func:`_live_outbound_status`. Its ``"running"`` is the only
-    state in which the lane delivers, so the metadata row's ``running`` reads it (BACKLOG #5762)
-    and the graph node's status is it."""
-    if not rr.registry.outbound[name].deployed:
+    state in which the lane is armed to claim new rows, so the metadata row's ``running`` reads it
+    (BACKLOG #5762); a ``"stopping"`` lane can still finish a row it holds. The ``/connections``
+    rows and the ``/graph/edges`` nodes read it too.
+
+    ``oc`` is the caller's own snapshot of the outbound, never re-read from ``rr.registry``: a
+    reload can swap the registry between a route's snapshot and this read."""
+    if not oc.deployed:
         return "not_deployed"
     if rr.outbound_failed(name):
         return "failed"
@@ -5733,15 +5738,7 @@ def create_app(
                     # operator has to fix on THIS row, while the halt is process-wide and has its own
                     # page (the AlertSink's log_write_failed), so collapsing them away would lose the
                     # only per-lane explanation the row carries.
-                    dstatus = (
-                        "not_deployed"
-                        if not oc.deployed
-                        else (
-                            "failed"
-                            if dfail
-                            else ("filtered" if dfiltered else _live_outbound_status(rr, dname))
-                        )
-                    )
+                    dstatus = _outbound_display_status(rr, dname, oc)
                 else:
                     dmethod, dpeer, dport, dstatus = "—", None, None, "draining"
                 rows.append(
@@ -6281,7 +6278,7 @@ def create_app(
             method=oc.spec.type.value,
             # BACKLOG #5762: the lane's display state, as the graph node reads it, not the graph's
             # running flag alone, which read running for a lane that delivers nothing.
-            running=_outbound_display_status(rr, name) == "running",
+            running=_outbound_display_status(rr, name, oc) == "running",
             metadata=dict(oc.metadata) if oc.metadata else None,
             settings=redacted_settings(oc.spec.settings),
             simulated=rr.outbound_simulated(name),
@@ -10072,10 +10069,6 @@ def create_app(
                 return "filtered"
             return "running" if rr.inbound_running(name) else "stopped"
 
-        def _outbound_status(name: str) -> str:
-            # Gated (#1814): the inbound node beside it already reads "stopped" on a down graph.
-            return _outbound_display_status(rr, name)
-
         # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
         nodes: dict[tuple[str, str], GraphNode] = {}
         for name in reg.inbound:
@@ -10084,7 +10077,11 @@ def create_app(
             )
         for name in reg.outbound:
             nodes[("outbound", name)] = GraphNode(
-                name=name, kind="outbound", status=_outbound_status(name)
+                # Gated (#1814) in _live_outbound_status: the inbound node beside it already
+                # reads "stopped" on a down graph. reg is this route's snapshot, as for inbounds.
+                name=name,
+                kind="outbound",
+                status=_outbound_display_status(rr, name, reg.outbound[name]),
             )
         for name in reg.routers:
             nodes[("router", name)] = GraphNode(name=name, kind="router", status=None)
