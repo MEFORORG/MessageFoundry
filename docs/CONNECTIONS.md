@@ -3772,10 +3772,11 @@ def handle(msg):
     measurements = ds.measurements()
     if not measurements:
         return None                  # nothing to deliver → FILTERED (counted + logged)
-    oru = Message.parse(
-        "MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|"
-        f"{ds.study_date or ''}||ORU^R01|{ds.sop_instance_uid or 'UNKNOWN'}|P|2.5.1"
-    )
+    oru = Message.parse("MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|||ORU^R01||P|2.5.1")
+    # Peer values go in as DATA (set_data escapes the delimiters), never into the parsed string;
+    # set_data refuses CR/LF, so flatten them first, as hl7_map's builders do.
+    oru.set_data("MSH-7", (ds.study_date or "").replace("\r", " ").replace("\n", " "))
+    oru.set_data("MSH-10", (ds.sop_instance_uid or "UNKNOWN").replace("\r", " ").replace("\n", " "))
     oru.add_segment(hl7_map.pid_from_dataset(ds))   # SR→HL7: code-first, HL7-escaped, CR/LF-guarded
     oru.add_segment(hl7_map.obr_from_dataset(ds))
     for set_id, m in enumerate(measurements, start=1):
