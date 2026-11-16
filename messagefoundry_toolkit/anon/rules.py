@@ -158,9 +158,9 @@ class FieldRule:
 # PID-27 veteran status, PID-28 nationality, PID-30 death indicator, NK1-3 relationship, NK1-14/15
 # marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
 # other field of these segments that is neither listed here nor mapped below has no rule yet.
-# At least these do: NK1-12, NK1-26 and NK1-38, GT1-4, GT1-19, GT1-42, GT1-45, GT1-46 and GT1-56,
-# PV1-5, PV1-50 and PV1-52, and MRG-2, MRG-5 and MRG-6. Only the coverage report names such a
-# field, and require_full_coverage refuses it.
+# A second pass mapped twenty more fields of the same class: GT1-4/19/21/24/29/42/45/46/51/56,
+# NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. Only the coverage report names a field with no rule,
+# and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
@@ -185,7 +185,10 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-3", SurrogateKind.MRN),
+    FieldRule("MRG-2", SurrogateKind.ID),  # prior alternate patient id, keyed like PID-4
     FieldRule("MRG-4", SurrogateKind.NAME),
+    FieldRule("MRG-5", SurrogateKind.ID),  # prior visit number, keyed like PV1-19
+    FieldRule("MRG-6", SurrogateKind.ID),  # prior alternate visit id, keyed like PV1-50
     FieldRule("MRG-7", SurrogateKind.NAME),
     # NK1 — next of kin / contacts (NK1-3 relationship code is KEPT by omission)
     FieldRule("NK1-2", SurrogateKind.NAME),
@@ -193,18 +196,22 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-12", SurrogateKind.ID),  # next of kin's employee number, a CX
     # NK1-13 is an XON. The name kind would write a person's name into it, and XON.3 is numeric,
     # so the output would fail strict validation; the blunt redact keeps it valid.
     FieldRule("NK1-13", SurrogateKind.FREETEXT),  # organization name
     FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
+    FieldRule("NK1-26", SurrogateKind.NAME),  # mother's maiden name
     FieldRule("NK1-30", SurrogateKind.NAME),  # contact person's name
     FieldRule("NK1-31", SurrogateKind.PHONE),  # contact person's telephone
     FieldRule("NK1-32", SurrogateKind.ADDRESS),  # contact person's address
     FieldRule("NK1-33", SurrogateKind.ID),  # next of kin's identifiers, a CX
     FieldRule("NK1-37", SurrogateKind.SSN),  # contact person's social security number
+    FieldRule("NK1-38", SurrogateKind.FREETEXT),  # next of kin's birth place, like PID-23
     # GT1 — guarantor
     FieldRule("GT1-2", SurrogateKind.ID),  # guarantor number, a CX
     FieldRule("GT1-3", SurrogateKind.NAME),
+    FieldRule("GT1-4", SurrogateKind.NAME),  # guarantor's spouse name
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
     FieldRule("GT1-7", SurrogateKind.PHONE),
@@ -213,6 +220,15 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
     FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
     FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
+    FieldRule("GT1-19", SurrogateKind.ID),  # guarantor's employee id, a CX
+    FieldRule("GT1-21", SurrogateKind.FREETEXT),  # guarantor organization name, an XON like NK1-13
+    FieldRule("GT1-24", SurrogateKind.DATE),  # guarantor's death date/time, like PID-29
+    FieldRule("GT1-29", SurrogateKind.ID),  # guarantor's employer id, a CX
+    FieldRule("GT1-42", SurrogateKind.NAME),  # guarantor's mother's maiden name
+    FieldRule("GT1-45", SurrogateKind.NAME),  # guarantor's contact person's name
+    FieldRule("GT1-46", SurrogateKind.PHONE),  # guarantor's contact person's telephone
+    FieldRule("GT1-51", SurrogateKind.FREETEXT),  # guarantor's employer organization, an XON
+    FieldRule("GT1-56", SurrogateKind.FREETEXT),  # guarantor's birth place, like PID-23
     # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
     # address, contact and phone, and the insured's employer, are mapped (BACKLOG #2645).
     FieldRule("IN1-5", SurrogateKind.ADDRESS),  # insurance company address
@@ -232,6 +248,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
     FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
+    FieldRule("PV1-5", SurrogateKind.ID),  # preadmit number, a CX
     FieldRule("PV1-6", SurrogateKind.FREETEXT),  # prior patient location, a PL like PV1-3
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
@@ -239,10 +256,14 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PV1-11", SurrogateKind.FREETEXT),  # temporary location, a PL
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    # PV1-37 is a DLD: a discharge location and its effective date. The blunt redact removes both.
+    FieldRule("PV1-37", SurrogateKind.FREETEXT),  # discharged-to location
     FieldRule("PV1-42", SurrogateKind.FREETEXT),  # pending location, a PL
     FieldRule("PV1-43", SurrogateKind.FREETEXT),  # prior temporary location, a PL
     FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
     FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
+    FieldRule("PV1-50", SurrogateKind.ID),  # alternate visit id, a CX
+    FieldRule("PV1-52", SurrogateKind.PROVIDER),  # other healthcare provider, an XCN
     FieldRule("PD1-4", SurrogateKind.PROVIDER),
     # ORC/OBR/OBX — orders, results, observations
     FieldRule("ORC-9", SurrogateKind.DATE),  # transaction date/time
