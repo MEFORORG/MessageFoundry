@@ -245,11 +245,15 @@ class _PgConn:
 
 
 class _MssqlCur:
+    def __init__(self) -> None:
+        self._probe = False
+
     async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        return None
+        # The kept session's owner probe (BACKLOG #5742) reads no row here, so the write runs.
+        self._probe = sql.startswith("SELECT user_id FROM sessions")
 
     async def fetchall(self) -> list[Any]:
-        return [("x",)]
+        return [] if self._probe else [("x",)]
 
 
 @pytest.mark.parametrize(
@@ -356,9 +360,9 @@ async def test_a_forged_account_still_runs_the_kept_sessions_seal_check(
     writes: list[str] = []
     write_session = store._write_session
 
-    async def counting(token_hash: str, change: Any) -> Any:
+    async def counting(token_hash: str, change: Any, **kwargs: Any) -> Any:
         writes.append(token_hash)
-        return await write_session(token_hash, change)
+        return await write_session(token_hash, change, **kwargs)
 
     monkeypatch.setattr(store, "_write_session", counting)
     result = await store.revoke_user_sessions(
@@ -1093,11 +1097,11 @@ async def test_a_retried_revoke_reports_each_refusal_once_and_last_accurately(
     write_session = store._write_session
     calls: list[str] = []
 
-    async def forged_once(token_hash: str, change: Any) -> Any:
+    async def forged_once(token_hash: str, change: Any, **kwargs: Any) -> Any:
         calls.append(token_hash)
         if len(calls) == 1:
             raise RowSealError("session", "")
-        return await write_session(token_hash, change)
+        return await write_session(token_hash, change, **kwargs)
 
     monkeypatch.setattr(store, "_write_session", forged_once)
     service = AuthService(store, AuthSettings())

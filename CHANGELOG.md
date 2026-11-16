@@ -46,6 +46,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
+- The state purge on SQL Server and Postgres deletes and names its rows in one statement, so a key
+  refreshed during the purge is no longer dropped from the state cache while its row survives.
+  (`BACKLOG #5734`)
+- A sign-out-everywhere-else handed another account's session as the one to keep leaves that row
+  untouched, instead of seal-checking and re-sealing it and failing the revoke on its seal.
+  (`BACKLOG #5742`)
+- `rotate-key`'s user re-seal pass charges the AES-GCM invocation bound after each record, under
+  the SQLite writer lock, and compares seal and secret prefixes byte-exact, so no record is skipped
+  for a prefix that differs only in case. (`BACKLOG #5738`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
