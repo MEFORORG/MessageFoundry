@@ -530,8 +530,11 @@ def _probe(links: dict[str, str] | None = None) -> ap.WinProbe:
     ],
 )
 def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path: str) -> None:
-    """Vault BACKLOG #5515. Red under: stripping the prefix and normalizing what is left, which
-    walked a plain path on C: and cleared it, as the volume GUID one was walked under its own."""
+    """Vault BACKLOG #5515. Red under origin/main's strip-then-normpath, though not every case was
+    cleared there: most were walked and cleared, but ``\\\\.\\C:\\certs\\..\\..\\D:\\ca.pem`` and
+    ``//?/Volume{0000}/../C:/...`` ended as a stream name, ``\\\\?\\C:`` and ``\\\\.\\C:`` as
+    drive-relative, the verbatim UNC case as a share, and ``//./C:/../UNC/...`` already as a
+    device path. This pins the device-path cause for each."""
     chain, cause = windows_chain(path, "C:\\cwd", _probe())
     assert (chain, cause) == ([], "the path is a device path this check does not read")
 

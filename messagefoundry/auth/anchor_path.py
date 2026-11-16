@@ -390,22 +390,15 @@ def evaluate_windows_object(
 
 
 def _verbatim_rest_is_plain(rest: str) -> bool:
-    """Whether the text after a verbatim ``\\\\?\\`` or ``\\??\\`` prefix is already in the form
-    the walk's normpath leaves it. Win32 hands a verbatim path to the kernel as written: it turns no
-    ``/`` into a separator and collapses no ``.``, ``..`` or empty name, where the walk does all
-    three. One trailing separator is allowed, though normpath drops it: on a folder it names the
-    same object, and on a file the verbatim open fails."""
+    """Whether the text after a verbatim prefix passes the verbatim rule in :func:`windows_chain`'s
+    vault BACKLOG #5515 list."""
     names = rest.removesuffix("\\").split("\\")
     return "/" not in rest and all(name not in ("", ".", "..") for name in names)
 
 
 def _climbs_out_of_device(rest: str) -> bool:
-    """Whether a ``.`` or ``..`` in the text after a normalized device prefix (``\\\\.\\`` and any
-    spelling with a forward slash) reaches its first name or climbs past it. Win32 collapses
-    ``..`` against the prefix itself, so ``\\\\.\\C:\\..\\UNC\\s\\x`` opens the share
-    ``\\\\s\\x``, where the walk's normpath stops at the drive and reads ``C:\\UNC\\s\\x``. A final
-    ``.`` or ``..`` also drops the separator before it, so ``\\\\.\\C:\\x\\..`` opens the volume
-    device ``\\\\.\\C:``, where normpath reads the root folder ``C:\\``."""
+    """Whether the text after a normalized device prefix trips the climb rule in
+    :func:`windows_chain`'s vault BACKLOG #5515 list."""
     depth = 0
     names = rest.replace("/", "\\").split("\\")
     for name in names:
@@ -424,16 +417,7 @@ def _strip_win_prefix(path: str) -> str | None:
     ``\\\\?\\C:\\x`` becomes ``C:\\x`` and ``\\\\?\\UNC\\s\\x`` becomes ``\\\\s\\x``. A volume GUID
     path keeps its prefix, since it has no other spelling. Any other device path answers ``None``.
 
-    So do two shapes of device path whose text the walk would normalize into another object than
-    Windows opens (vault BACKLOG #5515), not every such shape: a verbatim one (``\\\\?\\``, ``\\??\\``) holding a ``/`` or a
-    ``.``, ``..`` or empty name (:func:`_verbatim_rest_is_plain`), and a normalized one whose
-    ``.`` or ``..`` reaches or climbs out of its first name (:func:`_climbs_out_of_device`).
-    Neither is read as the nearest plain path: which object the kernel reaches there is not
-    emulated, so it is refused. A device prefix written with a forward slash is returned as
-    written, unless it climbs out; :func:`windows_chain` names it a device path after its
-    normpath, except a ``//?/Volume{`` path, which it walks. A drive letter or volume GUID with no
-    separator after it is returned too, since a ``subst`` target of that form is joined to the
-    rest of a path; :func:`windows_chain` refuses one the open would reach as the volume device."""
+    The shapes refused for vault BACKLOG #5515 are listed once, in :func:`windows_chain`."""
     # A normalized device prefix: ``\\.\`` or ``\\?\`` in any mix of slashes, but not the verbatim
     # all-backslash ``\\?\``.
     head = path[:4]
@@ -459,16 +443,8 @@ def _strip_win_prefix(path: str) -> str | None:
 
 
 def _prefixed_cwd_refuses(base: str, relative: str, cwd_rest: str) -> bool:
-    """Whether :func:`windows_chain` refuses the relative anchor ``relative`` against a working
-    directory written with a device prefix, whose text after that prefix is ``cwd_rest`` and which
-    :func:`_strip_win_prefix` turned into ``base`` (vault BACKLOG #5515). Which object Win32
-    resolves there is not emulated; these are refused instead:
-
-    - a rooted ``relative`` (``\\x``), which joins to the drive or volume, not to the folder;
-    - a ``base`` that is a bare drive (``\\\\?\\C:``) or volume GUID with no separator after it,
-      each of which names the volume device;
-    - a ``..`` in ``relative`` that climbs past the working directory's first name, which may be
-      collapsed against the prefix, where normpath stops at the drive."""
+    """Whether :func:`windows_chain` refuses ``relative`` under a device-prefixed working directory
+    (``cwd_rest`` after its prefix, ``base`` as stripped), by its vault BACKLOG #5515 list."""
     if relative[:1] in ("\\", "/"):
         return True
     norm = ntpath.normpath(base)
@@ -478,10 +454,8 @@ def _prefixed_cwd_refuses(base: str, relative: str, cwd_rest: str) -> bool:
 
 
 def _strip_nt_target(target: str) -> str | None:
-    """A link or ``subst`` target, which is an NT path the kernel reads as written, in the form
-    the walk reads, or ``None`` where :func:`_strip_win_prefix` would apply Win32's normalization
-    to it. Any device prefix but an all-backslash ``\\\\?\\`` or ``\\??\\`` is refused, and so is a
-    rest that prefix's verbatim check would refuse (vault BACKLOG #5515)."""
+    """A link or ``subst`` target, an NT path, in the form the walk reads, or ``None`` for one
+    :func:`windows_chain`'s vault BACKLOG #5515 list refuses."""
     head = target[:4].replace("/", "\\")
     if head in ("\\\\.\\", "\\\\?\\", "\\??\\") and not (
         target[:4] in ("\\\\?\\", "\\??\\") and _verbatim_rest_is_plain(target[4:])
@@ -623,11 +597,8 @@ def windows_chain(
     path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle.
 
     ``drive_target`` answers the folder a ``subst`` drive letter stands for (:func:`subst_target`),
-    which the walk reads through :func:`_strip_nt_target`, stricter than :func:`_strip_win_prefix`:
-    a ``\\\\.\\``, mixed-slash or non-plain verbatim answer ends the walk with a cause. It answers
-    ``None`` for a real volume, and
-    raises ``OSError`` when it cannot tell, which ends the walk with a cause. Such a
-    letter is spliced in like a link, because its ``X:\\`` is not a volume root: the folders above
+    read through :func:`_strip_nt_target`, or ``None`` for a real volume, and raises ``OSError``
+    when it cannot tell, which ends the walk with a cause. Such a letter is spliced in like a link, because its ``X:\\`` is not a volume root: the folders above
     the substituted one can still be renamed. ``volume_cause`` answers why a volume cannot be
     judged, and is asked before anything on that volume is read. So a mapped network drive costs no
     round trip per folder, and a FAT volume's missing DACL is never read as everyone-full-control.
@@ -636,18 +607,32 @@ def windows_chain(
     At least these end the walk with a cause, since Windows would open another object than the text
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
     link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
-    dot, which Win32 strips; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
+    dot; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
     device prefix written with forward slashes (``//?/S:/x``); and a stream name after a link.
 
-    Vault BACKLOG #5515 adds at least these device-path spellings the walk's normpath would read as
-    another object: a verbatim path holding a ``/`` or a ``.``, ``..`` or empty name, and a
-    normalized device path whose ``.`` or ``..`` reaches or climbs out of its first name
-    (:func:`_strip_win_prefix`); a prefixed drive or volume GUID with no separator after it; a link
-    or ``subst`` target with a ``\\\\.\\`` or mixed-slash prefix, or a verbatim one holding those
-    names (:func:`_strip_nt_target`); and, under a working directory written with a device prefix,
-    the three shapes :func:`_prefixed_cwd_refuses` names. Which object Win32 resolves a relative
-    name to under such a working directory is not emulated, so a shape outside that list is
-    walked as normpath reads it. A path that reaches a share ends with :data:`SHARE_CAUSE`."""
+    Vault BACKLOG #5515 adds at least these, where the walk's normpath would read another object
+    than Windows opens. This is the one list of them; the helpers point here.
+
+    - A verbatim path (``\\\\?\\`` or ``\\??\\``) holding a ``/``, a ``.`` or ``..`` name, or an
+      empty name other than one trailing separator.
+    - A normalized device path (``\\\\.\\``, or ``\\\\?\\`` written with any forward slash) where
+      a ``..`` removes its first name, or whose last name is ``.`` or ``..`` and leaves nothing
+      after its first name.
+    - A path or a link target that is a drive letter straight after a device prefix, with no
+      separator after the letter (``\\\\?\\C:``). A ``subst`` target of that form is joined to
+      the rest of the path instead.
+    - A path that, once a link or ``subst`` target is spliced in, is a volume GUID with nothing
+      after the GUID.
+    - A link or ``subst`` target with a device prefix other than an all-backslash ``\\\\?\\`` or
+      ``\\??\\``, or a verbatim one the first rule refuses.
+    - A relative path under a working directory whose first four characters are a device prefix,
+      in any slashes: a rooted one (``\\x``); one under a working directory that strips to a bare
+      drive, or keeps a ``\\\\?\\`` prefix with nothing after its drive or volume part; and one
+      whose ``..`` or last name, read after the working directory's text, trips the second rule.
+      Which object Win32 resolves there is not emulated, and any other such path is walked as
+      normpath reads it.
+
+    A path that reaches a share ends with :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
     # A prefixed drive with no separator after it (``\\?\C:``, ``\\.\C:``) is the volume device,
     # not a drive-relative path.
@@ -733,8 +718,8 @@ def windows_chain(
             child = ntpath.join(cur, name)
             if name.endswith((" ", ".")) and name not in (".", ".."):
                 return chain, WalkCause(
-                    f"{child!r} ends in a space or a dot, which Windows strips",
-                    "a name in the path ends in a space or a dot, which Windows strips",
+                    f"{child!r} ends in a space or a dot",
+                    "a name in the path ends in a space or a dot",
                 )
             try:
                 kind, target = probe(child)
