@@ -723,23 +723,64 @@ def test_the_token_permissions_are_exactly_what_each_job_needs() -> None:
     assert got == expected, got
 
 
-def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
-    """Both new steps must read their inputs from ``env:``, never from an inlined ``${{ }}``.
+#: A ``gh`` call on a line that is not a comment. ``gh`` reads ``GH_TOKEN`` without the body ever
+#: naming it, so the ``$VAR`` check below cannot see that key go missing.
+_GH_CALL = re.compile(r"(?m)^[^#\n]*(?<![\w-])gh\s+(?:api|pr)\b")
+
+
+def _assert_inputs_come_through_env(label: str, step: dict) -> None:
+    body = str(step.get("run", ""))
+    assert "${{" not in body, (
+        f"the {label} step interpolates an Actions expression into its shell body; pass it "
+        f"through env: instead"
+    )
+    declared = set((step.get("env") or {}).keys())
+    undeclared = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED - declared
+    assert not undeclared, f"{label} reads undeclared env var(s): {sorted(undeclared)}"
+    if _GH_CALL.search(body):
+        assert "GH_TOKEN" in declared, f"{label} calls gh but declares no GH_TOKEN in env:"
+
+
+def test_every_run_step_takes_every_input_through_env_not_interpolation() -> None:
+    """Every ``run:`` step must read its inputs from ``env:``, never from an inlined ``${{ }}``.
 
     This is zizmor template-injection parity asserted in-tree — a PR-controlled value pasted into a
     shell body is a code-execution seam — and it is simultaneously the precondition that lets the
-    behavioural tests below execute the shipped bodies verbatim."""
-    for step_id in ("allowset", "age", "authors", "disarm"):
-        step = _step(step_id)
-        body = str(step.get("run", ""))
-        assert "${{" not in body, (
-            f"the {step_id} step interpolates an Actions expression into its shell body; pass it "
-            f"through env: instead"
-        )
-        declared = set((step.get("env") or {}).keys())
-        referenced = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED
-        undeclared = referenced - declared
-        assert not undeclared, f"{step_id} reads undeclared env var(s): {sorted(undeclared)}"
+    behavioural tests below execute the shipped bodies verbatim.
+
+    RULE (BACKLOG #5503): this iterated a hand-kept list of step ids that left out ``ghsa`` and the
+    unnamed merge step, so an interpolation into either body, or a dropped env key there, would have
+    passed. The steps are now every ``run:`` step in every job, with a floor naming the ones known
+    today so a broken walk cannot pass on nothing.
+    """
+    run_steps = [s for s in _steps() if "run" in s]
+    labelled = {str(s.get("id") or s.get("name")): s for s in run_steps}
+    assert len(labelled) == len(run_steps), f"two run steps share a label: {list(labelled)}"
+    expected = {"disarm", "allowset", "ghsa", "age", "authors", str(_merge_step().get("name"))}
+    missing = sorted(expected - set(labelled))
+    assert not missing, f"run steps {list(labelled)} miss {missing}"
+    for label, step in labelled.items():
+        _assert_inputs_come_through_env(label, step)
+
+
+@pytest.mark.parametrize(
+    ("body", "env", "message"),
+    [
+        ('echo "${{ github.event.pull_request.title }}"\n', {}, "interpolates"),
+        ('echo "$DEPS_JSON"\n', {"GH_TOKEN": "t"}, "undeclared env var"),
+        ("gh api -X GET /advisories\n", {}, "declares no GH_TOKEN"),
+        ('gh pr merge --auto "$PR_URL"\n', {"PR_URL": "u"}, "declares no GH_TOKEN"),
+    ],
+)
+def test_the_env_check_refuses_each_planted_seam(body: str, env: dict, message: str) -> None:
+    """Prove the per-step check fires on each defect the ghsa and merge steps could carry."""
+    with pytest.raises(AssertionError, match=message):
+        _assert_inputs_come_through_env("planted", {"run": body, "env": env})
+
+
+def test_the_env_check_does_not_count_a_commented_gh_call() -> None:
+    """The comment form appears in the shipped ghsa body, and must not count as a call."""
+    _assert_inputs_come_through_env("comment", {"run": "# `gh api` copies the JSON\n"})
 
 
 # --------------------------------------------------------------------------------------------------
