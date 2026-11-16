@@ -117,3 +117,26 @@ def test_control_without_the_handed_graph_the_modules_run_twice(
     rc, runs, _handed = _boot(tmp_path, monkeypatch, keep=lambda graph: None)
     assert rc == 0
     assert runs == 2
+
+
+def test_create_managed_app_refuses_a_handed_graph_on_a_clustered_start(tmp_path: Path) -> None:
+    # vault BACKLOG #3076: the refusal sits beside the lifespan's seed, not only in serve.
+    from messagefoundry.config.settings import ClusterSettings, EgressSettings
+
+    egress = EgressSettings(deny_by_default=False)
+
+    with pytest.raises(ValueError, match="clustered start"):
+        api_mod.create_managed_app(
+            db_path=tmp_path / "mf.db",
+            config_dir=tmp_path,
+            start_registry=Registry(),
+            egress_settings=egress,
+            cluster_settings=ClusterSettings(enabled=True, node_id="n1"),
+        )
+    # The control: the same call on a single node builds the app.
+    api_mod.create_managed_app(
+        db_path=tmp_path / "mf.db",
+        config_dir=tmp_path,
+        start_registry=Registry(),
+        egress_settings=egress,
+    )

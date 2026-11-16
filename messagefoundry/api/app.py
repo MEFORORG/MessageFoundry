@@ -12486,7 +12486,8 @@ def create_managed_app(
     again, so the operator's config modules run once on that start (BACKLOG #5391, S19-75). Every
     step the first load takes after its ``load_config`` still runs on it. It is read before the
     cluster config version is seeded, which a clustered start must not do (vault BACKLOG #3076),
-    so ``serve`` passes it only on a single node. ``static_credential_settings`` is
+    so it is refused beside an enabled ``cluster_settings``, and ``serve`` passes it only on a
+    single node. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
     inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
     privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
@@ -12513,6 +12514,9 @@ def create_managed_app(
         )
     if start_registry is not None and config_dir is None:
         raise ValueError("create_managed_app: start_registry was passed with no config_dir")
+    if start_registry is not None and cluster_settings is not None and cluster_settings.enabled:
+        # vault BACKLOG #3076: a clustered first load reads the directory after the version seed.
+        raise ValueError("create_managed_app: start_registry was passed on a clustered start")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

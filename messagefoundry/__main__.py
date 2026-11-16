@@ -1540,9 +1540,9 @@ def _graph_references_env_safe(config_dir: str) -> tuple[bool, Registry | None]:
 
     try:
         registry = load_config(config_dir)
+        return graph_references_env(registry), registry
     except (WiringError, FileNotFoundError, OSError):
         return False, None
-    return graph_references_env(registry), registry
 
 
 def _is_under(path: str, base: Path) -> bool:
@@ -1571,11 +1571,10 @@ def _emit_anchor_diagnostics(
 ) -> tuple[int | None, Registry | None]:
     """The three ADR 0050 §2 startup diagnostics (paths only, PHI-safe; once at boot, not per reload).
 
-    Returns the exit code, and the graph AC-3 loaded where it had to load one, else ``None``
-    (:func:`_graph_references_env_safe`).
-
-    Returns a non-zero exit code for the one scoped hard failure (AC-3), else ``None`` after emitting at
-    most one advisory WARNING:
+    Returns a pair. The first is a non-zero exit code for the one scoped hard failure (AC-3), else
+    ``None`` after emitting at most one advisory WARNING. The second is the graph AC-3 loaded on a
+    start it did not refuse, where it had to load one, else ``None``
+    (:func:`_graph_references_env_safe`):
 
     * **AC-3 (ERROR / exit 2):** an EXPLICIT root is set, the graph references ``env()``, and the
       resolved ``<env>.toml`` is absent. The only new hard failure — scoped so a zero-``env()`` graph or
@@ -2237,20 +2236,25 @@ def _write_start_audit(lines: list[str]) -> None:
     call wrote: in ``supervise`` that reached its stdout handler, and in ``serve`` before
     ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr. The static-
     credential (#1989) and remote-debugging (#2700) AUDIT lines, logged after ``_start_logging``,
-    come through here too, because an AUDIT line is not subject to ``[logging].level``.
+    come through here too, so ``[logging].level`` does not filter them either. At least five other
+    AUDIT lines ``serve`` logs after ``_start_logging`` still go through ``logger.warning``, so that
+    level does filter those.
 
-    Each line goes through ``Logger.handle``, which skips ``Logger.isEnabledFor``: both the
-    logger's effective level and a process-wide ``logging.disable()``. It keeps the rest of what
-    ``logger.warning`` does: the logger's ``disabled`` flag and its filters, the propagation walk,
-    each handler's level and filter chain, and the lastResort when no handler exists. So where
-    ``[logging].level = ERROR`` filters WARNING out, the application log, stdout and the collector
-    still get the line, once."""
+    Each line goes through ``Logger.handle``, which skips the logger's effective level. A
+    process-wide ``logging.disable()`` at WARNING or above still drops it, as it would drop
+    ``logger.warning``. It keeps the rest of what ``logger.warning`` does: the logger's ``disabled``
+    flag and its filters, the propagation walk, each handler's level and filter chain, and the
+    lastResort when no handler exists. So where ``[logging].level = ERROR`` filters WARNING out,
+    the application log, stdout and the collector still get the line, once. The record names this
+    function's caller as where it was logged."""
     if not lines:
         return
     pending = list(lines)
     lines.clear()
     logger = logging.getLogger(__name__)
-    fn, lno, func, _sinfo = logger.findCaller()
+    if logger.manager.disable >= logging.WARNING:
+        return
+    fn, lno, func, _sinfo = logger.findCaller(stacklevel=2)
     for line in pending:
         logger.handle(
             logger.makeRecord(logger.name, logging.WARNING, fn, lno, "%s", (line,), None, func)
@@ -3199,6 +3203,9 @@ def _serve(args: argparse.Namespace) -> int:
             enforcing=enforcing,
             audit=_start_audit,
         )
+        if _posture_refused:
+            _write_start_audit(_start_audit)
+            return 2
         _log_file = (
             LogFile(
                 path=settings.logging.file,
@@ -3212,9 +3219,6 @@ def _serve(args: argparse.Namespace) -> int:
     except BaseException:
         _write_start_audit(_start_audit)
         raise
-    if _posture_refused:
-        _write_start_audit(_start_audit)
-        return 2
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
     # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
     # when it can read the file.
@@ -5655,13 +5659,13 @@ def _supervise(args: argparse.Namespace) -> int:
             enforcing=enforcing,
             audit=posture_audit,
         )
+        if posture_refused:
+            _write_start_audit(posture_audit)
+            return 2
         supervisor_spool_dir = _supervisor_forward_spool_dir(settings, db_base)
     except BaseException:
         _write_start_audit(posture_audit)
         raise
-    if posture_refused:
-        _write_start_audit(posture_audit)
-        return 2
     forwarder_installed = False
 
     def configure_with_forwarder(forward: SyslogForward | None) -> bool:

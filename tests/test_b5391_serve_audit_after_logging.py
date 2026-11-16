@@ -337,3 +337,28 @@ def test_the_remote_debug_audit_reaches_stdout_at_log_level_error(
     assert rc == 0
     out = capsys.readouterr().out.splitlines()
     assert len([o for o in out if line in o]) == 1
+
+
+def test_a_written_audit_record_names_its_caller_and_respects_logging_disable() -> None:
+    records: list[logging.LogRecord] = []
+
+    class _Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    recorder = _Keep()
+    logger = logging.getLogger("messagefoundry.__main__")
+    logger.addHandler(recorder)
+    try:
+        cli._write_start_audit(["AUDIT: one"])
+        logging.disable(logging.CRITICAL)
+        try:
+            cli._write_start_audit(["AUDIT: two"])
+        finally:
+            logging.disable(logging.NOTSET)
+    finally:
+        logger.removeHandler(recorder)
+    assert [r.getMessage() for r in records] == ["AUDIT: one"]
+    assert records[0].funcName == (
+        "test_a_written_audit_record_names_its_caller_and_respects_logging_disable"
+    )
