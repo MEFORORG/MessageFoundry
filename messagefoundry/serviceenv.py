@@ -342,17 +342,21 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     keeps what either reading would refuse. Each string's first line is a variable when it holds
     an equals sign. A later line is one when it sets a name the refusal is about, so a store key
     on a later line still refuses. A later line that sets an ordinary variable
-    (:data:`_ORDINARY_LINE`) ends the value above it, and is not kept: under the whole-string
-    reading it sets nothing, so the secrets directory's name is never taken as set by a later
-    line. Any other line, such as one of key material, belongs to the value above it, so a key
-    whose value starts on the next line is not empty, and an inline PEM key is judged on its own
-    lines only.
+    (:data:`_ORDINARY_LINE`) ends the value above it under the line reading, and is not kept:
+    under the whole-string reading it sets nothing, so the secrets directory's name is never taken
+    as set by a later line. Any other line, such as one of key material, belongs to the value
+    above it, so a key whose value starts on the next line is not empty.
+
+    The first line's name is also kept with the whole rest of its string as its value, which is
+    what the whole-string reading sets. So ``KEY=`` above another variable's line, or a path-form
+    OIDC key above a line holding PEM armour, refuses as ``main`` refused it: under that reading
+    the key holds every line below it.
 
     A first line with no equals sign sets nothing under the line reading. When it starts
     ``MEFOR_VALUE_``, the whole-string reading sets one variable whose name starts with it and
     holds a line break, and the engine loads that one. It is kept under the first line's name,
-    but only when no later line sets a refused name, since both readings then describe the same
-    variable and it is counted once."""
+    unless a later line sets a name :func:`_names` keeps, since both readings then describe the
+    same variable and it is counted once."""
     read: list[_Variable] = []
     for where, entry in entries:
         first, *rest_lines = _LINE_BREAK.split(entry)
@@ -375,18 +379,32 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                 parts = [rest]  # ends the value above, and is not kept
             else:
                 parts.append(line)
-        if first_equals:
-            read.append(_Variable(where, first_written, "\n".join(first_parts)))
-        elif first_written.upper().startswith(_VALUE_PREFIX) and "=" in entry and not later:
-            read.append(_Variable(where, first_written, entry.partition("=")[2], broken=True))
-        read.extend(
+        later_variables = [
             _Variable(
                 f"{where}, line {number} of a string whose first line is another entry",
                 written,
                 "\n".join(value_parts),
             )
             for number, written, value_parts in later
-        )
+        ]
+        if first_equals:
+            line_value = "\n".join(first_parts)
+            read.append(_Variable(where, first_written, line_value))
+            whole_value = entry.partition("=")[2]
+            if whole_value != line_value:
+                # The whole-string reading of the same name: every line after it is its value. A
+                # value empty on its own line but not in its string, or an inline key whose armour
+                # sits below another line's name, refuses under that reading, so it refuses here.
+                read.append(_Variable(where, first_written, whole_value))
+        elif (
+            first_written.upper().startswith(_VALUE_PREFIX)
+            and "=" in entry
+            and not _names(later_variables)
+        ):
+            # Counted once: only when no later line names a variable the refusal keeps. A later
+            # line whose value is empty, blank or a path is not one, so the broken name stands.
+            read.append(_Variable(where, first_written, entry.partition("=")[2], broken=True))
+        read.extend(later_variables)
     return read
 
 

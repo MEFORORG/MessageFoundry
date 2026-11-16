@@ -89,7 +89,8 @@ if (-not (@(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
 function Stop-ServiceAndConfirm {
     <#
       Stop the service and CONFIRM from the SCM that it actually stopped. Returns $true when the
-      service is Stopped (or gone); $false when it is still running.
+      service is Stopped (or gone); $false when it is still running. Throws when the SCM cannot be
+      read, since that says neither.
 
       Neither half of this existed before (BACKLOG #1558), and neither half is enough on its own.
 
@@ -142,8 +143,17 @@ function Stop-ServiceAndConfirm {
     # The pattern keeps wildcards out; only this filter keeps a display name out. -eq and not -ceq,
     # because the SCM compares service names without case. What is stopped is the object this
     # returned (-InputObject), never a name a cmdlet resolves again.
-    $exact = { @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
-        Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1 }
+    #
+    # ONLY "NO SUCH SERVICE" READS AS GONE. Any other failure to read the SCM throws: it says nothing
+    # about whether the service still runs, and the caller would reconfigure or remove it as stopped.
+    $exact = {
+        try { $found = @(Get-Service -Name $ServiceName -ErrorAction Stop) } catch {
+            if ("$($_.FullyQualifiedErrorId)" -like 'NoServiceFoundForGivenName,*') { return }
+            throw ("Could not read '$ServiceName' from the SCM ($($_.Exception.Message)), so " +
+                "whether it is still running is not known. Nothing was changed after this read.")
+        }
+        $found | Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+    }
     $target = & $exact
     # Nothing by that exact name means nothing to stop, so neither nssm nor the SCM is asked to stop
     # anything: each would resolve the name again, and either can take it as a display name.

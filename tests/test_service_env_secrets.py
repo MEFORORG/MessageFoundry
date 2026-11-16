@@ -425,21 +425,45 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
-def test_an_empty_store_key_above_another_variable_is_not_refused(key: str) -> None:
+def test_an_empty_store_key_above_another_variable_still_refuses(key: str) -> None:
     """Vault BACKLOG #5394: an empty ``KEY=`` line, then another variable's line. The key is
-    empty under the line reading, and the next line is not its value."""
+    empty under the line reading, but NSSM may set the whole string as one variable, and then the
+    key holds the line below it. ``main`` refused this, and so must this."""
     posture = _service([f"{key}=\nMEFOR_AI_ENVIRONMENT=prod"])
-    assert posture.listed_keys == ()
-    assert service_env_refusal(posture) is None
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
 
 
-def test_a_path_form_oidc_key_is_not_inlined_by_another_variables_pem() -> None:
-    """The PEM header belongs to the variable on its own line, not to the path above it."""
-    posture = _service(
-        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\oidc.pem\nMEFOR_AI_ENVIRONMENT=-----BEGIN x"]
-    )
-    assert posture.listed_directory_names == ()
-    assert service_env_refusal(posture) is None
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_STORE_PASSWORD=\nPass=word",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\nFOO=bar\n-----BEGIN PRIVATE KEY-----\nx",
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\oidc.pem\nMEFOR_AI_ENVIRONMENT=-----BEGIN x",
+    ],
+)
+def test_a_first_name_whose_whole_string_holds_a_secret_refuses(entry: str) -> None:
+    """A line that sets an ordinary variable ends the value above it only under the line reading.
+    Under the whole-string reading the first name holds every line below it, so a value that
+    reads empty, or a path, on its own line refuses when its string carries more."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=",
+        "MEFOR_VALUE_A\nMEFOR_STORE_ENCRYPTION_KEY=   ",
+        "MEFOR_VALUE_A\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem",
+    ],
+)
+def test_a_broken_value_name_above_a_later_name_nothing_keeps_still_refuses(entry: str) -> None:
+    """The broken ``MEFOR_VALUE_A<LF>...`` name is dropped only when a later line sets a name the
+    refusal keeps. A later key that is empty, blank or a path is not one, so the whole-string
+    variable, which the engine loads, still refuses."""
+    posture = _service([entry])
+    assert posture.unplain_value_names == ("MEFOR_VALUE_A",)
+    assert service_env_refusal(posture) is not None
 
 
 def test_a_line_with_no_equals_sign_is_not_glued_onto_the_next() -> None:

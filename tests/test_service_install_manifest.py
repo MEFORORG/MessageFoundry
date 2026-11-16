@@ -495,6 +495,7 @@ def _stop_arms(
     chatter: str = "",
     service: str = "MessageFoundry",
     found_name: str | None = None,
+    lookup_error: str | None = None,
 ) -> dict:
     """Run Stop-ServiceAndConfirm with Get-Service and Stop-Service shadowed.
 
@@ -504,7 +505,8 @@ def _stop_arms(
 
     ``service`` is the -ServiceName passed. ``found_name`` is the Name the shadowed Get-Service
     reports for it, ``service`` itself when None: a different one is how the real cmdlet answers a
-    DISPLAY name (BACKLOG #5402).
+    DISPLAY name (BACKLOG #5402). ``lookup_error`` makes it throw an error with that
+    FullyQualifiedErrorId instead, and ``threw`` then holds what the helper threw, if anything.
 
     ``outputs`` counts the non-warning objects the helper emitted. It is reported rather than
     collapsed because the COUNT is the defect: the callers test one boolean.
@@ -520,6 +522,7 @@ def _stop_arms(
     nssm_arg = _psq(str(stub)) if nssm_exit is not None else "''"
     states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
     found_ps = _psq(found_name) if found_name is not None else "$null"
+    error_ps = _psq(lookup_error) if lookup_error is not None else "$null"
     body = (
         prelude
         + rf"""
@@ -527,10 +530,15 @@ def _stop_arms(
   $script:GetServiceCalls = 0
   $script:States = {states_ps}
   $script:FoundName = {found_ps}
+  $script:LookupError = {error_ps}
   $script:StopTargets = @()
   function Get-Service {{
     param([string]$Name, $ErrorAction)
     $script:GetServiceCalls++
+    if ($null -ne $script:LookupError) {{
+      throw [System.Management.Automation.ErrorRecord]::new(
+        [Exception]::new('synthetic lookup failure'), $script:LookupError, 'NotSpecified', $Name)
+    }}
     if ($script:States.Count -eq 0) {{ return $null }}
     $i = [Math]::Min($script:GetServiceCalls - 1, $script:States.Count - 1)
     $found = if ($null -ne $script:FoundName) {{ $script:FoundName }} else {{ $Name }}
@@ -543,9 +551,13 @@ def _stop_arms(
   }}
   $warnings = @()
   $result = $null
-  $emitted = & {{
-    {_STOP_FN} -ServiceName {_psq(service)} -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
-  }} 3>&1
+  $threw = ''
+  $emitted = @()
+  try {{
+    $emitted = & {{
+      {_STOP_FN} -ServiceName {_psq(service)} -NssmPath {nssm_arg} -TimeoutSeconds {timeout}
+    }} 3>&1
+  }} catch {{ $threw = "$_" }}
   $outputs = 0
   foreach ($o in @($emitted)) {{
     if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
@@ -558,6 +570,7 @@ def _stop_arms(
     stopServiceCalls = $script:StopServiceCalls
     getServiceCalls  = $script:GetServiceCalls
     stopTargets      = @($script:StopTargets)
+    threw            = $threw
   }} | ConvertTo-Json -Depth 4 -Compress
 """
     )
@@ -576,6 +589,27 @@ def test_a_clean_stop_is_reported_clean(tmp_path: Path) -> None:
     arms = _stop_arms(tmp_path, nssm_exit=0, states=["Stopped"])
     assert arms["result"] is True, "a clean stop must report success"
     assert arms["warnings"] == [], f"a clean stop must warn about nothing; got {arms['warnings']}"
+
+
+@pytest.mark.parametrize("nssm_exit", [0, None])
+def test_an_scm_read_that_fails_is_not_taken_as_gone(tmp_path: Path, nssm_exit: int | None) -> None:
+    """Only "no such service" means gone (BACKLOG #5402). Any other failed read says nothing about
+    whether the service still runs, so the helper throws rather than report it stopped, and stops
+    nothing it could not identify."""
+    failed = _stop_arms(
+        tmp_path, nssm_exit=nssm_exit, states=["Running"], lookup_error="RpcServerUnavailable"
+    )
+    assert "Could not read 'MessageFoundry' from the SCM" in failed["threw"], failed
+    assert failed["stopServiceCalls"] == 0, failed
+    # The control: the cmdlet's own "no such service" error is an absent service, as before.
+    gone = _stop_arms(
+        tmp_path,
+        nssm_exit=nssm_exit,
+        states=["Running"],
+        lookup_error="NoServiceFoundForGivenName,Microsoft.PowerShell.Commands.GetServiceCommand",
+    )
+    assert gone["threw"] == "" and gone["result"] is True, gone
+    assert gone["stopServiceCalls"] == 0, gone
 
 
 def test_a_nonzero_nssm_exit_is_no_longer_swallowed(tmp_path: Path) -> None:

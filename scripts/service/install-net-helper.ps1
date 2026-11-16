@@ -767,8 +767,7 @@ if ($problem) {
     if ($left.Count -gt 0) {
         $outcome = "Could not delete $($left -join ' and ')."
         if ($serviceExists) {
-            Set-Service -InputObject $existingService -StartupType Disabled -ErrorAction SilentlyContinue
-            $outcome += " '$ServiceName' was set to Disabled so the registration cannot start them."
+            $outcome += " $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'the registration cannot start them')"
         }
     }
     throw ("An installed copy failed its check: $problem. $outcome Nothing was started. Re-run from " +
