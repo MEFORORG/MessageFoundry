@@ -72,7 +72,8 @@ def _edges(coord: Any) -> list[str]:
 async def test_a_hold_at_a_moved_epoch_demotes_then_promotes(
     _name: str, make: Callable[[_Clock], Any]
 ) -> None:
-    """Before the fix the node stayed leader at the other node's epoch, and no edge fired."""
+    """Before the fix the node stayed leader at the other node's epoch, and no edge fired. The
+    heartbeat stamp is unset here, so the #5710 lapse check stays out of the way."""
     clock = _Clock()
     coord = make(clock)
     calls: list[int] = []
@@ -98,8 +99,9 @@ async def test_a_hold_at_a_moved_epoch_demotes_then_promotes(
 @pytest.mark.parametrize(("_name", "make"), _COORDINATORS, ids=_IDS)
 async def test_one_failed_renew_does_not_demote(_name: str, make: Callable[[_Clock], Any]) -> None:
     """The shipped cadence: one renew fails, and the next tick runs two heartbeats plus jitter after
-    the last good one, past the fence. A check on the renew's age would demote there; the epoch did
-    not move, so the leader renews and keeps leading."""
+    the last good one, past the fence. A check on the renew's age in the tick would demote there;
+    the epoch did not move, so the tick adds no demotion. Whether the watchdog fences during that
+    renew is its own rule, not exercised here."""
     clock = _Clock()
     coord = make(clock)
     calls: list[int] = []
