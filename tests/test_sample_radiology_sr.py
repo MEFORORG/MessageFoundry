@@ -21,9 +21,10 @@ from tests._dicom_sample import make_sr_part10  # noqa: E402
 SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 
-def _oru(**kwargs: str) -> Message:
+def _oru(*, sop_instance_uid: str, study_date: str) -> Message:
     reg = load_config(SAMPLES)
-    raw = RawMessage.from_bytes(make_sr_part10(**kwargs), "dicom")
+    part10 = make_sr_part10(sop_instance_uid=sop_instance_uid, study_date=study_date)
+    raw = RawMessage.from_bytes(part10, "dicom")
     out = reg.handlers["sr_to_oru"](raw)
     assert isinstance(out, Send) and out.to == "OB_POWERSCRIBE"
     assert isinstance(out.message, str)
