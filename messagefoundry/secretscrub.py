@@ -1320,14 +1320,19 @@ _KEY_MATERIAL = re.compile(
 # is not one of those: the run after the first segment may hold it, so ``redis://:p=ss@host`` is
 # read and hidden.
 #
-# THE FIRST SEGMENT IS POSSESSIVE (``++``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
+# THE FIRST SEGMENT MAY BE EMPTY (``*+``), so a password that STARTS with "@", or an empty user's
+# that starts with "=", is read: ``postgres://svc:@Pw@db`` and ``redis://:=Pw@db`` printed whole
+# while it had to take one character (code review of BACKLOG #5386). An empty password,
+# ``user:@host``, is then replaced by the placeholder too, which hides nothing and costs nothing.
+#
+# THE FIRST SEGMENT IS POSSESSIVE (``*+``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
 # not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
 # reads no nested quantifier.
 _DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)[^\s/@?#&=;,]++|(?<!//:)[^\s/@]++)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
+    r"(?:(?<=//:)[^\s/@?#&=;,]*+|(?<!//:)[^\s/@]*+)[^\s/;?#&,()|^~{}<>\[\]%\x27\x22]*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

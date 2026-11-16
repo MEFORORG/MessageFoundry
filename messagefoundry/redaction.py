@@ -261,10 +261,10 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
 #: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme,
-#: and narrower in one way: since BACKLOG #5386 that pattern's user may be empty, and this arm's
-#: may not, so a password-only DSN does not switch the encoded run off and a PID run beside it is
-#: still hidden. The price is that run's own: where such a DSN sits in the run's token, the run takes
-#: it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
+#: and narrower in two ways: since BACKLOG #5386 that pattern's user may be empty and its password
+#: may start with "@" (or be empty), and this arm's may not, so a password-only DSN does not switch
+#: the encoded run off and a PID run beside it is still hidden. The price is that run's own: where
+#: such a DSN sits in the run's token, the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
 #: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
 #: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one

@@ -218,16 +218,14 @@ def smoke_self(
             # allow_empty comes to suppress.
             reg.validate()
     except WiringError as exc:
-        # The engine's own wiring diagnostic, which names what to fix, so it keeps its wording and no
-        # type prefix, and takes the driver arms' longer bound rather than 200. It takes the same
-        # bounded, square-bracket path as every other arm (BACKLOG #5395): the bare credential scrub
-        # it took before wrote an unbounded detail with ``<redacted>``, which an HTML sink drops.
+        # The engine's own wiring diagnostic, so no type prefix. It wraps whatever a config module
+        # raised, so it takes the config-load arms' bound and the same square-bracket path as every
+        # other arm (BACKLOG #5395); before that it printed the exception text raw and unbounded.
         return CheckResult(
             rid,
             title,
             Status.FAIL,
-            "config failed to load: "
-            f"{safe_detail_text(codec_safe_str(exc), limit=DRIVER_DETAIL_LIMIT)}",
+            f"config failed to load: {safe_detail_text(codec_safe_str(exc))}",
         )
     except (OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # What the hop census reads as an unknown load, so the shared load's failure ends this row

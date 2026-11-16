@@ -1288,6 +1288,11 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             ("pw-At", "Sign_Pw-72"),
             "://svc:",
         ),
+        # A password that STARTS with "@", and an empty user's that starts with "=" or "@": the
+        # first segment had to take a character, so these printed whole (code review, round 2).
+        ("store dsn postgres://svc:@Lead_At-74@db.invalid/m", ("Lead_At-74",), "://svc:"),
+        ("store dsn redis://:=Lead_Eq-75@db.invalid", ("Lead_Eq-75",), "redis://:"),
+        ("store dsn redis://:@Lead_At-76@db.invalid", ("Lead_At-76",), "redis://:"),
         # Both at once, two "@" signs in the password.
         (
             "store dsn mssql+pyodbc://:pw@Two@Ats-73@db.invalid/mefor",

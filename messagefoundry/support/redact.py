@@ -622,7 +622,8 @@ def redact_log_line(line: str) -> str:
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
-    mask runs once more over the whole joined line (BACKLOG #5030). A final long-base64 sweep catches
+    mask runs once more over the whole joined line (BACKLOG #5030), then secretscrub's widened DSN
+    reading, over the whole line too (BACKLOG #5386). A final long-base64 sweep catches
     any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —

@@ -21,7 +21,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.store import base as store_base
 from messagefoundry.verify import checks, runner, smoke
-from messagefoundry.verify.model import DRIVER_DETAIL_LIMIT, CheckResult, safe_exc_detail
+from messagefoundry.verify.model import CheckResult, safe_exc_detail
 from messagefoundry.verify.report import render_json, render_markdown
 
 _PLANTED = "pw-V3rify_Det-81"
@@ -52,19 +52,20 @@ def test_config_load_failure_detail_hides_the_credential(
     _assert_hidden(r, "config failed to load: ")
 
 
-def test_a_wiring_error_keeps_its_text_whole_around_the_redaction(tmp_path: Path) -> None:
-    """The engine's own wiring diagnostic is the fix an operator reads, so it takes the driver arms'
-    longer bound rather than 200, and gets no type prefix."""
-    tail = "handler 'h' sends to unknown outbound 'ob_missing'"
-    long_text = f"{_LEAKY}; " + "x" * 300 + f"; {tail}"
-    r = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError(long_text)))
+def test_a_wiring_error_takes_the_config_load_path(tmp_path: Path) -> None:
+    """A WiringError wraps whatever a config module raised, so it takes the config-load arms'
+    bound and the square-bracket placeholder, and, being the engine's own diagnostic, no type
+    prefix. Control: the same text through the bound-free credential scrub runs past the bound."""
+    from messagefoundry.secretscrub import scrub_credentials
+
+    head = f"{_LEAKY}; handler 'h' sends to unknown outbound 'ob_missing'"
+    r = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError(head)))
     assert _PLANTED not in r.detail
-    assert r.detail.endswith(tail), r.detail
     assert "WiringError" not in r.detail
-    # The same bounded, square-bracket path as the other arms: no ``<redacted>``, and a bound.
     assert "[redacted]" in r.detail and "<redacted>" not in r.detail, r.detail
-    huge = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError("y " * 5000)))
-    assert len(huge.detail) < DRIVER_DETAIL_LIMIT + 100, len(huge.detail)
+    text = "y " * 5000
+    huge = smoke.smoke_self(str(tmp_path), graph=lambda: _raise(WiringError(text)))
+    assert len(huge.detail) < 400 < len(scrub_credentials(text)), len(huge.detail)
 
 
 @pytest.mark.parametrize(

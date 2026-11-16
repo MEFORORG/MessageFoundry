@@ -28,7 +28,8 @@ FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 #: The bound for an arm that quotes a store driver, a socket or the TLS stack rather than a
 #: Router/Handler. Those arms printed the whole text before BACKLOG #5395, and the engine's own
 #: refusals there, such as the store's Vault revocation remedy, run past ``safe_text``'s 200; the
-#: arms that can quote a message (config load, dry run, BACKLOG #1779) keep 200.
+#: arms that can quote a message (config load, a WiringError included, and dry run, BACKLOG #1779)
+#: keep 200.
 DRIVER_DETAIL_LIMIT: Final = 2000
 
 
@@ -60,9 +61,9 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
     the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
     the user. Then every whitespace-separated word of that result holding a fragment, between
-    placeholders, that the credentials-first result does not hold as a fragment of its own is
-    replaced whole. That errs toward hiding: a label the other order spelled differently goes with
-    its value.
+    placeholders, that it prints more often than the credentials-first result does is replaced
+    whole, at every occurrence (:func:`_printed_by_both`). That errs toward hiding: a label the
+    other order spelled differently goes with its value.
 
     The input is cut to :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass
     reads it, and its note is kept past the length bound.
