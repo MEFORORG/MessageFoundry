@@ -280,6 +280,7 @@ from messagefoundry.transports.base import (
     ProcessedArchive,
     ReplyBodyDropped,
     SyncReplyResolver,
+    cap_setting,
     check_file_key,
     guard_dir_settings,
     guarded_destination_dirs,
@@ -2877,13 +2878,12 @@ class RegistryRunner:
         return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(
-        self, ic: InboundConnection, settings: Mapping[str, Any] | None = None
+        self, ic: InboundConnection, settings: Mapping[str, Any]
     ) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
 
-        ``settings`` is the inbound's env()-RESOLVED settings, as the source is built from; the
-        start path passes them (BACKLOG #5677), since ``ic.spec.settings`` may still hold an
-        unresolved env() reference. Omitted, the raw spec settings are read.
+        ``settings`` is the inbound's env()-RESOLVED settings, as the source is built from (BACKLOG
+        #5677): ``ic.spec.settings`` may still hold an unresolved env() reference.
 
         An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
         own and gets the ``Http()`` factory's defaults."""
@@ -2893,9 +2893,8 @@ class RegistryRunner:
             )
         if not self._intake_auth_enabled(ic):
             return None
-        read = ic.spec.settings if settings is None else settings
-        per_peer = _intake_budget(read, "intake_auth_rate_limit", ic.name)
-        glob = _intake_budget(read, "intake_auth_rate_limit_global", ic.name)
+        per_peer = _intake_budget(settings, "intake_auth_rate_limit", ic.name)
+        glob = _intake_budget(settings, "intake_auth_rate_limit_global", ic.name)
         if not per_peer and not glob:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
@@ -5841,6 +5840,8 @@ class RegistryRunner:
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
+        # BACKLOG #5677: the resolved budgets, before the off-loop build below does any TLS work.
+        check_intake_budgets(source_cfg, ic.name)
         # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
         # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
         # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
@@ -14039,21 +14040,40 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
 
 
 def _intake_budget(settings: Mapping[str, Any], knob: str, name: str) -> int:
-    """One intake-auth failed-attempt budget, read from resolved settings (BACKLOG #5677).
+    """One intake-auth failed-attempt budget, read from env()-RESOLVED settings (BACKLOG #5677).
 
-    ``None`` or ``0`` disables the arm. Anything else must be a non-negative integer: a negative
-    budget would refuse every intake request, a bool is no count, and an unresolved env() reference
-    or other type would fail with a bare ``TypeError``. Refused as a ``WiringError`` naming the
-    connection and the setting, with the value withheld, as the ``Http()`` factory refuses it."""
-    value = settings.get(knob)
-    if value is None:
-        return 0
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    Read by :func:`~messagefoundry.transports.base.cap_setting`, the rule every other int cap
+    follows: ``None``, ``""`` and a zero disable the arm, and digit text from an uncast env() is a
+    count. A bool, a fraction or other text is refused there, and a negative here, since a negative
+    budget would refuse every intake request. Refused as a ``WiringError`` naming the connection
+    and the setting, with the value withheld."""
+    refusal: str | None = None
+    budget: int | None = None
+    try:
+        budget = cap_setting(settings.get(knob), int, knob=knob, transport="HTTP")
+    except ValueError as exc:
+        refusal = str(exc)  # withholds the value; raised below, outside this handler
+    if refusal is None and budget is not None and budget < 0:
+        refusal = f"HTTP {knob} is negative (value withheld), which would refuse every request"
+    if refusal is not None:
         raise WiringError(
-            f"inbound connection {name!r}: {knob} is not a non-negative integer (value withheld). "
-            "Set it to an integer number of failed attempts per minute, or 0 to disable that budget"
+            f"inbound connection {name!r}: {refusal}. Set it to a whole number of failed attempts "
+            "per minute, or 0 to disable that budget"
         )
-    return value
+    return budget or 0
+
+
+def check_intake_budgets(source: Source, name: str) -> None:
+    """Refuse an HTTP inbound whose resolved failed-attempt budgets are no count (BACKLOG #5677).
+
+    Run beside :func:`check_http_intake_auth` at start AND in the build check, so `messagefoundry
+    check`, promote and a reload's pre-swap check refuse what serve would refuse, before anything
+    stops. The ``Http()`` factory checks a literal and an env() ``default=`` at load; this sees the
+    value the environment resolved."""
+    if source.type is not ConnectorType.HTTP:
+        return
+    for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
+        _intake_budget(source.settings, knob, name)
 
 
 def _source_config(
@@ -14683,6 +14703,7 @@ def _build_check_connectors(
         # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
         # would leave this gate weaker at check time than every posture-keyed neighbour.
         check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
+        check_intake_budgets(source_cfg, ic.name)  # BACKLOG #5677, as at start
         build_source(source_cfg, egress=egress)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a

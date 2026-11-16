@@ -585,6 +585,12 @@ async def test_matching_reject_stays_final_and_ae_stays_retried_under_correlatio
             await dest.send(_msg("M1"))
         assert ei.value.code == "AR" and ei.value.permanent is True
         assert dest._conn is not None  # complete transaction, connection kept
+        # A reject with an EMPTY MSA-2 names no other message (a receiver that could not parse the
+        # body answers so), so it stays final rather than retrying a body that can never clear.
+        peer.raw_ack = _stray_ack("AR", "")
+        with pytest.raises(NegativeAckError) as blank:
+            await dest.send(_msg("M1"))
+        assert blank.value.code == "AR" and blank.value.permanent is True
         peer.raw_ack = _stray_ack("AE", "OTHER")
         with pytest.raises(NegativeAckError) as ei2:
             await dest.send(_msg("M2"))

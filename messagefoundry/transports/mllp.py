@@ -935,7 +935,8 @@ class MLLPDestination(DestinationConnector):
         # retryable DeliveryError; only a read-but-unparseable ACK becomes outcome='unparseable'.
         self.capture_response: bool = bool(s.get("capture_response", False))
         # BACKLOG #82: when True, a positive ACK (MSA-1 AA/CA) is accepted only if its MSA-2 echoes the
-        # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). Default
+        # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). A reject
+        # (AR/CR) naming a different, non-empty MSA-2 is one too (BACKLOG #5681). Default
         # False → no correlation, byte-identical (the sent control id is never threaded to _check_ack).
         # The sent MSH-10 is read defensively in send() (a non-HL7 / unreadable payload → skip, deliver
         # as before); MSA-2 is read separator-aware via Peek, never hardcoded delimiters.
@@ -1599,10 +1600,13 @@ class MLLPDestination(DestinationConnector):
         # BACKLOG #5681: a reject (AR/CR) is correlated too, because it is final -- a stray reject for
         # ANOTHER message would otherwise permanently dead-letter this one and leave the desynchronized
         # persistent socket cached. A MATCHING reject stays final, and AE/CE stays a retried
-        # NegativeAckError whatever its MSA-2, both unchanged.
+        # NegativeAckError whatever its MSA-2, both unchanged. A reject with an EMPTY MSA-2 names no
+        # other message, so it stays final too: a receiver that cannot parse a body, the engine's own
+        # MLLP listener included, answers AR with no MSA-2, and retrying that would never clear.
         if sent_control_id and msa1 in ("AA", "CA", "AR", "CR"):
             ack_control_id = ack.field("MSA-2")
-            if ack_control_id != sent_control_id:
+            positive = msa1 in ("AA", "CA")
+            if ack_control_id != sent_control_id and (positive or ack_control_id):
                 # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
                 # sized too, and it is interpolated into this raise. Clamped HERE and not at the
                 # read above, because the comparison must see the field the peer actually sent --

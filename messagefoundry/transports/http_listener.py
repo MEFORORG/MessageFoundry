@@ -2204,9 +2204,14 @@ class HttpSource(SourceConnector):
             # BACKLOG #5680, the HTTP twin of the MLLP listener's #1619 arm: a fault inside the
             # inbound handler, such as a store outage at the ingress commit, is an engine-side
             # failure. Left to `_on_client`, an OSError (TimeoutError included) read as `peer_reset`
-            # with no log line and no answer, and anything else as `framing_error`. Nothing is
-            # accepted here, so a 500 is the honest answer and the sender's retry is the recovery.
-            # Returns True: the failure emitted its own kind, so the outer `closed` is suppressed.
+            # with no log line and no answer, and anything else as `framing_error`. The answer is the
+            # temporary refusal's 503 with Retry-After, since such a fault is usually one a re-send
+            # clears. The fault may come after the ingress commit, so a re-send can commit a second
+            # copy, which at-least-once allows. Charged to the pacer like any body read, so a sender
+            # that re-sends at once during an outage is still paced. Returns True: the failure
+            # emitted its own kind, so the outer `closed` is suppressed.
+            if self._pacer is not None:
+                self._pacer.charge(1, now=time.monotonic())
             reason = safe_exc(exc)
             logger.error(
                 "HTTP source %s: a request failed in the inbound handler: %s (peer=%s)",
@@ -2215,7 +2220,13 @@ class HttpSource(SourceConnector):
                 peer_host or "unknown",
             )
             await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
-            await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
+            status, headers = _refusal_status(RefusalKind.TEMPORARY)
+            await self._write_safely(
+                writer,
+                build_response(
+                    status, '{"error":"temporarily unavailable"}', extra_headers=headers
+                ),
+            )
             return True
         # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
         # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health

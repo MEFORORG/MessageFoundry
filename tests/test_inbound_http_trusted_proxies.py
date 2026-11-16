@@ -398,11 +398,14 @@ def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
         )
     assert str(budget) not in str(exc.value)
     # Its control: without trusted_proxies this refusal does not read the budget. Only the general
-    # BACKLOG #5677 rule does, which refuses a budget that is no count at all, never one below 1.
-    try:
+    # BACKLOG #5677 rule does: a whole count (10.0, "10" or an env() default of 10) loads, and a
+    # fraction, a negative or a bool is refused by that rule's own message.
+    if isinstance(budget, bool) or budget in (0.5, 1.5, -1):
+        with pytest.raises(WiringError, match=knob) as general:
+            Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+        assert "at least 1" not in str(general.value)
+    else:
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
-    except WiringError as general:
-        assert f"{knob} is not a non-negative integer" in str(general)
 
 
 def test_whole_number_budgets_load_with_trusted_proxies() -> None:

@@ -2800,7 +2800,9 @@ def MLLP(
     path). Both control ids are read separator-aware from the message (never hardcoded ``|^~\\&``).
     ``False`` (the default) leaves delivery **byte-identical** — no correlation is performed. If the
     outgoing message's own MSH-10 is absent/unreadable there is nothing to correlate, so the check is
-    skipped and the message delivers as before. It does not alter a negative ACK's handling.
+    skipped and the message delivers as before. A reject (AR/CR) that names a
+    different, non-empty MSA-2 is the same retryable correlation failure (BACKLOG #5681); a reject
+    with a matching or empty MSA-2 stays final, and AE/CE is not correlated.
 
     ``send_min_interval_seconds`` (**outbound only**, BACKLOG #82) paces this lane's egress: the engine
     holds each ``send`` until at least this many seconds have elapsed since the previous send on the
@@ -3425,20 +3427,28 @@ def Http(
                 "that budget off. Set it to an integer number of failed attempts per minute, or "
                 "remove the setting"
             )
-    # BACKLOG #5677: the runner reads each budget as a count, so a negative (which would refuse
-    # every intake request), a bool or a non-integer is refused here, where `check` sees it, after
-    # the stricter trusted_proxies rule above. An env() is checked on its default= here and on its
-    # resolved value when the source starts.
+    # BACKLOG #5677: the runner reads each budget as a count by cap_setting's rule, so a bool, a
+    # fraction, other text or a negative (which would refuse every intake request) is refused here,
+    # where `check` sees it, after the stricter trusted_proxies rule above. An env() is checked on
+    # its default= here and on its resolved value by the runner's check_intake_budgets.
+    from messagefoundry.transports.base import cap_setting
+
     for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
-        budget = settings[knob]
-        if isinstance(budget, EnvRef):
-            budget = None if budget.default is _UNSET else budget.default
-        if budget is not None and (
-            isinstance(budget, bool) or not isinstance(budget, int) or budget < 0
-        ):
+        written = settings[knob]
+        if isinstance(written, EnvRef):
+            written = None if written.default is _UNSET else written.default
+        budget_refusal: str | None = None
+        try:
+            read = cap_setting(written, int, knob=knob, transport="Http")
+        except ValueError as exc:
+            budget_refusal = str(exc)  # withholds the value; raised below, outside this handler
+        else:
+            if read is not None and read < 0:
+                budget_refusal = f"Http {knob} is negative (value withheld)"
+        if budget_refusal is not None:
             raise WiringError(
-                f"Http {knob} is not a non-negative integer (value withheld). Set it to an "
-                "integer number of failed attempts per minute, or 0 to disable that budget"
+                f"{budget_refusal}. Set it to a whole number of failed attempts per minute, or 0 "
+                "to disable that budget"
             )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())

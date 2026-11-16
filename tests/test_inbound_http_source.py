@@ -335,12 +335,12 @@ async def test_a_handler_fault_is_handler_error_with_a_500_and_a_log_line(
     fault: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5680: a fault inside the inbound handler is engine-side. It must be recorded as
-    ``handler_error`` with an ERROR line and answered 500, never read as the peer's ``peer_reset``
+    ``handler_error`` with an ERROR line and answered 503 with Retry-After, never read as the peer's ``peer_reset``
     (an OSError, TimeoutError included) or ``framing_error`` (anything else)."""
-    from messagefoundry.transports.receipt import receipt_handler
+    from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 
     @receipt_handler
-    async def failing(body: bytes) -> object:
+    async def failing(body: bytes) -> IngressReceipt:
         raise fault
 
     ic = build_inbound_connection("IB_HTTP", Http(port=0), router="r")
@@ -360,7 +360,7 @@ async def test_a_handler_fault_is_handler_error_with_a_500_and_a_log_line(
             resp = await _http(source.sockport, body=b"payload")
     finally:
         await source.stop()
-    assert resp.status == 500
+    assert resp.status == 503 and "retry-after" in resp.headers
     assert [e[0] for e in events] == ["established", "handler_error"]
     assert any("inbound handler" in r.getMessage() for r in caplog.records)
 

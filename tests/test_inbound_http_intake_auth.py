@@ -891,21 +891,22 @@ def test_per_peer_arm_still_bounds_an_authenticated_peer() -> None:
         ("intake_auth_rate_limit_global", -5),
         ("intake_auth_rate_limit", True),
         ("intake_auth_rate_limit_global", 2.5),
-        ("intake_auth_rate_limit", "10"),
+        ("intake_auth_rate_limit", "1e3"),
         ("intake_auth_rate_limit", env("budget", default=-1)),
     ],
 )
 def test_the_factory_refuses_a_budget_that_is_no_count(knob: str, value: object) -> None:
-    with pytest.raises(WiringError, match=f"{knob} is not a non-negative integer") as exc:
-        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **{knob: value})
-    assert "-1" not in str(exc.value) and "2.5" not in str(exc.value)  # value withheld
+    knobs: dict[str, Any] = {knob: value}
+    with pytest.raises(WiringError, match=knob) as exc:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    shown = value.default if hasattr(value, "default") else value
+    assert str(shown) not in str(exc.value)  # value withheld
 
 
-def test_the_factory_still_accepts_zero_none_and_an_env_reference() -> None:
-    for value in (0, None, 7, env("budget"), env("budget", default=3)):
-        Http(
-            port=8080, intake_auth="api_key", intake_api_key=env("k"), intake_auth_rate_limit=value
-        )
+def test_the_factory_still_accepts_every_count_and_an_env_reference() -> None:
+    for value in (0, None, 7, "10", 10.0, env("budget"), env("budget", default=3)):
+        knobs: dict[str, Any] = {"intake_auth_rate_limit": value}
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
 
 
 def _budget_runner(**budgets: Any) -> tuple[Any, Any]:
@@ -924,25 +925,26 @@ def _budget_runner(**budgets: Any) -> tuple[Any, Any]:
     return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)), ic
 
 
-def test_the_runner_reads_the_resolved_budget_not_the_env_reference() -> None:
-    from messagefoundry.pipeline.wiring_runner import _source_config
+@pytest.mark.parametrize("value", [5, "5"])
+def test_the_runner_reads_the_resolved_budget_not_the_env_reference(value: object) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
 
     runner, ic = _budget_runner(intake_auth_rate_limit=env("budget"))
-    resolved = _source_config(ic, "127.0.0.1", {"budget": 5, "k": "secret-key"}).settings
-    limiter = runner._make_intake_rate_limiter(ic, resolved)
-    assert limiter is not None
-    # The raw spec still holds the env() reference: refused by name, never a bare TypeError.
-    with pytest.raises(WiringError, match="intake_auth_rate_limit is not a non-negative"):
-        runner._make_intake_rate_limiter(ic)
+    cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
+    check_intake_budgets(cfg, ic.name)
+    assert runner._make_intake_rate_limiter(ic, cfg.settings) is not None
 
 
-@pytest.mark.parametrize("value", [-1, True, "10"])
-def test_the_runner_refuses_a_resolved_budget_that_is_no_count(
-    value: object,
-) -> None:
-    from messagefoundry.pipeline.wiring_runner import _source_config
+@pytest.mark.parametrize("value", [-1, True, "abc"])
+def test_the_runner_refuses_a_resolved_budget_that_is_no_count(value: object) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
 
     runner, ic = _budget_runner(intake_auth_rate_limit_global=env("budget"))
-    resolved = _source_config(ic, "127.0.0.1", {"budget": value, "k": "secret-key"}).settings
-    with pytest.raises(WiringError, match="intake_auth_rate_limit_global is not a non-negative"):
-        runner._make_intake_rate_limiter(ic, resolved)
+    cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match="intake_auth_rate_limit_global") as exc:
+            refuse()
+        assert "IB_HTTP" in str(exc.value) and str(value) not in str(exc.value)
