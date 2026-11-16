@@ -142,8 +142,9 @@ async def _claim(store: MessageStore, lane: str, stage: Stage, now: float = FAR)
 
 
 async def _restart(store: MessageStore) -> None:
-    """The next start's recovery: what brings a dead worker's in-flight row back (#4607 steps 1,
-    2 and 5 would do it without a restart)."""
+    """The next start's recovery. These tests drive the per-item bodies with no supervisor, so
+    this stands in for what re-pends a dead worker's in-flight row: a respawn in a live per-lane
+    engine, or the next start on a pooled lane."""
     await store.reset_stale_inflight()
 
 
@@ -175,7 +176,7 @@ async def test_a_row_that_kills_the_router_worker_every_time_is_dead_lettered(
     for death in range(1, LIMIT + 1):
         item = await _claim(store, "IB", Stage.INGRESS)
         assert item.message_id == killer  # back at its lane position after each restart
-        with pytest.raises(_Kill):  # the death still goes on; respawning is #4607 steps 1, 2, 5
+        with pytest.raises(_Kill):  # the death still goes on; a supervisor respawns the worker
             await drive("IB", item)
         if death < LIMIT:
             # Below the cap only the count is written: the row is in flight, as the death left it.
@@ -339,7 +340,9 @@ async def test_a_delivery_death_is_capped_by_the_lanes_retry_policy(
     tmp_path: Path, store: MessageStore, claim_mode: str
 ) -> None:
     """An outbound death counts as a failed send under the lane's own policy (owner ruling
-    2026-11-11): its count is ``attempts``, and its cap the lane's ``max_attempts``."""
+    2026-11-11): its count is ``attempts``, and its cap the lane's ``max_attempts``. Below the cap a
+    per-lane lane re-pends the row through ``mark_failed`` (#1611 step 2), keeping ``attempts`` for
+    the respawned worker to re-claim; a dispatcher-drained lane writes nothing."""
     runner = _runner(_registry(tmp_path), store, claim_mode)
     runner._retry["OB"] = RetryPolicy(max_attempts=2, backoff_seconds=0.01)
     runner._destinations["OB"] = _KillingConnector()  # type: ignore[assignment]
@@ -348,7 +351,8 @@ async def test_a_delivery_death_is_capped_by_the_lanes_retry_policy(
 
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
-    assert await _row(store, mid, Stage.OUTBOUND) == ("inflight", 1, 0)
+    below_cap = "pending" if claim_mode == "per_lane" else "inflight"
+    assert await _row(store, mid, Stage.OUTBOUND) == (below_cap, 1, 0)
     await _restart(store)
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
@@ -366,8 +370,8 @@ async def test_a_retry_forever_lane_never_dead_letters_on_a_death(
     for death in range(1, LIMIT + 2):
         with pytest.raises(_Kill):
             await runner._process_delivery_item("OB", await _claim(store, "OB", Stage.OUTBOUND))
-        assert await _row(store, mid, Stage.OUTBOUND) == ("inflight", death, 0)
-        await _restart(store)
+        # Re-pended as a failed send, with its attempts kept, and never dead-lettered.
+        assert await _row(store, mid, Stage.OUTBOUND) == ("pending", death, 0)
 
 
 async def test_a_death_after_the_send_was_marked_done_leaves_it_done(
@@ -536,30 +540,29 @@ async def test_the_migration_adds_the_column_to_an_existing_store(tmp_path: Path
         await s.close()
 
 
-async def test_a_live_per_lane_engine_dead_letters_the_killer_across_restarts(
-    tmp_path: Path, store: MessageStore
+async def test_a_live_per_lane_engine_dead_letters_the_killer_in_one_start(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End to end in per_lane mode: each start re-claims the killer, its router worker dies, and
-    the start on which the count reaches the cap dead-letters it. The next message routes at once,
-    as it did before this change, since the killer is left in flight below the cap."""
+    """End to end in per_lane mode. The respawned router worker re-pends what the dead one held
+    (#1611 step 2), so the killer is re-claimed after each death and one start dead-letters it at
+    the cap, with no restart; the next message routes only after that, in FIFO order. Counting
+    across real restarts is pinned by the store tests above
+    (``test_the_count_survives_recovery_and_a_claim_never_raises_it``)."""
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.02)
     calls: list[str] = []
     killer = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
     after = await store.enqueue_ingress(channel_id="IB", raw=_hl7("OK"))
-    reg = _registry(tmp_path, router=_kill_on("KILL", calls))
-    for death in range(1, LIMIT + 1):
-        await _restart(store)  # the engine's start runs this before the runner's
-        runner = _runner(reg, store, "per_lane")
-        await runner.start()
-        try:
-            deadline = time.monotonic() + 10.0
-            while (await _row(store, killer, Stage.INGRESS))[2] < death:
-                assert time.monotonic() < deadline, calls
-                await asyncio.sleep(0.02)
-            while await _status(store, after) == MessageStatus.RECEIVED.value:
-                assert time.monotonic() < deadline, calls
-                await asyncio.sleep(0.02)
-        finally:
-            await runner.stop()
+    runner = _runner(_registry(tmp_path, router=_kill_on("KILL", calls)), store, "per_lane")
+    await runner.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while await _status(store, after) == MessageStatus.RECEIVED.value:
+            assert time.monotonic() < deadline, calls
+            await asyncio.sleep(0.02)
+    finally:
+        await runner.stop()
     assert calls.count("KILL") == LIMIT
-    assert await _row(store, killer, Stage.INGRESS) == ("dead", LIMIT, LIMIT)
+    assert calls[: LIMIT + 1] == ["KILL"] * LIMIT + ["OK"]  # FIFO: OK after the last death
+    # attempts 1: each in-process re-pend undoes its claim's increment, as the fault arm's does.
+    assert await _row(store, killer, Stage.INGRESS) == ("dead", 1, LIMIT)
     assert await _status(store, killer) == MessageStatus.ERROR.value
