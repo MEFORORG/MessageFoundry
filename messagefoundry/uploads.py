@@ -670,9 +670,8 @@ def _meta_from_json(raw: str, file_id: str, now: float | None = None) -> Uploade
     genuine uploads until wall time catches up. Anything else, including JSON that does not parse or
     nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388).
 
-    A refused sidecar is left out of the listing and the quota. The prune still removes its upload,
-    aged by the pair's modification times on disk, never by the sidecar's own claim
-    (:meth:`UploadStore._damaged_sync`)."""
+    A refused sidecar is left out of the listing and the quota, and the prune ages it as
+    :meth:`UploadStore._damaged_sync` says."""
     # Returns rather than raises, so the decode error, which holds the whole sidecar, is not left
     # on the refusal's __context__.
     d, hint = json_loads_or_refusal(raw)
@@ -1229,9 +1228,7 @@ class UploadStore:
         **``damaged`` is for the prune only (BACKLOG #5387, #5388).** When it is a list, each
         sidecar that is not UTF-8, or that decrypted but is not this upload's metadata
         (:func:`_meta_from_json`), and that ``held`` did not take, is appended to it as
-        :meth:`_damaged_sync` records it: aged by the pair's modification times on disk, owner
-        fields blank. So a plant dated far ahead, or one on a cipher that passes plaintext, still
-        leaves at expiry, and nothing it claims is trusted. A sidecar the cipher declined is never
+        :meth:`_damaged_sync` records it, which says how the prune ages it. A sidecar the cipher declined is never
         appended, because a key rotated away must not silently destroy data. At least that kind is
         still left out of the prune.
 
@@ -1394,8 +1391,10 @@ class UploadStore:
 
         Nothing is taken from the sidecar. ``modified`` is the later of the sidecar's and the
         body's modification times, read without following a link, so a pair is due only once both
-        halves are old on disk, and :meth:`_UnsealableUpload.expired` also prunes one dated more
-        than a day ahead. ``size`` is the body's size on disk, ``0`` when it is gone. The owner is
+        halves are old on disk. Unlike the never-sealable kind, one dated ahead is not pruned: a
+        genuine sealed upload refused only because a clock was stepped back is not damaged and waits
+        for wall time. This is the one statement of the damaged kind's retention rule; the
+        other docstrings and ``docs/PHI.md`` §3 point here. ``size`` is the body's size on disk, ``0`` when it is gone. The owner is
         blank, so the record bills nobody and the audit row names no owner. The record is the
         never-sealable kind's only in shape: :meth:`_scan_metas_sync` hands it to the prune alone."""
         try:
@@ -2404,9 +2403,11 @@ class UploadStore:
 
         def _delete() -> UploadedFileMeta:
             blob_path, meta_path = self._paths(file_id)
-            # Before anything is read or classed, so neither half is opened or unlinked.
+            # Before anything is read or classed. The sidecar is opened, so it must be a plain
+            # file. The body is only unlinked, which a FIFO allows and a directory refuses.
             _refuse_unplain(file_id, "sidecar", meta_path)
-            _refuse_unplain(file_id, "body", blob_path)
+            if blob_path.is_dir():
+                raise _damaged(file_id, "body", "it is a directory")
             meta: UploadedFileMeta | None = None
             refusal = _REFUSED_NOT_UNSEALABLE
             defect: str | None = None
@@ -2891,13 +2892,12 @@ class UploadStore:
         the ``upload.prune`` audit: ``file_id`` + ``uploader`` only, never content) plus the orphan count.
 
         Idempotent: a re-run finds the already-deleted pairs gone and returns an empty pass.
-        Undecryptable/foreign sidecars are skipped (never pruned — a rotated-away key must not silently
+        Sidecars the cipher declines are skipped (never pruned — a rotated-away key must not silently
         destroy data). One exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
         it is pruned once its sidecar's mtime passes the cutoff, and is reported with blank owner
         fields (:class:`_UnsealableUpload`). Another is a sidecar refused as damaged, which the
-        cipher did not decline (BACKLOG #5387, #5388): its upload is pruned once both halves of the
-        pair are past the cutoff on disk, never by the time it claims, is reported the same way and
-        is logged as such (:meth:`_damaged_sync`). Runs off the event loop; the periodic runner + the
+        cipher did not decline (BACKLOG #5387, #5388), aged as :meth:`_damaged_sync` says, reported
+        the same way and logged as such. Runs off the event loop; the periodic runner + the
         opportunistic save-time sweep both drive it. A save wakes the runner, and sweeps itself only
         where none is running (:meth:`wake_retention`).
 
@@ -2941,7 +2941,10 @@ class UploadStore:
             # whose sidecar is damaged by its pair's mtimes (BACKLOG #5387, #5388).
             aged = [lost for lost in held if lost.expired(cutoff, at)]
             for lost in broken:
-                if lost.expired(cutoff, at):
+                # By the cutoff alone, never by an mtime ahead of the clock: a genuine sealed
+                # upload refused only for an uploaded_at ahead of a clock stepped back is damaged
+                # in no other way, and must wait for wall time, not be pruned.
+                if lost.modified < cutoff:
                     aged.append(lost)
                     refused_ids.add(lost.file_id)
             return [meta for meta in metas if meta.uploaded_at < cutoff] + [
@@ -2972,7 +2975,7 @@ class UploadStore:
             removed = await asyncio.to_thread(_remove, meta)
             if removed is None:
                 break
-            if meta.file_id in refused_ids:
+            if removed and meta.file_id in refused_ids:
                 # The audit row names no owner, so the log says why (BACKLOG #5387, #5388).
                 _log.warning(
                     "uploaded-logs prune took %s, whose sidecar was refused, by its age on disk",

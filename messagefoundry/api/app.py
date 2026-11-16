@@ -9080,15 +9080,12 @@ def create_app(
             super().__init__(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged))
             self.damaged = damaged
 
-    def _upload_refused_text(damaged: bool) -> str:
+    def _upload_refused_text(refusal: UploadUnreadableError | bool) -> str:
+        """The 423 text of a refused file, a damaged file's own (BACKLOG #5388). ``refusal`` is the
+        store's refusal, or whether it was the damaged kind. Only its class is read, so its message
+        reaches no response."""
+        damaged = refusal if isinstance(refusal, bool) else isinstance(refusal, UploadDamagedError)
         return _UPLOAD_DAMAGED if damaged else _UPLOAD_UNREADABLE
-
-    def _upload_refused(exc: UploadUnreadableError) -> HTTPException:
-        """The 423 of a refused file, with a damaged file's own text (BACKLOG #5388). Only the
-        exception's class is read, so its message reaches no response."""
-        return HTTPException(
-            _UPLOAD_UNREADABLE_STATUS, _upload_refused_text(isinstance(exc, UploadDamagedError))
-        )
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -9416,7 +9413,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            raise _upload_refused(exc) from None
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
@@ -9577,7 +9574,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            raise _upload_refused(exc) from None
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9711,7 +9708,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            raise _upload_refused(exc) from None
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)

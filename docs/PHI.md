@@ -845,11 +845,14 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
    whose `file_id` is not its own path id, a count that is negative or above 2^53, an
    `uploaded_at` below zero or more than a day ahead, and a text field that is not a string, is
-   longer than any upload writes, or holds a lone surrogate. A refused sidecar is left out of the
-   listing and the quota, and the API answers 404 to its owner and 423, naming the file as
-   damaged, to an override holder. It is not left out of retention: the prune removes the pair
-   once the later of its sidecar's and its body's **mtimes** passes the retention window, or is
-   more than a day in the future, never by the time the sidecar claims. It logs that the sidecar
+   longer than any upload writes, or holds a lone surrogate. Apart from the never-sealable kind
+   above, which the quota still bills, a refused sidecar is left out of the listing and the quota,
+   and the API answers 404 to its owner and 423, naming the file as damaged, to an override
+   holder. It is not left out of retention: the prune removes the pair once the later of its
+   sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
+   claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, because a
+   genuine upload refused only after the host clock was stepped back is not damaged and is read
+   again once wall time catches up. It logs that the sidecar
    was refused, and the audit row carries blank owner fields. A sidecar the cipher declines is not
    this kind: a key rotated away must not destroy data, so it waits for `rotate-key` as above. At
    least a sidecar that is a link or is not a regular file is still outside retention, and an

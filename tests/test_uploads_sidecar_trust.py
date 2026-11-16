@@ -246,10 +246,28 @@ async def test_a_fifo_in_place_of_a_file_is_refused_without_blocking(
     path.unlink()
     os.mkfifo(path)
     read = store.get_meta if part == "meta" else store.read_bytes
-    for call in (read, store.delete):
+    # A FIFO sidecar is refused by delete too, since delete opens the sidecar; a FIFO body is only
+    # unlinked, so delete removes the pair.
+    calls = (read, store.delete) if part == "meta" else (read,)
+    for call in calls:
         with pytest.raises(UploadDamagedError):
             # An open of the FIFO would block the worker thread for good.
             await asyncio.wait_for(call(meta.file_id), timeout=10)
+    if part == "blob":
+        await asyncio.wait_for(store.delete(meta.file_id), timeout=10)
+        assert not path.exists() and not _sidecar(store, meta.file_id).exists()
+
+
+async def test_a_genuine_upload_dated_ahead_of_a_stepped_back_clock_is_not_pruned(
+    tmp_path: Path,
+) -> None:
+    # Its uploaded_at is more than a day ahead of the prune's clock, so it is refused, but it is
+    # not damaged: it must wait for wall time, not be pruned by its mtime, which is ahead too.
+    store = _keyed(tmp_path)
+    meta = await _saved(store)
+    result = await store.prune_expired(now=time.time() - 3 * 86_400, retention_days=30)
+    assert result.pruned == []
+    assert await store.get_meta(meta.file_id) == meta
 
 
 _DAY = 86_400
