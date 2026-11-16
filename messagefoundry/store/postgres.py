@@ -355,6 +355,7 @@ from messagefoundry.store.store import (
     inheritance_plan,
     inheriting_children,
     judge_totp,
+    listed_users,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -10234,7 +10235,7 @@ class PostgresStore:
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
-        return decoded_rows(rows, lambda r: UserRecord.from_mapping(dict(r)))
+        return listed_users(dict(r) for r in rows)
 
     async def count_users(self) -> int:
         return await self._count("users")

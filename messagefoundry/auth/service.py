@@ -12881,7 +12881,13 @@ class AuthService:
 
         The account's session epoch is checked where the account is read, in
         :meth:`identity_for_token` and :meth:`list_sessions`, so this costs no extra statement."""
-        session = await self._store.get_session(token_hash)
+        try:
+            session = await self._store.get_session(token_hash)
+        except RowSealError:
+            # A row whose cells do not parse (BACKLOG #5505) is ended and reported as one that
+            # fails its seal, and is no session.
+            await self._session_seal_failed(token_hash)
+            return None
         if session is None or session.revoked_at is not None:
             return None
         if not await self._session_row_holds(session, self._store.row_sealer()):
@@ -13319,6 +13325,11 @@ class AuthService:
         whose every check raced."""
         if user is None:
             return _SealCheck()
+        if user.unreadable:
+            # A listed row whose cells do not parse (BACKLOG #5505): it fails as a forged record
+            # does, on a keyless store too. A re-read would only raise again, so there is none.
+            await self._user_seal_failed(user.id)
+            return _SealCheck(failed=True)
         sealer = self._store.row_sealer()
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)

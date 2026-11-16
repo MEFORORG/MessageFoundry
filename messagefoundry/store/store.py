@@ -2222,9 +2222,13 @@ async def session_sealed_by_retired_key_async(
 ) -> bool:
     """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
     before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
-    that fails; this only says the refusal is a key change, not an integrity failure."""
-    return sealer is not None and await sealer.sealed_by_retired_key_async(
-        SESSION_KIND, record.seal_fields(), record.seal
+    that fails; this only says the refusal is a key change, not an integrity failure. A value the
+    encoder cannot read is no genuine seal, so it reads False (:func:`_encodes`, BACKLOG #5505)."""
+    if sealer is None:
+        return False
+    parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and await sealer.sealed_by_retired_key_async(
+        SESSION_KIND, parts, record.seal
     )
 
 
@@ -2813,10 +2817,11 @@ _CELL_PARSE_ERRORS: Final = (ValueError, TypeError, OverflowError, RecursionErro
 
 def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
     """``decode()``, or :class:`RowSealError` when a cell it reads does not parse (BACKLOG #5505).
-    A row someone wrote outside the store is answered as one that fails its seal, the same way and
-    through the same handlers, so one bad row is refused alone rather than raising a parse error
-    out of every listing and re-seal that reads it. ``ident`` is the row's stored id or token hash,
-    ``""`` when none is readable; the refusal's subject is its :func:`seal_row_ref`.
+    A row someone wrote outside the store raises the error a failed seal raises, so the handlers
+    that already catch that one, at least the re-seal pass and the write helpers' callers, refuse
+    that row alone; a multi-row read decides per row (:func:`listed_users`, :func:`decoded_rows`).
+    ``ident`` is the row's stored id or token hash, ``""`` when none is readable; the refusal's
+    subject is its :func:`seal_row_ref`.
 
     The refusal is raised once the handler has ended, so the parse error, which can quote the cell,
     is on neither chain (``WebAuthnCredential.from_mapping`` says why ``from None`` is not
@@ -2846,7 +2851,8 @@ def _cell_text(d: Mapping[str, Any], column: str) -> str:
 def parse_recovery_code_hashes(cell: str | None, user_id: str) -> list[str]:
     """The recovery-code hashes a ``totp_recovery_codes`` cell holds, ``[]`` for ``None``. A cell
     that is not a JSON list raises :class:`RowSealError` for the account (:func:`decode_or_refuse`,
-    BACKLOG #5505). Every reader of the column parses it here."""
+    BACKLOG #5505). :meth:`UserRow.recovery_code_hashes` and each backend's
+    ``get_recovery_code_hashes`` parse it here."""
     if cell is None:
         return []
 
@@ -3011,6 +3017,10 @@ class UserRecord:
     #: to pin a compare-and-set (``VerifiedUser.totp_secret_cell``, and ``admin-reset-totp``,
     #: BACKLOG #3778). ``None`` on a record built by hand.
     row: UserRow | None = field(default=None, compare=False, repr=False)
+    #: Set only on the stand-in :meth:`unreadable_row` builds for a listed row whose cells do not
+    #: parse (BACKLOG #5505). ``AuthService._verified`` answers it as a record that fails its seal,
+    #: on a keyless store too, so a list keeps showing the account as failing and reports it.
+    unreadable: bool = field(default=False, compare=False)
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -3021,13 +3031,42 @@ class UserRecord:
         return self.second_step_locked_until is not None and now < self.second_step_locked_until
 
     @classmethod
-    def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
-        """The account ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
-        :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d))
+    def unreadable_row(cls, user_id: str) -> UserRecord:
+        """The stand-in a list read returns for the account ``user_id`` names when its row does
+        not decode (:func:`listed_users`). Every field but the id is the closed value: disabled, no
+        password, no factor, no row to seal. Nothing may act on it but the seal check, which fails
+        it."""
+        return cls(
+            id=user_id,
+            username=user_id,
+            auth_provider="local",
+            display_name=None,
+            email=None,
+            disabled=True,
+            created_at=0.0,
+            updated_at=0.0,
+            last_login_at=None,
+            password_hash=None,
+            password_changed_at=None,
+            must_change_password=True,
+            failed_attempts=0,
+            locked_until=None,
+            unreadable=True,
+        )
 
     @classmethod
-    def _decode(cls, d: Mapping[str, Any]) -> UserRecord:
+    def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
+        """The account ``d`` holds; a cell of the row that does not parse raises
+        :class:`RowSealError`, as :func:`decode_or_refuse` says, and a missing column still raises
+        ``KeyError``. The store-wide global epoch is read outside that refusal: a fault in it is
+        one value every account reads, so it stays loud rather than refuse each account."""
+        global_epoch = global_epoch_or_refuse(d["global_session_epoch"])
+        return decode_or_refuse(
+            USER_KIND, _cell_text(d, "id"), lambda: cls._decode(d, global_epoch)
+        )
+
+    @classmethod
+    def _decode(cls, d: Mapping[str, Any], global_epoch: int) -> UserRecord:
         return cls(
             id=d["id"],
             username=d["username"],
@@ -3085,11 +3124,29 @@ class UserRecord:
             enrolment_code_digest=d.get("enrolment_code_digest"),
             enrolment_code_expires_at=_opt_float(d.get("enrolment_code_expires_at")),
             enrolment_code_issuer=d.get("enrolment_code_issuer"),
-            # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
-            # mapping without the global epoch fails here rather than decode one nobody read.
-            global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
+            # Read by from_mapping with a hard subscript for the same reason: every user reader is
+            # ``USER_READ_SQL``, and a mapping without the global epoch fails rather than decode one
+            # nobody read.
+            global_session_epoch=global_epoch,
             row=UserRow._decode(d),  # inside this decode's own refusal
         )
+
+
+def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
+    """The accounts a list read returned, in order (BACKLOG #5505). A row whose cells do not parse
+    is listed as :meth:`UserRecord.unreadable_row`, so the account stays in the list and the
+    service fails and reports it, as it does a record that fails its seal. Only a row whose id is
+    itself unreadable is left out, after :func:`decode_or_refuse` has logged it: nothing could
+    name it."""
+    out: list[UserRecord] = []
+    for d in rows:
+        try:
+            out.append(UserRecord.from_mapping(d))
+        except RowSealError:
+            ident = _cell_text(d, "id")
+            if ident:
+                out.append(UserRecord.unreadable_row(ident))
+    return out
 
 
 @dataclass(frozen=True)
@@ -19597,7 +19654,7 @@ class MessageStore:
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} ORDER BY username")
-            return decoded_rows(await cur.fetchall(), lambda r: UserRecord.from_mapping(dict(r)))
+            return listed_users(dict(r) for r in await cur.fetchall())
 
     async def count_users(self) -> int:
         async with self._read() as db:

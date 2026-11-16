@@ -9,7 +9,7 @@ verifies "correctly" and is forgeable in minutes — so this module enforces an 
 key is ever handed to the verifier: ``kty`` ∈ {RSA, EC}; RSA modulus ≥ 2048 bits; EC curve ∈
 {P-256, P-384}; ``use`` (if present) == ``sig``; ``key_ops`` (if present) contains ``verify``;
 ``alg`` (if present) names a supported JWS algorithm that fits the key; and a JWKS is **refused**
-if two keys share a ``kid`` (take-the-first is an attacker's lever).
+if two usable keys share a ``kid`` (take-the-first is an attacker's lever).
 
 A key's ``alg`` is kept beside it (BACKLOG #5517): :meth:`JwksCache.get_key` refuses a token whose
 ``alg`` differs from the one the key is restricted to, so an IdP's restriction is not dropped. A
@@ -174,8 +174,8 @@ def parse_jwks(body: bytes) -> dict[str, _PublicKey]:
     """Parse a JWKS document into ``{kid: public_key}``, applying the floor to each key.
 
     A key with **no** ``kid`` is skipped (the RP selects by ``kid``, so an unlabelled key is
-    unusable), but a **duplicate** ``kid`` is a hard :class:`JwksError` — silently taking the first of
-    two same-``kid`` keys is a downgrade lever. Keys the floor rejects are skipped, so one rolled-in
+    unusable), but a ``kid`` two usable keys share is a hard :class:`JwksError` — silently taking
+    the first of two same-``kid`` keys is a downgrade lever. Keys the floor rejects are skipped, so one rolled-in
     weak key does not blank the whole set — unless it leaves nothing usable, which raises.
     """
     return {kid: bound.key for kid, bound in _parse_bound(body).items()}
@@ -201,10 +201,8 @@ def _parse_bound(body: bytes) -> dict[str, _BoundKey]:
         if not isinstance(kid, str) or kid == "":
             skipped += 1  # unlabelled → unusable by kid
             continue
-        if kid in keys:
-            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
         try:
-            keys[kid] = _bound_key(entry)
+            bound = _bound_key(entry)
         except (JwksError, ValueError):
             # ValueError as well as JwksError: the floor's own checks raise JwksError, but the final
             # construction step in `cryptography` (RSAPublicNumbers/EllipticCurvePublicNumbers
@@ -213,6 +211,13 @@ def _parse_bound(body: bytes) -> dict[str, _BoundKey]:
             # whole parse, blanking the set AND (via the cache's already-stamped fetch attempt)
             # refusing every federated login until the min-refetch floor elapsed.
             skipped += 1  # a single weak/unsupported key must not blank the set
+            continue
+        # Checked among the USABLE keys only, after the floor, so the answer does not depend on
+        # key order: a skipped key (an encryption key sharing a signing key's kid, say) is never a
+        # second candidate, before or after the usable one (BACKLOG #5517).
+        if kid in keys:
+            raise JwksError(f"JWKS contains two keys with kid {kid!r} (ambiguous; refused)")
+        keys[kid] = bound
     if not keys:
         raise JwksError(f"JWKS yielded no usable signing keys ({skipped} skipped)")
     return keys
@@ -289,7 +294,7 @@ class JwksCache:
         if a forced refetch still does not yield the ``kid``.
         """
         bound = self._lookup(kid)
-        if bound.alg is not None and bound.alg is not alg:
+        if bound.alg is not None and bound.alg != alg:
             raise JwkAlgMismatch(
                 f"kid {kid!r} is restricted to {bound.alg.value}; the token names {alg.value}"
             )

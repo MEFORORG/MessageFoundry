@@ -2518,7 +2518,10 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def list_users(self) -> Sequence[UserRecord]: ...
+    async def list_users(self) -> Sequence[UserRecord]:
+        """Every account. One whose row does not parse is listed as
+        :meth:`~messagefoundry.store.store.UserRecord.unreadable_row` (BACKLOG #5505)."""
+        ...
 
     async def count_users(self) -> int: ...
 
@@ -2916,7 +2919,9 @@ class AuthStore(Protocol):
         passkeys goes through one helper per backend, which verifies the record it read before it
         re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
         re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
-        in its one user loader; the store's readers return rows unchecked."""
+        in its one user loader; the store's readers return rows unchecked. A role row whose cells
+        do not parse is left out (BACKLOG #5505), so the record no longer matches its seal and the
+        account fails that check alone."""
         ...
 
     async def reseal_user_records(self) -> tuple[int, int]:

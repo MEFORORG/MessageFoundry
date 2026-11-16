@@ -120,6 +120,20 @@ def test_an_encryption_key_beside_a_signing_key_is_left_out(rsa_key: rsa.RSAPriv
     assert set(oidc.parse_jwks(body)) == {"sig"}
 
 
+@pytest.mark.parametrize("encryption_first", [False, True])
+def test_a_skipped_key_sharing_a_kid_does_not_depend_on_order(
+    rsa_key: rsa.RSAPrivateKey, encryption_first: bool
+) -> None:
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    sig = _rsa_jwk(rsa_key, "k1", alg="RS256")
+    enc = _rsa_jwk(other, "k1", alg="RSA-OAEP")
+    body = _jwks(enc, sig) if encryption_first else _jwks(sig, enc)
+    assert set(oidc.parse_jwks(body)) == {"k1"}
+    # Two USABLE keys sharing a kid are still refused.
+    with pytest.raises(oidc.JwksError, match="two keys with kid"):
+        oidc.parse_jwks(_jwks(sig, _rsa_jwk(other, "k1", alg="RS256")))
+
+
 @pytest.mark.parametrize(
     ("make", "crv", "alg"),
     [

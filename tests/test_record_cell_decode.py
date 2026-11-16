@@ -35,6 +35,7 @@ from messagefoundry.store.store import (
     UserRow,
     session_seal_ok,
     session_seal_ok_async,
+    session_sealed_by_retired_key_async,
 )
 
 
@@ -147,21 +148,81 @@ async def test_the_recovery_code_reader_refuses_a_corrupt_cell_too(tmp_path: Pat
         await store.close()
 
 
-async def test_a_corrupt_account_leaves_the_other_accounts_listed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_a_corrupt_account_is_listed_as_failing_beside_the_others(
+    tmp_path: Path, keyed: bool
+) -> None:
     path = tmp_path / "list.db"
-    store = await MessageStore.open(path)
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(path, cipher=cipher)
     try:
         await _user(store, "u-good")
         await _user(store, "u-bad")
         _raw(path, "UPDATE users SET failed_attempts=? WHERE id=?", ("garbage", "u-bad"))
-        assert [u.id for u in await store.list_users()] == ["u-good"]
+        listed_raw = {u.id: u for u in await store.list_users()}
+        assert set(listed_raw) == {"u-good", "u-bad"}
+        assert listed_raw["u-bad"].unreadable and listed_raw["u-bad"].disabled
+        assert not listed_raw["u-good"].unreadable
         with pytest.raises(RowSealError):
             await store.get_user("u-bad")
-        # The service's admin list and scans read the store's list, so they survive too.
+        # The admin list keeps the account, failing, on a keyless store as on a keyed one.
         listed = await AuthService(store, AuthSettings()).list_checked_users()
-        assert [entry.id for entry in listed] == ["u-good"]
+        by_id = {entry.id: entry.user for entry in listed}
+        assert set(by_id) == {"u-good", "u-bad"}
+        assert by_id["u-good"] is not None and by_id["u-bad"] is None
     finally:
         await store.close()
+
+
+def test_a_corrupt_global_epoch_stays_loud() -> None:
+    """One store-wide value every account reads: not a per-row seal failure."""
+    with pytest.raises(ValueError, match="invalid literal"):
+        UserRecord.from_mapping({"id": "u", "global_session_epoch": "abc"})
+
+
+async def test_a_presented_session_that_does_not_parse_is_ended_and_no_session(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "presented.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-p")
+        bad = await _session(store, "u-p")
+        _raw(path, "UPDATE sessions SET user_epoch=? WHERE token_hash=?", ("x", bad))
+        assert await AuthService(store, AuthSettings())._load_session(bad) is None
+        conn = sqlite3.connect(path)
+        try:
+            revoked = conn.execute(
+                "SELECT revoked_at FROM sessions WHERE token_hash=?", (bad,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert revoked is not None and revoked[0] is not None
+    finally:
+        await store.close()
+
+
+async def test_a_retired_key_check_reads_an_unencodable_session_as_no_genuine_seal(
+    tmp_path: Path,
+) -> None:
+    old, new = generate_key(), generate_key()
+    path = tmp_path / "retired.db"
+    store = await MessageStore.open(path, cipher=make_cipher(old, write_v2=True))
+    try:
+        await _user(store, "u-k")
+        token_hash = await _session(store, "u-k")
+    finally:
+        await store.close()
+    rotated = await MessageStore.open(path, cipher=make_cipher(new, [old], write_v2=True))
+    try:
+        sealer = rotated.row_sealer()
+        record = await rotated.get_session(token_hash)
+        assert record is not None
+        assert await session_sealed_by_retired_key_async(sealer, record)  # control
+        wrongly_typed = replace(record, client=Decimal("1"))  # type: ignore[arg-type]
+        assert not await session_sealed_by_retired_key_async(sealer, wrongly_typed)
+    finally:
+        await rotated.close()
 
 
 async def test_a_corrupt_role_row_fails_its_account_seal_and_no_other(tmp_path: Path) -> None:
