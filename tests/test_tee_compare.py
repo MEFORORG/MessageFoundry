@@ -114,3 +114,13 @@ def test_same_order_reports_no_order_diff() -> None:
     # A segment on one side only is a presence diff alone; the shared segments keep their order.
     r = compare(oru, oru + "ZID|extra\r")
     assert [d.location for d in r.material_diffs] == ["ZID"]
+
+
+def test_an_inserted_repeated_segment_reports_no_reorder() -> None:
+    # One extra OBX in group 1 renumbers the later OBX occurrence. That is a presence diff and a
+    # mismatch, not a regrouping, so no order diff names a sequence neither message has.
+    left = _ORU_HEAD + _GROUP_1 + _GROUP_2
+    right = _ORU_HEAD + _GROUP_1 + "OBX|2|NM|HGB||13.9\r" + _GROUP_2
+    r = compare(left, right)
+    assert r.kind == "mismatch"
+    assert SEGMENT_ORDER not in {d.location for d in r.diffs}

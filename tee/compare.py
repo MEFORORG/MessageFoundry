@@ -5,7 +5,8 @@
 Given two HL7 messages — MEFOR's transformed output and Corepoint's output for the same input —
 classify them as ``exact`` (identical bar segment-terminator trivia), ``semantic`` (identical once a
 configurable ignore-list of legitimately-divergent fields is blanked), or ``mismatch`` (a material
-field differs), and enumerate the field-level differences.
+field differs, a segment is present on one side only, or the same segments appear in a different
+order), and enumerate the differences.
 
 Pure and dependency-free (separators read from each message's MSH via :mod:`tee.hl7_fields`); no I/O,
 no ``messagefoundry`` import. The ``kind`` verdict and counts are **PHI-safe**; the per-field ``left``/
@@ -32,7 +33,9 @@ DEFAULT_IGNORE_FIELDS: frozenset[tuple[str, int]] = frozenset(
 
 #: The :attr:`FieldDiff.location` of a segment-order difference: both sides hold the same segments
 #: but in a different sequence (an OBX moved between OBR groups, say). Its ``left``/``right`` are the
-#: space-joined segment ids in each side's order, which carry no field content.
+#: space-joined segment ids in each side's order. An id is the text before a segment's first field
+#: separator, so a line that a bare LF split out of a field value carries that value's text: treat
+#: these as message content, like every other diff value.
 SEGMENT_ORDER = "segment-order"
 
 
@@ -46,11 +49,11 @@ class CompareConfig:
 
 @dataclass(frozen=True)
 class FieldDiff:
-    """One differing field, or a whole-segment presence difference. ``location`` is an HL7 address like
-    ``PID-5`` / ``MSH-10`` (a repeated segment's occurrence is appended as ``#2``, ``#3``, …; a
-    whole-segment difference omits the field number, and a segment-order difference is
-    :data:`SEGMENT_ORDER`). ``ignored`` marks a difference in an ignore-list
-    field — surfaced for transparency but not counted as a mismatch."""
+    """One differing field, a whole-segment presence difference, or a segment-order difference.
+    ``location`` is an HL7 address like ``PID-5`` / ``MSH-10`` (a repeated segment's occurrence is
+    appended as ``#2``, ``#3``, …; a whole-segment difference omits the field number, and a
+    segment-order difference is :data:`SEGMENT_ORDER`). ``ignored`` marks a difference in an
+    ignore-list field — surfaced for transparency but not counted as a mismatch."""
 
     location: str
     left: str
@@ -151,11 +154,11 @@ def compare(left: str, right: str, config: CompareConfig | None = None) -> Compa
 
     # The (id, occurrence) keys align repeated segments but carry no position, so an OBX or NTE that
     # moved into another OBR group keeps its key and its fields, and the loop above sees nothing.
-    # Compare the order of the segments both sides hold; a one-side-only segment is already a
-    # presence diff above, so it is left out here rather than reported twice.
-    left_order = [key for key in li if key in ri]
-    right_order = [key for key in ri if key in li]
-    if left_order != right_order:
+    # Compare the order only where both sides hold the same keys. An inserted or deleted segment
+    # renumbers every later occurrence of its id, so a shared-key filter would report a reorder that
+    # did not happen; that pair is already a mismatch through its presence diff.
+    left_order, right_order = list(li), list(ri)
+    if li.keys() == ri.keys() and left_order != right_order:
         diffs.append(
             FieldDiff(
                 location=SEGMENT_ORDER,
