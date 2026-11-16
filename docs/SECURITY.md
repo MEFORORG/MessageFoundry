@@ -8108,6 +8108,12 @@ internal CA reads it when the connection is built, and the syslog forwarder read
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
 `restart_required` row for them. A changed syslog CA takes effect only at a restart.
 
+**The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
+change check reads its baseline from, and writes its rows to, the store that pin secures, so it
+cannot vouch for its own hop.** The `store_sqlserver_pin` item of the
+[trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
+can hide and which checks still refuse.
+
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that
 answered, including when none is configured. It does not say that no restart is needed. At least

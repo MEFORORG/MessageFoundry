@@ -182,20 +182,67 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
     items 1 to 4 at start and at every reload. The store checks it too at each open, before any
-    connect, with no audit row, because the store that holds the rows is not open yet. So at
-    ``enforce`` a pin the store refuses stops the start with no row.
+    connect, with no audit row, because the store that holds the rows is not open yet. So a pin
+    the store refuses stops the start with no row: for an ACL or path finding at ``enforce``, and
+    for an unreadable file or refused content at either setting.
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
     checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
-    and no fingerprint pin. A changed file is used by the next connect and audited by the next
-    reload, which writes ``changed`` and no ``restart_required``.
+    and no fingerprint pin. A changed file is used by the next connect. The next start or reload
+    (a dry-run reload runs none of this preflight) compares it with the last audited
+    fingerprint, and writes ``changed`` and no ``restart_required``, over the hop the next
+    paragraph limits.
 
-    **A reload runs the anchor checks and none of the store's content checks.** It checks the
-    ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
-    cannot read. The store's own content checks run at the next store open, not at a reload: at
-    least that the file is one server certificate, that it is inside its validity period, and
-    the encryption-header refusal (BACKLOG #3090). So a reload can pass a swapped file the next
-    store open refuses, and the driver reads that file at its next connect. At ``warn`` the start logs the pin's warning once: the
-    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
+    **The pin's audit rides the hop the pin protects.** The baseline that compare reads
+    (:func:`_last_fingerprint`), and every row this check writes (:func:`_record`), go over the
+    store's own connections, which this pin secures. So a swapped pin that lets another server
+    answer the hop can keep its own change out of the real store:
+
+    * At a start, the store is opened before this check runs, and every connection it opens reads
+      the pin on disk. When the new pin matches the real server, as after a certificate renewal,
+      the read and the rows reach the real store. When it admits another server instead, and
+      that server passes the store open, the read and the rows go to that server. It may relay
+      them to the real store, as a proxy would, so a ``changed`` row in the real store does not
+      by itself show a harmless renewal.
+    * At a reload, a pooled connection opened before the swap may still reach the real store,
+      and one opened after it reaches whichever server the swapped pin admits. One baseline read
+      can take up to :data:`_FINGERPRINT_PAGES` store calls, and each row is a call of its own, so
+      at least the read and a row, or two pages of one read, can go to different servers.
+    * A reload checks only the engine process that runs it. At least under ``supervise`` each
+      engine shard reloads on its own (ADR 0073), and an engine shard that has not reloaded has
+      not run this check, though each new connect of its store reads the swapped file too.
+    * A server that answers has at least three ways to keep the change out of the real store. It
+      can answer the read with the new fingerprint: then the change check writes no row and logs
+      nothing, and where the file passes its other checks too, nothing in this preflight records
+      the swap. It can answer with no row: then a fresh ``observed`` row is written in place of
+      ``changed``. Or it can acknowledge the ``changed`` row, which the real store never
+      receives. Where a row is written and its commit returns, the audit tee
+      (:mod:`messagefoundry.store.audit_tee`) still logs a copy. A collector receives it only
+      where a log forwarder is configured and up, and the first way writes no ``changed`` or
+      ``observed`` row to copy.
+
+    So the change audit in the store is only as good as the hop it is meant to catch. The file
+    checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
+    next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
+    be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
+    reload.** The store is not closed: the connections already in its pool can stay open,
+    whichever server they reach, and a new connect reads the file on disk then, as above. So
+    where the refusal follows a swap, correcting the file does not by itself end the pooled
+    connections opened under the swapped pin; a restart after the file is corrected does. Every
+    login and query those connections carried went to the server the swapped pin admitted, so
+    the store login and that traffic are to be treated as exposed. A
+    restart with the swapped file still in place does not undo the swap: the start opens the
+    store with that file unless a file check refuses it. Where the refusal follows an ACL or path
+    finding on unchanged bytes, the fix is the one its message names. The refusal's own rows
+    travel the hop like any other row.
+
+    **A reload runs the anchor checks and only one of the store's content checks.** It checks
+    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), refuses a file it
+    cannot read, and runs the private-key refusal (BACKLOG #3745). The store's other content
+    checks run at the next store open, not at a reload: at least that the file is one server
+    certificate, that it is inside its validity period, and the encryption-header refusal
+    (BACKLOG #3090). So a reload can pass a swapped file the next store open refuses, and the
+    driver reads that file at its next connect. At ``warn`` the start logs the pin's warning
+    once: the preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
     **Not added: a PostgreSQL ``ssl_root_cert``.** It is a CA bundle the store loads by path
     at each new connection, the shape of item 10's CAs, and nothing checks who can write it.
@@ -2191,8 +2238,8 @@ def collect_anchor_specs(
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
     (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
     (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
-    its hop does not read, so an install with none yields an empty list: the dormant,
-    byte-identical path.
+    its hop does not read and a ``[store].ssl_root_cert`` the store sends as no SQL Server pin, so
+    an install with none yields an empty list: the dormant, byte-identical path.
 
     The four section keywords have no default on purpose. A caller that left one out would leave
     its anchor unchecked with nothing to say so.
@@ -2419,8 +2466,10 @@ async def _preflight_one(
     verdict: AnchorVerdict | OSError | None = None,
 ) -> str:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
-    recorded even when the anchor then fails its pin/ACL, record any violation, then enforce (which may
-    raise). Returns the fingerprint of the bytes it read and passed.
+    recorded (for the SQL Server store pin, only as far as the module docstring's
+    ``store_sqlserver_pin`` item says) even when the anchor then fails its pin/ACL, record any
+    violation, then enforce (which may raise). Returns the fingerprint of the bytes it read and
+    passed.
 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context to verify a peer
@@ -2525,8 +2574,9 @@ async def run_anchor_preflight(
 ) -> dict[str, str]:
     """The central load/reload preflight over every configured anchor. Called at serve startup (before
     any listener binds) and on a config reload (re-reading the on-disk PEMs, so a swapped anchor is
-    caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
-    install with no OIDC/AD/mTLS anchor is byte-identical.
+    caught; the module docstring's ``store_sqlserver_pin`` item says what that cannot catch for the
+    SQL Server store pin). **Dormant when ``specs`` is empty** — it makes no store call and writes
+    no audit row; :func:`collect_anchor_specs` says when serve's list is empty.
 
     On a fatal violation (a pin mismatch, a file with no loadable PEM block, a private-key label,
     or under ``enforce`` an
