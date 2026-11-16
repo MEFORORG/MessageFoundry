@@ -543,10 +543,8 @@ function Remove-ServiceLogonRight {
     try {
         # $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it is cleared before
         # each call and a $null afterwards is treated as "secedit did not run" - the rule the nssm
-        # calls in both scripts follow. NOTE: install-service.ps1's Set-ServiceLogonRight runs the
-        # same two secedit calls WITHOUT this clear, so it can read the previous native command's
-        # code. That is a pre-existing gap in the grant path, not fixed here; filing it is the
-        # maintainer's, and this comment exists so the asymmetry is not read as parity.
+        # calls in both scripts follow. install-service.ps1's Set-ServiceLogonRight clears it the
+        # same way before its two secedit calls (BACKLOG #5401).
         $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {

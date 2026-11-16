@@ -1692,10 +1692,15 @@ function Set-ServiceLogonRight {
     try {
         # A native command that never ran leaves $LASTEXITCODE as it was, often 0 from an earlier
         # call, so it is cleared first and $null read as "did not run".
+        $outcome = {
+            if ($null -eq $global:LASTEXITCODE) { "did not run (it left no exit code)" }
+            else { "failed (exit $global:LASTEXITCODE)" }
+        }
         $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
-            Write-Warning "secedit export failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
+            Write-Warning ("secedit export $(& $outcome); grant 'Log on as a service' to " +
+                "'$Account' manually.")
             return
         }
         $lines = @(Get-Content -LiteralPath $inf)
@@ -1719,18 +1724,29 @@ function Set-ServiceLogonRight {
             # '$' in a held account name is written as itself.
             $new = $lines.Clone()
             $new[$at] = "SeServiceLogonRight = " + (@($holders + "*$sid") -join ',')
-        } else {
+        } elseif ($lines -match '^\s*\[Privilege Rights\]\s*$') {
             # No existing row: inject one under [Privilege Rights].
-            $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
+            $new = $lines -replace '^(\s*\[Privilege Rights\]\s*)$', "`$1`r`nSeServiceLogonRight = *$sid"
+        } else {
+            # No section either. Without one the re-import would change nothing and still be
+            # reported as a grant.
+            $new = @($lines) + @("[Privilege Rights]", "SeServiceLogonRight = *$sid")
         }
         Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
         $global:LASTEXITCODE = $null
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "secedit configure failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
+            Write-Warning ("secedit configure $(& $outcome); grant 'Log on as a service' to " +
+                "'$Account' manually.")
             return
         }
         Write-Host "  Right  : granted SeServiceLogonRight (Log on as a service) to '$Account'." -ForegroundColor Green
+    } catch {
+        # Best-effort, as the header says: a secedit that cannot launch, or a policy file that
+        # cannot be read or written, throws under the script's Stop preference.
+        Write-Warning ("'Log on as a service' was NOT granted to '$Account' ($($_.Exception.Message)); " +
+            "grant SeServiceLogonRight manually (secpol.msc -> Local Policies -> User Rights " +
+            "Assignment) or the service will fail to start with error 1069.")
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }

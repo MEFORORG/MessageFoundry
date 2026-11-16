@@ -2968,7 +2968,9 @@ def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
 
 
-def _grant_configured(tmp_path: Path, row: str | None, *, configure_runs: bool = True) -> str:
+def _grant_configured(
+    tmp_path: Path, row: str | None, *, configure_runs: bool = True, section: bool = True
+) -> str:
     """The policy install-service.ps1's Set-ServiceLogonRight hands ``secedit /configure`` when the
     export holds ``row`` (``None``: no SeServiceLogonRight row at all), granting the right to
     BUILTIN\\Administrators (S-1-5-32-544). secedit is a stub; nothing is configured.
@@ -2979,7 +2981,7 @@ def _grant_configured(tmp_path: Path, row: str | None, *, configure_runs: bool =
     assert _SCRIPT is not None
     parent = tmp_path / "grant-parent"
     parent.mkdir(exist_ok=True)
-    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]"]
+    inf = ["[Unicode]", "Unicode=yes", *(["[Privilege Rights]"] if section else [])]
     if row is not None:
         inf.append(row)
     inf.append("[Version]")
@@ -3041,7 +3043,15 @@ def test_a_configure_that_never_ran_is_not_reported_as_a_grant(tmp_path: Path) -
     that stale 0 reports a grant that never happened."""
     said = _grant_configured(tmp_path, "SeServiceLogonRight = *S-1-5-80-4001", configure_runs=False)
     assert "granted SeServiceLogonRight" not in said, said
-    assert "secedit configure failed" in said, said
+    assert "secedit configure did not run" in said, said
+
+
+@_windows_only
+def test_the_grant_with_no_privilege_rights_section_adds_one(tmp_path: Path) -> None:
+    """An export with no ``[Privilege Rights]`` line left the policy unchanged, and the re-import
+    of it was still reported as a grant."""
+    configured = _grant_configured(tmp_path, None, section=False)
+    assert "[Privilege Rights] | SeServiceLogonRight = *S-1-5-32-544" in configured, configured
 
 
 @_windows_only
