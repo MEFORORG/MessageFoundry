@@ -124,8 +124,8 @@ def test_hop_audit_is_logged_when_the_collector_was_skipped(
 def test_hop_audit_reaches_the_root_handlers_when_the_logger_filters_warning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # [logging].level = ERROR leaves the logger disabled for WARNING. The record is handed to the
-    # root's handlers, which are the configured sinks after configure_logging, and not to stderr.
+    # [logging].level = ERROR leaves the logger disabled for WARNING. The record is still handed to
+    # every handler on the way up, the root's (the configured sinks) among them, and not to stderr.
     root_seen: list[str] = []
 
     class _Root(logging.Handler):
@@ -139,33 +139,30 @@ def test_hop_audit_reaches_the_root_handlers_when_the_logger_filters_warning(
     finally:
         logging.getLogger().removeHandler(root_handler)
     assert rc is None
-    assert seen == []
+    assert _hop_audit(seen) == [True]
     assert len([m for m in root_seen if m.startswith("AUDIT: off-box")]) == 1
     assert "AUDIT:" not in capsys.readouterr().err
 
 
-def test_hop_audit_reaches_stderr_through_the_filter_chain_with_no_root_handler(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+def test_a_filtered_warning_on_an_empty_root_reaches_the_filtered_last_resort(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A filtered WARNING and a root with no handler: the record goes to stderr once, formatted and
-    # filtered like any MessageFoundry stderr sink, rather than to no handler.
-    import messagefoundry.logging_setup as logging_setup
+    # A filtered WARNING and no handler anywhere: the line goes to main()'s filtered lastResort,
+    # the redaction and control-character chain on stderr, once, rather than to no sink.
+    from messagefoundry.logging_setup import _FilteredLastResort
 
-    chained: list[logging.Handler] = []
-    real = logging_setup.build_stderr_handler
-
-    def build() -> logging.Handler:
-        handler = real()
-        chained.append(handler)
-        return handler
-
-    monkeypatch.setattr(cli, "build_stderr_handler", build)
     monkeypatch.setattr(logging.getLogger(), "handlers", [])
-    rc, seen = _start(_listed(), tmp_path, level=logging.ERROR)
-    assert rc is None
-    assert seen == []
-    assert len(chained) == 1 and chained[0].filters
-    lines = [line for line in capsys.readouterr().err.splitlines() if "AUDIT: off-box" in line]
+    monkeypatch.setattr(logging, "lastResort", _FilteredLastResort())
+    logger = logging.getLogger("messagefoundry.__main__")
+    previous = logger.level
+    logger.setLevel(logging.ERROR)
+    pending = ["AUDIT: the posture line"]
+    try:
+        cli._write_start_audit(pending)
+    finally:
+        logger.setLevel(previous)
+    assert pending == []
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "AUDIT: the posture line" in ln]
     assert len(lines) == 1 and "WARNING" in lines[0]
 
 

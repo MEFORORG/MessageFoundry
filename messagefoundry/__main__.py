@@ -84,7 +84,6 @@ from messagefoundry.logging_setup import (  # noqa: E402
     PRODUCTION_DEBUG_REFUSED,
     LogFile,
     SyslogForward,
-    build_stderr_handler,
     configure_logging,
     install_filtered_last_resort,
     level_refused_on_production,
@@ -2223,36 +2222,20 @@ def _write_start_audit(lines: list[str]) -> None:
     decision-time log call wrote: in ``supervise`` that reached its stdout handler, and in ``serve``
     before ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr.
 
-    Where the logger's level filters WARNING out, as ``[logging].level = ERROR`` does, each line is
-    handed straight to the root's handlers, which carry the redaction and control-character chain,
-    so the application log, stdout and the collector still get it once. A root with no handler
-    gets the same chain on stderr (:func:`build_stderr_handler`)."""
+    Each line goes through ``Logger.handle``, which skips the logger's own level check but keeps
+    everything else ``logger.warning`` does: the propagation walk, each handler's level and filter
+    chain, and the lastResort when no handler exists. So where ``[logging].level = ERROR`` filters
+    WARNING out, the application log, stdout and the collector still get the line, once."""
     if not lines:
         return
     pending = list(lines)
     lines.clear()
     logger = logging.getLogger(__name__)
-    if logger.isEnabledFor(logging.WARNING):
-        for line in pending:
-            logger.warning("%s", line)
-        return
-    records = [
-        logger.makeRecord(logger.name, logging.WARNING, __file__, 0, "%s", (line,), None)
-        for line in pending
-    ]
-    handlers = list(logging.getLogger().handlers)
-    if handlers:
-        for record in records:
-            for handler in handlers:
-                if record.levelno >= handler.level:
-                    handler.handle(record)
-        return
-    fallback = build_stderr_handler()
-    try:
-        for record in records:
-            fallback.handle(record)
-    finally:
-        fallback.close()
+    fn, lno, func, _sinfo = logger.findCaller()
+    for line in pending:
+        logger.handle(
+            logger.makeRecord(logger.name, logging.WARNING, fn, lno, "%s", (line,), None, func)
+        )
 
 
 def _start_logging(
@@ -3142,8 +3125,8 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # The store key file is checked BEFORE it is used (vault BACKLOG #2601). A refusal here or at
-    # the posture steps below still logs the keyless AUDIT line (BACKLOG #5391).
+    # The store key file is checked BEFORE it is used (vault BACKLOG #2601). Should this gate or the
+    # posture steps below refuse with an AUDIT line queued, it is still written (BACKLOG #5391).
     if not _store_key_file_gate(settings, enforcing=enforcing):
         _write_start_audit(_start_audit)
         return 2
@@ -5220,22 +5203,20 @@ def _serve(args: argparse.Namespace) -> int:
             # material OpenSSL cannot load (ssl.SSLError is an OSError), or a context a TLS policy
             # check refused (a ValueError), is a clean exit 2 with the reason, not the uncaught
             # CRITICAL floor's exit 1. The reason names the setting; the material may be the minted
-            # pair, so no operator setting is assumed here. A trust-anchor refusal is kept whole, as
-            # every other one is printed, because its later lines are the commands that fix the
-            # file; any other text is scrubbed, since it can quote a configured path. Logged too,
-            # through the handlers' own filters, so the log file and the collector keep the record
-            # the uncaught floor used to give them.
-            reason = (
-                str(exc) if isinstance(exc, TrustAnchorError) else scrub_control_chars(str(exc))
-            )
+            # pair, so no operator setting is assumed here. Scrubbed, as the forwarder's CA refusal
+            # is, because the text can quote a configured path. Logged too, with the traceback, so
+            # the log file and the collector keep the record the uncaught floor used to give them,
+            # and a defect that raised one of these types can still be traced.
             print(
-                f"error: the API TLS context was not built: {reason}\nRefusing to start.",
+                "error: the API TLS context was not built: "
+                f"{scrub_control_chars(str(exc))}; refusing to start.",
                 file=sys.stderr,
             )
             logging.getLogger(__name__).error(
-                "the API TLS context was not built (%s): %s; refusing to start.",
+                "the TLS context of the API listener was not built (%s): %s; refusing to start.",
                 type(exc).__name__,
                 exc,
+                exc_info=exc,
             )
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx

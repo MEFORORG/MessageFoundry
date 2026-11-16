@@ -123,7 +123,8 @@ def test_a_start_refused_before_logging_is_configured_still_logs_the_audit(
 ) -> None:
     # Under enforce with no collector, _start_logging refuses before configure_logging. The
     # refusal does not lose the record: it goes to the handlers the process has then, here the
-    # recorder (in a real serve, main()'s filtered lastResort on stderr).
+    # recorder. In a real serve no handler exists yet and it reaches main()'s filtered lastResort
+    # on stderr, which test_b5390's empty-root test pins.
     rc, seen = _serve(
         tmp_path,
         monkeypatch,
@@ -135,7 +136,6 @@ def test_a_start_refused_before_logging_is_configured_still_logs_the_audit(
     err = capsys.readouterr().err
     assert "block_unlisted_outbound=false on a production PHI instance" in err
     assert "must forward its logs off-box" in err
-    assert "AUDIT:" not in err
     assert _audit(seen, "block_unlisted_outbound=false") == [False]
 
 
@@ -200,10 +200,10 @@ def test_a_posture_refusal_in_serve_still_logs_the_egress_audit(
 
 
 @pytest.mark.parametrize(
-    ("raised", "whole"),
+    "raised",
     [
-        (ssl.SSLError(9, "[SSL] PEM lib" + chr(10) + "forged line"), False),
-        (TrustAnchorError("pin mismatch" + chr(10) + "icacls fix-line"), True),
+        ssl.SSLError(9, "[SSL] PEM lib" + chr(10) + "forged line"),
+        TrustAnchorError("pin mismatch" + chr(10) + "forged line"),
     ],
 )
 def test_api_tls_context_failure_is_a_clean_refusal(
@@ -211,11 +211,10 @@ def test_api_tls_context_failure_is_a_clean_refusal(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     raised: Exception,
-    whole: bool,
 ) -> None:
     # S19-28 (#5391 item 1): bad API TLS material or a refused client-CA anchor is exit 2 with the
-    # reason, not the uncaught CRITICAL floor's exit 1, and is logged as well as printed. A
-    # trust-anchor refusal keeps its fix lines; any other text is scrubbed.
+    # reason, not the uncaught CRITICAL floor's exit 1, and is logged as well as printed. The
+    # printed reason is scrubbed, so a newline in it cannot forge a line.
     built: list[bool] = []
 
     def refuse(*args: object, **kwargs: object) -> ssl.SSLContext:
@@ -234,6 +233,5 @@ def test_api_tls_context_failure_is_a_clean_refusal(
     assert rc == 2
     err = capsys.readouterr().err
     assert "error: the API TLS context was not built:" in err
-    tail = "icacls fix-line" if whole else "forged line"
-    assert (chr(10) + tail in err) is whole
-    assert [m for m, _ in seen if "the API TLS context was not built" in m]
+    assert chr(10) + "forged line" not in err
+    assert [m for m, _ in seen if "the TLS context of the API listener was not built" in m]
