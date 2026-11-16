@@ -1244,6 +1244,14 @@ _RESOLVED_STATUSES: Final = (
     OutboxStatus.CANCELLED.value,
 )
 
+#: What a claim contains when it opens a claimed row (BACKLOG #5735): the cipher's refusal, which
+#: :meth:`MessageStore._dead_letter_unopenable` dead-letters or hands back as an outage, and a
+#: failed read of a shared body, which it hands back. Anything else, an error in the engine's own
+#: code or a ``sqlite3.DatabaseError`` that is not an ``OperationalError`` among them, propagates
+#: out of the claim, as on the server backends, which catch ``CipherError`` alone.
+_CLAIM_READ_ERRORS: Final = (sqlite3.OperationalError, OSError)
+_CLAIM_OPEN_ERRORS: Final = (CipherError, *_CLAIM_READ_ERRORS)
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerDeathOutcome:
@@ -14562,7 +14570,7 @@ class MessageStore:
         for row in rows:
             try:
                 items.append(await self._outbox_item_from_row(row))
-            except Exception as exc:
+            except _CLAIM_OPEN_ERRORS as exc:
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
                 if await self._dead_letter_unopenable(row, exc) is not None:
@@ -14626,7 +14634,7 @@ class MessageStore:
         propagates. The caller keeps the row from being delivered past: ``claim_fifo_heads`` hands
         it to the dispatcher's T17 path, and the other claims set it aside
         (:meth:`_set_aside_claimed`)."""
-        if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
+        if is_transient_open_failure(exc) or isinstance(exc, _CLAIM_READ_ERRORS):
             return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
         try:
@@ -14779,7 +14787,7 @@ class MessageStore:
             await self._commit()
         try:
             return await self._outbox_item_from_row(claimed)
-        except Exception as exc:
+        except _CLAIM_OPEN_ERRORS as exc:
             # Same as claim_ready: an undecryptable head must not stall the lane — dead-letter it and
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
@@ -14866,7 +14874,7 @@ class MessageStore:
         for i, row in enumerate(ordered):
             try:
                 items.append(await self._outbox_item_from_row(row))
-            except Exception as exc:
+            except _CLAIM_OPEN_ERRORS as exc:
                 if await self._dead_letter_unopenable(row, exc) is not None:
                     await self._set_aside_claimed(ordered[i:], now)
                     break  # set aside with the rest of the lane: never deliver past it (#5735)
@@ -14989,7 +14997,7 @@ class MessageStore:
             for i, row in enumerate(lane_rows):
                 try:
                     items.append(await self._outbox_item_from_row(row))
-                except Exception as exc:
+                except _CLAIM_OPEN_ERRORS as exc:
                     fault = await self._dead_letter_unopenable(row, exc)
                     if fault is not None:
                         # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).

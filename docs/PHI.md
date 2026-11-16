@@ -120,11 +120,15 @@ classifies through `is_tag_failure`, which counts every marked Transit value as 
 `vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure. An
 outage does not (BACKLOG #5765): a failure `gave_no_verdict` names, at least an unreachable Vault,
 a 5xx and a refused token, is no tag failure, and the claim does not dead-letter the row (BACKLOG
-#5735). Under the default `claim_mode = "pooled"` the row takes the ADR 0070 infra-fault path, so
-a fault that lasts stops the lane with a `connection_stopped` alert under `infra_fault_policy =
-"stop"`, or raises `lane_stuck` under `retry_forever`. Under `claim_mode = "per_lane"` the claim
-sets the row aside for five seconds, and it is retried with no cap and no alert of its own while
-the failure lasts. Transit
+#5735). Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
+infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
+under `infra_fault_policy = "stop"`, or raises `lane_stuck` under `retry_forever`. That covers the
+FIFO lanes under the default `claim_mode = "pooled"`, and no other claim. Every other claim sets the
+row aside for five seconds, and it is retried at that cadence with no cap and no alert of its own
+while the failure lasts, so a lasting outage there is silent but for a WARNING log line per retry.
+At least these claims take that path: every claim under `claim_mode = "per_lane"`, and under
+`pooled` an unordered outbound lane's `claim_ready` (ADR 0066 D4) and the extra rows a batch
+window claims through `claim_next_fifo`. Transit
 gives the same AEAD refusal when the data key it is pointed at is not the one that sealed the cell,
 so a recreated key, or another Vault's key of the same name, would read as a moved cell for every
 such cell. An unmarked value refused in a message or saved-search cell is audited, and its alert is
