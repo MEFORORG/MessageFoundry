@@ -644,7 +644,11 @@ def test_the_arming_job_runs_only_its_known_steps() -> None:
 def test_the_merge_condition_evaluates_to_the_policy_over_every_input() -> None:
     cond = str(_merge_step().get("if", ""))
     assert cond, "the merge step has no if:, so it merges every Dependabot PR"
-    wrong = [c for c in _merge_contexts() if _evaluate_expression(cond, c) != _merge_policy(c)]
+    # Five tri-state axes, four update types and three dependency types: 3**5 * 4 * 3. An empty
+    # product would leave `wrong` empty and pass the absence assertion below on nothing.
+    contexts = _merge_contexts()
+    assert len(contexts) >= 2916, f"only {len(contexts)} merge contexts; expected 2916"
+    wrong = [c for c in contexts if _evaluate_expression(cond, c) != _merge_policy(c)]
     assert not wrong, (
         f"the merge condition disagrees with the policy on {len(wrong)} input combinations; "
         f"first: {wrong[0]} (condition says {_evaluate_expression(cond, wrong[0])})"
