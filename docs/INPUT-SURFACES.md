@@ -30,7 +30,7 @@ and the code disagree, the code is right.
 | [Results of Handler lookups](#a-handler-lookup-result-has-a-fixed-shape) | This page; [ADR 0010](adr/0010-handler-callable-db-lookup.md), [ADR 0043](adr/0043-fhir-read-lookup.md) |
 | [Service settings](#service-settings-are-defined-in-configurationmd) | [CONFIGURATION.md](CONFIGURATION.md) |
 | [The command line](#the-command-line-is-defined-by-its-parser-and-its-help) | The parser and its `--help`; this page names the options whose help does not state a form |
-| [The toolkit, harness and tray](#the-toolkit-harness-and-tray-take-input-of-their-own) | Their parsers and help; [TRAY.md](TRAY.md); [`harness/README.md`](../harness/README.md) |
+| [The toolkit, harness, tray, tee relay and network helper](#the-toolkit-harness-tray-tee-relay-and-network-helper-take-input-of-their-own) | Their parsers and help; [TRAY.md](TRAY.md); [`harness/README.md`](../harness/README.md); [TEE-RELAY.md](TEE-RELAY.md); [`net-helper/README.md`](../net-helper/README.md) |
 | [Operator scripts](#the-operator-scripts-check-their-parameters-in-powershell) | This page |
 | [The VS Code extension](#the-vs-code-extension-is-a-client-and-the-engine-rule-is-the-control) | The engine rules it calls into |
 | [Web console rows marked `-`](#some-web-console-parameters-carry-no-named-rule) | A generated table; no document defines a structure for each |
@@ -270,7 +270,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py` |
+| HL7 v2 | At least these. At ingress, both shared handlers refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, and a segment that the message structure for the type in MSH-9 has no place for. On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. In your Router or Handler, the Tier 3 primitives compare fields with each other, for example `same_across` and `dates_in_order`. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `validate` in `parsing/validate.py`; `parsing/consistency.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
@@ -320,8 +320,12 @@ It does hold them to a structure when it loads them. The rules live in
 [`config/wiring.py`](../messagefoundry/config/wiring.py), at least these:
 
 - The loader runs each top-level `.py` file whose name does not start with `_`. A `_` file is a
-  helper, loaded only when a sibling imports it. A helper named like a standard-library module is
-  refused.
+  helper, loaded only when a sibling imports it. A helper that has the name of a module already
+  there is refused: a standard-library module, an installed module, or one the process has already
+  imported (`_refuse_shadowing_helper`).
+- Before any module runs, `_assert_safe_config_source` refuses a configuration directory, or a
+  file in it, that it reads as writable by another account. [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2)
+  states what it reads and what it leaves out.
 - A module declares nothing by being loaded. It registers objects by calling `inbound()`,
   `outbound()`, `@router` and `@handler`, at least. Those calls outside a load are refused.
 - Two objects of one kind may not share a name, and that covers a name declared both in a module
@@ -408,7 +412,7 @@ others.
 
 `CLI_TIERS` in [`cli_surface.py`](../messagefoundry/cli_surface.py) names subcommands across two
 commands: this one and the separate `messagefoundry-toolkit` command. The next section covers the
-toolkit, the test harness and the tray manager.
+toolkit, the test harness, the tray manager, the tee relay and the network helper.
 
 Individual commands are described where they are used, for example in
 [USER-GUIDE.md](USER-GUIDE.md), [SERVICE.md](SERVICE.md) and [CONFIGURATION.md](CONFIGURATION.md).
@@ -423,10 +427,8 @@ What happens to input the command line will not take:
 | Anything a command did not expect, raised as an uncaught error | One redacted line on the log stream and exit `1`. Under `--json`, an `{"error": ...}` object on stdout as well. `run_cli` in `cli_common.py` owns this floor. |
 
 Several commands take a path to a configuration directory. The engine loads Python from that
-directory, so the path is a trust decision, not only a format question. Of the files inside it, this
-page maps `connections.toml` only. The Router and Handler modules are Python;
-[CONNECTIONS.md](CONNECTIONS.md) describes how to author them. [CODESETS.md](CODESETS.md) defines
-the code-set files.
+directory, so the path is a trust decision, not only a format question. The files inside it are
+mapped above, under `connections.toml` and the configuration-directory modules.
 
 Some commands read message files, at least `dryrun` and `check`. Those bodies go through the same
 decode and guard functions as live ingress. The module docstring of
@@ -435,7 +437,7 @@ differs.
 
 ---
 
-## The toolkit, harness and tray take input of their own
+## The toolkit, harness, tray, tee relay and network helper take input of their own
 
 **`messagefoundry-toolkit`** holds the authoring commands. `_build_parser` in
 `messagefoundry_toolkit/__main__.py` defines them, and `--help` prints them as the engine command's
@@ -456,14 +458,28 @@ parameters and settings file. `load_config` in
 key that fails falls back to its default without a message. It sends the engine no input but two
 unauthenticated reads, `GET /health` and `GET /ui`.
 
+**The tee relay** (`python -m tee`) is a standalone application, not part of the engine.
+`_build_parser` in [`tee/__main__.py`](../tee/__main__.py) defines its subcommands, and `--help`
+prints them. Its `host:port` options are held to that form, the host optional, and to a port from 1 to 65535 by
+`_parse_endpoint`, and its age options to `Nd`, `Nh`, `Nm` or a `YYYY-MM-DD` date by `_parse_age`;
+a value that fails is a usage error. [TEE-RELAY.md](TEE-RELAY.md) describes it.
+
+**The network helper** (`mefor-net-helper.exe`, Windows only) takes one request per connection on
+its named pipe, a single line of JSON, and reads `mefor-net-helper.conf` at start.
+[`net-helper/README.md`](../net-helper/README.md) defines both: each request's form, each
+configuration key's rule, and that a request naming another address, interface or mask than the
+file's is refused. Nothing in the engine calls the helper yet.
+
 ---
 
 ## The operator scripts check their parameters in PowerShell
 
 The scripts under [`scripts/service/`](../scripts/service/) take parameters from an operator.
 [SERVICE.md](SERVICE.md) shows how to run them. **`Get-Help` prints only a script's syntax line,
-not its parameter descriptions,** so this table is where their structure is written down. Each rule
-is in the script's `param()` block or its body.
+not its parameter descriptions,** so this table is where their structure is written down. The cause
+is where the help sits: each script opens with its `<#` help block directly under its two licence
+comment lines, with no blank line between them, and PowerShell then does not read the block as
+help. Each rule is in the script's `param()` block or its body.
 
 | Script | Parameter | Rule |
 |---|---|---|
@@ -471,7 +487,7 @@ is in the script's `param()` block or its body.
 | | `-Environment` | Required. Letters, digits, `.`, `_` and `-` |
 | | `-Config` | Required. An existing directory |
 | | `-ListenHost` | An IP address, or a host name whose last label is not all digits |
-| | `-LogLevel` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| | `-LogLevel` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, in upper case. The script's own check ignores case, so it accepts `debug`, but it passes the value as written to `serve --log-level`, which refuses any but the upper-case form, so such a service fails at every start |
 | | `-EngineWheelSha256`, `-RequirementsLockSha256` | 64 hex characters |
 | `install-net-helper.ps1` | `-HelperSource` | Required |
 | | `-HelperSha256` | Required. 64 hex characters |

@@ -696,6 +696,14 @@ NSSM environment.
   A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
   active environment's value file if it is not a secret and is the same for every instance (the
   previous bullet's link says when and why).
+  **Off Windows, no installer creates the directory**, and the engine still reads only the path
+  `MEFOR_SECRETS_DIRECTORY` names. For a container, `docker/compose.yaml` carries a read-only bind
+  mount at `/run/mefor/secrets`, commented out. For systemd, a unit can point the variable at its
+  credentials directory, which is not measured. Where each goes, and the modes and owners the
+  engine refuses on POSIX, are stated once, under *Where the directory is* in
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Linux, on a
+  host or in a container, is not a supported v1 deployment target
+  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
