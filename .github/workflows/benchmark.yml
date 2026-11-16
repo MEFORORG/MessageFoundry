@@ -6,10 +6,31 @@
 # docs/benchmarks/TUNING-BASELINE.md + committed under docs/benchmarks/results/.
 #
 # Manual: `gh workflow run benchmark.yml --ref <branch>` (heavy + container-bound, so never on push/PR).
+#
+# `-f profile=claim-path` runs only the claim-path benchmark (vault BACKLOG #4915 step 1) in the two
+# server-store jobs, in place of the reference and failover steps, and skips the SQLite job: it times
+# claim_fifo_heads at two commits (scripts/bench/claim_path.sh says how). The default profile is the
+# baseline above, unchanged.
 name: throughput-baseline
 
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "baseline (reference rate-steps + failover) or claim-path (BACKLOG #4915, server stores only)"
+        type: choice
+        options:
+          - baseline
+          - claim-path
+        default: baseline
+      claim_path_before:
+        description: "claim-path profile: the before commit, a full SHA (default: engine PR 1782's parent)"
+        type: string
+        default: d619b1bb085cc794d7337b02b71d995d512d4ab7
+      claim_path_after:
+        description: "claim-path profile: the after commit, a full SHA (default: engine PR 1782's squash merge)"
+        type: string
+        default: 1882b3f93bd5558936142f3067fee3d29e39bd91
 
 permissions:
   contents: read
@@ -25,6 +46,7 @@ env:
 jobs:
   baseline-sqlite:
     name: baseline (sqlite)
+    if: inputs.profile != 'claim-path'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -226,8 +248,23 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## postgres"; uname -a; python --version; psql --version 2>/dev/null || echo "psql n/a"; git rev-parse HEAD; } | tee out/load/env-postgres.txt
+      - name: Claim-path benchmark, before and after (vault BACKLOG #4915)
+        if: inputs.profile == 'claim-path'
+        timeout-minutes: 45
+        env:
+          CLAIM_PATH_BEFORE: ${{ inputs.claim_path_before }}
+          CLAIM_PATH_AFTER: ${{ inputs.claim_path_after }}
+        run: bash scripts/bench/claim_path.sh postgres
+      - name: Upload claim-path report
+        if: always() && inputs.profile == 'claim-path'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claimpath-postgres
+          path: out/claimpath/
+          if-no-files-found: ignore
       - name: Create a separate database for the failover profile
         id: failover_db
+        if: inputs.profile != 'claim-path'
         # Why the failover profile needs its own database is at its step below. POSTGRES_DB creates
         # only one, so this adds the second through asyncpg, which the postgres extra installs.
         # continue-on-error so a failure here skips only the failover step, which gates on this
@@ -259,6 +296,7 @@ jobs:
           asyncio.run(main())
           PY
       - name: Serve (Postgres), sign in + reference rate-steps
+        if: inputs.profile != 'claim-path'
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
@@ -492,8 +530,23 @@ jobs:
         run: |
           mkdir -p out/load
           { echo "## sqlserver"; uname -a; python --version; git rev-parse HEAD; } | tee out/load/env-sqlserver.txt
+      - name: Claim-path benchmark, before and after (vault BACKLOG #4915)
+        if: inputs.profile == 'claim-path'
+        timeout-minutes: 45
+        env:
+          CLAIM_PATH_BEFORE: ${{ inputs.claim_path_before }}
+          CLAIM_PATH_AFTER: ${{ inputs.claim_path_after }}
+        run: bash scripts/bench/claim_path.sh sqlserver
+      - name: Upload claim-path report
+        if: always() && inputs.profile == 'claim-path'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claimpath-sqlserver
+          path: out/claimpath/
+          if-no-files-found: ignore
       - name: Create a separate database for the failover profile
         id: failover_db
+        if: inputs.profile != 'claim-path'
         # As in the postgres leg: why is at the failover step, and continue-on-error keeps a failure
         # here from skipping the reference measurement. -b makes a T-SQL error exit non-zero.
         # ALLOW_SNAPSHOT_ISOLATION is set here so the two failover nodes do not both race to set it
@@ -503,6 +556,7 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundryFailover') IS NULL CREATE DATABASE MessageFoundryFailover; ALTER DATABASE MessageFoundryFailover SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE; ALTER DATABASE MessageFoundryFailover SET ALLOW_SNAPSHOT_ISOLATION ON;"
       - name: Serve (SQL Server), sign in + reference rate-steps
+        if: inputs.profile != 'claim-path'
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
