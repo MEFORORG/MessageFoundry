@@ -124,3 +124,14 @@ def test_an_inserted_repeated_segment_reports_no_reorder() -> None:
     r = compare(left, right)
     assert r.kind == "mismatch"
     assert SEGMENT_ORDER not in {d.location for d in r.diffs}
+
+
+def test_a_regrouping_is_reported_beside_an_unrelated_extra_segment() -> None:
+    left = _ORU_HEAD + _GROUP_1 + _NTE + _GROUP_2
+    right = _ORU_HEAD + _GROUP_1 + _GROUP_2 + _NTE + "ZID|extra\r"
+    r = compare(left, right)
+    order = [d for d in r.material_diffs if d.location == SEGMENT_ORDER]
+    assert [(d.left, d.right) for d in order] == [
+        ("MSH PID OBR OBX NTE OBR OBX", "MSH PID OBR OBX OBR OBX NTE")
+    ]
+    assert "ZID" in {d.location for d in r.material_diffs}
