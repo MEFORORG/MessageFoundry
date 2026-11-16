@@ -3,7 +3,8 @@
 """Offline checks of the claim-path benchmark tool (scripts/bench/claim_path.py, vault BACKLOG
 #4915). The timed half needs a live server store and runs only in benchmark.yml's claim-path
 profile; these cover the parts a wrong figure would come from: the scenario grammar, the statistics,
-the before/after table, the bench-database guard, the refusal to credit a run to a commit it did
+the before/after table and its refusal to compare a keyed side with an unkeyed one, the
+bench-database guard, the refusal to credit a run to a commit it did
 not import, the expected-row arithmetic, and the sampling loop that discards a wrong claim."""
 
 from __future__ import annotations
@@ -150,6 +151,7 @@ def _report(
     payload_bytes: int = 2048,
     n: float = 100.0,
     discarded: dict[str, int] | None = None,
+    store_keyed: bool = True,
 ) -> Path:
     rep = {
         "label": label,
@@ -160,6 +162,7 @@ def _report(
         "rows_per_lane": 16,
         "payload_bytes": payload_bytes,
         "iterations": 100,
+        "store_keyed": store_keyed,
         "scenarios": [
             {
                 "lanes": 64,
@@ -196,6 +199,9 @@ def test_compare_gives_the_median_of_rounds_in_round_order(tmp_path: Path) -> No
     assert cells[7] == "1.500"  # the p90 ratio
     assert cells[10] == "2 (lock_timeout:head 2)"  # discards summed over rounds, per side
     assert cells[11] == "2 (empty 1, lock_timeout:head 1)"
+    # Each side names whether its store was keyed (claim_path.sh mints a throwaway store key).
+    assert f"- before={'before' * 5} on PostgreSQL 16, store keyed" in table
+    assert f"- after={'after' * 5} on PostgreSQL 16, store keyed" in table
 
 
 @pytest.mark.parametrize(
@@ -203,6 +209,7 @@ def test_compare_gives_the_median_of_rounds_in_round_order(tmp_path: Path) -> No
     [
         ({"payload_bytes": 1024}, "refused: payload_bytes differs"),
         ({"n": 60.0}, "refused: fewer samples than iterations (after r1 n=60)"),
+        ({"store_keyed": False}, "refused: store_keyed differs across reports (False, True)"),
     ],
 )
 def test_compare_refuses_sides_that_did_not_measure_the_same_work(

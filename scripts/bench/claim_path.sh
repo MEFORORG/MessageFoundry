@@ -8,7 +8,8 @@
 #   bash scripts/bench/claim_path.sh <postgres|sqlserver>
 #
 # Environment: CLAIM_PATH_BEFORE and CLAIM_PATH_AFTER, two full 40-character commit SHAs;
-# CLAIM_PATH_ROUNDS, default 2; the job's MEFOR_STORE_* connection settings.
+# CLAIM_PATH_ROUNDS, default 2; the job's MEFOR_STORE_* connection settings. The script sets
+# MEFOR_STORE_ENCRYPTION_KEY itself, to a key it mints for the run.
 #
 # Each commit is extracted with git archive into its own directory, stamped with its SHA, and installed
 # editable into its own venv against its own constraints.lock, so each side runs on the dependencies
@@ -89,6 +90,15 @@ else
       -Q "IF DB_ID('${db[$label]}') IS NULL CREATE DATABASE ${db[$label]}; ALTER DATABASE ${db[$label]} SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE; ALTER DATABASE ${db[$label]} SET ALLOW_SNAPSHOT_ISOLATION ON;"
   done
 fi
+
+# measure opens the store through open_store, which refuses to start a keyless audit chain, and each
+# bench database is new, so its chain is empty. Mint a throwaway AES-256 store key at runtime, never a
+# committed literal, once for the whole run so every round reopens the same keyed chain. Both sides
+# run keyed, and each report records it. Assigned before export: `export VAR="$(...)"` returns
+# export's status and hides a failed mint.
+store_key="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+if [[ "${GITHUB_ACTIONS:-}" == true ]]; then echo "::add-mask::$store_key"; fi
+export MEFOR_STORE_ENCRYPTION_KEY="$store_key"
 
 for round in $(seq 1 "$rounds"); do
   if (( round % 2 )); then order=(before after); else order=(after before); fi

@@ -12,7 +12,10 @@ rows. This tool measures one commit at a time, so the same file times both sides
 test, put first on ``sys.path``) and refuses to run if the import resolved anywhere else, or if the
 root's ``CLAIM_PATH_COMMIT`` file (written at extraction) does not name ``--commit``. It refuses any
 database whose name is not one of the bench's own (``mf_claim_*`` or ``MfClaim*``), because it
-empties the queue tables of the database the ``MEFOR_STORE_*`` environment names. It seeds synthetic
+empties the queue tables of the database the ``MEFOR_STORE_*`` environment names. It opens the store
+through ``open_store``, the engine's one store-open seam, at its refusing keyless default, so a fresh
+bench database opens only with a store key in hand: claim_path.sh mints a throwaway
+``MEFOR_STORE_ENCRYPTION_KEY`` for the run, and each report records ``store_keyed``. It seeds synthetic
 ingress rows (one fixed, PHI-free HL7 message padded to ``--payload-bytes`` with seeded random
 base64, never printed), resets the queue table before each scenario, then times each
 ``claim_fifo_heads`` call alone. After every claim it calls ``release_claimed``, which puts the
@@ -26,8 +29,9 @@ and the next one runs.
 ``compare`` reads the JSON reports ``measure`` wrote and prints one Markdown table per backend. A
 report keeps summary statistics, not samples, so rounds are not pooled: each cell is the median over
 rounds of that round's statistic, with each round's p50 listed in round order, and each side's
-discarded claims by reason. It refuses a scenario whose two sides did not measure the same work
-(rows claimed, payload size, rows per lane, iterations) or whose sample count fell short, and exits
+discarded claims by reason, and names whether each report's store was keyed. It refuses a scenario
+whose two sides did not measure the same work (rows claimed, payload size, rows per lane,
+iterations, store keyed) or whose sample count fell short, and exits
 non-zero if it refused any scenario or if no scenario has both sides.
 
 Only timings, counts, the backend's version line and the commit label reach the output.
@@ -62,8 +66,9 @@ _BENCH_DB_PREFIXES = ("mf_claim_", "MfClaim")
 # The server stores clamp one claim to this many lanes (_FIFO_HEADS_LANE_CHUNK).
 _MAX_LANES = 500
 _PAD_SEED = 4915
-# The work both sides of a compared scenario must share.
-_SAME_WORK = ("rows_claimed", "payload_bytes", "rows_per_lane", "iterations")
+# The work both sides of a compared scenario must share. A keyed store encrypts and decrypts the
+# rows a claim reads, so a keyed side and an unkeyed side did not do the same work.
+_SAME_WORK = ("rows_claimed", "payload_bytes", "rows_per_lane", "iterations", "store_keyed")
 
 # One claim: (milliseconds, the claimed row ids, the lock-timeout phase if the store reported one).
 ClaimFn = Callable[[], Awaitable[tuple[float, list[Any], str | None]]]
@@ -176,17 +181,21 @@ def _check_bench_database(environ: dict[str, str] | os._Environ[str]) -> str:
     return name
 
 
-async def _open_store(backend: str) -> Any:
-    from messagefoundry.config.settings import load_settings
+async def _open_store(backend: str) -> tuple[Any, bool]:
+    """The open store, and whether a store key was named for it.
 
-    settings = load_settings(environ=os.environ).store
-    if backend == "postgres":
-        from messagefoundry.store.postgres import PostgresStore
+    Through ``open_store``, the engine's one store-open seam, at its refusing keyless default: a
+    fresh bench database has an empty audit chain, so the open is refused unless a key is in hand
+    (claim_path.sh mints a throwaway one). ``create=True`` is the default the backend ``open`` this
+    replaced ran with, so a new database gets its schema as before."""
+    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.store.base import open_store
 
-        return await PostgresStore.open(settings)
-    from messagefoundry.store.sqlserver import SqlServerStore
-
-    return await SqlServerStore.open(settings)
+    settings = load_settings(environ=os.environ).store.model_copy(
+        update={"backend": StoreBackend(backend)}
+    )
+    store = await open_store(settings, create=True)
+    return store, bool(settings.encryption_key or settings.encryption_key_file)
 
 
 async def _fetchval(store: Any, backend: str, query: str) -> Any:
@@ -259,7 +268,7 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
         "python": platform.python_version(),
         "scenarios": [],
     }
-    store = await _open_store(backend)
+    store, report["store_keyed"] = await _open_store(backend)
     try:
         version = await _fetchval(
             store, backend, "SELECT version()" if backend == "postgres" else "SELECT @@VERSION"
@@ -388,8 +397,14 @@ def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int, int]
     meta: dict[str, set[str]] = defaultdict(set)
     for path in paths:
         rep = json.loads(path.read_text(encoding="utf-8"))
-        meta[rep["backend"]].add(f"{rep['label']}={rep['commit']} on {rep.get('server', '?')}")
-        run = {k: rep.get(k) for k in ("label", "payload_bytes", "rows_per_lane", "iterations")}
+        keyed = {True: "keyed", False: "unkeyed"}.get(rep.get("store_keyed"), "keying unrecorded")
+        meta[rep["backend"]].add(
+            f"{rep['label']}={rep['commit']} on {rep.get('server', '?')}, store {keyed}"
+        )
+        run = {
+            k: rep.get(k)
+            for k in ("label", "payload_bytes", "rows_per_lane", "iterations", "store_keyed")
+        }
         for sc in rep["scenarios"]:
             key = (rep["backend"], sc["lanes"], sc["per_lane_limit"])
             grouped[key][rep["label"]].append({**sc, **run, "round": rep.get("round", 0)})
