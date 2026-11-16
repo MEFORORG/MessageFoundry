@@ -509,7 +509,8 @@ function Invoke-CimMethod {
   [pscustomobject]@{ ReturnValue = 0 }
 }
 function Get-ItemProperty { param($LiteralPath, $Name, $ErrorAction) [pscustomobject]@{ ObjectName = $script:stored } }
-function Set-Service { param($Name, $StartupType, $ErrorAction) $script:disabled = $true }
+function Get-Service { param($Name, $ErrorAction) [pscustomobject]@{ Name = 'Svc' } }
+function Set-Service { param($Name, $InputObject, $StartupType, $ErrorAction) $script:disabled = $true }
 $pw = ConvertTo-SecureString 'synthetic-pw-3411' -AsPlainText -Force
 foreach ($arm in @(@('rig', $OtherRunAs), @('verbatim', $OtherAccount))) {
   $stored = ''; $startName = ''; $disabled = $false; $err = ''

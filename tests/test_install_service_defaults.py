@@ -671,12 +671,26 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
     """The refusal used to say the service "was set to Disabled" even when that call failed
     silently. Now it reports what happened, and a failure tells the operator to do it by hand."""
     assert _SCRIPT is not None
+    # Get-Service -Name also matches a DISPLAY name, so 'Windows Time' resolves to W32Time
+    # (BACKLOG #5402). A by-name Set-Service resolves the same way, so a call that takes the name
+    # rather than the exact object shows up as W32Time in the calls.
     body = (
-        "  function Set-Service { param($Name, $StartupType, $ErrorAction)\n"
-        "    if ($Name -eq 'Gone') { throw 'no such service' } }\n"
+        "  $calls = [Collections.Generic.List[string]]::new()\n"
+        "  $display = @{ W32Time = 'Windows Time' }\n"
+        "  function Get-Service { param($Name, $ErrorAction)\n"
+        "    @(@('Svc', 'Locked', 'W32Time') | Where-Object { $_ -eq $Name -or $display[$_] -eq $Name } |\n"
+        "      ForEach-Object { [pscustomobject]@{ Name = $_ } }) }\n"
+        "  function Set-Service { param($Name, $InputObject, $StartupType, $ErrorAction)\n"
+        "    $targets = if ($InputObject) { @($InputObject.Name) } else {\n"
+        "      @(Get-Service -Name $Name | ForEach-Object { $_.Name }) }\n"
+        "    foreach ($t in $targets) { $calls.Add($t) }\n"
+        "    if ($targets -contains 'Locked') { throw 'access denied' } }\n"
         "  [pscustomobject]@{\n"
         "    done = (Disable-RefusedService -ServiceName 'Svc' -Consequence 'it cannot start')\n"
-        "    failed = (Disable-RefusedService -ServiceName 'Gone' -Consequence 'it cannot start')\n"
+        "    failed = (Disable-RefusedService -ServiceName 'Locked' -Consequence 'it cannot start')\n"
+        "    gone = (Disable-RefusedService -ServiceName 'Gone' -Consequence 'it cannot start')\n"
+        "    display = (Disable-RefusedService -ServiceName 'Windows Time' -Consequence 'it cannot start')\n"
+        "    calls = @($calls)\n"
         "  } | ConvertTo-Json -Compress\n"
     )
     got = json.loads(
@@ -684,9 +698,18 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
     )
     assert got["done"] == "'Svc' was set to Disabled so it cannot start."
     assert got["failed"].startswith(
-        "WARNING: 'Gone' could NOT be set to Disabled (no such service)"
+        "WARNING: 'Locked' could NOT be set to Disabled (access denied)"
     )
-    assert "Set-Service -Name 'Gone' -StartupType Disabled" in got["failed"]
+    assert got["gone"].startswith(
+        "WARNING: 'Gone' could NOT be set to Disabled (no service is named exactly 'Gone')"
+    )
+    assert got["display"].startswith("WARNING: 'Windows Time' could NOT be set to Disabled"), got
+    assert got["calls"] == ["Svc", "Locked"], (
+        f"a service other than the exact name was disabled: {got['calls']}"
+    )
+    # The hand advice opens the service by its name only, never by a display name.
+    assert 'sc.exe config "Gone" start= disabled' in got["gone"]
+    assert "Set-Service -Name" not in got["gone"]
 
 
 def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> None:

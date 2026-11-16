@@ -375,7 +375,11 @@ function Set-ServiceAccount {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        # ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
+        # DISPLAY name, so the service is found by Name and disabled as the object (-InputObject).
+        $exact = @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+            Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        if ($exact) { Set-Service -InputObject $exact -StartupType Disabled -ErrorAction SilentlyContinue }
         throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
     }
     $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
@@ -431,15 +435,23 @@ function Disable-RefusedService {
       Set $ServiceName to Disabled after a refusal, and return the sentence that says what happened:
       that it was set to Disabled, so $Consequence, or that it could not be and must be disabled by
       hand before the next boot. The refusal message reports this, rather than assuming it.
+
+      ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
+      DISPLAY name, so the service is found by Name and disabled as the object (-InputObject); a name
+      that matches no service exactly is reported as not disabled. The hand advice names sc.exe,
+      which opens a service by its name only.
     #>
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Consequence)
     try {
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction Stop
+        $exact = @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+            Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        if (-not $exact) { throw "no service is named exactly '$ServiceName'" }
+        Set-Service -InputObject $exact -StartupType Disabled -ErrorAction Stop
         return "'$ServiceName' was set to Disabled so $Consequence."
     } catch {
         return ("WARNING: '$ServiceName' could NOT be set to Disabled ($($_.Exception.Message)), so " +
-            "it may start at the next boot. Disable it by hand: Set-Service -Name '$ServiceName' " +
-            "-StartupType Disabled.")
+            "it may start at the next boot. Disable it by hand: sc.exe config `"$ServiceName`" " +
+            "start= disabled")
     }
 }
 

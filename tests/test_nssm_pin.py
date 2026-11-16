@@ -193,7 +193,18 @@ _STUBS = """
   $changes = [Collections.Generic.List[string]]::new()
   $throwWith = ''
   $disabled = [Collections.Generic.List[string]]::new()
-  function Set-Service { param($Name, $StartupType, $ErrorAction) $disabled.Add("$Name=$StartupType") }
+  # Set-Service -Name resolves the name again and may take it as a DISPLAY name (BACKLOG #5402), so
+  # a by-name call is recorded apart from the object form (-InputObject) the installers must use.
+  function Set-Service {
+    param($Name, $InputObject, $StartupType, $ErrorAction)
+    if ($InputObject) { $disabled.Add("$($InputObject.Name)=$StartupType") }
+    else { $disabled.Add("by-name:$Name=$StartupType") }
+  }
+  function Get-Service {
+    param($Name, $ErrorAction)
+    @($registry.Keys | Where-Object { $_ -eq $Name -or $registry[$_]['DisplayName'] -eq $Name } |
+      ForEach-Object { [pscustomobject]@{ Name = $_ } })
+  }
   function Get-ItemProperty {
     param($LiteralPath, $Name, $ErrorAction)
     $svcName = Split-Path -Leaf $LiteralPath
@@ -945,6 +956,26 @@ def test_no_installer_sets_the_account_through_nssm(report: dict[str, Any], scri
     through_nssm = [c for c in nssm_calls if "ObjectName" in str(c["text"])]
     assert not through_nssm, f"{script} still runs `nssm set ObjectName`: {through_nssm}"
     assert _at(commands, _named("Set-ServiceAccount")), f"CONTROL FAILED: {script} sets no account"
+
+
+_SERVICE_ACTIONS = ("Stop-Service", "Set-Service", "Start-Service", "Restart-Service")
+
+
+@pytest.mark.parametrize("script", _WITH_BLOCK + _WITHOUT_NSSM)
+def test_no_script_acts_on_a_service_by_a_name_the_cmdlet_resolves_again(
+    report: dict[str, Any], script: str
+) -> None:
+    """Stop-Service and Set-Service -Name also take a DISPLAY name, and the service-name pattern
+    allows a space, so -ServiceName 'Windows Time' would act on W32Time (BACKLOG #5402). Every call
+    that stops, starts or reconfigures a service takes the exact-name object instead."""
+    acting = [c for c in _script(report, script)["commands"] if c.get("name") in _SERVICE_ACTIONS]
+    assert acting, f"CONTROL FAILED: {script} has no service cmdlet call to check"
+    by_name = [
+        str(c["text"])
+        for c in acting
+        if "-InputObject" not in str(c["text"]) or "-Name" in str(c["text"])
+    ]
+    assert not by_name, f"{script} acts on a service by name, not by the exact object: {by_name}"
 
 
 @pytest.mark.parametrize("script", _WITHOUT_NSSM)

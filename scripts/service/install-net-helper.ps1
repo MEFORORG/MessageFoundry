@@ -321,7 +321,11 @@ function Set-ServiceAccount {
     )
     $fail = {
         param([string]$Why)
-        Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+        # ONLY THE SERVICE WHOSE NAME IS $ServiceName (BACKLOG #5402). Set-Service -Name also takes a
+        # DISPLAY name, so the service is found by Name and disabled as the object (-InputObject).
+        $exact = @(Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) |
+            Where-Object { $_.Name -eq $ServiceName } | Select-Object -First 1
+        if ($exact) { Set-Service -InputObject $exact -StartupType Disabled -ErrorAction SilentlyContinue }
         throw "$Why '$ServiceName' was set to Disabled so it cannot start as the wrong account."
     }
     $svc = Get-CimInstance Win32_Service -ErrorAction Stop |
@@ -815,7 +819,11 @@ Set-ServiceAccount -ServiceName $ServiceName -Account LocalSystem
 try {
     Set-ServiceImage -ServiceName $ServiceName -Path $TargetNssm
 } catch {
-    Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+    # The exact-name lookup above, run again: this registration may be new since it ran (#5402).
+    $registered = & $exactService
+    if ($registered) {
+        Set-Service -InputObject $registered -StartupType Disabled -ErrorAction SilentlyContinue
+    }
     throw ("$($_.Exception.Message) '$ServiceName' was set to Disabled. Remove it with " +
         ".\uninstall-net-helper.ps1 and re-run.")
 }
