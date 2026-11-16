@@ -135,10 +135,10 @@ def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> No
 @pytest.mark.parametrize("sep", ["=", ": ", "='", " = "])
 def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str, sep: str) -> None:
     """The PHI name pass reads ``Login Password`` as a name and takes it. Run before any credential
-    pass that needs the label, the value printed; the label word is lower-cased first now, so the
-    pair is no longer a name. The second control is the PHI-first order with no such step, which
+    pass that needs the label, the value printed; the credentials-first order hides it, and a word
+    prints only where both orders print it. The second control is the PHI-first order alone, which
     prints the value on this text."""
-    from messagefoundry.redaction import _REDACTED, redact, safe_exc
+    from messagefoundry.redaction import redact, safe_exc
     from messagefoundry.secretscrub import scrub_credentials
 
     close = "'" if sep.endswith("'") else ""
@@ -146,8 +146,8 @@ def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str, sep: st
     exc = RuntimeError(text)
     assert _PLANTED in safe_exc(exc)  # control: the PHI pass alone keeps it
     if sep == "=":
-        bare = _REDACTED.join(scrub_credentials(x) for x in redact(text).split(_REDACTED))
-        assert _PLANTED in bare, bare  # control: PHI first with no pre-mask keeps it
+        bare = scrub_credentials(redact(text))
+        assert _PLANTED in bare, bare  # control: PHI first alone keeps it
     assert _PLANTED not in safe_exc_detail(exc)
 
 
@@ -236,25 +236,51 @@ def test_a_name_after_a_credential_label_is_hidden_whole(text: str) -> None:
     assert "Doe" not in detail and "Jane" not in detail, detail
 
 
-def test_a_name_before_a_credential_label_is_still_a_name() -> None:
-    """Lower-casing the label word breaks the label's pair, not a real name before it."""
+@pytest.mark.parametrize(
+    ("text", "hidden"),
+    [
+        # A name before a label: the PHI pass reads it with the label, and it stays hidden.
+        (f"Patient Jane Doe Password={_PLANTED} y", ("Jane", "Doe", _PLANTED)),
+        ("patient Smithson Token: tk-1 x", ("Smithson", "tk-1")),
+        ("login for Doe Password=pw-1", ("Doe", "pw-1")),
+        ("user DOE PWD=pw-1", ("DOE", "pw-1")),
+        # A label the PHI pass takes in an HL7 field run, its value in the next word.
+        ("ERR a|b^password= Zq7x-ghi more", ("Zq7x-ghi",)),
+        ("ERR a%7Cb%5Etoken: Zq7x-ghi", ("Zq7x-ghi",)),
+        ("DOE^JANE^^password: Zq7x-ghi", ("Zq7x-ghi", "JANE")),
+        # A label paired with a name across a newline, a comma or a no-break space.
+        ("bad settings:\nServer: db.invalid\nUser: Svc\nPassword: Hq9-Real_Pw", ("Hq9-Real_Pw",)),
+        ("User=Svc, Password=x9y8", ("x9y8",)),
+        ("UID=SVC, PWD=x9y8", ("x9y8",)),
+        ("Login Password=x9y8", ("x9y8",)),
+    ],
+)
+def test_a_word_either_order_hides_stays_hidden(text: str, hidden: tuple[str, ...]) -> None:
+    """Code review round 2 measured each of these print under one order of the two passes. A word
+    prints only where both orders print it now. Control: one order alone prints at least one of the
+    words, so the other order is what hides it."""
+    from messagefoundry.redaction import redact
+    from messagefoundry.secretscrub import scrub_credentials
     from messagefoundry.verify.model import safe_detail_text
 
-    detail = safe_detail_text(f"Patient Jane Doe Password={_PLANTED} y")
-    assert "Jane" not in detail and "Doe" not in detail and _PLANTED not in detail, detail
+    phi_first = scrub_credentials(redact(text))
+    credentials_first = redact(scrub_credentials(text))
+    assert any(w in phi_first or w in credentials_first for w in hidden), (
+        phi_first,
+        credentials_first,
+    )
+    detail = safe_detail_text(text)
+    for word in hidden:
+        assert word not in detail, detail
 
 
-def test_the_paired_label_words_are_secretscrubs() -> None:
-    """The label words are spelled as a literal for the static ReDoS gate; they must stay
-    ``secretscrub``'s password and token families."""
-    import re
+def test_the_placeholder_is_not_an_html_tag() -> None:
+    """A sink that renders a pasted detail as HTML would drop ``<redacted>`` and show ``PWD=`` as an
+    empty password; the detail's placeholder is the square-bracket one."""
+    from messagefoundry.verify.model import safe_detail_text
 
-    from messagefoundry import secretscrub
-    from messagefoundry.verify.model import _PAIRED_CREDENTIAL_LABEL
-
-    words = re.search(r"\(\?i:([^)]*)\)", _PAIRED_CREDENTIAL_LABEL.pattern)
-    assert words is not None
-    assert set(words[1].split("|")) == {*secretscrub._CREDENTIAL_WORDS, *secretscrub._TOKEN_WORDS}
+    detail = safe_detail_text(f"Server=db;UID=sa;PWD={_PLANTED};")
+    assert "PWD=[redacted]" in detail and "<" not in detail, detail
 
 
 def test_a_cut_input_keeps_its_unscanned_note() -> None:

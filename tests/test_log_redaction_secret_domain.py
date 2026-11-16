@@ -1391,6 +1391,30 @@ def test_a_dsn_user_holding_no_password_is_not_read_as_one(
     assert "pw-Ctl_Pw-80" not in scrub_credentials(with_pw)
 
 
+@pytest.mark.parametrize(
+    ("line", "secret"),
+    [
+        # An empty user then a port and a query: not a password, and the query label must survive.
+        ("ws://:8765?accessToken=Tail@Tok_Sec-9 rest", "Tok_Sec-9"),
+        ("redis://:5432?AccessToken=Tok-Sec_9:x@Tail_Sec-8", "Tok-Sec_9"),
+        # A literal or encoded HL7 run after a later "@" keeps the separators the PHI pass reads.
+        ("x postgres://svc:pw-A1@db|PID|1|x@y|MRN7712345 end", "MRN7712345"),
+        ("1MRN4455667redis://:pw@!%26%5E%7E+*+*@", "MRN4455667"),
+        # A later member or address after a "|": its label survives, and the host is not rewritten.
+        ("dsn postgres://svc:pw-A1@db:5432|dbPassword=Tail@Sec_B2 end", "Sec_B2"),
+    ],
+)
+def test_the_widened_dsn_pattern_does_not_reach_past_a_separator(line: str, secret: str) -> None:
+    """Code review of BACKLOG #5386 measured each of these print through the support bundle where
+    the pattern before #5386 hid it. Control: the empty-user and at-sign widening still applies."""
+    assert secret not in redact_log_line(line), redact_log_line(line)
+    assert "pw-A1" not in redact_log_line(line)
+    smtp = "smtp://ops:pw-A1@mail.corp:587|cc=admin@corp.invalid"
+    assert "@mail.corp:587|cc=admin@corp.invalid" in scrub_credentials(smtp)
+    for control in ("postgres://:pw-E1@db/x", "postgres://svc:pw@At-E2@db/x"):
+        assert "E1" not in scrub_credentials(control) and "At-E2" not in scrub_credentials(control)
+
+
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
 #: to build the differential corpus. The empty entry is the control, and the claim has to be made about
 #: the PAIR rather than the head alone: a LETTER-headed scheme behind it is a shape every spelling of

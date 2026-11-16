@@ -31,24 +31,15 @@ FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 DRIVER_DETAIL_LIMIT: Final = 2000
 
 
-#: A credential label word right after a capitalized word and a space, as in ``Login Password=`` or
-#: ``Access Token:``. The PHI name pass reads two capitalized words as a name and takes both, and
-#: the credential pass after it then finds no label, so the value printed. Lower-casing the label
-#: word alone breaks that pair and changes nothing else; after a lower-case word there is no pair,
-#: so ``word PWD=`` keeps its spelling. The words are ``secretscrub``'s password and token
-#: families, spelled here so the static ReDoS gate reads a literal;
-#: ``tests/test_verify_detail_redaction.py`` holds them to ``secretscrub``. Each match starts at a
-#: word boundary and the word runs are not nested, so the scan is linear.
-_PAIRED_CREDENTIAL_LABEL: Final = re.compile(
-    r"\b([A-Z][A-Za-z0-9]*[ \t]+)"
-    r"((?i:password|passwd|passphrase|pass|pwd|secret|credential"
-    r"|authorization|bearer|token|session|api_key|api-key|apikey))\b(?=['\"]?\s*[:=])"
-)
+#: The placeholder both passes write here: the PHI pass's own, and ``scrub_credentials`` is told to use
+#: it. Square brackets rather than ``secretscrub``'s ``<redacted>``, so a sink that renders a pasted
+#: detail as HTML cannot read it as a tag and show ``PWD=`` as an empty password.
+_PLACEHOLDER: Final = "[redacted]"
 
 
 def safe_detail_text(text: str, *, limit: int | None = None) -> str:
-    """``text`` for a :class:`CheckResult` detail: bounded, then PHI, then credentials over the whole
-    result, then the length bound (BACKLOG #5395).
+    """``text`` for a :class:`CheckResult` detail: bounded, then a word printed only where both
+    orders of the PHI and credential passes print it, then the length bound (BACKLOG #5395).
 
     A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
     leaves the box. The text a check quotes is a driver's, a config module's or the OS's: a store
@@ -59,25 +50,27 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
     log filter and wiring's own diagnostics use.
 
-    THE PHI PASS RUNS FIRST, AND THE CREDENTIAL PASS READS ITS WHOLE RESULT. Run first, the
-    credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's value, the
-    PHI pass then found no ``mrn:`` label, and the MRN printed. Run after, over the whole text, it can
-    only hide more than the PHI pass did. Not split at the PHI placeholders, as the support bundle's
-    second layer is: the placeholder is a run of non-space characters, so ``postgresql://19800505:<pw>@``
-    still reads as a DSN once the PHI pass has replaced the user, where a split cut it in two and the
-    password printed.
+    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run and a word prints only where
+    both print it. Credentials first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn:
+    MRN7712345`` as the token's value, the PHI pass then found no ``mrn:`` label, and the MRN printed.
+    PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
+    as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
+    (``a|b^password= <value>``), and the value printed. The primary result is PHI first, then the
+    credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
+    the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
+    the user. Then every whitespace-separated word of that result holding a fragment, between
+    placeholders, that the credentials-first result does not hold as a fragment of its own is
+    replaced whole. That errs toward hiding: a label the other order spelled differently goes with
+    its value.
 
-    The one thing the PHI pass takes that the credential pass needs is a label read as a name, such
-    as ``Login Password``. :data:`_PAIRED_CREDENTIAL_LABEL` lower-cases its label word first, so the
-    name pass leaves it. The input is cut to
-    :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass reads it, and its note
-    is kept past the length bound.
+    The input is cut to :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass
+    reads it, and its note is kept past the length bound.
 
     Not the support bundle's ``redact_log_line``: its long-base64 sweep blanked any 24-character run,
     which is an exception class name such as ``SSLCertVerificationError`` and the segments of a POSIX
     path, the words an operator needs here. This is best-effort, with at least the residuals
-    ``secretscrub`` states, and the PHI pass can blank a capitalized two-word phrase such as ``Program
-    Files``."""
+    ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
+    capitalized two-word phrase such as ``Program Files``."""
     from messagefoundry.redaction import clamp_untrusted, redact, safe_text
     from messagefoundry.secretscrub import scrub_credentials
 
@@ -85,10 +78,26 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it
     # must outlive the length bound below, which would otherwise drop it with the tail.
     head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
-    lowered = _PAIRED_CREDENTIAL_LABEL.sub(lambda m: m[1] + m[2].lower(), head)
-    cleaned = scrub_credentials(redact(lowered))
+    phi_first = scrub_credentials(redact(head), placeholder=_PLACEHOLDER)
+    credentials_first = redact(scrub_credentials(head, placeholder=_PLACEHOLDER))
+    cleaned = _printed_by_both(phi_first, credentials_first)
     shown = safe_text(cleaned) if limit is None else safe_text(cleaned, limit=limit)
     return f"{shown} {note}" if note else shown
+
+
+def _fragments(word: str) -> list[str]:
+    return [piece for piece in word.split(_PLACEHOLDER) if piece]
+
+
+def _printed_by_both(primary: str, other: str) -> str:
+    """``primary`` with each word replaced by the placeholder where it holds a fragment ``other``
+    does not. Linear: one split of each text and set lookups."""
+    printed = {piece for word in other.split() for piece in _fragments(word)}
+    return re.sub(
+        r"\S+",
+        lambda m: m[0] if all(p in printed for p in _fragments(m[0])) else _PLACEHOLDER,
+        primary,
+    )
 
 
 def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:

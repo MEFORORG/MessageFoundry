@@ -3153,10 +3153,10 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     # ``_CREDENTIAL_AHEAD``'s comment states, so the user classes are held apart here.
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
-    assert r"://[^\s:/@]*):[^\s/@]++" in secretscrub._DSN_PASSWORD.pattern
-    # Past the first segment the pattern adds only a run that cannot hold whitespace or "/", then
-    # the "@": so every match it makes, the arm's first segment then "@" also makes.
-    tail = secretscrub._DSN_PASSWORD.pattern.split(r"[^\s/@]++", 1)[1]
+    assert r"://[^\s:/@]*):" in secretscrub._DSN_PASSWORD.pattern
+    # With a user, the first segment is the arm's, and past it the pattern adds only a run that
+    # cannot hold whitespace or "/", then the "@": so every match it makes with a user, the arm makes.
+    tail = secretscrub._DSN_PASSWORD.pattern.split(r"(?<!//:)[^\s/@]++)", 1)[1]
     assert tail.startswith(r"[^\s/") and tail.endswith("]*@"), tail
 
 
