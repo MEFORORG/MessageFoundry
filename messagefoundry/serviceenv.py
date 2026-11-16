@@ -135,8 +135,9 @@ class ServiceEnvPosture:
     status: ServiceEnvStatus
     #: The service whose lists were read, when one was found.
     service_name: str | None = None
-    #: Every variable name the service's environment lists set, upper-cased. Empty unless
-    #: ``status`` is ``OBSERVED``.
+    #: Every variable name the service's environment lists set, upper-cased: each string's
+    #: first name, and a secret-class or ``MEFOR_VALUE_*`` name a later line of it starts. Empty
+    #: unless ``status`` is ``OBSERVED``.
     listed: tuple[str, ...] = ()
     #: ``(name, registry value)`` for each name in ``listed``, so a refusal can say which value
     #: to change.
@@ -300,7 +301,8 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 
 def _refused_name(line: str) -> bool:
     """Whether ``line`` sets a name the refusal is about: a secret-class name or a
-    ``MEFOR_VALUE_*`` one. Neither can be spelled by a line of base64 or PEM armour."""
+    ``MEFOR_VALUE_*`` one, the three classes ``listed_keys``, ``listed_directory_names`` and
+    ``listed_value_names`` read. None can be spelled by a line of base64 or PEM armour."""
     name = line.partition("=")[0].strip().upper()
     return (
         name in KEY_CLASS_NAMES or name in DIRECTORY_CLASS_NAMES or name.startswith(_VALUE_PREFIX)
@@ -308,21 +310,20 @@ def _refused_name(line: str) -> bool:
 
 
 def _lines(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Each entry, and each later line of it that sets a refused name, with the registry value
-    it came from (vault BACKLOG #5394). The reader cannot tell whether NSSM takes a line or the
-    whole string as a variable, so it reads both. The whole string keeps an inline key whose
-    ``-----BEGIN`` starts on a later line; it is dropped when its name itself holds a line break,
-    which no variable is named. A later line is kept only for a name the refusal is about, so a
-    line of key material is never read as a name, and a name no variable sets, such as the
-    secrets directory's, is never taken as set."""
+    """Each entry whole, and the rest of it from each later line that starts a refused name,
+    with the registry value it came from (vault BACKLOG #5394). The reader cannot tell whether
+    NSSM takes a line or the whole string as a variable, so it reads both. A later line's name
+    keeps the rest of the string as its value, as the first line's does, so a key whose value
+    starts on the next line is still not empty. Only a name the refusal is about is read off a
+    later line, so a line of key material is never read as a name, and a name such as the
+    secrets directory's is never taken as set by a later line."""
     read: list[tuple[str, str]] = []
     for where, entry in entries:
-        name, _equals, _value = entry.partition("=")
-        if not _LINE_BREAK.search(name):
-            read.append((where, entry))
-        lines = _LINE_BREAK.split(entry)
-        if len(lines) > 1:
-            read.extend((where, line) for line in lines if _refused_name(line))
+        read.append((where, entry))
+        for brk in _LINE_BREAK.finditer(entry):
+            rest = entry[brk.end() :]
+            if _refused_name(rest):
+                read.append((where, rest))
     return read
 
 

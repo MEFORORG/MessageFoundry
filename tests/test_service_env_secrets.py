@@ -383,10 +383,29 @@ def test_a_later_line_of_key_material_is_never_read_as_a_name() -> None:
     assert posture.listed == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
 
 
-def test_a_whole_string_whose_name_holds_a_line_break_lists_no_name() -> None:
-    posture = _service(["MEFOR_VALUE_A\nMEFOR_VALUE_B=x"])
-    assert posture.listed == ("MEFOR_VALUE_B",)
-    assert posture.unplain_value_names == ()
+@pytest.mark.parametrize("entry", ["MEFOR_VALUE_A\nX=1", "MEFOR_VALUE_\nFOO=1"])
+def test_a_whole_string_whose_name_holds_a_line_break_still_refuses(entry: str) -> None:
+    """NSSM may set the whole string as one variable, whose name then holds a line feed and
+    still starts ``MEFOR_VALUE_``, which the engine loads. ``main`` refused it, and so must this."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_STORE_ENCRYPTION_KEY=\nabcdef",
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\n-----BEGIN x",
+    ],
+)
+def test_a_later_name_whose_value_starts_on_the_next_line_refuses(entry: str) -> None:
+    """A later line's name keeps the rest of the string as its value, as the first line's does."""
+    assert service_env_refusal(_service([entry])) is not None
+
+
+@pytest.mark.parametrize("name", DIRECTORY_CLASS_NAMES)
+def test_every_other_secret_class_name_on_a_later_line_refuses(name: str) -> None:
+    posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=-----BEGIN x"])
+    assert posture.listed_directory_names == (name,)
 
 
 def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
