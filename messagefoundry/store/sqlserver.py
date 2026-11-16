@@ -8068,159 +8068,166 @@ class SqlServerStore:
         # Whole: a slice cuts its note (#1797).
         detail = safe_text(detail, limit=200) if detail else detail
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
-        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._fence_scope(), self._acquire() as conn:
             try:
-                # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
-                # UPDLOCK (BACKLOG #5752): a second completion of the same row waits here and then
-                # reads the first one's committed DONE, so only one reply is ever captured.
-                await cur.execute(
-                    "SELECT message_id, destination_name, handler_name, attempts, status"
-                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (outbox_id,),
-                )
-                row = await cur.fetchone()
-                if row is None:
-                    await self._commit(conn)
-                    return
-                message_id, destination_name, handler_name, attempts = (
-                    row[0],
-                    row[1],
-                    row[2],
-                    row[3],
-                )
-                # A DONE row does not complete again (no second reply or re-ingress child); any
-                # other still does, as on SQLite, and an armed H1 fence judges it below.
-                if row[4] == OutboxStatus.DONE.value:
-                    log.warning(
-                        "complete_with_response: outbound row %s is already %s; nothing written",
-                        outbox_id,
-                        row[4],
-                    )
-                    await self._commit_read(conn)
-                    return
-                # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
-                # response artifact, the re-ingress work-row, the ledger row and the finalize together.
-                # An artifact with no resolved queue row is the half-applied state C3 rejects.
-                await self._exec_terminal(
-                    cur,
-                    "complete_with_response",
-                    (outbox_id,),
-                    "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
-                    " lease_expires_at=NULL" + output + " WHERE id=?" + guard,
-                    (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
-                    checked=bool(guard),
-                )
-                # BACKLOG #5752: two rows of one message to one destination (two handlers) would read
-                # the same MAX unlocked and collide on the response PK, rolling back a delivery the
-                # partner already accepted. The per-message finalize applock, which _maybe_finalize
-                # re-takes at the end as a no-op, serializes the read.
-                await self._applock(cur, f"mefor:finalize:{message_id}")
-                await cur.execute(
-                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
-                    " WHERE message_id=? AND destination_name=?",
-                    (message_id, destination_name),
-                )
-                seq = int((await cur.fetchone())[0])
-                # Inline the PG _enc empty-guard: encrypt only a truthy value (never '' / None). Bound to
-                # the (message_id, dest, seq) response cell (ASVS 11.3.3).
-                enc_body = (
-                    self._cipher.encrypt(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
-                    )
-                    if body
-                    else body
-                )
-                enc_detail = (
-                    self._cipher.encrypt(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
-                    )
-                    if detail
-                    else detail
-                )
-                headers_json = encode_response_headers(response_headers)  # #154
-                enc_headers = (
-                    self._cipher.encrypt(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
-                    )
-                    if headers_json
-                    else headers_json
-                )
-                await cur.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail,"
-                    " resp_headers, captured_at)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        message_id,
-                        destination_name,
-                        seq,
-                        enc_body,
-                        outcome,
-                        enc_detail,
-                        enc_headers,
-                        now,
-                    ),
-                )
-                if reingress_to is not None:
-                    # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
-                    # free) — a token referencing the immutable artifact by PK, on the loopback lane.
-                    artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
-                    work_created = now
-                    # Hoist the row id so the artifact-ref payload binds to its own row tag.
-                    work_row_id = uuid4().hex
+                async with self._cursor(conn) as cur:
+                    # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
+                    # UPDLOCK (BACKLOG #5752): a second completion of the same row waits here and then
+                    # reads the first one's committed DONE, so only one reply is ever captured.
                     await cur.execute(
-                        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
-                        " handler_name, payload, status, attempts, next_attempt_at, owner,"
-                        " lease_expires_at, created_at, updated_at)"
-                        " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
-                        (
-                            work_row_id,
-                            message_id,
-                            Stage.RESPONSE.value,
-                            reingress_to,
-                            self._cipher.encrypt(
-                                artifact_ref,
-                                aad=queue_payload_aad(
-                                    row_id=work_row_id,
-                                    message_id=message_id,
-                                    stage=Stage.RESPONSE.value,
-                                    channel_id=reingress_to,
-                                    destination_name=None,
-                                    handler_name=None,
-                                    body_ref=None,
-                                ),
+                        "SELECT message_id, destination_name, handler_name, attempts, status"
+                        " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (outbox_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await self._commit(conn)
+                        return
+                    message_id, destination_name, handler_name, attempts = (
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                    )
+                    # A DONE row does not complete again (no second reply or re-ingress child); any
+                    # other still does, as on SQLite, and an armed H1 fence judges it below.
+                    if row[4] == OutboxStatus.DONE.value:
+                        log.warning(
+                            "complete_with_response: outbound row %s is already %s; nothing written",
+                            outbox_id,
+                            row[4],
+                        )
+                        await self._commit_read(conn)
+                        return
+                    # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
+                    # response artifact, the re-ingress work-row, the ledger row and the finalize together.
+                    # An artifact with no resolved queue row is the half-applied state C3 rejects.
+                    await self._exec_terminal(
+                        cur,
+                        "complete_with_response",
+                        (outbox_id,),
+                        "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
+                        " lease_expires_at=NULL" + output + " WHERE id=?" + guard,
+                        (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
+                        checked=bool(guard),
+                    )
+                    # BACKLOG #5752: two rows of one message to one destination (two handlers) would read
+                    # the same MAX unlocked and collide on the response PK, rolling back a delivery the
+                    # partner already accepted. The per-message finalize applock, which _maybe_finalize
+                    # re-takes at the end as a no-op, serializes the read.
+                    await self._applock(cur, f"mefor:finalize:{message_id}")
+                    await cur.execute(
+                        "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                        " WHERE message_id=? AND destination_name=?",
+                        (message_id, destination_name),
+                    )
+                    seq = int((await cur.fetchone())[0])
+                    # Inline the PG _enc empty-guard: encrypt only a truthy value (never '' / None). Bound to
+                    # the (message_id, dest, seq) response cell (ASVS 11.3.3).
+                    enc_body = (
+                        self._cipher.encrypt(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        )
+                        if body
+                        else body
+                    )
+                    enc_detail = (
+                        self._cipher.encrypt(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        )
+                        if detail
+                        else detail
+                    )
+                    headers_json = encode_response_headers(response_headers)  # #154
+                    enc_headers = (
+                        self._cipher.encrypt(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
                             ),
-                            OutboxStatus.PENDING.value,
-                            now,
-                            work_created,
+                        )
+                        if headers_json
+                        else headers_json
+                    )
+                    await cur.execute(
+                        "INSERT INTO response"
+                        " (message_id, destination_name, response_seq, body, outcome, detail,"
+                        " resp_headers, captured_at)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            message_id,
+                            destination_name,
+                            seq,
+                            enc_body,
+                            outcome,
+                            enc_detail,
+                            enc_headers,
                             now,
                         ),
                     )
-                # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
-                await self._record_delivered_key(
-                    cur,
-                    outbox_id=outbox_id,
-                    message_id=message_id,
-                    destination_name=destination_name,
-                    handler_name=handler_name,
-                    now=now,
-                )
-                await self._event(
-                    cur,
-                    message_id,
-                    "delivered",
-                    destination_name,
-                    f"attempt {attempts} (response {outcome})",
-                    now,
-                )
-                # Finalizer last; preceded by the SELECT above so its applock is not the first statement.
-                await self._maybe_finalize(cur, message_id, now)
-                await self._commit(conn)
+                    if reingress_to is not None:
+                        # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
+                        # free) — a token referencing the immutable artifact by PK, on the loopback lane.
+                        artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
+                        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
+                        work_created = now
+                        # Hoist the row id so the artifact-ref payload binds to its own row tag.
+                        work_row_id = uuid4().hex
+                        await cur.execute(
+                            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                            " handler_name, payload, status, attempts, next_attempt_at, owner,"
+                            " lease_expires_at, created_at, updated_at)"
+                            " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
+                            (
+                                work_row_id,
+                                message_id,
+                                Stage.RESPONSE.value,
+                                reingress_to,
+                                self._cipher.encrypt(
+                                    artifact_ref,
+                                    aad=queue_payload_aad(
+                                        row_id=work_row_id,
+                                        message_id=message_id,
+                                        stage=Stage.RESPONSE.value,
+                                        channel_id=reingress_to,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
+                                ),
+                                OutboxStatus.PENDING.value,
+                                now,
+                                work_created,
+                                now,
+                            ),
+                        )
+                    # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
+                    await self._record_delivered_key(
+                        cur,
+                        outbox_id=outbox_id,
+                        message_id=message_id,
+                        destination_name=destination_name,
+                        handler_name=handler_name,
+                        now=now,
+                    )
+                    await self._event(
+                        cur,
+                        message_id,
+                        "delivered",
+                        destination_name,
+                        f"attempt {attempts} (response {outcome})",
+                        now,
+                    )
+                    # Finalizer last; preceded by the SELECT above so its applock is not the first statement.
+                    await self._maybe_finalize(cur, message_id, now)
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #5752: the transaction may hold the finalize applock, so a failed
+                # rollback discards the connection rather than recycling it with the lock held.
+                # After the cursor closes, as reserve_upload_quota does.
+                await self._rollback_or_discard(conn)
                 raise
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -12277,35 +12284,40 @@ class SqlServerStore:
         sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
         del plaintext_chunks
         now = time.time()
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                # BACKLOG #5753: a concurrent put of the same content waits on this content
-                # address's applock and then inserts nothing, rather than failing the upload on a
-                # duplicate key. The first put's copy wins and this one's sealed chunks are dropped.
-                # A named lock, not HOLDLOCK: a key-range lock held across the chunk loop would also
-                # block increfs of the neighbouring attachment key. The SELECT opens the
-                # transaction the applock needs. OUTPUT, not rowcount, reports the insert (see
-                # _exec_terminal on SET NOCOUNT ON).
-                await cur.execute("SELECT TOP (1) id FROM attachment WHERE id=?", (ref,))
-                await cur.fetchall()
-                await self._applock(cur, f"mefor:attachment:{ref}")
-                await cur.execute(
-                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                    " OUTPUT inserted.id SELECT ?,?,?,0,? WHERE NOT EXISTS"
-                    " (SELECT 1 FROM attachment WHERE id=?)",
-                    (ref, content_type, total, now, ref),
-                )
-                if not await cur.fetchall():
-                    await self._commit_read(conn)
-                    return ref
-                for seq, ct in enumerate(sealed):
+                async with self._cursor(conn) as cur:
+                    # BACKLOG #5753: a concurrent put of the same content waits on this content
+                    # address's applock and then inserts nothing, rather than failing the upload
+                    # on a duplicate key. The first put's copy wins and this one's sealed chunks
+                    # are dropped. A named lock, not HOLDLOCK: a key-range lock held across the
+                    # chunk loop would also block increfs of the neighbouring attachment key. The
+                    # SELECT opens the transaction the applock needs. OUTPUT, not rowcount, reports
+                    # the insert (see _exec_terminal on SET NOCOUNT ON).
+                    await cur.execute("SELECT TOP (1) id FROM attachment WHERE id=?", (ref,))
+                    await cur.fetchall()
+                    await self._applock(cur, f"mefor:attachment:{ref}")
                     await cur.execute(
-                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
-                        (ref, seq, ct),
+                        "INSERT INTO attachment (id, content_type, total_bytes, refcount,"
+                        " created_at) OUTPUT inserted.id SELECT ?,?,?,0,? WHERE NOT EXISTS"
+                        " (SELECT 1 FROM attachment WHERE id=?)",
+                        (ref, content_type, total, now, ref),
                     )
-                await self._commit(conn)
+                    inserted = bool(await cur.fetchall())
+                    if inserted:
+                        for seq, ct in enumerate(sealed):
+                            await cur.execute(
+                                "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
+                                " VALUES (?,?,?)",
+                                (ref, seq, ct),
+                            )
+                if inserted:
+                    await self._commit(conn)
+                else:
+                    await self._commit_read(conn)
             except Exception:
-                # The transaction may hold the applock, so a failed rollback discards the conn.
+                # The transaction may hold the applock. After the cursor closes, as
+                # reserve_upload_quota does, so a discarded connection cannot race its close.
                 await self._rollback_or_discard(conn)
                 raise
         return ref
