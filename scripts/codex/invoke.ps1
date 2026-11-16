@@ -16,9 +16,10 @@ function Resolve-BridgePython {
 }
 
 if ($args.Count -gt 0 -and $args[0] -eq 'hook') {
-    # The bridge decides and exits 0 or 2. Anything else, such as a missing .venv or a bridge
-    # that crashed, is no decision: it blocks on the PreToolUse registration and is a
-    # non-blocking 1 on every other event. docs/CODEX.md, "Who decides a block", states the rule.
+    # The bridge decides with exit 0, or with 10 (BLOCK_EXIT in bridge.py) for a block, which
+    # becomes 2 here. Anything else, a missing .venv, a crash, or the 2 that Python and argparse
+    # exit with, is no decision: it blocks on the PreToolUse registration and is a non-blocking 1
+    # on every other event. docs/CODEX.md, "Who decides a block", states the rule.
     $noDecision = 1
     for ($i = 1; $i -lt $args.Count - 1; $i++) {
         if ($args[$i] -eq '--event' -and $args[$i + 1] -eq 'PreToolUse') { $noDecision = 2 }
@@ -26,7 +27,7 @@ if ($args.Count -gt 0 -and $args[0] -eq 'hook') {
     $code = $noDecision
     try {
         & (Resolve-BridgePython) (Join-Path $PSScriptRoot 'bridge.py') @args
-        if ($LASTEXITCODE -in 0, 2) { $code = $LASTEXITCODE }
+        if ($LASTEXITCODE -eq 0) { $code = 0 } elseif ($LASTEXITCODE -eq 10) { $code = 2 }
     } catch {
         [Console]::Error.WriteLine("Codex bridge launcher: $_")
     }

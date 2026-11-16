@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -120,11 +121,14 @@ def test_missing_session_is_error(bridge, tmp_path):
 
 
 def test_new_unsupported_hook_is_reported(bridge, tmp_path):
+    payload = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
     settings(tmp_path, [{"type": "prompt", "prompt": "review"}])
+    # In an advisory group it is reported and the group skipped.
+    assert "prompt" in bridge.dispatch(tmp_path, payload)["systemMessage"]
+    # In a guard group it is a fault, which run_hook decides.
+    settings(tmp_path, [{"type": "prompt", "prompt": "review", "onFailure": "block"}])
     with pytest.raises(ValueError, match="prompt"):
-        bridge.dispatch(
-            tmp_path, {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
-        )
+        bridge.dispatch(tmp_path, payload)
 
 
 def test_hook_timeout_is_reported_without_blocking_later_hooks(bridge, tmp_path, capsys):
@@ -683,13 +687,15 @@ def _link_python(root):
     ("event", "setup", "expected"),
     [
         ("PreToolUse", "0", 0),
+        ("PreToolUse", "10", 2),
         ("PreToolUse", "2", 2),
         ("PreToolUse", "1", 2),
-        ("PreToolUse", "3", 2),
         ("PreToolUse", "no-venv", 2),
         ("PreToolUse", "no-repo", 2),
         ("Stop", "0", 0),
-        ("Stop", "2", 2),
+        ("Stop", "10", 2),
+        # Python's "can't open file", argparse and a crash exit 2: no decision, never a block.
+        ("Stop", "2", 1),
         ("Stop", "1", 1),
         ("Stop", "no-venv", 1),
         ("Stop", "no-repo", 1),
@@ -701,6 +707,8 @@ def test_a_registered_command_passes_a_decision_and_maps_no_decision(
     """No decision (a crash, a missing .venv, no repo) blocks on PreToolUse and is a
     non-blocking 1 elsewhere, never 0. The real invoke.ps1 runs a stub bridge."""
     import tomllib
+
+    assert bridge_block_exit() == 10, "invoke.ps1 hardcodes the bridge's BLOCK_EXIT"
 
     root = tmp_path / "repo"
     scripts = root / "scripts/codex"
@@ -726,3 +734,112 @@ def test_a_registered_command_passes_a_decision_and_maps_no_decision(
         timeout=60,
     )
     assert completed.returncode == expected, (shell, completed.stdout, completed.stderr)
+
+
+def bridge_block_exit():
+    spec = importlib.util.spec_from_file_location(
+        "codex_bridge_c", ROOT / "scripts/codex/bridge.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.BLOCK_EXIT
+
+
+def _main(bridge, monkeypatch, root, argv, stdin_bytes=b"", encoding="cp1252"):
+    """Run bridge.main() as Codex would, with a text stdin that does not decode as UTF-8."""
+    monkeypatch.setattr(bridge, "ROOT", root)
+    monkeypatch.setattr(sys, "argv", ["bridge.py", *argv])
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(stdin_bytes), encoding=encoding))
+    return bridge.main()
+
+
+def test_hook_mode_reads_the_payload_as_utf8_bytes(bridge, tmp_path, monkeypatch, capsys):
+    echo = "import json, sys; p = json.load(sys.stdin); print(json.dumps({'reason': p['tool_input']['command']}))"
+    settings(tmp_path, [python(echo)])
+    payload = {**BASH_CALL, "tool_input": {"command": "cat \u2190 \u3053"}}
+    code = _main(
+        bridge,
+        monkeypatch,
+        tmp_path,
+        ["hook", "--event", "PreToolUse"],
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["reason"] == "cat \u2190 \u3053"
+
+
+def test_hook_mode_exits_the_block_code_only_for_a_decision(bridge, tmp_path, monkeypatch):
+    settings(tmp_path, [exits(2)])
+    argv = ["hook", "--event", "PreToolUse"]
+    assert _main(bridge, monkeypatch, tmp_path, argv, json.dumps(BASH_CALL).encode()) == 10
+    settings(tmp_path, [handler("{}")])
+    assert _main(bridge, monkeypatch, tmp_path, argv, json.dumps(BASH_CALL).encode()) == 0
+    # A usage error exits 2 through argparse, which the launcher reads as no decision.
+    with pytest.raises(SystemExit) as stopped:
+        _main(bridge, monkeypatch, tmp_path, ["hook", "--evnt", "Stop"], b"{}")
+    assert stopped.value.code == 2
+
+
+def test_run_mode_leaves_a_target_scripts_own_event_flag(bridge, monkeypatch):
+    calls: list[list[str]] = []
+
+    def call(argv, **kwargs):
+        calls.append(argv)
+        return 0
+
+    monkeypatch.setattr(bridge.subprocess, "call", call)
+    argv = ["run", "scripts/codex/bridge.py", "--event", "push", "--even", "x", "--limit", "3"]
+    assert _main(bridge, monkeypatch, ROOT, [*argv, "--session-id", "s"]) == 0
+    assert calls[0][-6:] == ["--event", "push", "--even", "x", "--limit", "3"]
+
+
+GUARD_DENY = {
+    "matcher": "^(Bash|PowerShell)$",
+    "hooks": [{**handler(json.dumps(DENIAL)), "onFailure": "block"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("registered", "named", "code"),
+    [("PreToolUse", "Stop", 2), ("PreToolUse", None, 2), ("Stop", "PreToolUse", 0)],
+    ids=["pre-named-stop", "pre-unnamed", "stop-named-pre"],
+)
+def test_a_payload_naming_another_event_is_a_fault_under_the_registered_one(
+    bridge, tmp_path, capsys, registered, named, code
+):
+    write_settings(tmp_path, {"PreToolUse": [GUARD_DENY], "Stop": [{"hooks": [handler("{}")]}]})
+    payload = {"session_id": "x", "tool_name": "Bash"}
+    if named:
+        payload["hook_event_name"] = named
+    assert run(bridge, tmp_path, payload, registered) == code
+    assert "registered as" in capsys.readouterr().err
+
+
+def test_an_event_name_in_another_case_still_runs_the_guard(bridge, tmp_path, capsys):
+    write_settings(tmp_path, {"PreToolUse": [GUARD_DENY]})
+    payload = {**BASH_CALL, "hook_event_name": "pretooluse"}
+    assert run(bridge, tmp_path, payload, "PreToolUse") == 0
+    assert json.loads(capsys.readouterr().out) == DENIAL
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [{"matcher": "^(Task|Agent|Workflow$|spawn_task"}, {"hooks": [UNSUPPORTED]}],
+    ids=["bad-matcher", "unsupported-hook"],
+)
+def test_a_defective_advisory_group_is_skipped_and_the_guard_still_runs(
+    bridge, tmp_path, capsys, defect
+):
+    advisory = {"matcher": ".*", "hooks": [handler("{}")], **defect}
+    write_settings(tmp_path, {"PreToolUse": [advisory, GUARD_DENY]})
+    assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["hookSpecificOutput"] == DENIAL["hookSpecificOutput"]
+    assert "skipped a hook group with a defect" in result["systemMessage"]
+
+
+def test_a_defect_in_the_guard_group_itself_still_blocks(bridge, tmp_path):
+    guard = {**GUARD_DENY, "hooks": [*GUARD_DENY["hooks"], UNSUPPORTED]}
+    write_settings(tmp_path, {"PreToolUse": [guard]})
+    assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 2

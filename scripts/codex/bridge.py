@@ -179,6 +179,11 @@ PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
 GUARD_SCRIPTS = ("scripts/hooks/shell-guard-dispatch.ps1",)
 
 
+# Hook mode's exit code for run_hook's block. invoke.ps1 turns it into 2 and maps every other
+# non-zero, the interpreter's and argparse's 2 included, to the event's no-decision code.
+BLOCK_EXIT = 10
+
+
 class HookBlocked(Exception):
     """A deliberate block: a hook exited 2, or failed with onFailure set to block."""
 
@@ -286,10 +291,17 @@ def is_guard(group: dict) -> bool:
     return False
 
 
+def group_is_guard(group: dict) -> bool:
+    try:
+        return is_guard(group)
+    except (AttributeError, TypeError):
+        return True  # A group too malformed to read may be a guard.
+
+
 def fault_blocks(root: Path, payload: object, event: str) -> bool:
     """Whether a bridge fault must block: only on PreToolUse, and only where a guard could run."""
-    if isinstance(payload, dict):
-        event = str(payload.get("hook_event_name") or event)
+    if not event and isinstance(payload, dict):
+        event = str(payload.get("hook_event_name") or "")
     if event != "PreToolUse":
         return False  # A fault never stops Codex from stopping, starting or prompting.
     if not isinstance(payload, dict):
@@ -302,13 +314,24 @@ def fault_blocks(root: Path, payload: object, event: str) -> bool:
         return True
 
 
-def run_hook(root: Path, stdin_text: str, event: str = "") -> int:
-    """Decide one Codex hook event: exit 0 to proceed, or exit 2 to block, never anything else."""
+def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> int:
+    """Decide one Codex hook event: 0 to proceed or 2 to block, never anything else.
+
+    With no stdin given, the payload is read from this process's stdin as UTF-8 bytes; the text
+    stream would decode it with the console code page. `event` is the event Codex registered.
+    """
     payload: object = None
     try:
-        payload = json.loads(stdin_text)
+        if stdin is None:
+            stdin = sys.stdin.buffer.read()
+        payload = json.loads(stdin.decode("utf-8-sig") if isinstance(stdin, bytes) else stdin)
         if not isinstance(payload, dict):
             raise ValueError("the hook payload must be a JSON object")
+        named = str(payload.get("hook_event_name") or "")
+        if event:
+            if named.lower() != event.lower():
+                raise ValueError(f"the payload names event {named!r}, registered as {event!r}")
+            payload["hook_event_name"] = event  # The registered spelling selects the settings.
         result = dispatch(root, payload)
     except HookBlocked as exc:
         print(str(exc), file=sys.stderr)
@@ -326,6 +349,64 @@ def run_hook(root: Path, stdin_text: str, event: str = "") -> int:
     if result:
         print(json.dumps(result))
     return 0
+
+
+def run_group(root: Path, payload: dict, env: dict[str, str], group: dict, result: dict) -> None:
+    event = payload["hook_event_name"]
+    for hook in group.get("hooks", []):
+        if hook.get("type") != "command" or hook.get("async"):
+            raise ValueError(
+                f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
+            )
+        # Claude Code's hook contract: exit 2 blocks. Any other failure, a timeout or a command
+        # that cannot start included, is a non-blocking error unless the hook sets onFailure to
+        # block, and the remaining hooks still run. Only a successful hook's stdout is read.
+        try:
+            completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
+                hook_argv(root, hook),
+                input=json.dumps(payload),
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=hook.get("timeout", 30),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            captured = exc.stderr or ""
+            if isinstance(captured, bytes):
+                captured = captured.decode("utf-8", "replace")
+            print_hook_stderr(captured)
+            hook_failed(result, hook, f"timed out after {exc.timeout} seconds")
+            continue
+        except OSError as exc:
+            hook_failed(result, hook, f"could not start ({exc})")
+            continue
+        if completed.returncode == 2:
+            raise HookBlocked(completed.stderr.strip() or "Claude hook blocked this event")
+        print_hook_stderr(completed.stderr)
+        if completed.returncode:
+            hook_failed(result, hook, f"exited {completed.returncode}")
+            continue
+        output = completed.stdout.strip()
+        if not output:
+            continue
+        try:
+            update = json.loads(output)
+        except json.JSONDecodeError:
+            update = None
+        if not isinstance(update, dict):
+            if event not in PLAIN_CONTEXT_EVENTS:
+                print(output, file=sys.stderr)
+                continue
+            output = output.replace(
+                "scripts\\coord\\seat.ps1",
+                "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
+            )
+            update = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": output}}
+        merge_output(result, update)
 
 
 def dispatch(root: Path, payload: dict) -> dict:
@@ -352,64 +433,22 @@ def dispatch(root: Path, payload: dict) -> dict:
         )
     discriminator = discriminator_for(event, payload)
     for group in config.get("hooks", {}).get(event, []):
-        if not group_selected(group, discriminator):
-            continue
-        for hook in group.get("hooks", []):
-            if hook.get("type") != "command" or hook.get("async"):
-                raise ValueError(
-                    f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
-                )
-            # Claude Code's hook contract: exit 2 blocks. Any other failure, a timeout or a command
-            # that cannot start included, is a non-blocking error unless the hook sets onFailure to
-            # block, and the remaining hooks still run. Only a successful hook's stdout is read.
-            try:
-                completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
-                    hook_argv(root, hook),
-                    input=json.dumps(payload),
-                    cwd=root,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=hook.get("timeout", 30),
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                captured = exc.stderr or ""
-                if isinstance(captured, bytes):
-                    captured = captured.decode("utf-8", "replace")
-                print_hook_stderr(captured)
-                hook_failed(result, hook, f"timed out after {exc.timeout} seconds")
-                continue
-            except OSError as exc:
-                hook_failed(result, hook, f"could not start ({exc})")
-                continue
-            if completed.returncode == 2:
-                raise HookBlocked(completed.stderr.strip() or "Claude hook blocked this event")
-            print_hook_stderr(completed.stderr)
-            if completed.returncode:
-                hook_failed(result, hook, f"exited {completed.returncode}")
-                continue
-            output = completed.stdout.strip()
-            if not output:
-                continue
-            try:
-                update = json.loads(output)
-            except json.JSONDecodeError:
-                update = None
-            if not isinstance(update, dict):
-                if event not in PLAIN_CONTEXT_EVENTS:
-                    print(output, file=sys.stderr)
-                    continue
-                output = output.replace(
-                    "scripts\\coord\\seat.ps1",
-                    "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
-                )
-                update = {
-                    "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
-                }
-            merge_output(result, update)
+        try:
+            if group_selected(group, discriminator):
+                run_group(root, payload, env, group, result)
+        except HookBlocked:
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError, re.error) as exc:
+            # Each group is judged on its own. A defect in a guard group is a bridge fault, which
+            # run_hook decides; one in an advisory group is reported and skipped, so a guard group
+            # after it still runs.
+            if group_is_guard(group):
+                raise
+            message = (
+                f"Codex bridge: skipped a hook group with a defect: {type(exc).__name__}: {exc}"
+            )
+            print(f"{message} (not blocking)", file=sys.stderr)
+            merge_output(result, {"systemMessage": f"{message} (not blocking)"})
     return result
 
 
@@ -421,7 +460,6 @@ def main() -> int:
     parser.add_argument("--session-id", default=os.environ.get("CODEX_THREAD_ID", ""))
     parser.add_argument("--migrate-copies", action="store_true")
     parser.add_argument("--include-user-skills", action="store_true")
-    parser.add_argument("--event", default="", help="hook mode: the event Codex registered")
     args, rest = parser.parse_known_args()
     if args.mode == "sync-skills":
         user_skills = user_skill_directory() if args.include_user_skills else None
@@ -440,7 +478,10 @@ def main() -> int:
         print(ROOT / child_environment(ROOT, args.session_id)["KORUS_STATE_REL"])
         return 0
     if args.mode == "hook":
-        return run_hook(ROOT, sys.stdin.read(), args.event)
+        hook_parser = argparse.ArgumentParser(prog="bridge.py hook", allow_abbrev=False)
+        hook_parser.add_argument("--event", default="", help="the event Codex registered")
+        event = hook_parser.parse_args(rest).event
+        return BLOCK_EXIT if run_hook(ROOT, None, event) == 2 else 0
     if args.mode == "doctor":
         config = json.loads((ROOT / ".claude/settings.json").read_text(encoding="utf-8-sig"))
         for event in config.get("hooks", {}):
