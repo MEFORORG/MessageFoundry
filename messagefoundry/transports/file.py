@@ -64,7 +64,6 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
-    FileKeyError,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
@@ -874,7 +873,11 @@ def _archive_subdir(directory: Path, value: object, knob: str) -> Path:
     refused there. The value is joined onto the watch directory, normalised and compared with it;
     one inside the watch tree is spelled from the watch directory as configured, as every listed
     path is. Purely lexical (``abspath`` reads only the working directory), so it is safe on the
-    event loop. The value is withheld from the error, as the other setting refusals here do."""
+    event loop. An ``os.PathLike`` value (a ``pathlib.Path``) is read through ``os.fspath`` and
+    checked the same way. The value is withheld from the error, as the other setting refusals here
+    do."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"file source {knob} must name a directory (value withheld)")
     if sys.platform == "win32":
@@ -1797,15 +1800,14 @@ class FileSource(SourceConnector):
         durable row behind it: the file is then handed over at most once in this process, and the
         rest of the scan goes on, rather than the file being handed over again on every scan while
         the ledger stays broken. With no durable row, a restart or a cache eviction hands it over
-        once more, which at-least-once allows. A malformed key (``FileKeyError``) is a programming
-        error, not a store fault, and still escapes."""
+        once more, which at-least-once allows. A key the ledger refuses (``FileKeyError``) is
+        handled the same way, so the file is not handed over again on every scan, as it was not
+        when the cache went first."""
         if self.processed_ledger is None:
             self._seen_add(file_key)
             return False
         try:
             await self.processed_ledger.mark_processed(file_key)
-        except FileKeyError:
-            raise
         except Exception as exc:  # noqa: BLE001 -- any store fault; the scan must go on
             logger.warning(
                 "file source %s: processed-ledger write failed (%s); the file is remembered for "

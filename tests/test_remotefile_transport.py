@@ -748,6 +748,44 @@ async def test_source_leave_failing_ledger_hands_each_file_over_once(
     assert "processed-ledger write failed (OSError)" in caplog.text
 
 
+async def test_source_leave_refused_ledger_key_hands_each_file_over_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Red on c0df8be6c2: a key that passes the ledger's read check but that its write refuses
+    # (FileKeyError) escaped before the key was cached, so the first file was handed over again on
+    # every poll. On main the key was cached first; now it is cached and the poll goes on.
+    from messagefoundry.transports.base import FileKeyError
+
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/b.hl7": b"MSH|^~\\&|B"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+
+    async def mark(file_key: str) -> None:
+        raise FileKeyError("synthetic")
+
+    ledger.mark_processed = mark  # type: ignore[method-assign]
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    for _ in range(3):
+        await src._poll_once()
+    assert sorted(h.bodies) == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"], "each handed over exactly once"
+    assert "processed-ledger write failed (FileKeyError" in caplog.text
+
+
+def test_source_pathlike_processed_subdir_is_accepted_and_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Red on c0df8be6c2: a PurePosixPath was refused as not naming a directory; main joined it.
+    from pathlib import PurePosixPath
+
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=PurePosixPath(".done"))
+    assert src._processed_dir == "/in/.done"
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _src(monkeypatch, _FakeClient(files={}), processed_subdir=PurePosixPath(".."))
+
+
 @pytest.mark.parametrize("value", ["", "  ", ".", "./", "..", "a/..", "a/../..", "../in"])
 def test_source_processed_subdir_at_or_above_the_poll_dir_is_refused(
     monkeypatch: pytest.MonkeyPatch, value: str

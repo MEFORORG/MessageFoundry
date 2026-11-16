@@ -70,6 +70,7 @@ import hashlib
 import io
 import itertools
 import logging
+import os
 import posixpath
 import re
 import socket
@@ -118,7 +119,6 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
     DestinationStartupError,
-    FileKeyError,
     InboundHandler,
     NegativeAckError,
     PollStopGuard,
@@ -2737,7 +2737,10 @@ def _remote_processed_dir(remote_dir: str, value: object) -> str:
     ``"a/.."``. A directory above it (``".."``) is refused too, to keep the rule the same as the
     local source's, where an ancestor hides every drop. Purely lexical on POSIX paths, with no server call. An absolute value under a
     relative ``remote_dir`` cannot be placed against it without the server, so it is let through.
-    The value is withheld from the error, as the other setting refusals here do."""
+    An ``os.PathLike`` value is read through ``os.fspath`` and checked the same way. The value is
+    withheld from the error, as the other setting refusals here do."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
     if not isinstance(value, str) or not value.strip():
         raise ValueError("REMOTEFILE processed_subdir must name a directory (value withheld)")
     target = posixpath.normpath(posixpath.join(remote_dir, value))
@@ -3475,16 +3478,15 @@ class RemoteFileSource(SourceConnector):
         always have a durable row behind it: the file is then handed over at most once in this
         process, and the rest of the poll goes on, rather than the file being handed over again on
         every poll while the ledger stays broken. With no durable row, a restart or a cache eviction
-        hands it over once more, which at-least-once allows. A malformed key (``FileKeyError``) is
-        a programming error, not a store fault, and still escapes."""
+        hands it over once more, which at-least-once allows. A key the ledger refuses
+        (``FileKeyError``) is handled the same way, so the file is not handed over again on every
+        poll, as it was not when the cache went first."""
         if self.processed_ledger is None:
             self._seen_add(file_key)
             return False
         try:
             with self._stop_guard.store_call():
                 await self.processed_ledger.mark_processed(file_key)
-        except FileKeyError:
-            raise
         except Exception as exc:  # noqa: BLE001 -- any store fault; the poll must go on
             logger.warning(
                 "REMOTEFILE %s: processed-ledger write failed (%s); the file is remembered for "

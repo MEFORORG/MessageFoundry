@@ -233,6 +233,18 @@ def test_a_non_string_archive_subdir_is_refused(tmp_path: Path) -> None:
         _source(tmp_path, processed_subdir=3)
 
 
+def test_a_pathlike_archive_subdir_is_accepted_and_checked(tmp_path: Path) -> None:
+    """Red on c0df8be6c2: a ``pathlib.Path`` setting was refused; on main it was joined. Its
+    ``os.fspath`` now takes the same checks as a string."""
+    inbox = tmp_path / "in"
+    src = _source(inbox, processed_subdir=Path("done"), error_subdir=Path("err/../bad"))
+    assert src.processed_dir == inbox / "done"
+    assert src.error_dir == inbox / "bad"
+    for value in (Path(".."), inbox):
+        with pytest.raises(ValueError, match="processed_subdir"):
+            _source(inbox, processed_subdir=value)
+
+
 def test_an_unnormalised_archive_subdir_is_normalised(tmp_path: Path) -> None:
     inbox = tmp_path / "in"
     src = _source(inbox, processed_subdir="./done/../arch", error_subdir="err/")
@@ -332,10 +344,17 @@ async def test_a_persistently_failing_leave_ledger_hands_each_file_over_once(
     assert "CTL568" not in caplog.text, "no body in the log"
 
 
-async def test_a_malformed_ledger_key_still_escapes(tmp_path: Path) -> None:
-    """A FileKeyError is a programming error, not a store fault, so it is not swallowed."""
+async def test_a_refused_ledger_key_hands_each_file_over_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on c0df8be6c2: a key that passes the ledger's read check but that its write refuses
+    (``FileKeyError``) escaped before the key was cached, so the first file was handed over again on
+    every scan and the second was never reached. On main the key was cached first; now the refusal
+    is logged by type, the key cached, and the scan goes on."""
     from messagefoundry.transports.base import FileKeyError
 
+    (tmp_path / "a.hl7").write_bytes(_HL7.encode())
+    (tmp_path / "b.hl7").write_bytes(_HL7.replace("CTL5684", "CTL5685").encode())
     src = _source(tmp_path, after_read="leave")
 
     class _Ledger(_FailingLedger):
@@ -343,9 +362,14 @@ async def test_a_malformed_ledger_key_still_escapes(tmp_path: Path) -> None:
             raise FileKeyError("synthetic")
 
     src.processed_ledger = _Ledger()
-    with pytest.raises(FileKeyError):
-        await src._leave_record("fk1:" + "0" * 64)
-    assert "fk1:" + "0" * 64 not in src._processed_seen
+    rec = _Recorder()
+    src._handler = rec
+    src._prepare_subdirs()
+    for _ in range(4):
+        await src._scan_once()
+    assert len(rec.bodies) == 2, "each drop handed over exactly once in this process"
+    assert "processed-ledger write failed (FileKeyError)" in caplog.text
+    assert "CTL568" not in caplog.text, "no body in the log"
 
 
 async def test_a_successful_leave_ledger_write_comes_before_the_cache(tmp_path: Path) -> None:
