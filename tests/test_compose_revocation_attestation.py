@@ -39,10 +39,15 @@ def _serving_engines() -> dict[str, dict[str, Any]]:
 
 
 def _gated(env: dict[str, Any]) -> bool:
-    """Whether the revocation gate reads this service's bind: in-process TLS off loopback."""
+    """Whether the revocation gate reads this service's bind: in-process TLS off loopback. The API
+    leaves loopback only when local_access_only is false and a non-loopback listen address is set,
+    so a service missing either stays on 127.0.0.1 and needs no attestation."""
+    listen = env.get("MEFOR_SECURITY_LISTEN_ADDRESS")
     return (
         bool(env.get("MEFOR_API_TLS_CERT_FILE"))
-        and env.get("MEFOR_SECURITY_LISTEN_ADDRESS") not in _LOOPBACK_HOSTS
+        and str(env.get("MEFOR_SECURITY_LOCAL_ACCESS_ONLY", "")).lower() == "false"
+        and bool(listen)
+        and listen not in _LOOPBACK_HOSTS
     )
 
 
