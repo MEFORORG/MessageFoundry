@@ -80,12 +80,12 @@ function isWithin(root: string, target: string): boolean {
   return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
 }
 
-/** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer. */
+/** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.
+ *  A folder value is not read: these settings are read with no resource, so `get` ignores it too. */
 export interface PathSettingScopes {
   readonly defaultValue?: unknown;
   readonly globalValue?: unknown;
   readonly workspaceValue?: unknown;
-  readonly workspaceFolderValue?: unknown;
 }
 
 /**
@@ -98,7 +98,9 @@ export interface PathSettingScopes {
  * folder open, is dropped for the next scope down, as VS Code drops a restricted setting in
  * Restricted Mode: the user's own value, else the manifest default, else `fallback`. That holds in a
  * trusted window too, because trust is granted to run the folder's code, not to let its settings
- * point the extension at files outside it. A file elsewhere is named in user settings.
+ * point the extension at files outside it. A file elsewhere is named in user settings. `ws` is the
+ * first workspace folder, the one every CLI call runs in, so in a multi-root workspace a value
+ * naming another of its folders is dropped too: the fail-closed reading.
  *
  * A user-set value is the operator's own choice and is returned as written. No answer at all (`seen`
  * undefined) gives `fallback`, so an unread scope is never taken as permission. The answer also
@@ -118,16 +120,11 @@ export function containedPathSetting(
   if (seen === undefined) {
     return { value: fallback, source: "default", dropped: false };
   }
-  let dropped = false;
-  for (const v of [seen.workspaceFolderValue, seen.workspaceValue]) {
-    if (v === undefined) {
-      continue;
-    }
-    if (typeof v === "string" && ws && isWithin(path.resolve(ws), path.resolve(ws, v))) {
-      return { value: v, source: "workspace", dropped };
-    }
-    dropped = true;
+  const v = seen.workspaceValue;
+  if (typeof v === "string" && ws && isWithin(path.resolve(ws), path.resolve(ws, v))) {
+    return { value: v, source: "workspace", dropped: false };
   }
+  const dropped = v !== undefined;
   if (seen.globalValue !== undefined) {
     // As written even when it is not text, as `get` returned it, so a malformed user value still
     // reaches the callers' own refusals (connectionServiceConfig names it as an empty path).
@@ -144,3 +141,4 @@ export interface ContainedPathSetting {
   readonly source: "workspace" | "user" | "default";
   readonly dropped: boolean;
 }
+

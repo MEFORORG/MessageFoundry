@@ -97,7 +97,7 @@ export function aiPolicyCliPlan(
   if (!workspace && !path.isAbsolute(file)) {
     return undefined;
   }
-  return { args: ["ai-policy", ...serviceConfigFlag(file)], cwd: workspace || undefined };
+  return { args: aiPolicyCliArgs(setting, isSet), cwd: workspace || undefined };
 }
 
 /**

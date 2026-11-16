@@ -85,14 +85,14 @@ export function isExecGated(): boolean {
   return !vscode.workspace.isTrusted;
 }
 
-/** The path settings whose workspace value was dropped and already named to the user, so each is
- *  named once a session rather than on every CLI call. */
+/** The dropped workspace values already named to the user, keyed by setting and value, so each is
+ *  named once a session rather than on every CLI call, and a new dropped value is named again. */
 const droppedPathSettings = new Set<string>();
 
 /**
  * A workspace-relative path setting, contained to the workspace folder by
  * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder is dropped
- * for the user's value or the default, and the user is told once.
+ * for the user's value or the default, and the user is told once per value.
  */
 function pathSetting(
   key: "configDir" | "serviceConfig" | "messageSetsDir",
@@ -100,12 +100,13 @@ function pathSetting(
 ): ContainedPathSetting {
   const seen = config().inspect(key);
   const contained = containedPathSetting(seen, workspaceDir(), fallback);
-  if (contained.dropped && !droppedPathSettings.has(key)) {
-    droppedPathSettings.add(key);
+  const seenKey = `${key}\u0000${String(seen?.workspaceValue)}`;
+  if (contained.dropped && !droppedPathSettings.has(seenKey)) {
+    droppedPathSettings.add(seenKey);
     // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
     void vscode.window.showWarningMessage(
       `messagefoundry.${key}, set in workspace settings, names no path inside the workspace folder, ` +
-        "so the user or default value is used. To use a path elsewhere, set it in user settings.",
+        "so it is not used. To use a path elsewhere, set it in user settings.",
     );
   }
   return contained;
@@ -119,14 +120,22 @@ export function configDir(): string {
  *  and a workspace value is contained to the folder (BACKLOG #5404); the `alert` CLI creates it on
  *  first `add` if absent. */
 export function serviceConfig(): string {
-  return pathSetting("serviceConfig", "messagefoundry.toml").value;
+  return serviceConfigSetting().value;
+}
+
+/** {@link serviceConfig} with the scope it came from, for a caller whose checks depend on whether
+ *  the workspace set the value it is handed (securityEditor.ts). */
+export function serviceConfigSetting(): ContainedPathSetting {
+  return pathSetting("serviceConfig", "messagefoundry.toml");
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
  *  `connectionServiceConfig` in connectionWizardModel.ts (BACKLOG #2908). A workspace value the
- *  containment dropped does not count, so this agrees with {@link serviceConfig} (BACKLOG #5404). */
+ *  containment dropped still counts (BACKLOG #5404), so the file used in its place is NAMED to the
+ *  CLI and a missing one is refused, rather than an edit being checked against no file. */
 export function serviceConfigIsSet(): boolean {
-  return pathSetting("serviceConfig", "messagefoundry.toml").source !== "default";
+  const s = serviceConfigSetting();
+  return s.source !== "default" || s.dropped;
 }
 
 /**

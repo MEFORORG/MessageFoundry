@@ -30,8 +30,10 @@ const REMOTE_REFUSAL = `MessageFoundry: ${REMOTE} is a remote engine — the IDE
 
 let stubWorkspace: string | undefined;
 let stubTrusted = true;
-/** The workspace value of `messagefoundry.serviceConfig`, or undefined for a setting left unset. */
+/** The value of `messagefoundry.serviceConfig`, or undefined for a setting left unset. */
 let stubSetting: string | undefined;
+/** The scope `stubSetting` is set in: the user's settings, or the workspace's own. */
+let stubScope: "globalValue" | "workspaceValue" = "globalValue";
 let notices: string[];
 /** The `onDidCloseTerminal` listeners Restart's stop is waiting on. */
 const closeListeners = new Set<(t: unknown) => void>();
@@ -44,15 +46,16 @@ const vscodeStub = {
     get isTrusted(): boolean {
       return stubTrusted;
     },
-    // The setting as the user's own settings set it, so it counts as set. A workspace value naming
-    // a path outside the folder never reaches Restart: cli.ts's containment of the path settings
-    // drops it for the default (BACKLOG #5404), so it could not drive the stat this suite counts.
+    // The setting in the scope `stubScope` names; set, either way, it counts as set. The order
+    // tests use the user's scope: a workspace value naming a path outside the folder never reaches
+    // Restart, because cli.ts's containment does not use it (BACKLOG #5404), which the last test
+    // here pins end to end.
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown =>
         key === "serviceConfig" && stubSetting !== undefined ? stubSetting : fallback,
       inspect: (key: string) =>
         key === "serviceConfig"
-          ? { defaultValue: "messagefoundry.toml", globalValue: stubSetting }
+          ? { defaultValue: "messagefoundry.toml", [stubScope]: stubSetting }
           : undefined,
     }),
   },
@@ -134,11 +137,13 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     stubWorkspace = ws;
     stubTrusted = true;
     stubSetting = UNC_SETTING;
+    stubScope = "globalValue";
     notices = [];
   });
 
   teardown(() => {
     stubWorkspace = undefined;
+    stubScope = "globalValue";
     closeListeners.clear();
   });
 
@@ -231,6 +236,16 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(notices.length, 1, JSON.stringify(notices));
     assert.match(notices[0], /which is not a file in this workspace/);
     assert.strictEqual(run.stopped, false, "the refusal still comes before the stop");
+    assert.strictEqual(run.started, false);
+  });
+
+  test("the same value planted in workspace settings is never statted, trusted and local (BACKLOG #5404)", async () => {
+    stubScope = "workspaceValue";
+    const run = await restart(LOOPBACK);
+
+    // The containment names the default file in its place, inside the workspace.
+    assert.deepStrictEqual(run.statted, [`statSync ${path.resolve(ws, "messagefoundry.toml")}`]);
+    assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
   });
 

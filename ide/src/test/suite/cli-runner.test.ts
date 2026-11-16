@@ -132,15 +132,15 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
       source: "workspace",
       dropped: false,
     });
-    // A dropped value counts as unset, so serviceConfigIsSet agrees with serviceConfig.
+    // Dropped is reported, so serviceConfigIsSet can name the file used in its place.
     assert.deepStrictEqual(containedPathSetting({ defaultValue: "x.toml", workspaceValue: OUT }, WS, "d"), {
       value: "x.toml",
       source: "default",
       dropped: true,
     });
-    assert.deepStrictEqual(containedPathSetting({ globalValue: "u", workspaceFolderValue: "..", workspaceValue: "in" }, WS, "d"), {
-      value: "in",
-      source: "workspace",
+    assert.deepStrictEqual(containedPathSetting({ globalValue: "u", workspaceValue: "../in" }, WS, "d"), {
+      value: "u",
+      source: "user",
       dropped: true,
     });
     // A malformed user value passes through as `get` returned it, for the callers' own refusals.
@@ -158,7 +158,6 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     const scopes = { defaultValue: "samples/config", globalValue: "mine", workspaceValue: "../x" };
     assert.strictEqual(valueOf(scopes, WS, "d"), "mine");
     assert.strictEqual(valueOf({ defaultValue: "samples/config", workspaceValue: OUT }, WS, "d"), "samples/config");
-    assert.strictEqual(valueOf({ workspaceFolderValue: "..", workspaceValue: "in" }, WS, "d"), "in");
     assert.strictEqual(valueOf({ workspaceValue: 42 }, WS, "d"), "d");
   });
 
@@ -180,10 +179,20 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     new RegExp(`^\\s*return pathSetting\\("${name}", "[^"]+"\\)\\.value;\\s*$`).test(body(src, name));
 
   test("configDir, serviceConfig and messageSetsDir read through pathSetting, which contains them", () => {
-    for (const name of ["configDir", "serviceConfig", "messageSetsDir"]) {
+    for (const name of ["configDir", "messageSetsDir"]) {
       assert.ok(contained(CLI, name), `${name} does not read through pathSetting`);
     }
+    assert.match(body(CLI, "serviceConfig"), /^\s*return serviceConfigSetting\(\)\.value;\s*$/);
+    assert.match(body(CLI, "serviceConfigSetting"), /^\s*return pathSetting\("serviceConfig", "messagefoundry\.toml"\);\s*$/);
     assert.ok(/containedPathSetting\(seen, workspaceDir\(\), fallback\)/.test(CLI), "pathSetting no longer contains");
+  });
+
+  test("serviceConfigIsSet reads the contained setting and counts a dropped value as set", () => {
+    // Counted unset, a dropped value would leave connection edits checked against no file.
+    const b = body(CLI, "serviceConfigIsSet");
+    assert.match(b, /serviceConfigSetting\(\)/);
+    assert.match(b, /source !== "default" \|\| s\.dropped/);
+    assert.doesNotMatch(b, /settingIsSet\(/, "serviceConfigIsSet reads the raw scopes again");
   });
 
   test("control: the pre-fix reader fails the predicate", () => {

@@ -12,7 +12,7 @@
 // "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as fs from "node:fs";
 import * as vscode from "vscode";
-import { runJson, serviceConfig, workspaceDir } from "./cli";
+import { runJson, serviceConfigSetting, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
 import { ShownFile, saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
@@ -91,9 +91,12 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
 function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
   // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
-  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
-  const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
-  const target = securityConfigTarget(ws, serviceConfig(), { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer. A
+  // workspace value cli.ts's containment dropped is not the value handed here (BACKLOG #5404), so
+  // the scope is the one the handed value came from, not whether the workspace set any.
+  const setting = serviceConfigSetting();
+  const fromWorkspace = seen === undefined || setting.source === "workspace";
+  const target = securityConfigTarget(ws, setting.value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,
   });

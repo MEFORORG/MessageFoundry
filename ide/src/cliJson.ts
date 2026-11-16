@@ -57,7 +57,6 @@ export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
 export const ENGINE_MODULE: CliModule = "messagefoundry";
 export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
 
-
 /** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
  *  module does not compile until it names its command. */
 const COMMAND_NAMES: Record<CliModule, string> = {

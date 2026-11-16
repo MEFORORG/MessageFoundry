@@ -199,11 +199,15 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   and does not take these options.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
   `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
-  settings that names a path outside the folder is dropped for your user value or the default, with
-  a warning, in a trusted window too; to use a path elsewhere, set it in user settings.
+  settings whose spelling names a path outside the first workspace folder is not used: your user
+  value or the default applies instead, with a warning, in a trusted window too. To use a path
+  elsewhere, set it in user settings. The check reads the spelling only, so it does not catch a link
+  or junction inside the folder that leads out of it; the New Route wizard and the security editor
+  make their own link checks before they write.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
-  editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
+  editor never sees a workspace-set value whose spelling is outside the workspace folder, since that
+  value is not used (above), and it refuses any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. The workspace
   folder itself is taken as given, a link included: it is the first folder the workspace opens,
   which a repository's `.code-workspace` file can set to any folder, the repository's own or not,
@@ -211,7 +215,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
   the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
-  user or workspace settings (a folder value is ignored), every connection edit passes it, unless
+  user or workspace settings (a folder value is ignored), every connection edit passes it, or the
+  value used in place of a workspace value that is not used, unless
   it is blank, as `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
   setting leaves the flag off for connection edits, as it does for Start and Restart. A blank
