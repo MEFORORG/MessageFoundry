@@ -57,17 +57,43 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 # The rules whose loss would be silent and would matter. Not the whole deny-list: the point is a
 # floor under the PHI, secret and local-store rules that CLAUDE.md section 5 and section 9 promise
 # are enforced, so prose and mechanism cannot drift apart without a red test.
+#
+# Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the deny pattern
+# that keeps it away from an agent's file tools. A file git is told never to hold is one an agent
+# should neither read nor overwrite. Before BACKLOG #5495 most of these were denied to Read only:
+# Write covered `.env` and `secrets/**`, so `Write(*.key)` or `Write(*.db)` went through, and
+# `/docker/secrets.env`, `/docker/tls/` and the leak scanner's real token list had no rule at all.
+# Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
+# red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
+# secret line added to `.gitignore` gets no deny rule until someone adds it here, which is how the
+# docker paths were missed. Add the key when you add the ignore line.
+_GITIGNORED_SECRETS: dict[str, str] = {
+    ".env": ".env",
+    ".env.*": ".env.*",
+    "secrets/": "secrets/**",
+    "*.key": "*.key",
+    "*.pem": "*.pem",
+    "*.pfx": "*.pfx",
+    "*.db": "*.db",
+    "*.db-wal": "*.db-wal",
+    "*.db-shm": "*.db-shm",
+    "bootstrap-admin.txt": "bootstrap-admin.txt",
+    # A bare filename matches at any depth, which is broader than the rooted ignore line and still
+    # misses the tracked `docker/secrets.env.example` template.
+    "/docker/secrets.env": "secrets.env",
+    "/docker/tls/": "**/docker/tls/**",
+    "scripts/security/scan-tokens.local.txt": "scan-tokens.local.txt",
+}
+
+# The file tools each protected pattern is denied to, spelled out per tool so the list reads the
+# same as what it denies.
+_FILE_TOOLS = ("Read", "Edit", "Write")
+
 _REQUIRED_DENIES = frozenset(
-    {
-        "Read(.env)",
-        "Read(secrets/**)",
-        "Read(*.db)",
-        "Edit(.env)",
-        "Edit(secrets/**)",
-        "Write(.env)",
-        "Write(secrets/**)",
-    }
+    f"{tool}({pattern})" for pattern in _GITIGNORED_SECRETS.values() for tool in _FILE_TOOLS
 )
+
+_FILE_RULE = re.compile(rf"\A({'|'.join(_FILE_TOOLS)})\((.+)\)\Z")
 
 _PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
 
@@ -117,6 +143,21 @@ def _unanchored_refs(settings: dict[str, Any]) -> list[str]:
 
 def _dot_anchored_denies(settings: dict[str, Any]) -> list[str]:
     return [r for r in settings["permissions"]["deny"] if "(./" in r]
+
+
+def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
+    """Every path pattern some file tool is denied on and another file tool is not."""
+    tools_by_pattern: dict[str, set[str]] = {}
+    for rule in settings["permissions"]["deny"]:
+        m = _FILE_RULE.match(rule)
+        if m:
+            tools_by_pattern.setdefault(m.group(2), set()).add(m.group(1))
+    out = []
+    for pattern, tools in tools_by_pattern.items():
+        missing = [t for t in _FILE_TOOLS if t not in tools]
+        if missing:
+            out.append(f"{pattern}: missing {', '.join(missing)}")
+    return sorted(out)
 
 
 # ------------------------------------------------ does a matcher select the tools it appears to?
@@ -295,6 +336,34 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
         "These are what CLAUDE.md sections 5 and 9 point at when they say secrets and the local "
         "store are off limits. Removing one makes that prose false. Deny rules cost nothing when "
         "unused and are the only permission rules auto mode cannot override."
+    )
+
+
+def test_every_denied_path_is_denied_to_every_file_tool() -> None:
+    """A path denied to Read and not to Write can still be overwritten, and the reverse can be read.
+
+    Red before BACKLOG #5495: `*.key`, `*.pem`, `*.pfx`, `*.db-wal`, `*.db-shm` and
+    `bootstrap-admin.txt` were denied to Read alone, and `.env.*` and `*.db` to Read and Edit.
+    """
+    unmirrored = _unmirrored_file_denies(_load())
+    assert not unmirrored, (
+        f"{len(unmirrored)} deny pattern(s) do not name every file tool: {unmirrored}.\n"
+        "Add the missing Read, Edit or Write rule for the same pattern. Never resolve this by "
+        "removing the rule that is there."
+    )
+
+
+def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
+    """The mapping above is only honest while each key is still a `.gitignore` line."""
+    lines = {
+        line.strip()
+        for line in (_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    gone = sorted(k for k in _GITIGNORED_SECRETS if k not in lines)
+    assert not gone, (
+        f"{gone} no longer appear in .gitignore. Update _GITIGNORED_SECRETS to the line that now "
+        "ignores each path, and keep its deny rules."
     )
 
 
@@ -486,6 +555,13 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "dot-anchored deny rule",
         ),
         (
+            # The shape `*.key` had before BACKLOG #5495: denied to Read, not to the tools that
+            # write it. The Bash rule checks the detector skips a rule that names no file tool.
+            {"permissions": {"deny": ["Read(*.key)", "Bash(rm -rf:*)"]}, "hooks": {}},
+            _unmirrored_file_denies,
+            "deny pattern named for Read only",
+        ),
+        (
             # A settings document that wires NOTHING, checked against a root with no installers.
             # Every real hook script is then unaccounted for except the three on _KNOWN_UNWIRED, so
             # the detector must return a non-empty list. If it returns nothing here, it cannot see
@@ -530,6 +606,7 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
         "unanchored-hook",
         "unanchored-shell-form-hook",
         "dot-anchored-deny",
+        "unmirrored-file-deny",
         "unwired-hook-script",
         "exact-list-matcher",
     ],
