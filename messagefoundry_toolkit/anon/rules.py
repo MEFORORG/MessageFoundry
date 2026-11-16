@@ -146,12 +146,12 @@ class FieldRule:
 # mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
 # that list still has no rule, and only the coverage report names it.
 #
-# A surrogate is keyed on its kind and on the repetition's text, so a prior value in MRG keeps an
-# A40 merge's old-to-new linkage only where its kind matches the kind of the field it is the prior
-# value of. These match: MRG-1 with PID-3 (MRN), MRG-2 with PID-4, MRG-5 with PV1-19 and MRG-6 with
-# PV1-50 (ID), and MRG-7 with PID-5 (NAME). These do not: MRG-3, the prior account number, takes
-# MRN while PID-18 takes ID, and MRG-4, the prior patient id, is a CX paired with PID-2 but takes
-# NAME while PID-2 takes MRN.
+# An id or name surrogate is keyed on the dataset salt, its kind and the whole repetition's text.
+# So a prior value in MRG keeps a merge's prior-to-current link only where its kind matches its
+# pair's kind, and only when both are written identically. The kinds match for MRG-1 and PID-3
+# (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for MRG-7 and PID-5
+# (NAME). They do not match for two pairs. MRG-3, the prior account number, takes MRN, while
+# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME.
 #
 # BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
@@ -186,7 +186,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-21", SurrogateKind.MRN),  # mother's identifier, a CX
     FieldRule("PID-23", SurrogateKind.FREETEXT),  # birth place, free text that names a place
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
-    # MRG — merge (A40); keep linkage to the PID kinds above
+    # MRG — merge; the comment above the map says which pairs keep their link
     FieldRule("MRG-1", SurrogateKind.MRN),
     FieldRule("MRG-2", SurrogateKind.ID),  # prior alternate patient id, keyed like PID-4
     FieldRule("MRG-3", SurrogateKind.MRN),
