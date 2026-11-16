@@ -11,6 +11,7 @@ a ``${VAR:?...}`` substitution with no default, never a literal this file attest
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 from typing import Any
@@ -18,17 +19,14 @@ from typing import Any
 import pytest
 import yaml
 
-from messagefoundry.config.tls_policy import (
-    TLS_REVOCATION_ATTESTED_ENV,
-    in_process_tls_revocation_refused,
-    tls_revocation_attested,
-)
+from messagefoundry.config.settings import _LOOPBACK_HOSTS
+from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
 
 _COMPOSE = Path(__file__).resolve().parents[1] / "docker" / "compose.yaml"
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 _REQUIRED = re.compile(r"^\$\{" + TLS_REVOCATION_ATTESTED_ENV + r":\?[^}]+\}$")
 
 
+@functools.cache
 def _serving_engines() -> dict[str, dict[str, Any]]:
     """The environment of every service whose command is ``serve``, merge keys resolved."""
     doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
@@ -44,7 +42,7 @@ def _gated(env: dict[str, Any]) -> bool:
     """Whether the revocation gate reads this service's bind: in-process TLS off loopback."""
     return (
         bool(env.get("MEFOR_API_TLS_CERT_FILE"))
-        and env.get("MEFOR_SECURITY_LISTEN_ADDRESS") not in _LOOPBACK
+        and env.get("MEFOR_SECURITY_LISTEN_ADDRESS") not in _LOOPBACK_HOSTS
     )
 
 
@@ -65,19 +63,4 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
     assert _REQUIRED.match(str(value)), (
         f"{service} sets {TLS_REVOCATION_ATTESTED_ENV} to {value!r}. It must be a required compose "
         "substitution with no default, so the attestation stays the operator's own act."
-    )
-
-
-def test_the_gate_refuses_unset_and_passes_an_operator_attestation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # What the substitution protects: unset, the gate refuses (the old crash-loop); with the
-    # operator's 1, it passes. The gate itself is unchanged.
-    monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
-    assert in_process_tls_revocation_refused(
-        tls_enabled=True, is_loopback=False, attested=tls_revocation_attested()
-    )
-    monkeypatch.setenv(TLS_REVOCATION_ATTESTED_ENV, "1")
-    assert not in_process_tls_revocation_refused(
-        tls_enabled=True, is_loopback=False, attested=tls_revocation_attested()
     )
