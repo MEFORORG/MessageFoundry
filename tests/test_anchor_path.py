@@ -545,6 +545,17 @@ def test_a_link_to_a_device_path_normpath_would_change_is_not_walked(target: str
     assert cause is not None and cause.kind == "a link points at a path this check does not read"
 
 
+def test_a_link_in_the_form_readlink_returns_is_judged_by_its_rest() -> None:
+    """``os.readlink`` hands back ``\\\\?\\`` where the reparse point stores ``\\??\\``. A plain
+    one is walked; one holding ``..`` is not. Red under: stripping it and normalizing the rest."""
+    plain = {"C:\\certs\\lnk": r"\\?\C:\real"}
+    chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(plain))
+    assert cause is None and chain[-1][0] == "C:\\real\\ca.pem"
+    dotted = {"C:\\certs\\lnk": r"\\?\C:\real\..\other"}
+    _chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(dotted))
+    assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
 def test_a_subst_drive_onto_a_verbatim_path_normpath_would_change_is_not_walked() -> None:
     """A ``subst`` target goes through the same check. Red as above: it walked C:\\other."""
     _chain, cause = windows_chain(
@@ -573,14 +584,54 @@ def test_a_relative_anchor_under_a_verbatim_working_directory_is_still_walked(an
     assert cause is None
 
 
-@pytest.mark.parametrize("cwd", [r"\\.\C:\svc", r"\\?\C:\svc"])
-def test_a_relative_anchor_climbing_out_of_a_prefixed_working_directory_is_not_walked(
-    cwd: str,
+@pytest.mark.parametrize(
+    ("cwd", "anchor"),
+    [
+        # A `..` past the first name may be collapsed against the prefix and reach a share.
+        (r"\\.\C:\svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        (r"\\?\C:\svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        # The same under a volume GUID working directory, which the strip leaves as written.
+        (r"\\?\Volume{0000}\svc", r"..\..\Volume{1111}\certs\ca.pem"),
+        ("//?/Volume{0000}/svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        # A rooted relative name joins to the drive or volume, not to the folder.
+        (r"\\.\C:\svc", r"\..\UNC\files.test\share\ca.pem"),
+        (r"\\?\C:\svc", r"\certs\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"\certs\ca.pem"),
+        # A bare drive or volume GUID working directory names the volume device.
+        (r"\\?\C:", r"certs\ca.pem"),
+        (r"\\.\C:", r"certs\ca.pem"),
+        (r"\\?\Volume{0000}", r"certs\ca.pem"),
+        ("//?/Volume{0000}", r"certs\ca.pem"),
+    ],
+)
+def test_a_relative_anchor_under_a_prefixed_working_directory_it_cannot_place_is_not_walked(
+    cwd: str, anchor: str
 ) -> None:
-    """Joined to a device-prefixed working directory, a `..` past the drive may be collapsed
-    against the prefix and reach a share. Red under: normpath clamping it at C:\\."""
-    chain, cause = windows_chain(r"..\..\..\UNC\files.test\share\ca.pem", cwd, _probe())
+    """Which object Win32 resolves a relative name to there is not emulated, so these refuse.
+    Red under: joining by normpath, which clamped each at the drive or volume and cleared it."""
+    chain, cause = windows_chain(anchor, cwd, _probe())
     assert (chain, cause) == ([], "the path is a device path this check does not read")
+
+
+@pytest.mark.parametrize(
+    ("cwd", "anchor", "walked"),
+    [
+        (r"\\.\C:\svc", r"..\certs\ca.pem", "C:\\certs\\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"..\certs\ca.pem", "\\\\?\\Volume{0000}\\certs\\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"certs\ca.pem", "\\\\?\\Volume{0000}\\svc\\certs\\ca.pem"),
+        ("\\\\?\\C:\\", r"certs\ca.pem", "C:\\certs\\ca.pem"),  # the root, with its separator
+        (r"C:\svc", r"\certs\ca.pem", "C:\\certs\\ca.pem"),  # a plain working directory
+        (r"C:\svc", r"..\..\..\certs\ca.pem", "C:\\certs\\ca.pem"),
+    ],
+)
+def test_a_relative_anchor_under_a_working_directory_it_can_place_is_still_walked(
+    cwd: str, anchor: str, walked: str
+) -> None:
+    """The must-not-trip twins: a `..` that stays inside a prefixed working directory, a root
+    with its separator, and a plain working directory, which Win32 normalizes as normpath does."""
+    chain, cause = windows_chain(anchor, cwd, _probe())
+    assert cause is None
+    assert chain[-1][0] == walked
 
 
 @pytest.mark.parametrize(
