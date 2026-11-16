@@ -355,34 +355,37 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     variable and it is counted once."""
     read: list[_Variable] = []
     for where, entry in entries:
-        # (line number, name as written, whether it is kept, the parts of its value)
-        spans: list[tuple[int, str, bool, list[str]]] = []
-        first_equals = False
-        for number, line in enumerate(_LINE_BREAK.split(entry), 1):
+        first, *rest_lines = _LINE_BREAK.split(entry)
+        first_written, first_equals, first_rest = first.partition("=")
+        first_written = first_written.strip()
+        first_parts = [first_rest]
+        # A later line kept as a variable: its line number, name as written and value parts.
+        later: list[tuple[int, str, list[str]]] = []
+        parts = first_parts  # the value the current line belongs to
+        for number, line in enumerate(rest_lines, 2):
             written, equals, rest = line.partition("=")
+            if not equals:
+                parts.append(line)
+                continue
             written = written.strip()
-            if number == 1:
-                first_equals = bool(equals)
-                spans.append((number, written, first_equals, [rest]))
-            elif equals and _refused_name(written.upper()):
-                spans.append((number, written, True, [rest]))
+            if _refused_name(written.upper()):
+                parts = [rest]
+                later.append((number, written, parts))
             elif _ORDINARY_LINE.match(line):
-                spans.append((number, written, False, [rest]))
+                parts = [rest]  # ends the value above, and is not kept
             else:
-                spans[-1][3].append(line)
-        later = [span for span in spans[1:] if span[2]]
-        first_written = spans[0][1]
+                parts.append(line)
         if first_equals:
-            read.append(_Variable(where, first_written, "\n".join(spans[0][3])))
+            read.append(_Variable(where, first_written, "\n".join(first_parts)))
         elif first_written.upper().startswith(_VALUE_PREFIX) and "=" in entry and not later:
             read.append(_Variable(where, first_written, entry.partition("=")[2], broken=True))
         read.extend(
             _Variable(
                 f"{where}, line {number} of a string whose first line is another entry",
                 written,
-                "\n".join(parts),
+                "\n".join(value_parts),
             )
-            for number, written, _kept, parts in later
+            for number, written, value_parts in later
         )
     return read
 
@@ -401,7 +404,7 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str], ...]:
         value = variable.value
         # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
-        if not name or not (value.strip() or name.startswith(_VALUE_PREFIX)):
+        if not name or not ((value and not value.isspace()) or name.startswith(_VALUE_PREFIX)):
             continue
         if name in _INLINE_PEM_NAMES and "-----BEGIN" not in value:
             continue
@@ -425,7 +428,7 @@ def _value_entry_shapes(
         name = written.upper()
         if not name.startswith(_VALUE_PREFIX) or name == _VALUE_PREFIX:
             continue
-        if not variable.value.strip():
+        if not variable.value or variable.value.isspace():
             empty[name] = None
         if variable.broken or not (written.isascii() and _setting_names.is_value_name(name)):
             unplain[name] = None
