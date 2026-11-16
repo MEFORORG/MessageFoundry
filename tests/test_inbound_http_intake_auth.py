@@ -968,29 +968,36 @@ def test_the_runner_refuses_a_resolved_budget_that_is_no_count(value: object) ->
         assert "IB_HTTP" in str(exc.value) and str(value) not in str(exc.value)
 
 
-@pytest.mark.parametrize(
-    ("budget", "values"),
-    [(env("budget"), {"budget": ""}), (env("budget", default=None), {})],
-)
-def test_an_env_budget_that_resolves_to_no_value_is_refused(
-    budget: object, values: dict[str, object]
-) -> None:
-    # BACKLOG #5677: a set-but-empty variable, or an unset one whose default= is None, would turn
-    # the brute-force bound off with nobody having written None or 0. Refused, as on main, where
-    # int() raised on it.
+@pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
+def test_an_env_budget_that_resolves_to_no_value_is_refused(knob: str) -> None:
+    # BACKLOG #5677: a set-but-empty variable would turn the brute-force bound off with nobody
+    # having written None or 0. On main the runner's int() raised a TypeError on every unresolved
+    # env() budget, so this branch's resolved read must refuse the empty one itself.
     from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
 
-    runner, ic = _budget_runner(intake_auth_rate_limit=budget)
-    cfg = _source_config(ic, "127.0.0.1", {**values, "k": "synthetic-key"})
-    assert cfg.settings["intake_auth_rate_limit"] in ("", None)
+    runner, ic = _budget_runner(**{knob: env("budget")})
+    cfg = _source_config(ic, "127.0.0.1", {"budget": "", "k": "synthetic-key"})
     for refuse in (
         lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
         lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
     ):
-        with pytest.raises(WiringError, match="intake_auth_rate_limit.*resolved to no value"):
+        with pytest.raises(WiringError, match=knob + r" \(env 'budget'\) resolved to no value"):
             refuse()
-    # Its control: a None or 0 written in the config still disables that budget.
+    # Its control: a None or 0 written in the config still disables that budget, and so does a 0
+    # the environment resolves to.
     for literal in (None, 0):
-        runner, ic = _budget_runner(intake_auth_rate_limit=literal)
+        runner, ic = _budget_runner(**{knob: literal})
         cfg = _source_config(ic, "127.0.0.1", {"k": "synthetic-key"})
         check_intake_budgets(cfg, ic.name, ic.spec.settings)
+    runner, ic = _budget_runner(**{knob: env("budget")})
+    cfg = _source_config(ic, "127.0.0.1", {"budget": "0", "k": "synthetic-key"})
+    check_intake_budgets(cfg, ic.name, ic.spec.settings)
+
+
+@pytest.mark.parametrize("default", [None, ""])
+def test_the_factory_refuses_an_env_budget_default_of_no_value(default: object) -> None:
+    # The runner refuses an env() budget that resolves to no value, so a default= of None or ""
+    # would pass `check` wherever the variable is set and be refused at serve wherever it is not.
+    knobs: dict[str, Any] = {"intake_auth_rate_limit": env("budget", default=default)}
+    with pytest.raises(WiringError, match="default= of intake_auth_rate_limit is refused"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)

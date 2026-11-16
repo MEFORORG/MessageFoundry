@@ -3430,15 +3430,21 @@ def Http(
     # BACKLOG #5677: the runner reads each budget as a count by cap_setting's rule, so a bool, a
     # fraction, other text or a negative (which would refuse every intake request) is refused here,
     # where `check` sees it, after the stricter trusted_proxies rule above. An env() is checked on
-    # its default= here and on its resolved value by the runner's check_intake_budgets.
+    # its default= here and on its resolved value by the runner's check_intake_budgets, which
+    # refuses one that resolves to no value; a default= of None or "" is refused here for that
+    # reason, so check does not pass what serve refuses wherever the variable is unset.
     from messagefoundry.transports.base import cap_setting
 
     for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
         written = settings[knob]
         from_default = isinstance(written, EnvRef)
+        no_value_default = False
         if isinstance(written, EnvRef):
+            no_value_default = written.default is None or written.default == ""
             written = None if written.default is _UNSET else written.default
         budget_refusal: str | None = None
+        if no_value_default:
+            budget_refusal = f"Http {knob} has no value, which the listener refuses whenever the variable is unset"
         try:
             read = cap_setting(written, int, knob=knob, transport="Http")
         except ValueError as exc:

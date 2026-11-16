@@ -14051,17 +14051,18 @@ def _intake_budget(
     bool, a fraction or other text is refused there, and a negative here, since a negative budget
     would refuse every intake request. ``written`` is the inbound's settings as configured: where
     the budget was an env() reference that resolved to ``""`` or ``None`` (a set-but-empty
-    variable, or an unset one with ``default=None``), it is refused too, so only a ``None`` or a
-    zero written in the config, or a zero the environment resolves to, turns the bound off.
+    variable, or an unset one with ``default=None``), it is refused too rather than turning the
+    bound off; a zero the environment resolves to still turns it off.
     Refused as a ``WiringError`` naming the connection and the setting, with the value withheld."""
     refusal: str | None = None
     budget: int | None = None
     value = settings.get(knob)
-    if isinstance(written.get(knob), EnvRef) and (value is None or value == ""):
+    ref = written.get(knob)
+    if isinstance(ref, EnvRef) and (value is None or value == ""):
         raise WiringError(
-            f"inbound connection {name!r}: HTTP {knob} is an env() reference that resolved to no "
-            "value, which would turn that budget off. Set it to a whole number of failed attempts "
-            "per minute, or write None or 0 to disable that budget"
+            f"inbound connection {name!r}: HTTP {knob} (env {ref.key!r}) resolved to no value, "
+            "which would turn that budget off. Set it to a whole number of failed attempts per "
+            "minute, or to 0 to disable that budget"
         )
     try:
         budget = cap_setting(value, int, knob=knob, transport="HTTP")
