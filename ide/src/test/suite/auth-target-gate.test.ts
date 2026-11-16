@@ -169,6 +169,12 @@ gateSuite("a cached bearer goes only to a target assertTargetAllowed passes (BAC
     assert.match(errors[0], /^MessageFoundry: not a valid engine URL: /);
   });
 
+  test("A4 control: a refused host is shown as written, an underscore unescaped", async () => {
+    assert.strictEqual(await auth.signIn(context, "http://engine_prod.invalid:8765"), undefined);
+    assert.strictEqual(errors.length, 1);
+    assert.ok(errors[0].includes("non-loopback host engine_prod.invalid"), errors[0]);
+  });
+
   test("A3: withStepUpAuth inherits the gate through withAuth", async () => {
     const seen: string[] = [];
     const result = await auth.withStepUpAuth(context, REFUSED, (token) => {

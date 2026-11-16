@@ -6,7 +6,7 @@
 // demand or after a 401.
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
-import { escapeMarkdown, mustChangeProblem } from "./engineStatusModel";
+import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
 import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
 import { type StepUpHost, withStepUp } from "./stepUp";
@@ -59,9 +59,13 @@ function secretKey(url: string): string {
 function refuseDisallowedTarget(url: string): boolean {
   const gate = assertTargetAllowed(url);
   if (!gate.ok) {
-    // The reason quotes the URL, which a workspace setting can supply, and a notification renders a
-    // markdown link in it, `command:` links included; escapeMarkdown breaks the link syntax.
-    void vscode.window.showErrorMessage(`MessageFoundry: ${escapeMarkdown(gate.reason)}`);
+    // Defence in depth: the reason quotes the URL verbatim, and a notification renders a markdown
+    // link in its text, `command:` links included. engineUrl and environments are machine-scoped,
+    // so a checked-in workspace cannot supply the URL, but a caller's URL is still any text.
+    // A notification does not honour a backslash escape, so the link breaks only where a backslash
+    // lands between `]` and `(`; escaping the four link characters does that and leaves the host
+    // readable, where escapeMarkdown would also put a backslash before an underscore in it.
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason.replace(/[[\]()]/g,(c) => `\\${c}`)}`);
   }
   return !gate.ok;
 }
