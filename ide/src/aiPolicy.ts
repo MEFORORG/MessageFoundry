@@ -20,6 +20,7 @@ import {
   carryDeniesOffline,
   carryDeniesOnline,
   evaluatedPermission,
+  narrowMode,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
   pickOfflinePolicy,
@@ -65,7 +66,7 @@ export interface AiPolicyWire {
  */
 function fromWire(w: AiPolicyWire): AiPolicy {
   return {
-    mode: w.mode,
+    mode: narrowMode(w.mode),
     dataScope: w.data_scope,
     environment: w.environment,
     assistPermitted: evaluatedPermission(w.assist_permitted),

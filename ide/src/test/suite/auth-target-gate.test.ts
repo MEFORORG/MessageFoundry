@@ -57,8 +57,13 @@ const realLoad = loader._load;
 
 function insideExtensionHost(): boolean {
   try {
-    const api = realLoad.call(loader, "vscode", module, false) as { version?: unknown };
-    return typeof api?.version === "string";
+    // Both fields, as the sibling suites check: a stray package exporting only `version` must not
+    // turn this suite into a silent skip.
+    const api = realLoad.call(loader, "vscode", module, false) as {
+      version?: unknown;
+      env?: { appName?: unknown };
+    };
+    return typeof api?.version === "string" && typeof api?.env?.appName === "string";
   } catch {
     return false;
   }

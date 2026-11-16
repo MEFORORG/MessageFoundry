@@ -51,10 +51,12 @@ function secretKey(url: string): string {
 }
 
 /**
- * Whether `url` is a target {@link assertTargetAllowed} refuses credentials or a token to, showing
- * the refusal when it is (SEC-005). Every path here that sends a password or a bearer asks first.
+ * Refuse `url` when {@link assertTargetAllowed} would not send it credentials or a token (SEC-005),
+ * and SHOW the refusal: returns true when refused. Not a silent predicate, so call it once per
+ * interactive flow, never from a timer. At least signIn, signOut and withAuth (and withStepUpAuth
+ * through it) call it before a password or a bearer leaves.
  */
-function targetRefused(url: string): boolean {
+function refuseDisallowedTarget(url: string): boolean {
   const gate = assertTargetAllowed(url);
   if (!gate.ok) {
     void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
@@ -111,11 +113,10 @@ export async function signOut(ctx: vscode.ExtensionContext, url: string): Promis
   if (!token) {
     return true; // nothing to revoke
   }
-  if (targetRefused(url)) {
-    await clearToken(ctx, url);
-    return false;
-  }
   try {
+    if (refuseDisallowedTarget(url)) {
+      return false; // never sent; the finally still forgets it
+    }
     await postJson<unknown>(url, "/auth/logout", {}, token);
     return true;
   } catch {
@@ -153,7 +154,7 @@ export async function peekToken(
 export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
   // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS
   // refusal — never prompt for or send credentials in clear to a non-loopback host (SEC-005).
-  if (targetRefused(url)) {
+  if (refuseDisallowedTarget(url)) {
     return undefined;
   }
   let provider = "local";
@@ -274,7 +275,7 @@ export async function withAuth<T>(
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
-  if (targetRefused(url)) {
+  if (refuseDisallowedTarget(url)) {
     return undefined;
   }
   const first = await ensureToken(ctx, url);

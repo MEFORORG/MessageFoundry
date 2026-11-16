@@ -17,6 +17,7 @@ import {
   carryDeniesOnline,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  narrowMode,
   pickOfflinePolicy,
   type AiPolicy,
   type PolicyStore,
@@ -170,6 +171,10 @@ suite("assistantState fails closed on a mode it does not name (BACKLOG #5406)", 
     for (const bad of [undefined, null, 7, true, {}, ["byo"]]) {
       const fresh = { ...policy({ assistPermitted: true }), mode: bad as unknown as string };
       assert.strictEqual(assistantState(mergeAuthoritativePolicy(null, fresh)).enabled, false, JSON.stringify(bad));
+      // The wire boundary narrows it to a string, so "Show AI Policy" cannot print ["byo"] as byo.
+      const narrowed = narrowMode(bad);
+      assert.strictEqual(narrowed, "unrecognized", JSON.stringify(bad));
+      assert.strictEqual(assistantState(policy({ mode: narrowed, assistPermitted: true })).enabled, false);
     }
   });
 

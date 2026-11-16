@@ -26,13 +26,14 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "In an untrusted workspace, MessageFoundry will not auto-run the workspace Python CLI (validate/graph/codeset/promote are disabled) and will not set up version control and its commit hook, which runs the workspace's own Python environment, or let the New Route wizard write a config module, or open the Security Settings editor, until you trust the workspace. The workspace's own values for the config, service-config and message-set paths and for live status are ignored until then.",
+      "description": "In an untrusted workspace, MessageFoundry will not auto-run the workspace Python CLI (validate/graph/codeset/promote are disabled) and will not set up version control and its commit hook, which runs the workspace's own Python environment, or let the New Route wizard write a config module, or open the Security Settings editor, until you trust the workspace. The workspace's own values for the config, service-config and message-set paths, for live status, and for the AI context size limit are ignored until then.",
       "restrictedConfigurations": [
         "messagefoundry.configDir",
         "messagefoundry.serviceConfig",
         "messagefoundry.messageSetsDir",
         "messagefoundry.liveStatus.enabled",
-        "messagefoundry.liveStatus.intervalSeconds"
+        "messagefoundry.liveStatus.intervalSeconds",
+        "messagefoundry.ai.contextCharLimit"
       ]
     }
   },

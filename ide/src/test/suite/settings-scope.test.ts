@@ -45,13 +45,15 @@ const REVIEWED_NON_TARGET = [
 ];
 
 /** Window-scoped settings whose WORKSPACE value an untrusted workspace must not supply (BACKLOG
- *  #5404): the paths the extension reads and writes, and the switch and rate of the live-status poll. */
+ *  #5404): the paths the extension reads and writes, the switch and rate of the live-status poll, and
+ *  the bound on how much code leaves for the model provider. */
 const WORKSPACE_RESTRICTED = [
   "messagefoundry.configDir",
   "messagefoundry.serviceConfig",
   "messagefoundry.messageSetsDir",
   "messagefoundry.liveStatus.enabled",
   "messagefoundry.liveStatus.intervalSeconds",
+  "messagefoundry.ai.contextCharLimit",
 ];
 
 suite("settings scope (SEC-005)", () => {
@@ -144,13 +146,20 @@ suite("untrusted-workspace capability (SEC-004)", () => {
   test("every window-scoped setting that names a path or turns on polling is restricted", () => {
     // A family check over the hand list above, as the scope suite does for targets: a new path or
     // polling setting trips it until someone files it.
-    const smellsLikeAPathOrPoll = /dir|path|config|file|liveStatus|poll|interval/i;
+    const smells = (key: string): boolean =>
+      /dir|path|config|file|liveStatus|poll|interval|limit/i.test(key.replace(/^messagefoundry\./, ""));
+    // Positive control: the pattern must at least catch the hand list, or the loop below proves nothing.
+    for (const key of WORKSPACE_RESTRICTED) {
+      assert.ok(smells(key), `the family pattern does not match ${key}`);
+    }
     const manifest = pkg();
     const props = manifest.contributes.configuration.properties;
     const restricted = manifest.capabilities?.untrustedWorkspaces?.restrictedConfigurations ?? [];
+    // machine and application scope are not settable from a workspace at all, so need no restriction.
+    const workspaceSettable = (scope: string | undefined): boolean => scope !== "machine" && scope !== "application";
     for (const [key, prop] of Object.entries(props)) {
-      if (prop.scope !== "machine" && smellsLikeAPathOrPoll.test(key.replace(/^messagefoundry\./, ""))) {
-        assert.ok(restricted.includes(key), `${key} names a path or polling; restrict it (BACKLOG #5404)`);
+      if (workspaceSettable(prop.scope) && smells(key)) {
+        assert.ok(restricted.includes(key), `${key} names a path, polling or an egress bound; restrict it (BACKLOG #5404)`);
       }
     }
   });

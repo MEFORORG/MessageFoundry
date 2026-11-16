@@ -99,6 +99,16 @@ export function evaluatedPermission(v: unknown): boolean | null {
 }
 
 /**
+ * Narrow a wire `mode` to a string (BACKLOG #5406), for the same reason as
+ * {@link evaluatedPermission}: a 200 can omit it or carry a non-string. Anything but a string becomes
+ * `"unrecognized"`, a mode {@link assistantState} does not name and so disables, and which every
+ * reader, the gate and "Show AI Policy" alike, then sees the same way.
+ */
+export function narrowMode(v: unknown): string {
+  return typeof v === "string" ? v : "unrecognized";
+}
+
+/**
  * Merge a FRESH authoritative (engine) policy over the last cached one, retaining an
  * `assistPermitted: false` that the fresh answer could not re-evaluate.
  *
@@ -337,14 +347,15 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
 const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /** A carried entry as the carrier may use it: a deny-shaped object the gate disables, as it is;
- *  anything else as {@link MALFORMED_DENY}. Every deny-shaped policy is one the gate disables, since
- *  the gate is an allow-list (BACKLOG #5406). Never throws, and never permits. */
+ *  anything else as {@link MALFORMED_DENY}. The gate check is kept beside the gate's own allow-list
+ *  (BACKLOG #5406), so "never permits" does not rest on how the gate is shaped. Never throws, and
+ *  never permits. */
 function carriedEntry(value: unknown): AiPolicy {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return MALFORMED_DENY;
   }
   const p = value as AiPolicy;
-  return typeof p.mode === "string" && isPolicyDeny(p) ? p : MALFORMED_DENY;
+  return typeof p.mode === "string" && isPolicyDeny(p) && !assistantState(p).enabled ? p : MALFORMED_DENY;
 }
 
 // Every read-modify-write of the carrier runs on this one chain, so two resolves that overlap cannot
