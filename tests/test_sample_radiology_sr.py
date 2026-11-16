@@ -58,3 +58,14 @@ def test_delimiters_and_line_breaks_stay_data() -> None:
     assert oru.field("MSH-10.1") == "1.2|EVIL^X~Y&Z"
     # No segment was injected: MSH, PID, OBR, then one OBX per measurement.
     assert oru.segments() == ["MSH", "PID", "OBR", "OBX", "OBX"]
+
+
+@pytest.mark.filterwarnings("ignore:Invalid value for VR:UserWarning")
+def test_mllp_frame_bytes_in_a_peer_uid_never_reach_the_wire() -> None:
+    # 0x0B and 0x1C open and close an MLLP frame; set_data carries them as hex escapes.
+    reg = _registry()
+    part10 = make_sr_part10(sop_instance_uid="1.2\x1c3\x0b4", study_date="20260620")
+    out = reg.handlers["sr_to_oru"](RawMessage.from_bytes(part10, "dicom"))
+    assert isinstance(out, Send) and isinstance(out.message, str)
+    assert "\x1c" not in out.message and "\x0b" not in out.message
+    assert Message.parse(out.message).field("MSH-10.1") == "1.2\x1c3\x0b4"
