@@ -736,9 +736,14 @@ def _mllp_ssl_context(
             # Opt-in revocation (#1005). AFTER the CA load, because the CRL goes into the same
             # trust store. Only meaningful under mTLS -- with no client cert required there is
             # nothing to revoke. Covers the inbound HTTP listener too: it calls this builder
-            # (http_listener.py), so one wiring serves two listeners.
+            # (http_listener.py), so one wiring serves two listeners. The whole client chain is
+            # checked, as on the API listener, so a revoked intermediate CA refuses the clients
+            # under it, and a loaded client CA with no CRL of its own refuses here (vault BACKLOG
+            # #5511; harden_crl_check says why).
             if crl := s.get("tls_crl_file"):
-                harden_crl_check(ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file")
+                harden_crl_check(
+                    ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file", chain=True
+                )
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
         # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites

@@ -151,38 +151,10 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
                 refusal = anchor_refusal(crl, enforcing=enforcing)
                 if refusal is not None:
                     raise refusal
-            # And the whole chain is checked, so a revoked intermediate refuses its clients too.
+            # And the whole chain is checked, so a revoked intermediate refuses its clients too,
+            # and a loaded client CA with no CRL of its own in the file refuses the build.
             harden_crl_check(ctx, crl.path, setting=crl.setting, chain=True)
-            _refuse_a_loaded_ca_without_its_own_crl(ctx, crl.path, setting=crl.setting)
     return ctx
-
-
-def _refuse_a_loaded_ca_without_its_own_crl(
-    ctx: ssl.SSLContext, crl_file: str, *, setting: str
-) -> None:
-    """Refuse the build when a loaded client CA has no CRL of its own in ``crl_file`` (vault BACKLOG
-    #5627). With the whole chain checked, OpenSSL needs that CRL for every certificate the CA
-    issued, a leaf or an intermediate a client sends, and refuses each client with ``unable to
-    get certificate CRL`` when it is missing: a context that builds and then refuses every client
-    under that CA, which this says at start instead. Which CRL is a CA's own is
-    :func:`messagefoundry.pki.cas_without_own_crl`'s to say, and the words are
-    :func:`messagefoundry.pki.own_crl_refusal`'s, which the running-hop reload says too. An
-    intermediate only the client sends is not loaded, so its own CRL cannot be checked here.
-    Raises ``ValueError`` naming ``setting``."""
-    from messagefoundry.pki import cas_without_own_crl, own_crl_refusal
-
-    try:
-        pem = Path(crl_file).read_bytes()
-    except OSError as exc:
-        raise ValueError(f"{setting} could not be read again after loading: {exc}") from exc
-    try:
-        missing = cas_without_own_crl(ctx.get_ca_certs(binary_form=True), pem)
-    except ValueError as exc:
-        raise ValueError(
-            f"{setting} could not be checked against [api].tls_client_ca_file: {exc}"
-        ) from exc
-    if missing:
-        raise ValueError(f"{setting}: {own_crl_refusal(missing)}")
 
 
 class ApiHandshakeRecord:

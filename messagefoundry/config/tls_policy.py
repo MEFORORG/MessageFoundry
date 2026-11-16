@@ -306,9 +306,16 @@ def harden_crl_check(
     With ``chain``, revocation is checked for every certificate in the peer's chain, not only the
     leaf (``VERIFY_CRL_CHECK_CHAIN``, vault BACKLOG #5627), so a revoked intermediate CA refuses
     the clients under it. Every CA in the chain then needs its issuer's CRL in the file, or each
-    client under it is refused with ``unable to get certificate CRL``: that fails closed. A
-    single-tier CA, whose own CRL covers its leaves, behaves as without it. The API listener
-    passes it; every other hop keeps the leaf check.
+    client under it is refused with ``unable to get certificate CRL``: that fails closed. So a
+    loaded CA with no CRL of its own in the file refuses here, at start
+    (:func:`messagefoundry.pki.own_crl_reason`), a root that only signs intermediates included.
+    A single-tier CA, whose own CRL covers its leaves, behaves as without it.
+
+    The listeners that require a client certificate pass it: the API listener (#5627) and, since
+    vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. Each pins
+    its client CA, so the CAs the start rule reads are the operator's. Every other hop keeps the
+    leaf check, at least the outbound hops under ``[tls].crl_file``: one may verify against the
+    OS trust store, whose roots no CRL file names, so the start rule would refuse it.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -391,6 +398,7 @@ def harden_crl_check(
     from pathlib import Path
 
     from messagefoundry.config.loaded_crls import record_crl_load
+    from messagefoundry.pki import own_crl_reason
 
     label = crl_label(crl_file, setting)
     path = Path(crl_file)
@@ -467,9 +475,14 @@ def harden_crl_check(
             ) from exc
     # Last of the refusals: only now is it known that OpenSSL holds exactly the CRLs judged.
     _check_crl_signatures(pem, anchors, label=label, crl_file=crl_file)
-    ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if chain:
-        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
+        # Vault BACKLOG #5627, #5511: a loaded CA with no CRL of its own would refuse every client
+        # under it at the handshake, so say so at start (messagefoundry.pki.own_crl_reason).
+        if (why := own_crl_reason(anchors, pem)) is not None:
+            raise ValueError(f"{label}: {why}")
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN  # carries the leaf bit too
+    else:
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if record_held_copy:
         record_crl_load(ctx, crl_file, pem, facts, setting=setting, blocks=blocks)
 

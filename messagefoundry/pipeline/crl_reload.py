@@ -38,7 +38,8 @@ checks the signature too, and refuses only the proven case, which is
 that a start loads with a warning, so this reload holds back some files a start would load. The
 remedy says which (vault BACKLOG #3506): a proven bad signature is a file to fix, and one the engine
 could not confirm asks for a check, then a restart, since such a file can be right.
-A hop that checks revocation for the whole chain, at least the API listener, must also find
+A hop that checks revocation for the whole chain, at least the API listener and the MLLP, HTTP and
+DICOM inbound listeners (vault BACKLOG #5511), must also find
 each CA it lists with a CRL of its own in the file (:func:`~messagefoundry.pki.cas_without_own_crl`,
 vault BACKLOG #5627), the rule a start applies there, so a file that fails it is a file to fix.
 The hop's list holds only its own trust store. An intermediate CA the peer sends in its handshake is
@@ -148,9 +149,8 @@ from messagefoundry.pki import (
     CrlFacts,
     CrlIssuerKey,
     CrlSignatureFinding,
-    cas_without_own_crl,
     crl_signature_finding,
-    own_crl_refusal,
+    own_crl_reason,
     quoted_issuer,
 )
 from messagefoundry.redaction import log_timestamp
@@ -918,11 +918,7 @@ def _load(
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
                 # loads live.
                 if anchors not in unowned:
-                    try:
-                        missing = cas_without_own_crl(anchors, pem)
-                        unowned[anchors] = own_crl_refusal(missing) if missing else None
-                    except ValueError as exc:  # a start refuses the same file, naming it
-                        unowned[anchors] = f"it could not be checked against the hop's CAs: {exc}"
+                    unowned[anchors] = own_crl_reason(anchors, pem)
                 if (unowned_why := unowned[anchors]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue

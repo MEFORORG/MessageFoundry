@@ -2346,7 +2346,8 @@ issuer. The engine applies a replaced file only when all three of these hold:
    the marker text out of the comment. The file carries no certificate the hop does not already
    trust. For `[api].tls_client_crl_file`, each CA the hop loaded from `[api].tls_client_ca_file`
    has a CRL of its own in it, as that setting's row says (vault BACKLOG #5627); a file that fails
-   this is refused as `fix_file`.
+   this is refused as `fix_file`. An inbound connection's `tls_crl_file` on an MLLP, HTTP or DICOM
+   listener takes the same rule against its `tls_ca_file` (vault BACKLOG #5511).
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
    and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
@@ -2471,12 +2472,14 @@ these cases after that WARNING (the paragraph after this list says which). At le
 
 **`[api].tls_client_crl_file` refuses more at start (vault BACKLOG #5627).** That hop checks the
 whole client chain, so each CA loaded from `[api].tls_client_ca_file` needs a CRL of its own in
-the file; that setting's row says what counts. So on that hop at least the second bullet's case
+the file; that setting's row says what counts. An inbound connection's `tls_crl_file` on an MLLP,
+HTTP or DICOM listener does the same against its `tls_ca_file` (vault BACKLOG #5511), so all that
+this paragraph says of the API hop holds there too. So on that hop at least the second bullet's case
 refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
 SHA-1 CRL with no key identifier among them. The SHA-1 trade-off above does not arise there for
 such a CRL, since it never loads. A CRL of the first bullet's kind can refuse too, at least where
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
-other hop loads all three cases with the WARNING.
+other hop, at least each outbound hop, loads all three cases with the WARNING.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
 it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
