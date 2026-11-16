@@ -92,7 +92,7 @@ def test_sustain_samples_floor() -> None:
         SaturationDetector(sustain_samples=1)  # fewer than 2 can't tell a burst from growth
 
 
-# --- BACKLOG #5768: a flat step is not a rise, and a window with no time span has no rate ----------
+# --- BACKLOG #5768: one rise is not sustained growth, and a window with no time span has no rate ---
 
 
 @pytest.mark.parametrize(
@@ -100,18 +100,29 @@ def test_sustain_samples_floor() -> None:
     [
         [0, 0, 0, 1],  # a primed idle lane takes one message
         [0, 0, 5, 5],  # one tick's burst, then nothing more arrives
-        [0, 5, 5, 10],  # a flat step mid-window
-        [3, 4, 5, 5],  # rises, then stops rising
+        [7, 7, 7, 8],  # a busy lane at steady state takes one more
     ],
 )
-def test_a_window_with_a_flat_step_does_not_fire(depths: list[int]) -> None:
+def test_a_window_with_one_rise_does_not_fire(depths: list[int]) -> None:
     assert _feed(SaturationDetector(sustain_samples=3), depths) is None
 
 
-def test_the_flat_step_ages_out_and_sustained_rise_then_fires() -> None:
+@pytest.mark.parametrize(
+    "depths",
+    [
+        [5, 5, 6, 7],  # an outbound sampled on each retry, faster than its arrivals
+        [0, 5, 5, 10],  # a flat step mid-window
+    ],
+)
+def test_a_window_with_flat_steps_and_two_rises_fires(depths: list[int]) -> None:
+    sig = _feed(SaturationDetector(sustain_samples=3), depths)
+    assert sig is not None and sig.depth == depths[-1]
+
+
+def test_the_single_rise_ages_out_and_sustained_rise_then_fires() -> None:
     det = SaturationDetector(sustain_samples=2)  # keeps 3 samples
     assert _feed(det, [0, 0, 1]) is None
-    sig = det.observe(3.0, 2)  # window [0, 1, 2]: every step rose
+    sig = det.observe(3.0, 2)  # window [0, 1, 2]: two rises
     assert sig is not None and sig.depth_start == 0 and sig.depth == 2
 
 
