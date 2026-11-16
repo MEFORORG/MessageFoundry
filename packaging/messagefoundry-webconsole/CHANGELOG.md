@@ -82,8 +82,10 @@ this line.**
   through `LoginRequest`, `MfaVerifyRequest`, `ReauthRequest` and `MfaConfirmRequest`, so a value
   one of those refuses is refused before it is hashed, audited or sent to the directory. Not every
   form field is checked: `_form_fits` names the ones that are. The sign-in authenticator code is
-  now refused past the JSON route's bound rather than cut to 16 characters. Needs the engine seam
-  that carries those four models. (vault BACKLOG #5397, #5398, #5399)
+  now refused, as the JSON route refuses it, past its bound or for any non-digit, a space
+  included, rather than cut to 16 characters; the enrolment code at confirm is refused past 64
+  rather than cut. Needs the engine seam digest that lists those four models. (vault BACKLOG
+  #5397, #5398, #5399)
 - **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`
   records on the handshake whether it admitted the caller, which the engine's accept gate reads,
   the latest recorded answer standing. A handshake with no Origin is not this gate's to judge, so it

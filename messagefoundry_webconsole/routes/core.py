@@ -186,15 +186,17 @@ def _form_fits(request: Request, model: type[BaseModel], **fields: str) -> bool:
     The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
     route's model does. Asking the model keeps one definition of each bound (BACKLOG #5397, #5398,
     #5399). Only the fields a caller passes are checked: at least the sign-in username, password and
-    authenticator code, the MFA and step-up codes, the step-up password and the enrolment-confirm
-    code. A field a caller does not pass, such as the sign-in passkey assertion, is not. Any refusal
-    by the model counts, not only a length one, so a constraint later added to a checked field binds
-    the form too.
+    authenticator code, the MFA and step-up codes, the step-up password, and the enrolment-confirm
+    code and enrolment code. A field a caller does not pass, such as the sign-in passkey assertion,
+    is not. Any refusal by the model counts, not only a length one: the sign-in authenticator code
+    is refused for a non-digit, a space included, as the JSON route refuses it. The check only
+    refuses; the service still receives the raw form value, not one the model normalised.
 
-    Every caller runs its rate limiter before this check, so a refused value has spent the attempt
-    that limiter charged, which the JSON route's 422 does not spend. A refusal is logged in the JSON 422 handler's own
-    words, with the method, the path and the error count, and never a value: the fields are
-    credentials."""
+    Each caller runs this after its rate limiter, so a refused value has already been charged
+    whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
+    passkey sign-in that charge was taken at the begin leg. A refusal is logged in the JSON 422
+    handler's own words, with the method, the path and the error count, and never a value: the
+    fields are credentials."""
     try:
         model(**fields)
     except ValidationError as exc:

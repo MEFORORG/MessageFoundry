@@ -634,10 +634,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
         raw_code = form.get("code", "")
+        enrolment_code = form.get("enrolment_code", "")
         try:
-            # The JSON MfaConfirmRequest's bound, on the code as submitted: an oversized code is
-            # never checked, and reads as a wrong one.
-            if not _form_fits(request, MfaConfirmRequest, code=raw_code):
+            # The JSON MfaConfirmRequest's bounds, on both codes as submitted: an oversized one is
+            # refused, never cut, is never checked, and reads as a wrong code.
+            if not _form_fits(
+                request, MfaConfirmRequest, code=raw_code, enrolment_code=enrolment_code
+            ):
                 elevation = Elevation()
             else:
                 elevation = await service.confirm_mfa_enrollment(
@@ -645,9 +648,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     raw_code.strip(),
                     token=token,
                     client=client,
-                    # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
-                    # code is that long, so the cut only stops an outsized value being normalised.
-                    enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
+                    enrolment_code=enrolment_code or None,
                 )
         except EnrolmentCodeRefused as exc:
             # ADR 0207: the one reply, so the holder can retry; the refusal spent no TOTP step and

@@ -21,6 +21,7 @@ from _ui_clients import PW, SAME_ORIGIN, held_totp_code, mint_bound_proof, provi
 
 from messagefoundry.api.auth_models import (
     _CONFIRM_CODE_MAX,
+    _ENROLMENT_CODE_MAX,
     _MFA_CODE_MAX,
     _NAME_MAX,
     _PASSWORD_MAX,
@@ -129,7 +130,8 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: ui_login cuts the authenticator code to a length instead of refusing it through
-    LoginRequest, or checks it against a bound other than the JSON route's."""
+    LoginRequest, checks it against a bound other than the JSON route's, or drops the model's digit
+    pattern."""
     service = await _service(engine)
     calls = _spy(monkeypatch, service, "login")
     async with ui_client(engine, service) as c:
@@ -140,6 +142,12 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
         # At the bound the code is passed on whole, as the JSON route passes it.
         await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
         assert len(calls) == 1 and calls[0][-1]["totp_code"] == "1" * MAX_DIGITS
+        # Not only the length: LoginRequest refuses a non-digit, a space included, as the JSON
+        # route does.
+        for refused in ("12345a", " 12345", "123 45"):
+            r = await c.post("/ui/login", data={**base, "totp_code": refused})
+            assert r.headers["location"] == "/ui/login?e=bad"
+        assert len(calls) == 1
         # A blank code is the two-step flow, passed on as no code.
         await c.post("/ui/login", data={**base, "totp_code": ""})
     assert len(calls) == 2 and calls[1][-1]["totp_code"] is None
@@ -243,8 +251,9 @@ async def test_an_oversized_step_up_password_never_reaches_reauth(
 async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ui_mfa_verify stops checking the code against MfaConfirmRequest before it calls
-    confirm_mfa_enrollment, or checks the stripped value rather than the one submitted."""
+    """RED when: ui_mfa_verify stops checking the code or the enrolment code against
+    MfaConfirmRequest before it calls confirm_mfa_enrollment, checks the stripped code rather than
+    the one submitted, or cuts the enrolment code instead of refusing it."""
     service = await _service(engine)
     await _add(service)
     calls = _spy(monkeypatch, service, "confirm_mfa_enrollment")
@@ -253,9 +262,14 @@ async def test_an_oversized_enrolment_confirm_code_never_reaches_the_service(
         await mint_bound_proof(c, "/ui/account/mfa/enroll")
         staged = await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)
         assert staged.status_code == 200 and "Secret:" in staged.text
-        for refused in ("1" * (_CONFIRM_CODE_MAX + 1), "1" * _CONFIRM_CODE_MAX + " "):
+        for refused in (
+            {"code": "1" * (_CONFIRM_CODE_MAX + 1)},
+            {"code": "1" * _CONFIRM_CODE_MAX + " "},
+            # The enrolment code is refused past MfaConfirmRequest's bound too, never cut to it.
+            {"code": "123456", "enrolment_code": "e" * (_ENROLMENT_CODE_MAX + 1)},
+        ):
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
-            r = await c.post("/ui/account/mfa/verify", data={"code": refused}, headers=SAME_ORIGIN)
+            r = await c.post("/ui/account/mfa/verify", data=refused, headers=SAME_ORIGIN)
             assert r.status_code == 400 and "Invalid code." in r.text
         assert calls == []
         # At the bound the code is checked, as the JSON route checks it.

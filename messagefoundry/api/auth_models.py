@@ -32,12 +32,12 @@ from messagefoundry.auth.usernames import username_refusal
 _NAME_MAX = 256
 _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
-#: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``). The browser /ui/mfa and
-#: /ui/reauth handlers refuse past the same bound (BACKLOG #5398, #5399).
+#: A TOTP code or a single-use recovery code (``MfaVerifyRequest.code``).
 _MFA_CODE_MAX = 64
-#: A TOTP code confirming a staged enrolment (``MfaConfirmRequest.code``). The browser
-#: /ui/account/mfa/verify handler refuses past the same bound.
+#: A TOTP code confirming a staged enrolment (``MfaConfirmRequest.code``).
 _CONFIRM_CODE_MAX = 16
+#: The issued enrolment code a confirm may carry (``MfaConfirmRequest.enrolment_code``, ADR 0207).
+_ENROLMENT_CODE_MAX = 64
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
@@ -485,7 +485,7 @@ class MfaConfirmRequest(RequestModel):
     code: str = Field(max_length=_CONFIRM_CODE_MAX)
     #: ADR 0207: the issued enrolment code, which a directory account's first
     #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
-    enrolment_code: str | None = Field(default=None, max_length=64)
+    enrolment_code: str | None = Field(default=None, max_length=_ENROLMENT_CODE_MAX)
 
 
 class MfaConfirmResponse(CredentialReply):
