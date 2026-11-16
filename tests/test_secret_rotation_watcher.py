@@ -452,6 +452,25 @@ def test_connector_secret_env_values_resolves_as_the_build_does() -> None:
     assert set(got) == {"hdrs", "u"}
 
 
+def test_connector_secret_env_values_renaming_is_not_a_rotation() -> None:
+    # Only the credential VALUES are MAC'd, so renaming a header or a query parameter while keeping
+    # the same key does not reset the clock or lift an overdue expiry refusal.
+    headers = _rest_with({"headers": EnvRef(key="hdrs")})
+    first = connector_secret_env_values(headers, {"hdrs": {"X-Api-Key": "SAME"}})
+    assert connector_secret_env_values(headers, {"hdrs": {"x-api-key": "SAME"}}) == first
+    url = _rest_with({"url": EnvRef(key="u")})
+    first = connector_secret_env_values(url, {"u": "https://a.example.invalid/x?api_key=SAME"})
+    renamed = connector_secret_env_values(url, {"u": "https://a.example.invalid/x?API_KEY=SAME"})
+    assert renamed == first
+
+
+def test_connector_secret_env_values_reads_a_secret_setting_raw() -> None:
+    # A credential setting is fingerprinted from its environment value as before, whatever its cast
+    # returns, so a cast to bytes does not drop it from rotation tracking.
+    reg = _rest_with({"bearer_token": EnvRef(key="tok", cast=str.encode)})
+    assert connector_secret_env_values(reg, {"tok": "SECRET"}) == {"tok": "SECRET"}
+
+
 # --- live-by-default: DEK tracked via the stamp when operator date unset -----
 
 

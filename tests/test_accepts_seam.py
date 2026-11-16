@@ -868,6 +868,46 @@ def _calls_a_module_less_helper(msg: Any) -> bool:
     return bool(_no_module_helper(msg))
 
 
+def _generator_accepts(msg: Any) -> Any:
+    yield False  # a generator object, which also reads as True
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_state_read(key: str) -> bool:
+    return state_get("ns", key, default=None) is not None
+
+
+def _calls_a_cached_helper(msg: Any) -> bool:
+    return _cached_state_read("k")
+
+
+class _Looped:
+    """Callables whose __wrapped__ chain is a cycle; the walk must stop, not hang."""
+
+    __call__ = staticmethod(_sync_pred)
+
+
+_loop_a, _loop_b = _Looped(), _Looped()
+_loop_a.__wrapped__ = _loop_b  # type: ignore[attr-defined]
+_loop_b.__wrapped__ = _loop_a  # type: ignore[attr-defined]
+
+
+class _RaisingClassProbe:
+    enabled = True
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # noqa: PLE0237 -- a lazy proxy's class lookup can raise
+        raise RuntimeError("synthetic: proxy not ready")
+
+
+_PROXY = _RaisingClassProbe()
+
+
+def _reads_a_proxy(msg: Any) -> bool:
+    # ``_PROXY.enabled`` is a (global, attribute) load, which captured_values tests with isinstance.
+    return bool(_PROXY.enabled)
+
+
 @pytest.mark.parametrize(
     "pred",
     [
@@ -875,8 +915,9 @@ def _calls_a_module_less_helper(msg: Any) -> bool:
         functools.partial(_async_accepts),
         _AsyncCallable(),
         _AsyncAdapter(_sync_pred),
+        _generator_accepts,
     ],
-    ids=["async_def", "partial_of_async", "async_call_instance", "async_update_wrapper"],
+    ids=["async_def", "partial_of_async", "async_call_instance", "async_update_wrapper", "gen"],
 )
 def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
     reg = _reg(tmp_path)
@@ -897,6 +938,7 @@ def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
         (_inner_def_reads_state, "state_get"),
         (_StateAdapter(_sync_pred), "state_get"),
         (_calls_a_partial_alias, "state_get"),
+        (_calls_a_cached_helper, "state_get"),
     ],
     ids=[
         "partial_kw",
@@ -908,6 +950,7 @@ def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
         "inner",
         "update_wrapper",
         "partial_alias",
+        "lru_cache_helper",
     ],
 )
 def test_an_indirect_run_scoped_read_fails_validate(
@@ -927,11 +970,23 @@ def test_an_indirect_run_scoped_read_fails_validate(
         functools.partial(_accepts_with, getter=lambda *a, **k: None),
         _closure_over(lambda *a, **k: None),
         _calls_a_module_less_helper,  # a helper whose __module__ is None must not crash validate
+        _loop_a,  # a __wrapped__ cycle must end the walk, not hang validate
     ],
-    ids=["plain", "partial_harmless", "closure_harmless", "module_less_helper"],
+    ids=["plain", "partial_harmless", "closure_harmless", "module_less_helper", "wrapped_cycle"],
 )
 def test_a_pure_indirect_accepts_still_validates(tmp_path: Path, pred: Any) -> None:
     # The control: the walk must not refuse a predicate that reaches no accessor.
     reg = _reg(tmp_path)
     reg.handler_accepts["h"] = pred
     reg.validate()
+
+
+def test_a_walk_that_raises_is_a_configuration_problem(tmp_path: Path) -> None:
+    # Author code that runs during the walk (an object's own __class__) and raises is refused as a
+    # WiringError naming the exception type only, never a raw traceback out of validate().
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_a_proxy
+    with pytest.raises(WiringError, match="could not be inspected") as exc:
+        reg.validate()
+    assert "RuntimeError" in str(exc.value)
+    assert "proxy not ready" not in str(exc.value)

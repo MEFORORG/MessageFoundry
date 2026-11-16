@@ -103,6 +103,7 @@ from messagefoundry.config.settings import (
     SyslogProtocol,
 )
 from messagefoundry.config.wiring import (
+    _UNRESOLVED,
     _WITHHELD_PEER,
     Registry,
     WiringError,
@@ -268,12 +269,18 @@ def _http_literal_static(
     it goes on the wire beside the connector's own. A query parameter counts when
     ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
 
+    A table counts only as a ``dict``, the one type every connector's header builder sends.
+
     An ``env()`` reference standing for the whole ``headers`` table, or for the ``url``, is read as
     the build resolves it (``config.wiring._db_setting``), against ``env_values``, else its literal
-    ``default=``. One the caller holds no value for, with no default, is not read, as
-    ``query_credential_hops`` leaves one: the serve-time registry guard passes the running values,
-    so the opt-in gate reads it there. Each label is fixed text, so no header name, parameter name
-    or value reaches a detail."""
+    ``default=``. A ``headers`` reference this reading cannot resolve is listed as possibly a
+    credential, as ``static_credential_db_hops`` lists an unresolved dialect, so ``messagefoundry
+    check``, which passes no values, does not report as credential-free a hop the serve-time guard
+    may refuse. An unresolved ``url`` is not read, as ``query_credential_hops`` leaves one: a URL from
+    ``env()`` is the ordinary case, and listing every one would bury the hops that matter. So
+    ``check`` and the serve-time guard can still differ on at least a credential in an ``env()``
+    URL's query. Each label is fixed text, so no header name, parameter name or value reaches a
+    detail."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     def overwritten(key: str) -> bool:
@@ -286,7 +293,11 @@ def _http_literal_static(
     out: list[str] = []
     values = env_values or {}
     headers = _db_setting(settings, "headers", None, values)
-    if isinstance(headers, Mapping) and any(
+    if headers is _UNRESOLVED:
+        out.append(
+            "possibly a credential in a headers table from env() this reading cannot resolve"
+        )
+    elif isinstance(headers, dict) and any(
         _is_secret_header(str(key), value) and not overwritten(str(key))
         for key, value in headers.items()
     ):

@@ -1090,11 +1090,13 @@ def test_the_header_and_query_quiet_twins_stay_quiet(literal_registry: Registry)
     assert "headers table" not in hops["OB_SOAP_AUTHZ_SPACE"].detail, hops["OB_SOAP_AUTHZ_SPACE"]
 
 
-def test_an_env_table_or_url_with_no_value_is_not_read(literal_registry: Registry) -> None:
-    # With no values the reference cannot be resolved, and query_credential_hops leaves it the same
-    # way; the serve-time guard passes the running values, so the gate reads it there.
+def test_an_env_table_with_no_value_is_possibly_a_credential(literal_registry: Registry) -> None:
+    # With no values (messagefoundry check) a headers table from env() cannot be resolved, so it is
+    # listed as possibly a credential rather than as presenting none, which the serve-time guard
+    # could contradict. An unresolved env() url is left unread, as query_credential_hops leaves it.
     hops = _by_name(literal_registry, None)
-    assert hops["OB_ENV_TABLE"].credential == "none", hops["OB_ENV_TABLE"]
+    assert hops["OB_ENV_TABLE"].credential == "static", hops["OB_ENV_TABLE"]
+    assert "cannot resolve" in hops["OB_ENV_TABLE"].detail, hops["OB_ENV_TABLE"]
     assert hops["OB_ENV_URL"].credential == "none", hops["OB_ENV_URL"]
 
 

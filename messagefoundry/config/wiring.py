@@ -2174,78 +2174,72 @@ def connector_secret_env_values(
     is never built and its values are never resolved (ADR 0111 AC-1), so the engine holds no
     credential of its to track.
 
-    A top-level ``env()`` ref is resolved as the build resolves it (:func:`_db_setting`, so its
-    ``cast`` runs and a missing key falls back to its ``default=``), and is included when it resolves
-    and the setting is one of three shapes (:func:`_env_secret_material`):
+    A top-level ``env()`` ref is included when the setting is one of three shapes
+    (:func:`_env_secret_material`):
 
     * a **rotatable** credential setting, recognised by :func:`_is_secret_setting` (so the SOAP
       ``body_secret_value_<i>`` prefix class is covered, not only the fixed :data:`_SECRET_SETTING_KEYS`
       names) and not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS`, whose
-      value is a non-empty string;
+      environment value is a non-empty string, read raw as before;
     * a ``headers`` reference standing for the whole table, whose table holds a header
       :func:`_is_secret_header` reads as a credential;
     * a URL setting (:func:`_is_url_setting`) whose value carries userinfo or a query parameter
       ``secretscrub`` reads as a credential.
 
-    For the last two the value MAC'd is the credential part alone, in a fixed encoding, so a change to
-    a harmless header or to the host is not read as a rotation. Values are returned **transiently** to
-    be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
-    Settings sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
-    ``env()``) credentials are skipped: they carry no stable per-environment identity to fingerprint,
-    and the factories already forbid an inline value for a secret setting. A header ``env()`` nested
-    inside a table is refused at load (:func:`_reject_envref_headers`), so it never reaches here."""
+    The last two are resolved as the build resolves them (:func:`_db_setting`, so the reference's
+    ``cast`` runs and a missing key falls back to its ``default=``), and only the credential VALUES
+    are MAC'd, in a fixed encoding, so a renamed header or parameter, a harmless header or a new host
+    is not read as a rotation. Values are returned **transiently** to be MAC'd — never persisted or
+    logged; the map key is the operator-chosen env name, never the value. Settings sharing an env key
+    collapse to one entry (one secret → one rotation clock).
+
+    Inline (non-``env()``) credentials are skipped: they carry no stable per-environment identity to
+    fingerprint. The factories forbid an inline value for a secret setting, but not a literal
+    credential in a ``headers`` table or a ``url`` query, so such a credential gets no rotation clock
+    here; the static-credential inventory lists it (BACKLOG #5510). A header ``env()`` nested inside a
+    table is refused at load (:func:`_reject_envref_headers`), so it never reaches here."""
     out: dict[str, str] = {}
     for _kind, _name, settings, deployed in registry.settings_carriers():
         if not deployed:
             continue
         for name, value in settings.items():
-            # Resolved only for a setting that can hold one, so no other setting's cast runs here.
-            if not isinstance(value, EnvRef) or not _may_hold_env_secret(name):
+            if not isinstance(value, EnvRef) or name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
                 continue
-            material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
+            if _is_secret_setting(name):
+                raw = env_values.get(value.key)
+                material = raw if isinstance(raw, str) and raw else None
+            elif name == "headers" or _is_url_setting(name):
+                # Resolved only for these two, so no other setting's cast runs here.
+                material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
+            else:
+                continue
             if material:
                 out[value.key] = material
     return out
 
 
-def _may_hold_env_secret(name: str) -> bool:
-    """Whether setting ``name`` is one of the three shapes :func:`connector_secret_env_values`
-    fingerprints."""
-    if name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
-        return False
-    return _is_secret_setting(name) or name == "headers" or _is_url_setting(name)
-
-
 def _env_secret_material(name: str, resolved: object) -> str | None:
-    """The credential material setting ``name`` holds once resolved to ``resolved``, as the string
-    :func:`connector_secret_env_values` hands the rotation watcher, or ``None`` when it holds none."""
-    if not _may_hold_env_secret(name):
-        return None
-    if _is_secret_setting(name):
-        return resolved if isinstance(resolved, str) and resolved else None
+    """The credential values a resolved ``headers`` table or URL setting holds, as the string
+    :func:`connector_secret_env_values` hands the rotation watcher, or ``None`` when it holds none.
+    A table counts only as a ``dict``, the one type every connector's header builder sends."""
     if name == "headers":
-        if not isinstance(resolved, Mapping):
+        if not isinstance(resolved, dict):
             return None
         held = sorted(
-            (str(key), str(value))
-            for key, value in resolved.items()
-            if _is_secret_header(str(key), value)
+            str(value) for key, value in resolved.items() if _is_secret_header(str(key), value)
         )
         return json.dumps(held) if held else None
-    if _is_url_setting(name):
-        urls = [resolved] if isinstance(resolved, str) else resolved
-        if not isinstance(urls, (list, tuple)):
-            return None
-        parts = [
-            part for url in urls if isinstance(url, str) and (part := _url_credential_part(url))
-        ]
-        return json.dumps(parts) if parts else None
-    return None
+    urls = [resolved] if isinstance(resolved, str) else resolved
+    if not isinstance(urls, (list, tuple)):
+        return None
+    parts = [part for url in urls if isinstance(url, str) and (part := _url_credential_part(url))]
+    return json.dumps(parts) if parts else None
 
 
 def _url_credential_part(url: str) -> list[object] | None:
-    """The userinfo and the credential query parameters of ``url``, or ``None`` when it has neither.
-    A value that does not parse holds nothing this can read; the build refuses such a URL."""
+    """The userinfo and the credential query parameters' values of ``url``, or ``None`` when it
+    has neither. A value that does not parse holds nothing this can read; the build refuses such a
+    URL."""
     try:
         split = urllib.parse.urlsplit(url)
         pairs = urllib.parse.parse_qsl(split.query, keep_blank_values=True)
@@ -2254,7 +2248,7 @@ def _url_credential_part(url: str) -> list[object] | None:
         _logger.debug("rotation watcher: a URL setting does not parse, so it is not fingerprinted")
         return None
     userinfo = split.netloc.rpartition("@")[0]
-    query = sorted([key, value] for key, value in pairs if _is_credential_param(key))
+    query = sorted(value for key, value in pairs if _is_credential_param(key))
     return [userinfo, query] if userinfo or query else None
 
 
@@ -5756,11 +5750,19 @@ def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -
 
 
 def _accepts_is_async(pred: object) -> bool:
-    """Whether ``pred``, or a function it runs through :func:`_accepts_callees`, is a coroutine or
-    async-generator function: calling it returns an object that is always truthy."""
+    """Whether ``pred``, or a function it runs through :func:`_accepts_callees`, is a coroutine,
+    async-generator or generator function: calling it returns an object that is always truthy.
+
+    A ``__wrapped__`` counts as code that may run, so a sync wrapper around an async function is
+    refused too, though it might run that function to completion. That errs closed, and the author
+    can drop the ``functools.wraps``."""
     return any(
         issubclass(type(obj), FunctionType)
-        and (inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj))
+        and (
+            inspect.iscoroutinefunction(obj)
+            or inspect.isasyncgenfunction(obj)
+            or inspect.isgeneratorfunction(obj)
+        )
         for obj in _accepts_walk(pred, _accepts_callees)
     )
 
@@ -5777,20 +5779,31 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     predicate's own module, and every partial and bound method, whose targets are judged the same
     way. An accessor counts when a reached object IS ``state_get`` or ``response_get``, so an alias
     is caught, or when a reached function's code, or code nested in it (a lambda or an inner
-    ``def``), names one, as the earlier one-level check did. Every read is static
-    (:func:`_accepts_callees`). It does not see at least: a call through ``getattr`` or another
-    computed name, a function in any other module, an object's other methods, or a value the
-    predicate builds while it runs."""
+    ``def``), names one, as the earlier one-level check did. A function or instance defined
+    elsewhere that carries a ``__wrapped__`` chain, such as a ``functools.lru_cache`` or a library
+    decorator around a config helper, is judged by the function at the end of the chain
+    (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
+    ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
+    :func:`_check_accepts_predicate` refuses a predicate whose walk raises. It does not see at
+    least: a call through ``getattr`` or another computed name, a function in any other module, an
+    object's other methods, or a value the predicate builds while it runs."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
-    from messagefoundry.config.reachability import _is_config_module, captured_values
+    from messagefoundry.config.reachability import (
+        _function_of,
+        _is_config_module,
+        captured_values,
+    )
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
 
     accessors = {id(state_get): "state_get", id(response_get): "response_get"}
-    root = pred
+    root, steps = pred, {id(pred)}
     while not issubclass(type(root), FunctionType) and (callees := _accepts_callees(root)):
+        if id(callees[0]) in steps:
+            break  # a __wrapped__ cycle among callables: stop rather than loop
         root = callees[0]
+        steps.add(id(root))
     home = root.__module__ if issubclass(type(root), FunctionType) else None
     if not isinstance(home, str) or home.startswith("messagefoundry."):
         # A shipped predicate such as message_type_of's: its module's globals are engine code, which
@@ -5801,13 +5814,14 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
         kind = type(value)
         if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
             return True
-        if issubclass(kind, FunctionType):
-            return _is_config_module(cast("FunctionType", value).__module__, home)
-        return (
-            callable(value)
-            and not issubclass(kind, type)
-            and _is_config_module(kind.__module__, home)
-        )
+        if issubclass(kind, type) or not callable(value):
+            return False
+        own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
+        if _is_config_module(own.__module__ if own else kind.__module__, home):
+            return True
+        # A cache or a library decorator around a config helper: judge the function it wraps.
+        inner = _function_of(value)
+        return inner is not None and _is_config_module(inner.__module__, home)
 
     def expand(obj: object) -> list[object]:
         if id(obj) in accessors:
@@ -5860,11 +5874,24 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
         )
     if _accepts_is_async(pred):
         raise WiringError(
-            f"accepts= predicate for handler {hname!r} is async; the router stage calls it without "
-            "awaiting, so its coroutine would read as True and accept every message. Make it a plain "
-            "function (msg) -> bool"
+            f"accepts= predicate for handler {hname!r} is async or a generator; the router stage "
+            "calls it without awaiting or iterating, so the object it returns would read as True "
+            "and accept every message. Make it a plain function (msg) -> bool"
         )
-    named = _accepts_run_scoped_reads(pred)
+    refusal: str | None = None
+    try:
+        named = _accepts_run_scoped_reads(pred)
+    except Exception as exc:  # noqa: BLE001 -- author code ran inside the walk; see below
+        # The walk can run an object's own __class__ (captured_values' isinstance), which is author
+        # code and can raise anything. Fail closed as a configuration problem naming only the
+        # exception type, never its text, rather than crash the load with a raw traceback.
+        refusal = (
+            f"accepts= predicate for handler {hname!r} could not be inspected for run-scoped reads "
+            f"({type(exc).__name__}); keep what it reads to plain functions and values"
+        )
+        named = set()
+    if refusal is not None:
+        raise WiringError(refusal)
     if named:
         raise WiringError(
             f"accepts= predicate for handler {hname!r} reads run-scoped state "
