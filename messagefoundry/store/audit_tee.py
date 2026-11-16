@@ -153,10 +153,22 @@ def _letters(words: Counter[str]) -> Counter[str]:
     return letters
 
 
-def _line_words(line: str) -> Counter[str]:
-    """The words a tee line shows outside the placeholders, counted: each JSON escape on it,
-    however many backslashes encode it, read as a break."""
-    return Counter(_WORD.findall(_LINE_ESCAPE.sub(" ", _PLACEHOLDERS.sub(" ", line))))
+def _line_words(line: str) -> tuple[Counter[str], Counter[str]]:
+    """The words a tee line shows outside the placeholders, counted, in two readings: each JSON
+    escape on it, however many backslashes encode it, read as a break; and the line read as JSON
+    text, left to right, so an escaped backslash is one break and what follows it is text, as in
+    a literal ``\\\\u1234``, whose digits the first reading takes as part of an escape."""
+    text = _PLACEHOLDERS.sub(" ", line)
+    return (
+        Counter(_WORD.findall(_LINE_ESCAPE.sub(" ", text))),
+        Counter(_WORD.findall(_JSON_ESCAPE.sub(" ", text))),
+    )
+
+
+def _shows_no_more(line: str, bar: tuple[Counter[str], Counter[str]]) -> bool:
+    """Whether ``line`` shows no word, counted, beyond ``bar``, a :func:`_line_words` reading, in
+    either reading: a word the bar's line hid in one reading is not let through by the other."""
+    return all(shown <= limit for shown, limit in zip(_line_words(line), bar, strict=True))
 
 
 def _parses(text: str) -> bool:
@@ -305,8 +317,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         # run that takes a ``Bearer`` label with it, and leave the credential the chain would have
         # caught. A stricter bar than the one that binds, which is :func:`_tee_line`'s.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
-        shown = _line_words(json.dumps(result, ensure_ascii=False)[1:-1])
-        if not shown <= _line_words(alone):
+        if not _shows_no_more(json.dumps(result, ensure_ascii=False)[1:-1], _line_words(alone)):
             return whole
         # A detail's note goes on after safe_text bounds it, in _bounded_detail.
         return result if detail else result + note
@@ -338,8 +349,9 @@ def _tee_line(
     its neighbours, so no check over a field alone can stand for it; an earlier version of this
     fix compared against one and shipped words the old line hid.
 
-    Each candidate is logged only if, on EVERY sink, what the handlers write for it shows no word,
-    counted, that the same sink wrote for the old line: the line with every scrubbed field, then
+    Each candidate is logged only if, on EVERY sink, every word what the handlers write for it
+    shows, counted and in both :func:`_line_words` readings, is one the same sink showed for the
+    old line: the line with every scrubbed field, then
     the old line with each field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed
     ``detail`` as ``whole_detail``, then the old line itself, which meets the bar trivially and
     so ends the search. Each handler runs the whole chain again over the one shared record, so
@@ -361,7 +373,7 @@ def _tee_line(
         for candidate in (after,) if whole == after else (after, whole):
             line = json.dumps(candidate, ensure_ascii=False)
             readings = sink_readings(line)
-            if all(_line_words(r) <= bar for r, bar in zip(readings, bars, strict=True)):
+            if all(_shows_no_more(r, bar) for r, bar in zip(readings, bars, strict=True)):
                 return line
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         _log_scrub_fault(exc)

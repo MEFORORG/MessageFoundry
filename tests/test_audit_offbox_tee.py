@@ -694,6 +694,9 @@ _WORD = re.compile(r"[A-Za-z0-9]+")
 #: is in a JSON ``detail`` on the line, reads as one break. Taking one backslash pair left
 #: ``u0001JANE`` behind as a word, and the comparison then missed ``JANE`` on either side.
 _ESCAPE_TEXT = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
+#: One JSON escape read left to right, so an escaped backslash is one break and the text after it
+#: is text: a literal backslash before ``u1234`` leaves ``u1234`` a word (review round-fc1a3906).
+_JSON_TEXT_ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
 
 
 def test_the_placeholder_pattern_is_the_two_placeholders() -> None:
@@ -828,11 +831,11 @@ def test_a_redacted_json_detail_is_re_encoded_no_longer_than_its_writer_wrote_it
     decode read, so a multi-line JSON detail with something to redact grew past the 200-character
     bound and shipped cut. It is spelled as ``json.dumps`` spells it now. Synthetic values."""
     assert audit_tee._encode_c0("a\nb\x01\t") == "a\\nb\\u0001\\t"
-    detail = json.dumps({"error": "step ok\n" * 19 + "DOE JANE"})
+    detail = json.dumps({"error": "step ok \n " * 16 + "DOE JANE"})
     assert len(detail) < 200
     (line,) = _tee_lines([{"detail": detail}], capsys)
     error = json.loads(_shipped_detail(line))["error"]
-    assert error.startswith("step ok\n") and "DOE" not in error
+    assert error.startswith("step ok \n ") and "DOE" not in error
 
 
 def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) -> None:
@@ -841,7 +844,7 @@ def test_a_json_detail_its_redaction_pushes_past_the_bound_still_parses(capsys) 
     ships as the JSON string ``"[redacted]"`` instead. Synthetic values."""
     from messagefoundry.redaction import safe_text
 
-    detail = json.dumps({"e": "ok " * 59 + "\x01DOE JANE"})
+    detail = json.dumps({"e": "ok " * 56 + "\x01 password=hunter2"})
     assert len(detail) == 200 and audit_tee._parses(safe_text(detail))
     # The control: the scrubbed detail, cut by safe_text alone, no longer parses.
     kept = audit_tee._scrub_field(detail, detail=True)
@@ -915,10 +918,13 @@ def _shown_per_sink_that_main_hid(
         for sink, (old_out, new_out) in enumerate(
             zip(sink_readings(old), sink_readings(new), strict=True), start=1
         ):
-            old_words = Counter(_WORD.findall(_ESCAPE_TEXT.sub(" ", _unplaced(old_out))))
-            new_words = Counter(_WORD.findall(_ESCAPE_TEXT.sub(" ", _unplaced(new_out))))
-            if extra := sorted(new_words - old_words):
-                shown.append((sink, ascii(case), extra))
+            # Both readings: escapes as breaks however many backslashes spell them, and the line
+            # as JSON text, where an escaped backslash is one break and what follows is text.
+            for escape in (_ESCAPE_TEXT, _JSON_TEXT_ESCAPE):
+                old_words = Counter(_WORD.findall(escape.sub(" ", _unplaced(old_out))))
+                new_words = Counter(_WORD.findall(escape.sub(" ", _unplaced(new_out))))
+                if extra := sorted(new_words - old_words):
+                    shown.append((sink, ascii(case), extra))
     return shown
 
 
@@ -926,7 +932,12 @@ def _shown_per_sink_that_main_hid(
 #: among them, a bar over the first pass alone shipped words main's same sink hid.
 _LATER_SINK_LEAKS: tuple[dict[str, str | None], ...] = (
     {"actor": "\x1bhunter2DOE\x7fsecret\t:x%7Cy%7Cz"},
-    {"client": '^abcdef0123456789abcd\x01password= ~secretpassword="'},
+    {"client": '^abcdef0123456789abcd\x01password=\u2028~secretpassword="'},
+    # Review round-fc1a3906: literal backslashes before digits, read as escapes by the bar.
+    {"actor": "\\u1234\\u5678\r&|SMITH,:"},
+    {"actor": "\\u1980\r&|SMITH,:"},
+    {"channel_id": "\\u1980\r&|SMITH,:"},
+    {"action": "\\Jones&|secret\x01\x00\t\\9\x1b"},
 )
 
 
@@ -946,9 +957,9 @@ def test_no_sink_shows_a_word_the_line_before_3045_hid_there(monkeypatch) -> Non
 #: Pieces for the seeded per-sink fuzz: controls, the log alphabet's DEL and U+2028, and the
 #: label, name, token and delimiter shapes the counterexamples above are made of.
 _FUZZ_PIECES = (
-    "\x01", "\x1b", "\x00", "\t", "\n", "\r", "\x7f", " ", "%7C", "password=", "secret",
+    "\x01", "\x1b", "\x00", "\t", "\n", "\r", "\x7f", "\u2028", "%7C", "password=", "secret",
     "hunter2", "DOE", "JANE", " ", "|", "^", "~", '"', ":", "Bearer ", "abcdef0123456789abcd",
-    "token=", "05/05/1980", "MRN ", "12345678", "x", "ABC|", "\\", "SMITH,", "=", "&",
+    "token=", "05/05/1980", "MRN ", "12345678", "x", "ABC|", "\\", "\\u1234", "SMITH,", "=", "&",
 )  # fmt: skip
 
 
