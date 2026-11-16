@@ -1140,7 +1140,7 @@ try {
         allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $lifecycleAt)
         handoff          = $handoffObj
         predecessor      = $pred
-        notes            = if ($Declare -and $Notes) { ($Notes -replace '\s+', ' ').Substring(0, [Math]::Min(2000, $Notes.Length)) } else { Prior 'notes' '' }
+        notes            = if ($Declare -and $Notes) { $collapsedNotes = $Notes -replace '\s+', ' '; $collapsedNotes.Substring(0, [Math]::Min(2000, $collapsedNotes.Length)) } else { Prior 'notes' '' }
     }
 
     # Carried forward ONLY where it exists, so a record never cleared keeps its old shape. Without
