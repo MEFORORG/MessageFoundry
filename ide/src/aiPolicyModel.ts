@@ -134,16 +134,26 @@ export function evaluatedPermission(v: unknown): boolean | null {
  */
 export function mergeAuthoritativePolicy(cached: AiPolicy | null, fresh: AiPolicy): AiPolicy {
   const permitted = evaluatedPermission(fresh.assistPermitted);
+  // `mode` is narrowed for the same reason as the bit (BACKLOG #5406): a 200 that omits it, or
+  // carries a non-string, reaches the cache as a string the gate disables.
+  const mode = typeof fresh.mode === "string" ? fresh.mode : UNRECOGNIZED_MODE;
   if (permitted === null && cached?.assistPermitted === false) {
-    return { ...fresh, assistPermitted: false };
+    return { ...fresh, mode, assistPermitted: false };
   }
-  return { ...fresh, assistPermitted: permitted };
+  return { ...fresh, mode, assistPermitted: permitted };
 }
 
 /**
+ * The mode a missing or non-string `mode` is narrowed to (BACKLOG #5406). {@link assistantState}
+ * names no such mode, so it disables assistance for it.
+ */
+export const UNRECOGNIZED_MODE = "unrecognized";
+
+/**
  * Apply the gating rules to a resolved policy. `enabled` false means the chat handler must not call
- * the model and should stream `message` instead. The only ENABLED case is BYO with the permission
- * granted or unknown (null) — BYO is PHI-safe by construction (code-only context).
+ * the model and should stream `message` instead. The only ENABLED cases are `byo` and
+ * `managed_endpoint` with the permission granted or unknown (null) — BYO is PHI-safe by construction
+ * (code-only context). Every other mode, named here or not, disables assistance.
  *
  * It lives here rather than in aiPolicy.ts (it is re-exported from there, so every caller is unchanged)
  * because it is the PREDICATE {@link mergeAuthoritativePolicy} feeds. Asserting the merge rule without
@@ -179,7 +189,17 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "Your MessageFoundry policy uses a managed AI provider, which this extension version does not yet support. Assistance is unavailable.",
     };
   }
-  if (p.mode === "byo" && p.assistPermitted === false) {
+  if (p.mode !== "byo") {
+    // An ALLOW-list, not a deny-list (BACKLOG #5406): a mode this version does not name -- a newer
+    // engine's, or a missing or malformed one -- disables assistance rather than falling through to
+    // the local model (SEC-022, CWE-636).
+    return {
+      enabled: false,
+      message:
+        "Your MessageFoundry policy names an AI mode this extension version does not recognize. Assistance is disabled.",
+    };
+  }
+  if (p.assistPermitted === false) {
     return { enabled: false, message: "Your role does not include the ai:assist permission." };
   }
   // BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
@@ -332,8 +352,8 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
 const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /** A carried entry as the carrier may use it: a deny-shaped object the gate disables, as it is;
- *  anything else as {@link MALFORMED_DENY}. A deny in a mode the gate does not know is not used as
- *  it is, since the gate enables a mode it does not know. Never throws, and never permits. */
+ *  anything else as {@link MALFORMED_DENY}. The gate check is kept as a second guard beside the
+ *  gate's own allow-list. Never throws, and never permits. */
 function carriedEntry(value: unknown): AiPolicy {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return MALFORMED_DENY;

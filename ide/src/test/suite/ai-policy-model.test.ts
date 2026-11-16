@@ -145,6 +145,44 @@ suite("mergeAuthoritativePolicy (BACKLOG #330 — a degraded read must not upgra
   });
 });
 
+// BACKLOG #5406 — the gate is an allow-list. A mode it does not name, from a newer engine or a
+// malformed answer, must disable assistance rather than fall through to the local model.
+suite("assistantState fails closed on a mode it does not name (BACKLOG #5406)", () => {
+  test("G1: an unrecognized mode disables assistance, whatever the permission says", () => {
+    for (const mode of ["managed_future", "BYO", "", "unrecognized"]) {
+      for (const assistPermitted of [true, null]) {
+        const state = assistantState(policy({ mode, assistPermitted }));
+        assert.strictEqual(state.enabled, false, `${JSON.stringify(mode)} permitted=${assistPermitted}`);
+        assert.ok((state.message ?? "").length > 0, "the gate says why");
+      }
+    }
+  });
+
+  test("G2: the two enabling modes still enable (the allow-list is not a blanket deny)", () => {
+    for (const mode of ["byo", "managed_endpoint"]) {
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: true })).enabled, true, mode);
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: null })).enabled, true, mode);
+      assert.strictEqual(assistantState(policy({ mode, assistPermitted: false })).enabled, false, mode);
+    }
+  });
+
+  test("G3: a fresh answer with a missing or non-string mode is narrowed to a string the gate disables", () => {
+    for (const bad of [undefined, null, 7, true, {}, ["byo"]]) {
+      const fresh = { ...policy({ assistPermitted: true }), mode: bad as unknown as string };
+      const merged = mergeAuthoritativePolicy(null, fresh);
+      assert.strictEqual(typeof merged.mode, "string", JSON.stringify(bad));
+      assert.strictEqual(assistantState(merged).enabled, false, JSON.stringify(bad));
+    }
+  });
+
+  test("G4: a cached answer in an unrecognized mode disables assistance offline, however old", () => {
+    const cached = { ...policy({ mode: "managed_future", assistPermitted: true }), cachedAt: 0 };
+    for (const now of [0, CACHED_PERMIT_MAX_AGE_MS * 10]) {
+      assert.strictEqual(assistantState(cachedPolicyOffline(cached, now)).enabled, false, `now=${now}`);
+    }
+  });
+});
+
 // BACKLOG #1154 (ASVS 8.3.2) — the age bound on a cached answer, asserted node-side for the reason
 // the header gives. The rule is asymmetric like the merge: a cached ENABLE expires, a cached
 // DISABLE never does. Each pole needs its own test, or a rule that expired everything (or nothing)
@@ -469,7 +507,7 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
       { mode: 7 },
       { assistPermitted: false },
       { mode: "byo", assistPermitted: true },
-      // A deny by isPolicyDeny that the gate would still enable: a mode it does not know.
+      // A deny in a mode the gate does not know (which the gate disables since BACKLOG #5406).
       { mode: "bogus", assistPermitted: false },
     ]) {
       const label = JSON.stringify(bad);
