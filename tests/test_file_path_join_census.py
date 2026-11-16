@@ -1124,8 +1124,9 @@ IDE_SITES: dict[str, Site] = {
         OPERATOR,
         _IDE_WORKSPACE
         + " Three more resolve the repository's top level and its core.hooksPath, both "
-        "read from the operator's own git, only to compare them with the hook's folder; nothing is "
-        "read or written at them.",
+        "read from the operator's own git, only to compare them with the hook's folder. sameDir "
+        "resolves each with realpath, which opens the path (a UNC path opens an SMB connection); "
+        "nothing is read or written at them.",
     ),
     "ide/src/statusBar.ts": Site(
         5,

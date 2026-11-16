@@ -78,8 +78,9 @@ export function assertTargetAllowed(url: string): TargetCheck {
  * in its text, `command:` links included. engineUrl and environments are machine-scoped, so a
  * checked-in workspace cannot supply the URL, but a caller's URL is still any text. A notification
  * does not honour a backslash escape, so the link breaks only where a backslash lands between `]`
- * and `(`; escaping the four link characters does that and leaves the host readable, where a full
- * markdown escape would also put a backslash before an underscore in it.
+ * and `(`; escaping the four link characters does that. It leaves most hosts as typed, where a full
+ * markdown escape would also put a backslash before an underscore in one; an IPv6 host shows its
+ * brackets escaped, as `\[::1\]`.
  */
 export function targetRefusalNotice(reason: string): string {
   return `MessageFoundry: ${reason.replace(/[[\]()]/g, (c) => `\\${c}`)}`;
