@@ -192,6 +192,9 @@ DELETE_FAILED_NOTICE = (
 #: planted behind a sealed sidecar, which ``rotate-key`` would seal for good. So the notice names the
 #: common case and its fix without claiming either is the only one. The store's opt-out for unmarked
 #: values would also let the file through; it is a loosening, so no notice here may point at it.
+#: A damaged file's 423 (BACKLOG #5388) carries its own engine text, which this console does not
+#: read, so it gets this notice too, and the notice's rotate-key fix does not repair it. That is a
+#: known gap, recorded in docs/PHI.md section 3, not a claim that the cause here always holds.
 _LOCKED_CAUSE = (
     "The engine cannot read the file under the store's encryption key, so it refuses it. A file "
     "stored as plaintext before the key was turned on stays refused until an administrator seals "
