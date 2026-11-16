@@ -6501,13 +6501,14 @@ class Registry:
         # is: an inbound and an outbound may still share one name. The folded index is a cache;
         # a hit is believed only while that name is still in the table.
         folded = self._folded_names.setdefault(kind, {})
-        clash = folded.get(name.casefold())
+        key = name.casefold()
+        clash = folded.get(key)
         if clash is not None and clash in table:
             raise WiringError(
                 f"duplicate {kind} name: {name!r} differs only in case from {clash!r}, and a "
                 "case-insensitive store collation would treat the two as one"
             )
-        folded[name.casefold()] = name
+        folded[key] = name
         table[name] = value
 
     def validate(self, *, allow_empty: bool = False) -> None:
