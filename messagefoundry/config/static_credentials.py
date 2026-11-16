@@ -75,9 +75,10 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from :func:`apply_static_credential_gate`, which also logs, and ``_digest``, which logs
-at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529): every function reads its arguments
-and touches nothing else.
+Pure apart from :func:`apply_static_credential_gate`, which also logs, ``_digest``, which logs
+at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), and ``_http_literal_static``, whose
+``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510): every function
+reads its arguments and touches nothing else.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -248,17 +249,24 @@ def http_hop_credentials(
 
 
 def _http_literal_static(
-    settings: Mapping[str, Any], *, displaced: bool, env_values: Mapping[str, Any] | None
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    *,
+    displaced: bool,
+    env_values: Mapping[str, Any] | None,
 ) -> list[str]:
     """The static credentials an HTTP-family hop writes outside its auth settings (BACKLOG #5510):
     an entry of its ``headers`` table, or a parameter of its ``url`` query.
 
     A header counts when the redaction screen (``config.wiring._is_secret_header``) reads it as a
-    credential, by name or by value, the test the off-box cleartext refusal applies. A header named
-    ``Authorization``, in any letter case, does not count when ``displaced``: the connector writes
-    its own ``Authorization`` after the static table, so a minted, bearer or Basic credential
-    replaces it on the wire. A query parameter counts when ``secretscrub.credential_query_params``
-    names it, the reader ``query_credential_hops`` uses.
+    credential, by name or by value, the test the off-box cleartext refusal applies, so at least a
+    ``Proxy-Authorization`` entry counts too. A static ``Authorization`` header does not count when
+    ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
+    every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
+    the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
+    added). So a REST, FHIR or DICOMweb ``"Authorization "``, with a trailing space, still counts:
+    it goes on the wire beside the connector's own. A query parameter counts when
+    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
 
     An ``env()`` reference standing for the whole ``headers`` table, or for the ``url``, is read as
     the build resolves it (``config.wiring._db_setting``), against ``env_values``, else its literal
@@ -266,12 +274,20 @@ def _http_literal_static(
     ``query_credential_hops`` leaves one: the serve-time registry guard passes the running values,
     so the opt-in gate reads it there. Each label is fixed text, so no header name, parameter name
     or value reaches a detail."""
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
+    def overwritten(key: str) -> bool:
+        if not displaced:
+            return False
+        if ctype is ConnectorType.SOAP:
+            return is_authorization_header_name(key)
+        return key.lower() == "authorization"
+
     out: list[str] = []
     values = env_values or {}
     headers = _db_setting(settings, "headers", None, values)
     if isinstance(headers, Mapping) and any(
-        _is_secret_header(str(key), value)
-        and not (displaced and str(key).strip().lower() == "authorization")
+        _is_secret_header(str(key), value) and not overwritten(str(key))
         for key, value in headers.items()
     ):
         out.append("a credential in the headers table")
@@ -299,7 +315,7 @@ def _http_hop(
     token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
     displaced = token or bool(_static_authorization(settings))
-    static += _http_literal_static(settings, displaced=displaced, env_values=env_values)
+    static += _http_literal_static(ctype, settings, displaced=displaced, env_values=env_values)
     if static:
         return StaticCredentialHop(
             name, "static", f"presents {' + '.join(static)} ({peer})", compliant_kind

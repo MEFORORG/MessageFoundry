@@ -821,14 +821,62 @@ def _inner_def_reads_state(msg: Any) -> bool:
     return inner()
 
 
+def _sync_pred(msg: Any) -> bool:
+    return True
+
+
+class _AsyncAdapter:
+    """A class-based wrapper: update_wrapper sets __wrapped__ on the instance, which must not hide
+    its own __call__ from the walk."""
+
+    def __init__(self, fn: Any) -> None:
+        functools.update_wrapper(self, fn)
+
+    async def __call__(self, msg: Any) -> bool:
+        return False
+
+
+class _StateAdapter:
+    def __init__(self, fn: Any) -> None:
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, msg: Any) -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+
+# A module-level alias that is a partial of the accessor, not the accessor itself.
+_sg = functools.partial(state_get, "ns")
+
+
+def _calls_a_partial_alias(msg: Any) -> bool:
+    return _sg("k", default=None) is not None
+
+
+def _helper_without_a_module() -> Any:
+    """A function made by exec with globals that lack __name__, so its __module__ is None."""
+    namespace: dict[str, Any] = {}
+    exec("def helper(msg):\n    return True\n", namespace)  # noqa: S102 -- a fixed literal
+    helper = namespace["helper"]
+    assert helper.__module__ is None
+    return helper
+
+
+_no_module_helper = _helper_without_a_module()
+
+
+def _calls_a_module_less_helper(msg: Any) -> bool:
+    return bool(_no_module_helper(msg))
+
+
 @pytest.mark.parametrize(
     "pred",
     [
         _async_accepts,
         functools.partial(_async_accepts),
         _AsyncCallable(),
+        _AsyncAdapter(_sync_pred),
     ],
-    ids=["async_def", "partial_of_async", "async_call_instance"],
+    ids=["async_def", "partial_of_async", "async_call_instance", "async_update_wrapper"],
 )
 def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
     reg = _reg(tmp_path)
@@ -847,8 +895,20 @@ def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
         (_StateCallable(), "state_get"),
         (_calls_a_helper, "state_get"),
         (_inner_def_reads_state, "state_get"),
+        (_StateAdapter(_sync_pred), "state_get"),
+        (_calls_a_partial_alias, "state_get"),
     ],
-    ids=["partial_kw", "partial_of_accessor", "default", "closure", "instance", "helper", "inner"],
+    ids=[
+        "partial_kw",
+        "partial_of_accessor",
+        "default",
+        "closure",
+        "instance",
+        "helper",
+        "inner",
+        "update_wrapper",
+        "partial_alias",
+    ],
 )
 def test_an_indirect_run_scoped_read_fails_validate(
     tmp_path: Path, pred: Any, accessor: str
@@ -866,8 +926,9 @@ def test_an_indirect_run_scoped_read_fails_validate(
         _is_adt,
         functools.partial(_accepts_with, getter=lambda *a, **k: None),
         _closure_over(lambda *a, **k: None),
+        _calls_a_module_less_helper,  # a helper whose __module__ is None must not crash validate
     ],
-    ids=["plain", "partial_harmless", "closure_harmless"],
+    ids=["plain", "partial_harmless", "closure_harmless", "module_less_helper"],
 )
 def test_a_pure_indirect_accepts_still_validates(tmp_path: Path, pred: Any) -> None:
     # The control: the walk must not refuse a predicate that reaches no accessor.

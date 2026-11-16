@@ -987,7 +987,7 @@ def test_a_ws_security_password_with_no_user_stamps_no_token() -> None:
 # --- a credential in the headers table or the url query (BACKLOG #5510) ---------------------------
 
 LITERAL_MODULE = """
-from messagefoundry import FHIR, FhirLookup, Rest, env, outbound
+from messagefoundry import FHIR, FhirLookup, Rest, Soap, env, outbound
 from messagefoundry.transports.smart import with_smart_backend
 
 outbound("OB_HDR_KEY", Rest(url="https://a.example.invalid/x", headers={"X-Api-Key": "HDRSECRET"}))
@@ -1009,6 +1009,13 @@ outbound("OB_SMART_AUTHZ", with_smart_backend(
     token_url="https://h.example.invalid/token", client_id="c", private_key=env("key")))
 outbound("OB_DARK", Rest(url="https://i.example.invalid/x", headers={"X-Api-Key": "DARK"}),
          deployed=False)
+# A trailing space keeps urllib from folding the name into the connector's own Authorization, so
+# REST sends both; SOAP drops every spelling before it writes its own.
+outbound("OB_SMART_AUTHZ_SPACE", with_smart_backend(
+    Rest(url="https://k.example.invalid/x", headers={"Authorization ": "Bearer SPACESECRET"}),
+    token_url="https://k.example.invalid/token", client_id="c", private_key=env("key")))
+outbound("OB_SOAP_AUTHZ_SPACE", Soap(url="https://l.example.invalid/ws", bearer_token=env("tok"),
+                                     headers={"Authorization ": "Bearer SOAPSPACE"}))
 """
 
 #: Values the env() table and url resolve to on a running instance. Synthetic.
@@ -1016,6 +1023,7 @@ LITERAL_VALUES: dict[str, object] = {
     "hdrs": {"Private-Token": "ENVSECRET"},
     "qurl": "https://j.example.invalid/x?token=URLSECRET",
     "key": "not-a-real-key",
+    "tok": "not-a-real-token",
 }
 
 #: No secret, and no header or parameter name, may reach a detail: each label is fixed text.
@@ -1027,6 +1035,8 @@ LITERAL_SECRETS = (
     "URLSECRET",
     "SMARTSECRET",
     "LKSECRET",
+    "SPACESECRET",
+    "SOAPSPACE",
     "X-Api-Key",
     "Private-Token",
     "api_key",
@@ -1061,6 +1071,7 @@ def test_a_header_or_query_credential_is_a_static_hop(literal_registry: Registry
         "OB_ENV_URL": query,  # an env() url, the same
         "OB_SMART_KEY": headers,  # a minted bearer does not displace a non-Authorization header
         "fhir_lookup:lk_query": query,
+        "OB_SMART_AUTHZ_SPACE": headers,  # not folded into the connector's own Authorization
     }
     for name, reason in expected.items():
         assert hops[name].credential == "static", hops[name]
@@ -1075,6 +1086,8 @@ def test_the_header_and_query_quiet_twins_stay_quiet(literal_registry: Registry)
     assert "OB_SMART_AUTHZ" not in hops
     # A connection that is never built is not a hop.
     assert "OB_DARK" not in hops
+    # SOAP drops every Authorization spelling before writing its own bearer, so only that is listed.
+    assert "headers table" not in hops["OB_SOAP_AUTHZ_SPACE"].detail, hops["OB_SOAP_AUTHZ_SPACE"]
 
 
 def test_an_env_table_or_url_with_no_value_is_not_read(literal_registry: Registry) -> None:

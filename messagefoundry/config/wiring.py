@@ -59,8 +59,8 @@ from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from signal import SIGINT, default_int_handler, getsignal
-from types import CodeType, MappingProxyType, ModuleType
-from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
+from types import CodeType, FunctionType, MappingProxyType, MethodType, ModuleType
+from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs, cast
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -2168,13 +2168,15 @@ def connector_secret_env_values(
     each with the sealed keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
-    It reads the settings of every deployed inbound and outbound connection, every ``DatabaseLookup``,
-    every ``FhirLookup`` and every reference source (BACKLOG #5513): each opens a hop with its own
-    credential. A ``deployed=False`` connection is skipped, because it is never built and its values
-    are never resolved (ADR 0111 AC-1), so the engine holds no credential of its to track.
+    It reads every declaration :meth:`Registry.settings_carriers` yields: each deployed inbound and
+    outbound connection, ``DatabaseLookup``, ``FhirLookup`` and reference source (BACKLOG #5513), since
+    each opens a hop with its own credential. A ``deployed=False`` connection is skipped, because it
+    is never built and its values are never resolved (ADR 0111 AC-1), so the engine holds no
+    credential of its to track.
 
-    A top-level ``env()`` ref is included when its key resolves in ``env_values`` and the setting is
-    one of three shapes (:func:`_env_secret_material`):
+    A top-level ``env()`` ref is resolved as the build resolves it (:func:`_db_setting`, so its
+    ``cast`` runs and a missing key falls back to its ``default=``), and is included when it resolves
+    and the setting is one of three shapes (:func:`_env_secret_material`):
 
     * a **rotatable** credential setting, recognised by :func:`_is_secret_setting` (so the SOAP
       ``body_secret_value_<i>`` prefix class is covered, not only the fixed :data:`_SECRET_SETTING_KEYS`
@@ -2193,27 +2195,31 @@ def connector_secret_env_values(
     and the factories already forbid an inline value for a secret setting. A header ``env()`` nested
     inside a table is refused at load (:func:`_reject_envref_headers`), so it never reaches here."""
     out: dict[str, str] = {}
-    sources: list[Mapping[str, Any]] = [
-        c.spec.settings for c in registry.inbound.values() if c.deployed
-    ]
-    sources += [c.spec.settings for c in registry.outbound.values() if c.deployed]
-    sources += [spec.settings for spec in registry.lookups.values()]
-    sources += [spec.settings for spec in registry.fhir_lookups.values()]
-    sources += [spec.source.settings for spec in registry.references.values()]
-    for settings in sources:
+    for _kind, _name, settings, deployed in registry.settings_carriers():
+        if not deployed:
+            continue
         for name, value in settings.items():
-            if not isinstance(value, EnvRef) or value.key not in env_values:
+            # Resolved only for a setting that can hold one, so no other setting's cast runs here.
+            if not isinstance(value, EnvRef) or not _may_hold_env_secret(name):
                 continue
-            material = _env_secret_material(name, env_values[value.key])
+            material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
             if material:
                 out[value.key] = material
     return out
 
 
+def _may_hold_env_secret(name: str) -> bool:
+    """Whether setting ``name`` is one of the three shapes :func:`connector_secret_env_values`
+    fingerprints."""
+    if name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
+        return False
+    return _is_secret_setting(name) or name == "headers" or _is_url_setting(name)
+
+
 def _env_secret_material(name: str, resolved: object) -> str | None:
     """The credential material setting ``name`` holds once resolved to ``resolved``, as the string
     :func:`connector_secret_env_values` hands the rotation watcher, or ``None`` when it holds none."""
-    if name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
+    if not _may_hold_env_secret(name):
         return None
     if _is_secret_setting(name):
         return resolved if isinstance(resolved, str) and resolved else None
@@ -2239,11 +2245,13 @@ def _env_secret_material(name: str, resolved: object) -> str | None:
 
 def _url_credential_part(url: str) -> list[object] | None:
     """The userinfo and the credential query parameters of ``url``, or ``None`` when it has neither.
-    A value that does not parse holds nothing this can read."""
+    A value that does not parse holds nothing this can read; the build refuses such a URL."""
     try:
         split = urllib.parse.urlsplit(url)
         pairs = urllib.parse.parse_qsl(split.query, keep_blank_values=True)
     except ValueError:
+        # Never the value or the parser's text, which can quote it: the setting holds a credential.
+        _logger.debug("rotation watcher: a URL setting does not parse, so it is not fingerprinted")
         return None
     userinfo = split.netloc.rpartition("@")[0]
     query = sorted([key, value] for key, value in pairs if _is_credential_param(key))
@@ -5707,22 +5715,31 @@ _ACCEPTS_FORBIDDEN_ACCESSORS = frozenset({"state_get", "response_get"})
 
 
 def _accepts_callees(obj: object) -> list[object]:
-    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, the plain function
-    behind a bound method or a ``__wrapped__`` chain (``reachability._function_of``, which reads the
-    chain statically so no author ``__getattr__`` runs), or a callable instance's ``__call__``. Empty
-    for a plain function, or for anything with none of these."""
-    # Lazy: reachability imports this module at its top level.
-    from messagefoundry.config.reachability import _function_of
+    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, a bound method's
+    function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
+    function with no ``__wrapped__``.
 
-    if isinstance(obj, functools.partial):
-        return [obj.func]
-    func = _function_of(obj)
-    if func is not None:
-        return [] if func is obj else [func]
-    if callable(obj) and not isinstance(obj, type):
-        call = inspect.getattr_static(type(obj), "__call__", None)
-        return [call] if inspect.isfunction(call) else []
-    return []
+    Every read is static, as ``reachability._function_of`` reads (``type()``, ``__dict__`` and
+    ``inspect.getattr_static``), so no author ``__class__``, ``__getattr__`` or
+    ``__getattribute__`` runs at load. A class-based wrapper that calls ``functools.update_wrapper``
+    yields both its own ``__call__`` and the function it wraps, since either may run."""
+    kind = type(obj)
+    if issubclass(kind, functools.partial):
+        return [cast("functools.partial[object]", obj).func]
+    if issubclass(kind, MethodType):
+        return [cast("MethodType", obj).__func__]
+    if issubclass(kind, FunctionType):
+        wrapped = cast("FunctionType", obj).__dict__.get("__wrapped__")
+        return [] if wrapped is None else [wrapped]
+    if issubclass(kind, type) or not callable(obj):
+        return []
+    out: list[object] = []
+    call = inspect.getattr_static(kind, "__call__", None)
+    if issubclass(type(call), FunctionType):
+        out.append(call)
+    with suppress(AttributeError):
+        out.append(inspect.getattr_static(obj, "__wrapped__"))
+    return out
 
 
 def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
@@ -5739,10 +5756,11 @@ def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -
 
 
 def _accepts_is_async(pred: object) -> bool:
-    """Whether ``pred``, or what it runs through :func:`_accepts_callees`, is a coroutine or
+    """Whether ``pred``, or a function it runs through :func:`_accepts_callees`, is a coroutine or
     async-generator function: calling it returns an object that is always truthy."""
     return any(
-        inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj)
+        issubclass(type(obj), FunctionType)
+        and (inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj))
         for obj in _accepts_walk(pred, _accepts_callees)
     )
 
@@ -5751,57 +5769,64 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     """The fail-open run-scoped accessors ``pred`` can reach, by name (BACKLOG #5514).
 
     The walk starts at ``pred`` and follows at least these edges: a ``functools.partial``'s function,
-    arguments and keywords; a bound method's function; a ``__wrapped__`` chain; a callable instance's
+    arguments and keywords; a bound method's function; a ``__wrapped__``; a callable instance's
     ``__call__``; and, for a function, what ``reachability.captured_values`` says it reads: its
-    default values, keyword defaults and closure cells, and a global it loads, or an attribute of a
-    config module, when that is a function defined in a loaded config module or in the predicate's
-    own module. An accessor counts when a reached object IS ``state_get`` or ``response_get``, so an
-    alias is caught, or when a reached code object, or one nested in it (a lambda or an inner
-    ``def``), names one, as the earlier one-level check did. It does not see at least: a call
-    through ``getattr`` or another computed name, a global function in any other module, an object's
-    other methods, or a value the predicate builds while it runs."""
+    globals, the attributes it reads off a config module, its closure cells and its defaults. Of
+    those it follows an accessor itself, a function, partial, bound method or callable instance,
+    when the function or the instance's class is defined in a loaded config module or in the
+    predicate's own module, and every partial and bound method, whose targets are judged the same
+    way. An accessor counts when a reached object IS ``state_get`` or ``response_get``, so an alias
+    is caught, or when a reached function's code, or code nested in it (a lambda or an inner
+    ``def``), names one, as the earlier one-level check did. Every read is static
+    (:func:`_accepts_callees`). It does not see at least: a call through ``getattr`` or another
+    computed name, a function in any other module, an object's other methods, or a value the
+    predicate builds while it runs."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
-    from messagefoundry.config.reachability import captured_values
+    from messagefoundry.config.reachability import _is_config_module, captured_values
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
 
     accessors = {id(state_get): "state_get", id(response_get): "response_get"}
     root = pred
-    while not inspect.isfunction(root) and (callees := _accepts_callees(root)):
+    while not issubclass(type(root), FunctionType) and (callees := _accepts_callees(root)):
         root = callees[0]
-    home = str(getattr(root, "__module__", ""))
-    if home.startswith("messagefoundry."):
+    home = root.__module__ if issubclass(type(root), FunctionType) else None
+    if not isinstance(home, str) or home.startswith("messagefoundry."):
         # A shipped predicate such as message_type_of's: its module's globals are engine code, which
         # this walk is not for, and following them would walk the engine.
         home = ""
 
     def followed(value: object) -> bool:
-        return id(value) in accessors or (
-            inspect.isfunction(value)
-            and (value.__module__ == home or value.__module__.startswith(_CONFIG_MODULE_PREFIX))
+        kind = type(value)
+        if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
+            return True
+        if issubclass(kind, FunctionType):
+            return _is_config_module(cast("FunctionType", value).__module__, home)
+        return (
+            callable(value)
+            and not issubclass(kind, type)
+            and _is_config_module(kind.__module__, home)
         )
 
     def expand(obj: object) -> list[object]:
         if id(obj) in accessors:
             return []
-        edges = _accepts_callees(obj)
-        if isinstance(obj, functools.partial):
-            edges += [*obj.args, *obj.keywords.values()]
-        if inspect.isfunction(obj):
-            edges += [
-                c.value
-                for c in captured_values(obj, home)
-                if c.source in ("closure", "default") or followed(c.value)
-            ]
+        edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
+        if issubclass(type(obj), functools.partial):
+            part = cast("functools.partial[object]", obj)
+            edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
+        if issubclass(type(obj), FunctionType):
+            func = cast("FunctionType", obj)
+            edges += [c.value for c in captured_values(func, home) if followed(c.value)]
         return edges
 
     found: set[str] = set()
     for obj in _accepts_walk(pred, expand):
         if id(obj) in accessors:
             found.add(accessors[id(obj)])
-        elif inspect.isfunction(obj):
-            codes: list[CodeType] = [obj.__code__]
+        elif issubclass(type(obj), FunctionType):
+            codes: list[CodeType] = [cast("FunctionType", obj).__code__]
             while codes:
                 code = codes.pop()
                 codes += [const for const in code.co_consts if isinstance(const, CodeType)]

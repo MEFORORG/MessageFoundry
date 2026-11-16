@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hmac
+import json
 from typing import Any
 
 import pytest
@@ -435,6 +436,20 @@ def test_connector_secret_env_values_reads_a_credential_url() -> None:
     userinfo = connector_secret_env_values(reg, {"u": "https://svc:PW@a.example.invalid/x"})
     assert set(userinfo) == {"u"}
     assert connector_secret_env_values(reg, {"u": "https://a.example.invalid/x?q=1"}) == {}
+
+
+def test_connector_secret_env_values_resolves_as_the_build_does() -> None:
+    # A reference is read as resolve_env_settings reads it for the build: its cast runs, and a key
+    # the values do not hold falls back to its default=. Read raw, a JSON-text table cast to a dict
+    # would be a str here and go unfingerprinted while the connector sends its credential.
+    reg = _rest_with(
+        {
+            "headers": EnvRef(key="hdrs", cast=json.loads),
+            "url": EnvRef(key="u", default="https://a.example.invalid/x?api_key=DEFAULT-K"),
+        }
+    )
+    got = connector_secret_env_values(reg, {"hdrs": '{"X-Api-Key": "HDR-1"}'})
+    assert set(got) == {"hdrs", "u"}
 
 
 # --- live-by-default: DEK tracked via the stamp when operator date unset -----
