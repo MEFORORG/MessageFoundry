@@ -1292,6 +1292,7 @@ def DatabaseLookup(
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
 ) -> None:
@@ -1338,6 +1339,7 @@ def DatabaseLookup(
                 "max_rows": max_rows,
                 "pool_max": pool_max,
                 "acquire_timeout": acquire_timeout,
+                "statement_timeout": statement_timeout,
                 **attestation,
             },
         )
@@ -4781,6 +4783,7 @@ def Database(
     odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     capture_response: bool = False,  # capture the statement's RETURNING/OUTPUT result-set (ADR 0013)
     capture_out_params: bool = False,  # #67: capture a stored-proc CALL's OUT params + scalar RETURN value
     reingress_to: str
@@ -4837,6 +4840,7 @@ def Database(
             "odbc_password_key": odbc_password_key,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            "statement_timeout": statement_timeout,
             "capture_response": capture_response,
             "capture_out_params": capture_out_params,
             "reingress_to": reingress_to,
@@ -4878,6 +4882,7 @@ def DatabasePoll(
     odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
     """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
@@ -4963,6 +4968,7 @@ def DatabasePoll(
             "odbc_password_key": odbc_password_key,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
+            "statement_timeout": statement_timeout,
             "encoding": encoding,
         },
     )

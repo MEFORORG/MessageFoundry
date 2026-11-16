@@ -76,6 +76,11 @@ class ConnectorType(str, Enum):  # noqa: UP042
 # DatabaseLookup, DatabaseRef) and the value the connector falls back to when a mapping omits it.
 # Defined once so the declared default and the applied default cannot drift (BACKLOG #2089).
 DEFAULT_DB_CONNECT_TIMEOUT = 15
+#: The default DATABASE ``statement_timeout`` on the SQL Server preset, in seconds (BACKLOG #5756):
+#: the store's own ``[store].command_timeout`` default. 0 is no limit. On the generic dialect it
+#: applies only to a driver family known to take the setting, and other families default to 0
+#: (``transports/database.py``, ``_TIMEOUT_DEFAULT_FAMILIES``).
+DEFAULT_DB_STATEMENT_TIMEOUT = 30
 
 
 def check_db_connect_timeout(value: object, label: str) -> int:
@@ -87,9 +92,17 @@ def check_db_connect_timeout(value: object, label: str) -> int:
     (which ``int()`` would quietly truncate) are refused. ``label`` names the declaration. The message
     names the setting and never the value, because a resolved env() value stays out of errors
     (BACKLOG #1183)."""
-    refusal = (
-        f"{label} connect_timeout must be a whole number of seconds, at least 1 (value withheld)"
+    return whole_seconds(
+        value,
+        f"{label} connect_timeout must be a whole number of seconds, at least 1 (value withheld)",
+        minimum=1,
     )
+
+
+def whole_seconds(value: object, refusal: str, *, minimum: int, maximum: int | None = None) -> int:
+    """``value`` as whole seconds within ``[minimum, maximum]``, or ``ValueError(refusal)``: the
+    parse rule :func:`check_db_connect_timeout` states, shared with the DATABASE connector's
+    ``statement_timeout`` (BACKLOG #5756). ``refusal`` must not quote the value."""
     if isinstance(value, bool):
         raise ValueError(refusal)
     # Raised after the handler ends: int()'s ValueError quotes the value (BACKLOG #1796).
@@ -98,7 +111,7 @@ def check_db_connect_timeout(value: object, label: str) -> int:
         seconds = int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError, OverflowError):
         seconds = None
-    if seconds is None or seconds < 1:
+    if seconds is None or seconds < minimum or (maximum is not None and seconds > maximum):
         raise ValueError(refusal)
     if not isinstance(value, str) and seconds != value:  # 2.5, not truncated to 2
         raise ValueError(refusal)
