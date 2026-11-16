@@ -5707,36 +5707,44 @@ _ACCEPTS_FORBIDDEN_ACCESSORS = frozenset({"state_get", "response_get"})
 
 
 def _accepts_callees(obj: object) -> list[object]:
-    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, a bound method's
-    function, a ``functools.wraps`` wrapper's ``__wrapped__``, or a callable instance's ``__call__``.
-    Empty for a plain function, or for anything with none of these."""
+    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, the plain function
+    behind a bound method or a ``__wrapped__`` chain (``reachability._function_of``, which reads the
+    chain statically so no author ``__getattr__`` runs), or a callable instance's ``__call__``. Empty
+    for a plain function, or for anything with none of these."""
+    # Lazy: reachability imports this module at its top level.
+    from messagefoundry.config.reachability import _function_of
+
     if isinstance(obj, functools.partial):
         return [obj.func]
-    if inspect.ismethod(obj):
-        return [obj.__func__]
-    if inspect.isfunction(obj):
-        wrapped = getattr(obj, "__wrapped__", None)
-        return [wrapped] if wrapped is not None else []
+    func = _function_of(obj)
+    if func is not None:
+        return [] if func is obj else [func]
     if callable(obj) and not isinstance(obj, type):
         call = inspect.getattr_static(type(obj), "__call__", None)
         return [call] if inspect.isfunction(call) else []
     return []
 
 
-def _accepts_is_async(pred: object) -> bool:
-    """Whether ``pred``, or what it runs through :func:`_accepts_callees`, is a coroutine or
-    async-generator function: calling it returns an object that is always truthy."""
-    stack: list[object] = [pred]
+def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
+    """Every object reachable from ``start`` through ``expand``, each once, depth first."""
+    stack: list[object] = [start]
     seen: set[int] = set()
     while stack:
         obj = stack.pop()
         if id(obj) in seen:
             continue
         seen.add(id(obj))
-        if inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj):
-            return True
-        stack += _accepts_callees(obj)
-    return False
+        yield obj
+        stack += expand(obj)
+
+
+def _accepts_is_async(pred: object) -> bool:
+    """Whether ``pred``, or what it runs through :func:`_accepts_callees`, is a coroutine or
+    async-generator function: calling it returns an object that is always truthy."""
+    return any(
+        inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj)
+        for obj in _accepts_walk(pred, _accepts_callees)
+    )
 
 
 def _accepts_run_scoped_reads(pred: object) -> set[str]:
@@ -5744,61 +5752,60 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
 
     The walk starts at ``pred`` and follows at least these edges: a ``functools.partial``'s function,
     arguments and keywords; a bound method's function; a ``__wrapped__`` chain; a callable instance's
-    ``__call__``; a function's default values, keyword defaults and closure cells; the code objects
-    nested in its own (a lambda or an inner ``def``); and a global it names that is a function defined
-    in a loaded config module or in the predicate's own module. An accessor counts when a reached
-    object IS ``state_get`` or ``response_get``, so an alias is caught, or when a reached code object
-    names one, as the earlier one-level check did. It does not see at least: a call through
-    ``getattr`` or another computed name, a global function in any other module, an object's other
-    methods, or a value the predicate builds while it runs."""
-    # Lazy: both modules sit beside this one and are imported by handler code, not by the loader.
+    ``__call__``; and, for a function, what ``reachability.captured_values`` says it reads: its
+    default values, keyword defaults and closure cells, and a global it loads, or an attribute of a
+    config module, when that is a function defined in a loaded config module or in the predicate's
+    own module. An accessor counts when a reached object IS ``state_get`` or ``response_get``, so an
+    alias is caught, or when a reached code object, or one nested in it (a lambda or an inner
+    ``def``), names one, as the earlier one-level check did. It does not see at least: a call
+    through ``getattr`` or another computed name, a global function in any other module, an object's
+    other methods, or a value the predicate builds while it runs."""
+    # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
+    # imports this module at its top level.
+    from messagefoundry.config.reachability import captured_values
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
 
     accessors = {id(state_get): "state_get", id(response_get): "response_get"}
     root = pred
-    while (callees := _accepts_callees(root)) and not inspect.isfunction(root):
+    while not inspect.isfunction(root) and (callees := _accepts_callees(root)):
         root = callees[0]
-    home = getattr(root, "__module__", None)
-    if str(home).startswith("messagefoundry."):
+    home = str(getattr(root, "__module__", ""))
+    if home.startswith("messagefoundry."):
         # A shipped predicate such as message_type_of's: its module's globals are engine code, which
         # this walk is not for, and following them would walk the engine.
-        home = None
+        home = ""
+
+    def followed(value: object) -> bool:
+        return id(value) in accessors or (
+            inspect.isfunction(value)
+            and (value.__module__ == home or value.__module__.startswith(_CONFIG_MODULE_PREFIX))
+        )
+
+    def expand(obj: object) -> list[object]:
+        if id(obj) in accessors:
+            return []
+        edges = _accepts_callees(obj)
+        if isinstance(obj, functools.partial):
+            edges += [*obj.args, *obj.keywords.values()]
+        if inspect.isfunction(obj):
+            edges += [
+                c.value
+                for c in captured_values(obj, home)
+                if c.source in ("closure", "default") or followed(c.value)
+            ]
+        return edges
+
     found: set[str] = set()
-    stack: list[object] = [pred]
-    seen: set[int] = set()
-    while stack:
-        obj = stack.pop()
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
+    for obj in _accepts_walk(pred, expand):
         if id(obj) in accessors:
             found.add(accessors[id(obj)])
-            continue
-        stack += _accepts_callees(obj)
-        if isinstance(obj, functools.partial):
-            stack += [*obj.args, *obj.keywords.values()]
-        if not inspect.isfunction(obj):
-            continue
-        stack += obj.__defaults__ or ()
-        stack += (obj.__kwdefaults__ or {}).values()
-        for cell in obj.__closure__ or ():
-            with suppress(ValueError):  # an empty cell: a free variable not yet bound
-                stack.append(cell.cell_contents)
-        codes: list[CodeType] = [obj.__code__]
-        while codes:
-            code = codes.pop()
-            codes += [const for const in code.co_consts if isinstance(const, CodeType)]
-            found |= _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
-            for name in code.co_names:
-                target = obj.__globals__.get(name)
-                if id(target) in accessors:
-                    found.add(accessors[id(target)])
-                elif inspect.isfunction(target) and (
-                    target.__module__ == home
-                    or str(target.__module__).startswith(_CONFIG_MODULE_PREFIX)
-                ):
-                    stack.append(target)
+        elif inspect.isfunction(obj):
+            codes: list[CodeType] = [obj.__code__]
+            while codes:
+                code = codes.pop()
+                codes += [const for const in code.co_consts if isinstance(const, CodeType)]
+                found |= _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
     return found
 
 

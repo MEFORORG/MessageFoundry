@@ -185,6 +185,16 @@ def _digest(settings: Mapping[str, Any]) -> bool:
         return False
 
 
+def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
+    """The static credentials the connector writes into its own ``Authorization`` header."""
+    out: list[str] = []
+    if settings.get("bearer_token"):
+        out.append("static bearer token")
+    if settings.get("basic_user") and settings.get("basic_password"):
+        out.append("HTTP Basic")
+    return out
+
+
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
@@ -195,12 +205,7 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
     stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
     ``body_secret_tokens``."""
-    out: list[str] = []
-    if not token:
-        if settings.get("bearer_token"):
-            out.append("static bearer token")
-        if settings.get("basic_user") and settings.get("basic_password"):
-            out.append("HTTP Basic")
+    out = [] if token else _static_authorization(settings)
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
     if _digest(settings):
@@ -293,7 +298,7 @@ def _http_hop(
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
-    displaced = bool(token or "static bearer token" in static or "HTTP Basic" in static)
+    displaced = token or bool(_static_authorization(settings))
     static += _http_literal_static(settings, displaced=displaced, env_values=env_values)
     if static:
         return StaticCredentialHop(
