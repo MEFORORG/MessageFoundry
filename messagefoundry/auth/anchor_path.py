@@ -521,7 +521,8 @@ class WalkCause(str):
 def subst_target(answer: str) -> str | None:
     """What a ``QueryDosDeviceW`` ``answer`` for a drive letter says a ``subst`` drive stands for,
     whole (``\\??\\C:\\certs`` or ``\\??\\UNC\\host\\share``), or ``None`` for a real volume or a
-    network redirector (``\\Device\\...``). Kept whole so :func:`_strip_win_prefix` maps a share to
+    network redirector (``\\Device\\...``). Kept whole so :func:`windows_chain` reads it through
+    :func:`_strip_nt_target`, the stricter reader for an NT path, which maps a share to
     ``\\\\host\\share``: stripping four characters by hand left ``UNC\\host\\share``, which the walk
     read as a path with no drive (vault BACKLOG #5197 item 14)."""
     return answer if answer.startswith("\\??\\") else None
@@ -621,8 +622,10 @@ def windows_chain(
     the link, an absolute one from its own root. Every pass then restarts from the root of the new
     path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle.
 
-    ``drive_target`` answers the folder a ``subst`` drive letter stands for, in any form
-    :func:`_strip_win_prefix` reads (:func:`subst_target`), or ``None`` for a real volume, and
+    ``drive_target`` answers the folder a ``subst`` drive letter stands for (:func:`subst_target`),
+    which the walk reads through :func:`_strip_nt_target`, stricter than :func:`_strip_win_prefix`:
+    a ``\\\\.\\``, mixed-slash or non-plain verbatim answer ends the walk with a cause. It answers
+    ``None`` for a real volume, and
     raises ``OSError`` when it cannot tell, which ends the walk with a cause. Such a
     letter is spliced in like a link, because its ``X:\\`` is not a volume root: the folders above
     the substituted one can still be renamed. ``volume_cause`` answers why a volume cannot be

@@ -568,7 +568,11 @@ def test_a_subst_drive_onto_a_verbatim_path_normpath_would_change_is_not_walked(
 
 
 def test_a_config_link_to_a_verbatim_path_normpath_would_change_is_refused() -> None:
-    """The config-source link walk reads link targets through the same helper. Red as above."""
+    """The config-source link walk shares :func:`_strip_win_prefix` with the anchor walk, so a
+    verbatim link target holding ``..`` refuses in both. That holds for verbatim targets only: the
+    anchor walk reads link targets through the stricter ``_strip_nt_target``, while
+    ``config/wiring.py``'s ``_windows_link_target`` still normalizes a ``\\\\.\\`` or mixed-slash
+    target. Red as above."""
     from messagefoundry.config.wiring import _windows_link_target
 
     with pytest.raises(OSError, match="device path"):
