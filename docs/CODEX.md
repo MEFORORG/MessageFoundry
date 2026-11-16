@@ -25,9 +25,14 @@ matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
 adapter; alias matching alone cannot translate an edit payload.
 
 New event types appear as unmapped at startup. Unsupported handler types and
-failed commands report errors. The bridge does not silently claim they ran.
-Command-only hooks use PowerShell on Windows and `sh` elsewhere; structured
-`command` and `args` avoid shell parsing. Hook chains have a 90-second outer limit.
+shells refuse the event. Exit codes follow Claude Code's hook contract: exit 2
+blocks and stops the event's remaining hooks. Any other non-zero exit, a timeout,
+or a command that cannot start is a non-blocking error. The bridge reports it on
+stderr, ignores that hook's output, and runs the remaining hooks. It does not
+silently claim a failed hook ran. Command-only hooks use the shell they name
+(`bash` is Git Bash on Windows), else PowerShell on Windows and `sh` elsewhere;
+structured `command` and `args` avoid shell parsing. Hook chains have a 90-second
+outer limit.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

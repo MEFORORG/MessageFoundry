@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -160,6 +161,40 @@ def merge_output(result: dict, update: dict) -> None:
                 target["permissionDecisionReason"] = source["permissionDecisionReason"]
 
 
+def git_bash() -> Path:
+    """Git for Windows' bash, which Claude Code runs a `shell: bash` hook with on Windows."""
+    git = shutil.which("git")
+    if git:
+        # git.exe sits in Git/cmd, Git/bin or Git/mingw64/bin. The real shell, usr/bin/bash.exe, goes
+        # before the bin/bash.exe wrapper that rewrites PATH; tests/_bash_resolver.py is the
+        # reference copy of this walk, which a standalone script cannot import.
+        for parent in Path(git).resolve().parents[:3]:
+            for rel in ("usr/bin/bash.exe", "bin/bash.exe"):
+                if (parent / rel).is_file():
+                    return parent / rel
+    raise FileNotFoundError("Git Bash not found beside git; a shell: bash hook cannot run")
+
+
+def hook_argv(root: Path, hook: dict) -> list[str]:
+    command = hook["command"]
+    if "args" in hook:
+        return [
+            command,
+            *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
+        ]
+    # Command-only sources run in the shell they name, else the current platform's shell.
+    # Environment expansion belongs to that shell; structured args above need no shell parsing.
+    shell = hook.get("shell")
+    if shell == "powershell" or (shell is None and os.name == "nt"):
+        command = command.replace("${CLAUDE_PROJECT_DIR}", "$env:CLAUDE_PROJECT_DIR")
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
+    if shell == "bash":
+        return [str(git_bash()) if os.name == "nt" else "bash", "-c", command]
+    if shell is None:
+        return ["sh", "-c", command]
+    raise ValueError(f"Unsupported Claude hook shell: {shell}")
+
+
 def dispatch(root: Path, payload: dict) -> dict:
     event = payload["hook_event_name"]
     env = child_environment(root, payload.get("session_id", ""))
@@ -190,12 +225,15 @@ def dispatch(root: Path, payload: dict) -> dict:
     discriminator = (
         aliases
         if event in ("PreToolUse", "PostToolUse", "PermissionRequest")
+        # The first key with a value: a key Codex sends as null or empty falls through to the next.
         else {
-            str(
-                payload.get(
-                    "source",
-                    payload.get("trigger", payload.get("agent_type", payload.get("reason", ""))),
-                )
+            next(
+                (
+                    str(payload[key])
+                    for key in ("source", "trigger", "agent_type", "reason")
+                    if payload.get(key)
+                ),
+                "",
             )
         }
     )
@@ -210,48 +248,44 @@ def dispatch(root: Path, payload: dict) -> dict:
                 raise ValueError(
                     f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
                 )
-            command = hook["command"]
-            if "args" in hook:
-                argv = [
-                    command,
-                    *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
-                ]
-            else:
-                # Command-only sources use the current platform's shell. Environment expansion
-                # belongs to that shell; structured args above need no shell parsing.
-                command = command.replace(
-                    "${CLAUDE_PROJECT_DIR}",
-                    "$env:CLAUDE_PROJECT_DIR" if os.name == "nt" else "${CLAUDE_PROJECT_DIR}",
+            # Claude Code's hook contract: exit 2 blocks; any other failure, a timeout or a command
+            # that cannot start included, is a non-blocking error reported on stderr, and the
+            # remaining hooks still run. Only a successful hook's stdout is read.
+            try:
+                completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
+                    hook_argv(root, hook),
+                    input=json.dumps(payload),
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=hook.get("timeout", 30),
+                    check=False,
                 )
-                argv = (
-                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
-                    if os.name == "nt"
-                    else ["sh", "-c", command]
-                )
-            completed = subprocess.run(  # nosec B603 - trusted repo hook; event data is stdin only
-                argv,
-                input=json.dumps(payload),
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=hook.get("timeout", 30),
-                check=False,
-            )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"Codex bridge: hook did not complete, not blocking: {exc}", file=sys.stderr)
+                continue
             if completed.stderr:
                 print(completed.stderr, file=sys.stderr, end="")
             if completed.returncode == 2:
                 raise PermissionError(completed.stderr or "Claude hook blocked this event")
-            completed.check_returncode()
+            if completed.returncode:
+                print(
+                    f"Codex bridge: hook exited {completed.returncode}, not blocking: "
+                    f"{hook['command']}",
+                    file=sys.stderr,
+                )
+                continue
             output = completed.stdout.strip()
             if not output:
                 continue
             try:
                 update = json.loads(output)
             except json.JSONDecodeError:
-                if event != "SessionStart":
+                # Claude Code adds plain exit-0 stdout as context for these two events only.
+                if event not in ("SessionStart", "UserPromptSubmit"):
                     print(output, file=sys.stderr)
                     continue
                 output = output.replace(
