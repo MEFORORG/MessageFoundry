@@ -447,11 +447,26 @@ def test_the_postgres_unopened_item_carries_the_fault() -> None:
 
 
 def _frames(exc: BaseException) -> list[Any]:
-    frames = []
-    tb = exc.__traceback__
-    while tb is not None:
-        frames.append(tb.tb_frame)
-        tb = tb.tb_next
+    """Every frame ``exc`` reaches: each traceback entry's frame and its ``f_back`` callers, for
+    ``exc`` and for every exception on its ``__cause__``/``__context__`` chain."""
+    frames: list[Any] = []
+    seen_exc: set[int] = set()
+    seen_frames: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        cur = pending.pop()
+        if cur is None or id(cur) in seen_exc:
+            continue
+        seen_exc.add(id(cur))
+        pending += [cur.__cause__, cur.__context__]
+        tb = cur.__traceback__
+        while tb is not None:
+            frame: Any = tb.tb_frame
+            while frame is not None and id(frame) not in seen_frames:
+                seen_frames.add(id(frame))
+                frames.append(frame)
+                frame = frame.f_back
+            tb = tb.tb_next
     return frames
 
 
@@ -464,7 +479,8 @@ async def test_the_fault_t17_logs_holds_no_claimed_payload(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Row one opens and its body runs; the outage hits row two. The exception T17 logs is a fresh
-    fault with no chain, and no frame in its traceback holds row one's plaintext."""
+    fault with no chain, and no frame it reaches, through its traceback, a caller's ``f_back`` or
+    its cause and context, holds row one's plaintext."""
     from messagefoundry.pipeline.stage_dispatcher import _LanePhase  # noqa: PLC0415
     from tests.test_stage_dispatcher import (  # noqa: PLC0415
         ManualClock,
@@ -496,7 +512,7 @@ async def test_the_fault_t17_logs_holds_no_claimed_payload(
         assert isinstance(fault, QueueOpenFault)
         assert (fault.__cause__, fault.__context__) == (None, None)
         leaked = {p for f in _frames(fault) for v in f.f_locals.values() for p in _payloads_in(v)}
-        assert leaked == set(), "a frame in the logged fault's traceback holds claimed plaintext"
+        assert leaked == set(), "a frame the logged fault reaches holds claimed plaintext"
     finally:
         await d.stop()
         await store.close()

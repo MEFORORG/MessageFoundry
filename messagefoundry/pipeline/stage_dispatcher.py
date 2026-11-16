@@ -446,15 +446,12 @@ class _WindowedCount:
 
 
 def _fresh_open_fault(shared: QueueOpenFault) -> QueueOpenFault:
-    """A new :class:`QueueOpenFault` with ``shared``'s text, raised and caught here, so its
-    traceback holds this frame alone and never the dispatcher's, whose items hold other rows'
-    plaintext (BACKLOG #6706). The claim hands one fault to every unopened row of a lane, so the
-    fault T17 logs is never ``shared`` itself: a raised ``shared`` would keep the raising frame
-    alive for as long as any of those rows lives."""
-    try:
-        raise QueueOpenFault(*shared.args) from None
-    except QueueOpenFault as fresh:
-        return fresh
+    """A new :class:`QueueOpenFault` with ``shared``'s text, constructed and never raised, so its
+    ``__traceback__``, ``__cause__`` and ``__context__`` are all None and logging it reaches no
+    frame, the dispatcher's included, whose items hold other rows' plaintext (BACKLOG #6706). The
+    claim hands one fault object to every unopened row of a lane, so T17 logs a copy rather than
+    ``shared`` itself: whatever chain or traceback ``shared`` may carry stays off the log."""
+    return QueueOpenFault(*shared.args)
 
 
 class StageDispatcher:
@@ -1847,9 +1844,10 @@ class StageDispatcher:
                     # The claim could not open this row for a reason that is not the row (a key
                     # service with no verdict, a failed store read or dead-letter write), so it is
                     # an infra fault at this item, never content poison (BACKLOG #5735). It takes
-                    # the T17 path below without being raised here: a raise here would put this
-                    # frame, whose `items` hold other rows' plaintext, into the fault's traceback
-                    # (BACKLOG #6706). The fault T17 logs is a fresh one, raised in a helper.
+                    # the T17 outcome directly and is never raised: a raise would give the fault a
+                    # traceback reaching this frame, whose `items` hold other rows' plaintext
+                    # (BACKLOG #6706). T17 logs a fresh, never-raised copy with no traceback,
+                    # cause or context.
                     return self._infra_fault_outcome(
                         lane, items, i, _fresh_open_fault(item.open_fault)
                     )
