@@ -2282,6 +2282,7 @@ def _start_logging(
     # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
     # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
     # [logging].forward_hop_attested, which lets the hop through silently under either dial.
+    _hop_warning: str | None = None
     if log_forward is not None:
         _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
         # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
@@ -2306,17 +2307,18 @@ def _start_logging(
             )
             return 2
         if _forward_hop is HopDisposition.WARN:
-            # Crossed, but never silent — the point of the fix. In `serve` the WARNING surfaces via
-            # the filtered lastResort even though configure_logging has not run yet.
-            logging.getLogger(__name__).warning(
-                "AUDIT: off-box log/audit forwarding to %s:%d is NOT a verified-TLS hop (%s), so the "
+            # Crossed, but never silent — the point of the fix. Warned on stderr now, and logged as
+            # an AUDIT record only once `configure` below has installed the handlers and the
+            # forwarder, so it reaches [logging].file and the collector, and is not logged at all
+            # when a later gate here refuses the start (BACKLOG #5390).
+            _hop_warning = (
+                f"off-box log/audit forwarding to {settings.logging.forward_host}:"
+                f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so the "
                 "evidence stream crosses the network unprotected on a PHI instance. Set "
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
-                "(ADR 0080) to a collector on another host.",
-                settings.logging.forward_host,
-                settings.logging.forward_port,
-                _forward_why,
+                "(ADR 0080) to a collector on another host."
             )
+            print(f"warning: {scrub_control_chars(_hop_warning)}", file=sys.stderr)
     # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
     # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
     # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under
@@ -2444,6 +2446,10 @@ def _start_logging(
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # BACKLOG #5390: the warn-mode hop's AUDIT record, first, as it was decided first. Not when the
+    # collector's CA was refused above: no forwarder was built, so no record crosses that hop.
+    if _hop_warning is not None and log_forward is not None:
+        logging.getLogger(__name__).warning("AUDIT: %s", _hop_warning)
     # Vault BACKLOG #2375: the forwarding gate's fail-open notes, logged again now that the
     # caller's handlers are installed, at WARNING and the ordinary way, so the caller's log level
     # applies to them. Logged whether or not a forwarder came up: stdout and the log file are
