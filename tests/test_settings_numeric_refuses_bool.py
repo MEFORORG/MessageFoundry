@@ -42,18 +42,34 @@ _FIELDS: list[tuple[type[_Section], str]] = [
 ]
 
 
+#: The guard's own refusal text, not pydantic's "Input should be a valid boolean".
+_REFUSAL = "expects a number, not a boolean"
+
+
+def _holds_a_number(got: object) -> bool:
+    if isinstance(got, bool):
+        return False
+    if isinstance(got, int | float):
+        return True
+    if isinstance(got, dict):
+        return any(_holds_a_number(item) for item in got.values())
+    if isinstance(got, list | tuple | set | frozenset):
+        return any(_holds_a_number(item) for item in got)
+    return False
+
+
 def _probe(model: type[BaseModel], name: str, value: object) -> str:
-    """``refused`` when the field itself refused ``value``, ``number`` when it took a bool as a
-    number, ``kept`` when it validated otherwise, and ``unknown`` when another check refused."""
+    """``refused-bool`` when the guard refused ``value``, ``refused`` when the field refused it
+    otherwise, ``number`` when a bool-only input validated to a value holding a number, ``kept``
+    when it validated otherwise, and ``unknown`` when another check refused."""
     try:
         built = model.model_validate({name: value})
     except ValidationError as exc:
         mine = [err for err in exc.errors() if err["loc"][:1] == (name,)]
-        if any("boolean" in err["msg"] for err in mine):
+        if any(_REFUSAL in err["msg"] for err in mine):
             return "refused-bool"
         return "refused" if mine else "unknown"
-    got = getattr(built, name)
-    return "number" if isinstance(got, int | float) and not isinstance(got, bool) else "kept"
+    return "number" if _holds_a_number(getattr(built, name)) else "kept"
 
 
 def test_the_sweep_reaches_numeric_and_nested_fields() -> None:
@@ -99,8 +115,24 @@ class _Shapes(_Section):
     ],
 )
 def test_every_numeric_shape_refuses_a_bool(name: str, value: object) -> None:
-    with pytest.raises(ValidationError, match="boolean"):
+    with pytest.raises(ValidationError, match=_REFUSAL):
         _Shapes.model_validate({name: value})
+
+
+def test_the_list_probe_can_see_a_list_of_numbers() -> None:
+    """Control for the sweep's list half: without the guard ``[True]`` on a ``list[int]`` field
+    validates to ``[1]``, which the probe reads as ``number``."""
+
+    class _Plain(BaseModel):
+        numbers: list[int] = []
+
+    assert _probe(_Plain, "numbers", [True]) == "number"
+    assert _probe(_Shapes, "numbers", [True]) == "refused-bool"
+
+
+def test_false_on_a_positive_bound_names_the_bool_not_the_bound() -> None:
+    with pytest.raises(ValidationError, match=_REFUSAL):
+        DeliverySettings.model_validate({"retry_backoff_seconds": False})
 
 
 def test_a_bool_field_and_numbers_still_validate() -> None:
@@ -115,19 +147,35 @@ def test_a_bool_in_the_file_refuses_load_naming_the_key(tmp_path: Path) -> None:
     cfg.write_text("[security]\ndelete_message_bodies_after_days = false\n", encoding="utf-8")
     with pytest.raises(ValidationError) as caught:
         load_settings(config_path=cfg, environ={})
-    assert "delete_message_bodies_after_days" in str(caught.value)
-    assert "boolean" in str(caught.value)
+    assert f"delete_message_bodies_after_days {_REFUSAL}" in str(caught.value)
 
 
-def test_a_bool_in_a_nested_alert_rule_refuses_naming_its_path(tmp_path: Path) -> None:
+_RULE = '[[alerts.rules]]\nevent_type = "queue_buildup"\n'
+
+
+@pytest.mark.parametrize(
+    ("body", "path"),
+    [
+        ("cooldown_seconds = true\n", "rules[0].cooldown_seconds"),
+        ("cooldown_seconds = false\n", "rules[0].cooldown_seconds"),
+        ("min_depth = true\n", "rules[0].min_depth"),
+        ("min_oldest_seconds = false\n", "rules[0].min_oldest_seconds"),
+        ("[[alerts.rules.escalate]]\nafter_count = false\n", "rules[0].escalate[0].after_count"),
+        ("[[alerts.rules.escalate]]\nafter_count = true\n", "rules[0].escalate[0].after_count"),
+        (
+            '[[alerts.rules.schedule.windows]]\ndays = [false]\nstart = "08:00"\nend = "17:00"\n',
+            "rules[0].schedule.windows[0].days",
+        ),
+    ],
+)
+def test_a_bool_in_a_nested_alert_rule_refuses_naming_its_path(
+    tmp_path: Path, body: str, path: str
+) -> None:
     cfg = tmp_path / "messagefoundry.toml"
-    cfg.write_text(
-        '[[alerts.rules]]\nevent_type = "queue_buildup"\ncooldown_seconds = true\n',
-        encoding="utf-8",
-    )
+    cfg.write_text(_RULE + body, encoding="utf-8")
     with pytest.raises(ValidationError) as caught:
         load_settings(config_path=cfg, environ={})
-    assert "rules[0].cooldown_seconds expects a number" in str(caught.value)
+    assert f"{path} {_REFUSAL}" in str(caught.value)
 
 
 def test_a_number_and_an_environment_string_still_parse(tmp_path: Path) -> None:
@@ -140,5 +188,5 @@ def test_a_number_and_an_environment_string_still_parse(tmp_path: Path) -> None:
 
 def test_an_optional_numeric_field_still_takes_none() -> None:
     assert DeliverySettings(retry_max_attempts=None).retry_max_attempts is None
-    with pytest.raises(ValidationError, match="boolean"):
+    with pytest.raises(ValidationError, match=_REFUSAL):
         DeliverySettings.model_validate({"retry_max_attempts": True})
