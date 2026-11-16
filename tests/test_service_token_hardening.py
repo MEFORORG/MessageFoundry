@@ -318,18 +318,21 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     if len(setters) != 1:
         return [*problems, f"expected one Set-ServiceTokenHardening call, found {len(setters)}"]
     setter = setters[0]
+    # Variable and parameter names resolve without regard to case too, so every text match below
+    # is made in lower case.
     for needle in ("$SidChoice.SidType", "-Privileges $ServicePrivileges"):
-        if needle not in setter["text"]:
+        if needle.lower() not in setter["text"].lower():
             problems.append(f"the call does not pass {needle}: {setter['text']}")
     accounts = calls("Set-ServiceAccount")
     if not accounts or setter["start"] < max(c["outerIfEnd"] for c in accounts):
         problems.append("the token is set before the run-as account it depends on")
     choices = calls("Get-ServiceSidTypeChoice")
-    if len(choices) != 1 or "-Skip:$SkipRestrictedServiceSid" not in choices[0]["text"]:
+    choice = choices[0]["text"].lower() if len(choices) == 1 else ""
+    if "-skip:$skiprestrictedservicesid" not in choice:
         problems.append("the SID type is not chosen from the account and the opt-out switch")
-    elif "-ServiceAccount $ServiceAccount" not in choices[0]["text"]:
+    elif "-serviceaccount $serviceaccount" not in choice:
         problems.append("the SID type choice is not handed the account that carries the grants")
-    lists = [a for a in facts["assignments"] if a["lhs"] == "ServicePrivileges"]
+    lists = [a for a in facts["assignments"] if str(a["lhs"]).lower() == "serviceprivileges"]
     if len(lists) != 1 or lists[0]["rhsText"] != f'@("{_PRIVILEGE}")':
         problems.append(
             f"$ServicePrivileges is not exactly {_PRIVILEGE}: {[a['rhsText'] for a in lists]}"
@@ -339,11 +342,11 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     if not grants or not lockdown or grants[0]["start"] < lockdown[0]["start"]:
         problems.append("the service's grant is not read back after the data-directory lockdown")
     rhs = {
-        a["lhs"]: a["rhsText"]
+        str(a["lhs"]).lower(): str(a["rhsText"]).lower()
         for a in facts["assignments"]
-        if a["lhs"] in ("storeDir", "writeDirs")
+        if str(a["lhs"]).lower() in ("storedir", "writedirs")
     }
-    if "$DbPath" not in rhs.get("storeDir", "") or rhs.get("writeDirs") != "$storeDir":
+    if "$dbpath" not in rhs.get("storedir", "") or rhs.get("writedirs") != "$storedir":
         problems.append(
             "the store's own directory is not read back, so a -DbPath elsewhere is missed"
         )
@@ -391,6 +394,12 @@ def test_the_wiring_guard_reads_a_call_spelled_in_another_case(tmp_path: Path) -
             '$ServicePrivileges = @("SeChangeNotifyPrivilege", "SeImpersonatePrivilege")',
             "is not exactly",
         ),
+        (
+            '$ServicePrivileges = @("SeChangeNotifyPrivilege")',
+            '$ServicePrivileges = @("SeChangeNotifyPrivilege")\n'
+            '$serviceprivileges += "SeImpersonatePrivilege"',
+            "is not exactly",
+        ),
         ("$problem = Get-WriteGrantProblem -Path $dir", "$problem = '' # -Path $dir", "read back"),
         ("$writeDirs += $storeDir", "", "store's own directory"),
         (
@@ -401,7 +410,7 @@ def test_the_wiring_guard_reads_a_call_spelled_in_another_case(tmp_path: Path) -
         ),
         (
             f"\n{_SETTER_CALL}\n",
-            f"\nfunction Invoke-Hardening {{ {_SETTER_CALL} }}\nInvoke-Hardening\n",
+            f"\nfunction Invoke-Hardening {{ {_SETTER_CALL} }}\n",
             "is inside a function",
         ),
     ],
@@ -409,6 +418,7 @@ def test_the_wiring_guard_reads_a_call_spelled_in_another_case(tmp_path: Path) -
         "call-removed",
         "switch-unwired",
         "privilege-added",
+        "privilege-added-in-another-case",
         "grant-not-read",
         "store-not-read",
         "account-set-after",

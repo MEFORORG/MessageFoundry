@@ -499,16 +499,26 @@ def test_the_pin_replaces_the_command_lines_name_and_not_the_reading() -> None:
     assert pinned is not remotedebug.remote_debug_posture, "the pin is not in"
     assert pinned().interpreter_enabled is False
     tree = pyast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
-    binds = [
-        node
-        for node in pyast.walk(tree)
-        if isinstance(node, pyast.ImportFrom)
-        and node.module == "messagefoundry.remotedebug"
-        and any(
-            alias.name == "remote_debug_posture" and alias.asname is None for alias in node.names
-        )
-    ]
-    assert binds, "__main__ no longer binds remote_debug_posture from messagefoundry.remotedebug"
+    name = "remote_debug_posture"
+
+    def binds(node: pyast.stmt) -> bool:
+        """Whether a MODULE-level statement binds the global name the pin replaces."""
+        if isinstance(node, (pyast.Import, pyast.ImportFrom)):
+            return any((alias.asname or alias.name) == name for alias in node.names)
+        if isinstance(node, (pyast.FunctionDef, pyast.AsyncFunctionDef, pyast.ClassDef)):
+            return node.name == name
+        if isinstance(node, (pyast.Assign, pyast.AnnAssign, pyast.AugAssign)):
+            targets = node.targets if isinstance(node, pyast.Assign) else [node.target]
+            return any(isinstance(t, pyast.Name) and t.id == name for t in targets)
+        return False
+
+    module_level = [node for node in tree.body if binds(node)]
+    last = module_level[-1] if module_level else None
+    assert (
+        isinstance(last, pyast.ImportFrom)
+        and last.module == "messagefoundry.remotedebug"
+        and any(a.name == name and a.asname is None for a in last.names)
+    ), f"__main__'s last module-level binding of {name} is not the import from remotedebug"
 
 
 def test_the_acceptance_key_is_the_settings_field_and_its_variable() -> None:
@@ -540,8 +550,9 @@ def _child_env() -> dict[str, str]:
 #: ``serve`` in a real interpreter with the start-up code gate, which runs just before this one,
 #: pinned to a clean reading, as :func:`_environment` pins it in process. Unpinned, start-up code
 #: this environment happens to carry would refuse first, and the arms below would read that gate.
-#: ``__main__`` is imported as ``-m messagefoundry`` imports it, so its guard goes in as there,
-#: and the remote-debugging reading stays the interpreter's own.
+#: ``__main__`` is IMPORTED and ``main`` called, not run through ``-m``: its module-level guard
+#: still goes in, and the remote-debugging reading stays the interpreter's own, but runpy's
+#: ``-m`` path and the ``if __name__ == "__main__"`` line are not exercised by these arms.
 _PINNED_SERVE = """\
 import sys
 import messagefoundry.startupcode as startupcode
@@ -610,7 +621,8 @@ def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Pa
     """The control for the arm above: the launch the refusal names. It stops at a later gate, the
     missing store key, which shows it ran on past this one."""
     _child_interface_on(tmp_path)  # for its skip: the child must import this checkout
-    proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")  # as the refusal names
+    # The interpreter flags the refusal names; the entry is _PINNED_SERVE's, not `-m messagefoundry`.
+    proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]

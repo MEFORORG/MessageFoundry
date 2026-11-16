@@ -1951,25 +1951,29 @@ def _inherited(entries: list[str]) -> list[str]:
     return [e.replace(":(", ":(I)(", 1) for e in entries]
 
 
-# A line whose first word only prints or throws: its double-quoted text is a message, not a call.
-_MESSAGE_LINE = re.compile(r'(?i)^(?:throw\b|write-\w+\b|"|#)')
+# A whole line that only prints or throws one double-quoted string, with no subexpression in it.
+_MESSAGE_LINE = re.compile(r'(?i)^(?:(?:throw|write-\w+)\s+)?"[^"$]*(?:\$(?!\()[^"$]*)*"$')
 _DACL_TOOL = re.compile(r"(?i)cacls|set-acl|takeown|system32")
 
 
 def _dacl_tool_lines(script: str) -> list[str]:
-    """The lines of ``script`` that name a DACL tool, each stripped.
+    """The lines of ``script`` that name a DACL tool, each stripped. Comment lines are skipped.
 
-    Double-quoted text is blanked only on a line that starts with ``throw``, a ``Write-`` cmdlet,
-    a bare string or a comment, where it is a message. Anywhere else a quoted string can be the
-    call itself: ``& "C:\\Windows\\System32\\icacls.exe" ...`` or ``cmd /c "icacls ..."``, which
-    the stand-ins below would not intercept, so those lines stay in the census.
+    A line is read as a message, and skipped, only when the WHOLE line is ``throw``, a ``Write-``
+    cmdlet or nothing, followed by one double-quoted string with no ``$(`` in it. Any other line
+    stays in the census whole, quotes included, because a quoted string there can be the call
+    itself: ``& "C:\\Windows\\System32\\icacls.exe" ...``, ``cmd /c "icacls ..."``, or a call after
+    a ``;`` or in a pipeline. The stand-ins below would not intercept those. This reds in the safe
+    direction: a message that is not alone on its line, ``if (...) { throw "icacls ..." }`` for
+    one, is counted as a tool line, and the census then refuses to run the step.
     """
     lines = []
     for raw in script.splitlines():
         line = raw.strip()
-        read = re.sub(r'"[^"]*"', '""', line) if _MESSAGE_LINE.match(line) else line
-        if _DACL_TOOL.search(read):
-            lines.append(read)
+        if line.startswith("#") or _MESSAGE_LINE.match(line):
+            continue
+        if _DACL_TOOL.search(line):
+            lines.append(line)
     return lines
 
 
@@ -1985,6 +1989,25 @@ def _dacl_tool_lines(script: str) -> list[str]:
 )
 def test_the_dacl_tool_census_sees_a_quoted_call(extra: str) -> None:
     """The census in front of the stand-ins must not read a quoted call as message text."""
+    _census_sees(extra)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        r'Write-Host "locking"; & "C:\Windows\System32\icacls.exe" $d /reset',
+        r'"$d" | ForEach-Object { & "C:\Windows\System32\icacls.exe" $_ /reset }',
+        r'Write-Host (& "C:\Windows\System32\icacls.exe" $d /reset)',
+        r'throw "failed: $(& "C:\Windows\System32\icacls.exe" $d /reset)"',
+    ],
+    ids=["after-a-message", "pipeline", "message-argument", "subexpression-in-a-message"],
+)
+def test_the_dacl_tool_census_sees_a_call_beside_a_message(extra: str) -> None:
+    """A line that starts like a message but runs a call is not skipped as one."""
+    _census_sees(extra)
+
+
+def _census_sees(extra: str) -> None:
     script = _smoke_step(_DACL_STEP)
     assert _dacl_tool_lines(script) == ["$acl = (& icacls $d | Out-String)"], (
         "CONTROL FAILED: the step's own census changed"
@@ -1998,6 +2021,7 @@ def test_the_dacl_tool_census_ignores_message_text() -> None:
         'throw "icacls on $d failed"',
         'Write-Host "icacls says:"',
         '"===== icacls $d ====="',
+        "# icacls is read here, never written",
     ]
     assert _dacl_tool_lines("\n".join(messages)) == []
     assert _dacl_tool_lines("\n".join([*messages, "& icacls $d"])) == ["& icacls $d"], (
@@ -2013,8 +2037,10 @@ def _run_dacl_step(
     A function shadows the bare name ``icacls`` and nothing else: a path to the executable would
     run the real one. So the script's DACL-tool lines are read first, and the bare call must be the
     only one. A few other spellings are stand-ins that throw as well. Wrapped as the runner wraps
-    a powershell step, as _run_smoke_stop says: 'stop' first, $LASTEXITCODE last. The step is
-    ``shell: powershell``, so Windows PowerShell 5.1 runs it where it is on PATH; pwsh elsewhere.
+    a powershell step, as _run_smoke_stop says: 'stop' first, $LASTEXITCODE last. The runner
+    dot-sources a script FILE; this dot-sources the same text as a script block, so nothing here
+    may rest on $PSScriptRoot or a file position. The step is ``shell: powershell``, so Windows
+    PowerShell 5.1 runs it where it is on PATH; pwsh elsewhere.
     """
     shell = shutil.which("powershell") or shutil.which("pwsh")
     if shell is None:
@@ -2550,42 +2576,44 @@ _ORDER_MUTATIONS = [
 
 
 @pytest.fixture(scope="module")
-def order_guard_facts(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
-    """The facts of every changed copy in ``_ORDER_MUTATIONS``, by arm id, read in one process.
+def order_guard_facts(tmp_path_factory: pytest.TempPathFactory) -> dict[object, dict]:
+    """The facts of every changed copy in ``_ORDER_MUTATIONS``, keyed by its mutation, read in one
+    process.
 
-    A mutation whose CONTROL assertion fails yields ``{"error": ...}`` for its own arm alone.
+    A mutation that raises, its CONTROL assertion or any other error, yields ``{"error": ...}``
+    for its own arm alone.
     """
     assert _SCRIPT is not None
     source = _SCRIPT.read_text(encoding="utf-8")
     tmp = tmp_path_factory.mktemp("order-guard")
-    facts: dict[str, dict] = {}
-    copies: dict[str, Path] = {}
-    for arm in _ORDER_MUTATIONS:
-        assert arm.id is not None
+    facts: dict[object, dict] = {}
+    copies: dict[object, Path] = {}
+    for n, arm in enumerate(_ORDER_MUTATIONS):
         mutate = arm.values[0]
         assert callable(mutate)
         try:
             text = mutate(source)
-        except AssertionError as exc:
-            facts[arm.id] = {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - reported on its own arm, below
+            facts[mutate] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
-        copies[arm.id] = tmp / f"install-service-{arm.id}.ps1"
-        copies[arm.id].write_text(text, encoding="utf-8")
+        copies[mutate] = tmp / f"install-service-{n}.ps1"
+        copies[mutate].write_text(text, encoding="utf-8")
     facts.update(zip(copies, _preflight_facts_many(tmp, list(copies.values())), strict=True))
     return facts
 
 
+# One process reads every arm's copy, and its time is charged to the first arm's setup.
+@pytest.mark.timeout(240)
 @pytest.mark.parametrize(("mutate", "expect"), _ORDER_MUTATIONS)
 def test_the_acl_order_guard_fails_when_the_order_is_broken(
-    request: pytest.FixtureRequest,
-    order_guard_facts: dict[str, dict],
+    order_guard_facts: dict[object, dict],
     mutate: Callable[[str], str],
     expect: tuple[str, ...],
 ) -> None:
     """THE CONTROL. Each mutation (``mutate``, applied by the fixture) breaks the order, or the
     call, in a copy of the script, and the guard must then name it, in one problem carrying every
     part of ``expect``. A guard that cannot fail would pass on a script that locks nothing."""
-    facts = order_guard_facts[request.node.callspec.id]
+    facts = order_guard_facts[mutate]
     assert "error" not in facts, facts["error"]
     problems = _acl_order_problems(facts)
     assert any(all(part in p for part in expect) for p in problems), problems

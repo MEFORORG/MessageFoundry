@@ -1566,9 +1566,10 @@ def _builds_in(value: object) -> int:
     return _wheel_builds(str(value))
 
 
-#: An engine-wheel install with ``--no-deps`` anywhere on its line, before or after the wheel: the
-#: tripwire that says BACKLOG #1583 option (c) has landed.
-_ENGINE_NO_DEPS = re.compile(r"pip install(?=[^\n]*--no-deps)[^\n]*dist/\S*\.whl")
+#: An engine-wheel install with ``--no-deps`` in the same command, before or after the wheel: the
+#: tripwire that says BACKLOG #1583 option (c) has landed. A ``;``, ``&``, ``|`` or ``#`` ends the
+#: command, so a flag on another command or in a trailing comment does not trip it.
+_ENGINE_NO_DEPS = re.compile(r"pip install(?=[^\n;&|#]*--no-deps)[^\n;&|#]*dist/\S*\.whl")
 
 
 @pytest.mark.parametrize(
@@ -1578,8 +1579,17 @@ _ENGINE_NO_DEPS = re.compile(r"pip install(?=[^\n]*--no-deps)[^\n]*dist/\S*\.whl
         ("/tmp/v/bin/pip install --quiet dist/*.whl --no-deps", True),
         ("/tmp/v/bin/pip install --quiet dist/*.whl", False),
         ("/tmp/v/bin/pip install --quiet dist/*.whl\necho --no-deps", False),
+        ("/tmp/v/bin/pip install --quiet dist/*.whl  # not --no-deps: see #1583", False),
+        ("pip install --no-deps packaging && /tmp/v/bin/pip install dist/*.whl", False),
     ],
-    ids=["flag-first", "flag-last", "no-flag", "flag-on-another-line"],
+    ids=[
+        "flag-first",
+        "flag-last",
+        "no-flag",
+        "flag-on-another-line",
+        "flag-in-a-comment",
+        "flag-on-another-command",
+    ],
 )
 def test_the_engine_no_deps_tripwire_reads_either_order(line: str, hit: bool) -> None:
     assert bool(_ENGINE_NO_DEPS.search(line)) is hit
@@ -3117,7 +3127,9 @@ def test_the_engine_wheel_smoke_refuses_an_empty_version_read() -> None:
     that changed nothing.
     """
     script = _engine_wheel_smoke_script()
-    guard = re.search(r'-z\s+"?\$\{?built\b[^\n]*\n?(?P<then>[^\n]*)', script)
+    # The guard's line and up to three after it, stopping at its `fi`, so a then/echo/exit split
+    # over lines still reads and a later statement's annotation does not.
+    guard = re.search(r'-z\s+"?\$\{?built\b[^\n]*(?:\n(?!\s*fi\b)[^\n]*){0,3}', script)
     assert guard, (
         "the wheel smoke no longer rejects an empty __version__ read — on the workflow_dispatch "
         "dry-run (the arm that exists to validate this path before a tag) an empty version is not "
