@@ -4920,6 +4920,9 @@ def _serve(args: argparse.Namespace) -> int:
         except (UnrolledStoreKeyRefused, KeylessAuditChainRefused) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        except _StoreOpenRefused as exc:  # its text already went through codec_safe_str
+            print(f"error: cannot open the store: {exc}; refusing to start.", file=sys.stderr)
+            return 2
     try:
         _material = ensure_api_tls_material(
             settings.api,
@@ -5238,14 +5241,18 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     supervisor forwards, or the settings file). ``db_base`` is anchored only by ``--project-root``
     here, so a base_dir set in the file is applied too, or the two would name different pairs.
 
-    The store the shards are about to open is opened first, on every start, over the same derived
-    store-hop posture serve's lifespan opens it with, and takes serve's start refusal before the
-    renewal runs (BACKLOG #4934), so a refused start writes nothing to the pair. A re-mint is then
-    audited like serve's, in that store. A failure to open propagates before any renewal.
+    A re-mint is audited like serve's, in the store the shards are about to open, over the same
+    derived store-hop posture serve's lifespan opens it with. On a start that may replace the pair,
+    that store is opened first and takes serve's start refusal before the renewal runs (BACKLOG
+    #4934), so a refused start writes nothing to the pair, and a failure to open propagates before
+    any renewal. A start that replaced a pair it did not expect to opens it after, as before.
     """
+    import asyncio
+
     from messagefoundry.api.tls import (
         GeneratedPairReplaced,
         ensure_api_tls_material,
+        generated_pair_may_be_replaced,
         generated_state_dir,
         record_generated_pair_replacements,
     )
@@ -5260,6 +5267,14 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
 
     state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
+    # BACKLOG #4934: a start that may replace the pair opens the store and takes the shards' start
+    # refusal before it writes anything, so a refused start renews nothing on disk. Any other start
+    # mints or reuses as before, and opens the store only if that replaced a pair after all.
+    renew_after_refusal = generated_pair_may_be_replaced(settings.api, state_dir=state_dir)
+    if not renew_after_refusal:
+        ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
+        if not replaced:
+            return state_dir
     posture = (
         hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
         if settings.ai is not None
@@ -5278,11 +5293,17 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
             keyless_chain_refusal=keyless_opt_out_refusal(shard_store, settings.security),
         )
         try:
-            # BACKLOG #4934: the shards' start refusal, on every start and before the renewal, so a
-            # refused start renews nothing on disk and the supervisor does not restart shards that
-            # would each refuse. The audit row below is then this store's first since the open.
+            # BACKLOG #4934: before the renewal and before the audit row below, which is this
+            # store's first since the open.
             await _refuse_unrolled_key_on(store, settings)
-            ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
+            if renew_after_refusal:
+                # Off the loop: key generation, file writes and the pair lock's wait block.
+                await asyncio.to_thread(
+                    ensure_api_tls_material,
+                    settings.api,
+                    state_dir=state_dir,
+                    replacements=replaced,
+                )
             await record_generated_pair_replacements(store, replaced)
         finally:
             await store.close()
@@ -5316,8 +5337,10 @@ def _refuse_unrolled_key_before_tls_write(settings: ServiceSettings) -> None:
     """Open ``serve``'s store and run :func:`_refuse_unrolled_key_on` before the start may replace
     the generated API pair (BACKLOG #4934), so a refused start renews nothing on disk. The lifespan
     refuses again after its own open; this one exists only because the mint comes first. Raises
-    :class:`~messagefoundry.pipeline.secret_rotation.UnrolledStoreKeyRefused`, and whatever the
-    open raises, as the lifespan's open would."""
+    :class:`~messagefoundry.pipeline.secret_rotation.UnrolledStoreKeyRefused`, the keyless-chain
+    refusal, :class:`_StoreOpenRefused` for an open refusal :func:`_open_store_or_refuse` maps, and
+    anything else the open raises. This open passes no ``refusal_hook``, so an at-open cipher
+    refusal reaches the log, not the alert notifier the lifespan's open would send it to."""
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store
@@ -5329,11 +5352,13 @@ def _refuse_unrolled_key_before_tls_write(settings: ServiceSettings) -> None:
     )
 
     async def _check() -> None:
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             await _refuse_unrolled_key_on(store, settings)

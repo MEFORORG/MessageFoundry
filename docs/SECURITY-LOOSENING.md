@@ -841,10 +841,12 @@ the next start may do.
   change. With it off, `serve` (and each `supervise` shard, and the supervisor before it renews the
   API certificate) refuses to start when the store key differs from its stamp, or has none, the
   chain has not been rolled to it, and the key the chain's current range is under is not
-  configured. A refused start renews no API certificate. The one exception is a store under
-  `[store].cipher_provider = "vault_transit"`: Transit holds that store's key, so the engine has no
-  local store key to compare with the stamp, the refusal never fires, and this setting changes
-  nothing there. With it on, that start goes ahead: its first audit row goes into that range under the
+  configured. A refused start renews no API certificate. The refusal never fires on at least two
+  kinds of store, so this setting changes nothing there: a store under
+  `[store].cipher_provider = "vault_transit"`, because Transit holds its key and the engine has no
+  local store key to compare with the stamp; and a store whose audit ranges the open could not
+  authenticate, because the open then cannot say which key the current range is under, though
+  that start's first audit row may still break the chain. With it on, that start goes ahead: its first audit row goes into that range under the
   new key, never verifies there, and the chain breaks at that row. `audit-verify` reports the break,
   and `rotate-key` cannot roll the chain afterwards.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
