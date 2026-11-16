@@ -185,12 +185,14 @@ def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bo
 
     The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
     route's model does. Asking the model keeps one definition of each bound (BACKLOG #5397, #5398,
-    #5399). Only the fields a caller passes are checked: at least the sign-in username, password and
-    authenticator code, the MFA and step-up codes, the step-up password, and the enrolment-confirm
-    code and enrolment code. A field a caller does not pass, such as the sign-in passkey assertion,
-    is not. Any refusal by the model counts, not only a length one: the sign-in authenticator code
-    is refused for a non-digit, a space included, as the JSON route refuses it. The check only
-    refuses; the service still receives the raw form value, not one the model normalised.
+    #5399). Only the fields a caller passes are checked: at least the sign-in username and password,
+    the MFA and step-up codes, the step-up password, and the enrolment-confirm code and enrolment
+    code. A field a caller does not pass, such as the sign-in passkey assertion, is not. Any refusal
+    by the model counts, not only a length one. The sign-in authenticator code and the passkey
+    enrolment code are checked for length only, by :func:`_form_within_lengths`, because the model's
+    other rules would refuse what the form has always passed on. The check only refuses and never
+    normalises: what the service receives is each caller's own reading of the submitted value,
+    which at /ui/reauth and the enrolment confirm is the code with surrounding space stripped.
 
     Each caller runs this after its rate limiter, so a refused value has already been charged
     whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
@@ -200,14 +202,37 @@ def _form_fits(request: Request, model: type[BaseModel], /, **fields: str) -> bo
     try:
         model(**fields)
     except ValidationError as exc:
-        _log.info(
-            "request validation failed on %s %s: %d field error(s)",
-            request.method,
-            request.url.path,
-            exc.error_count(),
-        )
+        _log_form_refusal(request, exc.error_count())
         return False
     return True
+
+
+def _form_within_lengths(request: Request, model: type[BaseModel], /, **fields: str) -> bool:
+    """Whether each of these form values is within the ``max_length`` the JSON route's own request
+    ``model`` sets on that field, and nothing else of the model's. A field the model leaves unbounded
+    always fits. A refusal is logged as :func:`_form_fits` logs one, never with a value."""
+    over = 0
+    for name, value in fields.items():
+        bounds = [
+            m.max_length
+            for m in model.model_fields[name].metadata
+            if isinstance(getattr(m, "max_length", None), int)
+        ]
+        if bounds and len(value) > min(bounds):
+            over += 1
+    if over:
+        _log_form_refusal(request, over)
+    return not over
+
+
+def _log_form_refusal(request: Request, errors: int) -> None:
+    """The JSON 422 handler's own words, with no value: the refused fields are credentials."""
+    _log.info(
+        "request validation failed on %s %s: %d field error(s)",
+        request.method,
+        request.url.path,
+        errors,
+    )
 
 
 def _refusal_error(elevation: Elevation, fallback: str) -> str:
@@ -792,16 +817,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # L5b (ADR 0068 §8): the form rides the SAME auth.login seam as the JSON surface, with
         # allow-listed provider values only; absent stays LOCAL (regression-pinned). The browser
         # AD-password sign-in is RETIRED (BACKLOG #1137): the login page renders no provider
-        # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
-        # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
-        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth).
+        # selector, and "ad" stays in the allow-list so the ENGINE (_dispatch_login) refuses and
+        # audits it, for every "ad" sign-in within the bounds below. An oversized one is refused
+        # here first, as for "local", and so is not audited. Directory accounts sign in by Windows
+        # SSO or OIDC, and the AD bind as the user survives only as the step-up re-bind at
+        # /ui/reauth (and the JSON /me/reauth).
         #
         # BACKLOG #5397: an oversized username, password or authenticator code is refused here,
         # before auth.login hashes or audits it, as the JSON route's 422 refuses it before the
         # engine sees it. That holds for provider "ad" too. Refused, never clamped: a truncated
-        # credential is a different one. The passkey challenge was already popped, and the budget
-        # charged as _form_fits says.
+        # credential is a different one. The authenticator code is bounded by length only: a blank
+        # or space-only one is still the two-step flow, and a non-digit one is still passed on, as
+        # before. The passkey challenge was already popped, and the budget charged as _form_fits
+        # says.
 
         def _refused() -> Response:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -815,8 +843,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
         # one is today's two-step flow.
         totp_code = form.get("totp_code", "")
-        if provider_value not in ("local", "ad") or not _form_fits(
-            request, LoginRequest, username=username, password=password, totp_code=totp_code
+        if (
+            provider_value not in ("local", "ad")
+            or not _form_fits(request, LoginRequest, username=username, password=password)
+            or not _form_within_lengths(request, LoginRequest, totp_code=totp_code)
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,

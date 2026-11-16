@@ -129,9 +129,9 @@ async def test_an_oversized_sign_in_clears_the_passkey_handle_it_consumed(
 async def test_an_oversized_sign_in_code_never_reaches_login(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ui_login cuts the authenticator code to a length instead of refusing it through
-    LoginRequest, checks it against a bound other than the JSON route's, or drops the model's digit
-    pattern."""
+    """RED when: ui_login cuts the authenticator code to a length instead of refusing it, checks it
+    against a bound other than LoginRequest's, or refuses a code within the bound for its content.
+    The form bounds the code by length only, so a non-digit or a space is passed on as before."""
     service = await _service(engine)
     calls = _spy(monkeypatch, service, "login")
     async with ui_client(engine, service) as c:
@@ -139,18 +139,54 @@ async def test_an_oversized_sign_in_code_never_reaches_login(
         r = await c.post("/ui/login", data={**base, "totp_code": "1" * (MAX_DIGITS + 1)})
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
         assert calls == []
-        # At the bound the code is passed on whole, as the JSON route passes it.
+        # At the bound the code is passed on whole.
         await c.post("/ui/login", data={**base, "totp_code": "1" * MAX_DIGITS})
         assert len(calls) == 1 and calls[0][-1]["totp_code"] == "1" * MAX_DIGITS
-        # Not only the length: LoginRequest refuses a non-digit, a space included, as the JSON
-        # route does.
-        for refused in ("12345a", " 12345", "123 45"):
-            r = await c.post("/ui/login", data={**base, "totp_code": refused})
-            assert r.headers["location"] == "/ui/login?e=bad"
-        assert len(calls) == 1
+        # Within the bound, content is not the form's to judge: each reaches auth.login unchanged.
+        passed = ("12345a", " 12345", "   ")
+        for code in passed:
+            await c.post("/ui/login", data={**base, "totp_code": code})
+        assert [call[-1]["totp_code"] for call in calls[1:]] == list(passed)
         # A blank code is the two-step flow, passed on as no code.
         await c.post("/ui/login", data={**base, "totp_code": ""})
-    assert len(calls) == 2 and calls[1][-1]["totp_code"] is None
+    assert len(calls) == 5 and calls[4][-1]["totp_code"] is None
+
+
+async def test_a_space_only_sign_in_code_is_still_the_two_step_flow(engine: Engine) -> None:
+    """RED when: ui_login refuses a space-only authenticator code instead of passing it on, which
+    the engine reads as no code. The control is a blank code, which lands on the same gate."""
+    service = await _service(engine)
+    await _add(service)
+    await _enrol_totp(service)
+    async with ui_client(engine, service) as c:
+        for code in ("", "   "):
+            r = await c.post(
+                "/ui/login", data={"username": "op", "password": PW, "totp_code": code}
+            )
+            assert r.status_code == 303 and r.headers["location"] == "/ui/mfa", (code, r.headers)
+            c.cookies.clear()
+
+
+async def test_a_stray_sign_in_code_does_not_refuse_an_account_with_no_factor(
+    engine: Engine,
+) -> None:
+    """RED when: ui_login refuses a sign-in for a non-digit authenticator code within the bound,
+    which on an account with no TOTP factor the engine has always ignored. The control is a blank
+    code, and an oversized one is still refused."""
+    service = await _service(engine)
+    await _add(service)
+    async with ui_client(engine, service) as c:
+        for code in ("", "12a"):
+            r = await c.post(
+                "/ui/login", data={"username": "op", "password": PW, "totp_code": code}
+            )
+            assert r.status_code == 303 and r.headers["location"] != "/ui/login?e=bad", code
+            c.cookies.clear()
+        r = await c.post(
+            "/ui/login",
+            data={"username": "op", "password": PW, "totp_code": "1" * (MAX_DIGITS + 1)},
+        )
+        assert r.headers["location"] == "/ui/login?e=bad"
 
 
 # --- BACKLOG #5398: POST /ui/mfa --------------------------------------------------------------

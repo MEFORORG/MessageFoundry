@@ -63,7 +63,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _CEREMONY_RETRY_AFTER, _form_fits, _refusal_error
+from .core import _CEREMONY_RETRY_AFTER, _form_fits, _form_within_lengths, _refusal_error
 
 _log = logging.getLogger(__name__)
 
@@ -226,9 +226,6 @@ register_ui_action(
 _SESSION_OFFER_TTL_SECONDS = 300.0
 #: The most sessions the table holds; the oldest mark is dropped first.
 _SESSION_OFFER_SESSIONS_MAX = 4096
-#: The longest enrolment code the console passes on, as the JSON plane's MfaConfirmRequest caps
-#: it (ADR 0207). A real code is far shorter.
-_ENROLMENT_CODE_MAX = 64
 
 
 class _SessionOffers:
@@ -893,9 +890,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             label = str(body.get("label", ""))
             # ADR 0207: the enrolment code a directory account's first factor needs, or None.
             raw_code = body.get("enrolment_code")
-            enrolment_code = (
-                raw_code[:_ENROLMENT_CODE_MAX] if isinstance(raw_code, str) and raw_code else None
-            )
+            enrolment_code = raw_code if isinstance(raw_code, str) and raw_code else None
         except (ValueError, KeyError, TypeError, AttributeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
@@ -923,6 +918,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 {"ok": False, "error": exc.detail},
                 status_code=exc.status_code,
                 headers={"Retry-After": _CEREMONY_RETRY_AFTER},
+            )
+        if enrolment_code is not None and not _form_within_lengths(
+            request, MfaConfirmRequest, enrolment_code=enrolment_code
+        ):
+            # BACKLOG #5399: the bound the JSON MfaConfirmRequest sets on the enrolment code. An
+            # oversized one is refused, never cut, is not checked or audited, and gets the reply a
+            # refused enrolment code gets. The ceremony stays staged.
+            return JSONResponse(
+                {"ok": False, "error": str(EnrolmentCodeRefused())}, status_code=400
             )
         try:
             elevation = await service.finish_webauthn_registration(

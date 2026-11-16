@@ -105,6 +105,51 @@ async def test_ac4_the_console_passkey_finish_needs_the_code(engine: Engine) -> 
     assert user is not None and user.enrolment_code_digest is None
 
 
+async def test_an_oversized_passkey_enrolment_code_never_reaches_the_finish(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5399. RED when: the console passkey finish cuts the enrolment code to a length
+    instead of refusing it, or checks it against a bound other than MfaConfirmRequest's. The
+    controls: a wrong code at the bound reaches the finish, and the ceremony the refusal left
+    staged then binds with the issued code."""
+    pytest.importorskip("webauthn")
+    from messagefoundry.api.auth_models import _ENROLMENT_CODE_MAX
+
+    service = await _service(engine)
+    identity, token, body = await _staged(service)
+    issued = await service.issue_enrolment_code(
+        identity.user_id, actor="test-host", issuer_id=None, via="host"
+    )
+    calls: list[object] = []
+    real = service.finish_webauthn_registration
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs.get("enrolment_code"))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", spy)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        # The issued code with junk after it: cut to the bound, the old handler kept a prefix.
+        oversized = (issued.code + "x" * _ENROLMENT_CODE_MAX)[: _ENROLMENT_CODE_MAX + 1]
+        refused = await c.post(
+            _VERIFY, json={**body, "enrolment_code": oversized}, headers=SAME_ORIGIN
+        )
+        assert refused.status_code == 400
+        assert refused.json() == {"ok": False, "error": ENROLMENT_CODE_REFUSED}
+        assert calls == []
+        at_bound = "x" * _ENROLMENT_CODE_MAX
+        wrong = await c.post(
+            _VERIFY, json={**body, "enrolment_code": at_bound}, headers=SAME_ORIGIN
+        )
+        assert wrong.status_code == 400 and calls == [at_bound]
+        served = await c.post(
+            _VERIFY, json={**body, "enrolment_code": issued.code}, headers=SAME_ORIGIN
+        )
+        assert served.status_code == 200 and served.json()["ok"] is True, served.text
+    assert len(await service.store.list_webauthn_credentials(identity.user_id)) == 1
+
+
 def test_the_binding_forms_carry_the_code_field_only_when_owed() -> None:
     """The TOTP confirm form and the passkey page carry the field when the session owes a code, and
     the passkey page says how to ask for one (ADR 0207 section 8)."""
