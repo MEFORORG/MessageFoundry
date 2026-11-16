@@ -8088,14 +8088,19 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
-                if row[4] != OutboxStatus.INFLIGHT.value:
+                # A row already resolved does not complete again (no second reply or re-ingress
+                # child); a re-pended one still does, and an armed H1 fence still judges it below.
+                if row[4] in (
+                    OutboxStatus.DONE.value,
+                    OutboxStatus.DEAD.value,
+                    OutboxStatus.CANCELLED.value,
+                ):
                     log.warning(
-                        "complete_with_response: outbound row %s is %s, not inflight;"
-                        " nothing written",
+                        "complete_with_response: outbound row %s is already %s; nothing written",
                         outbox_id,
                         row[4],
                     )
-                    await self._commit(conn)
+                    await self._commit_read(conn)
                     return
                 # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
                 # response artifact, the re-ingress work-row, the ledger row and the finalize together.

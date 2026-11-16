@@ -13496,10 +13496,11 @@ class MessageStore:
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             # A concurrent put of the same content may have stored it while this one sealed; its
-            # copy wins and this one's sealed chunks are dropped.
+            # copy wins and this one's sealed chunks are dropped. Only the id conflict is ignored;
+            # OR IGNORE would also swallow a NOT NULL failure and return a ref with no row.
             cur = await self._db.execute(
-                "INSERT OR IGNORE INTO attachment (id, content_type, total_bytes, refcount,"
-                " created_at) VALUES (?,?,?,0,?)",
+                "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
+                " VALUES (?,?,?,0,?) ON CONFLICT(id) DO NOTHING",
                 (ref, content_type, total, now),
             )
             if not cur.rowcount:
@@ -15272,12 +15273,17 @@ class MessageStore:
                 # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
                 # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
                 raise _AbortMember(None)
-            if row["status"] != OutboxStatus.INFLIGHT.value:
-                # BACKLOG #5752: only a claimed row completes. A second completion of a row already
-                # DONE (or re-pended, cancelled, dead-lettered) would mint a second reply artifact
-                # and a second re-ingress child, so nothing is written, as for a vanished row.
+            if row["status"] in (
+                OutboxStatus.DONE.value,
+                OutboxStatus.DEAD.value,
+                OutboxStatus.CANCELLED.value,
+            ):
+                # BACKLOG #5752: a row already resolved does not complete again. A second completion
+                # of a DONE row would mint a second reply artifact and a second re-ingress child, so
+                # nothing is written, as for a vanished row. A row re-pended mid-send still
+                # completes: its reply is real, and completing it spares the partner a resend.
                 log.warning(
-                    "complete_with_response: outbound row %s is %s, not inflight; nothing written",
+                    "complete_with_response: outbound row %s is already %s; nothing written",
                     outbox_id,
                     row["status"],
                 )
