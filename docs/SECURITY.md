@@ -7591,7 +7591,11 @@ request path. A row the tee misses, such as one whose commit a cancellation foll
 too. It holds its counts in memory, so a restart starts them again, and an engine shard counts only
 its own rows. Past five subjects alerting from one detector inside one window, it raises under one
 shared `<prefix>:*` subject, so a spread of addresses cannot open an alert, and send a page, per
-address. The notifier still keeps a little state per subject that did alert, as it does for every
+address. Each detector counts at most `MAX_SUBJECTS` subjects one by one. A subject pushed out of that table
+carries its count inside the window into one shared sum, which raises under the same `<prefix>:*`
+subject at the detector's threshold, so a burst spread over more addresses than the table holds is
+still counted (BACKLOG #5508). A spread that fits the table, with every address below the
+threshold, still raises nothing. The notifier still keeps a little state per subject that did alert, as it does for every
 alert key. An alert carries a count and a fixed sentence. It never carries a message body, a message
 id, an audit row's detail or a typed username, which can be a password typed into the wrong box. The
 sign-in detector counts `auth.login_failed`, which is written once per refused local sign-in in every
