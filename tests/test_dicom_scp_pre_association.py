@@ -78,6 +78,32 @@ async def _thread_baseline() -> int:
     return len(_threads_outside_the_test())
 
 
+async def _until_ended(scp: Any, baseline: int, *, within: float = 5.0) -> None:
+    """Wait until no association is left and the thread count is back at ``baseline``.
+
+    Both are awaited, never one awaited and the other read once (vault BACKLOG #5141, #5167). The
+    thread count can reach the baseline while an ``Association`` thread is still alive: the
+    baseline can hold a dying thread of the test before, and that thread outlives the close its
+    peer reads. A slot held for good still runs this wait out, and the red says what was held."""
+    last: list[tuple[int, int]] = []
+
+    def ended() -> bool:
+        reading = (
+            len(scp._server.active_associations),
+            len(_threads_outside_the_test()) - baseline,
+        )
+        last[:] = [reading]
+        return reading[0] == 0 and reading[1] <= 0
+
+    try:
+        await _until(ended, within=within)
+    except AssertionError:
+        associations, added = last[0]
+        raise AssertionError(
+            f"after {within}s, {associations} associations and {added} threads over the baseline"
+        ) from None
+
+
 def _open(
     port: int, *, tls: bool = False, timeout: float = 5.0, source: str = "127.0.0.1"
 ) -> socket.socket:
@@ -471,8 +497,19 @@ async def test_a_stall_mid_pdu_on_an_established_association_is_ended(
             assert await asyncio.to_thread(_closed_within, sock, 5.0), (
                 "the stalled peer was not ended"
             )
-            await _until(lambda: len(_threads_outside_the_test()) <= baseline)
-            assert scp._server.active_associations == []
+            await _until_ended(scp, baseline)
+        finally:
+            sock.close()
+
+
+async def test_the_end_wait_reds_while_an_association_is_held() -> None:
+    # CONTROL for _until_ended: a slot still held runs the wait out, even once the thread count
+    # alone would pass, so waiting on the state rather than reading it once loosens nothing.
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        sock = await _a_held_association(scp.sockport)
+        try:
+            with pytest.raises(AssertionError, match="1 associations"):
+                await _until_ended(scp, len(_threads_outside_the_test()) + 10, within=0.5)
         finally:
             sock.close()
 
@@ -511,9 +548,7 @@ async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing()
             # An Association thread outlives the close its peer reads, and the baseline can hold a
             # dying thread of the test before, so the count below may not wait for this one. A slot
             # still held here runs this wait out, as a slot held for good always has.
-            await _until(lambda: scp._server.active_associations == [], within=8.0)
-            await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=8.0)
-            assert scp._server.active_associations == []
+            await _until_ended(scp, baseline, within=8.0)
             assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
                 True,
                 0x0000,
@@ -648,8 +683,7 @@ async def test_a_peer_that_never_reads_cannot_block_the_association_for_good(
 
             with caplog.at_level(logging.WARNING, logger=_LOG):
                 await asyncio.to_thread(flood)
-                await _until(lambda: len(_threads_outside_the_test()) <= baseline, within=15.0)
-            assert scp._server.active_associations == []
+                await _until_ended(scp, baseline, within=15.0)
             # The send's own deadline ended it, not an idle timer after every request was served.
             ended = [m for m in _warnings(caplog) if "a send did not finish within 1s" in m]
             assert ended, _warnings(caplog)
@@ -712,8 +746,7 @@ async def _ends_with_no_thread(
             sock.close()
         else:
             assert await asyncio.to_thread(_closed_within, sock, 5.0), "the SCP left it open"
-        await _until(lambda: len(_threads_outside_the_test()) <= baseline)
-        assert scp._server.active_associations == []
+        await _until_ended(scp, baseline)
     finally:
         sock.close()
 
@@ -730,8 +763,7 @@ async def test_fifty_requests_with_a_context_of_no_transfer_syntax_leave_no_thre
         with caplog.at_level(logging.WARNING, logger=_LOG):
             for _ in range(50):
                 await asyncio.to_thread(lambda: _stall(scp.sockport, opening).close())
-            await _until(lambda: len(_threads_outside_the_test()) <= baseline)
-        assert scp._server.active_associations == []
+            await _until_ended(scp, baseline)
         assert any("does not negotiate" in m for m in _warnings(caplog)), _warnings(caplog)
         await scp.stop()
         await _until(lambda: len(_threads_outside_the_test()) < baseline)
@@ -762,12 +794,11 @@ async def test_fifty_requests_with_a_context_of_no_abstract_syntax_are_refused_a
 
             with caplog.at_level(logging.WARNING, logger=_LOG):
                 answers = [await asyncio.to_thread(one_peer) for _ in range(50)]
-                await _until(lambda: len(_threads_outside_the_test()) <= baseline)
+                await _until_ended(scp, baseline)
             assert scp._refusal_log.refusals == 50, (
                 "a request that cannot negotiate was not refused"
             )
             assert answers == [_rj(0x01, 0x01, 0x01)] * 50
-            assert scp._server.active_associations == []
             assert any("does not negotiate" in m for m in _warnings(caplog)), _warnings(caplog)
     finally:
         threading.excepthook = previous_hook
@@ -868,7 +899,10 @@ async def test_a_connection_refused_before_its_association_fires_conn_close() ->
                 sock.close()
         await _until(lambda: len(closed) == 2)
         assert len(opened) == 2
-        assert [e.address for e in closed] == [e.address for e in opened]
+        # Paired by address, not by order (vault BACKLOG #5141): the SCP shuts the socket before it
+        # fires EVT_CONN_CLOSE, so the second connection's close can fire first. Read as a red on
+        # ubuntu-latest, with the two addresses swapped.
+        assert sorted(e.address for e in closed) == sorted(e.address for e in opened)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
