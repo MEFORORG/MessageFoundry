@@ -19379,14 +19379,16 @@ class MessageStore:
                 async with _writer_guard(self._db, self._lock):
                     written = await self._write_user(user_id, change)
                     await self._commit()
-                    if written is not None:
-                        resealed += 1
-                        # Each re-encrypted TOTP secret is an AES-GCM invocation under the active
-                        # key (ASVS 11.3.4), charged per committed record under the writer lock the
-                        # charge needs, so an interrupted pass leaves no write uncharged (#5738).
-                        await self._charge_bound_batch()
             except RowSealError:
                 refused += 1
+                continue
+            if written is not None:
+                resealed += 1
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+                # 11.3.4), charged after each committed record so an interrupted pass leaves no write
+                # uncharged (BACKLOG #5738). Through the public checkpoint, which takes the writer
+                # lock the charge's commit needs and unwinds a failed add.
+                await self.checkpoint_cipher_invocations()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -21879,14 +21881,16 @@ class MessageStore:
         ``set_at``); per-namespace policy is a documented follow-up. Returns the number of entries
         purged. Off by default — the RetentionRunner calls it only when ``state_max_age_days`` is set."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        # BEGIN IMMEDIATE: the SELECT and the DELETE share one write transaction, so an engine shard
+        # in another process cannot refresh a listed key between them; the cache would otherwise
+        # drop a key whose row survives (BACKLOG #5734). ``RETURNING`` needs SQLite 3.35.
+        async with _writer_txn(self._db, self._lock, immediate=True):
             cur = await self._db.execute(
                 "SELECT namespace, key FROM state WHERE set_at < ?", (older_than,)
             )
             purged_keys = [(r["namespace"], r["key"]) for r in await cur.fetchall()]
-            if not purged_keys:
-                return 0
-            await self._db.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
+            if purged_keys:
+                await self._db.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
             await self._commit()
         # Commit succeeded → evict the purged keys from the read-through cache (after commit, mirroring
         # the write path: the table is the source of truth, the cache follows it only once durable).

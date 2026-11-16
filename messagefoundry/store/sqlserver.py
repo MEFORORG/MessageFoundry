@@ -10496,17 +10496,12 @@ class SqlServerStore:
         One ``DELETE ... OUTPUT`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
         expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
         between the two, so the cache would drop a key whose row survives."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] WHERE set_at < ?",
-                    (older_than,),
-                )
-                purged_keys = [(r[0], r[1]) for r in await cur.fetchall()]
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        rows = await self._execute_output(
+            "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
+            " WHERE set_at < ?",
+            (older_than,),
+        )
+        purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
         for ck in purged_keys:
             # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
             if ck in self._state_cache:
@@ -16618,14 +16613,16 @@ class SqlServerStore:
         cur: Any,
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
+        *,
+        owner: str | None = None,
     ) -> SessionRecord | None:
         """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
-        ``MessageStore._write_session`` states the contract, except ``owner``: this backend checks a
-        kept session's owner in :meth:`_keep_or_end_session` before this read, because an
-        ``UPDLOCK`` read filtered on ``user_id`` could still lock the foreign row it seeks to
-        (BACKLOG #5742). Call it on ``cur`` inside an open transaction. The read takes ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
-        guard, not the only one. The write reports through ``OUTPUT``, which a session-wide
-        ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        ``MessageStore._write_session`` states the contract, ``owner`` included (BACKLOG #5742).
+        Call it on ``cur`` inside an open transaction. The read takes ``UPDLOCK, ROWLOCK``, so the
+        compare on the seal is a second guard, not the only one. ``owner`` is checked after that
+        read, before the seal check; :meth:`_keep_or_end_session` probes the owner unlocked first,
+        so a foreign row is normally not locked at all. The write reports through ``OUTPUT``,
+        which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
         await cur.execute(
             "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
         )
@@ -16634,7 +16631,7 @@ class SqlServerStore:
         if not rows:
             return None
         current = SessionRecord.from_mapping(dict(zip(columns, rows[0])))  # noqa: B905
-        if current.revoked_at is not None:
+        if current.revoked_at is not None or (owner is not None and current.user_id != owner):
             return None
         await session_writer_seal_check(self._row_sealer, current)
         updated = await seal_session_async(self._row_sealer, change(current))
@@ -16916,14 +16913,17 @@ class SqlServerStore:
         A kept session of another account is left untouched (BACKLOG #5742): its owner is read
         first, without a lock hint, as :meth:`_write_session_txn` reads it, and a foreign row is
         neither seal-checked, re-sealed, nor locked under ``UPDLOCK`` outside the documented lock
-        order. ``user_id`` never changes, so the read cannot go stale before the write."""
+        order. A row the probe does not see, such as one whose insert had not committed, still
+        meets the owner check in :meth:`_write_session` before its seal check."""
         await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
         owners = await cur.fetchall()
         if owners and str(owners[0][0]) != restamp.user_id:
             return RevokeResult(revoked)
         if not outcome.tripped and restamp.kept(
             await write_kept_session(
-                self._write_session(cur, token_hash, restamp), outcome, token_hash
+                self._write_session(cur, token_hash, restamp, owner=restamp.user_id),
+                outcome,
+                token_hash,
             )
         ):
             return RevokeResult(revoked, kept=True)

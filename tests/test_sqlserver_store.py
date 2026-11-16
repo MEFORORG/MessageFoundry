@@ -1455,8 +1455,8 @@ async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: 
     real_write = store._write_session
     written: list[Any] = []
 
-    async def _spy(cur: Any, token_hash: str, change: Any) -> Any:
-        written.append(await real_write(cur, token_hash, change))
+    async def _spy(cur: Any, token_hash: str, change: Any, **kwargs: Any) -> Any:
+        written.append(await real_write(cur, token_hash, change, **kwargs))
         return written[-1]
 
     store._write_session = _spy

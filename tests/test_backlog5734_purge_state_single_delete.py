@@ -43,11 +43,16 @@ class _Table:
 
 
 class _SsCursor:
+    #: The OUTPUT rowset's columns, as ``_execute_output`` reads them.
+    description = (("namespace",), ("state_key",))
+
     def __init__(self, table: _Table) -> None:
         self._t = table
         self._result: list[tuple[str, str]] = []
 
     async def execute(self, sql: str, params: Any = ()) -> None:
+        # The SELECT branch, and the non-RETURNING DELETEs below, serve only the pre-fix code, so
+        # the test fails against it.
         if sql.startswith("SELECT"):
             self._result = self._t.select_expired()
         elif sql.startswith("DELETE"):
