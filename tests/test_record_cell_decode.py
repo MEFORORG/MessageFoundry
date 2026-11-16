@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, UserSealRefused
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -163,13 +163,40 @@ async def test_a_corrupt_account_is_listed_as_failing_beside_the_others(
         assert set(listed_raw) == {"u-good", "u-bad"}
         assert listed_raw["u-bad"].unreadable and listed_raw["u-bad"].disabled
         assert not listed_raw["u-good"].unreadable
-        with pytest.raises(RowSealError):
-            await store.get_user("u-bad")
+        single = await store.get_user("u-bad")
+        assert single is not None and single.unreadable
         # The admin list keeps the account, failing, on a keyless store as on a keyed one.
-        listed = await AuthService(store, AuthSettings()).list_checked_users()
+        service = AuthService(store, AuthSettings())
+        listed = await service.list_checked_users()
         by_id = {entry.id: entry.user for entry in listed}
         assert set(by_id) == {"u-good", "u-bad"}
         assert by_id["u-good"] is not None and by_id["u-bad"] is None
+        # The single-row readers answer it as a record that fails its seal, not an error.
+        assert await service._load_user("u-bad") is None
+        assert await service._load_user_by_username("u-bad") is None
+        with pytest.raises(UserSealRefused):
+            await service.checked_user("u-bad")
+        # A write still refuses it.
+        with pytest.raises(RowSealError):
+            await store.set_user_roles("u-bad", [], audits=())
+    finally:
+        await store.close()
+
+
+async def test_an_unreadable_administrator_does_not_block_another_admin_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "admins.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()  # the built-in roles
+        for user_id in ("a-1", "a-2", "a-3"):
+            await _user(store, user_id)
+            await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], audits=())
+        _raw(path, "UPDATE users SET lock_cycles=? WHERE id=?", ("many", "a-2"))
+        await service.delete_user("a-3", actor="test")  # a-1 still counts; a-2 is skipped
+        assert await store.get_user("a-3") is None
     finally:
         await store.close()
 

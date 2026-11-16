@@ -101,7 +101,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -2179,10 +2179,8 @@ def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
     so does a value the encoder cannot read, as :func:`user_seal_ok` answers it (BACKLOG #5505)."""
     if sealer is None:
         return True
-    try:
-        return sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
-    except TypeError:
-        return False
+    parts = record.seal_fields()
+    return _encodes(SESSION_KIND, parts) and sealer.verify(SESSION_KIND, parts, record.seal)
 
 
 # The awaitable read checks below serve either sealer (ADR 0217 slice 1b). Under the local sealer
@@ -2771,7 +2769,10 @@ async def admin_guard_counts(
         if is_target:
             target += 1
             continue
-        record = await read_record(holder_id)
+        try:
+            record = await read_record(holder_id)
+        except RowSealError:
+            continue  # a holder whose row does not parse counts as one that fails (BACKLOG #5505)
         if record is None or not await user_seal_ok_async(sealer, record):
             continue
         if record.row.disabled or role_id not in record.role_ids:
@@ -2833,7 +2834,8 @@ def decode_or_refuse[T](kind: str, ident: str, decode: Callable[[], T]) -> T:
         failure = type(exc).__name__
     subject = seal_row_ref(kind, ident) if ident else ""
     log.warning(
-        "a %s row (%s) holds a cell that does not parse (%s); it is refused as a failed seal",
+        "a row of a %s record (%s) holds a cell that does not parse (%s); it is refused as a"
+        " failed seal",
         kind,
         subject or "no readable id",
         failure,
@@ -2857,7 +2859,10 @@ def parse_recovery_code_hashes(cell: str | None, user_id: str) -> list[str]:
         return []
 
     def parse() -> list[str]:
-        hashes = json.loads(cell)
+        # The shared hostile-JSON reader: a depth bomb is a refusal, not a RecursionError.
+        hashes, refused = json_loads_or_refusal(cell)
+        if refused is not None:
+            raise ValueError("totp_recovery_codes is not JSON")
         if not isinstance(hashes, list):  # ``null`` included
             raise TypeError("totp_recovery_codes is not a list")
         return [str(h) for h in hashes]
@@ -3132,21 +3137,26 @@ class UserRecord:
         )
 
 
+def user_or_unreadable(d: Mapping[str, Any]) -> UserRecord:
+    """The account a user read returned (BACKLOG #5505): :meth:`UserRecord.from_mapping`, or, for
+    a row whose cells do not parse, :meth:`UserRecord.unreadable_row`, so every user reader hands
+    the service a record it fails and reports, as it does one that fails its seal, rather than an
+    error. A row whose id is itself unreadable still raises the :class:`RowSealError`: nothing
+    could name it. The write helpers read through :meth:`UserRow.from_mapping` and still refuse."""
+    try:
+        return UserRecord.from_mapping(d)
+    except RowSealError:
+        ident = _cell_text(d, "id")
+        if not ident:
+            raise
+    return UserRecord.unreadable_row(ident)
+
+
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
-    """The accounts a list read returned, in order (BACKLOG #5505). A row whose cells do not parse
-    is listed as :meth:`UserRecord.unreadable_row`, so the account stays in the list and the
-    service fails and reports it, as it does a record that fails its seal. Only a row whose id is
-    itself unreadable is left out, after :func:`decode_or_refuse` has logged it: nothing could
-    name it."""
-    out: list[UserRecord] = []
-    for d in rows:
-        try:
-            out.append(UserRecord.from_mapping(d))
-        except RowSealError:
-            ident = _cell_text(d, "id")
-            if ident:
-                out.append(UserRecord.unreadable_row(ident))
-    return out
+    """The accounts a list read returned, in order, each read by :func:`user_or_unreadable`, so
+    an account whose row does not parse stays in the list (BACKLOG #5505). Only a row whose id is
+    itself unreadable is left out, after :func:`decode_or_refuse` has logged it."""
+    return decoded_rows(rows, user_or_unreadable)
 
 
 @dataclass(frozen=True)
@@ -19377,7 +19387,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return UserRecord.from_mapping(dict(row)) if row else None
+        return user_or_unreadable(dict(row)) if row else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
         """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
@@ -19566,7 +19576,7 @@ class MessageStore:
                 f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
             )
             row = await cur.fetchone()
-        return UserRecord.from_mapping(dict(row)) if row else None
+        return user_or_unreadable(dict(row)) if row else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read: it asks the directory's IMMUTABLE id
@@ -19576,13 +19586,13 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
             row = await cur.fetchone()
-        return UserRecord.from_mapping(dict(row)) if row else None
+        return user_or_unreadable(dict(row)) if row else None
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE username=?", (username,))
             row = await cur.fetchone()
-        return UserRecord.from_mapping(dict(row)) if row else None
+        return user_or_unreadable(dict(row)) if row else None
 
     async def set_user_username(
         self,
