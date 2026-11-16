@@ -458,13 +458,66 @@ def test_a_tracking_ref_of_a_remote_no_longer_configured_does_not_back_a_branch(
     r = check(repo)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "1 of 1 configured remote(s) answered" in r.stdout
+    assert "not trusted, no configured remote: 1 tracking ref(s)" in r.stdout
     assert "1 commits on 1 branch exist on no remote" in r.stdout
 
 
+def test_a_nested_remote_that_did_not_answer_is_not_trusted_through_its_parent(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. ``--remotes=origin`` globs ``refs/remotes/origin/*``, and that ``*`` crosses
+    ``/``, so trusting origin also trusted the namespace of a dead remote named ``origin/dead``."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "held only by a nested dead remote", "work")
+    git(repo, "checkout", "-q", "main")
+    # `git remote add` refuses a name that is a subset of an existing remote's; a hand-edited config
+    # does not, and `git remote` then lists it.
+    git(repo, "config", "remote.origin/dead.url", str(tmp_path / "gone.git"))
+    git(repo, "config", "remote.origin/dead.fetch", "+refs/heads/*:refs/remotes/origin/dead/*")
+    assert "origin/dead" in git(repo, "remote").split()
+    git(repo, "update-ref", "refs/remotes/origin/dead/side", "side")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "not trusted, did not answer: origin/dead" in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_an_EMPTY_remote_backs_nothing(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP -- the twin of the HEAD-less backup in ``two_remotes``. Both answer, but this one
+    holds no branch at all: a store recreated empty. Its stale tracking refs must not back anything,
+    so with it the only remote the repository is UNVERIFIABLE, not clean."""
+    git(repo, "remote", "set-url", "origin", str(_bare(tmp_path / "recreated.git")))
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "UNVERIFIABLE" in r.stdout
+    assert "0 unbacked commits" not in r.stdout
+
+
+def test_a_repo_with_no_remote_counts_commits_an_orphan_tracking_ref_points_at(
+    tmp_path: Path,
+) -> None:
+    """MUST TRIP. With no remote configured nothing may exclude, but a bare ``--not --remotes``
+    still let a namespace left behind by a removed remote hide the commits it points at."""
+    r = tmp_path / "lonely"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
+    git(r, "config", "user.email", "t@example.invalid")
+    git(r, "config", "user.name", "t")
+    _commit(r, "f.txt", "x", "only copy")
+    git(r, "update-ref", "refs/remotes/gone/main", "main")
+
+    res = check(r)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "NO-REMOTE" in res.stdout
+    assert "1 commits across 1 refs exist on this disk only" in res.stdout
+
+
 def test_a_squash_landed_verdict_needs_a_REACHABLE_origin(repo: Path, tmp_path: Path) -> None:
-    """MUST TRIP. The patch-id arm reads ``origin/main``. When origin no longer answers but another
-    remote does, that ref is a local copy of a dead store, so a patch found there proves nothing about
-    where the content now lives."""
+    """MUST TRIP. The patch-id arm reads a trusted remote's default branch, origin first. When origin
+    no longer answers but another remote does, ``origin/main`` is a local copy of a dead store, so a
+    patch found there proves nothing about where the content now lives; backup's main lacks it."""
     _add_backup_remote(repo, tmp_path)
     _squash_land(repo, "landed on origin only")
     # Local main goes back to what backup holds, so only `side` can be a finding.
