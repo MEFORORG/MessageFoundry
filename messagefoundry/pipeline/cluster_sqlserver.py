@@ -65,6 +65,7 @@ from messagefoundry.pipeline.cluster import (
     heartbeat_lapsed,
     late_hold_pause_seconds,
     lease_release_unconfirmed,
+    log_epoch_change_demotion,
     log_heartbeat_lapse_stand_down,
     log_late_hold_refusal,
     members_from_node_rows,
@@ -528,6 +529,7 @@ class SqlServerCoordinator:
             # itself); SqlServerStore._fetchone_clamped says what that leaves unbounded. A stepdown
             # waits on this lock for the fence timeout (acquire_leadership_lock).
             issued_at = self._monotonic()
+            prior_epoch = self._leader_epoch
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at  # stamp for the fence watchdog
@@ -540,6 +542,9 @@ class SqlServerCoordinator:
                     return
                 if self._stand_down_if_lapsed():
                     return  # lapsed while the claim was in flight; DbCoordinator's tick says why
+                if self._is_leader and self._leader_epoch != prior_epoch:
+                    self._demote_on_epoch_change(prior_epoch)  # BACKLOG #5746
+                    return
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)
@@ -552,6 +557,15 @@ class SqlServerCoordinator:
                     "lease taken or expired"
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
+
+    def _demote_on_epoch_change(self, prior_epoch: int | None) -> None:
+        """Mirrors :meth:`DbCoordinator._demote_on_epoch_change` (BACKLOG #5746); read its
+        docstring for why a moved epoch demotes and why the epoch, not the renew age, is compared."""
+        log_epoch_change_demotion(self.node_id, self._leader_epoch, prior_epoch)
+        self._is_leader = False
+        self._leader_epoch = None
+        self._alert_leadership_lost("lease epoch moved since the last renew")
+        self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _refuse_late_hold(self, issued_at: float) -> None:
         """Mirrors :meth:`DbCoordinator._refuse_late_hold` (BACKLOG #5711); read its docstring for
