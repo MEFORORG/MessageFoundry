@@ -857,8 +857,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    retention: the prune removes the pair once the later of its
    sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
    claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, so a damaged
-   pair whose mtimes are set ahead stays on disk until they pass, and `rotate-key`, which rewrites
-   a pair it can decrypt, restarts that clock.
+   pair whose mtimes are set ahead stays on disk until they pass.
    The prune logs each such removal as one of a refused sidecar, and its audit row carries blank
    owner fields. A sound sidecar whose `uploaded_at` is more than a day ahead of the prune's clock
    is aged the same way, by its pair's mtimes and never by an mtime ahead of the clock, since that

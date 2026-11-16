@@ -9033,8 +9033,9 @@ def create_app(
     # own text, because no key and no rotate-key repairs it, and a keyless store has no key at all.
     _UPLOAD_DAMAGED = (
         "this uploaded file is damaged, so it was not read. No key and no command repairs it. An "
-        "operator may delete it; where the delete is refused too, it must be removed from the "
-        "uploads directory by hand"
+        "operator may delete it, but a damaged sidecar refuses the delete too. The retention prune "
+        "removes a damaged file, with an audit row, once it is old on disk; removing it from the "
+        "uploads directory by hand leaves no audit row"
     )
 
     _UPLOAD_UNAVAILABLE = (

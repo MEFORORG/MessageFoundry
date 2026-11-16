@@ -446,3 +446,20 @@ async def test_a_refusal_carries_no_file_content_on_its_chain(tmp_path: Path) ->
         with pytest.raises(UploadUnreadableError) as info:
             await read(meta.file_id)
         assert [type(e) for e in _chain(info.value)] == [UploadDamagedError]
+
+
+async def test_a_pair_sealed_under_a_key_is_not_damaged_on_a_keyless_store(tmp_path: Path) -> None:
+    # The keyless cipher hands a sealed value back as it is. That file is not damaged, since its
+    # key recovers it, so it must be cipher-declined: refused, never aged on disk and pruned.
+    keyed = _keyed(tmp_path)
+    meta = await _saved(keyed)
+    sidecar, body = _sidecar(keyed, meta.file_id), _blob(keyed, meta.file_id)
+    _age(sidecar, body, days=60)
+    keyless = _keyless(tmp_path)
+    assert await keyless.list_files() == []
+    for read in (keyless.get_meta, keyless.read_bytes):
+        with pytest.raises(UploadUnreadableError) as info:
+            await read(meta.file_id)
+        assert not isinstance(info.value, UploadDamagedError)
+    assert (await keyless.prune_expired(retention_days=30)).pruned == []
+    assert sidecar.exists() and body.exists()

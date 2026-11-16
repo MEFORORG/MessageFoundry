@@ -448,6 +448,18 @@ _REFUSED_NOT_UNSEALABLE = "the uploaded file's metadata is refused under the con
 
 _DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it was not read"
 
+_STILL_SEALED = "the uploaded file's {part} is sealed under a store key this engine does not hold"
+
+
+def _refuse_still_sealed(text: str, part: str) -> None:
+    """Raise a :class:`CipherError` when the cipher handed back text that is still sealed, as the
+    keyless cipher does with a value it cannot open. Such a file is not damaged: the key it was
+    sealed under recovers it. So it must take the cipher-declined path, which the prune never
+    removes, rather than the damaged one, which the prune ages on disk (BACKLOG #5387, #5388). No
+    sidecar JSON and no base64 body ever starts with the marker, so a sound file never trips it."""
+    if text.startswith(MARKER_PREFIX):
+        raise CipherError(_STILL_SEALED.format(part=part))
+
 
 class UploadDamagedError(UploadUnreadableError):
     """The :class:`UploadUnreadableError` of a damaged file, which no key or ``rotate-key`` repairs
@@ -1166,6 +1178,7 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "body", file_id),
             allow_unmarked=self._passes_unmarked,
         )
+        _refuse_still_sealed(b64, "body")
         # Strict, as the writer emits it, so a damaged body is refused rather than served with
         # its stray characters dropped. Encoded first, so a non-ASCII character raises a
         # UnicodeError and the only other refusal is binascii.Error, the two read_bytes catches.
@@ -1182,6 +1195,7 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "meta", file_id),
             allow_unmarked=self._passes_unmarked,
         )
+        _refuse_still_sealed(raw, "sidecar")
         return _meta_from_json(raw, file_id)
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
@@ -1331,7 +1345,9 @@ class UploadStore:
                     else type(exc).__name__
                 )
                 _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, defect)
-                broken = True
+                # Only the store's own shape refusal is damage the prune may age. Any other error
+                # here is not known to be one, so it is skipped, never pruned.
+                broken = isinstance(exc, _MalformedSidecarError)
             lost = None
             if classify and sink is not None:
                 lost = self._unsealable_sync(fid, entry)
