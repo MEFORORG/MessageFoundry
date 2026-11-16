@@ -324,8 +324,10 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 
 ```json
 // .claude/settings.json — deny-list (excerpt — abridged; the real file carries more deny rules,
-// and denies each protected path to the Read, Edit and Write file tools alike; those file-tool
-// rules do not stop a shell command)
+// and a Read, an Edit and a Write rule for each protected path. Claude Code's permissions page
+// says the Edit rule is what covers the Write tool and a Write(path) rule matches nothing; the
+// Write rules are kept for a client that honours them. The file-tool rules do not stop a shell
+// command)
 "deny": [
   "Read(.env)", "Edit(.env)", "Write(.env)",
   "Read(*.db)", "Edit(*.db)", "Write(*.db)",

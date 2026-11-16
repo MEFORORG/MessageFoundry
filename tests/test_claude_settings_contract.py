@@ -60,10 +60,12 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 #
 # Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the deny patterns
 # that keep it away from an agent's file tools. A secret, credential or store file git is told
-# never to hold is one an agent should neither read nor overwrite. Before BACKLOG #5495 the key,
-# certificate, store sidecar and bootstrap-credential patterns were denied to Read alone, with no
-# Edit or Write rule, and `/docker/secrets.env`, `/docker/tls/`, the leak scanner's real token list
-# and the rest of the `*.db*` family had no file-tool rule at all.
+# never to hold is one an agent should neither read nor overwrite. Before BACKLOG #5495,
+# `/docker/secrets.env`, the leak scanner's real token list, files in `/docker/tls/` other than
+# `*.key` and `*.pem`, and the `*.db*` family beyond `*.db`, `*.db-wal` and `*.db-shm` had no
+# file-tool rule at all, so the file tools could read and overwrite them. `*.key`, `*.pem`,
+# `*.pfx`, `*.db-wal`, `*.db-shm` and `bootstrap-admin.txt` had a Read rule and no Edit rule; on
+# the client measured 2026-11-16 the Read rule alone already refused the Write tool on its path.
 # Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
 # red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
 # secret line added to `.gitignore` gets no deny rule until someone adds it here, which is how the
@@ -88,9 +90,11 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     "scripts/security/scan-tokens.local.txt": ("scan-tokens.local.txt",),
 }
 
-# The file tools each protected pattern is denied to. Claude Code documents an Edit rule as
-# applying to every built-in tool that edits files, Write included; the Write rule is spelled out
-# anyway, as `Write(.env)` already was, so the list reads the same as what it denies.
+# The tool names each protected pattern carries a rule for. Claude Code's permissions page says
+# `Edit` rules apply to all built-in tools that edit files, and that a `Write(path)` rule is
+# accepted but matches nothing, so the Edit rule is what denies the Write tool; the client measured
+# 2026-11-16 also refused a Write on a Read-denied path. The Write rules are kept, as `Write(.env)`
+# already was, so a client that does honour them denies the same set; they add nothing today.
 _FILE_TOOLS = ("Read", "Edit", "Write")
 
 _REQUIRED_DENIES = frozenset(
@@ -159,8 +163,9 @@ def _keys_missing_from_gitignore(text: str) -> list[str]:
 
 
 def _keys_missing_from_planted_gitignore(_settings: dict[str, Any]) -> list[str]:
-    """Detector shim: a `.gitignore` holding every key but `*.pfx` must report that one key."""
-    return _keys_missing_from_gitignore("\n".join(k for k in _GITIGNORED_SECRETS if k != "*.pfx"))
+    """Detector shim: a `.gitignore` holding every key but `*.pfx`, which appears only commented."""
+    kept = [k for k in _GITIGNORED_SECRETS if k != "*.pfx"]
+    return _keys_missing_from_gitignore("\n".join([*kept, "# *.pfx"]))
 
 
 def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
@@ -169,7 +174,8 @@ def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
     It compares pattern text, not path coverage: a broader rule for another tool does not count,
     except a bare tool name.
 
-    One way only: a path hidden from Read is secret enough not to overwrite, but a write-only deny,
+    One way only: a path hidden from Read is secret enough to deny by name to the writing tools
+    too, but a write-only deny,
     say on a gate file agents must read, is a legitimate rule on its own. A bare tool name in the
     deny list denies that tool on every path, so it covers every pattern.
     """
@@ -370,10 +376,11 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
 
 
 def test_every_read_denied_path_is_denied_to_every_file_tool() -> None:
-    """A path denied to Read and not to Edit or Write can still be overwritten.
+    """Every Read-denied pattern also carries an Edit and a Write rule of its own.
 
-    Red before BACKLOG #5495: `*.key`, `*.pem`, `*.pfx`, `*.db-wal`, `*.db-shm` and
-    `bootstrap-admin.txt` were denied to Read alone, and `.env.*` and `*.db` to Read and Edit.
+    Stricter than the client needs (see `_FILE_TOOLS`): it keeps a path's write protection stated
+    in the list rather than resting on how one client treats a Read rule. Red before BACKLOG #5495,
+    when six Read-denied patterns, listed above `_GITIGNORED_SECRETS`, had no Edit rule.
     """
     unmirrored = _unmirrored_file_denies(_load())
     assert not unmirrored, (
@@ -398,6 +405,11 @@ def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
         }
     }
     assert _unmirrored_file_denies(planted) == ["*.key: missing Write"]
+
+
+def test_the_gitignore_detector_names_only_the_missing_key() -> None:
+    """Exact output: the wrong key, an extra key, or a commented line read as live all fail."""
+    assert _keys_missing_from_planted_gitignore({}) == ["*.pfx"]
 
 
 def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
@@ -601,8 +613,7 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "dot-anchored deny rule",
         ),
         (
-            # The shape `*.key` had before BACKLOG #5495: denied to Read, not to the tools that
-            # write it.
+            # The shape `*.key` had before BACKLOG #5495: a Read rule and no Edit or Write rule.
             {"permissions": {"deny": ["Read(*.key)"]}, "hooks": {}},
             _unmirrored_file_denies,
             "deny pattern named for Read only",
@@ -666,10 +677,13 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
 def test_the_checks_can_actually_fail(planted: dict[str, Any], checker: Any, label: str) -> None:
     """A guard that cannot be shown to fail is not a guard.
 
-    Both checks above are absence assertions over a file that is currently correct, which is the
+    The checks above are absence assertions over files that are currently correct, which is the
     shape that passes just as well when the check is broken -- the failure mode this repo has
     already recorded twice (`tests/test_feature_map_claims.py`, the `.claude/` link-gate exemption).
-    Each detector is run here against a settings document carrying exactly the defect it hunts.
+    Each detector is run here against an input carrying exactly the defect it hunts: a planted
+    settings document, or, for the `.gitignore` check, a planted `.gitignore` text the shim builds,
+    in which case the settings document passed is empty and unused. This asserts only that each
+    detector reports something; the two exact-output tests above pin what the newer ones report.
     """
     assert checker(planted), (
         f"the {label} detector returned nothing for a document that contains one. The "
