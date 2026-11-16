@@ -293,20 +293,37 @@ class _WindowsProbe:
 
 
 #: What splits one registry string into lines. A single ``REG_SZ`` value can hold several
-#: ``NAME=value`` lines, and one ``REG_MULTI_SZ`` item can too.
-_LINE_BREAK = re.compile(r"\r\n|[\r\n\0]")
+#: ``NAME=value`` lines, and one ``REG_MULTI_SZ`` item can too. No NUL: ``winreg`` cuts a
+#: ``REG_SZ`` at its first one and splits a ``REG_MULTI_SZ`` on them, so none reaches here.
+_LINE_BREAK = re.compile(r"\r\n|[\r\n]")
+
+
+def _refused_name(line: str) -> bool:
+    """Whether ``line`` sets a name the refusal is about: a secret-class name or a
+    ``MEFOR_VALUE_*`` one. Neither can be spelled by a line of base64 or PEM armour."""
+    name = line.partition("=")[0].strip().upper()
+    return (
+        name in KEY_CLASS_NAMES or name in DIRECTORY_CLASS_NAMES or name.startswith(_VALUE_PREFIX)
+    )
 
 
 def _lines(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Each entry whole, then each of its lines as an entry of its own, each with the registry
-    value it came from. A one-line entry is read twice, which lists nothing new. The reader cannot tell whether NSSM takes a line or the
-    whole string as a variable, so it reads both (vault BACKLOG #5394): the whole string keeps an
-    inline key whose ``-----BEGIN`` starts on a later line, and the lines catch a store key a later
-    line sets. Reading too many only lists a name a later line spells, and a name outside the
-    secret classes refuses nothing."""
-    return [
-        (where, part) for where, entry in entries for part in (entry, *_LINE_BREAK.split(entry))
-    ]
+    """Each entry, and each later line of it that sets a refused name, with the registry value
+    it came from (vault BACKLOG #5394). The reader cannot tell whether NSSM takes a line or the
+    whole string as a variable, so it reads both. The whole string keeps an inline key whose
+    ``-----BEGIN`` starts on a later line; it is dropped when its name itself holds a line break,
+    which no variable is named. A later line is kept only for a name the refusal is about, so a
+    line of key material is never read as a name, and a name no variable sets, such as the
+    secrets directory's, is never taken as set."""
+    read: list[tuple[str, str]] = []
+    for where, entry in entries:
+        name, _equals, _value = entry.partition("=")
+        if not _LINE_BREAK.search(name):
+            read.append((where, entry))
+        lines = _LINE_BREAK.split(entry)
+        if len(lines) > 1:
+            read.extend((where, line) for line in lines if _refused_name(line))
+    return read
 
 
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:

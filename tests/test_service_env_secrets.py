@@ -354,7 +354,7 @@ def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> Non
     assert later.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
 
 
-@pytest.mark.parametrize("brk", ["\r\n", "\n", "\r", "\0"])
+@pytest.mark.parametrize("brk", ["\r\n", "\n", "\r"])
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_a_store_key_on_a_later_line_of_one_value_refuses(key: str, brk: str) -> None:
     """Vault BACKLOG #5394: one ``REG_SZ`` value can hold several ``NAME=value`` lines. A store
@@ -372,6 +372,32 @@ def test_an_env_value_on_a_later_line_of_one_value_refuses() -> None:
     assert posture.listed_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
     assert posture.empty_value_names == ("MEFOR_VALUE_PARTNER_HOST",)
     assert service_env_refusal(posture) is not None
+
+
+def test_a_later_line_of_key_material_is_never_read_as_a_name() -> None:
+    """A padded base64 line holds an equals sign. Read as ``NAME=value`` it would put key
+    material in ``listed``; only a name the refusal is about is read off a later line."""
+    posture = _service(
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\nMIIB==\n-----END"]
+    )
+    assert posture.listed == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+def test_a_whole_string_whose_name_holds_a_line_break_lists_no_name() -> None:
+    posture = _service(["MEFOR_VALUE_A\nMEFOR_VALUE_B=x"])
+    assert posture.listed == ("MEFOR_VALUE_B",)
+    assert posture.unplain_value_names == ()
+
+
+def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
+    """NSSM may take the whole item as one variable, so a later line's MEFOR_SECRETS_DIRECTORY is
+    not evidence the service has one, and the refusal still says to add it."""
+    posture = _service(
+        ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:
