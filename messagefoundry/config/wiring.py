@@ -6331,6 +6331,21 @@ def _require_connection_name(conn: InboundConnection | OutboundConnection, kind:
     )
 
 
+def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
+    """Each pair of ``names`` that differ only in case, as (first declared, later one) (BACKLOG
+    #5392). A SQL Server store with a case-insensitive default collation compares the queue,
+    response and scope rows a connection name keys without case, so two such connections would
+    share them there while SQLite and Postgres keep them apart. A connection name is ASCII (the
+    name rule), so ``casefold`` is exactly that collation's comparison for it; trailing spaces and
+    width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and an outbound
+    may share a name, as they may exactly."""
+    seen: dict[str, str] = {}
+    for name in names:
+        first = seen.setdefault(name.casefold(), name)
+        if first != name:
+            yield first, name
+
+
 @dataclass
 class Registry:
     """The wired graph produced by loading config modules."""
@@ -6491,24 +6506,10 @@ class Registry:
             )
         self._add(self.fhir_lookups, spec.name, spec, "fhir lookup")
 
-    def _add(self, table: dict[str, Any], name: str, value: Any, kind: str) -> None:
+    @staticmethod
+    def _add(table: dict[str, Any], name: str, value: Any, kind: str) -> None:
         if name in table:
             raise WiringError(f"duplicate {kind} name: {name!r}")
-        # BACKLOG #5392. A SQL Server store with a case-insensitive default collation compares
-        # queue, response and scope rows by name without case, so ``IB_A`` and ``ib_a`` would
-        # share them there while every other backend keeps them apart. Refuse the pair at load on
-        # every backend, so one graph means the same thing on each. Per table, as the exact check
-        # is: an inbound and an outbound may still share one name. The folded index is a cache;
-        # a hit is believed only while that name is still in the table.
-        folded = self._folded_names.setdefault(kind, {})
-        key = name.casefold()
-        clash = folded.get(key)
-        if clash is not None and clash in table:
-            raise WiringError(
-                f"duplicate {kind} name: {name!r} differs only in case from {clash!r}, and a "
-                "case-insensitive store collation would treat the two as one"
-            )
-        folded[key] = name
         table[name] = value
 
     def validate(self, *, allow_empty: bool = False) -> None:
@@ -6558,6 +6559,16 @@ class Registry:
         # Before the other rules: some read the same literals laxly, and validate raises only the
         # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
         yield from self.bool_literal_problems()
+        for kind, table in (
+            ("inbound connection", self.inbound),
+            ("outbound connection", self.outbound),
+        ):
+            for first, second in case_twins(table):
+                yield (
+                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and a "
+                    "SQL Server store with a case-insensitive collation would give the two one "
+                    "set of queue, response and scope rows"
+                )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"

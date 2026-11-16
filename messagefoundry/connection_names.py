@@ -58,8 +58,8 @@ def is_connection_name(value: object) -> bool:
 def inbound_record_name(name: str) -> str:
     """How a record or report names an INBOUND connection: ``inbound:<name>``.
 
-    Inbound, outbound and ``FhirLookup`` names are separate namespaces, so one bare name can be two
-    connections. The loosening reports, the audit records and the refusals must all spell each
+    Inbound, outbound, ``FhirLookup``, ``DatabaseLookup`` and reference-set names are separate
+    namespaces, so one bare name can be two connections. The loosening reports, the audit records and the refusals must all spell each
     namespace the same way, or a report row cannot be matched to its log line. An outbound name is
     rendered bare. Written once here so no caller re-spells the prefix."""
     return f"inbound:{name}"
