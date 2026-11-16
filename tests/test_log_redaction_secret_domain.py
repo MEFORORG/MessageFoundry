@@ -1272,6 +1272,46 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
     assert secret not in scrub_credentials(after_underscore)
 
 
+@pytest.mark.parametrize(
+    ("line", "pieces", "kept"),
+    [
+        # An empty user: a DSN that sets only a password. It printed in full before BACKLOG #5386.
+        (
+            "store dsn postgres://:pw-Empty_Usr-71@db.invalid:5432/mefor",
+            ("pw-Empty_Usr-71",),
+            "://:",
+        ),
+        # An unencoded "@" inside the password. The pattern stopped at the first "@" and printed the
+        # tail; each piece is asserted, since the head alone was already hidden.
+        (
+            "store dsn postgres://svc:pw-At@Sign_Pw-72@db.invalid:5432/mefor",
+            ("pw-At", "Sign_Pw-72"),
+            "://svc:",
+        ),
+        # Both at once, two "@" signs in the password.
+        (
+            "store dsn mssql+pyodbc://:pw@Two@Ats-73@db.invalid/mefor",
+            ("Two", "Ats-73"),
+            "mssql+pyodbc://:",
+        ),
+    ],
+)
+def test_a_dsn_password_with_no_user_or_an_at_sign_is_hidden_whole(
+    line: str, pieces: tuple[str, ...], kept: str
+) -> None:
+    """BACKLOG #5386, on both copies of ``_DSN_PASSWORD`` and through both public entry points. The
+    scheme and the user (empty or not) survive, so an operator can still tell which store it was."""
+    for label, out in (
+        ("support.redact", redact_log_line(line)),
+        ("secretscrub", scrub_credentials(line)),
+        ("support.redact pattern", _sub_dsn(redact_mod._DSN_PASSWORD, line)),
+        ("secretscrub pattern", _sub_dsn(scrub_mod._DSN_PASSWORD, line)),
+    ):
+        for piece in pieces:
+            assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
+        assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
+
+
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
 #: to build the differential corpus. The empty entry is the control, and the claim has to be made about
 #: the PAIR rather than the head alone: a LETTER-headed scheme behind it is a shape every spelling of

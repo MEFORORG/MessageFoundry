@@ -1284,7 +1284,17 @@ _KEY_MATERIAL = re.compile(
 # including the glued run above and the non-letter leading runs, so neither narrowing can come back
 # without a red -- and a differential arm that fails if either earlier head ever redacts something this
 # one does not.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+#
+# THE USER MAY BE EMPTY AND THE PASSWORD MAY HOLD AN "@" (BACKLOG #5386). The user was ``[^\s:/@]+``,
+# so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and printed the
+# password whole. The password was ``[^\s/@]+``, so it stopped at its own first "@": an unencoded
+# ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed. Now the user is ``*`` and the
+# password runs, greedily, to the LAST "@" before whitespace or a "/". That last "@" can sit past the
+# host, in a query such as ``?user=a@b``, and then the host is hidden too: over-redaction, the safe
+# direction, and group 1 still names the scheme and user. A password holding a "/" still stops there;
+# a URL parser would read that "/" as the path too. Linear still: the password walk stops at the "/"
+# of the next ``://``, so one scheme head's walk cannot cross into the next one's.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/]+@")
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,

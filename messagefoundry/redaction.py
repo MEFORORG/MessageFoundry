@@ -279,7 +279,7 @@ _CREDENTIAL_AHEAD = re.compile(
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
     r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
-    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]*:[^\s/]+@"""
     r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
 )
 
