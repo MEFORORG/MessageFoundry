@@ -389,14 +389,58 @@ def evaluate_windows_object(
 # =================================================================================================
 
 
+def _verbatim_rest_is_plain(rest: str) -> bool:
+    """Whether the text after a verbatim ``\\\\?\\`` or ``\\??\\`` prefix is already in the form
+    the walk's normpath leaves it. Win32 hands a verbatim path to the kernel as written: it turns no
+    ``/`` into a separator and collapses no ``.``, ``..`` or empty name, where the walk does all
+    three. One trailing separator is kept as written by both."""
+    names = rest.removesuffix("\\").split("\\")
+    return "/" not in rest and all(name not in ("", ".", "..") for name in names)
+
+
+def _climbs_out_of_device(rest: str) -> bool:
+    """Whether a ``..`` in the text after a normalized device prefix (``\\\\.\\`` and any spelling
+    with a forward slash) climbs to or past its first name. Win32 collapses ``..`` against the
+    prefix itself, so ``\\\\.\\C:\\..\\UNC\\s\\x`` opens the share ``\\\\s\\x``, where the walk's
+    normpath stops at the drive and reads ``C:\\UNC\\s\\x``."""
+    depth = 0
+    for name in rest.replace("/", "\\").split("\\"):
+        if name == "..":
+            depth -= 1
+            if depth < 1:
+                return True
+        elif name not in ("", "."):
+            depth += 1
+    return False
+
+
 def _strip_win_prefix(path: str) -> str | None:
     """A path with any ``\\\\?\\`` or ``\\\\.\\`` prefix turned into the form the walk reads.
 
     ``\\\\?\\C:\\x`` becomes ``C:\\x`` and ``\\\\?\\UNC\\s\\x`` becomes ``\\\\s\\x``. A volume GUID
-    path keeps its prefix, since it has no other spelling. Any other device path answers ``None``."""
+    path keeps its prefix, since it has no other spelling. Any other device path answers ``None``.
+
+    So does a device path whose text the walk would normalize into another object than Windows
+    opens (vault BACKLOG #5515): a verbatim one (``\\\\?\\``, ``\\??\\``) holding a ``/`` or a
+    ``.``, ``..`` or empty name (:func:`_verbatim_rest_is_plain`), and a normalized one whose
+    ``..`` climbs out of its first name (:func:`_climbs_out_of_device`). Neither is read as the
+    nearest plain path: which object the kernel reaches there is not emulated, so it is refused.
+    A device prefix written with a forward slash is returned as written, unless it climbs out;
+    :func:`windows_chain` names it a device path after its normpath."""
+    # A normalized device prefix: ``\\.\`` or ``\\?\`` in any mix of slashes, but not the verbatim
+    # all-backslash ``\\?\``.
+    head = path[:4]
+    if (
+        head.replace("/", "\\") in ("\\\\.\\", "\\\\?\\")
+        and head != "\\\\?\\"
+        and _climbs_out_of_device(path[4:])
+    ):
+        return None
     for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
         if path.startswith(prefix):
             rest = path[len(prefix) :]
+            if prefix != "\\\\.\\" and not _verbatim_rest_is_plain(rest):
+                return None
             if rest[:4].upper() == "UNC\\":
                 return "\\\\" + rest[4:]
             if len(rest) >= 2 and rest[1] == ":" and rest[0].isascii() and rest[0].isalpha():
@@ -551,8 +595,10 @@ def windows_chain(
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
     link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
     dot, which Win32 strips; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
-    device prefix written with forward slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
-    :data:`SHARE_CAUSE`."""
+    device prefix written with forward slashes (``//?/S:/x``); a verbatim path, or a ``..`` that
+    climbs out of a device prefix, that the walk's normpath would read as another object
+    (:func:`_strip_win_prefix`, vault BACKLOG #5515); and a stream name after a link. A path that
+    reaches a share ends with :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
     if full is None:
         return [], WalkCause.plain(_DEVICE_PATH)

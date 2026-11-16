@@ -50,6 +50,7 @@ from messagefoundry.auth.anchor_path import (
 from messagefoundry.auth.trust_anchors import AUDIT_ACTION, AnchorSpec, TrustAnchorError
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store import MessageStore
+from tests.test_odbc_path_walk_gaps import _probe
 from tests.test_trust_anchors import _block
 
 _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="reads a real NTFS DACL")
@@ -482,6 +483,58 @@ def test_a_unc_path_or_a_fat_volume_is_indeterminate() -> None:
 def test_a_prefixed_path_reads_as_its_plain_form() -> None:
     assert _win_chain_verdict(_pd_objects(), "\\\\?\\C:\\ProgramData\\mefor\\ca.pem").ok is True
     assert _win_chain_verdict({}, "\\\\.\\PhysicalDrive0").ok is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Verbatim: Win32 hands the text to the kernel as written, where normpath collapses it.
+        r"\\?\C:\certs\..\other\ca.pem",
+        r"\\?\C:\certs\.\ca.pem",
+        r"\\?\C:\certs/ca.pem",
+        r"\\?\C:\certs\\ca.pem",
+        r"\??\C:\certs\..\ca.pem",
+        r"\\?\Volume{0000}\certs\..\ca.pem",
+        r"\\?\UNC\files.test\share\..\..\C$\ca.pem",
+        # A normalized device path: Win32 collapses `..` against the prefix itself, so this opens
+        # the share \\files.test\share, where normpath stopped at C: and walked C:\UNC\...
+        r"\\.\C:\..\UNC\files.test\share\ca.pem",
+        r"\\.\C:\certs\..\..\D:\ca.pem",
+        "//?/Volume{0000}/../C:/certs/ca.pem",
+        "//./C:/../UNC/files.test/share/ca.pem",
+    ],
+)
+def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path: str) -> None:
+    """Vault BACKLOG #5515. Red under: stripping the prefix and normalizing what is left, which
+    walked a plain path on C: and cleared it, as the volume GUID one was walked under its own."""
+    chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert (chain, cause) == ([], "the path is a device path this check does not read")
+
+
+def test_a_link_to_a_verbatim_path_normpath_would_change_is_not_walked() -> None:
+    """A junction or symlink target is an NT path, read as written. Red as above."""
+    links = {"C:\\certs\\lnk": "\\??\\C:\\real\\..\\other"}
+    _chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(links))
+    assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
+@pytest.mark.parametrize(
+    ("path", "anchor"),
+    [
+        (r"\\?\C:\certs\ca.pem", "C:\\certs\\ca.pem"),
+        ("\\\\?\\C:\\certs\\", "C:\\certs"),  # one trailing separator, kept as written by both
+        (r"\\.\C:\certs\..\other\ca.pem", "C:\\other\\ca.pem"),  # `..` that stays under C:
+        (r"\\.\C:/certs/ca.pem", "C:\\certs\\ca.pem"),  # Win32 turns `/` into `\` here
+        ("//?/Volume{0000}/certs/./ca.pem", "\\\\?\\Volume{0000}\\certs\\ca.pem"),
+    ],
+)
+def test_a_device_path_windows_normalizes_the_same_way_is_still_walked(
+    path: str, anchor: str
+) -> None:
+    """The controls: a plain verbatim path, and a normalized one whose `..` stays inside it."""
+    chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert cause is None
+    assert chain[-1][0] == anchor
 
 
 def test_a_missing_component_is_indeterminate_not_insecure() -> None:
