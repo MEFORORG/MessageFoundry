@@ -62,10 +62,9 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 # that keep it away from an agent's file tools. A secret, credential or store file git is told
 # never to hold is one an agent should neither read nor overwrite. Before BACKLOG #5495,
 # `/docker/secrets.env`, the leak scanner's real token list, files in `/docker/tls/` other than
-# `*.key` and `*.pem`, and the `*.db*` family beyond `*.db`, `*.db-wal` and `*.db-shm` had no
-# file-tool rule at all, so the file tools could read and overwrite them. `*.key`, `*.pem`,
-# `*.pfx`, `*.db-wal`, `*.db-shm` and `bootstrap-admin.txt` had a Read rule and no Edit rule; on
-# the client measured 2026-11-16 the Read rule alone already refused the Write tool on its path.
+# `*.key`, `*.pem` and `*.pfx`, and the `*.db*` family beyond `*.db`, `*.db-wal` and `*.db-shm`
+# had no file-tool rule at all. `*.key`, `*.pem`, `*.pfx`, `*.db-wal`, `*.db-shm` and
+# `bootstrap-admin.txt` had a Read rule and no Edit rule; see `_FILE_TOOLS` for what that meant.
 # Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
 # red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
 # secret line added to `.gitignore` gets no deny rule until someone adds it here, which is how the
@@ -83,18 +82,18 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     # The whole store family: a rollback journal, a `.bak` snapshot copy.
     "*.db*": ("*.db*",),
     "bootstrap-admin.txt": ("bootstrap-admin.txt",),
-    # A bare filename matches at any depth, which is broader than the rooted ignore line and still
-    # misses the tracked `docker/secrets.env.example` template.
+    # A bare filename, so not tied to `docker/`; it still misses the tracked
+    # `docker/secrets.env.example` template.
     "/docker/secrets.env": ("secrets.env",),
     "/docker/tls/": ("**/docker/tls/**",),
     "scripts/security/scan-tokens.local.txt": ("scan-tokens.local.txt",),
 }
 
-# The tool names each protected pattern carries a rule for. Claude Code's permissions page says
-# `Edit` rules apply to all built-in tools that edit files, and that a `Write(path)` rule is
-# accepted but matches nothing, so the Edit rule is what denies the Write tool; the client measured
-# 2026-11-16 also refused a Write on a Read-denied path. The Write rules are kept, as `Write(.env)`
-# already was, so a client that does honour them denies the same set; they add nothing today.
+# The tool names each protected pattern carries a rule for. This is the one place this branch states
+# how the client treats them. https://code.claude.com/docs/en/permissions says `Edit` rules apply
+# to all built-in tools that edit files, and that a `Write(path)` rule is accepted but matches
+# nothing. Measured 2026-11-16: a Write to a new path matching only a Read deny rule was refused.
+# The Write rules are kept, as `Write(.env)` already was, for a client that honours them.
 _FILE_TOOLS = ("Read", "Edit", "Write")
 
 _REQUIRED_DENIES = frozenset(
@@ -378,9 +377,8 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
 def test_every_read_denied_path_is_denied_to_every_file_tool() -> None:
     """Every Read-denied pattern also carries an Edit and a Write rule of its own.
 
-    Stricter than the client needs (see `_FILE_TOOLS`): it keeps a path's write protection stated
-    in the list rather than resting on how one client treats a Read rule. Red before BACKLOG #5495,
-    when six Read-denied patterns, listed above `_GITIGNORED_SECRETS`, had no Edit rule.
+    Stricter than the client needs; see `_FILE_TOOLS`. Red before BACKLOG #5495, when six
+    Read-denied patterns, listed above `_GITIGNORED_SECRETS`, had no Edit rule.
     """
     unmirrored = _unmirrored_file_denies(_load())
     assert not unmirrored, (
@@ -426,7 +424,7 @@ def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
 
 
 def test_no_deny_rule_uses_the_narrow_dot_anchor() -> None:
-    """`Read(./.env)` matches one directory; `Read(.env)` matches every depth."""
+    """`Read(./secrets/**)` matches one directory; `Read(secrets/**)` matches every depth."""
     narrow = _dot_anchored_denies(_load())
     assert not narrow, (
         f"{len(narrow)} deny rule(s) use the `./` anchor and match at one depth only: {narrow}.\n"
