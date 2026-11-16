@@ -273,8 +273,11 @@ class TestRefuses:
         self._assert_refused(proc, rp, raw)
         assert "reads UNREADABLE" in proc.stderr, proc.stderr
 
-    def test_a_fence_that_throws_is_refused(self, repo: Path, home: Path) -> None:
-        """A registry record with NO pid key makes Test-RecordLiveness throw under StrictMode."""
+    def test_a_registry_record_with_no_pid_key_is_refused_as_unreadable(
+        self, repo: Path, home: Path
+    ) -> None:
+        """A record with NO pid key used to make Test-RecordLiveness throw under seat.ps1's
+        StrictMode. It answers UNREADABLE now (BACKLOG #5491), which still refuses the clear."""
         rp = declare_dangling(repo)
         raw = rp.read_text(encoding="utf-8-sig")
         (home / ".claude" / "sessions" / "x.json").write_text(
@@ -282,7 +285,7 @@ class TestRefuses:
         )
         proc = clear(repo, home, rp.parent.name, rp.stem)
         self._assert_refused(proc, rp, raw)
-        assert "liveness lookup" in proc.stderr and "failed" in proc.stderr, proc.stderr
+        assert "reads UNREADABLE" in proc.stderr, proc.stderr
 
     def test_an_unparsable_registry_file_vetoes_the_clear(self, repo: Path, home: Path) -> None:
         """A file caught mid-write may be the very session being fenced."""

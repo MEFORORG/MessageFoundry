@@ -149,10 +149,21 @@ function Get-LoginForSession {
     # for -- but it REPORTS the count, so the caller can say which of the two silences it is in.
     $hits = @(
         Get-SessionRecords -ConfigRoot $ConfigRoot |
-            Where-Object { $_.Record -and $_.Record.sessionId -and ($_.Record.sessionId -ieq $SessionId) }
+            Where-Object { [string](Get-RecordField $_.Record 'sessionId') -ieq $SessionId }
     )
     $login = if ($hits.Count -eq 1) { Get-LoginLabel $hits[0].Root } else { '' }
     return [pscustomobject]@{ Login = $login; Matched = $hits.Count }
+}
+
+# One field of a registry record, or $null when the record lacks it. A bare `$rec.pid` throws under
+# Set-StrictMode for a missing property, and these functions run in their caller's strict scope
+# (seat.ps1 and fleet.ps1 set it). A record missing a field is what a file caught mid-write looks like,
+# so the read must answer rather than throw (BACKLOG #5491).
+function Get-RecordField($Record, [string]$Name) {
+    if ($null -eq $Record) { return $null }
+    $p = $Record.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
 }
 
 # Every registry record, with the root it came from attached.
@@ -204,8 +215,12 @@ function Test-RecordLiveness {
     # A record with NO pid cannot be fenced, so it is UNREADABLE, not DEAD. It used to report DEAD --
     # which is not a veto anywhere -- and a registry file caught mid-write has exactly this shape, so a
     # session that had just launched read as "nobody is there" to a caller about to delete its worktree.
-    $procId = [int]$Record.pid
-    if (-not $procId) { return @{ State = "UNREADABLE"; Detail = "no pid in record; it cannot be fenced" } }
+    # Fields are read through Get-RecordField and parsed with TryParse, because a cast throws on a value
+    # that is not a number (BACKLOG #5491).
+    $procId = 0
+    if (-not [int]::TryParse([string](Get-RecordField $Record 'pid'), [ref]$procId) -or $procId -le 0) {
+        return @{ State = "UNREADABLE"; Detail = "no usable pid in record; it cannot be fenced" }
+    }
 
     $proc = Get-Process -Id $procId -EA SilentlyContinue
     if (-not $proc) { return @{ State = "DEAD"; Detail = "pid $procId not running" } }
@@ -217,11 +232,16 @@ function Test-RecordLiveness {
         # upgrading it to LIVE: an unverifiable fence is not a passed fence.
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; start time unreadable" }
     }
-    if ($null -eq $Record.startedAt) {
-        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no startedAt" }
+    $startedMs = [int64]0
+    $registered = $null
+    if ([int64]::TryParse([string](Get-RecordField $Record 'startedAt'), [ref]$startedMs)) {
+        try { $registered = [DateTimeOffset]::FromUnixTimeMilliseconds($startedMs).LocalDateTime }
+        catch [System.ArgumentOutOfRangeException] { }
+    }
+    if ($null -eq $registered) {
+        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no usable startedAt" }
     }
 
-    $registered = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$Record.startedAt).LocalDateTime
     # A process cannot have started after the session it hosts registered (small forward slop for
     # clock jitter). Started much later => this pid was recycled onto a different process.
     $delta = ($procStart - $registered).TotalMinutes
@@ -243,7 +263,7 @@ function Get-SessionLiveness {
         [int]$StartSkewMinutes = 15
     )
     $hit = @(Get-SessionRecords -ConfigRoot $ConfigRoot |
-        Where-Object { $_.Record.sessionId -and ([string]$_.Record.sessionId).StartsWith($SessionId, 'OrdinalIgnoreCase') })
+        Where-Object { $sid = [string](Get-RecordField $_.Record 'sessionId'); $sid -and $sid.StartsWith($SessionId, 'OrdinalIgnoreCase') })
 
     if ($hit.Count -eq 0) {
         # Not registered. NOT proof it is gone -- a session that never registered looks identical to

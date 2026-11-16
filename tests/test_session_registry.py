@@ -303,3 +303,87 @@ def test_an_unset_profile_names_no_config_root(tmp_path: Path) -> None:
     (in_cwd / "sessions").mkdir(parents=True)
     write_session(in_cwd, pid=1, session_id="in-the-cwd")
     assert _roots_and_records(None, cwd=tmp_path) == {"Roots": [], "Records": []}
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5491: the fence must answer, not throw, under Set-StrictMode -Version Latest. seat.ps1 and
+# fleet.ps1 both set it, and it reaches these functions through the caller's scope. A record missing a
+# property is exactly what a registry file caught mid-write looks like.
+# --------------------------------------------------------------------------------------------------
+
+
+def _strict(script: str) -> str:
+    """Run ``script`` after dot-sourcing the registry under StrictMode Latest; return its stdout."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{REGISTRY}'; Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; "
+            + script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+    return proc.stdout.strip()
+
+
+def _strict_fence(record: dict[str, Any]) -> str:
+    """Test-RecordLiveness's State for ``record``, parsed from JSON as a real record is."""
+    payload = json.dumps(record).replace("'", "''")
+    return _strict(f"(Test-RecordLiveness -Record ('{payload}' | ConvertFrom-Json)).State")
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"sessionId": "s", "startedAt": NOW_MS},
+        {"pid": "not-a-number", "sessionId": "s", "startedAt": NOW_MS},
+        {"pid": 2**40, "sessionId": "s", "startedAt": NOW_MS},
+        {"pid": -4, "sessionId": "s", "startedAt": NOW_MS},
+    ],
+    ids=["no-pid-key", "non-numeric-pid", "pid-past-int32", "negative-pid"],
+)
+def test_a_record_whose_pid_cannot_be_read_is_unreadable_under_strict_mode(
+    record: dict[str, Any],
+) -> None:
+    """The header's contract: no pid, or one that is not a number, is UNREADABLE -- possibly live."""
+    assert _strict_fence(record) == "UNREADABLE"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"startedAt": "not-a-number"}, {"startedAt": 2**62}],
+    ids=["no-startedat-key", "non-numeric-startedat", "startedat-out-of-range"],
+)
+def test_a_live_pid_whose_start_cannot_be_read_is_unverified_under_strict_mode(
+    extra: dict[str, Any],
+) -> None:
+    """The fence could not be evaluated, so it is not passed, and it must not throw either."""
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", **extra}) == "UNVERIFIED"
+
+
+def test_a_live_record_is_still_live_under_strict_mode() -> None:
+    """Control: the guarded reads still pass a record that carries every field."""
+    assert _strict_fence({"pid": os.getpid(), "sessionId": "s", "startedAt": NOW_MS}) == "LIVE"
+
+
+def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
+    config_root: Path,
+) -> None:
+    """One sessionId-less record in the registry must not throw every lookup, or a caller that
+    catches the throw reports the session it asked about as unknown."""
+    (config_root / "sessions" / "99003.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    write_session(config_root, pid=os.getpid(), session_id="5491aaaa-0000")
+    got = _strict(
+        f"$r = Get-SessionLiveness -SessionId '5491aaaa' -ConfigRoot '{config_root}'; "
+        f"$l = Get-LoginForSession -SessionId '5491aaaa-0000' -ConfigRoot '{config_root}'; "
+        "'{0}|{1}' -f $r.State, $l.Matched"
+    )
+    assert got == "LIVE|1"
