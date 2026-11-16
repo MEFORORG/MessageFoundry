@@ -397,8 +397,12 @@ def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
             **knobs,
         )
     assert str(budget) not in str(exc.value)
-    # Its control: without trusted_proxies this refusal does not read the budget.
-    Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    # Its control: without trusted_proxies this refusal does not read the budget. Only the general
+    # BACKLOG #5677 rule does, which refuses a budget that is no count at all, never one below 1.
+    try:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    except WiringError as general:
+        assert f"{knob} is not a non-negative integer" in str(general)
 
 
 def test_whole_number_budgets_load_with_trusted_proxies() -> None:

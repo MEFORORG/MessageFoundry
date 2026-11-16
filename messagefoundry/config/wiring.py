@@ -3425,6 +3425,21 @@ def Http(
                 "that budget off. Set it to an integer number of failed attempts per minute, or "
                 "remove the setting"
             )
+    # BACKLOG #5677: the runner reads each budget as a count, so a negative (which would refuse
+    # every intake request), a bool or a non-integer is refused here, where `check` sees it, after
+    # the stricter trusted_proxies rule above. An env() is checked on its default= here and on its
+    # resolved value when the source starts.
+    for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
+        budget = settings[knob]
+        if isinstance(budget, EnvRef):
+            budget = None if budget.default is _UNSET else budget.default
+        if budget is not None and (
+            isinstance(budget, bool) or not isinstance(budget, int) or budget < 0
+        ):
+            raise WiringError(
+                f"Http {knob} is not a non-negative integer (value withheld). Set it to an "
+                "integer number of failed attempts per minute, or 0 to disable that budget"
+            )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
     )

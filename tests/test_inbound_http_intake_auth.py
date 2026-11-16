@@ -879,3 +879,70 @@ def test_per_peer_arm_still_bounds_an_authenticated_peer() -> None:
     limiter.charge_failure("partner")
     limiter.charge_failure("partner")
     assert not limiter.check("partner")
+
+
+# --- BACKLOG #5677: the failed-attempt budgets are validated, at the factory and at start ----
+
+
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("intake_auth_rate_limit", -1),
+        ("intake_auth_rate_limit_global", -5),
+        ("intake_auth_rate_limit", True),
+        ("intake_auth_rate_limit_global", 2.5),
+        ("intake_auth_rate_limit", "10"),
+        ("intake_auth_rate_limit", env("budget", default=-1)),
+    ],
+)
+def test_the_factory_refuses_a_budget_that_is_no_count(knob: str, value: object) -> None:
+    with pytest.raises(WiringError, match=f"{knob} is not a non-negative integer") as exc:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **{knob: value})
+    assert "-1" not in str(exc.value) and "2.5" not in str(exc.value)  # value withheld
+
+
+def test_the_factory_still_accepts_zero_none_and_an_env_reference() -> None:
+    for value in (0, None, 7, env("budget"), env("budget", default=3)):
+        Http(
+            port=8080, intake_auth="api_key", intake_api_key=env("k"), intake_auth_rate_limit=value
+        )
+
+
+def _budget_runner(**budgets: Any) -> tuple[Any, Any]:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry, build_inbound_connection
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0, intake_auth="api_key", intake_api_key=env("k"), **budgets),
+        router="r",
+    )
+    reg = Registry()
+    reg.add_inbound(ic)
+    store: Any = object()  # never touched: only the limiter seam is called
+    return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)), ic
+
+
+def test_the_runner_reads_the_resolved_budget_not_the_env_reference() -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    runner, ic = _budget_runner(intake_auth_rate_limit=env("budget"))
+    resolved = _source_config(ic, "127.0.0.1", {"budget": 5, "k": "secret-key"}).settings
+    limiter = runner._make_intake_rate_limiter(ic, resolved)
+    assert limiter is not None
+    # The raw spec still holds the env() reference: refused by name, never a bare TypeError.
+    with pytest.raises(WiringError, match="intake_auth_rate_limit is not a non-negative"):
+        runner._make_intake_rate_limiter(ic)
+
+
+@pytest.mark.parametrize("value", [-1, True, "10"])
+def test_the_runner_refuses_a_resolved_budget_that_is_no_count(
+    value: object,
+) -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    runner, ic = _budget_runner(intake_auth_rate_limit_global=env("budget"))
+    resolved = _source_config(ic, "127.0.0.1", {"budget": value, "k": "secret-key"}).settings
+    with pytest.raises(WiringError, match="intake_auth_rate_limit_global is not a non-negative"):
+        runner._make_intake_rate_limiter(ic, resolved)

@@ -2876,8 +2876,14 @@ class RegistryRunner:
         """
         return dict(self._sync_reply_metrics)
 
-    def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
+    def _make_intake_rate_limiter(
+        self, ic: InboundConnection, settings: Mapping[str, Any] | None = None
+    ) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        ``settings`` is the inbound's env()-RESOLVED settings, as the source is built from; the
+        start path passes them (BACKLOG #5677), since ``ic.spec.settings`` may still hold an
+        unresolved env() reference. Omitted, the raw spec settings are read.
 
         An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
         own and gets the ``Http()`` factory's defaults."""
@@ -2887,8 +2893,9 @@ class RegistryRunner:
             )
         if not self._intake_auth_enabled(ic):
             return None
-        per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
-        glob = int(ic.spec.settings.get("intake_auth_rate_limit_global") or 0)
+        read = ic.spec.settings if settings is None else settings
+        per_peer = _intake_budget(read, "intake_auth_rate_limit", ic.name)
+        glob = _intake_budget(read, "intake_auth_rate_limit_global", ic.name)
         if not per_peer and not glob:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
@@ -5862,7 +5869,7 @@ class RegistryRunner:
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
-        source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
+        source.intake_rate_limiter = self._make_intake_rate_limiter(ic, source_cfg.settings)
         # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
         # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
         # reply_from, so every other connection keeps the shipped 202 path byte for byte.
@@ -14029,6 +14036,24 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
     if created_at is None:
         return ""
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(created_at))
+
+
+def _intake_budget(settings: Mapping[str, Any], knob: str, name: str) -> int:
+    """One intake-auth failed-attempt budget, read from resolved settings (BACKLOG #5677).
+
+    ``None`` or ``0`` disables the arm. Anything else must be a non-negative integer: a negative
+    budget would refuse every intake request, a bool is no count, and an unresolved env() reference
+    or other type would fail with a bare ``TypeError``. Refused as a ``WiringError`` naming the
+    connection and the setting, with the value withheld, as the ``Http()`` factory refuses it."""
+    value = settings.get(knob)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WiringError(
+            f"inbound connection {name!r}: {knob} is not a non-negative integer (value withheld). "
+            "Set it to an integer number of failed attempts per minute, or 0 to disable that budget"
+        )
+    return value
 
 
 def _source_config(
