@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api.auth_models import _NAME_MAX, _PASSWORD_MAX
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
@@ -768,6 +769,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         provider_value = form.get("provider", "local")
         if provider_value not in ("local", "ad"):
             return RedirectResponse("/ui/login?e=bad", status_code=303)
+
+        def _refused() -> Response:
+            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
+            if handle:
+                clear_passkey_sign_in_cookie(refused, request)
+            return refused
+
+        username = form.get("username", "")
+        password = form.get("password", "")
+        # BACKLOG #5397: the JSON LoginRequest's own bounds, so an oversized credential is refused
+        # before auth.login hashes or audits it, as that route's 422 is. Refused, never clamped: a
+        # truncated password is a different credential.
+        if len(username) > _NAME_MAX or len(password) > _PASSWORD_MAX:
+            return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
@@ -779,8 +794,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             else None
         )
         outcome = await auth.login(
-            form.get("username", ""),
-            form.get("password", ""),
+            username,
+            password,
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
             # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
@@ -795,10 +810,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
-            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
-            if handle:
-                clear_passkey_sign_in_cookie(refused, request)
-            return refused
+            return _refused()
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
