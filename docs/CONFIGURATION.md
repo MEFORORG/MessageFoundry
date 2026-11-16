@@ -2538,7 +2538,9 @@ lapse before the new CRL takes effect. Waiting then leaves a gap in which its pe
 the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
 effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
-engine logs a WARNING that says so.
+engine logs a WARNING that says so. A reload applies it too, but OpenSSL allows no skew, so a
+revocation only that CRL lists is not enforced until its `thisUpdate` passes. The reload's applied
+line is then a WARNING that says so and names the time (vault BACKLOG #5507).
 
 A reload changes what the next full TLS handshake checks. An established connection is not checked
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays

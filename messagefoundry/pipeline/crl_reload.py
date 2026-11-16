@@ -62,7 +62,10 @@ retried next pass.
 
 **A CRL up to five minutes ahead counts as in effect**
 (:data:`~messagefoundry.config.tls_policy.CRL_CLOCK_SKEW_SECONDS`), at a start and here alike, so a
-CA's clock running a little fast does not hold a reload back.
+CA's clock running a little fast does not hold a reload back. OpenSSL itself allows no skew, so
+such a CRL is loaded but not used until its ``thisUpdate``: a revocation only it lists is not
+enforced before then. A reload that applies one says so at WARNING, and says when (vault BACKLOG
+#5507), as a start does. Waiting for ``thisUpdate`` to load it would enforce it no sooner.
 
 **A context's trust store only grows.** Each reload adds the file's CRLs and nothing removes the old
 ones, so memory and per-handshake CRL scoring grow with every reload. ``[cert_monitor].crl_max_reloads``
@@ -854,7 +857,10 @@ def _reload_path(
         # Judged again each pass, so a warning goes once its time has passed, and a refusal a
         # later pass finds for these bytes is reported (:data:`_REOPENED_WHILE_NOT_IN_EFFECT`).
         refusals.reopen()
-    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior)
+    # Applied inside the skew window: OpenSSL allows none, so the applied line must say when the
+    # CRL starts to count (vault BACKLOG #5507). The start's test, with no skew (judge_crl_bytes).
+    early = crl_not_in_effect(blocks, now=now, skew=0.0) if reloaded else None
+    return _finish(label, path, fingerprint, stale, reloaded, refusals, prior, early)
 
 
 def _load(
@@ -959,11 +965,31 @@ def _finish(
     reloaded: int,
     refusals: _Refusals,
     prior: ReloadRefusal | None,
+    early: CrlBlock | None = None,
 ) -> ReloadOutcome:
-    """Log and record what one file's reload did, and return it."""
-    if reloaded:
+    """Log and record what one file's reload did, and return it.
+
+    ``early`` is the applied file's CRL that is not in effect yet with no clock skew allowed
+    (vault BACKLOG #5507). A start warns of the same CRL (:func:`judge_crl_bytes`)."""
+    if reloaded and early is None:
         log.info(
             "crl_reload: applied %s to %d running TLS context(s) without a restart", label, reloaded
+        )
+    elif reloaded and early is not None:
+        # Not a refusal: the reload counts a CRL up to CRL_CLOCK_SKEW_SECONDS ahead as in effect,
+        # so a fast CA clock does not hold a revocation back. But OpenSSL scores a CRL not yet in
+        # effect below one that is, so until thisUpdate a revocation only this CRL lists is not
+        # enforced, and the INFO line alone would say it was applied.
+        log.warning(
+            "crl_reload: applied %s to %d running TLS context(s) without a restart, but its CRL "
+            "from issuer %s takes effect at %s, after this host's clock reads now. It is accepted "
+            "as clock skew, and OpenSSL allows none, so until then a revocation only that CRL "
+            "lists is not enforced: each hop judges that issuer's peers by a CRL it already holds "
+            "in effect, or refuses them with 'CRL is not yet valid' where it holds none",
+            label,
+            reloaded,
+            quoted_issuer(early.issuer),
+            log_timestamp(early.this_update),
         )
     if refusals.strongest is None:
         clear_reload_refusal(path)

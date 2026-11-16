@@ -1272,6 +1272,35 @@ def test_a_reload_allows_five_minutes_of_clock_skew(pki: _Pki, minutes: int, app
     assert _accepts(hop, pki.server())
 
 
+@pytest.mark.parametrize(("minutes", "early"), [(2, True), (-1, False)])
+def test_a_reload_inside_the_skew_window_says_the_revocation_is_not_enforced_yet(
+    pki: _Pki, caplog: pytest.LogCaptureFixture, minutes: int, early: bool
+) -> None:
+    """Vault BACKLOG #5507. The reload applies a CRL up to five minutes ahead, but OpenSSL allows
+    no skew and keeps choosing the copy in effect, so the revocation it adds is not enforced yet.
+    The applied line must not say it was applied and stop there. The control: one minute behind,
+    the same CRL is in effect, the revocation is enforced, and the plain INFO line is right."""
+    hop = pki.outbound_hop()
+    pki.crl.write_bytes(pki.crl_pem(issued=_in_minutes(minutes), lasts=60 * _DAY, revoke=True))
+
+    with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.crl_reload"):
+        outcome = _reload(pki)
+
+    assert outcome is not None and (outcome.reloaded, outcome.refusal) == (1, None)
+    applied = [r for r in caplog.records if "crl_reload: applied" in r.getMessage()]
+    assert len(applied) == 1, caplog.text
+    (line,) = applied
+    # What the hop does now is the measurement the line must agree with.
+    assert _accepts(hop, pki.server()) is early
+    if early:
+        assert line.levelno == logging.WARNING
+        assert "a revocation only that CRL lists is not enforced" in line.getMessage()
+        assert "takes effect at" in line.getMessage()
+    else:
+        assert line.levelno == logging.INFO
+        assert "not enforced" not in line.getMessage()
+
+
 def test_one_context_loading_one_file_twice_is_one_record_and_one_reload(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     harden_crl_check(hop, str(pki.crl), setting="[api].other_crl_file")

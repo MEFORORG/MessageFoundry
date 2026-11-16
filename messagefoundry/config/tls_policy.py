@@ -795,6 +795,8 @@ def judge_crl_bytes(
 #: a reload back, over ordinary clock skew. The cost: OpenSSL itself allows no skew, so a lone CRL
 #: inside this window refuses every peer it judges until its ``thisUpdate`` passes. A reload is
 #: spared that, because the copy it adds to stays in effect and OpenSSL keeps choosing it until then.
+#: So a revocation only the new CRL lists waits until then too, and the reload logs that at WARNING
+#: (vault BACKLOG #5507). Loading it only once in effect would enforce it no sooner.
 CRL_CLOCK_SKEW_SECONDS = 300.0
 
 
