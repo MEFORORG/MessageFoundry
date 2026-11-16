@@ -11,4 +11,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Create this worktree''s .venv first; see docs/WORKTREES.md.'
 }
 & $python (Join-Path $PSScriptRoot 'bridge.py') @args
+# Codex starts a hook as pwsh -Command, which reports a script's exit 2 as 1, so a block would
+# reach Codex as 1. Ending the process keeps the code. Hook mode only: an interactive caller's
+# window must survive `run`.
+if ($args.Count -gt 0 -and $args[0] -eq 'hook') { [Environment]::Exit($LASTEXITCODE) }
 exit $LASTEXITCODE

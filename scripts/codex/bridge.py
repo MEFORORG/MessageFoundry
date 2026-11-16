@@ -179,49 +179,49 @@ PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
 def git_bash() -> str | None:
     """The Git Bash that Claude Code runs a bash hook with on Windows, or None if there is none."""
     configured = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
-    if configured and Path(configured).is_file():
-        return configured
+    if configured:
+        return configured  # As set: a wrong path then fails to start and is reported.
     git = shutil.which("git")
     if git:
         # git.exe sits in Git/cmd, Git/bin or Git/mingw64/bin. Git/bin/bash.exe is the wrapper that
         # puts Git's usr/bin and mingw64/bin on PATH, so a hook's own cat or grep resolves.
-        for parent in Path(git).resolve().parents:
+        for parent in Path(git).resolve().parents[:3]:
             if (parent / "bin/bash.exe").is_file():
                 return str(parent / "bin/bash.exe")
     return None
+
+
+# -Command reports a native program's exit 2 as 1, which would turn a block into a non-blocking
+# error. This tail keeps -Command's own result, 0 or 1, except that a failed last statement which
+# left exit code 2 behind exits 2.
+POWERSHELL_EXIT_TAIL = "\nif (-not $?) { if ($LASTEXITCODE -eq 2) { exit 2 }; exit 1 }"
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
     command = hook["command"]
     if "args" in hook:
         return [
-            command,
-            *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
+            str(part).replace("${CLAUDE_PROJECT_DIR}", str(root))
+            for part in (command, *hook["args"])
         ]
     # A command-only source runs in the shell it names. Claude Code's default is bash, and on
     # Windows PowerShell when Git Bash is not installed. Environment expansion belongs to that
     # shell; structured args above need no shell parsing.
     shell = hook.get("shell")
-    bash = git_bash() if os.name == "nt" else "bash"
-    if shell == "bash" or (shell is None and bash):
-        if not bash:
+    if shell in ("bash", None):
+        bash = git_bash() if os.name == "nt" else "bash"
+        if bash:
+            return [bash, "-c", command]
+        if shell == "bash":
             raise FileNotFoundError("Git Bash not found; a shell: bash hook cannot run")
-        return [bash, "-c", command]
-    if shell in ("powershell", None):
-        command = command.replace("${CLAUDE_PROJECT_DIR}", "$env:CLAUDE_PROJECT_DIR")
-        # -Command reports a native program's exit 2 as 1, which would turn a block into a
-        # non-blocking error; passing $LASTEXITCODE on keeps it.
-        return [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"{command}\nexit $LASTEXITCODE",
-        ]
+        shell = "powershell"
+    if shell == "powershell":
+        command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command + POWERSHELL_EXIT_TAIL]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 
-def hook_failed(hook: dict, why: str) -> None:
+def hook_failed(result: dict, hook: dict, why: str) -> None:
     """Report a failure Claude Code treats as non-blocking, unless the hook opts into blocking."""
     label = hook.get("statusMessage") or " ".join(
         [hook["command"], *(str(arg) for arg in hook.get("args", []))]
@@ -229,7 +229,14 @@ def hook_failed(hook: dict, why: str) -> None:
     message = f"Codex bridge: hook {why}: {label}"
     if hook.get("onFailure") == "block":
         raise PermissionError(f"{message} (onFailure is block)")
+    # On stderr and as a systemMessage, since a host may not show the stderr of an exit 0.
     print(f"{message} (not blocking)", file=sys.stderr)
+    merge_output(result, {"systemMessage": f"{message} (not blocking)"})
+
+
+def print_hook_stderr(text: str) -> None:
+    if text:
+        print(text, file=sys.stderr, end="" if text.endswith("\n") else "\n")
 
 
 def dispatch(root: Path, payload: dict) -> dict:
@@ -293,22 +300,20 @@ def dispatch(root: Path, payload: dict) -> dict:
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
-                if exc.stderr:
-                    captured = exc.stderr
-                    if isinstance(captured, bytes):
-                        captured = captured.decode("utf-8", "replace")
-                    print(captured, file=sys.stderr, end="")
-                hook_failed(hook, f"timed out after {exc.timeout} seconds")
+                captured = exc.stderr or ""
+                if isinstance(captured, bytes):
+                    captured = captured.decode("utf-8", "replace")
+                print_hook_stderr(captured)
+                hook_failed(result, hook, f"timed out after {exc.timeout} seconds")
                 continue
             except OSError as exc:
-                hook_failed(hook, f"could not start ({exc})")
+                hook_failed(result, hook, f"could not start ({exc})")
                 continue
             if completed.returncode == 2:
                 raise PermissionError(completed.stderr.strip() or "Claude hook blocked this event")
-            if completed.stderr:
-                print(completed.stderr, file=sys.stderr, end="")
+            print_hook_stderr(completed.stderr)
             if completed.returncode:
-                hook_failed(hook, f"exited {completed.returncode}")
+                hook_failed(result, hook, f"exited {completed.returncode}")
                 continue
             output = completed.stdout.strip()
             if not output:

@@ -59,6 +59,13 @@ DENIAL = {
 BASH_CALL = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
 
 
+def assert_denied_with_notice(result, notice):
+    """The later hook's denial survived, and the failure reached the JSON Codex reads."""
+    assert result["hookSpecificOutput"] == DENIAL["hookSpecificOutput"]
+    assert notice in result["systemMessage"]
+    assert "(not blocking)" in result["systemMessage"]
+
+
 def test_reads_current_source_each_time_and_preserves_denial(bridge, tmp_path):
     payload = {"session_id": "test", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
     settings(tmp_path, [])
@@ -124,8 +131,9 @@ def test_hook_timeout_is_reported_without_blocking_later_hooks(bridge, tmp_path,
     """Claude Code treats a timed-out hook as a non-blocking error, and so must the bridge."""
     slow = python("import time; time.sleep(5)", timeout=0.1, statusMessage="the slow hook")
     settings(tmp_path, [slow, handler(json.dumps(DENIAL))])
-    assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
-    assert "timed out after 0.1 seconds: the slow hook (not blocking)" in capsys.readouterr().err
+    notice = "timed out after 0.1 seconds: the slow hook (not blocking)"
+    assert_denied_with_notice(bridge.dispatch(tmp_path, BASH_CALL), notice)
+    assert notice in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("code", [1, 3, 127])
@@ -133,18 +141,16 @@ def test_non_blocking_exit_is_reported_and_later_hooks_still_run(bridge, tmp_pat
     """Only exit 2 blocks. Another non-zero exit must neither block nor stop the hooks after it."""
     # The failing hook's stdout is not read, so its "continue": false must not reach the result.
     settings(tmp_path, [exits(code, stdout='{"continue": false}'), handler(json.dumps(DENIAL))])
-    assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
+    assert_denied_with_notice(bridge.dispatch(tmp_path, BASH_CALL), f"exited {code}: ")
     err = capsys.readouterr().err
-    assert f"hook says {code}" in err
-    assert f"exited {code}: " in err
-    assert "(not blocking)" in err
+    # The hook's own stderr ends its line, so the bridge's report starts a fresh one.
+    assert f"hook says {code}\nCodex bridge: hook exited {code}: " in err
 
 
-def test_unstartable_hook_is_reported_without_blocking(bridge, tmp_path, capsys):
+def test_unstartable_hook_is_reported_without_blocking(bridge, tmp_path):
     missing = {"type": "command", "command": str(tmp_path / "no-such-hook.exe"), "args": []}
     settings(tmp_path, [missing, handler(json.dumps(DENIAL))])
-    assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
-    assert "could not start" in capsys.readouterr().err
+    assert_denied_with_notice(bridge.dispatch(tmp_path, BASH_CALL), "could not start")
 
 
 @pytest.mark.parametrize(
@@ -169,12 +175,35 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
-def test_a_native_exit_2_inside_a_powershell_hook_still_blocks(bridge, tmp_path):
-    """pwsh -Command reports a native program's exit 2 as 1, which would fail open."""
-    command = f"& '{sys.executable}' -c 'import sys; sys.exit(2)'"
-    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command}])
-    with pytest.raises(PermissionError):
-        bridge.dispatch(tmp_path, BASH_CALL)
+@pytest.mark.parametrize(
+    ("command", "outcome"),
+    [
+        # pwsh -Command reports a native program's exit 2 as 1, which would fail open.
+        ("& '{py}' -c 'import sys; sys.exit(2)'", "block"),
+        # A stale exit 2 from an earlier statement must not block a hook that went on to succeed.
+        ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
+        # A failed cmdlet as the last statement stays -Command's own non-blocking 1.
+        ("Get-Item -LiteralPath 'no-such-item-b4'", "notice"),
+    ],
+    ids=["native-exit-2", "stale-exit-2", "failed-cmdlet"],
+)
+def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, command, outcome):
+    hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
+    settings(tmp_path, [hook])
+    if outcome == "block":
+        with pytest.raises(PermissionError):
+            bridge.dispatch(tmp_path, BASH_CALL)
+        return
+    result = bridge.dispatch(tmp_path, BASH_CALL)
+    assert ("exited 1:" in result.get("systemMessage", "")) == (outcome == "notice"), result
+
+
+def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
+    structured = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/guard", "args": ["a"]}
+    assert bridge.hook_argv(tmp_path, structured) == [f"{tmp_path}/guard", "a"]
+    shell = {"type": "command", "shell": "powershell", "command": "'${CLAUDE_PROJECT_DIR}_x'"}
+    # Braced, so a following name character cannot join the variable name.
+    assert "'${env:CLAUDE_PROJECT_DIR}_x'" in bridge.hook_argv(tmp_path, shell)[-1]
 
 
 def test_each_event_matches_its_own_discriminator_field(bridge, tmp_path):
@@ -498,3 +527,39 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
         timeout=20,
     )
     assert json.loads(completed.stdout) == {"probe": True}
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="invoke.ps1 needs a .venv to link")
+def test_every_registered_command_passes_the_bridge_exit_2_to_codex(tmp_path):
+    """pwsh -Command reports a script's exit 2 as 1, so a bridge block would reach Codex as 1.
+
+    The real invoke.ps1 runs a stub bridge, through a link to this test's own virtualenv.
+    """
+    import tomllib
+
+    root = tmp_path / "repo"
+    scripts = root / "scripts/codex"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/codex/invoke.ps1", scripts / "invoke.ps1")
+    (scripts / "bridge.py").write_text("import sys\nsys.exit(2)\n")
+    if os.name == "nt":  # A junction needs no symlink privilege.
+        link = ["cmd", "/c", "mklink", "/J", str(root / ".venv"), sys.prefix]
+        subprocess.run(link, check=True, capture_output=True)
+    else:
+        (root / ".venv").symlink_to(sys.prefix, target_is_directory=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
+    for event, groups in config["hooks"].items():
+        for group in groups:
+            for hook in group["hooks"]:
+                completed = subprocess.run(
+                    ["pwsh", "-NoProfile", "-Command", hook["command"]],
+                    cwd=scripts,
+                    input="{}",
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                assert completed.returncode == 2, (event, completed.stderr)

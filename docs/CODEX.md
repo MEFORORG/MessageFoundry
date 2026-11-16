@@ -28,8 +28,10 @@ New event types appear as unmapped at startup. Unsupported handler types and
 shells refuse the event. As in Claude Code, exit 2 blocks. Any other non-zero
 exit, a timeout, or a command that cannot start is a non-blocking error, unless
 the hook sets `"onFailure": "block"`. The bridge reports a non-blocking error on
-stderr, naming the hook, ignores that hook's output, and runs the remaining hooks.
-It does not silently claim a failed hook ran.
+stderr and as a `systemMessage`, naming the hook, ignores that hook's output, and
+runs the remaining hooks. It does not silently claim a failed hook ran. A block
+leaves the bridge with exit 2, and the registered command and `invoke.ps1` pass
+that code on, because `pwsh -Command` would report it as 1.
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
