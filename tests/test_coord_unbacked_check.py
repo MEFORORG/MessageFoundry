@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -690,6 +691,128 @@ def test_a_squash_on_a_SECOND_answering_remote_clears(
     if on_backup:
         assert r.returncode == 0, r.stdout + r.stderr
         assert "patch already on backup/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("target_inside", [False, True], ids=["to-local-branch", "to-own-ref"])
+def test_a_tracking_SYMREF_pointing_outside_its_remote_backs_nothing(
+    repo: Path, target_inside: bool
+) -> None:
+    """``to-local-branch`` MUST TRIP; ``to-own-ref`` is its must-not-trip twin. ``--remotes=origin``
+    follows symrefs, so ``refs/remotes/origin/HEAD -> refs/heads/side`` made the unpushed branch
+    exclude itself. Pointed at origin's own ``side`` tracking ref, after a real push, it is backed."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+    if target_inside:
+        git(repo, "push", "-q", "origin", "side")
+        git(repo, "fetch", "-q", "origin")
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/side")
+    else:
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/side")
+
+    r = check(repo)
+    if target_inside:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "0 unbacked commits" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("corrupt", [True, False], ids=["missing-object", "intact"])
+def test_a_FAILED_scan_is_unverifiable_never_zero(repo: Path, corrupt: bool) -> None:
+    """``missing-object`` MUST TRIP; ``intact`` is its control. A rev-list that dies prints nothing,
+    and the script read that silence as 0 unbacked commits."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "first", "first unpushed")
+    first = git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "h.txt", "second", "second unpushed")
+    git(repo, "checkout", "-q", "main")
+    if corrupt:
+        obj = repo / ".git" / "objects" / first[:2] / first[2:]
+        os.chmod(obj, stat.S_IWRITE)
+        obj.unlink()
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "0 unbacked commits" not in r.stdout
+    if corrupt:
+        assert "UNVERIFIABLE" in r.stdout
+        assert "git rev-list FAILED for: side" in r.stdout
+    else:
+        assert "rev-list FAILED" not in r.stdout
+        assert "2 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_BROKEN_tracking_ref_does_not_make_the_run_read_clean(repo: Path) -> None:
+    """MUST TRIP. A tracking ref naming a missing object made the ``--remotes=origin`` glob die for
+    every ref, and the empty output read as 0 unbacked commits."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "main")
+    bad = repo / ".git" / "refs" / "remotes" / "origin" / "bad"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("0123456789abcdef0123456789abcdef01234567\n", encoding="ascii")
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "0 unbacked commits" not in r.stdout
+
+
+@pytest.mark.parametrize(
+    "real", [False, True], ids=["local-tag-named-like-it", "real-tracking-ref"]
+)
+def test_a_local_ref_NAMED_like_a_tracking_ref_never_stands_in(
+    repo: Path, tmp_path: Path, real: bool
+) -> None:
+    """``local-tag-named-like-it`` MUST TRIP; ``real-tracking-ref`` is its must-not-trip twin. With
+    no real ``refs/remotes/backup/main``, ``rev-parse refs/remotes/backup/main`` resolved a local tag
+    of that name holding an unpushed squash, and the squash marked the branch landed."""
+    git(repo, "remote", "add", "backup", str(_bare(tmp_path / "backup.git", head="trunk")))
+    git(repo, "push", "-q", "backup", "main:keep")
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "squashed somewhere", "work")
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "g.txt", "squashed somewhere", "squashed: work")
+    if real:
+        git(repo, "push", "-q", "backup", "main")
+    else:
+        git(repo, "tag", "refs/remotes/backup/main")
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    git(repo, "fetch", "-q", "--all")
+
+    r = check(repo)
+    if real:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on backup/main (squash/rebase-landed)" in r.stdout
+    else:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "squash/rebase-landed" not in r.stdout
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+@pytest.mark.parametrize("landed", [True, False], ids=["landed", "not-landed"])
+def test_a_STALE_remote_HEAD_does_not_hide_main(repo: Path, landed: bool) -> None:
+    """``landed`` MUST NOT TRIP; ``not-landed`` is its must-trip twin. ``refs/remotes/origin/HEAD``
+    still names an unpruned ``origin/master``. Keeping only the first of HEAD target, main and
+    master read master alone, so a squash on origin/main stopped clearing."""
+    git(repo, "push", "-q", "origin", "main:master")
+    if landed:
+        _squash_land(repo, "landed")
+    else:
+        git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+        git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+
+    r = check(repo)
+    if landed:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on origin/main (squash/rebase-landed)" in r.stdout
     else:
         assert r.returncode == 1, r.stdout + r.stderr
         assert "1 commits on 1 branch exist on no remote" in r.stdout
