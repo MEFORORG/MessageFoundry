@@ -62,6 +62,18 @@ def test_bundle_version_and_manifest(tmp_path: Path) -> None:
     assert "no raw message bodies" in manifest["phi_contract"]
 
 
+def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: Path) -> None:
+    """BACKLOG #5385: the contract is machine-readable, so it must not open with an unqualified "no
+    secrets" while the app-log tail it lists is only best-effort redacted. It names that residual."""
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=None)
+    contract = json.loads(_members(out)["manifest.json"])["phi_contract"]
+    assert "no secrets" not in contract.lower()
+    assert "best-effort" in contract.lower()
+    assert "username" in contract
+    assert "not as secret-free or phi-free" in contract.lower()
+
+
 def test_status_snapshot_uses_real_models() -> None:
     # No settings -> engine info from __version__, db None. Built from the REAL status models.
     snap = status_snapshot(None)

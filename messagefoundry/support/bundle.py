@@ -16,9 +16,14 @@ starts no server. Contents (each a small text/JSON member):
 * ``app-log.txt`` — a **redacted** tail of the configured app log (see
   :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
 
-HARD RULE (do not break): no raw message bodies and no secrets. The config summary emits counts/names
-only; the status snapshot is the metadata-only status models; the log tail is run through the redaction
-pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
+HARD RULE (do not break): no raw message bodies, and no secret this module puts in itself. The config
+summary emits counts/names only; the status snapshot is the metadata-only status models; the log tail is
+run through the redaction pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
+**That rule is a goal for the code, not a claim about the archive.** The log tail's redaction is
+best-effort: a single-token identifier, an operator username included, can survive it, so a bundle is
+NOT secret-free or PHI-free as a whole. The manifest's ``phi_contract`` says so in words rather than
+opening with "no secrets" (BACKLOG #5385), as the CLI help does (BACKLOG #1475), and ``docs/PHI.md``
+stream 14 is the record.
 
 That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
 exception's **message** never enters the bundle: config loading wraps text raised by arbitrary operator
@@ -203,7 +208,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     into the tail text, not propagated.
 
     EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
-    ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
+    ``phi_contract`` claim about this member true: that it is a redacted copy, never that it is clean. The two failure branches used to ``return`` ahead of
     the redactor with the configured path, the file name and the OS error text inline, so a bundle's
     ``app-log.txt`` could carry an unredacted deployment path (BACKLOG #1571). They now report the
     branch, not the circumstances: the operator knows their own ``log_dir``, and the code says which
@@ -271,11 +276,18 @@ def build_bundle(
         "generated_at": now,
         "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         "members": sorted(members),
-        # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract).
+        # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
+        # is machine-readable and a reviewer may rely on it, so it claims no more than every member
+        # meets: the app-log tail's redaction is best-effort, so the bundle as a whole is NOT
+        # secret-free or PHI-free, and the string says so rather than opening with "no secrets"
+        # (BACKLOG #5385; the CLI help made the same repair under BACKLOG #1475).
         "phi_contract": (
-            "no raw message bodies, no secrets; config summary is counts/names only; status is the "
-            "metadata-only status models; the app-log tail is redacted; a section that failed reports "
-            "a fixed MF-BUNDLE-* code plus the exception type, never the exception message"
+            "no raw message bodies by design; config summary is counts/names only and holds no "
+            "secret; status is the metadata-only status models; the app-log tail is a BEST-EFFORT "
+            "redacted copy of the app log, so a single-token identifier, an operator username "
+            "included, can survive it, and the bundle is to be handled as a copy of the app log, not "
+            "as secret-free or PHI-free; a section that failed reports a fixed MF-BUNDLE-* code plus "
+            "the exception type, never the exception message"
         ),
     }
     members["manifest.json"] = json.dumps(manifest, indent=2, sort_keys=True)
