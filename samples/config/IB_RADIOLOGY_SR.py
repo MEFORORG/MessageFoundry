@@ -66,6 +66,10 @@ def route(msg):
     return []  # non-SR objects are not mapped here
 
 
+def _one_line(value: str) -> str:
+    return value.replace("\r", " ").replace("\n", " ")
+
+
 @handler("sr_to_oru")
 def handle(msg):
     # Parse the SR (headers + ContentSequence; no pixel data) and map it to an ORU. Pure: same object in
@@ -75,11 +79,13 @@ def handle(msg):
     measurements = ds.measurements()
     if not measurements:
         return None  # an SR with no numeric content delivers nothing → FILTERED (counted + logged)
-    control_id = ds.sop_instance_uid or "UNKNOWN"
-    oru = Message.parse(
-        "MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|"
-        f"{ds.study_date or ''}||ORU^R01|{control_id}|P|2.5.1"
-    )
+    # The MSH literal is the author's own text. The two DICOM values are untrusted peer data, so they
+    # go in through the parsed model as DATA (set_data escapes the HL7 delimiters), never interpolated
+    # into the string handed to Message.parse, where a '|' or '^' would become structure. CR/LF are
+    # flattened first, as hl7_map's builders do, so a line break cannot add a segment.
+    oru = Message.parse("MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|||ORU^R01||P|2.5.1")
+    oru.set_data("MSH-7", _one_line(ds.study_date or ""))
+    oru.set_data("MSH-10", _one_line(ds.sop_instance_uid or "UNKNOWN"))
     oru.add_segment(hl7_map.pid_from_dataset(ds))
     oru.add_segment(hl7_map.obr_from_dataset(ds))
     for set_id, measurement in enumerate(measurements, start=1):
