@@ -13,15 +13,19 @@ from typing import Any
 import pytest
 
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.uploads import UploadedFileMeta, UploadStore
+from messagefoundry.uploads import UploadedFileMeta, UploadStore, UploadUnreadableError
 
 _BODY = b"synthetic diagnostic line\n"
 
 
-def _keyless(tmp_path: Path, *, retention_days: int = 30) -> UploadStore:
+def _keyless(tmp_path: Path) -> UploadStore:
     # The identity cipher passes unmarked sidecars, which is where a planted one is read.
+    return UploadStore(tmp_path / "uploads", make_cipher(None), max_bytes=4096)
+
+
+def _keyed(tmp_path: Path) -> UploadStore:
     return UploadStore(
-        tmp_path / "uploads", make_cipher(None), max_bytes=4096, retention_days=retention_days
+        tmp_path / "uploads", make_cipher(generate_key(), write_v2=True), max_bytes=4096
     )
 
 
@@ -89,12 +93,58 @@ async def test_a_planted_filename_is_sanitized(tmp_path: Path) -> None:
 async def test_a_well_formed_sidecar_still_reads(tmp_path: Path) -> None:
     for store in (
         _keyless(tmp_path / "plain"),
-        UploadStore(
-            tmp_path / "keyed" / "uploads",
-            make_cipher(generate_key(), write_v2=True),
-            max_bytes=4096,
-        ),
+        _keyed(tmp_path / "keyed"),
     ):
         meta = await _saved(store)
         assert await store.get_meta(meta.file_id) == meta
         assert await store.list_files() == [meta]
+
+
+# --- BACKLOG #5388: a damaged file is a handled refusal on every by-id read ----------------------
+
+_DAMAGED_SIDECARS = {
+    "not-utf8": b"\xff\xfe\x00 not utf-8",
+    "not-json": b"{not json",
+    "nested": b"[" * 100_000 + b"]" * 100_000,
+    "long-int": b'{"size": ' + b"9" * 5000 + b"}",
+    "not-object": b"[1, 2]",
+}
+
+
+@pytest.mark.parametrize("raw", list(_DAMAGED_SIDECARS.values()), ids=list(_DAMAGED_SIDECARS))
+async def test_a_damaged_sidecar_is_refused_on_get_meta_and_delete(
+    tmp_path: Path, raw: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _sidecar(store, meta.file_id).write_bytes(raw)
+    with pytest.raises(UploadUnreadableError):
+        await store.get_meta(meta.file_id)
+    with pytest.raises(UploadUnreadableError):
+        await store.delete(meta.file_id)
+    # Refused, so nothing was removed, and the scan leaves it out rather than failing.
+    assert _sidecar(store, meta.file_id).exists()
+    assert await store.list_files() == []
+    assert any("damaged, refused" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_damaged_sidecar_on_a_keyed_store_is_refused_on_delete(tmp_path: Path) -> None:
+    store = _keyed(tmp_path)
+    meta = await _saved(store)
+    _sidecar(store, meta.file_id).write_bytes(b"\xff\xfe\x00 not utf-8")
+    with pytest.raises(UploadUnreadableError):
+        await store.get_meta(meta.file_id)
+    with pytest.raises(UploadUnreadableError):
+        await store.delete(meta.file_id)
+    assert _sidecar(store, meta.file_id).exists()
+
+
+@pytest.mark.parametrize(
+    "raw", [b"\xff\xfe not utf-8", b"not base64!"], ids=["not-utf8", "not-b64"]
+)
+async def test_a_damaged_body_is_refused_on_read_bytes(tmp_path: Path, raw: bytes) -> None:
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    (store._root / f"{meta.file_id}.blob").write_bytes(raw)  # noqa: SLF001
+    with pytest.raises(UploadUnreadableError):
+        await store.read_bytes(meta.file_id)

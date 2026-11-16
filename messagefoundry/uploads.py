@@ -414,7 +414,9 @@ class UploadUnreadableError(UploadError, CipherError):
     :class:`CipherError` too, so any caller that already catches the cipher's error still does. The
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
-    :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
+    :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither. A damaged
+    file, one not UTF-8 or a sidecar that is not this upload's metadata, raises it too, with
+    :data:`_DAMAGED` (BACKLOG #5388)."""
 
 
 class UploadUnavailableError(UploadError, CipherError):
@@ -428,6 +430,26 @@ class UploadUnavailableError(UploadError, CipherError):
 #: The text of the refusal :meth:`UploadStore.delete` raises when its caller's read was refused
 #: and the upload is not the never-sealable kind. It names no file and no cipher detail.
 _REFUSED_NOT_UNSEALABLE = "the uploaded file's metadata is refused under the configured store key"
+
+
+_DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it was not read"
+
+
+def _defect(exc: Exception) -> str:
+    """What a damaged sidecar or body log line says of ``exc``: never a value from the file. A
+    :class:`_MalformedSidecarError` names only the defect and a decode error renders without its
+    bytes; any other error, which could echo a value, is named by type only."""
+    if isinstance(exc, (_MalformedSidecarError, UnicodeError)):
+        return codec_safe_str(exc)
+    return type(exc).__name__
+
+
+def _log_damaged(file_id: str, part: str, exc: ValueError) -> str:
+    """Log a damaged ``part`` of upload ``file_id`` and return the refusal text a by-id read
+    raises :class:`UploadUnreadableError` with (BACKLOG #5388), so one damaged file answers a
+    handled error rather than a server error."""
+    _log.warning("uploaded-file %s %s: damaged, refused: %s", part, file_id, _defect(exc))
+    return _DAMAGED.format(part=part)
 
 
 class UploadNotFoundError(UploadError):
@@ -1208,16 +1230,10 @@ class UploadStore:
                 # the part the class check reads is still one rotate-key can never seal. An
                 # OSError is not, so a stalled read is not paid twice under _quota_lock.
                 classify = isinstance(exc, UnicodeDecodeError)
-            except _MalformedSidecarError as exc:
-                # Decrypted, but not metadata this store wrote, or not this upload's (BACKLOG
-                # #5387). Left out of the listing, the quota and the prune. The message names
-                # only the defect, never a value.
-                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, exc)
             except (ValueError, TypeError, KeyError) as exc:
-                # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
-                _log.warning(
-                    "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
-                )
+                # Decrypted, but not metadata this store wrote, or not this upload's (BACKLOG
+                # #5387). Left out of the listing, the quota and the prune. Never a value logged.
+                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, _defect(exc))
             if classify and sink is not None:
                 lost = self._unsealable_sync(fid, entry)
                 if lost is not None:
@@ -2213,7 +2229,8 @@ class UploadStore:
         return await asyncio.to_thread(_scan)
 
     async def get_meta(self, file_id: str) -> UploadedFileMeta:
-        """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`."""
+        """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`,
+        and :class:`UploadUnreadableError` for a sidecar the cipher refuses or that is damaged."""
 
         def _read() -> UploadedFileMeta:
             _, meta_path = self._paths(file_id)
@@ -2225,12 +2242,15 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
+            except (UnicodeDecodeError, _MalformedSidecarError) as exc:
+                raise UploadUnreadableError(_log_damaged(file_id, "sidecar", exc)) from None
 
         return await asyncio.to_thread(_read)
 
     async def read_bytes(self, file_id: str) -> bytes:
         """Return the decrypted body bytes (path-traversal-guarded). Raises
-        :class:`UploadNotFoundError`."""
+        :class:`UploadNotFoundError`, and :class:`UploadUnreadableError` for a body the cipher
+        refuses or that is damaged."""
 
         def _read() -> bytes:
             blob_path, _ = self._paths(file_id)
@@ -2242,6 +2262,9 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
+            except ValueError as exc:
+                # Not UTF-8, or not the base64 the body is stored as (binascii.Error).
+                raise UploadUnreadableError(_log_damaged(file_id, "body", exc)) from None
 
         return await asyncio.to_thread(_read)
 
@@ -2284,6 +2307,12 @@ class UploadStore:
                     raise UploadUnavailableError(str(exc)) from exc
                 except CipherError as exc:
                     refusal = str(exc)
+                except (UnicodeDecodeError, _MalformedSidecarError) as exc:
+                    # Damaged, never trusted, and classed only where the scan classes it too: a
+                    # cipher that refuses plaintext, where it may be the never-sealable kind.
+                    refusal = _log_damaged(file_id, "sidecar", exc)
+                    if not self._refuses_plaintext:
+                        raise UploadUnreadableError(refusal) from None
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:

@@ -1522,6 +1522,38 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
         ]
 
 
+async def test_a_damaged_sidecar_answers_a_handled_error_not_a_500(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #5388: a sidecar that is not UTF-8, or not the metadata JSON, used to raise an
+    uncaught error from get_meta and delete, so its routes answered 500. It is now refused like an
+    unreadable one: 404 for the owner, whose ownership cannot be read, and 423 for an override
+    holder, with the file left on disk."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        for raw in (b"\xff\xfe not utf-8", b"[" * 100_000):
+            fid = (
+                await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+            ).json()["file_id"]
+            (root / f"{fid}.meta").write_bytes(raw)
+            for headers, status in ((h, 404), (ha, 423)):
+                for r in (
+                    await c.get(f"/uploads/{fid}/messages", headers=headers),
+                    await c.delete(f"/uploads/{fid}", headers=headers),
+                ):
+                    assert r.status_code == status, r.text
+            assert (root / f"{fid}.meta").exists()
+
+
 @_BREAKS
 async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     engine: Engine,
