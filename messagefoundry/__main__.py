@@ -2419,8 +2419,9 @@ def _start_logging_gates(
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
                 "(ADR 0080) to a collector on another host."
             )
-            print(f"warning: {scrub_control_chars(_hop_warning)}", file=sys.stderr)
+            # Queued before the print, so a stderr write that raises cannot lose the record.
             pending_audit.append(f"AUDIT: {_hop_warning}")
+            print(f"warning: {scrub_control_chars(_hop_warning)}", file=sys.stderr)
     # --- BACKLOG #1966, owner ruling R4 (a) of 2026-09-24 (ASVS 16.4.3, ADR 0200) -----------------
     # Now that the on-disk spool exists, a PHI instance needs off-box forwarding configured as
     # verified TLS to a non-loopback collector. Under `enforce` a start without it REFUSES; under

@@ -350,3 +350,31 @@ def test_a_deferred_collector_ca_refusal_still_logs_the_hop_audit_once(
     assert deferred == [sentinel]
     assert configured == [None]
     assert _hop_audit(recorder.seen) == [True]
+
+
+def test_a_stderr_write_that_raises_still_logs_the_hop_audit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The hop's AUDIT record is queued before its stderr warning, so a failing stderr cannot
+    # lose it: the guard writes it on the way out of the raise.
+    class _Broken:
+        def write(self, _text: str) -> int:
+            raise OSError("synthetic stderr failure")
+
+        def flush(self) -> None:
+            pass
+
+    monkeypatch.setattr("sys.stderr", _Broken())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.__main__"):
+        assert_capture_sees(caplog, "messagefoundry.__main__")
+        with pytest.raises(OSError, match="synthetic stderr failure"):
+            cli._start_logging(
+                _listed(),
+                env_name="staging",
+                enforcing=False,
+                spool_dir=str(tmp_path / "spool"),
+                configure=lambda forward: True,
+                deferred_ca_refusals=[],
+            )
+    audit = [r.getMessage() for r in caplog.records if r.getMessage().startswith(_HOP_AUDIT_PREFIX)]
+    assert len(audit) == 1
