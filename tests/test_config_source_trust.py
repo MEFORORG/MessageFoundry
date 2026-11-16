@@ -174,14 +174,9 @@ def test_builtin_users_modify_refused() -> None:
 def test_foreign_nonadmin_write_refused() -> None:
     aces = [(_ALLOW, _WRITE, _FOREIGN)]
     reason = _evaluate_config_dacl(_OWNER, aces, _SELF, _never_admin)
-    # Again the ACE finding, reported ahead of the owner verdict. The full text is pinned here,
-    # on every platform, because its grantee list states what the scan trusts and must stay true.
-    assert reason == (
-        f"a non-owner, non-admin principal ({_FOREIGN}) has write access: only the file's owner, "
-        "SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER, OWNER RIGHTS, the engine's own "
-        "account (never LocalService or NetworkService) or a Domain, Schema or Enterprise Admins "
-        "group that resolves into Administrators may hold it"
-    )
+    # Again the ACE finding, reported ahead of the owner verdict. The full text is pinned here so
+    # that a platform-independent leg covers it.
+    assert reason == f"a non-owner, non-admin principal ({_FOREIGN}) has write access"
 
 
 def test_everyone_generic_all_refused() -> None:

@@ -10128,13 +10128,7 @@ def _evaluate_config_dacl(
                     "Administrators membership could not be resolved"
                 )
                 continue
-        # This names every grantee the scan above trusts; a change to that set changes this text.
-        return (
-            f"a non-owner, non-admin principal ({trustee_sid}) has write access: only the file's "
-            "owner, SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER, OWNER RIGHTS, the "
-            "engine's own account (never LocalService or NetworkService) or a Domain, Schema or "
-            "Enterprise Admins group that resolves into Administrators may hold it"
-        )
+        return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
     # A definite owner refusal is reported ahead of an entry the scan could not judge.
     return _config_owner_problem(owner_sid, self_sid, engine_sid, owner_in_admins) or unsure
 
