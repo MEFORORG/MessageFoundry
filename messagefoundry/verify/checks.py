@@ -33,10 +33,16 @@ from typing import TYPE_CHECKING
 from messagefoundry import __version__
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
-from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
 from messagefoundry.verify import cipher_policy
-from messagefoundry.verify.model import FAILING, CheckResult, Status, safe_exc_detail
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    FAILING,
+    CheckResult,
+    Status,
+    safe_detail_text,
+    safe_exc_detail,
+)
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import AuthSettings, StoreSettings
@@ -122,7 +128,7 @@ def _census(odbc_hops: Callable[[], OdbcHops], rid: str) -> OdbcHops:
         return odbc_hops()
     except Exception as exc:  # a census failure the census did not foresee: it read nothing
         _log.warning("%s: the ODBC hop census raised %s", rid, type(exc).__name__)
-        reason = scrub_credentials(codec_safe_str(exc))[:200]  # BACKLOG #5395
+        reason = safe_detail_text(codec_safe_str(exc))  # BACKLOG #5395
         return OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
 
 
@@ -561,7 +567,10 @@ def check_lockable_accounts(
         return CheckResult(rid, title, Status.ERROR, str(exc))
     except Exception as exc:  # any driver or decode failure: the check broke, not a finding
         return CheckResult(
-            rid, title, Status.ERROR, f"could not read the accounts: {safe_exc_detail(exc)}"
+            rid,
+            title,
+            Status.ERROR,
+            f"could not read the accounts: {safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)}",
         )
     # Wave 2 (ADR 0197 Amendment A, N-G): named, not failed. The discoverable record is what the
     # client reported, so on a client that does not conform it can overstate.

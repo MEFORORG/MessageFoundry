@@ -3148,9 +3148,11 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         *secretscrub._KEY_MATERIAL_WORDS,
     }
     assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
-    url_arm = r"://[^\s:/]*:[^\s/]+@"
+    # The arm is the DSN pattern's user, colon and first password segment, then the "@" every match
+    # reaches next, so it matches wherever the pattern does (BACKLOG #5386).
+    url_arm = r"://[^\s:/]*:[^\s/@]+@"
     assert url_arm in pattern
-    assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+    assert r"://[^\s:/]*):[^\s/@]++" in secretscrub._DSN_PASSWORD.pattern
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:

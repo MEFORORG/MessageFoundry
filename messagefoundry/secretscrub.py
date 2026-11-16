@@ -1290,13 +1290,27 @@ _KEY_MATERIAL = re.compile(
 # printed the password whole, and neither did a user holding an "@", as the ``user@server`` login of
 # a hosted database or an e-mail address does. The password was ``[^\s/@]+``, so it stopped at its
 # own first "@": an unencoded ``p@ss`` came out as ``<placeholder>@ss@host`` with the tail printed.
-# Now the user is ``[^\s:/]*``, running to the first ":", and the password runs, greedily, to the
-# LAST "@" before whitespace or a "/". That last "@" can sit past the
-# host, in a query such as ``?user=a@b``, and then the host is hidden too: over-redaction, the safe
-# direction, and group 1 still names the scheme and user. A password holding a "/" still stops there;
-# a URL parser would read that "/" as the path too. Linear still: the password walk stops at the "/"
-# of the next ``://``, so one scheme head's walk cannot cross into the next one's.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/]*):[^\s/]+@")
+# Now the user is ``[^\s:/]*``, running to the first ":". The password is the old first segment,
+# taken possessively, then a run that may hold an "@", and the match ends at the last "@" in it.
+#
+# A FURTHER SEGMENT STOPS AT A SEPARATOR, and it has to. Running the password to the last "@" in
+# the token was tried first and swallowed the next member's label whenever that member's value held
+# an "@": ``postgres://svc:pw@db:5432;sslpassword=Tail@Secret9`` came out as
+# ``svc:<placeholder>@Secret9``, because the label the member pass needed was inside the match, so
+# the tail printed where the old pattern let that pass mask it. So the run after the first segment
+# holds none of ``; ? # & , ( )`` or a quote, the characters a member, a query or a quoted value
+# starts after. The first segment is the old class, so every match the old pattern made, this one
+# makes. The residual: a password whose own "@" is followed by one of those characters before the
+# host's "@" is cut at that "@", and its tail prints, as the whole tail did before.
+#
+# THE FIRST SEGMENT IS POSSESSIVE (``++``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
+# would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
+# nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
+# not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
+# reads no nested quantifier.
+_DSN_PASSWORD = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
+)
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,

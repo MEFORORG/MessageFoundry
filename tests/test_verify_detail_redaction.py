@@ -21,7 +21,7 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError
 from messagefoundry.store import base as store_base
 from messagefoundry.verify import checks, runner, smoke
-from messagefoundry.verify.model import DETAIL_LIMIT, CheckResult, safe_exc_detail
+from messagefoundry.verify.model import CheckResult, safe_exc_detail
 from messagefoundry.verify.report import render_json, render_markdown
 
 _PLANTED = "pw-V3rify_Det-81"
@@ -118,19 +118,28 @@ def test_control_safe_exc_alone_keeps_the_credential() -> None:
     assert _PLANTED in safe_exc(RuntimeError(_LEAKY))
 
 
-def test_a_credential_past_safe_excs_usual_cut_is_kept_out_and_the_detail_bounded() -> None:
-    """A detail keeps up to ``DETAIL_LIMIT``, more than ``safe_exc``'s 200, so a driver's remedy at
-    the tail survives; a credential that far in is still hidden. The control shows the same text at
-    that length carries it without the credential pass."""
+def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> None:
+    """The detail keeps ``safe_text``'s bound, and a credential sitting just inside it is hidden. No
+    order control: ``safe_text`` cuts at whole tokens, so neither order was measured to print a
+    value at the cut; the credential pass runs first for the label reason in the next test."""
+    exc = RuntimeError(" ".join(["word"] * 37) + f" PWD={_PLANTED}" + " tail" * 80)
+    detail = safe_exc_detail(exc)
+    assert _PLANTED not in detail, detail
+    assert "PWD=" in detail, detail
+    assert len(detail) < 260, len(detail)
+
+
+@pytest.mark.parametrize(
+    "label", ["Login Password", "Access Token", "Client Secret", "Bind Password"]
+)
+def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str) -> None:
+    """The PHI name pass reads ``Login Password`` as a name. Run first, it took the label away from
+    the credential pass and the value printed; the credential pass runs first now."""
     from messagefoundry.redaction import safe_exc
 
-    padding = " ".join(["word"] * 60)
-    exc = RuntimeError(f"{padding} {_LEAKY} " + "tail " * 400)
-    assert _PLANTED in safe_exc(exc, limit=DETAIL_LIMIT)  # control
-    detail = safe_exc_detail(exc)
-    assert _PLANTED not in detail
-    assert "Server=db.invalid" in detail  # past 200 characters, still shown
-    assert len(detail) < DETAIL_LIMIT + 40, len(detail)
+    exc = RuntimeError(f"{label}={_PLANTED}")
+    assert _PLANTED in safe_exc(exc)  # control: the PHI pass alone keeps it
+    assert _PLANTED not in safe_exc_detail(exc)
 
 
 @pytest.mark.parametrize(
@@ -192,3 +201,23 @@ def test_the_odbc_census_reason_hides_a_config_load_credential(tmp_path: Path) -
     assert entries == []
     assert reason is not None and "did not load" in reason
     assert _PLANTED not in reason, reason
+
+
+def test_the_odbc_census_failure_reason_hides_the_credential() -> None:
+    def boom() -> checks.OdbcHops:
+        raise RuntimeError(_LEAKY)
+
+    hops = checks._census(boom, "host.odbc")
+    assert hops.unknown is not None and _PLANTED not in hops.unknown, hops.unknown
+
+
+def test_the_graph_read_failure_reason_hides_the_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> object:
+        raise RuntimeError(_LEAKY)
+
+    monkeypatch.setattr(runner, "_buildable_entries", boom)
+    hops = runner._driver_hops(None, None, str(tmp_path), lambda: Registry())
+    assert hops.unknown is not None and "graph read raised" in hops.unknown
+    assert _PLANTED not in hops.unknown, hops.unknown

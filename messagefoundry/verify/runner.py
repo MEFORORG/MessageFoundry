@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.redaction import codec_safe_str
-from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports.db_endpoint import (
     SQLSERVER_DEFAULT_DRIVER,
     _preset_driver,  # the preset's own driver test, so the census cannot drift from the build
@@ -25,7 +24,7 @@ from messagefoundry.verify.checks import (
     check_lockable_accounts,
     run_host_checks,
 )
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import CheckResult, Status, safe_detail_text
 from messagefoundry.verify.smoke import (
     check_store_connectivity,
     smoke_self,
@@ -203,7 +202,7 @@ def _buildable_entries(
         # SystemExit: a config module that exits at import must not end the verify run.
         return (
             [],
-            f"the config dir {config_dir!r} did not load: {scrub_credentials(codec_safe_str(exc))[:200]}",
+            f"the config dir {config_dir!r} did not load: {safe_detail_text(codec_safe_str(exc))}",
         )
     entries: list[tuple[str, str | None, str | None]] = []
     for kind, name, dialect, driver in odbc_hops(reg):
@@ -320,8 +319,7 @@ def _driver_hops(
         _log.warning("host.odbc: the graph read raised %s", type(exc).__name__)
         entries, unread = (
             [],
-            f"the graph read raised {type(exc).__name__}: "
-            f"{scrub_credentials(codec_safe_str(exc))[:200]}",
+            f"the graph read raised {type(exc).__name__}: {safe_detail_text(codec_safe_str(exc))}",
         )
     # Reasons a listed Driver 18 answers: the store's backend, and with no --config given the
     # graph, so the fast host check on a host with Driver 18 reads PASS as before.

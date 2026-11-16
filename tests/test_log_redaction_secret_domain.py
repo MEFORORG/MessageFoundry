@@ -1323,6 +1323,42 @@ def test_a_dsn_password_with_no_user_or_an_at_sign_is_hidden_whole(
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
 
 
+@pytest.mark.parametrize(
+    ("line", "pieces", "kept"),
+    [
+        # A later member or query value holding an "@" keeps its own label: a password running to
+        # the token's last "@" swallowed it and printed the tail (review of BACKLOG #5386).
+        (
+            "store dsn postgres://svc:pw-M1@db.invalid:5432;sslpassword=Tail@Mem_Sec-76",
+            ("pw-M1", "Mem_Sec-76"),
+            "://svc:",
+        ),
+        (
+            "store dsn postgres://svc:pw-M2@db.invalid:5432?AccessToken=Tail@Tok_Sec-77",
+            ("pw-M2", "Tok_Sec-77"),
+            "://svc:",
+        ),
+        (
+            "jdbc:sqlserver://svc:pw-M3@db.invalid:1433;AccessToken=Tail@Tok_Sec-78;",
+            ("pw-M3", "Tok_Sec-78"),
+            "://svc:",
+        ),
+    ],
+)
+def test_a_later_member_holding_an_at_sign_keeps_its_label(
+    line: str, pieces: tuple[str, ...], kept: str
+) -> None:
+    """The DSN password stops before a member or query separator, so the member pass after it still
+    sees its label. Through the public entry points only: masking the member is that pass's job."""
+    for label, out in (
+        ("support.redact", redact_log_line(line)),
+        ("secretscrub", scrub_credentials(line)),
+    ):
+        for piece in pieces:
+            assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
+        assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
+
+
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above
 #: to build the differential corpus. The empty entry is the control, and the claim has to be made about
 #: the PAIR rather than the head alone: a LETTER-headed scheme behind it is a shape every spelling of
