@@ -2283,9 +2283,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         return await _ui_dl_replay(request, None, None, engine, identity, gate)
 
+    # Both path routes declare ConnectionName, the rule DeadLetterReplayRequest carries for the same
+    # values, so FastAPI answers 422 before the handler runs (BACKLOG #5500). As plain str, a
+    # hand-built URL's bad name reached the model inside _ui_dl_replay, whose bare ValidationError
+    # no handler maps, so it answered 500 rather than refusing the input.
     @app.post("/ui/dead-letters/{channel_id}/replay")
     async def ui_replay_dead_letters(
-        channel_id: str,
+        channel_id: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_REPLAY)),
@@ -2296,8 +2300,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/dead-letters/{channel_id}/{destination_name}/replay")
     async def ui_replay_dead_letters_dest(
-        channel_id: str,
-        destination_name: str,
+        channel_id: ConnectionName,
+        destination_name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_REPLAY)),
