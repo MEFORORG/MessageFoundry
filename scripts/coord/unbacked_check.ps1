@@ -77,6 +77,10 @@
     check that cannot tell must not print the word that means it can. Use -SkipReachability to
     suppress the probe; the output then says reachability was not checked.
 
+    The same holds for ONE dead remote among live ones. The repository is then not UNVERIFIABLE, so
+    only the remotes that answered may exclude a commit; a branch held by the dead remote alone is
+    counted as unbacked (BACKLOG #5502).
+
     A RELATED PRACTICE, because this check is how the need surfaces. Prose that CITES a commit which
     will deliberately never land -- a trial branch, a refuted experiment, a rejected approach -- makes
     a merged file depend on a sha this check would otherwise be the only thing protecting. Measured
@@ -177,19 +181,17 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 #
 # The classification only ever moves a commit from AT-RISK to DURABLE. A commit that fails both arms
 # is reported exactly as before, so this cannot mask the case the script exists for.
+#
+# $Landed is the set of commits the caller's one `git cherry` per ref marked '-', against $Upstream.
+# $NotArgs is the caller's exclusion set, so a parent counts as backed only by a remote this run trusts
+# (see $trusted below, BACKLOG #5502).
 function Test-CommitContentDurable {
-    param([string]$Repo, [string]$Commit)
+    param([string]$Repo, [string]$Commit, [hashtable]$Landed, [string]$Upstream, [string[]]$NotArgs)
 
     # Arm 1: patch-id already upstream. `git cherry` marks '-' when an equivalent patch exists on the
     # upstream ref, which is precisely the squash/rebase-landed case a sha comparison cannot see.
-    foreach ($up in @('origin/main', 'origin/master')) {
-        if ((& git -C $Repo rev-parse --verify --quiet "$up") ) {
-            $mark = (& git -C $Repo cherry $up $Commit 2>$null | Select-Object -First 1)
-            if ($mark -and $mark.StartsWith('-')) {
-                return [pscustomobject]@{ Durable = $true; Why = "patch already on $up (squash/rebase-landed)" }
-            }
-            break
-        }
+    if ($Landed.ContainsKey($Commit)) {
+        return [pscustomobject]@{ Durable = $true; Why = "patch already on $Upstream (squash/rebase-landed)" }
     }
 
     # Arm 2: a re-derivable merge over backed parents.
@@ -199,7 +201,7 @@ function Test-CommitContentDurable {
     if ($parents.Count -lt 2) { return [pscustomobject]@{ Durable = $false; Why = $null } }
 
     foreach ($par in $parents) {
-        $n = (& git -C $Repo rev-list --count $par --not --remotes 2>$null)
+        $n = (& git -C $Repo rev-list --count $par @NotArgs 2>$null)
         if (-not $n -or [int]$n -gt 0) {
             return [pscustomobject]@{ Durable = $false; Why = $null }   # a parent is itself unbacked
         }
@@ -247,6 +249,23 @@ foreach ($p in $Path) {
         }
     }
 
+    # TRUST ONLY WHAT ANSWERED (BACKLOG #5502). A bare `--not --remotes` lets the tracking refs of a
+    # remote that did not answer exclude commits too, so with one live remote and one dead one the
+    # repository is not UNVERIFIABLE and a branch held only by the dead one read as backed. So when
+    # some remotes answered, only theirs are trusted: only their refs/remotes/<name>/* exclude, and the
+    # patch-id arm reads origin/* only if origin is among them. When every remote answered, or none
+    # did (UNVERIFIABLE, whose count is stated as a floor), or reachability was skipped, every remote
+    # is trusted and the bare form stays, so a tracking ref under no configured remote still counts.
+    $trusted = if ($reachable.Count -gt 0) { $reachable } else { $remotes }
+    $notArgs = @('--not', '--remotes')
+    if ($reachable.Count -gt 0 -and $unreachable.Count -gt 0) {
+        $notArgs = @('--not') + @($trusted | ForEach-Object { "--remotes=$_" })
+    }
+    $upstream = $null
+    if ($trusted -contains 'origin') {
+        $upstream = @('origin/main', 'origin/master') | Where-Object { & git -C $p rev-parse --verify --quiet $_ } | Select-Object -First 1
+    }
+
     $refs = @(& git -C $p for-each-ref --format='%(refname)' refs/heads 2>$null)
     $findings = @()
 
@@ -277,7 +296,7 @@ foreach ($p in $Path) {
         # symbolic-ref fails on a detached HEAD; that failure IS the test.
         & git -C $native symbolic-ref --quiet HEAD 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) { continue }
-        $dn = (& git -C $native rev-list --count HEAD --not --remotes 2>$null)
+        $dn = (& git -C $native rev-list --count HEAD @notArgs 2>$null)
         if ($dn -and [int]$dn -gt 0) {
             $detached += [pscustomobject]@{
                 Worktree = $native
@@ -292,16 +311,26 @@ foreach ($p in $Path) {
         # configured it excludes nothing, so the count is the branch's entire history -- correct, and
         # the reason the NO-REMOTE case is reported separately below rather than silently inflating a
         # total that would then read as ordinary unpushed work.
-        $n = (& git -C $p rev-list --count $ref --not --remotes 2>$null)
+        $n = (& git -C $p rev-list --count $ref @notArgs 2>$null)
         if ($n -and [int]$n -gt 0) {
             # CLASSIFY BEFORE ALARMING (BACKLOG #1299). Only when EVERY unbacked commit on this ref is
             # content-durable does the ref stop being a finding -- one commit that fails both arms
             # keeps the whole ref in the at-risk report, because the point is not to lose that one.
-            $unbacked = @(& git -C $p rev-list $ref --not --remotes 2>$null)
+            $unbacked = @(& git -C $p rev-list $ref @notArgs 2>$null)
+            # ONE `git cherry` PER REF, read line by line (BACKLOG #5493). It lists every commit in
+            # upstream..ref, so a per-commit call whose FIRST line was taken as that commit's verdict
+            # read the OLDEST commit's mark, and one landed commit at the base of a branch cleared
+            # every unpushed commit on top of it.
+            $landed = @{}
+            if ($upstream) {
+                foreach ($cl in @(& git -C $p cherry $upstream $ref 2>$null)) {
+                    if ($cl -match '^- ([0-9a-f]+)$') { $landed[$Matches[1]] = $true }
+                }
+            }
             $why = $null
             $allDurable = $unbacked.Count -gt 0
             foreach ($c in $unbacked) {
-                $v = Test-CommitContentDurable -Repo $p -Commit $c
+                $v = Test-CommitContentDurable -Repo $p -Commit $c -Landed $landed -Upstream $upstream -NotArgs $notArgs
                 if (-not $v.Durable) { $allDurable = $false; break }
                 if (-not $why) { $why = $v.Why }
             }

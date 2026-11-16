@@ -65,14 +65,33 @@ def check(*paths: Path, extra: list[str] | None = None) -> subprocess.CompletedP
     return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
 
 
+def _bare(path: Path) -> Path:
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(path)], check=True, capture_output=True
+    )
+    return path
+
+
+def _commit(repo: Path, name: str, text: str, msg: str) -> None:
+    (repo / name).write_text(text, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", msg)
+
+
+def _squash_land(repo: Path, text: str) -> None:
+    """Branch ``side`` gets one commit; ``main`` gets the same CONTENT as a different commit -- what
+    a squash-merge produces -- and is pushed to origin. HEAD is left on main."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", text, "work")
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "g.txt", text, "squashed: work")
+    git(repo, "push", "-q", "origin", "main")
+
+
 @pytest.fixture
 def origin(tmp_path: Path) -> Path:
     """A bare repo standing in for a reachable remote. Local, so no network in the suite."""
-    o = tmp_path / "origin.git"
-    subprocess.run(
-        ["git", "init", "-q", "--bare", "-b", "main", str(o)], check=True, capture_output=True
-    )
-    return o
+    return _bare(tmp_path / "origin.git")
 
 
 @pytest.fixture
@@ -231,16 +250,7 @@ def test_a_comma_list_through_dash_file_is_split(repo: Path, tmp_path: Path) -> 
 def test_a_squash_landed_branch_is_reclassified_not_alarmed(repo: Path) -> None:
     """MUST NOT TRIP. The squash-merge case: `main` carries the CONTENT under a different sha, so the
     branch points at an object on no remote while nothing is at risk."""
-    git(repo, "checkout", "-q", "-b", "side")
-    (repo / "g.txt").write_text("landed", encoding="utf-8")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-qm", "work")
-    # main gets the same CONTENT as a different commit -- what a squash-merge produces.
-    git(repo, "checkout", "-q", "main")
-    (repo / "g.txt").write_text("landed", encoding="utf-8")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-qm", "squashed: work")
-    git(repo, "push", "-q", "origin", "main")
+    _squash_land(repo, "landed")
     git(repo, "fetch", "-q", "origin")
 
     r = check(repo)
@@ -360,3 +370,90 @@ def test_the_printed_remedy_writes_a_ref_that_can_be_VERIFIED_LATER(repo: Path) 
     )
     # The reason has to travel with the command, or the extra step reads as ceremony and gets cut.
     assert "A bare push records none of that" in r.stdout
+
+
+# --- BACKLOG #5493, #5502: a multi-commit branch, and a clone with one unreachable remote ---------
+
+
+def test_a_landed_OLDEST_commit_does_not_clear_the_newer_unpushed_ones(repo: Path) -> None:
+    """MUST TRIP. ``git cherry <upstream> <commit>`` lists EVERY commit in ``upstream..commit``,
+    oldest first. Reading its first line as the verdict for ``<commit>`` read the OLDEST commit's
+    mark, so once the branch's first commit had squash-landed upstream, every newer commit on top of
+    it -- work that exists on one disk -- read as patch-already-upstream and the ref was cleared.
+
+    Its twin is ``test_a_squash_landed_branch_is_reclassified_not_alarmed``: the same landed commit
+    with nothing on top must still clear."""
+    _squash_land(repo, "landed")
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "checkout", "-q", "side")
+    _commit(repo, "h.txt", "this exists on exactly one disk", "newer work, never pushed anywhere")
+    git(repo, "checkout", "-q", "main")
+
+    # The premise: the oldest commit's line is '-', the newest commit's line is '+'.
+    marks = git(repo, "cherry", "origin/main", "side").split()
+    assert marks[0] == "-" and marks[2] == "+", marks
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "side" in r.stdout
+    assert "2 commits on 1 branch exist on no remote" in r.stdout
+
+
+def _add_backup_remote(repo: Path, tmp_path: Path) -> None:
+    git(repo, "remote", "add", "backup", str(_bare(tmp_path / "backup.git")))
+    git(repo, "push", "-q", "backup", "main")
+
+
+@pytest.fixture
+def two_remotes(repo: Path, tmp_path: Path) -> Path:
+    """``repo`` with a second reachable remote, ``backup``, holding a branch that origin does not."""
+    _add_backup_remote(repo, tmp_path)
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "pushed to backup only", "work on backup only")
+    git(repo, "push", "-q", "backup", "side")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "--all")
+    return repo
+
+
+def test_a_branch_backed_by_a_reachable_second_remote_reads_clean(two_remotes: Path) -> None:
+    """MUST NOT TRIP -- the control for the test below. Both remotes answer, so a branch held by
+    ``backup`` alone is backed."""
+    r = check(two_remotes)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "0 unbacked commits" in r.stdout
+    assert "2 of 2 configured remote(s) answered" in r.stdout
+
+
+def test_a_branch_backed_ONLY_by_an_unreachable_remote_is_counted(
+    two_remotes: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. The repository is not UNVERIFIABLE, because origin answers, but ``refs/remotes/
+    backup/side`` is a local copy of a store that no longer answers. Excluding it with a bare
+    ``--not --remotes`` cleared a branch whose only other copy is gone."""
+    git(two_remotes, "remote", "set-url", "backup", str(tmp_path / "gone.git"))
+
+    r = check(two_remotes)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "UNVERIFIABLE" not in r.stdout
+    assert "1 of 2 configured remote(s) answered" in r.stdout
+    assert "side" in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_squash_landed_verdict_needs_a_REACHABLE_origin(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP. The patch-id arm reads ``origin/main``. When origin no longer answers but another
+    remote does, that ref is a local copy of a dead store, so a patch found there proves nothing about
+    where the content now lives."""
+    _add_backup_remote(repo, tmp_path)
+    _squash_land(repo, "landed on origin only")
+    # Local main goes back to what backup holds, so only `side` can be a finding.
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    git(repo, "fetch", "-q", "--all")
+    git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "UNVERIFIABLE" not in r.stdout
+    assert "squash/rebase-landed" not in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
