@@ -35,7 +35,8 @@
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
       (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
-                  or UNREADABLE when a record that names no session is present and may be this one.
+                  or UNREADABLE when a possibly-live record that names no session is present and
+                  may be this one. The same record turns a matched DEAD or STALE into UNREADABLE.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
@@ -158,7 +159,7 @@ function Get-LoginForSession {
 
 # One field of a registry record, or $null when the record lacks it. A bare `$rec.pid` throws under
 # Set-StrictMode for a missing property, and these functions run in their caller's strict scope
-# (seat.ps1 and fleet.ps1 set it). A record missing a field is what a file caught mid-write looks like,
+# (at least seat.ps1 and fleet.ps1 set it). A record missing a field is what a file caught mid-write looks like,
 # so the read must answer rather than throw (BACKLOG #5491).
 function Get-RecordField($Record, [string]$Name) {
     if ($null -eq $Record) { return $null }
@@ -254,10 +255,11 @@ function Test-RecordLiveness {
     # clock jitter). Started much later => this pid was recycled onto a different process.
     $delta = ($procStart - $registered).TotalMinutes
     if ($delta -gt 1) {
-        return @{ State = "STALE"; Detail = "pid $procId reused (process started $([int]$delta)m after the session)" }
+        return @{ State = "STALE"; Detail = "pid $procId reused (process started $([long]$delta)m after the session)" }
     }
     if ($delta -lt (-1 * $StartSkewMinutes)) {
-        return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([int](-$delta))m" }
+        # [long], not [int]: a far-future startedAt puts the gap past Int32 minutes, and the cast threw.
+        return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([long](-$delta))m" }
     }
     return @{ State = "LIVE"; Detail = "" }
 }
@@ -274,13 +276,19 @@ function Get-SessionLiveness {
     $hit = @($records |
         Where-Object { $sid = [string](Get-RecordField $_.Record 'sessionId'); $sid -and $sid.StartsWith($SessionId, 'OrdinalIgnoreCase') })
 
+    # A record that names no session may be this one, caught mid-write, so a gone answer beside one
+    # that is possibly live is not a gone answer. Under StrictMode it used to throw, which seat.ps1
+    # refused on; skipping it silently would turn that refusal into a clear (BACKLOG #5491). One whose
+    # own fence reads DEAD or STALE cannot be a live session, so it does not veto.
+    $anonymous = @($records | Where-Object {
+            -not [string](Get-RecordField $_.Record 'sessionId') -and
+            (Test-RecordLiveness -Record $_.Record -StartSkewMinutes $StartSkewMinutes).State -notin @('DEAD', 'STALE')
+        }).Count
+    $anonymousDetail = "but $anonymous possibly-live record(s) name no session, and one may be it"
+
     if ($hit.Count -eq 0) {
-        # A record that names no session may be this one, caught mid-write, so a miss beside one is not
-        # a clean miss. Under StrictMode it used to throw, which seat.ps1 refused on; skipping it
-        # silently would turn that refusal into a clear (BACKLOG #5491).
-        $anonymous = @($records | Where-Object { -not [string](Get-RecordField $_.Record 'sessionId') }).Count
         if ($anonymous -gt 0) {
-            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, but $anonymous record(s) name no session and one may be it"; Record = $null }
+            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, $anonymousDetail"; Record = $null }
         }
         # Not registered. NOT proof it is gone -- a session that never registered looks identical to
         # one that exited cleanly, so callers must fall back to an independent signal.
@@ -297,6 +305,10 @@ function Get-SessionLiveness {
         if (-not $best -or $rank[$l.State] -lt $rank[$best.State]) {
             $best = @{ Found = $true; State = $l.State; Detail = $l.Detail; Record = $h.Record }
         }
+    }
+    if ($anonymous -gt 0 -and $best.State -in @('DEAD', 'STALE')) {
+        $best.Detail = "its record reads $($best.State) ($($best.Detail)), $anonymousDetail"
+        $best.State = "UNREADABLE"
     }
     return $best
 }

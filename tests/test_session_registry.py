@@ -394,6 +394,32 @@ def test_a_miss_beside_a_record_naming_no_session_is_not_a_clean_miss(config_roo
     assert got == "False|UNREADABLE"
 
 
+def test_a_gone_match_beside_a_live_record_naming_no_session_is_unreadable(
+    config_root: Path,
+) -> None:
+    """The matched record reads DEAD, but the anonymous live one may be the same session, caught
+    mid-write after a relaunch, so the answer must not license a clear."""
+    write_session(config_root, pid=never_live_pid(), session_id="5491cccc-0000")
+    (config_root / "sessions" / "99005.json").write_text(
+        json.dumps({"pid": os.getpid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    assert liveness(config_root, "5491cccc")["State"] == "UNREADABLE"
+
+
+def test_a_dead_record_naming_no_session_does_not_veto(config_root: Path) -> None:
+    """A record whose own fence reads DEAD cannot be a live session, so it leaves a miss clean."""
+    (config_root / "sessions" / "99006.json").write_text(
+        json.dumps({"pid": never_live_pid(), "startedAt": NOW_MS}), encoding="utf-8"
+    )
+    assert liveness(config_root, "5491dddd")["State"] == "UNKNOWN"
+
+
+def test_a_far_future_startedat_is_stale_not_a_throw_under_strict_mode() -> None:
+    """The gap in minutes passes Int32 there; the detail's cast must not throw."""
+    record = {"pid": os.getpid(), "sessionId": "s", "startedAt": 200_000_000_000_000}
+    assert _strict_fence(record) == "STALE"
+
+
 def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
     config_root: Path,
 ) -> None:

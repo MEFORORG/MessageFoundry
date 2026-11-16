@@ -170,11 +170,14 @@ foreach ($row in $sessionRows) {
     $cwd = $null
     if ($row.Record.PSObject.Properties.Name -contains 'cwd') { $cwd = Get-NormPath ([string]$row.Record.cwd) }
     if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
+    # A record that names no session cannot be matched to a seat record, so counting it would report
+    # a writer failure that is not one. A bare read of the field throws under this file's StrictMode.
+    $liveSid = [string](Get-RecordField $row.Record 'sessionId')
+    if (-not $liveSid) { continue }
     $l = Test-RecordLiveness -Record $row.Record
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
-            # A LIVE record may name no session; a bare read throws under this file's StrictMode.
-            SessionId = [string](Get-RecordField $row.Record 'sessionId')
+            SessionId = $liveSid
             Cwd       = $cwd
             Box       = (ConvertTo-BoxKey -Path ([string]$row.Record.cwd))
             Root      = $row.Root

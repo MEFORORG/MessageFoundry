@@ -300,8 +300,9 @@ def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5492. Every stale copy predates the shared root and reads only the LOCAL registry, so
-    with a shared root configured the tombstone must land there as well, and -Check must report
-    ABSENT while the local copy is missing. The root is a temp directory, never a real one."""
+    with a shared root configured the tombstone must land there and not on the share, and -Check
+    must report ABSENT while the local copy is missing. The root is a temp directory, never a real
+    one."""
     repo = _stale_clone(tmp_path, _stale_alloc(_STALE_REVISIONS["4c68c28eb-blob"]))
     _seed_registry(repo, [1769, 1771])
     shared = tmp_path / "shared-root"
@@ -313,8 +314,10 @@ def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
     wrote = _tombstone(repo)
     assert wrote.returncode == 0, wrote.stdout + wrote.stderr
     local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
-    for record in (local, shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"):
-        assert json.loads(record.read_text(encoding="utf-8"))["tombstone"] is True, record
+    assert json.loads(local.read_text(encoding="utf-8"))["tombstone"] is True
+    assert not (shared / "alloc").exists(), (
+        "the share is another clone's and PC's, so it is not touched"
+    )
     assert _allocate_with_stale_copy(repo) == _TOMBSTONE_NUMBER + 1
 
     local.unlink()
@@ -323,21 +326,21 @@ def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
     assert f"ABSENT: {local}" in absent.stdout
 
 
-def test_an_unresolved_shared_root_still_tombstones_the_local_registry(
+def test_an_unresolvable_shared_root_does_not_block_the_local_tombstone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The local registry does not depend on the share, so a root that cannot be resolved still
-    lets it be written, and the run then refuses with exit 4, -Check included."""
+    """The local registry does not depend on the share, so a root that cannot be resolved neither
+    stops the write nor turns -Check into a refusal."""
     repo = _stale_clone(tmp_path, b"# stale\n")
     monkeypatch.setenv("MEFOR_COORD_ROOT", str(tmp_path / "no-such-root"))
 
     wrote = _tombstone(repo)
-    assert wrote.returncode == 4, wrote.stdout + wrote.stderr
+    assert wrote.returncode == 0, wrote.stdout + wrote.stderr
     local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
     assert json.loads(local.read_text(encoding="utf-8"))["tombstone"] is True
 
     checked = _tombstone(repo, "-Check")
-    assert checked.returncode == 4, checked.stdout + checked.stderr
+    assert checked.returncode == 0, checked.stdout + checked.stderr
     assert f"PRESENT: {local}" in checked.stdout
 
 
