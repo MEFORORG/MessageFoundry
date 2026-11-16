@@ -3128,24 +3128,63 @@ class _Staging:
         :func:`_discard_verify_staging`). The lock is dropped first because Windows will not delete a
         file that is still open. ``spared`` maps files directly in the directory that the
         teardown must neither unlink nor truncate to why, beside those a spare marker there
-        records (:func:`_spared_items`)."""
+        records (:func:`_spared_items`).
+
+        Where a spare in ``spared`` is unrecorded (:func:`_unrecorded_spares`), the directory is
+        withheld from every sweep again here, BEFORE the lock drops, so no sweep can take it in
+        between and the result handed to the teardown is final (BACKLOG #5617)."""
         with self._mutex:
             if self._released or (unless_claimed and self._claimed):
                 return None
             self._released = True
+        withheld: bool | None = None
+        if spared and _unrecorded_spares(self.path, spared):
+            withheld = _withhold_from_sweep(self.path)
         _unlock_and_close(self._fd)
         # `spared` is passed only when set, so a stand-in for a seam keeps its one-argument shape.
         return (
-            _teardown_staging(self.path, spared=spared) if spared else _teardown_staging(self.path)
+            _teardown_staging(self.path, spared=spared, withheld=withheld)
+            if spared
+            else _teardown_staging(self.path)
         )
 
 
-def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) -> str | None:
+def _unrecorded_spares(path: Path, spared: Mapping[str, str] | None) -> list[str]:
+    """The names in ``spared``, still in ``path``, whose marker does not record their reason
+    (:func:`_records_another_reason`): the marker's reason, not its existence, since a relabel
+    that failed leaves an older reason, which a later sweep would read in place of this run's."""
+    return sorted(
+        n
+        for n, reason in (spared or {}).items()
+        if reason and _still_there(path / n) and _records_another_reason(path / n, reason)
+    )
+
+
+#: What a teardown and a late rollback say of a directory they could not withhold from sweeps.
+#: It assumes no sparing marker: one that is missing or reads ``released`` spares nothing.
+_NOT_WITHHELD = (
+    "could not be withheld from sweeps: a sweep that takes it spares the file where a marker "
+    "beside it reads anything but `released`, under that reason, or for an unread reason where it "
+    "holds no reason a restore writes or cannot be read; where the marker is missing or reads "
+    "`released`, the sweep spares nothing and treats the file as any other"
+)
+
+
+def _teardown_staging(
+    path: Path, *, spared: Mapping[str, str] | None = None, withheld: bool | None = None
+) -> str | None:
     """:func:`_discard_verify_staging`, then, if the directory survived, put its lock file and marker
     back so the next sweep can prove it abandoned. Never raises. A file a restore spares, in
     ``spared`` or by a marker in the directory, is neither unlinked nor truncated
-    (:func:`_spared_items`); a directory holding one this run spared but could not record, or whose
-    marker still reads another reason, is not re-marked, so no sweep ever takes it (BACKLOG #5617).
+    (:func:`_spared_items`).
+
+    A directory holding a spare this run could not record, or whose marker still reads another
+    reason (:func:`_unrecorded_spares`), is never re-marked. Whether a sweep can still take it
+    depends on the withholding: ``withheld`` is the result of the attempt :meth:`_Staging.release`
+    made while it held the lock, and with none this teardown makes the attempt itself. Where it
+    landed no sweep ever takes the directory, and its notes say so; where it failed, ``.lock-held``
+    stays, a sweep can take the directory, and the notes keep their next-sweep wording
+    (BACKLOG #5617).
 
     A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
     listing order and on NTFS the dot-names list first. Left like that, the directory would hold
@@ -3165,19 +3204,15 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
     # Read here, the one teardown every path runs (a release and the sweep alike), so no path can
     # unlink or truncate a file a restore spared in an earlier run (BACKLOG #5617).
     held = _spared_items(path, spared)
-    # The marker's reason, not its existence: a relabel that failed leaves an older reason, which a
-    # later sweep would read in place of this run's (BACKLOG #5617). Read before the discard, so the
-    # notes it reports never promise a sweep that will not take the directory.
-    unrecorded = sorted(
-        n
-        for n, reason in (spared or {}).items()
-        if reason and _still_there(path / n) and _records_another_reason(path / n, reason)
-    )
-    # A spare whose marker could not be written holds for this run alone. Its restore already
-    # withheld the directory from every sweep while it held the lock (`_record_spare`); this
-    # repeats the withholding should that have failed, and declines to re-mark it below. Done
-    # before the discard, so the notes promise no sweep only where the withholding landed.
-    withheld = bool(unrecorded) and _withhold_from_sweep(path)
+    # Read before the discard, so the notes it reports never promise a sweep that will not take the
+    # directory. A spare whose marker could not be written holds for this run alone; its restore
+    # tried to withhold the directory when the write failed (`_record_spare`), and again in
+    # `release` while it still held the lock, and that second result decides.
+    unrecorded = _unrecorded_spares(path, spared)
+    if not unrecorded:
+        withheld = False
+    elif withheld is None:
+        withheld = _withhold_from_sweep(path)
     for n in unrecorded if withheld else ():
         if held and n in held:
             held[n] = held[n].replace(_NEXT_SWEEP, _NO_SWEEP)
@@ -3200,8 +3235,7 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
             ", ".join(unrecorded),
             "so no sweep removes the directory: delete it by hand"
             if withheld
-            else "and could not be withheld from sweeps, which report it under the reason its "
-            "marker holds",
+            else f"and the directory {_NOT_WITHHELD}",
         )
     else:
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
@@ -5797,15 +5831,9 @@ def _finish_rollback(
     if relabelled:
         outcome = "its marker says so"
     elif withheld:
-        outcome = (
-            "its marker could not be relabelled and still reads its earlier reason, so no "
-            "sweep removes its directory"
-        )
+        outcome = "its marker could not be relabelled, so its directory is withheld from sweeps"
     else:
-        outcome = (
-            "its marker could not be relabelled and still reads its earlier reason, and its "
-            "directory could not be withheld from sweeps, which report it under that reason"
-        )
+        outcome = f"its marker could not be relabelled, and its directory {_NOT_WITHHELD}"
     log.error(
         "the failed restore's rollback removed the placed store at %s only after its staging "
         "teardown, so the staged copy %s is the only decrypted copy of it, kept unemptied; %s: "

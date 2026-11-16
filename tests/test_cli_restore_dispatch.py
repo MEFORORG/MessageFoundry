@@ -2406,6 +2406,52 @@ def test_a_withholding_that_fails_is_never_reported_as_landed(
     shutil.rmtree(leftover)
 
 
+def test_a_withholding_retried_under_the_lock_decides_the_refusal(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The relabel to `rollback-failed` does not land, and the first attempt to withhold the
+    # directory is refused. The second attempt must run while the restore still holds its lock,
+    # so no sweep can take the directory in between, and its result, here a removal that lands,
+    # decides the refusal. It used to run after the lock dropped.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    real_unlink = os.unlink
+    refused: list[str] = []
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.path.basename(os.fspath(path)) == ".lock-held" and not refused:
+            refused.append(os.fspath(path))
+            raise PermissionError(13, "held open by a scanner", os.fspath(path))
+        real_unlink(path, *args, **kwargs)
+
+    real_unlock = dr_backup._unlock_and_close
+    held_at_unlock: list[list[bool]] = []
+
+    def unlock(fd: int) -> None:
+        held_at_unlock.append(
+            [(d / ".lock-held").exists() for d in dest.parent.glob("mefor-restore-*")]
+        )
+        real_unlock(fd)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _hold(
+            mp, lambda p: _is_staged_store(p) or (p.name, p.parent.name) == ("msg.db", "restored")
+        )
+        mp.setattr(os, "unlink", unlink)
+        mp.setattr(dr_backup, "_unlock_and_close", unlock)
+        _refuse_marker_reason(mp, "rollback-failed")
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    (refusal,) = [line for line in _refusal(capsys).splitlines() if line.startswith("error:")]
+    assert len(refused) == 1, refused
+    assert held_at_unlock and held_at_unlock[-1] == [False], held_at_unlock
+    assert "which no sweep removes" in refusal, refusal
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    assert not (leftover / ".lock-held").exists()
+    shutil.rmtree(leftover)
+
+
 def test_an_unreadable_spare_marker_is_logged(tmp_path, caplog) -> None:
     marker = tmp_path / "x.db.mefor-spared"
     marker.write_bytes(b"\xff\xfe")

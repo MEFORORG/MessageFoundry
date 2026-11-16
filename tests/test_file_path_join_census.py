@@ -823,11 +823,12 @@ SITES: dict[str, Site] = {
         "Fixed lock and marker names inside directories listed by this module's own prefix, after "
         "link and owner checks.",
     ),
-    "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(
-        3,
+    "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(1, INTERNAL, _STAGING),
+    "messagefoundry/pipeline/dr_backup.py::_unrecorded_spares": Site(
+        2,
         INTERNAL,
-        "Fixed lock and marker names, and the names of files a restore spared, inside a staging "
-        "directory this module created.",
+        "The names of files a restore spared, and their markers, inside a staging directory this "
+        "module created; lstat'ed and read only.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place._is_spared": Site(
         1,
