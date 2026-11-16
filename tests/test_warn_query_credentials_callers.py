@@ -37,11 +37,22 @@ _PINNED: Counter[tuple[str, str, str]] = Counter(
             "False",
         ): 1,
         # BACKLOG #5755 moved the builds of _ensure_destination_built and _reconcile_outbounds
-        # here. Its callers log the line first: _ensure_destination_built's own warning step, and
-        # a reload's step 3 prepare, after its build_check.
+        # behind _build_logged_destination, which forwards the keyword. Its two callers: an
+        # operator start's build, after _ensure_destination_built's own warning step, and a
+        # reload's step 3 prepare, after its build_check.
         (
             "messagefoundry/pipeline/wiring_runner.py",
             "RegistryRunner._build_logged_destination",
+            "warn_query_credentials",
+        ): 1,
+        (
+            "messagefoundry/pipeline/wiring_runner.py",
+            "RegistryRunner._build_lane_destination",
+            "False",
+        ): 1,
+        (
+            "messagefoundry/pipeline/wiring_runner.py",
+            "RegistryRunner._prepare_outbound_reconcile",
             "False",
         ): 1,
         ("messagefoundry/pipeline/wiring_runner.py", "RegistryRunner._start_outbound", "False"): 1,

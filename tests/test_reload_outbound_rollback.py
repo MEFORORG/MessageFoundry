@@ -534,3 +534,31 @@ async def test_a_reload_that_re_enables_a_start_disabled_lane_builds_it(
         assert _directory(rr) == tmp_path / "out"
     finally:
         await rr.stop()
+
+
+async def test_a_build_step_3_adds_after_the_quiesce_that_fails_restores_every_lane_and_intake(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane comes to need a connector only once intake has stopped, so step 3 tops the plan up
+    after the quiesce, and that build fails. Every lane keeps its connector, the connector the
+    first prepare built is closed, and intake is restored."""
+    old = runner.registry
+    before = dict(runner._destinations)
+    real_residue = runner._recover_stopped_worker_residue
+
+    async def a_lane_fails_meanwhile() -> int:
+        # Step 1a, inside the quiesce: the lane reads failed, so step 3 must swap its connector.
+        runner._record_failed(_OB, RuntimeError("failed meanwhile"), kind="outbound")
+        return await real_residue()
+
+    monkeypatch.setattr(runner, "_recover_stopped_worker_residue", a_lane_fails_meanwhile)
+    made = _fault_nth_build(monkeypatch, 2)  # build 1 is the first prepare's, for file_out_2
+    closed = _record_closes(runner, monkeypatch)
+    with pytest.raises(RuntimeError, match="later lane"):
+        await runner.reload(_registry(tmp_path, "out", second="out2_v2"))
+    await _settle(runner)
+
+    assert runner.registry is old
+    assert runner._destinations == before
+    assert len(made) == 1 and made[0] in closed
+    assert runner.inbound_running("file_in")

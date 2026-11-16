@@ -5307,10 +5307,14 @@ class RegistryRunner:
         if oc is None or not oc.deployed:
             return None
         if warn_query_credentials:
-            # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
-            warn_url_query_credentials_before_build(
-                f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
-            )
+            try:
+                # Before anything below can fail the build, as _start_outbound does (BACKLOG
+                # #4997). A raise here fails the lane, isolated as the build's own would be.
+                warn_url_query_credentials_before_build(
+                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                )
+            except Exception as exc:
+                return self._install_lane_destination(name, _LaneBuild(exc, _AnchorVerdict()))
         return self._install_lane_destination(name, await self._build_lane_destination(name, oc))
 
     async def _build_lane_destination(self, name: str, oc: OutboundConnection) -> _LaneBuild:
@@ -5329,7 +5333,7 @@ class RegistryRunner:
             if anchor.error is not None:
                 return _LaneBuild(anchor.error, anchor)
             # The caller has logged the query-credential line (_build_logged_destination).
-            connector = await self._build_logged_destination(dest)
+            connector = await self._build_logged_destination(dest, warn_query_credentials=False)
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
             # refusal the engine start path gives it, isolated the same way (this method never raises).
@@ -8564,7 +8568,9 @@ class RegistryRunner:
                 oc = new.outbound[name]
                 if kind == "build":
                     plan.built[name] = await self._build_logged_destination(
-                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
+                        # build_check already warned for this reload (vault BACKLOG #2910)
+                        warn_query_credentials=False,
                     )
                 else:
                     # build_check already warned for this reload (vault BACKLOG #2910)
@@ -8586,7 +8592,12 @@ class RegistryRunner:
             if not oc.deployed or (not oc.auto_start and not self._outbound_lane_live(name)):
                 continue
             if self._leaves_passive_park(name, oc):
-                wanted.append((name, "start"))
+                # Not while the #122 halt would hold it at the gate: its build checks the CA,
+                # dials and probes, which a held lane must not, as the reload's CA pre-check
+                # leaves it alone too (vault BACKLOG #3263). If the gate's probe lifts the halt,
+                # the apply holds it unbuilt for the next reload or start.
+                if not (self._delivery_halted and self._halt_gate_asks(name)):
+                    wanted.append((name, "start"))
                 continue
             if self._dr_parks_outbound(oc.priority) or self._keeps_anchor_failure(
                 "outbound", name, old, oc
@@ -8595,6 +8606,13 @@ class RegistryRunner:
             if self._outbound_rebuild(name, oc, old, halted=self._delivery_halted):
                 wanted.append((name, "build"))
         return wanted
+
+    def _halt_gate_asks(self, name: str) -> bool:
+        """Whether step 3's #122 gate asks its probe about lane ``name``: the one condition the
+        apply and the prepare both read (:meth:`_apply_outbound_reconcile`)."""
+        return (
+            self._delivery_halted and name not in self._outbound_paused
+        ) or name in self._gate_parked
 
     def _dr_parks_outbound(self, declared: Priority | None) -> bool:
         """Whether :meth:`_dr_filters_out` would park an outbound of this tier, with no marker
@@ -8661,7 +8679,9 @@ class RegistryRunner:
             return "swap"
         return None
 
-    async def _build_logged_destination(self, dest: Destination) -> DestinationConnector:
+    async def _build_logged_destination(
+        self, dest: Destination, *, warn_query_credentials: bool
+    ) -> DestinationConnector:
         """Build a lane's connector whose URL query-credential line its caller already logged,
         by a build check or its own warning step (vault BACKLOG #2910), so the egress check does
         not repeat it. #200 (ADR 0092): stamped with the posture, as a start's is; an unstamped
@@ -8670,7 +8690,10 @@ class RegistryRunner:
         return await _build_off_loop(
             self._hop_posture,
             functools.partial(
-                build_destination, dest, egress=self._egress, warn_query_credentials=False
+                build_destination,
+                dest,
+                egress=self._egress,
+                warn_query_credentials=warn_query_credentials,
             ),
         )
 
@@ -8862,9 +8885,7 @@ class RegistryRunner:
             # either way, and :meth:`build_check` has already constructed every connector in the
             # new graph (no bind and no connection by contract; it may read files) at the top of
             # this reload, before a single lane was touched.
-            if (
-                self._delivery_halted and name not in self._outbound_paused
-            ) or name in self._gate_parked:
+            if self._halt_gate_asks(name):
                 if unpark_permitted is None:
                     unpark_permitted = self._outbound_start_permitted(name)
                 if not unpark_permitted:
@@ -8936,10 +8957,19 @@ class RegistryRunner:
                 # awaited, as a failed activation hands the threshold back without the reload
                 # lock, does not reach here: `_leaves_passive_park` reads it false, and the lane
                 # takes the passive park below.
-                if name in self._destinations or ("outbound", name) in self._filtered:
-                    pass  # `_ensure_destination_built`'s own guard: the lane takes nothing.
+                if ("outbound", name) in self._filtered:
+                    # `_ensure_destination_built`'s own guard: the lane takes nothing, and what
+                    # the prepare built is closed with the plan.
+                    pass
                 elif (started := plan.started.pop(name, None)) is None:
-                    self._unbuilt_by_prepare(name)  # held as a failed build is, below
+                    # The prepare left it unbuilt while the #122 halt held it, and this reload's
+                    # probe has lifted the halt since. Held as a failed build is, below, with no
+                    # failure recorded: the next reload or an operator start builds it.
+                    log.warning(
+                        "reload: outbound %r left the DR park during a log halt; the next "
+                        "reload or a start builds it",
+                        name,
+                    )
                 else:
                     self._install_lane_destination(name, started)
                 if name in self._destinations:
@@ -8994,7 +9024,9 @@ class RegistryRunner:
                     # and unchanged, so the worker is respawned on it.
                     self._spawn_worker(name)
                 else:
-                    self._unbuilt_by_prepare(name)
+                    self._unbuilt_by_prepare(name, retired)
+                    if rebuild == "add":
+                        self._spawn_worker(name)
                 continue
             if rebuild == "add":
                 # added (or replacing a crashed worker): swap in, retire any stale connector, spawn.
@@ -9028,12 +9060,18 @@ class RegistryRunner:
                 self._filtered.pop(("outbound", name), None)
                 self._unpark_outbound_lane(name)
 
-    def _unbuilt_by_prepare(self, name: str) -> None:
+    def _unbuilt_by_prepare(
+        self, name: str, retired: list[tuple[str, DestinationConnector]]
+    ) -> None:
         """The apply reached a lane its prepare built nothing for. They read the same state with
-        no await between them, so this is a defect. The lane is recorded failed rather than left
-        on a connector the new spec no longer matches: the failure pages, and the next reload
-        rebuilds a failed lane (:meth:`_outbound_rebuild`)."""
+        no await between them, so this is a defect. The lane's connector is retired and the lane
+        recorded failed, as a lane whose build failed at start is (ADR 0031), rather than left
+        delivering through a connector the new spec no longer matches: the failure pages, and
+        the next reload rebuilds a failed lane (:meth:`_outbound_rebuild`)."""
         log.error("reload: outbound %r had no connector built for it", name)
+        stale = self._destinations.pop(name, None)
+        if stale is not None:
+            retired.append((name, stale))
         self._record_failed(
             name, RuntimeError("the reload built no connector for this lane"), kind="outbound"
         )
@@ -9074,20 +9112,23 @@ class RegistryRunner:
             return
 
         async def close_all() -> None:
-            await self._close_retired(connectors)  # each failure is logged
+            failures: list[tuple[str, str]] = []  # each one is logged
+            for name, connector in connectors:
+                await self._close_replaced(name, connector, failures)
 
         task = asyncio.create_task(close_all())
         self._lookup_close_tasks.add(task)
         task.add_done_callback(self._lookup_close_tasks.discard)
+        task.add_done_callback(self._abandoned_lookup_closes.discard)
 
     async def _close_replaced(
         self, name: str, replaced: DestinationConnector, failures: list[tuple[str, str]]
     ) -> None:
-        """Close the connector a reload rebuild has just swapped out of ``name``'s lane. A close
-        that raises is logged and appended to ``failures`` rather than raised: the new connector is
-        already live, and the reload's rollback restores intake and never the outbound mapping, so
-        raising would put the old graph back beside a connector built from the new one (engine PR
-        2815). A cancellation still propagates.
+        """Close the connector a reload has just taken out of ``name``'s lane, whether a rebuild
+        swapped it out or a not-deployed, ``auto_start`` or DR park retired it. A close that raises
+        is logged and appended to ``failures`` rather than raised: the reload's swap has already
+        committed when it closes, so the lane stands as the new graph has it (engine PR 2815,
+        BACKLOG #5755). A cancellation still propagates.
 
         A send in flight on ``replaced`` is not cancelled here; its delivery path settles it
         (:meth:`_connector_retired`, BACKLOG #5718)."""
@@ -9256,8 +9297,10 @@ class RegistryRunner:
         (vault BACKLOG #2753), the previous graph's intake is restored before the error or the
         cancellation propagates, with its lookup executors and ADR 0057 inline eligibility, and steps
         3a and 4 do not run. Step 3 changes no outbound lane until its last await has returned, so
-        a rolled-back reload finds every outbound lane as it was; the connectors it takes out of a
-        lane are closed only once the swap commits (BACKLOG #5755). Restarting inbounds before
+        a fault or cancellation in a step or a connector build leaves the outbound lanes as they
+        were; a raise inside its synchronous apply is the exception (:meth:`_reconcile_outbounds`).
+        The connectors it takes out of a lane are closed only once the swap commits, after the
+        reload lock is released (BACKLOG #5755). Restarting inbounds before
         reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
@@ -9513,8 +9556,9 @@ class RegistryRunner:
                     retired = await self._reconcile_outbounds(old, new_registry)
                 finally:
                     self._outbound_plan = None
-                # What the prepare built and no lane took, closed with the retired ones.
-                retired += outbound_plan.take_all()
+                # What the prepare built and no lane took was never in a lane: closed detached,
+                # so a failed close is not reported as a lane's.
+                self._close_detached(outbound_plan.take_all())
             except BaseException as exc:
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
@@ -9534,7 +9578,9 @@ class RegistryRunner:
                 self.registry = old
                 self._env_values = old_env_values
                 # BACKLOG #5755: step 3 changes no outbound lane before its last await returns,
-                # so the outbound lanes are as they were. The connectors its prepare built and no
+                # so a fault or cancellation in a step or a build leaves them as they were. A raise
+                # inside its synchronous apply, a defect, leaves the lanes it reached as it left
+                # them (:meth:`_reconcile_outbounds`). The connectors its prepare built and no
                 # lane took are closed, scheduled before any await so a second cancellation
                 # cannot skip them.
                 self._close_detached(outbound_plan.take_all())
@@ -9608,10 +9654,6 @@ class RegistryRunner:
             except BaseException:
                 self._close_detached(retired)
                 raise
-            # The swap committed: close what step 3 took out of its lanes. Last, so a
-            # cancellation that lands in a close finds the rest of the commit done; the closes it
-            # cut off run detached (:meth:`_close_retired`).
-            close_failures = await self._close_retired(retired)
             log.info(
                 "wiring reloaded: %d inbound, %d outbound connection(s)",
                 len(new_registry.inbound),
@@ -9625,7 +9667,11 @@ class RegistryRunner:
         report = asyncio.create_task(self._warn_stranded_by_dropped_inbounds(old, new_registry))
         self._reload_report_tasks.add(report)
         report.add_done_callback(self._reload_report_tasks.discard)
-        return tuple(close_failures)
+        # BACKLOG #5755: the swap committed, so close what step 3 took out of its lanes. Outside
+        # the reload lock, so a close that hangs holds up no later reload or operator door, and
+        # last, so a cancellation that lands in one has cut off nothing of the commit; the closes
+        # it cut off run detached (:meth:`_close_retired`).
+        return tuple(await self._close_retired(retired))
 
     # --- inbound path --------------------------------------------------------
 
