@@ -941,10 +941,16 @@ def _budget_runner(**budgets: Any) -> tuple[Any, Any]:
 def test_the_runner_reads_the_resolved_budget_not_the_env_reference(value: object) -> None:
     from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
 
-    runner, ic = _budget_runner(intake_auth_rate_limit=env("budget"))
+    # The global budget off, so the limiter exists only if the per-peer value read is not zero.
+    runner, ic = _budget_runner(
+        intake_auth_rate_limit=env("budget"), intake_auth_rate_limit_global=0
+    )
     cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
     check_intake_budgets(cfg, ic.name)
     assert runner._make_intake_rate_limiter(ic, cfg.settings) is not None
+    # Its control: the same wiring with the environment resolving to 0 builds no limiter.
+    off = _source_config(ic, "127.0.0.1", {"budget": "0", "k": "synthetic-key"})
+    assert runner._make_intake_rate_limiter(ic, off.settings) is None
 
 
 @pytest.mark.parametrize("value", [-1, True, "abc"])

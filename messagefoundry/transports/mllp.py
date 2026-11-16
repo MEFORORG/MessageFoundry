@@ -369,11 +369,11 @@ def _bounded_ack_field(value: str | None) -> str:
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
-class _AckCorrelationError(DeliveryError):
-    """A well-formed ACK that names another message's control id (BACKLOG #82, #5681).
-
-    Still a retryable :class:`DeliveryError`; the subclass exists only so the persistent lane can log
-    its own discard reason instead of calling a parseable reply an unparseable one."""
+#: The prefix of the retryable DeliveryError a well-formed ACK naming another message's control id
+#: raises (BACKLOG #82, #5681). The persistent lane keys its discard reason on it. A plain
+#: DeliveryError rather than a subclass, so the error class operators and alert rules see is
+#: unchanged.
+_ACK_MISMATCH = "ACK control-id mismatch"
 
 
 #: A segment break in a payload not yet normalized (``normalize`` maps both to ``\r``).
@@ -1360,16 +1360,16 @@ class MLLPDestination(DestinationConnector):
             response = self._check_ack(ack_bytes, sent_control_id)
         except NegativeAckError:
             raise  # complete transaction on a healthy transport — the connection stays cached
-        except _AckCorrelationError:
-            # A parseable ACK for ANOTHER message (BACKLOG #82, #5681): the socket is out of step
-            # with the sends, so discard it, under its own reason rather than "unparseable ACK".
-            await self._discard_unparseable(conn, writer, reason="ACK control-id mismatch")
-            raise
-        except DeliveryError:
+        except DeliveryError as exc:
             # An unparseable ACK (non-capturing) means the transaction was NOT fully successful
             # ("one ACK read *and parsed*", ADR 0067 §2.2) — discard like any other DeliveryError
-            # rather than trust a peer that talks garbage to keep its framing aligned.
-            await self._discard_unparseable(conn, writer)
+            # rather than trust a peer that talks garbage to keep its framing aligned. A parseable
+            # ACK for ANOTHER message (BACKLOG #82, #5681) is discarded too, since the socket is out
+            # of step with the sends, under its own reason rather than "unparseable ACK".
+            mismatch = str(exc).startswith(_ACK_MISMATCH)
+            await self._discard_unparseable(
+                conn, writer, reason=_ACK_MISMATCH if mismatch else "unparseable ACK"
+            )
             raise
         if response is not None and response.outcome == "unparseable":
             # capture_response turns the unparseable ACK into a captured outcome instead of a raise
@@ -1626,8 +1626,8 @@ class MLLPDestination(DestinationConnector):
                 # sized too, and it is interpolated into this raise. Clamped HERE and not at the
                 # read above, because the comparison must see the field the peer actually sent --
                 # bounding first would silently correlate a long control id against its own prefix.
-                raise _AckCorrelationError(
-                    f"ACK control-id mismatch: "
+                raise DeliveryError(
+                    f"{_ACK_MISMATCH}: "
                     f"MSA-1={msa1} "
                     f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
                     f"!= sent MSH-10={sent_control_id!r}"

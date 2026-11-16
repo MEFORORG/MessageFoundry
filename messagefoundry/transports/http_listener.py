@@ -2095,9 +2095,10 @@ class HttpSource(SourceConnector):
     async def _serve_one(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, peer_host: str | None
     ) -> bool:
-        """Read + answer exactly one request. Returns True if a pre-ingress failure occurred (so the
-        outer ``closed`` event is suppressed — the failure already emitted its specific kind). Reading
-        the whole request is bounded by ``receive_timeout`` (the slow-loris guard)."""
+        """Read + answer exactly one request. Returns True if a failure emitted its own kind (so the
+        outer ``closed`` event is suppressed): a pre-ingress failure, or an inbound-handler fault,
+        which may come after the ingress commit (BACKLOG #5680). Reading the whole request is
+        bounded by ``receive_timeout`` (the slow-loris guard)."""
         assert self._handler is not None
 
         async def _read_authenticated() -> HttpRequest:
@@ -2204,10 +2205,8 @@ class HttpSource(SourceConnector):
             # BACKLOG #5680, the HTTP twin of the MLLP listener's #1619 arm: a fault inside the
             # inbound handler, such as a failed ingress commit, is an engine-side failure. Left to
             # `_on_client`, an OSError (TimeoutError included) read as `peer_reset` with no log line
-            # and no answer, and anything else as `framing_error`. The answer splits on the
-            # exception TYPE: an OSError gets the temporary refusal's 503 with Retry-After, and any
-            # other exception, which includes most store outages, a plain 500. docs/CONNECTIONS.md,
-            # Table B's HTTP listener row, is the one statement of that split. The fault may come
+            # and no answer, and anything else as `framing_error`. Which status the fault gets is
+            # stated once, in docs/CONNECTIONS.md Table B's HTTP listener row. The fault may come
             # after the ingress commit, so a re-send can commit a second copy, which at-least-once
             # allows. Charged to the pacer like any body read, so a sender that re-sends at once is
             # still paced. Returns True: the failure emitted its own kind, so the outer `closed` is
