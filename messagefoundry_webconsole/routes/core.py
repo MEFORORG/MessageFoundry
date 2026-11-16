@@ -180,17 +180,24 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
     return _DIRECTORY_UNCONFIRMED_ERROR
 
 
-def _form_fits(model: type[BaseModel], **fields: str) -> bool:
+def _form_fits(request: Request, model: type[BaseModel], **fields: str) -> bool:
     """Whether the JSON route's own request ``model`` accepts these hand-parsed form values.
 
     The /ui credential forms parse their bodies with ``parse_qsl``, so nothing bounds a field the
     way the JSON route's model does. Asking the model itself keeps one definition of each bound
-    (BACKLOG #5397, #5398, #5399). A refusal is logged as that route's 422 is, by model name only,
-    never with a value: the fields are credentials."""
+    (BACKLOG #5397, #5398, #5399). Any refusal by the model counts, not only a length one, so a
+    constraint later added to the model binds the form too. A refusal is logged in the JSON 422
+    handler's own words, with the method, the path and the error count, and never a value: the
+    fields are credentials."""
     try:
         model(**fields)
-    except ValidationError:
-        _log.info("a /ui credential form failed its JSON request model %s", model.__name__)
+    except ValidationError as exc:
+        _log.info(
+            "request validation failed on %s %s: %d field error(s)",
+            request.method,
+            request.url.path,
+            exc.error_count(),
+        )
         return False
     return True
 
@@ -785,6 +792,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # BACKLOG #5397: an oversized username or password is refused here, before auth.login hashes
         # or audits it, as the JSON route's 422 refuses it before the engine sees it. That holds for
         # provider "ad" too. Refused, never clamped: a truncated password is a different credential.
+        # Unlike that 422, this refusal comes after the sign-in budget above was charged and the
+        # passkey challenge was popped.
 
         def _refused() -> Response:
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
@@ -796,7 +805,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         username = form.get("username", "")
         password = form.get("password", "")
         if provider_value not in ("local", "ad") or not _form_fits(
-            LoginRequest, username=username, password=password
+            request, LoginRequest, username=username, password=password
         ):
             return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
@@ -1897,11 +1906,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         code = form.get("code", "")
         # BACKLOG #5398: the JSON MfaVerifyRequest's own bound. An oversized code never reaches
-        # verify_mfa, whose recovery-code leg hashes it once per slot. It is not audited or charged,
-        # as the JSON route's 422 is not, and it reads as a wrong code.
+        # verify_mfa, whose recovery-code leg hashes it once per slot, so it is not audited and it
+        # reads as a wrong code. The ceremony budget above has already been charged for it.
         elevation = (
             await auth.verify_mfa(token, code, client=client)
-            if _form_fits(MfaVerifyRequest, code=code)
+            if _form_fits(request, MfaVerifyRequest, code=code)
             else Elevation()
         )
         if elevation.token is not None:
@@ -1932,8 +1941,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
         # already audited the failure of any code within the bound. Generic copy: the form cannot
-        # say whether the code was wrong or expired without narrowing a guess. A directory refusal narrows nothing, because
-        # the code was never checked (BACKLOG #2023), so it says what did happen.
+        # say whether the code was wrong or expired without narrowing a guess. A directory refusal
+        # narrows nothing, because the code was never checked (BACKLOG #2023), so it says what did
+        # happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
@@ -2106,10 +2116,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             raw_code = form.get("code", "")
             code = raw_code.strip()
             # BACKLOG #5399: the JSON MfaVerifyRequest's bound, on the value as submitted. An
-            # oversized code is not checked, audited or charged, and reads as a wrong one.
+            # oversized code is not checked or audited, and reads as a wrong one. The ceremony
+            # budget above has already been charged for it.
             code_elevation = (
                 await auth.verify_mfa(token, code, client=client)
-                if code and _form_fits(MfaVerifyRequest, code=raw_code)
+                if code and _form_fits(request, MfaVerifyRequest, code=raw_code)
                 else Elevation()
             )
             if code_elevation.session_lost:
@@ -2152,8 +2163,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         password = form.get("password", "")
         try:
             # BACKLOG #5399: the JSON ReauthRequest's bound. An oversized password is neither
-            # hashed nor sent to the directory, and takes the wrong-password exit below. It is not
-            # audited or charged, as the JSON route's 422 is not.
+            # hashed nor sent to the directory, is not audited, and takes the wrong-password exit
+            # below. The ceremony budget above has already been charged for it.
             pw_elevation = (
                 await auth.reauth(
                     identity,
@@ -2162,7 +2173,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     client=client,
                     purpose=action.action if continues else None,
                 )
-                if _form_fits(ReauthRequest, password=password)
+                if _form_fits(request, ReauthRequest, password=password)
                 else Elevation()
             )
         except BaseException:

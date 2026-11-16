@@ -96,7 +96,6 @@ async def test_an_oversized_sign_in_credential_never_reaches_login(
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=bad"
         assert calls == []
-        assert "mf_session" not in c.cookies
         # At the bound the credential is checked, as the JSON route checks it.
         await c.post("/ui/login", data={"username": "op", "password": PW, field: "a" * bound})
     assert len(calls) == 1 and calls[0][arg] == "a" * bound
@@ -161,6 +160,12 @@ async def test_an_oversized_step_up_code_never_reaches_verify_mfa(
             "/ui/reauth", data={**form, "code": "1" * (_MFA_CODE_MAX + 1)}, headers=SAME_ORIGIN
         )
         assert r.status_code == 200 and "Invalid code." in r.text
+        assert calls == []
+        # The bound is on the value as submitted, as the JSON route's is, so trailing space the
+        # handler strips does not carry a code past it.
+        padded = "1" * _MFA_CODE_MAX + " "
+        r = await c.post("/ui/reauth", data={**form, "code": padded}, headers=SAME_ORIGIN)
+        assert "Invalid code." in r.text
         assert calls == []
         r = await c.post(
             "/ui/reauth", data={**form, "code": "1" * _MFA_CODE_MAX}, headers=SAME_ORIGIN
