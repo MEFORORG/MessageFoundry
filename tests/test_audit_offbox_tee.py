@@ -982,6 +982,20 @@ def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> No
     assert audit_tee._tee_line(before, after) == json.dumps(before, ensure_ascii=False)
 
 
+def test_a_fault_while_bounding_the_detail_ships_the_line_before_3045(monkeypatch) -> None:
+    """Review of the B1 repair: a fault in ``_bounded_detail``, outside both scrub guards, dropped
+    the record. It ships the line before #3045 instead. Synthetic values."""
+
+    def boom(*_args: object) -> str:
+        raise RuntimeError("synthetic")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "_bounded_detail", boom)
+        patch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+        scrubbed = _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=True)
+    assert scrubbed == _raw_tee_lines([{"detail": "\x01DOE JANE"}], monkeypatch, scrub=False)
+
+
 def test_a_detail_the_line_check_hides_whole_keeps_its_json_and_note() -> None:
     """Review of the PR 2864 repair: where the scrubbed line shows a word the old line hid,
     ``_tee_line`` hid a changed ``detail`` as bare ``[redacted]``, which is not the JSON a

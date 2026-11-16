@@ -577,17 +577,21 @@ def emit_audit_tee(
     try:
         # Each text field is scrubbed before json.dumps escapes a C0 control in it (#3045), and
         # _tee_line holds the result to what the record above, the line before #3045, hid.
-        scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
-        if detail:
-            kept = _scrub_field(detail, detail=True)
-            scrubbed["detail"] = (
-                old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
+        try:
+            scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
+            if detail:
+                kept = _scrub_field(detail, detail=True)
+                scrubbed["detail"] = (
+                    old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
+                )
+            # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
+            whole_detail = (
+                _bounded_detail(_FIELD_REDACTED, note, old_detail) if detail else _FIELD_REDACTED
             )
-        # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
-        whole_detail = (
-            _bounded_detail(_FIELD_REDACTED, note, old_detail) if detail else _FIELD_REDACTED
-        )
-        line = _tee_line(record, {**record, **scrubbed}, whole_detail)
+            line = _tee_line(record, {**record, **scrubbed}, whole_detail)
+        except Exception as exc:  # noqa: BLE001 - a scrub fault ships the line before #3045
+            _log_scrub_fault(exc)
+            line = json.dumps(record, ensure_ascii=False)
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
