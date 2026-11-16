@@ -8,9 +8,9 @@
 # Manual: `gh workflow run benchmark.yml --ref <branch>` (heavy + container-bound, so never on push/PR).
 #
 # `-f profile=claim-path` runs only the claim-path benchmark (vault BACKLOG #4915 step 1) in the two
-# server-store jobs, in place of the reference and failover steps, and skips the SQLite job: it times
-# claim_fifo_heads at two commits (scripts/bench/claim_path.sh says how). The default profile is the
-# baseline above, unchanged.
+# server-store jobs, in place of the environment stamp, reference, failover and baseline-upload steps,
+# and skips the SQLite job: it times claim_fifo_heads at two commits (scripts/bench/claim_path.sh says
+# how). The default profile is the baseline above, unchanged.
 name: throughput-baseline
 
 on:
@@ -245,6 +245,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install --constraint constraints.lock -e ".[dev,postgres]"
       - name: Environment stamp
+        # The claim-path profile writes nothing to out/load; its own report names the commit, the
+        # server version and the Python, so this baseline stamp and its upload are skipped there.
+        if: inputs.profile != 'claim-path'
         run: |
           mkdir -p out/load
           { echo "## postgres"; uname -a; python --version; psql --version 2>/dev/null || echo "psql n/a"; git rev-parse HEAD; } | tee out/load/env-postgres.txt
@@ -390,7 +393,7 @@ jobs:
           echo "failover exit: $?"
           set -e
       - name: Upload baseline report
-        if: always()
+        if: always() && inputs.profile != 'claim-path'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: baseline-postgres
@@ -527,6 +530,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --constraint constraints.lock -e ".[dev,sqlserver]"
       - name: Environment stamp
+        # Skipped under claim-path, as in the postgres leg.
+        if: inputs.profile != 'claim-path'
         run: |
           mkdir -p out/load
           { echo "## sqlserver"; uname -a; python --version; git rev-parse HEAD; } | tee out/load/env-sqlserver.txt
@@ -646,7 +651,7 @@ jobs:
           echo "failover exit: $?"
           set -e
       - name: Upload baseline report
-        if: always()
+        if: always() && inputs.profile != 'claim-path'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: baseline-sqlserver

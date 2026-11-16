@@ -16,7 +16,7 @@
 # Each gets its own database, so neither commit's schema is applied over the other's. The rounds
 # alternate the order (before then after, then after then before), and the count must be even so
 # each order runs equally often. Reports are metrics only and go to out/claimpath/, and the
-# before/after table goes to the job summary.
+# before/after table, with each side's discarded claims, goes to the job summary.
 set -euo pipefail
 
 backend="${1:?usage: claim_path.sh <postgres|sqlserver>}"
@@ -99,5 +99,10 @@ for round in $(seq 1 "$rounds"); do
   done
 done
 
-python -I scripts/bench/claim_path.py compare "$out"/"$backend"-*.json | tee "$out/summary-$backend.md"
+# The table reaches the job summary even when compare refuses a scenario, so the refusal is readable
+# there; compare's exit status is still the step's.
+status=0
+python -I scripts/bench/claim_path.py compare "$out"/"$backend"-*.json > "$out/summary-$backend.md" || status=$?
+cat "$out/summary-$backend.md"
 cat "$out/summary-$backend.md" >> "$GITHUB_STEP_SUMMARY"
+exit "$status"

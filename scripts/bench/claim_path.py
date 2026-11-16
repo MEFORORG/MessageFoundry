@@ -13,16 +13,22 @@ test, put first on ``sys.path``) and refuses to run if the import resolved anywh
 root's ``CLAIM_PATH_COMMIT`` file (written at extraction) does not name ``--commit``. It refuses any
 database whose name is not one of the bench's own (``mf_claim_*`` or ``MfClaim*``), because it
 empties the queue tables of the database the ``MEFOR_STORE_*`` environment names. It seeds synthetic
-ingress rows (one fixed, PHI-free HL7 message padded to ``--payload-bytes``, never printed),
-refreshes the queue table's statistics, then times each ``claim_fifo_heads`` call alone. After every
-timed claim it calls ``release_claimed``, which puts the claimed rows back to pending with their
-attempts restored, so every iteration claims the same rows. A claim that returns a different row
-count than the scenario expects stops the run: a timing over the wrong work is not a figure.
+ingress rows (one fixed, PHI-free HL7 message padded to ``--payload-bytes`` with seeded random
+base64, never printed), resets the queue table before each scenario, then times each
+``claim_fifo_heads`` call alone. After every claim it calls ``release_claimed``, which puts the
+claimed rows back to pending with their attempts restored, so every iteration claims the same rows.
+
+A claim that returns a different row count than the scenario expects, or reports a lock timeout, is
+not a sample: a timing over the wrong work is not a figure. It is released, counted by reason, and
+the slot is tried again, up to ``--max-discards`` per scenario; past that the scenario stops short
+and the next one runs.
 
 ``compare`` reads the JSON reports ``measure`` wrote and prints one Markdown table per backend. A
 report keeps summary statistics, not samples, so rounds are not pooled: each cell is the median over
-rounds of that round's statistic, with each round's p50 listed in round order. It exits non-zero if
-no scenario has both sides.
+rounds of that round's statistic, with each round's p50 listed in round order, and each side's
+discarded claims by reason. It refuses a scenario whose two sides did not measure the same work
+(rows claimed, payload size, rows per lane, iterations) or whose sample count fell short, and exits
+non-zero if it refused any scenario or if no scenario has both sides.
 
 Only timings, counts, the backend's version line and the commit label reach the output.
 """
@@ -31,14 +37,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import os
 import platform
+import random
 import statistics
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -52,12 +61,73 @@ _TABLES = ("message_events", "queue", "response", "delivered_keys", "messages")
 _BENCH_DB_PREFIXES = ("mf_claim_", "MfClaim")
 # The server stores clamp one claim to this many lanes (_FIFO_HEADS_LANE_CHUNK).
 _MAX_LANES = 500
+_PAD_SEED = 4915
+# The work both sides of a compared scenario must share.
+_SAME_WORK = ("rows_claimed", "payload_bytes", "rows_per_lane", "iterations")
+
+# One claim: (milliseconds, the claimed row ids, the lock-timeout phase if the store reported one).
+ClaimFn = Callable[[], Awaitable[tuple[float, list[Any], str | None]]]
+ReleaseFn = Callable[[list[Any]], Awaitable[None]]
 
 
 def _raw(payload_bytes: int) -> str:
-    """One synthetic message: the MSH line plus an NTE segment padding it to ``payload_bytes``."""
+    """One synthetic message: the MSH line plus an NTE segment padding it to ``payload_bytes``.
+
+    The padding is seeded random bytes in base64. A run of one character compresses to almost
+    nothing in Postgres's TOAST, so the rows would not carry the size asked for; random bytes do
+    not compress. Base64 holds no HL7 separator, so the NTE stays one field. The fixed seed gives
+    the same message on every run and at both commits."""
     pad = max(0, payload_bytes - len(_MSH) - len("NTE|1||\r"))
-    return f"{_MSH}NTE|1||{'X' * pad}\r"
+    # Seeded filler, not a secret; its base64 is longer than pad characters, so it is cut to fit.
+    noise = random.Random(_PAD_SEED).randbytes(pad)  # nosec B311 (synthetic filler, seeded)
+    return f"{_MSH}NTE|1||{base64.b64encode(noise).decode('ascii')[:pad]}\r"
+
+
+def _expected_rows(lanes: int, limit: int, rows_per_lane: int) -> int:
+    """Rows one claim of ``lanes`` x ``limit`` must return when each seeded lane holds
+    ``rows_per_lane`` pending rows: the limit per lane, capped at what a lane holds, and 0 for the
+    empty scenario."""
+    return lanes * min(limit, rows_per_lane)
+
+
+async def _sample(
+    claim: ClaimFn,
+    release: ReleaseFn,
+    *,
+    expected: int,
+    warmup: int,
+    iterations: int,
+    max_discards: int,
+) -> tuple[list[float], dict[str, int]]:
+    """Run ``warmup`` then ``iterations`` full claims; return the timed samples, the warm-up
+    dropped, and the discarded claims by reason.
+
+    Every claim's rows are released before the next claim. A claim that returned other than
+    ``expected`` rows, or reported a lock timeout, fills no slot, warm-up or timed: it is counted
+    and the slot is tried again. At ``max_discards`` discards the scenario stops, so fewer than
+    ``iterations`` samples come back, and the report shows it."""
+    samples: list[float] = []
+    discards: dict[str, int] = defaultdict(int)
+    done = 0
+    while done < warmup + iterations:
+        elapsed_ms, ids, lock_timeout = await claim()
+        if ids:
+            await release(ids)
+        if lock_timeout is not None or len(ids) != expected:
+            if lock_timeout is not None:
+                reason = f"lock_timeout:{lock_timeout}"
+            elif not ids:
+                reason = "empty"
+            else:
+                reason = "short" if len(ids) < expected else "over"
+            discards[reason] += 1
+            if sum(discards.values()) >= max_discards:
+                break
+            continue
+        if done >= warmup:
+            samples.append(elapsed_ms)
+        done += 1
+    return samples, dict(discards)
 
 
 def _parse_scenarios(text: str) -> list[tuple[int, int]]:
@@ -185,6 +255,7 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
         "payload_bytes": len(raw),
         "warmup": args.warmup,
         "iterations": args.iterations,
+        "max_discards": args.max_discards,
         "python": platform.python_version(),
         "scenarios": [],
     }
@@ -195,8 +266,16 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
         )
         report["server"] = str(version).splitlines()[0] if version else "unknown"
         if backend == "postgres":
+            # Autovacuum off on the queue table, so it cannot fire partway through a scenario at a
+            # point that differs per run; the VACUUM below resets the table between scenarios.
             await _execute(
-                store, backend, [f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"]
+                store,
+                backend,
+                [
+                    f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE",
+                    "ALTER TABLE queue SET"
+                    " (autovacuum_enabled = false, toast.autovacuum_enabled = false)",
+                ],
             )
         else:
             await _execute(store, backend, [f"DELETE FROM {table}" for table in _TABLES])
@@ -204,43 +283,62 @@ async def _measure(args: argparse.Namespace) -> dict[str, Any]:
             for _ in range(args.rows_per_lane):
                 await store.enqueue_ingress(channel_id=lane, raw=raw, now=_SEED_NOW)
         for lanes, limit in scenarios:
-            # Refresh statistics before each scenario, so the planner sees the seeded table rather
-            # than the empty one, and so autoanalyze does not fire at a point that differs per run.
+            # Before each scenario, so it starts from the same table whatever ran before it. On
+            # Postgres, VACUUM clears the dead row versions the previous scenario's claims and
+            # releases left, and ANALYZE refreshes the statistics so the planner sees the seeded
+            # table rather than the empty one. SQL Server only refreshes statistics; its automatic
+            # statistics update stays on and may still fire within a scenario.
             await _execute(
                 store,
                 backend,
-                ["ANALYZE queue" if backend == "postgres" else "UPDATE STATISTICS queue"],
+                ["VACUUM ANALYZE queue" if backend == "postgres" else "UPDATE STATISTICS queue"],
             )
             names = seeded[:lanes] if limit else unseeded[:lanes]
             per_lane = max(limit, 1)
-            expected = lanes * min(limit, args.rows_per_lane)
-            samples: list[float] = []
-            for i in range(args.warmup + args.iterations):
+            expected = _expected_rows(lanes, limit, args.rows_per_lane)
+
+            async def claim(
+                names: list[str] = names, per_lane: int = per_lane
+            ) -> tuple[float, list[Any], str | None]:
                 start = time.perf_counter()
                 res = await store.claim_fifo_heads(
                     _STAGE, names, now=_CLAIM_NOW, per_lane_limit=per_lane
                 )
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
                 ids = [item.id for items in res.by_lane.values() for item in items]
-                if ids:
-                    await store.release_claimed(ids, now=_CLAIM_NOW)
-                if len(ids) != expected:
-                    raise SystemExit(
-                        f"{backend} {lanes}x{limit}: claimed {len(ids)} rows, expected {expected};"
-                        " refusing to time the wrong work"
-                    )
-                if i >= args.warmup:
-                    samples.append(elapsed_ms)
-            stats = _stats(samples)
-            report["scenarios"].append(
-                {"lanes": lanes, "per_lane_limit": limit, "rows_claimed": expected, **stats}
+                timeout = getattr(res, "lock_timeout", None)
+                return elapsed_ms, ids, None if timeout is None else str(timeout.phase)
+
+            async def release(ids: list[Any]) -> None:
+                await store.release_claimed(ids, now=_CLAIM_NOW)
+
+            samples, discards = await _sample(
+                claim,
+                release,
+                expected=expected,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                max_discards=args.max_discards,
             )
-            print(
-                f"{backend} {args.label} r{args.round} {lanes}x{limit} rows={expected}"
-                f" p50={stats['p50']:.2f}ms p90={stats['p90']:.2f}ms p99={stats['p99']:.2f}ms"
-                f" mean={stats['mean']:.2f}ms",
-                flush=True,
-            )
+            scenario: dict[str, Any] = {
+                "lanes": lanes,
+                "per_lane_limit": limit,
+                "rows_claimed": expected,
+                "discarded": discards,
+                "n": float(len(samples)),
+            }
+            line = f"{backend} {args.label} r{args.round} {lanes}x{limit} rows={expected}"
+            if samples:
+                stats = _stats(samples)
+                scenario.update(stats)
+                line += (
+                    f" p50={stats['p50']:.2f}ms p90={stats['p90']:.2f}ms"
+                    f" p99={stats['p99']:.2f}ms mean={stats['mean']:.2f}ms"
+                )
+            if len(samples) < args.iterations:
+                line += f" STOPPED SHORT at {len(samples)} of {args.iterations} samples"
+            report["scenarios"].append(scenario)
+            print(f"{line} discarded={_discard_text(discards)}", flush=True)
     finally:
         await store.close()
     return report
@@ -250,8 +348,40 @@ def _median(rows: list[dict[str, Any]], stat: str) -> float:
     return float(statistics.median(float(r[stat]) for r in rows))
 
 
-def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int]:
-    """The before/after table, and how many scenario rows it holds."""
+def _discard_text(discards: dict[str, int]) -> str:
+    """``{"empty": 1, "lock_timeout:head": 2}`` -> ``"3 (empty 1, lock_timeout:head 2)"``."""
+    total = sum(discards.values())
+    if not total:
+        return "0"
+    return f"{total} ({', '.join(f'{k} {v}' for k, v in sorted(discards.items()))})"
+
+
+def _summed_discards(rows: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = defaultdict(int)
+    for r in rows:
+        for reason, count in r.get("discarded", {}).items():
+            out[reason] += int(count)
+    return dict(out)
+
+
+def _refusal(rows: list[dict[str, Any]]) -> str | None:
+    """Why the reports of one scenario, both sides and every round, cannot be compared, or None."""
+    for field in _SAME_WORK:
+        values = sorted({repr(r.get(field)) for r in rows})
+        if len(values) > 1:
+            return f"refused: {field} differs across reports ({', '.join(values)})"
+    short = [
+        f"{r['label']} r{r['round']} n={int(r.get('n', 0))}"
+        for r in rows
+        if int(r.get("n", 0)) != r.get("iterations")
+    ]
+    if short:
+        return f"refused: fewer samples than iterations ({'; '.join(short)})"
+    return None
+
+
+def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int, int]:
+    """The before/after table, how many scenario rows it holds, and how many it refused."""
     grouped: dict[tuple[str, int, int], dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -259,11 +389,12 @@ def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int]:
     for path in paths:
         rep = json.loads(path.read_text(encoding="utf-8"))
         meta[rep["backend"]].add(f"{rep['label']}={rep['commit']} on {rep.get('server', '?')}")
+        run = {k: rep.get(k) for k in ("label", "payload_bytes", "rows_per_lane", "iterations")}
         for sc in rep["scenarios"]:
             key = (rep["backend"], sc["lanes"], sc["per_lane_limit"])
-            grouped[key][rep["label"]].append({**sc, "round": rep.get("round", 0)})
+            grouped[key][rep["label"]].append({**sc, **run, "round": rep.get("round", 0)})
     lines: list[str] = []
-    emitted = 0
+    emitted = refused = 0
     for backend in sorted(meta):
         lines.append(f"### {backend}")
         lines.extend(f"- {m}" for m in sorted(meta[backend]))
@@ -271,14 +402,22 @@ def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int]:
         lines.append(
             "| lanes x limit | rows | before p50 ms (r1, r2, ...) | after p50 ms (r1, r2, ...) |"
             " p50 after/before | before p90 | after p90 | p90 after/before | before p99 |"
-            " after p99 |"
+            " after p99 | before discarded | after discarded |"
         )
-        lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|")
         for key in sorted(k for k in grouped if k[0] == backend):
             b = sorted(grouped[key].get(before, []), key=lambda r: r["round"])
             a = sorted(grouped[key].get(after, []), key=lambda r: r["round"])
             if not b or not a:
                 lines.append(f"| {key[1]}x{key[2]} | missing: {'before' if not b else 'after'} |")
+                continue
+            discarded = (
+                f" {_discard_text(_summed_discards(b))} | {_discard_text(_summed_discards(a))} |"
+            )
+            why = _refusal(b + a)
+            if why is not None:
+                lines.append(f"| {key[1]}x{key[2]} | {why} |{discarded}")
+                refused += 1
                 continue
             b50, a50, b90, a90 = (
                 _median(b, "p50"),
@@ -292,11 +431,11 @@ def _compare(paths: list[Path], before: str, after: str) -> tuple[str, int]:
                 f" {a50:.2f} ({', '.join(f'{r["p50"]:.2f}' for r in a)}) |"
                 f" {a50 / b50 if b50 else float('nan'):.3f} | {b90:.2f} | {a90:.2f} |"
                 f" {a90 / b90 if b90 else float('nan'):.3f} |"
-                f" {_median(b, 'p99'):.2f} | {_median(a, 'p99'):.2f} |"
+                f" {_median(b, 'p99'):.2f} | {_median(a, 'p99'):.2f} |{discarded}"
             )
             emitted += 1
         lines.append("")
-    return "\n".join(lines), emitted
+    return "\n".join(lines), emitted, refused
 
 
 def _positive(text: str) -> int:
@@ -320,6 +459,12 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--payload-bytes", type=_positive, default=2048)
     m.add_argument("--warmup", type=int, default=10)
     m.add_argument("--iterations", type=_positive, default=100)
+    m.add_argument(
+        "--max-discards",
+        type=_positive,
+        default=50,
+        help="per scenario: wrong-count or lock-timeout claims allowed before the scenario stops",
+    )
     m.add_argument("--out", required=True, type=Path)
     c = sub.add_parser("compare", help="print the before/after table from measure's reports")
     c.add_argument("reports", nargs="+", type=Path)
@@ -331,8 +476,11 @@ def main(argv: list[str] | None = None) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         return 0
-    table, emitted = _compare(args.reports, args.before, args.after)
+    table, emitted, refused = _compare(args.reports, args.before, args.after)
     print(table)
+    if refused:
+        print(f"refused {refused} scenario(s) whose sides differ or fell short", file=sys.stderr)
+        return 1
     if not emitted:
         print("no scenario has both a before and an after report", file=sys.stderr)
         return 1
