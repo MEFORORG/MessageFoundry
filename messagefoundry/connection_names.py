@@ -76,3 +76,15 @@ def fhir_lookup_record_name(name: str) -> str:
     """How a record or report names a ``FhirLookup`` connection: ``fhir_lookup:<name>``. Why it is
     prefixed is on :func:`inbound_record_name`."""
     return f"fhir_lookup:{name}"
+
+
+def db_lookup_record_name(name: str) -> str:
+    """How a record or report names a ``DatabaseLookup`` connection: ``db_lookup:<name>``. Why it is
+    prefixed is on :func:`inbound_record_name`."""
+    return f"db_lookup:{name}"
+
+
+def reference_record_name(name: str) -> str:
+    """How a record or report names a reference set: ``reference:<name>``. Why it is prefixed is on
+    :func:`inbound_record_name`."""
+    return f"reference:{name}"

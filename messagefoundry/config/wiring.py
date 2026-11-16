@@ -113,9 +113,11 @@ from messagefoundry.config.snapshot import (
 )
 from messagefoundry.connection_names import (
     CONNECTION_NAME_PATTERN,
+    db_lookup_record_name,
     fhir_lookup_record_name,
     inbound_record_name,
     is_connection_name,
+    reference_record_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import QUALIFIED_CERT_NAME, unmatchable_san_reason
@@ -6359,6 +6361,10 @@ class Registry:
     # (the SQL kind): the RegistryRunner builds one read executor from these; fhir_lookup(name, query)
     # reads it at handler run time. Carried with the graph so a reload re-arms the executor atomically.
     fhir_lookups: dict[str, FhirLookupSpec] = field(default_factory=dict)
+    #: ``_add``'s case-folded name index, per kind: folded name -> the name as declared.
+    _folded_names: dict[str, dict[str, str]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     # Engine-shard identity (ADR 0073), attached by pipeline.sharding.filter_registry_for_shard and
     # None on an unfiltered graph OR a single-shard config (which stays byte-identical to plain
     # `serve`). shard_id names THIS process's shard; all_shard_ids pins the full shard universe of
@@ -6485,10 +6491,23 @@ class Registry:
             )
         self._add(self.fhir_lookups, spec.name, spec, "fhir lookup")
 
-    @staticmethod
-    def _add(table: dict[str, Any], name: str, value: Any, kind: str) -> None:
+    def _add(self, table: dict[str, Any], name: str, value: Any, kind: str) -> None:
         if name in table:
             raise WiringError(f"duplicate {kind} name: {name!r}")
+        # BACKLOG #5392. A SQL Server store with a case-insensitive default collation compares
+        # queue, response and scope rows by name without case, so ``IB_A`` and ``ib_a`` would
+        # share them there while every other backend keeps them apart. Refuse the pair at load on
+        # every backend, so one graph means the same thing on each. Per table, as the exact check
+        # is: an inbound and an outbound may still share one name. The folded index is a cache;
+        # a hit is believed only while that name is still in the table.
+        folded = self._folded_names.setdefault(kind, {})
+        clash = folded.get(name.casefold())
+        if clash is not None and clash in table:
+            raise WiringError(
+                f"duplicate {kind} name: {name!r} differs only in case from {clash!r}, and a "
+                "case-insensitive store collation would treat the two as one"
+            )
+        folded[name.casefold()] = name
         table[name] = value
 
     def validate(self, *, allow_empty: bool = False) -> None:
@@ -7023,8 +7042,11 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
         ),
-        *((f"db_lookup:{s.name}", s.settings, False) for s in registry.lookups.values()),
-        *((f"reference:{r.name}", r.source.settings, False) for r in registry.references.values()),
+        *((db_lookup_record_name(s.name), s.settings, False) for s in registry.lookups.values()),
+        *(
+            (reference_record_name(r.name), r.source.settings, False)
+            for r in registry.references.values()
+        ),
     ]
     out += [
         AttestedHop(
@@ -7964,13 +7986,17 @@ def static_credential_db_hops(
     for spec in registry.lookups.values():
         reason = kind(spec.settings)
         if reason is not None:
-            out.append((f"db_lookup:{spec.name}", f"{reason} ({_peer_label(spec.settings)})"))
+            out.append(
+                (db_lookup_record_name(spec.name), f"{reason} ({_peer_label(spec.settings)})")
+            )
     for ref in registry.references.values():
         if ref.source.kind != "database":
             continue
         reason = kind(ref.source.settings)
         if reason is not None:
-            out.append((f"reference:{ref.name}", f"{reason} ({_peer_label(ref.source.settings)})"))
+            out.append(
+                (reference_record_name(ref.name), f"{reason} ({_peer_label(ref.source.settings)})")
+            )
     return sorted(out)
 
 

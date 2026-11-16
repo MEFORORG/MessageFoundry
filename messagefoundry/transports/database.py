@@ -102,7 +102,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.config.wiring import _is_text_codec
-from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.connection_names import db_lookup_record_name, inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
@@ -5229,7 +5229,7 @@ class DatabaseLookupExecutor:
                 read_only=True,
                 attested=attested,
                 # Named as the loosening reports name a lookup, so a refusal matches its row.
-                connection=f"db_lookup:{cname}",
+                connection=db_lookup_record_name(cname),
             )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
@@ -5270,7 +5270,7 @@ class DatabaseLookupExecutor:
             # and the next lookup opens and probes it again.
             self._role_readings[connection] = await probe_login_roles(
                 pool,
-                label=f"db_lookup:{connection}",
+                label=db_lookup_record_name(connection),
                 acquire_timeout=self._acquire_timeout[connection],
             )
         # The local, not a re-read: an aclose() that ran during the probe has removed the entry.

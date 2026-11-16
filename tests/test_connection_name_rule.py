@@ -247,3 +247,48 @@ def test_a_corepoint_xml_package_with_a_long_name_still_loads(tmp_path: Path) ->
     assert channels
     for ch in channels:
         assert connection_names.is_connection_name(ch.module_name)
+
+
+def _two_inbounds(tmp_path: Path, first: str, second: str, outbound_name: str = "OB") -> Path:
+    body = LOGIC_PY + textwrap.dedent(
+        f"""
+        from messagefoundry import File, MLLP, inbound, outbound
+        inbound({first!r}, MLLP(port=2600), router="r")
+        inbound({second!r}, MLLP(port=2601), router="r")
+        outbound({outbound_name!r}, File(directory="./out"))
+        """
+    )
+    (tmp_path / "logic.py").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def test_names_differing_only_in_case_are_refused_at_load(tmp_path: Path) -> None:
+    # BACKLOG #5392: a case-insensitive SQL Server collation would give the two one set of rows.
+    with pytest.raises(WiringError, match="differs only in case") as info:
+        load_config(_two_inbounds(tmp_path, "IB_ACME_ADT", "ib_acme_adt"))
+    assert "'ib_acme_adt'" in str(info.value)
+    assert "'IB_ACME_ADT'" in str(info.value)
+
+
+def test_distinct_names_and_a_case_twin_in_another_table_still_load(tmp_path: Path) -> None:
+    # The control: two names that differ by more than case load, and the check is per table, as the
+    # exact-duplicate check is, so an outbound may share an inbound's name up to case.
+    registry = load_config(_two_inbounds(tmp_path, "IB_ACME_ADT", "IB_ACME_ORU", "ib_acme_adt"))
+    assert set(registry.inbound) == {"IB_ACME_ADT", "IB_ACME_ORU"}
+    assert set(registry.outbound) == {"ib_acme_adt"}
+
+
+def test_every_record_namespace_has_one_helper() -> None:
+    assert connection_names.db_lookup_record_name("L") == "db_lookup:L"
+    assert connection_names.reference_record_name("R") == "reference:R"
+    # No engine module hand-spells a namespace prefix the helpers own (BACKLOG #5392).
+    root = Path(connection_names.__file__).parent
+    prefixes = ('f"db_lookup:{', 'f"reference:{', 'f"inbound:{', 'f"fhir_lookup:{')
+    spelled = [
+        f"{path.relative_to(root)}: {prefix}"
+        for path in root.rglob("*.py")
+        if path.name != "connection_names.py"
+        for prefix in prefixes
+        if prefix in path.read_text(encoding="utf-8")
+    ]
+    assert spelled == []
