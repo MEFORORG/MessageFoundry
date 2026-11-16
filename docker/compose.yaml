@@ -43,8 +43,8 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_API_PORT: "8443"
   MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"
   MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
-  # Off loopback serve also refuses this certificate bind until you attest revocation with
-  # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+  # The API revocation attestation, required with no default, as the default `engine` below says.
+  MEFOR_TLS_REVOCATION_ATTESTED: "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds, in the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it}"
   MEFOR_INBOUND_BIND_HOST: "0.0.0.0"
   MEFOR_SECURITY_REQUIRE_MFA: "true"
   MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
@@ -89,8 +89,15 @@ services:
       MEFOR_API_PORT: "8443"
       MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
-      # Off loopback serve also refuses this certificate bind until you attest revocation with
-      # MEFOR_TLS_REVOCATION_ATTESTED: "1" (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+      # Off loopback, serve refuses this in-process certificate bind until you attest revocation
+      # (docs/SECURITY.md, API revocation gate), and nothing but a loopback bind clears that gate
+      # otherwise; a container cannot bind loopback and still be reached on a published port. So
+      # this variable is REQUIRED, with NO DEFAULT: unset, `docker compose` refuses to start rather
+      # than letting the engine exit 2 and restart forever. The attestation is yours, so this file
+      # never writes the value. Outbound hops read the same variable with a different effect
+      # (docs/DEPLOYMENT.md, "Revocation-guard behavior"). Like the Postgres password below, this
+      # is COMPOSE SUBSTITUTION.
+      MEFOR_TLS_REVOCATION_ATTESTED: "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds, in the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it}"
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
       # --- production guardrails ---
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce
