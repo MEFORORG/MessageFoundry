@@ -1283,7 +1283,7 @@ class AlertRuleSet:
 class _ClearedState:
     """The in-memory alert state one clear dropped for a key, held until its durable resolve
     settles (:meth:`NotifierAlertSink._resolve_settled`): a ``connection_started``'s (BACKLOG
-    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` is always None."""
+    #1741), or any other auto-resolving inverse's (BACKLOG #4916, #5766)."""
 
     last: float | None
     occurrences: int | None
@@ -2089,14 +2089,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             cleared.suspended = None
 
     def forget(self, event_type: str, connection: str) -> None:
-        """Drop ALL in-memory advisory state for ``(event_type, connection)`` — the suspend window AND the
-        #81 escalation occurrence counter. Called by the API on an operator **resolve** (the condition is
-        closed), so a later re-open of the same key starts un-suspended at the base escalation tier,
-        matching the fresh durable instance the store opens."""
-        self._suspended.pop(f"{event_type}:{connection}", None)
-        self._occurrences.pop(f"{event_type}:{connection}", None)
-        for cleared in self._pending_clears.get(f"{event_type}:{connection}", ()):
-            cleared.suspended = cleared.occurrences = None
+        """Drop ALL in-memory advisory state for ``(event_type, connection)`` — the suspend window, the
+        #81 escalation occurrence counter and the re-alert cooldown (BACKLOG #5766). Called by the API
+        on an operator **resolve** (the condition is closed), so a later re-open of the same key starts
+        un-suspended at the base escalation tier and pages at once, matching the fresh durable instance
+        the store opens."""
+        key = f"{event_type}:{connection}"
+        self._last_sent.pop(key, None)
+        self._suspended.pop(key, None)
+        self._occurrences.pop(key, None)
+        for cleared in self._pending_clears.get(key, ()):
+            cleared.last = cleared.suspended = cleared.occurrences = None
 
     async def prime_suspensions(self) -> None:
         """Seed the in-memory suspend cache from durable ``alert_instance.suspended_until`` at startup, so
@@ -2333,18 +2336,21 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if inverse_of is not None:
             # #143/#81: a resolved condition has nothing left to mute OR escalate — drop the windowed-
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
-            # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
+            # re-open of the SAME key starts un-suspended, uncooled and at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
             # BACKLOG #4916: the drop is provisional, as connection_started's is (BACKLOG #1741). A
             # fenced resolve can leave the row open on purpose, so what it dropped goes back if it
             # does not land (_resolve_settled). connection_started passes its own on_settled and
-            # has already taken both entries, so nothing is queued for it here.
+            # has already taken all three entries, so nothing is queued for it here.
+            # BACKLOG #5766: the re-alert cooldown goes too, so a recurrence inside it pages and
+            # dispatches its control action as the new incident it is.
+            last = self._last_sent.pop(key, None)
             suspended = self._suspended.pop(key, None)
             occurrences = self._occurrences.pop(key, None)
             # Queued even when it dropped nothing: a later clear's entry is what takes an earlier
             # failed one's state over in _resolve_settled, rather than that state going back.
             if on_settled is None:
-                cleared = _ClearedState(None, occurrences, suspended)
+                cleared = _ClearedState(last, occurrences, suspended)
                 self._pending_clears.setdefault(key, []).append(cleared)
 
                 def settle_cleared(landed: bool) -> None:
