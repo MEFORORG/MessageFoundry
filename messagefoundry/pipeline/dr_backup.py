@@ -2902,16 +2902,14 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
 
 
 def _withhold_from_sweep(staging: Path) -> None:
-    """Remove the marker a sweep needs to prove ``staging`` abandoned, so no sweep ever tears it
-    down: for a spare whose marker could not be written, which no later teardown could read. The
-    lock file stays, so a config walk still prunes the directory (:func:`_is_staging_dir`). A
-    restore calls this twice while it still holds the lock, so no sweep acts in between: where a
-    relabel fails (:func:`_record_spare`), and in :meth:`_Staging.release`. Two callers run after
-    the lock dropped, so a sweep that took the directory in that window can re-mark it: the
-    teardown, for a spare the release could not read, and the relabel to ``rolled-back`` a late
-    rollback makes (:func:`_finish_rollback`). Never raises; a marker that could not be removed
-    is logged at ERROR, the one record of the outcome, since what a sweep then does is a race
-    nothing here words."""
+    """Try to remove the ``.lock-held`` marker a sweep needs before it takes ``staging``: for a
+    spare whose marker could not be written, which no later teardown could read. The lock file
+    stays, so a config walk still prunes the directory (:func:`_is_staging_dir`). A restore calls
+    this twice while it still holds the lock: where a relabel fails (:func:`_record_spare`), and
+    in :meth:`_Staging.release`. Two callers run after the lock dropped, when a sweep can already
+    hold the directory: the teardown, for a spare the release could not read, and the relabel to
+    ``rolled-back`` a late rollback makes (:func:`_finish_rollback`). Never raises; a marker that
+    could not be removed is logged at ERROR, and the directory then stays sweepable."""
     try:
         os.unlink(staging / _HELD_MARKER_NAME)
     except FileNotFoundError:
@@ -3134,8 +3132,8 @@ class _Staging:
         teardown must neither unlink nor truncate to why, beside those a spare marker there
         records (:func:`_spared_items`).
 
-        Where a spare in ``spared`` is unrecorded (:func:`_spare_records`), the directory is
-        withheld from every sweep again here, BEFORE the lock drops. What this read found is
+        Where a spare in ``spared`` is unrecorded (:func:`_spare_records`), removing the
+        directory's ``.lock-held`` is tried again here, BEFORE the lock drops. What this read found is
         handed to the teardown, which neither reads those spares again nor re-marks the directory
         (BACKLOG #5617). The unlock and the teardown run whatever this does."""
         with self._mutex:
@@ -3178,7 +3176,7 @@ class _SpareRecords:
 
 def _spare_records(path: Path, spared: Mapping[str, str]) -> _SpareRecords:
     """Read which spares in ``spared``, still in ``path``, their markers record
-    (:func:`_spare_recorded`), and where one is known not to, withhold ``path`` from every sweep.
+    (:func:`_spare_recorded`), and where one is known not to, try :func:`_withhold_from_sweep`.
     The marker's reason, not its existence, since a relabel that failed leaves an older reason,
     which a later sweep would read in place of this run's."""
     unrecorded: list[str] = []
@@ -5485,8 +5483,9 @@ def _restore_blocking(
             else:
                 # The rollback could not remove the placed store, so the staged name stays a name
                 # for it, and once the operator deletes that store it is the only decrypted copy.
-                # Recorded and reported, never emptied or removed by a sweep; the refusal below
-                # names it through the teardown's leftover.
+                # Relabelled where the write lands, and reported; a sweep spares it only while its
+                # marker reads anything but `released`. The refusal below names it through the
+                # teardown's leftover.
                 spared_reason = _SPARE_ROLLBACK_FAILED
                 _record_spare(spared_item, spared_reason)
                 log.error(
@@ -5852,7 +5851,8 @@ def _finish_rollback(
         )
         return left
     # A marker that kept its older reason would mislabel the copy as a name for a store that is
-    # gone, so its directory is withheld instead (`_record_spare`).
+    # gone, so where the relabel fails, removing the directory's `.lock-held` is tried instead
+    # (`_record_spare`).
     relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
     log.error(
         "the failed restore's rollback removed the placed store at %s only after its staging "
