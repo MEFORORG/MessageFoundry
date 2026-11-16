@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import contextvars
 import errno
@@ -35,7 +36,6 @@ import functools
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -55,7 +55,7 @@ from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.redaction import codec_safe_str
+from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
@@ -415,8 +415,10 @@ class UploadUnreadableError(UploadError, CipherError):
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
     :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither. A damaged
-    file, one not UTF-8 or a sidecar that is not this upload's metadata, raises it too, with
-    :data:`_DAMAGED` (BACKLOG #5388)."""
+    file raises it too, with :data:`_DAMAGED` (BACKLOG #5388): at least a file that is not UTF-8,
+    a body that is not strict base64, and a sidecar that is not this upload's metadata. On a store
+    that refuses plaintext, :meth:`UploadStore.delete` may instead remove a sidecar that is not
+    UTF-8, when it is the never-sealable kind the scan classes too."""
 
 
 class UploadUnavailableError(UploadError, CipherError):
@@ -435,20 +437,13 @@ _REFUSED_NOT_UNSEALABLE = "the uploaded file's metadata is refused under the con
 _DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it was not read"
 
 
-def _defect(exc: Exception) -> str:
-    """What a damaged sidecar or body log line says of ``exc``: never a value from the file. A
-    :class:`_MalformedSidecarError` names only the defect and a decode error renders without its
-    bytes; any other error, which could echo a value, is named by type only."""
-    if isinstance(exc, (_MalformedSidecarError, UnicodeError)):
-        return codec_safe_str(exc)
-    return type(exc).__name__
-
-
-def _log_damaged(file_id: str, part: str, exc: ValueError) -> str:
+def _log_damaged(file_id: str, part: str, defect: str) -> str:
     """Log a damaged ``part`` of upload ``file_id`` and return the refusal text a by-id read
     raises :class:`UploadUnreadableError` with (BACKLOG #5388), so one damaged file answers a
-    handled error rather than a server error."""
-    _log.warning("uploaded-file %s %s: damaged, refused: %s", part, file_id, _defect(exc))
+    handled error rather than a server error. ``defect`` is already rendered content-free, and the
+    caller raises after its handler ends, so the decode error, which holds the whole file, is not
+    left on the refusal's ``__context__``."""
+    _log.warning("uploaded-file %s %s: damaged, refused: %s", part, file_id, defect)
     return _DAMAGED.format(part=part)
 
 
@@ -584,10 +579,10 @@ def sanitize_filename(name: str | None) -> str:
         return "upload"
     # Strip directory parts on either separator (the value may come from a Windows or POSIX client).
     base = name.replace("\\", "/").rsplit("/", 1)[-1]
-    base = strip_control_chars(base).strip()
-    if not base:
-        return "upload"
-    return base[:_MAX_FILENAME]
+    # Cut, then strip again, so a cut that ends on a space leaves none and a second pass, as every
+    # sidecar read makes (BACKLOG #5387), returns the same name.
+    base = strip_control_chars(base).strip()[:_MAX_FILENAME].rstrip()
+    return base or "upload"
 
 
 class _MalformedSidecarError(ValueError):
@@ -602,11 +597,20 @@ def _sidecar_text(d: dict[str, Any], key: str, default: str) -> str:
     return value
 
 
+#: The largest count a sidecar may carry, far past any upload the engine accepts. Larger is a plant:
+#: a 4000-digit ``size`` would bill an uploader out of quota and land in the audit detail.
+_MAX_SIDECAR_COUNT = 2**53
+
+
 def _sidecar_count(d: dict[str, Any], key: str) -> int:
     value = d.get(key, 0)
     # bool is an int subclass, and no field here is ever written as one.
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise _MalformedSidecarError(f"field {key!r} is not a non-negative integer")
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= _MAX_SIDECAR_COUNT
+    ):
+        raise _MalformedSidecarError(f"field {key!r} is not a count in range")
     return value
 
 
@@ -616,28 +620,34 @@ def _meta_from_json(raw: str, file_id: str) -> UploadedFileMeta:
     On a store that passes unmarked sidecars (keyless, ``vault_transit``, or
     ``allow_unmarked_ciphertext``) the JSON is not bound to its path, so a planted one could name
     another upload's ``file_id`` for the prune to delete, or carry a negative ``size`` that lifts a
-    quota. So the ``file_id`` must be the path's own id, each count a non-negative integer, the
-    timestamp a finite non-negative number and every text field a string, and the filename is
-    sanitized as :meth:`UploadStore.save` sanitizes it. Anything else, including JSON that does not
-    parse or nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388)."""
-    try:
-        d = json.loads(raw)
-    except (ValueError, RecursionError):
-        # ValueError covers JSONDecodeError and an integer past the digit limit.
-        raise _MalformedSidecarError("not valid JSON") from None
+    quota. So the ``file_id`` must be the path's own id, each count an integer from 0 to
+    :data:`_MAX_SIDECAR_COUNT`, the timestamp a number from 0 to a day past now, and every text field
+    a string, and the filename is sanitized as :meth:`UploadStore.save` sanitizes it. A timestamp
+    further ahead is refused as :meth:`_UnsealableUpload.expired` treats an mtime: it would never age
+    out and would bill its uploader for good. Anything else, including JSON that does not parse or
+    nests past the parser's depth, raises :class:`_MalformedSidecarError` (BACKLOG #5388).
+
+    A refused sidecar is left out of the listing, the quota and the prune, so it stays on disk
+    until an operator removes it."""
+    # Returns rather than raises, so the decode error, which holds the whole sidecar, is not left
+    # on the refusal's __context__.
+    d, hint = json_loads_or_refusal(raw)
+    if hint is not None:
+        raise _MalformedSidecarError("not valid JSON")
     if not isinstance(d, dict):
         raise _MalformedSidecarError("not a JSON object")
     if d.get("file_id") != file_id:
         raise _MalformedSidecarError("its file_id is not its own upload id")
     uploaded_at = d.get("uploaded_at", 0.0)
-    if not isinstance(uploaded_at, (int, float)) or isinstance(uploaded_at, bool):
-        raise _MalformedSidecarError("field 'uploaded_at' is not a number")
-    try:
-        stamp = float(uploaded_at)
-    except OverflowError:
-        raise _MalformedSidecarError("field 'uploaded_at' is out of range") from None
-    if not math.isfinite(stamp) or stamp < 0:
-        raise _MalformedSidecarError("field 'uploaded_at' is not a finite non-negative number")
+    # An int compares with a float exactly, so a huge one is refused here rather than overflowing,
+    # and NaN fails both bounds.
+    if (
+        not isinstance(uploaded_at, (int, float))
+        or isinstance(uploaded_at, bool)
+        or not 0 <= uploaded_at <= time.time() + _SECONDS_PER_DAY
+    ):
+        raise _MalformedSidecarError("field 'uploaded_at' is not a time in range")
+    stamp = float(uploaded_at)
     return UploadedFileMeta(
         file_id=file_id,
         filename=sanitize_filename(_sidecar_text(d, "filename", "upload")),
@@ -1089,7 +1099,9 @@ class UploadStore:
             aad=cell_aad("uploaded_file", "body", file_id),
             allow_unmarked=self._passes_unmarked,
         )
-        return base64.b64decode(b64)
+        # Strict, as the writer emits it, so a damaged body is refused rather than served with
+        # its stray characters dropped.
+        return base64.b64decode(b64, validate=True)
 
     def _encrypt_meta(self, meta: UploadedFileMeta) -> str:
         return self._cipher.encrypt(
@@ -1233,7 +1245,14 @@ class UploadStore:
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but not metadata this store wrote, or not this upload's (BACKLOG
                 # #5387). Left out of the listing, the quota and the prune. Never a value logged.
-                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, _defect(exc))
+                # A _MalformedSidecarError names only the defect; any other error, which could
+                # echo a value, only its type.
+                defect = (
+                    codec_safe_str(exc)
+                    if isinstance(exc, _MalformedSidecarError)
+                    else type(exc).__name__
+                )
+                _log.warning("uploaded-file sidecar %s: malformed metadata: %s", fid, defect)
             if classify and sink is not None:
                 lost = self._unsealable_sync(fid, entry)
                 if lost is not None:
@@ -2243,7 +2262,9 @@ class UploadStore:
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
             except (UnicodeDecodeError, _MalformedSidecarError) as exc:
-                raise UploadUnreadableError(_log_damaged(file_id, "sidecar", exc)) from None
+                defect = codec_safe_str(exc)
+            # Raised after the handler, so the error holding the file is on no chain.
+            raise UploadUnreadableError(_log_damaged(file_id, "sidecar", defect))
 
         return await asyncio.to_thread(_read)
 
@@ -2262,9 +2283,10 @@ class UploadStore:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
-            except ValueError as exc:
-                # Not UTF-8, or not the base64 the body is stored as (binascii.Error).
-                raise UploadUnreadableError(_log_damaged(file_id, "body", exc)) from None
+            except (UnicodeDecodeError, binascii.Error) as exc:
+                # Not UTF-8, or not the strict base64 the body is stored as.
+                defect = codec_safe_str(exc)
+            raise UploadUnreadableError(_log_damaged(file_id, "body", defect))
 
         return await asyncio.to_thread(_read)
 
@@ -2292,6 +2314,7 @@ class UploadStore:
             blob_path, meta_path = self._paths(file_id)
             meta: UploadedFileMeta | None = None
             refusal = _REFUSED_NOT_UNSEALABLE
+            defect: str | None = None
             if sidecar_refused:
                 # The store checks the caller's claim: only a cipher that refuses plaintext can
                 # hold the never-sealable kind.
@@ -2308,11 +2331,15 @@ class UploadStore:
                 except CipherError as exc:
                     refusal = str(exc)
                 except (UnicodeDecodeError, _MalformedSidecarError) as exc:
-                    # Damaged, never trusted, and classed only where the scan classes it too: a
-                    # cipher that refuses plaintext, where it may be the never-sealable kind.
-                    refusal = _log_damaged(file_id, "sidecar", exc)
-                    if not self._refuses_plaintext:
-                        raise UploadUnreadableError(refusal) from None
+                    defect = codec_safe_str(exc)
+                    classed = isinstance(exc, UnicodeDecodeError)
+            if defect is not None:
+                # Damaged, never trusted, and raised after the handler, so the error holding the
+                # file is on no chain. Classed only where the scan classes it too: a sidecar that is
+                # not UTF-8, on a cipher that refuses plaintext, may be the never-sealable kind.
+                refusal = _log_damaged(file_id, "sidecar", defect)
+                if not (classed and self._refuses_plaintext):
+                    raise UploadUnreadableError(refusal)
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
@@ -2861,7 +2888,7 @@ class UploadStore:
         ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
         # A sidecar whose id fails the path guard, or whose pair holds a link, is left alone (never
         # blindly unlinked) and named, so an operator can remove it (BACKLOG #5552). The id is cut
-        # short: an unsealed sidecar's JSON chooses it.
+        # short: the scan's ids are the path's own (BACKLOG #5387), but a caller may pass any.
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:

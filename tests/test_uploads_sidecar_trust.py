@@ -13,7 +13,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.uploads import UploadedFileMeta, UploadStore, UploadUnreadableError
+from messagefoundry.uploads import (
+    UploadedFileMeta,
+    UploadStore,
+    UploadUnreadableError,
+    sanitize_filename,
+)
 
 _BODY = b"synthetic diagnostic line\n"
 
@@ -66,6 +71,8 @@ async def test_a_sidecar_naming_another_upload_cannot_steer_the_prune(tmp_path: 
         {"uploaded_at": float("inf")},
         {"uploaded_at": -1.0},
         {"uploaded_at": 10**400},
+        {"uploaded_at": time.time() + 10 * 86_400},
+        {"size": 10**4000},
         {"uploaded_at": "now"},
         {"uploader_id": ["u-op"]},
         {"filename": {"x": 1}},
@@ -88,6 +95,13 @@ async def test_a_planted_filename_is_sanitized(tmp_path: Path) -> None:
     meta = await _saved(store)
     _plant(store, meta.file_id, filename="..\\..\\evil\x07.txt")
     assert (await store.get_meta(meta.file_id)).filename == "evil.txt"
+
+
+def test_sanitizing_a_name_cut_on_a_space_is_a_fixed_point() -> None:
+    # Each sidecar read sanitizes the stored name again, so a second pass must change nothing.
+    once = sanitize_filename("a" * 254 + " " + "b" * 10 + ".txt")
+    assert not once.endswith(" ")
+    assert sanitize_filename(once) == once
 
 
 async def test_a_well_formed_sidecar_still_reads(tmp_path: Path) -> None:
@@ -140,7 +154,9 @@ async def test_a_damaged_sidecar_on_a_keyed_store_is_refused_on_delete(tmp_path:
 
 
 @pytest.mark.parametrize(
-    "raw", [b"\xff\xfe not utf-8", b"not base64!"], ids=["not-utf8", "not-b64"]
+    "raw",
+    [b"\xff\xfe not utf-8", b"not base64!", b"%%%%", b"abcd!"],
+    ids=["not-utf8", "bad-padding", "no-alphabet", "stray-char"],
 )
 async def test_a_damaged_body_is_refused_on_read_bytes(tmp_path: Path, raw: bytes) -> None:
     store = _keyless(tmp_path)
@@ -148,3 +164,24 @@ async def test_a_damaged_body_is_refused_on_read_bytes(tmp_path: Path, raw: byte
     (store._root / f"{meta.file_id}.blob").write_bytes(raw)  # noqa: SLF001
     with pytest.raises(UploadUnreadableError):
         await store.read_bytes(meta.file_id)
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    cur: BaseException | None = exc
+    while cur is not None and cur not in seen:
+        seen.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return seen
+
+
+async def test_a_refusal_carries_no_file_content_on_its_chain(tmp_path: Path) -> None:
+    # The decode error holds the whole file (.doc, .object); it must not ride the refusal's chain.
+    store = _keyless(tmp_path)
+    meta = await _saved(store)
+    _sidecar(store, meta.file_id).write_bytes(b'{"filename": "SYNTH-SECRET", oops')
+    (store._root / f"{meta.file_id}.blob").write_bytes(b"SYNTH-BODY \xff")  # noqa: SLF001
+    for read in (store.get_meta, store.read_bytes, store.delete):
+        with pytest.raises(UploadUnreadableError) as info:
+            await read(meta.file_id)
+        assert [type(e) for e in _chain(info.value)] == [UploadUnreadableError]

@@ -451,7 +451,7 @@ async def test_the_scan_never_logs_a_decrypted_body(
         assert await store.list_files() == []
     joined = " ".join(caplog.messages)
     assert "MRN123" not in joined, joined
-    assert "malformed metadata: field 'size' is not a non-negative integer" in joined
+    assert "malformed metadata: field 'size' is not a count in range" in joined
 
 
 # --- the converted trigger: the refusal, and what the reseal still does --------------------------
