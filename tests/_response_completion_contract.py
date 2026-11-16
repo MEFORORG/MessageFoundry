@@ -5,9 +5,8 @@
 ``complete_with_response`` writes the reply artifact and, for a loopback, a ``Stage.RESPONSE``
 re-ingress work-row. Two defects are pinned here on every backend:
 
-* a completion of a row already resolved (``DONE``, ``dead`` or ``cancelled``) wrote a second
-  artifact and a second re-ingress child. A row re-pended mid-send still completes, since its reply
-  is real;
+* a second completion of a ``DONE`` row wrote a second artifact and a second re-ingress child. A
+  row re-pended mid-send still completes, since its reply is real;
 * two rows of one message to one destination (two handlers) read ``MAX(response_seq)`` unlocked on
   the server backends, so a concurrent pair collided on the ``response`` primary key and rolled back
   a delivery the partner had already accepted.
@@ -77,23 +76,6 @@ async def assert_a_second_completion_writes_nothing(
     assert await _status(fetch, items[0].id) == OutboxStatus.DONE.value
 
 
-async def assert_a_dead_lettered_row_does_not_complete(
-    store: Any, fetch: RawFetch, _raw: RawSql
-) -> None:
-    mid = await store.enqueue_message(
-        channel_id="IB_SRC", raw=RAW, deliveries=[(DEST, RAW)], now=1.0
-    )
-    row_id = await _row_id(fetch, mid, Stage.OUTBOUND.value)
-    assert [i.id for i in await store.claim_ready(destination_name=DEST, now=1.0)] == [row_id]
-    await store.dead_letter_now(row_id, "operator dead-lettered it mid-send", now=1.5)
-    await store.complete_with_response(
-        row_id, body=REPLY, outcome="accepted", reingress_to=LOOP, now=2.0
-    )
-    assert await _seqs(fetch, mid) == []
-    assert await _reingress_rows(fetch, mid) == 0
-    assert await _status(fetch, row_id) == OutboxStatus.DEAD.value
-
-
 async def assert_a_row_re_pended_mid_send_still_captures(
     store: Any, fetch: RawFetch, _raw: RawSql
 ) -> None:
@@ -145,7 +127,6 @@ async def assert_concurrent_completions_to_one_destination_both_capture(
 
 CASES = (
     assert_a_second_completion_writes_nothing,
-    assert_a_dead_lettered_row_does_not_complete,
     assert_a_row_re_pended_mid_send_still_captures,
     assert_concurrent_completions_to_one_destination_both_capture,
 )

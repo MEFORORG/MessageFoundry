@@ -13482,8 +13482,8 @@ class MessageStore:
         ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
         # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
         # then discards. The SELECT opens no write transaction (SQLite reads don't).
-        async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+        async with self._read() as conn:
+            cur = await conn.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
             if await cur.fetchone() is not None:
                 return ref
         # BACKLOG #5753: reserve the whole burst in the persisted bound (ASVS 11.3.4) before the first
@@ -15273,15 +15273,11 @@ class MessageStore:
                 # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
                 # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
                 raise _AbortMember(None)
-            if row["status"] in (
-                OutboxStatus.DONE.value,
-                OutboxStatus.DEAD.value,
-                OutboxStatus.CANCELLED.value,
-            ):
-                # BACKLOG #5752: a row already resolved does not complete again. A second completion
-                # of a DONE row would mint a second reply artifact and a second re-ingress child, so
-                # nothing is written, as for a vanished row. A row re-pended mid-send still
-                # completes: its reply is real, and completing it spares the partner a resend.
+            if row["status"] == OutboxStatus.DONE.value:
+                # BACKLOG #5752: a DONE row does not complete again. A second completion would mint
+                # a second reply artifact and a second re-ingress child, so nothing is written, as
+                # for a vanished row. Any other row still completes, as mark_done would complete
+                # it: the partner accepted and its reply is real, so keeping it spares a resend.
                 log.warning(
                     "complete_with_response: outbound row %s is already %s; nothing written",
                     outbox_id,

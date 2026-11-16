@@ -84,7 +84,9 @@ async def _bounded_store(tmp_path: pathlib.Path) -> tuple[MessageStore, AesGcmCi
     store = await MessageStore.open(
         tmp_path / "bound.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
     )
-    assert cipher.invocation_bound_enabled
+    if not cipher.invocation_bound_enabled:
+        await store.close()
+        raise AssertionError("the keyed store did not enable the AES-GCM invocation bound")
     return store, cipher
 
 

@@ -8088,13 +8088,9 @@ class SqlServerStore:
                     row[2],
                     row[3],
                 )
-                # A row already resolved does not complete again (no second reply or re-ingress
-                # child); a re-pended one still does, and an armed H1 fence still judges it below.
-                if row[4] in (
-                    OutboxStatus.DONE.value,
-                    OutboxStatus.DEAD.value,
-                    OutboxStatus.CANCELLED.value,
-                ):
+                # A DONE row does not complete again (no second reply or re-ingress child); any
+                # other still does, as on SQLite, and an armed H1 fence judges it below.
+                if row[4] == OutboxStatus.DONE.value:
                     log.warning(
                         "complete_with_response: outbound row %s is already %s; nothing written",
                         outbox_id,
@@ -12283,14 +12279,20 @@ class SqlServerStore:
         now = time.time()
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # BACKLOG #5753: a concurrent put of the same content waits on the key-range lock
-                # here and then inserts nothing, rather than failing the upload on a duplicate key.
-                # The first put's copy wins and this one's sealed chunks are dropped. OUTPUT, not
-                # rowcount, reports the insert (see _exec_terminal on SET NOCOUNT ON).
+                # BACKLOG #5753: a concurrent put of the same content waits on this content
+                # address's applock and then inserts nothing, rather than failing the upload on a
+                # duplicate key. The first put's copy wins and this one's sealed chunks are dropped.
+                # A named lock, not HOLDLOCK: a key-range lock held across the chunk loop would also
+                # block increfs of the neighbouring attachment key. The SELECT opens the
+                # transaction the applock needs. OUTPUT, not rowcount, reports the insert (see
+                # _exec_terminal on SET NOCOUNT ON).
+                await cur.execute("SELECT TOP (1) id FROM attachment WHERE id=?", (ref,))
+                await cur.fetchall()
+                await self._applock(cur, f"mefor:attachment:{ref}")
                 await cur.execute(
                     "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
                     " OUTPUT inserted.id SELECT ?,?,?,0,? WHERE NOT EXISTS"
-                    " (SELECT 1 FROM attachment WITH (UPDLOCK, HOLDLOCK) WHERE id=?)",
+                    " (SELECT 1 FROM attachment WHERE id=?)",
                     (ref, content_type, total, now, ref),
                 )
                 if not await cur.fetchall():
@@ -12303,7 +12305,8 @@ class SqlServerStore:
                     )
                 await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # The transaction may hold the applock, so a failed rollback discards the conn.
+                await self._rollback_or_discard(conn)
                 raise
         return ref
 

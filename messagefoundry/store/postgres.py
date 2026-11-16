@@ -5947,7 +5947,9 @@ class PostgresStore:
         guard, guard_args = self._resolve_guard(4)
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
-                async with conn.transaction():
+                # READ COMMITTED pinned: the MAX(response_seq) read after the lock must see the
+                # completion it waited on, which a repeatable-read server default would hide.
+                async with conn.transaction(isolation="read_committed"):
                     # FOR UPDATE (BACKLOG #5752): a second completion of the same row waits here and
                     # then reads the first one's committed DONE, so only one reply is ever captured.
                     row = await conn.fetchrow(
@@ -5955,13 +5957,9 @@ class PostgresStore:
                     )
                     if row is None:
                         return
-                    # A row already resolved does not complete again (no second reply or re-ingress
-                    # child); a re-pended one still does, and an armed H1 fence still judges it below.
-                    if row["status"] in (
-                        OutboxStatus.DONE.value,
-                        OutboxStatus.DEAD.value,
-                        OutboxStatus.CANCELLED.value,
-                    ):
+                    # A DONE row does not complete again (no second reply or re-ingress child);
+                    # any other still does, as on SQLite, and an armed H1 fence judges it below.
+                    if row["status"] == OutboxStatus.DONE.value:
                         log.warning(
                             "complete_with_response: outbound row %s is already %s; nothing written",
                             outbox_id,
@@ -7561,7 +7559,12 @@ class PostgresStore:
         sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
         del plaintext_chunks
         now = time.time()
-        async with self._timed_acquire() as conn, conn.transaction():
+        # READ COMMITTED pinned, so the ON CONFLICT below waits out a concurrent put and inserts
+        # nothing, where repeatable read would raise a serialization failure instead.
+        async with (
+            self._timed_acquire() as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
             # BACKLOG #5753: a concurrent put of the same content waits on the primary key here and
             # then inserts nothing, rather than failing the upload on a duplicate key. The first
             # put's copy wins and this one's sealed chunks are dropped.
