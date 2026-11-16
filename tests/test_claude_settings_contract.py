@@ -59,16 +59,12 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 # are enforced, so prose and mechanism cannot drift apart without a red test.
 #
 # Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the patterns the
-# deny list names for Read and Edit. A secret, credential or store file git is told
-# never to hold is one an agent should neither read nor overwrite. Before BACKLOG #5495,
-# `/docker/secrets.env`, the leak scanner's real token list, files in `/docker/tls/` other than
-# `*.key`, `*.pem` and `*.pfx`, and the `*.db*` family beyond `*.db`, `*.db-wal` and `*.db-shm`
-# had no file-tool rule at all. `*.key`, `*.pem`, `*.pfx`, `*.db-wal`, `*.db-shm` and
-# `bootstrap-admin.txt` had a Read rule and no Edit rule.
+# deny list names for Read and Edit. It holds secret, credential and store files only; PHI and
+# customer-data ignore lines, such as `harness_io/` and `/migration-local/`, are not mapped.
 # Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
 # red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
-# secret line added to `.gitignore` gets no deny rule until someone adds it here, which is how the
-# docker paths were missed. Add the key when you add the ignore line.
+# secret line added to `.gitignore` gets no deny rule until someone adds it here. Add the key when
+# you add the ignore line.
 _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     ".env": (".env",),
     ".env.*": (".env.*",),
@@ -91,8 +87,7 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
 
 # The tool names each protected pattern carries a rule for. Claude Code's permissions page,
 # https://code.claude.com/docs/en/permissions, read 2026-11-16, says `Edit` rules apply to all
-# built-in tools that edit files, and that a `Write(path)` rule is accepted but matches nothing.
-# So no `Write(...)` rule is required here.
+# built-in tools that edit files.
 _FILE_TOOLS = ("Read", "Edit")
 
 _REQUIRED_DENIES = frozenset(
@@ -102,7 +97,6 @@ _REQUIRED_DENIES = frozenset(
         for p in patterns
         for tool in _FILE_TOOLS
     }
-    # Pinned before BACKLOG #5495 and kept as they were.
     | {"Write(.env)", "Write(secrets/**)"}
 )
 
@@ -378,8 +372,7 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
 def test_every_read_denied_path_is_denied_to_edit_too() -> None:
     """Every Read-denied pattern also carries an Edit rule of its own.
 
-    Red before BACKLOG #5495, when six Read-denied patterns, listed above `_GITIGNORED_SECRETS`,
-    had no Edit rule.
+    Red before BACKLOG #5495, when six Read-denied patterns had no Edit rule.
     """
     unmirrored = _unmirrored_file_denies(_load())
     assert not unmirrored, (
