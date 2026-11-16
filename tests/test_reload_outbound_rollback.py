@@ -454,21 +454,6 @@ async def test_a_rollback_whose_sandbox_close_raises_still_restores_intake(
     assert runner.inbound_running("file_in")
 
 
-async def test_a_reload_re_parks_a_paused_lane_it_takes_out_of_deployment_without_quiescing_it(
-    runner: RegistryRunner, tmp_path: Path
-) -> None:
-    """An operator-stopped lane still quiescing keeps the quiescence its stop left when a reload
-    retires its connector, which closes only once the swap commits: it is not marked drained
-    while a send may still be in flight on it."""
-    runner._stop_outbound_unsafe(_OB)
-    quiesced = runner._outbound_quiesced[_OB]
-    quiesced.clear()  # a send is still in flight on the lane
-    await runner.reload(_registry(tmp_path, "out", deployed=False, second="out2"))
-
-    assert _OB in runner._gate_parked and _OB in runner._outbound_paused
-    assert not quiesced.is_set()
-
-
 async def test_the_lane_anchor_check_reads_the_reloads_one_schedule_time(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

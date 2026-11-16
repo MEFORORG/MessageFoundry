@@ -36,18 +36,12 @@ _PINNED: Counter[tuple[str, str, str]] = Counter(
             "RegistryRunner._build_fhir_lookup_executor.build",
             "False",
         ): 1,
-        # Its two callers log the line first: _ensure_destination_built's own warning step, and
-        # a reload's step 3, after its build_check (BACKLOG #5755 moved it out of the former).
+        # BACKLOG #5755 moved the builds of _ensure_destination_built and _reconcile_outbounds
+        # here. Its callers log the line first: _ensure_destination_built's own warning step, and
+        # a reload's step 3 prepare, after its build_check.
         (
             "messagefoundry/pipeline/wiring_runner.py",
-            "RegistryRunner._build_lane_destination",
-            "False",
-        ): 1,
-        # A reload's step 3 builds, after its build_check (BACKLOG #5755 moved them out of
-        # _reconcile_outbounds).
-        (
-            "messagefoundry/pipeline/wiring_runner.py",
-            "RegistryRunner._build_reload_destination",
+            "RegistryRunner._build_logged_destination",
             "False",
         ): 1,
         ("messagefoundry/pipeline/wiring_runner.py", "RegistryRunner._start_outbound", "False"): 1,
