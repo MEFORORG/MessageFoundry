@@ -1142,6 +1142,27 @@ shellSuite("engine trust — pairing a certificate with a target (BACKLOG #1695)
     assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, RENEWED);
   });
 
+  test("a value dropped while an abandoned CLI child is alive drops the anchor, not keeps it (BACKLOG #5404)", async () => {
+    // The control is the test above: with the child alive and the value NOT dropped, the anchor is kept.
+    stubInventory = plantedEngine();
+    await trust.refreshEngineTrust();
+    trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });
+    const exit = hungCli();
+    await trust.refreshEngineTrust(); // gives up on the child, which stays alive
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM);
+
+    stubWorkspaceValues.serviceConfig = path.join(os.tmpdir(), "elsewhere", "messagefoundry.toml");
+    await trust.refreshEngineTrust();
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined, "the in-flight path kept the anchor");
+    assert.strictEqual(invocations.length, 2, "a CLI started for a dropped value");
+
+    exit();
+    await ticks();
+    await settle();
+    assert.strictEqual(invocations.length, 2, "the child's exit ran the CLI for a dropped value");
+    assert.strictEqual(engineClient.tlsOptions(new URL(LOOPBACK)).ca, undefined);
+  });
+
   test("a failure while an abandoned CLI child is alive waits for its exit, then asks", async () => {
     stubInventory = NO_CERT_YET;
     trust.setEngineTrustLimitsForTest({ cliAnswerMs: 50 });

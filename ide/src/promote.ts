@@ -9,7 +9,7 @@ import * as vscode from "vscode";
 import { withStepUpAuth } from "./auth";
 import { engineUrl, environments, runJson, workspaceDir, writerPathSetting, type EnvironmentTarget } from "./cli";
 import { HttpError, type Approvable } from "./engineClient";
-import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
+import { assertTargetAllowed, isLocalEngine, targetRefusalNotice } from "./engineTarget";
 import {
   preflightOutcome,
   promoteOutcomeMessage,
@@ -117,7 +117,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   // and bearer token. Loopback over http stays allowed (the default 127.0.0.1 dev flow).
   const gate = assertTargetAllowed(target.url);
   if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    void vscode.window.showErrorMessage(targetRefusalNotice(gate.reason));
     return;
   }
   if (!isLocalEngine(target.url)) {

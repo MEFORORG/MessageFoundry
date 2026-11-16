@@ -88,14 +88,21 @@ export interface SetupText {
 }
 
 /**
- * {@link SetupText} for a setup that wrote the hook (`hookWritten`) or skipped it because a path
- * setting names a folder outside the workspace. Without a hook, setup must not say checks run on
- * commit or name a hook file it never wrote (BACKLOG #5404).
+ * What setup did with the commit hook: wrote none (`none`, a path setting names a folder outside the
+ * workspace), wrote it but left core.hooksPath pointing elsewhere or unset (`written`), or wrote it
+ * and pointed core.hooksPath at it (`wired`). Only `wired` turns on checks on commit.
  */
-export function setupText(hookWritten: boolean): SetupText {
-  const files = hookWritten ? `.gitignore, .gitattributes and ${HOOK_REL}` : ".gitignore and .gitattributes";
+export type HookState = "none" | "written" | "wired";
+
+/**
+ * {@link SetupText} for a setup in the given {@link HookState}. Unless the hook is wired, setup must
+ * not say checks run on commit, and without a hook it must not name a hook file it never wrote
+ * (BACKLOG #5404).
+ */
+export function setupText(hook: HookState): SetupText {
+  const files = hook !== "none" ? `.gitignore, .gitattributes and ${HOOK_REL}` : ".gitignore and .gitattributes";
   const hasHistory = `MessageFoundry: this repository already has commits, so no baseline commit was made. Review and commit ${files} yourself.`;
-  if (hookWritten) {
+  if (hook === "wired") {
     return {
       done: "MessageFoundry: version control & checks are set up.",
       hasHistory,
@@ -107,15 +114,24 @@ export function setupText(hookWritten: boolean): SetupText {
         "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
     };
   }
+  const { done, what } =
+    hook === "written"
+      ? {
+          done: `MessageFoundry: version control is set up and ${HOOK_REL} was written, but core.hooksPath does not point at ${HOOKS_DIR}, so this setup did not turn on checks on commit. Point core.hooksPath at ${HOOKS_DIR} to turn them on; the 'MessageFoundry Checks' output says why it was left alone.`,
+          what: "did not wire its commit hook",
+        }
+      : {
+          done: "MessageFoundry: version control is set up, but this setup wrote no commit hook and did not set core.hooksPath, so it did not turn on checks on commit. Set the path settings to folders inside the workspace and run setup again to add it.",
+          what: "set up no commit hook",
+        };
   return {
-    done:
-      "MessageFoundry: version control is set up, but this setup wrote no commit hook and did not set core.hooksPath, so it did not turn on checks on commit. Set the path settings to folders inside the workspace and run setup again to add it.",
+    done,
     hasHistory,
     commitMessage: "Initial commit",
     commitFailed: "MessageFoundry: the commit failed — see the 'MessageFoundry Checks' output.",
     offerBaseline:
-      "A required check hasn't passed yet. You can still commit this as your baseline snapshot. This setup set up no commit hook, so it did not turn on checks for later commits; run the checks yourself after fixing the flagged items. Details are in the 'MessageFoundry Checks' output.",
+      `A required check hasn't passed yet. You can still commit this as your baseline snapshot. This setup ${what}, so it did not turn on checks for later commits; run the checks yourself after fixing the flagged items. Details are in the 'MessageFoundry Checks' output.`,
     committedAnyway:
-      "MessageFoundry: baseline committed. This setup set up no commit hook, so it did not turn on checks for later commits — fix the flagged items in 'MessageFoundry Checks'.",
+      `MessageFoundry: baseline committed. This setup ${what}, so it did not turn on checks for later commits — fix the flagged items in 'MessageFoundry Checks'.`,
   };
 }

@@ -23,6 +23,7 @@ import {
   HOOKS_DIR,
   PRE_COMMIT_TEMPLATE,
   setupText,
+  type HookState,
   type SetupText,
 } from "./sourceControlTemplates";
 
@@ -142,11 +143,16 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   const notes: string[] = [];
   notes.push(`.gitignore: ${await scaffoldGitignore(ws)}`);
   notes.push(`.gitattributes: ${await scaffoldGitattributes(ws)}`);
+  // Checks run on commit only once the hook is both written AND wired: a hook git is not pointed at
+  // never runs, so the text below claims checks only when both happened.
+  let hookState: HookState = "none";
   if (hookPaths.hook === undefined) {
     notes.push("hook: not written (a path setting names a folder outside the workspace)");
   } else {
     notes.push(`hook: ${await scaffoldHook(bin, ws, hookPaths.hook)}`);
-    notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
+    const wiring = await wireHooksPath(bin, ws);
+    notes.push(`core.hooksPath: ${wiring.note}`);
+    hookState = wiring.wired ? "wired" : "written";
   }
 
   // Logged here, before the prompts below. Every line is time-stamped, so logging these after the
@@ -154,7 +160,7 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   logChecks(["Set Up Version Control & Checks:", ...notes.map((n) => `  • ${n}`)].join("\n"));
 
   await maybeAddRemote(bin, ws);
-  const text = setupText(hookPaths.hook !== undefined);
+  const text = setupText(hookState);
   await maybeFirstCommit(bin, ws, hookPaths.check, text);
 
   void vscode.window.showInformationMessage(text.done);
@@ -282,17 +288,20 @@ async function scaffoldHook(bin: string, ws: string, paths: CheckPaths): Promise
   return "written (.mefor-hooks/pre-commit, +x)";
 }
 
-/** Point git at the hook only if safe: don't clobber a user's existing hooksPath or real hook. */
-async function wireHooksPath(bin: string, ws: string): Promise<string> {
+/**
+ * Point git at the hook only if safe: don't clobber a user's existing hooksPath or real hook.
+ * `wired` is true only when core.hooksPath names the hook's folder afterwards.
+ */
+async function wireHooksPath(bin: string, ws: string): Promise<{ note: string; wired: boolean }> {
   const current = await getHooksPath(bin, ws);
   if (current === HOOKS_DIR) {
-    return "already set";
+    return { note: "already set", wired: true };
   }
   if (current) {
     void vscode.window.showWarningMessage(
       `MessageFoundry: core.hooksPath is already '${current}'. Left as-is — point it at '${HOOKS_DIR}' to enable checks.`,
     );
-    return `left as '${current}' (not clobbered)`;
+    return { note: `left as '${current}' (not clobbered)`, wired: false };
   }
   const realHook = vscode.Uri.file(path.join(ws, ".git", "hooks", "pre-commit"));
   try {
@@ -300,12 +309,14 @@ async function wireHooksPath(bin: string, ws: string): Promise<string> {
     void vscode.window.showWarningMessage(
       "MessageFoundry: an existing .git/hooks/pre-commit was found. Left it alone — remove or merge it, then re-run setup.",
     );
-    return "not set (existing .git/hooks/pre-commit)";
+    return { note: "not set (existing .git/hooks/pre-commit)", wired: false };
   } catch {
     // no existing real hook — safe to set
   }
   const res = await git(bin, ["config", "core.hooksPath", HOOKS_DIR], ws);
-  return res.code === 0 ? `set to '${HOOKS_DIR}'` : `failed: ${res.stderr.trim()}`;
+  return res.code === 0
+    ? { note: `set to '${HOOKS_DIR}'`, wired: true }
+    : { note: `failed: ${res.stderr.trim()}`, wired: false };
 }
 
 // "Where should this config repo be stored?" — the setup-time storage choice. Local-only suits a

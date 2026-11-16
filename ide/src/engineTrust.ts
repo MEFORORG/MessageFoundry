@@ -503,16 +503,12 @@ async function askCli(
     return;
   }
 
-  if (cliRun !== undefined) {
-    cliWanted = true;
-    engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
-    inconclusive();
-    return;
-  }
   // A value the containment dropped (BACKLOG #5404) is refused, as a writer refuses one: the file
   // used in its place is not the one the operator named, so its `[api].tls_cert_file` must not
   // become a trust anchor. No outcome is set, so any anchor this source registered earlier is
-  // dropped too; a caFile pin is read separately and still applies.
+  // dropped too; a caFile pin is read separately and still applies. Checked before the
+  // earlier-run branch below, which keeps the old anchor, so a dropped value drops it on that path
+  // as well.
   const setting = writerCheckSetting("serviceConfig");
   if (setting.dropped !== false) {
     engineLog().warn(
@@ -523,6 +519,12 @@ async function askCli(
           "(a caFile pin in messagefoundry.environments still applies)",
       ),
     );
+    return;
+  }
+  if (cliRun !== undefined) {
+    cliWanted = true;
+    engineLog().warn("an earlier `cert inventory` run has not exited; not starting another");
+    inconclusive();
     return;
   }
   let payload: unknown;

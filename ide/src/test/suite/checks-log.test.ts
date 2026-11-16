@@ -76,6 +76,8 @@ let stubWorkspace: string | undefined;
 let checkCode = 1;
 /** Whether the stubbed repository already has a commit (BACKLOG #5413: then no baseline is offered). */
 let hasHead = false;
+/** What `git config --get core.hooksPath` prints; empty is unset, as git reports it. */
+let hooksPath = "";
 /** The answer to the "required check hasn't passed" prompt. */
 let baselineAnswer: string | undefined = "Commit baseline anyway";
 /** Settings the stub reports as set in USER settings; everything else is left at its default. */
@@ -212,6 +214,7 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     events = [];
     checkCode = 1;
     hasHead = false;
+    hooksPath = "";
     baselineAnswer = "Commit baseline anyway";
     userSettings = {};
     shown = [];
@@ -232,6 +235,8 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       } else if (args[0] === "rev-parse" && args.includes("HEAD")) {
         // An unborn branch fails this, as a freshly initialised repository does.
         done(hasHead ? null : Object.assign(new Error("stubbed"), { code: 1 }), hasHead ? "0000000\n" : "", "");
+      } else if (args[0] === "config" && args.includes("--get") && args.includes("core.hooksPath")) {
+        done(hooksPath ? null : Object.assign(new Error("stubbed"), { code: 1 }), hooksPath ? `${hooksPath}\n` : "", "");
       } else if (args[0] === "commit") {
         done(null, "[main (root-commit) 0000000] Initial commit\n", "");
       } else {
@@ -358,6 +363,25 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     const history = shown.find((m) => m.includes("already has commits"));
     assert.ok(history !== undefined, JSON.stringify(shown));
     assert.ok(!history.includes("pre-commit"), history);
+  });
+
+  test("with the hook written but core.hooksPath left elsewhere, nothing says checks run on commit", async () => {
+    hooksPath = "other-hooks"; // the user's own hooks path, which setup does not clobber
+    for (const code of [0, 1]) {
+      checkCode = code;
+      events = [];
+      shown = [];
+      await sc.setupSourceControl({} as never);
+      assert.ok(lines().some((l) => l.includes("hook: written")), JSON.stringify(lines()));
+      assert.ok(lines().some((l) => l.includes("core.hooksPath: left as 'other-hooks'")), JSON.stringify(lines()));
+      const made = commits();
+      assert.strictEqual(made.length, 1, JSON.stringify(launches()));
+      assert.strictEqual(made[0][made[0].indexOf("-m") + 1], "Initial commit");
+      for (const m of shown) {
+        assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active/.test(m), m);
+      }
+      assert.ok(shown.some((m) => m.includes("core.hooksPath does not point at")), JSON.stringify(shown));
+    }
   });
 
   test("control: with the hook written, setup and the baseline commit say checks are enabled", async () => {
