@@ -600,6 +600,72 @@ async def test_matching_reject_stays_final_and_ae_stays_retried_under_correlatio
         await peer.stop()
 
 
+async def test_stray_reject_on_the_connect_per_send_path_is_retried() -> None:
+    # BACKLOG #5681 on `_send_once` (persistent=false): the stray reject is the same retryable
+    # correlation failure there, not a permanent NegativeAckError.
+    peer = _AckPeer(raw_ack=_stray_ack("AR", "OTHER"))
+    await peer.start()
+    dest = _dest(peer.port, verify_ack_control_id=True, persistent=False)
+    try:
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(_msg("M1"))
+        assert not isinstance(ei.value, NegativeAckError)
+        assert "control-id mismatch" in str(ei.value)
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+
+async def test_cr_with_an_empty_msa2_stays_final() -> None:
+    # The empty-MSA-2 rule covers the enhanced-mode reject as well as AR.
+    peer = _AckPeer(raw_ack=_stray_ack("CR", ""))
+    await peer.start()
+    dest = _dest(peer.port, verify_ack_control_id=True)
+    try:
+        with pytest.raises(NegativeAckError) as ei:
+            await dest.send(_msg("M1"))
+        assert ei.value.code == "AR" and ei.value.permanent is True  # CR folds into AR
+        assert dest._conn is not None  # complete transaction, connection kept
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+
+@pytest.mark.parametrize("msa2", [" ", " M1 "])
+async def test_a_whitespace_msa2_is_compared_exactly(msa2: str) -> None:
+    # MSA-2 is compared exactly, as the positive-ACK check always has: a space-only MSA-2 is not
+    # empty, and a padded copy of the sent id is not that id, so each reads as naming another
+    # message and is retried. This pins the current rule; it does not argue for it.
+    peer = _AckPeer(raw_ack=_stray_ack("AR", msa2))
+    await peer.start()
+    dest = _dest(peer.port, verify_ack_control_id=True)
+    try:
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(_msg("M1"))
+        assert not isinstance(ei.value, NegativeAckError)
+        assert dest._conn is None
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+
+async def test_stray_reject_discard_logs_its_own_reason(caplog: pytest.LogCaptureFixture) -> None:
+    # The discard after a parseable reply naming another message is not an "unparseable ACK".
+    peer = _AckPeer(raw_ack=_stray_ack("AR", "OTHER"))
+    await peer.start()
+    dest = _dest(peer.port, verify_ack_control_id=True)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):  # noqa: SIM117
+            with pytest.raises(DeliveryError):
+                await dest.send(_msg("M1"))
+    finally:
+        await dest.aclose()
+        await peer.stop()
+    warn_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "discarded after delivery failure: ACK control-id mismatch" in warn_text
+    assert "unparseable ACK" not in warn_text
+
+
 # --- AC-11: reconnects logged (metadata only) + counted -------------------------
 
 

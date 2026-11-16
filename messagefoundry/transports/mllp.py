@@ -369,6 +369,13 @@ def _bounded_ack_field(value: str | None) -> str:
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
+class _AckCorrelationError(DeliveryError):
+    """A well-formed ACK that names another message's control id (BACKLOG #82, #5681).
+
+    Still a retryable :class:`DeliveryError`; the subclass exists only so the persistent lane can log
+    its own discard reason instead of calling a parseable reply an unparseable one."""
+
+
 #: A segment break in a payload not yet normalized (``normalize`` maps both to ``\r``).
 _LINE_BREAK = re.compile(r"[\r\n]")
 
@@ -1353,6 +1360,11 @@ class MLLPDestination(DestinationConnector):
             response = self._check_ack(ack_bytes, sent_control_id)
         except NegativeAckError:
             raise  # complete transaction on a healthy transport — the connection stays cached
+        except _AckCorrelationError:
+            # A parseable ACK for ANOTHER message (BACKLOG #82, #5681): the socket is out of step
+            # with the sends, so discard it, under its own reason rather than "unparseable ACK".
+            await self._discard_unparseable(conn, writer, reason="ACK control-id mismatch")
+            raise
         except DeliveryError:
             # An unparseable ACK (non-capturing) means the transaction was NOT fully successful
             # ("one ACK read *and parsed*", ADR 0067 §2.2) — discard like any other DeliveryError
@@ -1449,18 +1461,21 @@ class MLLPDestination(DestinationConnector):
         self,
         conn: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         writer: asyncio.StreamWriter,
+        *,
+        reason: str = "unparseable ACK",
     ) -> None:
         """Discard the cached connection after a read-but-unparseable ACK (both the raising
-        non-capturing path and the captured ``outcome='unparseable'`` path). Fixed reason only in
-        the log: the parse error's text can embed a reply fragment (#120)."""
+        non-capturing path and the captured ``outcome='unparseable'`` path), or after a parseable
+        ACK naming another message's control id. ``reason`` is a fixed engine string, never the
+        error's text: the parse error's text can embed a reply fragment (#120)."""
         if self._conn is conn:
             self._conn = None
             self.reconnects += 1
             logger.warning(
-                "MLLP %s:%d persistent connection discarded after delivery failure: "
-                "unparseable ACK",
+                "MLLP %s:%d persistent connection discarded after delivery failure: %s",
                 self.host,
                 self.port,
+                reason,
             )
             await self._close_bounded(writer)
 
@@ -1611,7 +1626,7 @@ class MLLPDestination(DestinationConnector):
                 # sized too, and it is interpolated into this raise. Clamped HERE and not at the
                 # read above, because the comparison must see the field the peer actually sent --
                 # bounding first would silently correlate a long control id against its own prefix.
-                raise DeliveryError(
+                raise _AckCorrelationError(
                     f"ACK control-id mismatch: "
                     f"MSA-1={msa1} "
                     f"MSA-2={_bounded_ack_field(ack_control_id)!r} "

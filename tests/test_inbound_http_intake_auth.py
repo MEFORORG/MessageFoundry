@@ -903,6 +903,18 @@ def test_the_factory_refuses_a_budget_that_is_no_count(knob: str, value: object)
     assert str(shown) not in str(exc.value)  # value withheld
 
 
+def test_a_refused_env_default_is_named_as_the_default() -> None:
+    # The factory reads only an env() budget's default=, so the refusal says that is what it
+    # refused; a literal budget's refusal does not mention a default.
+    knobs: dict[str, Any] = {"intake_auth_rate_limit": env("budget", default=-1)}
+    with pytest.raises(WiringError, match="default= of intake_auth_rate_limit") as exc:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    assert "-1" not in str(exc.value)
+    with pytest.raises(WiringError) as literal:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), intake_auth_rate_limit=-1)
+    assert "default=" not in str(literal.value)
+
+
 def test_the_factory_still_accepts_every_count_and_an_env_reference() -> None:
     for value in (0, None, 7, "10", 10.0, env("budget"), env("budget", default=3)):
         knobs: dict[str, Any] = {"intake_auth_rate_limit": value}

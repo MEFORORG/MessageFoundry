@@ -3418,14 +3418,14 @@ def Http(
                 f"Http sets trusted_proxies but {knob} is off. {reason}. Set {knob}, or remove "
                 "the setting"
             )
-        # The runner reads a budget with int(), so a fraction below 1 would pass the test above
-        # and turn the arm off; a negative, a bool or an env() is no checked budget either.
+        # A budget this rule cannot see at load is no checked budget: an env() could resolve to
+        # 0, which turns the arm off. A fraction, a negative or a bool is no count at all.
         if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
             raise WiringError(
                 f"Http sets trusted_proxies but {knob} is not an integer of at least 1 (value "
-                "withheld). The listener reads it with int(), so a fraction below 1 would turn "
-                "that budget off. Set it to an integer number of failed attempts per minute, or "
-                "remove the setting"
+                "withheld). With trusted_proxies set it must be a whole number written here, not "
+                "an env() reference, a fraction or a negative. Set it to an integer number of "
+                "failed attempts per minute, or remove the setting"
             )
     # BACKLOG #5677: the runner reads each budget as a count by cap_setting's rule, so a bool, a
     # fraction, other text or a negative (which would refuse every intake request) is refused here,
@@ -3435,6 +3435,7 @@ def Http(
 
     for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
         written = settings[knob]
+        from_default = isinstance(written, EnvRef)
         if isinstance(written, EnvRef):
             written = None if written.default is _UNSET else written.default
         budget_refusal: str | None = None
@@ -3446,9 +3447,13 @@ def Http(
             if read is not None and read < 0:
                 budget_refusal = f"Http {knob} is negative (value withheld)"
         if budget_refusal is not None:
+            # An env() budget is refused here only on its default=, so say so: the environment
+            # variable itself is not read until the listener starts.
+            where = f"the env() default= of {knob} is refused: " if from_default else ""
+            fix = f"Set the default= of {knob}" if from_default else "Set it"
             raise WiringError(
-                f"{budget_refusal}. Set it to a whole number of failed attempts per minute, or 0 "
-                "to disable that budget"
+                f"{where}{budget_refusal}. {fix} to a whole number of failed attempts per minute, "
+                "or 0 to disable that budget"
             )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
