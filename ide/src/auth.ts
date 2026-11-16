@@ -89,11 +89,21 @@ async function showConsoleFix(url: string, problem: string, path: string): Promi
  * The local token is cleared in a `finally`: if the engine is unreachable we cannot revoke, but we must
  * still forget it here — refusing to sign out because the engine is down would be worse. The caller is told
  * which of the two happened rather than being given a blanket "signed out".
+ *
+ * The bearer goes out only to a target {@link assertTargetAllowed} passes, the same gate
+ * {@link signIn} applies (BACKLOG #5407). A token cached for a URL the gate now refuses is forgotten
+ * here without being sent, and the caller is told it was not revoked.
  */
 export async function signOut(ctx: vscode.ExtensionContext, url: string): Promise<boolean> {
   const token = await peekToken(ctx, url);
   if (!token) {
     return true; // nothing to revoke
+  }
+  const gate = assertTargetAllowed(url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    await clearToken(ctx, url);
+    return false;
   }
   try {
     await postJson<unknown>(url, "/auth/logout", {}, token);
@@ -246,12 +256,21 @@ export async function ensureToken(
  * **401** (expired/invalid) clears it and retries once with a fresh sign-in. A 403 (authenticated
  * but lacking the permission) is NOT retried — re-login as the same user wouldn't help — and
  * propagates so the caller can surface it. Returns undefined if the user cancels a sign-in.
+ *
+ * A target {@link assertTargetAllowed} refuses gets no call at all, so a token cached for it is never
+ * sent (BACKLOG #5407): the gate is checked here, before the cache is read, and not only inside
+ * {@link signIn}, which a cached token skips. Returns undefined then, as for a refused sign-in.
  */
 export async function withAuth<T>(
   ctx: vscode.ExtensionContext,
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
+  const gate = assertTargetAllowed(url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    return undefined;
+  }
   const first = await ensureToken(ctx, url);
   if (first === undefined) {
     return undefined; // sign-in cancelled
