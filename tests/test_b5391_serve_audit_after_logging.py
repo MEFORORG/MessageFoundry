@@ -132,6 +132,7 @@ def test_a_start_refused_before_logging_is_configured_logs_no_audit(
     err = capsys.readouterr().err
     assert "block_unlisted_outbound=false on a production PHI instance" in err
     assert "must forward its logs off-box" in err
+    assert "AUDIT:" not in err
     assert _audit(seen, "") == []
 
 
@@ -172,4 +173,4 @@ def test_keyless_audit_reaches_stderr_when_the_level_filters_warning(
     )
     assert rc == 0
     err = capsys.readouterr().err.splitlines()
-    assert [line for line in err if line.startswith("AUDIT: starting keyless")] != []
+    assert len([line for line in err if line.startswith("AUDIT: starting keyless")]) == 1

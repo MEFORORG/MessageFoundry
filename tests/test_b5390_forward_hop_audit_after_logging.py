@@ -101,14 +101,15 @@ def test_hop_audit_is_logged_once_after_configure(
     assert f"AUDIT: off-box log/audit forwarding to {_HOST}:" in err
 
 
-def test_no_hop_audit_when_no_forwarder_came_up(
+def test_hop_audit_is_logged_when_the_collector_was_skipped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # configure skipped the collector, so no record crosses the hop and none is audited for it.
+    # configure built the forwarder but skipped a collector that was down: the accepted posture is
+    # still recorded, since it governs the next start as much as this one.
     rc, seen = _start(_listed(), tmp_path, live=False)
     assert rc is None
-    assert _hop_audit(seen) == []
-    assert "AUDIT: off-box" not in capsys.readouterr().err
+    assert _hop_audit(seen) == [True]
+    assert "AUDIT: off-box" in capsys.readouterr().err
 
 
 def test_a_later_refusal_logs_no_hop_audit(
@@ -121,4 +122,5 @@ def test_a_later_refusal_logs_no_hop_audit(
     err = capsys.readouterr().err
     assert f"warning: off-box log/audit forwarding to {_HOST}:" in err
     assert "allowed_syslog" in err
+    assert "AUDIT:" not in err
     assert _hop_audit(seen) == []

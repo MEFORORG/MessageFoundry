@@ -2221,7 +2221,7 @@ def _start_logging(
     spool_dir: str,
     configure: Callable[[SyslogForward | None], bool],
     deferred_ca_refusals: list[TrustAnchorError] | None = None,
-    pending_audit: Sequence[str] = (),
+    pending_audit: list[str] | None = None,
 ) -> int | None:
     """Pass the off-box forwarding gates, then install this process's log handlers.
 
@@ -2314,8 +2314,9 @@ def _start_logging(
         if _forward_hop is HopDisposition.WARN:
             # Crossed, but never silent — the point of the fix. Warned on stderr now, and logged as
             # an AUDIT record only once `configure` below has installed the handlers and the
-            # forwarder, so it reaches [logging].file and the collector, and is not logged at all
-            # when a later gate here refuses the start (BACKLOG #5390).
+            # forwarder, so a level that admits WARNING sends it to [logging].file and the
+            # collector, and it is not logged at all when a later gate here refuses the start
+            # (BACKLOG #5390).
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
                 f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so the "
@@ -2451,11 +2452,12 @@ def _start_logging(
         # the text names the setting and the fix, never the key.
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's when a forwarder came
-    # up to use it, in the order they were decided. Each goes to stderr as well as the handlers,
-    # because [logging].level can filter WARNING out of every handler and stderr is not filtered.
-    _audit_lines = [*pending_audit]
-    if _hop_warning is not None and forwarder_live:
+    # BACKLOG #5391, #5390: the caller's AUDIT lines, then the warn-mode hop's when its forwarder
+    # was built (a refused collector CA above builds none). Each goes to stderr as well as the
+    # handlers, because [logging].level can filter WARNING out of every handler and stderr is not
+    # filtered.
+    _audit_lines = list(pending_audit or ())
+    if _hop_warning is not None and log_forward is not None:
         _audit_lines.append(f"AUDIT: {_hop_warning}")
     for _audit_line in _audit_lines:
         print(scrub_control_chars(_audit_line), file=sys.stderr)
@@ -3047,9 +3049,9 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
         # Explicit, audited override: start keyless on a PHI instance. A loud warning now and an
-        # AUDIT record in _start_audit, so the deliberate weakening is never silent. Under strict enforcement the second ack
-        # ([security].allow_unencrypted_phi_under_strict_enforcement=true) was verified above, so
-        # the AUDIT line names it too; the warn posture names the opt-out alone.
+        # AUDIT record in _start_audit, so the deliberate weakening is never silent. Under strict
+        # enforcement the second ack ([security].allow_unencrypted_phi_under_strict_enforcement=true)
+        # was verified above, so the AUDIT line names it too; the warn posture names the opt-out alone.
         # The opt-out is named as the operator wrote it (vault BACKLOG #2340).
         _start_audit.append(
             f"AUDIT: starting keyless on a {'production ' if production else ''}PHI instance "
