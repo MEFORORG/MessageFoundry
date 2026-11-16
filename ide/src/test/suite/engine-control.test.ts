@@ -649,7 +649,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       /buildServeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
       /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
       /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
-      /serveCommandLine\(configDir\(\),\s*startServiceConfig\(\)\)/,
+      /serveCommandLine\(launch\.configDir,\s*launch\.serviceConfig\)/,
     ];
     for (const call of calls) {
       assert.ok(call.test(code), `not handed the service config: ${call}`);

@@ -22,7 +22,7 @@ import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from 
 import type { LensParseResult, OpSchema } from "./stepsModel";
 import {
   containedPathSetting,
-  writerPathValue,
+  droppedNotice,
   writerRefusal,
   type ContainedPathSetting,
 } from "./workspaceContainment";
@@ -102,10 +102,10 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder, or a user
  * value that is not text, is dropped for the next scope down, and the user is told once per value.
  */
-function pathSetting(key: PathSettingKey, fallback: string): ContainedPathSetting {
+function pathSetting(key: PathSettingKey, fallback: string, warn = true): ContainedPathSetting {
   const seen = config().inspect(key);
   const contained = containedPathSetting(seen, workspaceDir(), fallback);
-  if (contained.dropped === false) {
+  if (contained.dropped === false || !warn) {
     return contained;
   }
   const raw = contained.dropped === "workspace" ? seen?.workspaceValue : seen?.globalValue;
@@ -113,14 +113,27 @@ function pathSetting(key: PathSettingKey, fallback: string): ContainedPathSettin
   if (!droppedPathSettings.has(seenKey)) {
     droppedPathSettings.add(seenKey);
     // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
-    void vscode.window.showWarningMessage(
-      contained.dropped === "workspace"
-        ? `messagefoundry.${key}, set in workspace settings, is not used: it is not a path inside the ` +
-            "workspace folder, or no folder is open. To use a path elsewhere, set it in user settings."
-        : `messagefoundry.${key}, set in user settings, is not used: it is not text.`,
-    );
+    void vscode.window.showWarningMessage(droppedNotice(key, contained.dropped));
   }
   return contained;
+}
+
+/** Each path setting's fallback when the manifest gives no default. */
+const PATH_FALLBACK: Readonly<Record<PathSettingKey, string>> = {
+  configDir: "samples/config",
+  serviceConfig: "messagefoundry.toml",
+  messageSetsDir: "samples/messages",
+};
+
+/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. A
+ *  writer's refusal replaces the reader's once-per-value warning, so one cause shows one notice. */
+function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
+  const s = pathSetting(key, PATH_FALLBACK[key], false);
+  if (s.dropped !== false) {
+    void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
+    return undefined;
+  }
+  return s;
 }
 
 /**
@@ -128,16 +141,10 @@ function pathSetting(key: PathSettingKey, fallback: string): ContainedPathSettin
  * undefined after an error naming the setting when a value the operator wrote was dropped. A reader
  * uses {@link configDir}, {@link serviceConfig} or {@link messageSetsDir}, which go on with the
  * value used in the dropped one's place; a writer must not act on that substitute. See
- * {@link writerPathValue}.
+ * {@link writerRefusal}.
  */
 export function writerPathSetting(key: PathSettingKey): string | undefined {
-  const s =
-    key === "configDir" ? configDirSetting() : key === "serviceConfig" ? serviceConfigSetting() : messageSetsDirSetting();
-  const value = writerPathValue(s);
-  if (s.dropped !== false) {
-    void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
-  }
-  return value;
+  return writerSetting(key)?.value;
 }
 
 /**
@@ -147,11 +154,15 @@ export function writerPathSetting(key: PathSettingKey): string | undefined {
  */
 export function writerConfigTarget(): { configDir: string; serviceConfig: string | undefined } | undefined {
   const dir = writerPathSetting("configDir");
-  const file = dir === undefined ? undefined : writerPathSetting("serviceConfig");
-  if (dir === undefined || file === undefined) {
+  if (dir === undefined) {
     return undefined;
   }
-  return { configDir: dir, serviceConfig: connectionServiceConfig(file, serviceConfigIsSet()) };
+  const file = writerSetting("serviceConfig");
+  if (file === undefined) {
+    return undefined;
+  }
+  // Nothing was dropped, so the setting is set exactly when it did not come from the default.
+  return { configDir: dir, serviceConfig: connectionServiceConfig(file.value, file.source !== "default") };
 }
 
 export function configDir(): string {
@@ -160,7 +171,7 @@ export function configDir(): string {
 
 /** {@link configDir} with its scope and which value, if any, was dropped. */
 export function configDirSetting(): ContainedPathSetting {
-  return pathSetting("configDir", "samples/config");
+  return pathSetting("configDir", PATH_FALLBACK.configDir);
 }
 
 /** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative,
@@ -173,7 +184,7 @@ export function serviceConfig(): string {
 /** {@link serviceConfig} with the scope it came from, for a caller whose checks depend on whether
  *  the workspace set the value it is handed (securityEditor.ts). */
 export function serviceConfigSetting(): ContainedPathSetting {
-  return pathSetting("serviceConfig", "messagefoundry.toml");
+  return pathSetting("serviceConfig", PATH_FALLBACK.serviceConfig);
 }
 
 /** Whether `messagefoundry.serviceConfig` is set rather than left at the manifest default; see
@@ -271,7 +282,7 @@ export function messageSetsDir(): string {
 
 /** {@link messageSetsDir} with its scope and which value, if any, was dropped. */
 export function messageSetsDirSetting(): ContainedPathSetting {
-  return pathSetting("messageSetsDir", "samples/messages");
+  return pathSetting("messageSetsDir", PATH_FALLBACK.messageSetsDir);
 }
 
 /**
@@ -518,12 +529,8 @@ export function codesetShow(name: string, cwd?: string): Promise<CodeSetDetail> 
 }
 
 // The code-set writers take the config directory from their caller, which reads it with
-// writerPathSetting and stops before any prompt when that refuses (BACKLOG #5404).
-
-/** `codeset upsert` — write codesets/NAME.csv from a DETAIL (the CLI validates + re-loads it). */
-export function codesetUpsert(dir: string, detail: CodeSetDetail, cwd?: string): Promise<unknown> {
-  return runJson(["codeset", "upsert", "--config", dir, "--data", JSON.stringify(detail)], cwd);
-}
+// writerPathSetting and stops before any prompt when that refuses (BACKLOG #5404). The editors
+// build their own `codeset upsert`, which takes an optional `--name`.
 
 /** `codeset rename NAME --to NEWNAME` — rename the file (keeps its extension). */
 export function codesetRename(dir: string, name: string, to: string, cwd?: string): Promise<unknown> {

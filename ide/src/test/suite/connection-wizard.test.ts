@@ -352,7 +352,7 @@ suite("connection writers — every upsert and remove names the service settings
     const cli = sources.find((s) => s.file === "cli.ts")?.text ?? "";
     assert.match(
       cli,
-      /export function writerConfigTarget\(\)[\s\S]*?connectionServiceConfig\(file, serviceConfigIsSet\(\)\)/,
+      /export function writerConfigTarget\(\)[\s\S]*?connectionServiceConfig\(file\.value, file\.source !== "default"\)/,
     );
     // Control: the pre-#5404 call, which read the substitute, fails the predicate.
     assert.ok(!flagged.test("connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), c)"));

@@ -25,7 +25,6 @@ import * as vscode from "vscode";
 
 import { peekToken, signIn, signOut } from "./auth";
 import {
-  configDir,
   engineUrl,
   environments,
   pythonPath,
@@ -1126,8 +1125,13 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       // in a git worktree that has no service TOML and no store, so `serve` would quietly create a
       // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
-      // the authority on which store and which environment this engine is.
-      const cmd = serveCommandLine(configDir(), startServiceConfig());
+      // the authority on which store and which environment this engine is. Read as a launch, as Start
+      // reads it, so a dropped value is refused rather than copied (BACKLOG #5404).
+      const launch = writerConfigTarget();
+      if (launch === undefined) {
+        return;
+      }
+      const cmd = serveCommandLine(launch.configDir, launch.serviceConfig);
       await vscode.env.clipboard.writeText(cmd);
       logAction("copy start command", cmd);
       void vscode.window.showInformationMessage(

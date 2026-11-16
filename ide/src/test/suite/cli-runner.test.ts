@@ -8,7 +8,7 @@ import * as path from "path";
 
 import { ENGINE_MODULE, TOOLKIT_MODULE } from "../../cliJson";
 import { INTERPRETER_OPTIONS, aiPolicyCliArgs, aiPolicyCliPlan, cliArgv } from "../../engineControlModel";
-import { committedRelativePath, containedPathSetting, writerPathValue, writerRefusal } from "../../workspaceContainment";
+import { committedRelativePath, containedPathSetting, droppedNotice, writerRefusal } from "../../workspaceContainment";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 
@@ -162,16 +162,22 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     assert.throws(() => path.isAbsolute(42 as unknown as string), TypeError);
   });
 
-  test("a writer gets no value when one was dropped, and its refusal names the setting and scope", () => {
-    assert.strictEqual(writerPathValue(containedPathSetting({ globalValue: "mine", workspaceValue: OUT }, WS, "d")), undefined);
-    assert.strictEqual(writerPathValue(containedPathSetting({ defaultValue: "x", globalValue: 42 }, WS, "d")), undefined);
-    assert.strictEqual(writerPathValue(containedPathSetting({ workspaceValue: "cfg" }, undefined, "d")), undefined);
+  test("a drop a writer refuses is reported as dropped, and both notices name the setting and scope", () => {
+    // writerSetting in cli.ts refuses exactly when `dropped` is not false.
+    assert.strictEqual(containedPathSetting({ globalValue: "mine", workspaceValue: OUT }, WS, "d").dropped, "workspace");
+    assert.strictEqual(containedPathSetting({ defaultValue: "x", globalValue: 42 }, WS, "d").dropped, "user");
+    assert.strictEqual(containedPathSetting({ workspaceValue: "cfg" }, undefined, "d").dropped, "workspace");
     // Controls: nothing dropped, so the writer acts on the value a reader sees.
-    assert.strictEqual(writerPathValue(containedPathSetting({ globalValue: OUT }, WS, "d")), OUT);
-    assert.strictEqual(writerPathValue(containedPathSetting({ workspaceValue: "cfg" }, WS, "d")), "cfg");
-    assert.strictEqual(writerPathValue(containedPathSetting({ defaultValue: "x" }, WS, "d")), "x");
+    assert.strictEqual(containedPathSetting({ globalValue: OUT }, WS, "d").dropped, false);
+    assert.strictEqual(containedPathSetting({ workspaceValue: "cfg" }, WS, "d").dropped, false);
+    assert.strictEqual(containedPathSetting({ defaultValue: "x" }, WS, "d").dropped, false);
     assert.match(writerRefusal("configDir", "workspace"), /messagefoundry\.configDir, set in workspace settings, is not a path inside/);
     assert.match(writerRefusal("serviceConfig", "user"), /messagefoundry\.serviceConfig, set in user settings, is not text/);
+    assert.match(droppedNotice("configDir", "workspace"), /^messagefoundry\.configDir, set in workspace settings, is not a path inside .*so it is not used\./);
+    assert.match(droppedNotice("serviceConfig", "user"), /set in user settings, is not text, so it is not used\.$/);
+    const writer = body(CLI, "writerPathSetting");
+    assert.match(writer, /^\s*return writerSetting\(key\)\?\.value;\s*$/);
+    assert.match(CLI, /function writerSetting\([^)]*\)[^{]*\{\s*const s = pathSetting\(key, PATH_FALLBACK\[key\], false\);\s*if \(s\.dropped !== false\) \{/);
   });
 
   test("a committed hook path is workspace-relative with forward slashes, or refused", () => {
@@ -215,11 +221,13 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
 
   test("configDir, serviceConfig and messageSetsDir read through pathSetting, which contains them", () => {
     assert.match(body(CLI, "messageSetsDir"), /^\s*return messageSetsDirSetting\(\)\.value;\s*$/);
-    assert.match(body(CLI, "messageSetsDirSetting"), /^\s*return pathSetting\("messageSetsDir", "samples\/messages"\);\s*$/);
+    assert.match(body(CLI, "messageSetsDirSetting"), /^\s*return pathSetting\("messageSetsDir", PATH_FALLBACK\.messageSetsDir\);\s*$/);
     assert.match(body(CLI, "configDir"), /^\s*return configDirSetting\(\)\.value;\s*$/);
-    assert.match(body(CLI, "configDirSetting"), /^\s*return pathSetting\("configDir", "samples\/config"\);\s*$/);
+    assert.match(body(CLI, "configDirSetting"), /^\s*return pathSetting\("configDir", PATH_FALLBACK\.configDir\);\s*$/);
     assert.match(body(CLI, "serviceConfig"), /^\s*return serviceConfigSetting\(\)\.value;\s*$/);
-    assert.match(body(CLI, "serviceConfigSetting"), /^\s*return pathSetting\("serviceConfig", "messagefoundry\.toml"\);\s*$/);
+    assert.match(body(CLI, "serviceConfigSetting"), /^\s*return pathSetting\("serviceConfig", PATH_FALLBACK\.serviceConfig\);\s*$/);
+    // The fallbacks agree with the manifest defaults.
+    assert.match(CLI, /configDir: "samples\/config",\s*serviceConfig: "messagefoundry\.toml",\s*messageSetsDir: "samples\/messages",/);
     assert.ok(/containedPathSetting\(seen, workspaceDir\(\), fallback\)/.test(CLI), "pathSetting no longer contains");
   });
 
@@ -280,7 +288,7 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     }
     const t = body(CLI, "writerConfigTarget");
     assert.match(t, /writerPathSetting\("configDir"\)/);
-    assert.match(t, /writerPathSetting\("serviceConfig"\)/);
+    assert.match(t, /writerSetting\("serviceConfig"\)/);
   });
 });
 

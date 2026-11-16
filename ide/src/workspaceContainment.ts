@@ -123,8 +123,8 @@ export interface PathSettingScopes {
  * `node:path`, which throws on one. No answer at all (`seen` undefined) gives `fallback`, so an
  * unread scope is never taken as permission. The answer also names the scope the value came from
  * and which scope's value, if any, was dropped, so a caller never re-derives either from the raw
- * scopes. A command that writes or launches under the setting reads it through
- * {@link writerPathValue}, which refuses a dropped value rather than act on the one used in its place.
+ * scopes. A command that writes or launches under the setting refuses a dropped value rather than
+ * act on the one used in its place, and shows {@link writerRefusal} (cli.ts `writerPathSetting`).
  *
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
  * these settings. It does not catch a link or junction inside the folder that leads out of it, or a
@@ -165,25 +165,29 @@ export interface ContainedPathSetting {
   readonly dropped: DroppedScope | false;
 }
 
+/** Why `messagefoundry.<key>` was dropped, as both notices below say it. It names the setting and
+ *  the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
+function droppedWhy(key: string, dropped: DroppedScope): string {
+  return dropped === "workspace"
+    ? `messagefoundry.${key}, set in workspace settings, is not a path inside the workspace folder, or no folder is open`
+    : `messagefoundry.${key}, set in user settings, is not text`;
+}
+
+/** The warning a READER shows once per dropped value: it goes on with the value used in its place. */
+export function droppedNotice(key: string, dropped: DroppedScope): string {
+  const use = dropped === "workspace" ? " To use a path elsewhere, set it in user settings." : "";
+  return `${droppedWhy(key, dropped)}, so it is not used.${use}`;
+}
+
 /**
- * The value a command that WRITES or LAUNCHES under a path setting may act on, or undefined when a
+ * The refusal a command that WRITES or LAUNCHES under a path setting shows instead of acting, when a
  * value the operator wrote was dropped (BACKLOG #5404). A reader may go on with the value used in
  * the dropped one's place; a writer must not, because the operator named a different file or folder,
  * and an alert rule, code set, connection, generated message, reload or engine Start aimed at the
- * substitute lands where nobody chose. The caller shows {@link writerRefusal} instead.
+ * substitute lands where nobody chose.
  */
-export function writerPathValue(s: ContainedPathSetting): string | undefined {
-  return s.dropped === false ? s.value : undefined;
-}
-
-/** The refusal a writer shows when {@link writerPathValue} answers undefined. It names the setting
- *  and the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
 export function writerRefusal(key: string, dropped: DroppedScope): string {
-  const why =
-    dropped === "workspace"
-      ? "set in workspace settings, is not a path inside the workspace folder, or no folder is open"
-      : "set in user settings, is not text";
   const fix = dropped === "workspace" ? "Fix the workspace value, or set the path in user settings." : "Fix the user value.";
-  return `MessageFoundry: messagefoundry.${key}, ${why}, so nothing was written or started. ${fix}`;
+  return `MessageFoundry: ${droppedWhy(key, dropped)}, so nothing was written or started. ${fix}`;
 }
 

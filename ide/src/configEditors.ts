@@ -196,9 +196,13 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // form here is an in-place edit of `renderedName` (name locked) or the blank new form
           // (renderedName null). A list failure aborts the save — upserting the bare post would
           // re-strip every non-rendered key, so failing closed is the only non-destructive option.
+          const target = writerConfigTarget();
+          if (target === undefined) {
+            return;
+          }
           let fresh: ConnObj[];
           try {
-            fresh = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+            fresh = await runJson<ConnObj[]>(["connection", "list", "--config", target.configDir], ws);
           } catch (e) {
             postToWebview(panel.webview, {
               command: "error",
@@ -214,10 +218,6 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           });
           if (plan.collision) {
             postToWebview(panel.webview, { command: "error", message: nameCollisionError(plan.collision) });
-            return;
-          }
-          const target = writerConfigTarget();
-          if (target === undefined) {
             return;
           }
           markSaving();
