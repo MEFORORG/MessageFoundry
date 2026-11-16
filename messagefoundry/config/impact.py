@@ -52,7 +52,7 @@ from messagefoundry.config.reachability import (
     source_lines,
     table_kinds,
 )
-from messagefoundry.config.wiring import Registry, WiringError, case_twins, config_py_files
+from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.redaction import safe_exc
@@ -216,12 +216,14 @@ def plan_rename(
         )
     # And onto a case twin of another connection, which graph_problems refuses (BACKLOG #5392).
     if target_kind in ("inbound", "outbound"):
-        others = [n for n in _table(registry, target_kind) if n != old]
-        twin = next(case_twins([*others, new]), None)
-        if twin is not None and twin[1] == new:
+        folded = new.casefold()
+        twin = next(
+            (n for n in _table(registry, target_kind) if n != old and n.casefold() == folded), None
+        )
+        if twin is not None:
             raise WiringError(
                 f"cannot rename {target_kind} {old!r} to {new!r}: it differs only in case from "
-                f"the registered {target_kind} {twin[0]!r}"
+                f"the registered {target_kind} {twin!r}"
             )
 
     sources = SourceCache()

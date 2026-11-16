@@ -287,7 +287,9 @@ def test_every_record_namespace_has_one_helper() -> None:
     # A string literal, either quote, f-string or not, that opens with a prefix and goes on to a
     # placeholder or ends there to be concatenated. An error message such as "db_lookup: no ..." is
     # prose, not a record name.
-    spelled_re = re.compile(r"""\bf?(["'])(?:db_lookup|reference|inbound|fhir_lookup):(?:\{|\1)""")
+    spelled_re = re.compile(
+        r"""(?<!\w)[rRbBuU]?[fF]?[rR]?(["'])(?:db_lookup|reference|inbound|fhir_lookup):(?:\{|\1)"""
+    )
     spelled = [
         f"{path.relative_to(root)}: {match.group(0)}"
         for path in root.rglob("*.py")

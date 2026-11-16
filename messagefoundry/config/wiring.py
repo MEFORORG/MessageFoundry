@@ -6335,10 +6335,10 @@ def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
     """Each pair of ``names`` that differ only in case, as (first declared, later one) (BACKLOG
     #5392). A SQL Server store with a case-insensitive default collation compares the queue,
     response and scope rows a connection name keys without case, so two such connections would
-    share them there while SQLite and Postgres keep them apart. A connection name is ASCII (the
-    name rule), so ``casefold`` is exactly that collation's comparison for it; trailing spaces and
-    width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and an outbound
-    may share a name, as they may exactly."""
+    share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
+    ASCII (the name rule), so ``casefold`` is exactly that collation's comparison for it; trailing
+    spaces and width, which SQL Server also ignores, cannot occur in one. Per table: an inbound and
+    an outbound may share a name, as they may exactly."""
     seen: dict[str, str] = {}
     for name in names:
         first = seen.setdefault(name.casefold(), name)
@@ -6376,10 +6376,6 @@ class Registry:
     # (the SQL kind): the RegistryRunner builds one read executor from these; fhir_lookup(name, query)
     # reads it at handler run time. Carried with the graph so a reload re-arms the executor atomically.
     fhir_lookups: dict[str, FhirLookupSpec] = field(default_factory=dict)
-    #: ``_add``'s case-folded name index, per kind: folded name -> the name as declared.
-    _folded_names: dict[str, dict[str, str]] = field(
-        default_factory=dict, repr=False, compare=False
-    )
     # Engine-shard identity (ADR 0073), attached by pipeline.sharding.filter_registry_for_shard and
     # None on an unfiltered graph OR a single-shard config (which stays byte-identical to plain
     # `serve`). shard_id names THIS process's shard; all_shard_ids pins the full shard universe of
@@ -6562,12 +6558,13 @@ class Registry:
         for kind, table in (
             ("inbound connection", self.inbound),
             ("outbound connection", self.outbound),
+            ("fhir lookup", self.fhir_lookups),
         ):
             for first, second in case_twins(table):
                 yield (
-                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and a "
-                    "SQL Server store with a case-insensitive collation would give the two one "
-                    "set of queue, response and scope rows"
+                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and "
+                    "a SQL Server store column that compares without case, at least the alert "
+                    "and event columns, would read the two as one"
                 )
         for conn in self.inbound.values():
             if conn.router not in self.routers:
