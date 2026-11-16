@@ -5505,6 +5505,7 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
     # as the gates above: every shard would refuse, and the supervisor would only restart them. The
     # store key file is checked before the renewal below can open the store and read it.
+    from messagefoundry.pipeline.secret_rotation import UnrolledStoreKeyRefused
     from messagefoundry.restricted_file import RestrictedFileError
     from messagefoundry.store.base import KeylessAuditChainRefused
 
@@ -5571,6 +5572,9 @@ def _supervise(args: argparse.Namespace) -> int:
     try:
         state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except UnrolledStoreKeyRefused as exc:  # BACKLOG #4934: in full, since it carries the remedy
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except RestrictedFileError as exc:  # the TLS key could not be created restricted

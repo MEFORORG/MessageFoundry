@@ -853,9 +853,10 @@ the next start may do.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
-- **Reversible:** the setting is, the break is not. The chain stays broken at that row, and turning
-  the setting back off makes the next start refuse again, because the chain's range is still under
-  the lost key.
+- **Reversible:** no, once a start has used it. The chain stays broken at that row, and the store
+  needs the setting on for every later start: turned back off, the next start refuses again,
+  because the chain's range is still under the lost key, and no `rotate-key` run can move it. Set
+  only and never used, it changes nothing and can be removed.
 
 ### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
 Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A
