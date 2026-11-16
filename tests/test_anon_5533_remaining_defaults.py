@@ -122,7 +122,9 @@ def _out(adapter: Callable[..., str]) -> str:
 
 @functools.cache
 def _out_without_new_rules(adapter: Callable[..., str]) -> str:
-    rules = tuple(r for r in engine_rules.DEFAULT_RULES if r.path not in _NEW_DEFAULTS)
+    """Each adapter runs on its own copy of the defaults, less the fields this pass added."""
+    module: Any = tee_rules if adapter is tee_anonymize else engine_rules
+    rules = tuple(r for r in module.DEFAULT_RULES if r.path not in _NEW_DEFAULTS)
     return adapter(_MESSAGE, salt=_SALT, rules=rules)
 
 

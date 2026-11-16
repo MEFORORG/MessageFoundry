@@ -2790,6 +2790,9 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-6`, `PV1-11`, `PV1-42`, `PV1-43` | Prior, temporary, pending and prior temporary patient locations (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 | `PID-23` | Birth place (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
+| `GT1-24` | Guarantor's death date and time (BACKLOG #5533) | `date` |
+| `GT1-56`, `NK1-38` | Birth places of the guarantor and the next of kin (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
+| `PV1-37` | Discharged-to location and its effective date (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]`, its location code too |
 
 What the `date` kind does to a value:
 
