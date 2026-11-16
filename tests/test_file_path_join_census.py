@@ -1136,10 +1136,13 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/testBench.ts": Site(1, OPERATOR, "The fixtures setting, under the workspace."),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
-        4,
+        8,
         GUARDED,
-        "The containment check itself: it refuses a workspace setting whose spelling, and then whose "
-        "real path, relative to the workspace climbs out or is absolute.",
+        "The containment checks themselves. resolveInsideWorkspace refuses a setting whose spelling, "
+        "and then whose real path, relative to the workspace climbs out or is absolute. "
+        "containedPathSetting resolves a workspace value only to compare its spelling with the "
+        "folder, and drops it when it is outside. committedRelativePath resolves a value only to "
+        "return it relative to the folder, and refuses one outside it by spelling. None opens a file.",
         "ide/src/workspaceContainment.ts::path.relative(root, target)",
     ),
 }

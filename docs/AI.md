@@ -194,8 +194,9 @@ local `messagefoundry ai-policy` CLI, but only for the default engine target, an
 has never held any engine's answer. The CLI is always given `--service-config`, naming
 `messagefoundry.serviceConfig` or, when that is unset or blank, `messagefoundry.toml`, so a missing
 or unreadable settings file is refused rather than read as the built-in default. With no workspace
-folder open, the CLI is not asked unless that path is absolute, since a relative one would be read
-from the editor's own working directory. A workspace value of `messagefoundry.serviceConfig` whose
+folder open, the CLI is not asked unless that path is fully qualified, since a relative one would be
+read from the editor's own working directory. On Windows that means a drive-letter or UNC path: a
+root-relative `\svc\x.toml` takes the current drive and is refused too. A workspace value of `messagefoundry.serviceConfig` whose
 spelling names a path outside the workspace folder is not used, and the user's value or the
 default is named instead; the check reads the spelling only, not links inside the folder. If none
 of those can confirm a policy, it uses a fail-closed

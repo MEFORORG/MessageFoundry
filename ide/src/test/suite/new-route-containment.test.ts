@@ -263,7 +263,33 @@ wizardSuite("The New Route wizard writes only inside a trusted workspace (BACKLO
     stubConfigDir = "../outside";
     await create();
     assert.deepStrictEqual(writes, []);
-    assert.ok(messages.some((m) => m.level === "error" && /does not resolve inside/.test(m.text)), JSON.stringify(messages));
+    // The refusal names the setting, the scope it was written in and why, not the folder check's cause.
+    assert.ok(
+      messages.some(
+        (m) => m.level === "error" && /messagefoundry\.configDir, set in workspace settings, is not a path inside/.test(m.text),
+      ),
+      JSON.stringify(messages),
+    );
+  });
+
+  test("a user configDir that is not text writes nothing and names the user scope (BACKLOG #5404)", async () => {
+    stubConfigDir = 42 as unknown as string;
+    await create();
+    assert.deepStrictEqual(writes, []);
+    assert.ok(
+      messages.some((m) => m.level === "error" && /messagefoundry\.configDir, set in user settings, is not text/.test(m.text)),
+      JSON.stringify(messages),
+    );
+  });
+
+  test("a user configDir that passes the setting check but not the folder check names that cause", async () => {
+    stubConfigDir = "../outside";
+    await create();
+    assert.deepStrictEqual(writes, []);
+    assert.ok(
+      messages.some((m) => m.level === "error" && /does not resolve inside this workspace folder: it lies outside it/.test(m.text)),
+      JSON.stringify(messages),
+    );
   });
 
   test("control: the same workspace configDir inside the workspace writes the module", async () => {

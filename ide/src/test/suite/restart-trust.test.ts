@@ -65,6 +65,10 @@ const vscodeStub = {
       return Promise.resolve(undefined);
     },
     showWarningMessage: (): Promise<undefined> => Promise.resolve(undefined),
+    showErrorMessage: (message: string): Promise<undefined> => {
+      notices.push(message);
+      return Promise.resolve(undefined);
+    },
     onDidCloseTerminal: (listener: (t: unknown) => void) => {
       closeListeners.add(listener);
       return { dispose: (): void => void closeListeners.delete(listener) };
@@ -243,8 +247,11 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     stubScope = "workspaceValue";
     const run = await restart(LOOPBACK);
 
-    // The containment names the default file in its place, inside the workspace.
-    assert.deepStrictEqual(run.statted, [`statSync ${path.resolve(ws, "messagefoundry.toml")}`]);
+    // The containment drops the value, and a launch refuses rather than start on the default file
+    // used in its place, so nothing is statted at all.
+    assert.deepStrictEqual(run.statted, []);
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.match(notices[0], /messagefoundry\.serviceConfig, set in workspace settings, is not a path inside/);
     assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
   });

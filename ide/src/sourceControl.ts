@@ -10,7 +10,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
-import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
+import { configDir, messageSetsDir, run, workspaceDir, writerPathSetting } from "./cli";
+import { committedRelativePath } from "./workspaceContainment";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { sourceControlScript } from "./sourceControlWebview";
@@ -102,6 +103,11 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
     void vscode.window.showWarningMessage(UNTRUSTED_SETUP_MESSAGE);
     return;
   }
+  // Read before git init, so a refusal leaves nothing half set up.
+  const hookPaths = hookPathValues(ws);
+  if (hookPaths === undefined) {
+    return;
+  }
 
   const bin = await findGit();
   if (!bin) {
@@ -134,7 +140,7 @@ export async function setupSourceControl(_context: vscode.ExtensionContext): Pro
   const notes: string[] = [];
   notes.push(`.gitignore: ${await scaffoldGitignore(ws)}`);
   notes.push(`.gitattributes: ${await scaffoldGitattributes(ws)}`);
-  notes.push(`hook: ${await scaffoldHook(bin, ws)}`);
+  notes.push(`hook: ${await scaffoldHook(bin, ws, hookPaths)}`);
   notes.push(`core.hooksPath: ${await wireHooksPath(bin, ws)}`);
 
   // Logged here, before the prompts below. Every line is time-stamped, so logging these after the
@@ -214,13 +220,41 @@ function shSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-async function scaffoldHook(bin: string, ws: string): Promise<string> {
+/** The workspace-relative `configDir` and `messageSetsDir` the committed hook names, or undefined
+ *  after a refusal. Each is read as a write (BACKLOG #5404): a dropped value refuses rather than
+ *  bake the substitute into the hook. A path outside the folder, which a user setting can name,
+ *  refuses too, because the hook is committed and every clone would run it against this machine's
+ *  layout (see committedRelativePath). */
+function hookPathValues(ws: string): { configDir: string; messagesDir: string } | undefined {
+  const cfg = writerPathSetting("configDir");
+  const msgs = cfg === undefined ? undefined : writerPathSetting("messageSetsDir");
+  if (cfg === undefined || msgs === undefined) {
+    return undefined;
+  }
+  const configRel = committedRelativePath(ws, cfg);
+  const messagesRel = committedRelativePath(ws, msgs);
+  if (configRel === undefined || messagesRel === undefined) {
+    const key = configRel === undefined ? "configDir" : "messageSetsDir";
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: messagefoundry.${key} names a path outside the workspace folder. The commit hook is ` +
+        "committed to the repository, so it names folders inside the workspace only; nothing was set up.",
+    );
+    return undefined;
+  }
+  return { configDir: configRel, messagesDir: messagesRel };
+}
+
+async function scaffoldHook(
+  bin: string,
+  ws: string,
+  paths: { configDir: string; messagesDir: string },
+): Promise<string> {
   // Function replacements (not string ones) — a string replacement would interpret `$`-sequences
   // (e.g. `$'`) in the quoted value, re-injecting unescaped text.
   const hook = PRE_COMMIT_TEMPLATE.replace(
     /__CONFIG_DIR__/g,
-    () => shSingleQuote(configDir()),
-  ).replace(/__MESSAGES_DIR__/g, () => shSingleQuote(messageSetsDir()));
+    () => shSingleQuote(paths.configDir),
+  ).replace(/__MESSAGES_DIR__/g, () => shSingleQuote(paths.messagesDir));
   const hookPath = path.join(ws, HOOKS_DIR, "pre-commit");
   await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.join(ws, HOOKS_DIR)));
   await vscode.workspace.fs.writeFile(vscode.Uri.file(hookPath), Buffer.from(hook, "utf8"));

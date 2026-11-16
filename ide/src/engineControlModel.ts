@@ -9,7 +9,7 @@
 // the gating in engineStatusModel's EngineControlContext (WHETHER to offer Start), and the invocation
 // built here (WHAT Start runs): the exact command ADR 0110 blessed for the clipboard — `serve --config
 // <dir>` with NO --db/--env overrides, so the service TOML stays the sole authority on store + environment.
-import * as path from "node:path";
+import { isFullyQualifiedPath } from "./engineTrustModel";
 
 /** The interpreter import used to preflight before launching `serve`. It is `serve`'s own early import
  *  chain (config.models imports pydantic), so it fails for BOTH "wrong interpreter, no messagefoundry"
@@ -95,9 +95,8 @@ export function aiPolicyCliPlan(
   const file = aiPolicyServiceFile(setting, isSet);
   // `!workspace`, not `=== undefined`: an empty string is no folder either. Fully qualified, not
   // just absolute: on Windows a root-relative `\svc\x.toml` is absolute but still takes the
-  // current drive, so it must resolve to itself.
-  const qualified = path.isAbsolute(file) && path.resolve(file) === path.normalize(file);
-  if (!workspace && !qualified) {
+  // current drive. The test is engine trust's own, so the two folderless rules cannot drift.
+  if (!workspace && !isFullyQualifiedPath(file)) {
     return undefined;
   }
   return { args: aiPolicyCliArgs(setting, isSet), cwd: workspace || undefined };

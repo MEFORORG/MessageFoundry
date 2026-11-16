@@ -75,6 +75,22 @@ export function resolveInsideWorkspace(ws: string, dir: string): string | undefi
   return isWithin(root, target) ? logical : undefined;
 }
 
+/**
+ * `value` as a workspace-relative path with forward slashes, for a file committed to the repository
+ * such as the pre-commit hook, or undefined when its spelling does not lie inside `ws`. A user-scope
+ * absolute path is the operator's own and names a file on this machine only, so a hook committed
+ * with it would point every other clone at that machine's layout. Spelling only, with no I/O.
+ */
+export function committedRelativePath(ws: string, value: string): string | undefined {
+  const root = path.resolve(ws);
+  const target = path.resolve(root, value);
+  if (!isWithin(root, target)) {
+    return undefined;
+  }
+  const rel = path.relative(root, target);
+  return rel === "" ? "." : rel.split(path.sep).join("/");
+}
+
 function isWithin(root: string, target: string): boolean {
   const rel = path.relative(root, target);
   return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
@@ -102,10 +118,13 @@ export interface PathSettingScopes {
  * first workspace folder, the one every CLI call runs in, so in a multi-root workspace a value
  * naming another of its folders is dropped too: the fail-closed reading.
  *
- * A user-set value is the operator's own choice and is returned as written. No answer at all (`seen`
- * undefined) gives `fallback`, so an unread scope is never taken as permission. The answer also
- * names the scope the value came from and whether a workspace value was dropped, so a caller never
- * re-derives either from the raw scopes.
+ * A user-set value is the operator's own choice and is returned as written when it is text. One that
+ * is not text is dropped too, for the default, so no caller hands a number or an object to
+ * `node:path`, which throws on one. No answer at all (`seen` undefined) gives `fallback`, so an
+ * unread scope is never taken as permission. The answer also names the scope the value came from
+ * and which scope's value, if any, was dropped, so a caller never re-derives either from the raw
+ * scopes. A command that writes or launches under the setting reads it through
+ * {@link writerPathValue}, which refuses a dropped value rather than act on the one used in its place.
  *
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
  * these settings. It does not catch a link or junction inside the folder that leads out of it, or a
@@ -124,21 +143,47 @@ export function containedPathSetting(
   if (typeof v === "string" && ws && isWithin(path.resolve(ws), path.resolve(ws, v))) {
     return { value: v, source: "workspace", dropped: false };
   }
-  const dropped = v !== undefined;
-  if (seen.globalValue !== undefined) {
-    // As written even when it is not text, as `get` returned it, so a malformed user value still
-    // reaches the callers' own refusals (connectionServiceConfig names it as an empty path).
-    return { value: seen.globalValue as string, source: "user", dropped };
+  const u = seen.globalValue;
+  if (typeof u === "string") {
+    return { value: u, source: "user", dropped: v !== undefined ? "workspace" : false };
   }
+  // A workspace drop is named first: it is the value the operator is most likely to be reading.
+  const dropped = v !== undefined ? "workspace" : u !== undefined ? "user" : false;
   const value = typeof seen.defaultValue === "string" ? seen.defaultValue : fallback;
   return { value, source: "default", dropped };
 }
 
-/** {@link containedPathSetting}'s answer: the value, the scope it came from, and whether a
- *  workspace value was dropped on the way. */
+/** The scope whose value {@link containedPathSetting} dropped: a workspace value that is not inside
+ *  the folder (or set with no folder open), or a user value that is not text. */
+export type DroppedScope = "workspace" | "user";
+
+/** {@link containedPathSetting}'s answer: the value, the scope it came from, and which scope's value
+ *  was dropped on the way, if any. */
 export interface ContainedPathSetting {
   readonly value: string;
   readonly source: "workspace" | "user" | "default";
-  readonly dropped: boolean;
+  readonly dropped: DroppedScope | false;
+}
+
+/**
+ * The value a command that WRITES or LAUNCHES under a path setting may act on, or undefined when a
+ * value the operator wrote was dropped (BACKLOG #5404). A reader may go on with the value used in
+ * the dropped one's place; a writer must not, because the operator named a different file or folder,
+ * and an alert rule, code set, connection, generated message, reload or engine Start aimed at the
+ * substitute lands where nobody chose. The caller shows {@link writerRefusal} instead.
+ */
+export function writerPathValue(s: ContainedPathSetting): string | undefined {
+  return s.dropped === false ? s.value : undefined;
+}
+
+/** The refusal a writer shows when {@link writerPathValue} answers undefined. It names the setting
+ *  and the scope it was written in, never the value (docs/REVIEW-STANDARDS.md R12). */
+export function writerRefusal(key: string, dropped: DroppedScope): string {
+  const why =
+    dropped === "workspace"
+      ? "set in workspace settings, is not a path inside the workspace folder, or no folder is open"
+      : "set in user settings, is not text";
+  const fix = dropped === "workspace" ? "Fix the workspace value, or set the path in user settings." : "Fix the user value.";
+  return `MessageFoundry: messagefoundry.${key}, ${why}, so nothing was written or started. ${fix}`;
 }
 

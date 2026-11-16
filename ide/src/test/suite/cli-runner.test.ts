@@ -8,7 +8,7 @@ import * as path from "path";
 
 import { ENGINE_MODULE, TOOLKIT_MODULE } from "../../cliJson";
 import { INTERPRETER_OPTIONS, aiPolicyCliArgs, aiPolicyCliPlan, cliArgv } from "../../engineControlModel";
-import { containedPathSetting } from "../../workspaceContainment";
+import { committedRelativePath, containedPathSetting, writerPathValue, writerRefusal } from "../../workspaceContainment";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 
@@ -140,15 +140,46 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     assert.deepStrictEqual(containedPathSetting({ defaultValue: "x.toml", workspaceValue: OUT }, WS, "d"), {
       value: "x.toml",
       source: "default",
-      dropped: true,
+      dropped: "workspace",
     });
     assert.deepStrictEqual(containedPathSetting({ globalValue: "u", workspaceValue: "../in" }, WS, "d"), {
       value: "u",
       source: "user",
-      dropped: true,
+      dropped: "workspace",
     });
-    // A malformed user value passes through as `get` returned it, for the callers' own refusals.
-    assert.strictEqual(containedPathSetting({ globalValue: 42 }, WS, "d").source, "user");
+  });
+
+  test("a user value that is not text is dropped for the default, so node:path never sees it", () => {
+    for (const bad of [42, null, { a: 1 }, ["cfg"], true]) {
+      const s = containedPathSetting({ defaultValue: "x.toml", globalValue: bad }, WS, "d");
+      assert.deepStrictEqual(s, { value: "x.toml", source: "default", dropped: "user" }, JSON.stringify(bad));
+      // The value every reader hands node:path is text, so these cannot throw.
+      assert.doesNotThrow(() => path.isAbsolute(s.value));
+    }
+    // With a workspace value dropped too, the workspace drop is the one named.
+    assert.strictEqual(containedPathSetting({ globalValue: 42, workspaceValue: OUT }, WS, "d").dropped, "workspace");
+    // Control: before the fix, path.isAbsolute throws on the value as `get` returned it.
+    assert.throws(() => path.isAbsolute(42 as unknown as string), TypeError);
+  });
+
+  test("a writer gets no value when one was dropped, and its refusal names the setting and scope", () => {
+    assert.strictEqual(writerPathValue(containedPathSetting({ globalValue: "mine", workspaceValue: OUT }, WS, "d")), undefined);
+    assert.strictEqual(writerPathValue(containedPathSetting({ defaultValue: "x", globalValue: 42 }, WS, "d")), undefined);
+    assert.strictEqual(writerPathValue(containedPathSetting({ workspaceValue: "cfg" }, undefined, "d")), undefined);
+    // Controls: nothing dropped, so the writer acts on the value a reader sees.
+    assert.strictEqual(writerPathValue(containedPathSetting({ globalValue: OUT }, WS, "d")), OUT);
+    assert.strictEqual(writerPathValue(containedPathSetting({ workspaceValue: "cfg" }, WS, "d")), "cfg");
+    assert.strictEqual(writerPathValue(containedPathSetting({ defaultValue: "x" }, WS, "d")), "x");
+    assert.match(writerRefusal("configDir", "workspace"), /messagefoundry\.configDir, set in workspace settings, is not a path inside/);
+    assert.match(writerRefusal("serviceConfig", "user"), /messagefoundry\.serviceConfig, set in user settings, is not text/);
+  });
+
+  test("a committed hook path is workspace-relative with forward slashes, or refused", () => {
+    assert.strictEqual(committedRelativePath(WS, "samples/config"), "samples/config");
+    assert.strictEqual(committedRelativePath(WS, path.join(WS, "samples", "config")), "samples/config");
+    assert.strictEqual(committedRelativePath(WS, "."), ".");
+    assert.strictEqual(committedRelativePath(WS, OUT), undefined);
+    assert.strictEqual(committedRelativePath(WS, "../shared"), undefined);
   });
 
   test("a workspace value inside the folder is used", () => {
@@ -180,10 +211,11 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
   });
 
   const contained = (src: string, name: string): boolean =>
-    new RegExp(`^\\s*return pathSetting\\("${name}", "[^"]+"\\)\\.value;\\s*$`).test(body(src, name));
+    new RegExp(`^\\s*return ${name}Setting\\(\\)\\.value;\\s*$`).test(body(src, name));
 
   test("configDir, serviceConfig and messageSetsDir read through pathSetting, which contains them", () => {
-    assert.ok(contained(CLI, "messageSetsDir"), "messageSetsDir does not read through pathSetting");
+    assert.match(body(CLI, "messageSetsDir"), /^\s*return messageSetsDirSetting\(\)\.value;\s*$/);
+    assert.match(body(CLI, "messageSetsDirSetting"), /^\s*return pathSetting\("messageSetsDir", "samples\/messages"\);\s*$/);
     assert.match(body(CLI, "configDir"), /^\s*return configDirSetting\(\)\.value;\s*$/);
     assert.match(body(CLI, "configDirSetting"), /^\s*return pathSetting\("configDir", "samples\/config"\);\s*$/);
     assert.match(body(CLI, "serviceConfig"), /^\s*return serviceConfigSetting\(\)\.value;\s*$/);
@@ -202,6 +234,53 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
   test("control: the pre-fix reader fails the predicate", () => {
     const pre = 'export function configDir(): string {\n  return config().get<string>("configDir", "samples/config");\n}';
     assert.ok(!contained(pre, "configDir"));
+  });
+
+  // A writer that read the substitute would act on a file or folder nobody chose (BACKLOG #5404).
+  const READER_IN_WRITE = [
+    /"codeset", "(?:upsert|rename|remove)", "--config", configDir\(\)/,
+    /"alert", "(?:add|remove)", "--service-config", serviceConfig\(\)/,
+    /connection(?:Upsert|Remove)Args\(configDir\(\)/,
+    /connectionServiceConfig\(serviceConfig\(\), serviceConfigIsSet\(\)\)/,
+  ];
+  const offenders = (src: string): RegExp[] => READER_IN_WRITE.filter((re) => re.test(src));
+
+  test("no writer hands the CLI a path setting read by a reader accessor", () => {
+    const files = fs.readdirSync(SRC).filter((f) => f.endsWith(".ts"));
+    for (const f of files) {
+      assert.deepStrictEqual(offenders(code(f)).map(String), [], `${f} writes with a reader accessor`);
+    }
+  });
+
+  test("control: the pre-fix writer argvs fail the scan", () => {
+    assert.strictEqual(offenders('["codeset", "remove", "--config", configDir(), "--name", n]').length, 1);
+    assert.strictEqual(offenders('["alert", "add", "--service-config", serviceConfig(), "--data", d]').length, 1);
+    assert.strictEqual(
+      offenders("connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), c)").length,
+      2,
+    );
+  });
+
+  test("the writers read through writerPathSetting", () => {
+    for (const [file, key] of [
+      ["alertEditor.ts", "serviceConfig"],
+      ["codeSetEditor.ts", "configDir"],
+      ["configEditors.ts", "configDir"],
+      ["extension.ts", "configDir"],
+      ["generate.ts", "messageSetsDir"],
+      ["promote.ts", "configDir"],
+      ["newRoute.ts", "configDir"],
+      ["sourceControl.ts", "configDir"],
+      ["sourceControl.ts", "messageSetsDir"],
+    ] as const) {
+      assert.ok(code(file).includes(`writerPathSetting("${key}")`), `${file} no longer reads ${key} as a writer`);
+    }
+    for (const file of ["configEditors.ts", "connectionEditor.ts", "connectionQuickInput.ts", "statusBar.ts"]) {
+      assert.ok(code(file).includes("writerConfigTarget()"), `${file} no longer reads its target as a writer`);
+    }
+    const t = body(CLI, "writerConfigTarget");
+    assert.match(t, /writerPathSetting\("configDir"\)/);
+    assert.match(t, /writerPathSetting\("serviceConfig"\)/);
   });
 });
 

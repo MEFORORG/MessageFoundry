@@ -15,7 +15,14 @@ import * as vscode from "vscode";
 import { runJson, serviceConfigSetting, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
-import { ShownFile, saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
+import {
+  ShownFile,
+  saveUpdatesProblem,
+  securityConfigInput,
+  securityConfigTarget,
+  securitySetArgs,
+  securityShowArgs,
+} from "./securityEditorModel";
 
 interface ShowResult {
   values: Record<string, unknown>;
@@ -91,12 +98,8 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
 function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
   // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
-  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer. A
-  // workspace value cli.ts's containment dropped (BACKLOG #5404) is checked as written, so it is
-  // refused here as before rather than this editor reading and saving the file used in its place.
-  const setting = serviceConfigSetting();
-  const value = setting.dropped ? seen?.workspaceValue : setting.value;
-  const fromWorkspace = seen === undefined || setting.dropped || setting.source === "workspace";
+  // A value cli.ts's containment dropped (BACKLOG #5404) is checked as written; securityConfigInput.
+  const { value, fromWorkspace } = securityConfigInput(seen, serviceConfigSetting());
   const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,

@@ -32,6 +32,7 @@ import {
   serviceConfig,
   serviceConfigIsSet,
   workspaceDir,
+  writerConfigTarget,
 } from "./cli";
 import {
   SERVE_DEFAULT_SERVICE_CONFIG,
@@ -578,7 +579,13 @@ export class EngineStatusBar implements vscode.Disposable {
     }
     // Read once (BACKLOG #5566): the guard below and every command this Start runs use this one
     // value, so a settings change while a prompt or the provisioning terminal is open cannot split them.
-    const serviceConfigArg = startServiceConfig();
+    // Read as a launch (BACKLOG #5404): a dropped workspace or user value refuses rather than start
+    // serve on the folder or file used in its place.
+    const launch = writerConfigTarget();
+    if (launch === undefined) {
+      return;
+    }
+    const serviceConfigArg = launch.serviceConfig;
     // A set service config that names no file: serve and provision-admin refuse it, so say so now
     // rather than prompt for a new store that the refusal would never create.
     const refusal = serviceConfigRefusal(ws, serviceConfigArg);
@@ -646,7 +653,7 @@ export class EngineStatusBar implements vscode.Disposable {
       askAdmin: () => askAdminDetails(),
       provisionInTerminal: (admin) => this.provisionInTerminal(python, ws, admin, serviceConfigArg),
       chooseAfterRefusal: (detail) => chooseAfterRefusal(detail),
-      serve: () => this.serveEngine(python, ws, serviceConfigArg),
+      serve: () => this.serveEngine(python, ws, launch.configDir, serviceConfigArg),
       report: (message) => notify(message),
     });
   }
@@ -717,10 +724,10 @@ export class EngineStatusBar implements vscode.Disposable {
   }
 
   /** Start `serve` in its own terminal. Reached only through the Start plan's `serve` effect. */
-  private serveEngine(python: string, ws: string, serviceConfigArg: string | undefined): void {
+  private serveEngine(python: string, ws: string, configDirArg: string, serviceConfigArg: string | undefined): void {
     const { command, args } = buildServeInvocation({
       python,
-      configDir: configDir(),
+      configDir: configDirArg,
       serviceConfig: serviceConfigArg,
     });
     const term = vscode.window.createTerminal({
@@ -776,7 +783,12 @@ export class EngineStatusBar implements vscode.Disposable {
     // The Start below would refuse a service config that names no file, so refuse BEFORE stopping
     // the running engine; otherwise a refused Restart acts as Stop (BACKLOG #5566).
     const ws = workspaceDir();
-    const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, startServiceConfig());
+    // A dropped value refuses here too, before the stop, for the same reason (BACKLOG #5404).
+    const launch = writerConfigTarget();
+    if (launch === undefined) {
+      return;
+    }
+    const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, launch.serviceConfig);
     if (refusal !== undefined) {
       notify(refusal);
       return;

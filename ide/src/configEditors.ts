@@ -14,11 +14,11 @@
 // reloading the (clean) document from disk, which is BYPASSED if the same file is also open, dirty, in
 // a text view.
 import * as vscode from "vscode";
-import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
+import { configDir, writerConfigTarget, runJson, workspaceDir, writerPathSetting } from "./cli";
 import { postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
 import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
+import { connectionRemoveArgs, connectionUpsertArgs } from "./connectionWizardModel";
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
@@ -216,9 +216,13 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
             postToWebview(panel.webview, { command: "error", message: nameCollisionError(plan.collision) });
             return;
           }
+          const target = writerConfigTarget();
+          if (target === undefined) {
+            return;
+          }
           markSaving();
           try {
-            await runJson(connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), plan.conn), ws);
+            await runJson(connectionUpsertArgs(target.configDir, target.serviceConfig, plan.conn), ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
@@ -228,6 +232,10 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           await render();
           void vscode.window.showInformationMessage(`MessageFoundry: saved ${m.conn.name} to connections.toml.`);
         } else if (m?.command === "delete" && m.name) {
+          const target = writerConfigTarget();
+          if (target === undefined) {
+            return;
+          }
           const confirm = await vscode.window.showWarningMessage(
             `Remove connection "${m.name}" from connections.toml?`,
             { modal: true },
@@ -238,7 +246,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           }
           markSaving();
           try {
-            await runJson(connectionRemoveArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), m.name), ws);
+            await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, m.name), ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
@@ -344,9 +352,13 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           return;
         }
         if (m?.command === "save" && m.detail) {
+          const dir = writerPathSetting("configDir");
+          if (dir === undefined) {
+            return;
+          }
           markSaving();
           try {
-            await runJson(["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(m.detail)], ws);
+            await runJson(["codeset", "upsert", "--config", dir, "--data", JSON.stringify(m.detail)], ws);
           } catch (e) {
             clearGuard();
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
@@ -355,6 +367,10 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
           await render();
           void vscode.window.showInformationMessage(`MessageFoundry: saved code set ${m.detail.name}.`);
         } else if (m?.command === "delete" && m.name) {
+          const dir = writerPathSetting("configDir");
+          if (dir === undefined) {
+            return;
+          }
           const confirm = await vscode.window.showWarningMessage(
             `Remove code set "${m.name}"?`,
             { modal: true },
@@ -364,7 +380,7 @@ export class CodeSetCustomEditorProvider implements vscode.CustomTextEditorProvi
             return;
           }
           try {
-            await runJson(["codeset", "remove", "--config", configDir(), "--name", m.name], ws);
+            await runJson(["codeset", "remove", "--config", dir, "--name", m.name], ws);
           } catch (e) {
             postToWebview(panel.webview, { command: "error", message: e instanceof Error ? e.message : String(e) });
             return;
