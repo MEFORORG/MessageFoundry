@@ -8068,141 +8068,166 @@ class SqlServerStore:
         # Whole: a slice cuts its note (#1797).
         detail = safe_text(detail, limit=200) if detail else detail
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
-        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._fence_scope(), self._acquire() as conn:
             try:
-                # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
-                await cur.execute(
-                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
-                    (outbox_id,),
-                )
-                row = await cur.fetchone()
-                if row is None:
-                    await self._commit(conn)
-                    return
-                message_id, destination_name, handler_name, attempts = (
-                    row[0],
-                    row[1],
-                    row[2],
-                    row[3],
-                )
-                # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
-                # response artifact, the re-ingress work-row, the ledger row and the finalize together.
-                # An artifact with no resolved queue row is the half-applied state C3 rejects.
-                await self._exec_terminal(
-                    cur,
-                    "complete_with_response",
-                    (outbox_id,),
-                    "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
-                    " lease_expires_at=NULL" + output + " WHERE id=?" + guard,
-                    (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
-                    checked=bool(guard),
-                )
-                await cur.execute(
-                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
-                    " WHERE message_id=? AND destination_name=?",
-                    (message_id, destination_name),
-                )
-                seq = int((await cur.fetchone())[0])
-                # Inline the PG _enc empty-guard: encrypt only a truthy value (never '' / None). Bound to
-                # the (message_id, dest, seq) response cell (ASVS 11.3.3).
-                enc_body = (
-                    self._cipher.encrypt(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
-                    )
-                    if body
-                    else body
-                )
-                enc_detail = (
-                    self._cipher.encrypt(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
-                    )
-                    if detail
-                    else detail
-                )
-                headers_json = encode_response_headers(response_headers)  # #154
-                enc_headers = (
-                    self._cipher.encrypt(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
-                    )
-                    if headers_json
-                    else headers_json
-                )
-                await cur.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail,"
-                    " resp_headers, captured_at)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        message_id,
-                        destination_name,
-                        seq,
-                        enc_body,
-                        outcome,
-                        enc_detail,
-                        enc_headers,
-                        now,
-                    ),
-                )
-                if reingress_to is not None:
-                    # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
-                    # free) — a token referencing the immutable artifact by PK, on the loopback lane.
-                    artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
-                    work_created = now
-                    # Hoist the row id so the artifact-ref payload binds to its own row tag.
-                    work_row_id = uuid4().hex
+                async with self._cursor(conn) as cur:
+                    # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
+                    # UPDLOCK (BACKLOG #5752): a second completion of the same row waits here and then
+                    # reads the first one's committed DONE, so only one reply is ever captured.
                     await cur.execute(
-                        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
-                        " handler_name, payload, status, attempts, next_attempt_at, owner,"
-                        " lease_expires_at, created_at, updated_at)"
-                        " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
-                        (
-                            work_row_id,
-                            message_id,
-                            Stage.RESPONSE.value,
-                            reingress_to,
-                            self._cipher.encrypt(
-                                artifact_ref,
-                                aad=queue_payload_aad(
-                                    row_id=work_row_id,
-                                    message_id=message_id,
-                                    stage=Stage.RESPONSE.value,
-                                    channel_id=reingress_to,
-                                    destination_name=None,
-                                    handler_name=None,
-                                    body_ref=None,
-                                ),
+                        "SELECT message_id, destination_name, handler_name, attempts, status"
+                        " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (outbox_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await self._commit(conn)
+                        return
+                    message_id, destination_name, handler_name, attempts = (
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                    )
+                    # A DONE row does not complete again (no second reply or re-ingress child); any
+                    # other still does, as on SQLite, and an armed H1 fence judges it below.
+                    if row[4] == OutboxStatus.DONE.value:
+                        log.warning(
+                            "complete_with_response: outbound row %s is already %s; nothing written",
+                            outbox_id,
+                            row[4],
+                        )
+                        await self._commit_read(conn)
+                        return
+                    # ADR 0157 C1: the guard rides THIS, the first write, so a rejection discards the
+                    # response artifact, the re-ingress work-row, the ledger row and the finalize together.
+                    # An artifact with no resolved queue row is the half-applied state C3 rejects.
+                    await self._exec_terminal(
+                        cur,
+                        "complete_with_response",
+                        (outbox_id,),
+                        "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
+                        " lease_expires_at=NULL" + output + " WHERE id=?" + guard,
+                        (OutboxStatus.DONE.value, now, outbox_id, *guard_params),
+                        checked=bool(guard),
+                    )
+                    # BACKLOG #5752: two rows of one message to one destination (two handlers) would read
+                    # the same MAX unlocked and collide on the response PK, rolling back a delivery the
+                    # partner already accepted. The per-message finalize applock, which _maybe_finalize
+                    # re-takes at the end as a no-op, serializes the read.
+                    await self._applock(cur, f"mefor:finalize:{message_id}")
+                    await cur.execute(
+                        "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                        " WHERE message_id=? AND destination_name=?",
+                        (message_id, destination_name),
+                    )
+                    seq = int((await cur.fetchone())[0])
+                    # Inline the PG _enc empty-guard: encrypt only a truthy value (never '' / None). Bound to
+                    # the (message_id, dest, seq) response cell (ASVS 11.3.3).
+                    enc_body = (
+                        self._cipher.encrypt(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        )
+                        if body
+                        else body
+                    )
+                    enc_detail = (
+                        self._cipher.encrypt(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        )
+                        if detail
+                        else detail
+                    )
+                    headers_json = encode_response_headers(response_headers)  # #154
+                    enc_headers = (
+                        self._cipher.encrypt(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
                             ),
-                            OutboxStatus.PENDING.value,
-                            now,
-                            work_created,
+                        )
+                        if headers_json
+                        else headers_json
+                    )
+                    await cur.execute(
+                        "INSERT INTO response"
+                        " (message_id, destination_name, response_seq, body, outcome, detail,"
+                        " resp_headers, captured_at)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            message_id,
+                            destination_name,
+                            seq,
+                            enc_body,
+                            outcome,
+                            enc_detail,
+                            enc_headers,
                             now,
                         ),
                     )
-                # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
-                await self._record_delivered_key(
-                    cur,
-                    outbox_id=outbox_id,
-                    message_id=message_id,
-                    destination_name=destination_name,
-                    handler_name=handler_name,
-                    now=now,
-                )
-                await self._event(
-                    cur,
-                    message_id,
-                    "delivered",
-                    destination_name,
-                    f"attempt {attempts} (response {outcome})",
-                    now,
-                )
-                # Finalizer last; preceded by the SELECT above so its applock is not the first statement.
-                await self._maybe_finalize(cur, message_id, now)
-                await self._commit(conn)
+                    if reingress_to is not None:
+                        # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
+                        # free) — a token referencing the immutable artifact by PK, on the loopback lane.
+                        artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
+                        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
+                        work_created = now
+                        # Hoist the row id so the artifact-ref payload binds to its own row tag.
+                        work_row_id = uuid4().hex
+                        await cur.execute(
+                            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                            " handler_name, payload, status, attempts, next_attempt_at, owner,"
+                            " lease_expires_at, created_at, updated_at)"
+                            " VALUES (?,?,?,?,NULL,NULL,?,?,0,?,NULL,NULL,?,?)",
+                            (
+                                work_row_id,
+                                message_id,
+                                Stage.RESPONSE.value,
+                                reingress_to,
+                                self._cipher.encrypt(
+                                    artifact_ref,
+                                    aad=queue_payload_aad(
+                                        row_id=work_row_id,
+                                        message_id=message_id,
+                                        stage=Stage.RESPONSE.value,
+                                        channel_id=reingress_to,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
+                                ),
+                                OutboxStatus.PENDING.value,
+                                now,
+                                work_created,
+                                now,
+                            ),
+                        )
+                    # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
+                    await self._record_delivered_key(
+                        cur,
+                        outbox_id=outbox_id,
+                        message_id=message_id,
+                        destination_name=destination_name,
+                        handler_name=handler_name,
+                        now=now,
+                    )
+                    await self._event(
+                        cur,
+                        message_id,
+                        "delivered",
+                        destination_name,
+                        f"attempt {attempts} (response {outcome})",
+                        now,
+                    )
+                    # Finalizer last; preceded by the SELECT above so its applock is not the first statement.
+                    await self._maybe_finalize(cur, message_id, now)
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #5752: the transaction may hold the finalize applock, so a failed
+                # rollback discards the connection rather than recycling it with the lock held.
+                # After the cursor closes, as reserve_upload_quota does.
+                await self._rollback_or_discard(conn)
                 raise
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
@@ -10537,6 +10562,32 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # BACKLOG #5740, as on SQLite: release the shared bodies these dead rows reference and
+                # NULL their body_ref BEFORE blanking. This backend writes no store-once row, but a
+                # restored one carries a body_ref, and a blanked payload left with it set still read
+                # as replayable: its shared body (PHI) and its message's attachment were never
+                # released. One statement NULLs and OUTPUTs the old refs, so the decref covers exactly
+                # them.
+                await cur.execute(
+                    "UPDATE queue SET body_ref=NULL OUTPUT deleted.body_ref"
+                    " WHERE stage=? AND status=? AND body_ref IS NOT NULL"
+                    f" AND updated_at < {cutoff_sql}",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                )
+                ref_counts: dict[str, int] = {}
+                for r in await cur.fetchall():
+                    key = str(r[0])
+                    ref_counts[key] = ref_counts.get(key, 0) + 1
+                for body_hash in sorted(ref_counts):
+                    count = ref_counts[body_hash]
+                    await cur.execute(
+                        "UPDATE shared_body SET refcount = CASE WHEN refcount <= ? THEN 0"
+                        " ELSE refcount - ? END WHERE hash=?",
+                        (count, count, body_hash),
+                    )
+                    await cur.execute(
+                        "DELETE FROM shared_body WHERE hash=? AND refcount<=0", (body_hash,)
+                    )
                 # As on SQLite: two statements, one count each (BACKLOG #4996). DATALENGTH, not
                 # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
                 # would otherwise read as blank and survive.
@@ -12186,9 +12237,9 @@ class SqlServerStore:
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
 
-        def _seal() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+        def _hash() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
@@ -12202,36 +12253,68 @@ class SqlServerStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
-        now = time.time()
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards; then reserve the whole burst in the persisted bound (ASVS 11.3.4).
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
-                if await cur.fetchone() is not None:
-                    await self._commit_read(
-                        conn
-                    )  # dedup: identical content already stored — write nothing
-                    return ref
-                await cur.execute(
-                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                    " VALUES (?,?,?,0,?)",
-                    (ref, content_type, total, now),
-                )
-                for seq, ct in enumerate(sealed):
-                    await cur.execute(
-                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
-                        (ref, seq, ct),
-                    )
-                await self._commit(conn)
+                exists = await cur.fetchone() is not None
+                await self._commit_read(conn)
             except Exception:
                 await conn.rollback()
+                raise
+        if exists:
+            return ref
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
+        now = time.time()
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    # BACKLOG #5753: a concurrent put of the same content waits on this content
+                    # address's applock and then inserts nothing, rather than failing the upload
+                    # on a duplicate key. The first put's copy wins and this one's sealed chunks
+                    # are dropped. A named lock, not HOLDLOCK: a key-range lock held across the
+                    # chunk loop would also block increfs of the neighbouring attachment key. The
+                    # SELECT opens the transaction the applock needs. OUTPUT, not rowcount, reports
+                    # the insert (see _exec_terminal on SET NOCOUNT ON).
+                    await cur.execute("SELECT TOP (1) id FROM attachment WHERE id=?", (ref,))
+                    await cur.fetchall()
+                    await self._applock(cur, f"mefor:attachment:{ref}")
+                    await cur.execute(
+                        "INSERT INTO attachment (id, content_type, total_bytes, refcount,"
+                        " created_at) OUTPUT inserted.id SELECT ?,?,?,0,? WHERE NOT EXISTS"
+                        " (SELECT 1 FROM attachment WHERE id=?)",
+                        (ref, content_type, total, now, ref),
+                    )
+                    inserted = bool(await cur.fetchall())
+                    if inserted:
+                        for seq, ct in enumerate(sealed):
+                            await cur.execute(
+                                "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
+                                " VALUES (?,?,?)",
+                                (ref, seq, ct),
+                            )
+                if inserted:
+                    await self._commit(conn)
+                else:
+                    await self._commit_read(conn)
+            except Exception:
+                # The transaction may hold the applock. After the cursor closes, as
+                # reserve_upload_quota does, so a discarded connection cannot race its close.
+                await self._rollback_or_discard(conn)
                 raise
         return ref
 
@@ -12341,30 +12424,31 @@ class SqlServerStore:
         self, cur: Any, where: str, params: tuple[object, ...]
     ) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
-        attachment sibling of the SQLite retention seam). Tally each distinct attachment the matching
-        messages reference via the ``message_attachment`` linkage, decref each by how many of these
-        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even
-        if the purge re-runs. Runs in the CALLER's transaction (the decref + join-row DELETE + body null
-        commit atomically). **Re-run is a no-op:** a re-run finds the join rows gone and decrefs nothing —
-        no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
-        holds. ``where`` is a code-controlled fragment (never user input); ``params`` binds it identically
-        in both statements."""
+        attachment sibling of the SQLite retention seam). DELETE the matching messages'
+        ``message_attachment`` join rows, then decref each attachment by how many of those rows named
+        it (GC at 0), so the release is exactly-once even if the purge re-runs. Runs in the CALLER's
+        transaction (the join-row DELETE + decref + body null commit atomically). **Re-run is a
+        no-op:** a re-run finds the join rows gone and decrefs nothing — no double-decref, no refcount
+        underflow, no premature GC of an attachment a SIBLING message still holds. ``where`` is a
+        code-controlled fragment (never user input)."""
+        # BACKLOG #5740: ONE statement deletes the join rows and reports what it deleted, so the
+        # decref covers exactly the rows removed. A tally SELECT and a separate DELETE each read
+        # their own RCSI statement snapshot, so a row that came to match between them was deleted
+        # without its decref (the document kept past retention) or decreffed without its delete (a
+        # document collected while a link still names it). Deleting them makes a re-run decref
+        # nothing. OUTPUT, not rowcount, reports the rows (see _exec_terminal on SET NOCOUNT ON).
+        await cur.execute(
+            f"DELETE FROM message_attachment OUTPUT deleted.attachment_id WHERE {where}", params
+        )
+        counts: dict[str, int] = {}
+        for r in await cur.fetchall():
+            key = str(r[0])
+            counts[key] = counts.get(key, 0) + 1
         # The decrefs take the header locks in content-address order, as the ingress and
         # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
         # in Python as those are, so the database collation does not decide the order.
-        await cur.execute(
-            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
-            params,
-        )
-        cols = [c[0] for c in cur.description]
-        releases = [dict(zip(cols, r)) for r in await cur.fetchall()]  # noqa: B905
-        if not releases:
-            return
-        for row in sorted(releases, key=lambda r: str(r["attachment_id"])):
-            await self._decref_attachment(cur, row["attachment_id"], int(row["n"]))
-        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
-        await cur.execute(f"DELETE FROM message_attachment WHERE {where}", params)
+        for ref in sorted(counts):
+            await self._decref_attachment(cur, ref, counts[ref])
 
     @staticmethod
     def _attachment_still_referenced_sql(msg_col: str) -> str:

@@ -4707,12 +4707,41 @@ Facts that are easy to get wrong, stated plainly first:
   connection on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`) wraps the driver's
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the
   `RetryPolicy` path. It never waits indefinitely.
-- **The DATABASE connector has no per-statement timeout.** It exposes `connect_timeout` (default
-  15 s, a **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects),
-  `pool_max` and
-  `acquire_timeout`, and there is **no** `timeout_seconds` on this connector. A long-running
-  statement is therefore unbounded; keep lookup/write statements indexed and narrow. (The *store's*
-  own SQL Server / Postgres connections do apply `[store].command_timeout`, default 30 s.)
+- **The DATABASE connector bounds each statement with `statement_timeout`** (whole seconds, `0`
+  for no limit; on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`, BACKLOG
+  #5756). **Unset, the default depends on the driver family.** It is 30 s on the SQL Server
+  preset and on a generic connection whose `odbc_driver` is Microsoft's ODBC Driver for SQL
+  Server (family `msodbc`), the one family known to take the setting: the SQL Server store
+  sets `[store].command_timeout` through the same pyodbc setter on that driver. It is `0`, no
+  limit, on every other generic connection: psqlODBC (family `psqlodbc`), whose source is
+  reported to refuse the connection attribute the setting writes, and MySQL (family `mysql`),
+  for which nothing here shows either way. Both are readings of code, not measurements of a
+  driver. Where the default is `0`, nothing below that a timeout bounds is bounded until
+  `statement_timeout` is set. Every borrow that carries a non-zero value applies it as pyodbc's connection `timeout`, the ODBC query timeout
+  of each statement, the way the store applies `[store].command_timeout`. A statement that runs
+  past a non-zero value fails with `HYT00`, a **transient** error: a send or poll retries, while a `db_lookup`,
+  which is single-shot, raises into its Handler. A `mark_statement` that times out leaves its row
+  unmarked, so the row re-emits, a duplicate, on the next poll; a mark that can wait on a lock
+  longer than this needs a larger value. A non-zero value also bounds how long a connection stop
+  or reload waits for an in-flight statement. It is not known to bound a `COMMIT`, a call on the connection
+  rather than a statement. A driver that refuses the value when a borrow sets it fails that
+  borrow as a configuration fault that names `statement_timeout`, whatever the driver, so a
+  value set explicitly is never dropped silently. A send then stops its lane; a poll reports the
+  failure and polls again next interval; a `db_lookup` raises into its Handler. A transient driver
+  state from that write is the connection's failure instead: the borrow fails transiently and
+  the connection is discarded. The transient states are every state the connector retries:
+  SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
+  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
+  connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
+  mark or lookup at least reports it as an ordinary failure. Such a connection needs `0`. Both
+  refusals are readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
+  sets **no** statement timeout. The connector also exposes `connect_timeout` (default 15 s, a
+  **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects), `pool_max`
+  and `acquire_timeout`; there is no `timeout_seconds`. Each DATABASE pool runs aioodbc's driver
+  calls (statements, fetches, commits, rollbacks) on its own thread pool, sized `pool_max + 4`,
+  rather than the event loop's default executor. Not every driver call moved: at least the cursor
+  closes, the discard of a failed connection, the rollback after a cancelled statement and the
+  autocommit set still run on the default executor.
 - **The store's message-pipeline pool acquire is bounded on both server backends.**
   `[store].acquire_timeout` (default **30 s**, must be > 0) caps one borrow from the SQL Server or
   Postgres store pool, and the throwaway pool a `DatabaseRef` reference sync opens takes its own
@@ -4799,7 +4828,7 @@ connection-count knob** (the stdlib opener exposes none) — the same framing 13
 `connect_timeout` and a `timeout_seconds`; the REST/SOAP/FHIR/DICOMweb HTTP family exposes
 `timeout_seconds` only (a single per-request wall clock — there is no separate connect timeout);
 REMOTEFILE (SFTP/FTP/FTPS) exposes **no** timeout argument, and its bounds are hard-coded module values in `transports/remotefile.py`, not operator-configurable. All three protocols start from a 30 s value. On FTP and FTPS it is a whole-socket timeout, on the control and data connections alike. On SFTP it covers the TCP connect, the SSH banner exchange and authentication. A separate `SFTP_CHANNEL_READ_TIMEOUT_SECONDS` (120 s) then bounds opening the SFTP session (BACKLOG #1936) and each read from the established SFTP channel (BACKLOG #1195). Both refusals are transient. The read bound is per read, not per transfer, so a slow transfer that keeps making progress never trips it. The session-open bound releases the worker thread once it passes. In one narrow race inside paramiko it can leave a separate helper thread parked instead; the `_open_sftp_within` docstring says what paramiko does there. An upload that stops making progress is closed after `SFTP_WRITE_STALL_SECONDS` (120 s, per step, BACKLOG #2082), and that refusal is transient too; the `_WriteWatchdog` docstring says what paramiko does there. **The SFTP bounds are not complete.** paramiko retries a timed-out socket write without limit, and only the upload is watched for it, so at least the small requests every other operation sends could still wait on a server that keeps its TCP window shut;
-DATABASE exposes `connect_timeout` + `acquire_timeout` and no statement timeout; local FILE exposes
+DATABASE exposes `connect_timeout`, `acquire_timeout` and `statement_timeout`; local FILE exposes
 none (filesystem I/O is unbounded by design). The MLLP/TCP/X12/HTTP listeners expose
 `receive_timeout`; the DICOM SCP instead applies `timeout_seconds` to its three pynetdicom timers. For
 **synchronous** request→response feeds (REST/SOAP, X12 270/271) set a **short** `timeout_seconds`.
@@ -5068,7 +5097,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
 | DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL, plus the send-time certificate check before anything is built or dialled: expired or not yet valid → configuration fault (`direct-cert-validity:<setting>:<bound>`), the lane stops and the queue stays under the default `credential_fault_policy` | `RetryPolicy`, except that certificate class, which stops the lane (or dead-letters under `credential_fault_policy = "dead_letter"`) |
-| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
+| DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects), `acquire_timeout` 30 s on the pool borrow and `statement_timeout` on each statement, 30 s on the SQL Server preset and on a generic Microsoft driver, and `0` on any other generic driver, unless set (`0` = no limit; BACKLOG #5756). For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
 | Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |
 | Engine API + `/ui` + `/ws/stats` (`[api].port`) | uvicorn defaults (the engine passes no `timeout_keep_alive`) | the ASGI lifespan calls `engine.stop()`, cancelling every worker | throttled requests get `429` + an audit row | n/a — the caller retries |
