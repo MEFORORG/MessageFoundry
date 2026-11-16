@@ -159,8 +159,9 @@ class FieldRule:
 # marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
 # other field of these segments that is neither listed here nor mapped below has no rule yet.
 # A second pass mapped twenty more fields of the same class: GT1-4/19/21/24/29/42/45/46/51/56,
-# NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. Only the coverage report names a field with no rule,
-# and require_full_coverage refuses it.
+# NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. At least these still have no rule: the dates
+# PID-33, NK1-8/9, GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. Only
+# the coverage report names such a field, and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
@@ -184,8 +185,8 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
-    FieldRule("MRG-3", SurrogateKind.MRN),
     FieldRule("MRG-2", SurrogateKind.ID),  # prior alternate patient id, keyed like PID-4
+    FieldRule("MRG-3", SurrogateKind.MRN),
     FieldRule("MRG-4", SurrogateKind.NAME),
     FieldRule("MRG-5", SurrogateKind.ID),  # prior visit number, keyed like PV1-19
     FieldRule("MRG-6", SurrogateKind.ID),  # prior alternate visit id, keyed like PV1-50

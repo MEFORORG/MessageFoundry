@@ -121,15 +121,6 @@
   the §3 field list and changes none of its ratified choices:** the coded fields of those segments
   stay `KEEP` by omission, and `rules.py` names them with the reason. A field of those segments
   that is neither mapped nor named there still has no rule; the coverage report names it.
-- **AMENDED 2026-11-16 (BACKLOG #5533): twenty more default rules of the same class.** The
-  default map adds the names `GT1-4`, `GT1-42`, `GT1-45` and `NK1-26` as `NAME`; the ids
-  `GT1-19`, `GT1-29`, `NK1-12`, `PV1-5` and `PV1-50` as `ID`; `GT1-46` as `PHONE`; `GT1-24`
-  (the guarantor's death date) as `DATE`, like `PID-29`; the birth places `GT1-56` and `NK1-38`,
-  the organization names `GT1-21` and `GT1-51`, and `PV1-37` (a discharge location with its
-  date) as `FREETEXT`; and `PV1-52` as `PROVIDER`. `MRG-2`, `MRG-5` and `MRG-6` take `ID`, the
-  kind of the field each is the prior value of (`PID-4`, `PV1-19`, `PV1-50`), so the merge
-  linkage survives as it does for `MRG-1`. **This adds to the §3 field list and changes none of
-  its ratified choices.**
 - **AMENDED 2026-11-10 (BACKLOG #5532, #5541): the leak-check reads an escaped value decoded.**
   The structural detectors read each unmapped value as written and each of its components and
   subcomponents decoded from its HL7 escape sequences, the parts the engine's `Message` and `Peek`
@@ -149,6 +140,15 @@
   the `KEEP` set or the field list moves. The leak-check scans the components these kinds keep
   for a dashed SSN and a punctuated phone, as written and decoded, though a rule maps the field,
   so the fields #5533 mapped refuse those shapes as they did unmapped.
+- **AMENDED 2026-11-16 (BACKLOG #5533): twenty more default rules of the same class.** The
+  default map adds the names `GT1-4`, `GT1-42`, `GT1-45` and `NK1-26` as `NAME`; the ids
+  `GT1-19`, `GT1-29`, `NK1-12`, `PV1-5` and `PV1-50` as `ID`; `GT1-46` as `PHONE`; `GT1-24`
+  (the guarantor's death date) as `DATE`, like `PID-29`; the birth places `GT1-56` and `NK1-38`,
+  the organization names `GT1-21` and `GT1-51`, and `PV1-37` (a discharge location with its
+  date) as `FREETEXT`; and `PV1-52` as `PROVIDER`. `MRG-2`, `MRG-5` and `MRG-6` take `ID`, the
+  kind of the field each is the prior value of (`PID-4`, `PV1-19`, `PV1-50`), so the merge
+  linkage survives as it does for `MRG-1`. **This adds to the §3 field list and changes none of
+  its ratified choices.**
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

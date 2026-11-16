@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The default rules map the rest of the GT1, NK1, MRG and PV1 fields BACKLOG #5533 left unmapped.
+"""The default rules map twenty more GT1, NK1, MRG and PV1 fields BACKLOG #5533 left unmapped.
 
 The first pass on this row mapped fourteen fields (``tests/test_anon_b214_5533.py``). Fields of
 the same class stayed unmapped inside segments the default map already scrubbed: names, ids,
-phones, birth places, a death date and visit locations. With ``require_full_coverage`` off, each
+phones, birth places, a death date and visit locations. At least some fields of these segments
+still have no rule; ``rules.py`` names them. With ``require_full_coverage`` off, each
 one's value passed into the dataset as captured. This pins each to a kind, checks on both adapters
 that a made-up value in each is gone from the output, and keeps a control that shows the same
 value survives when its rule is taken away. Every message here is synthetic (CLAUDE.md section 9),
@@ -137,13 +138,34 @@ def test_the_default_rules_map_every_field_on_the_list(module: Any) -> None:
         assert kinds.get(address) == kind, address
 
 
+_MRG_PAIRS = (("MRG-2", "PID-4"), ("MRG-5", "PV1-19"), ("MRG-6", "PV1-50"))
+
+
 @_EACH_RULES
-def test_each_mrg_field_takes_the_kind_of_its_current_value(module: Any) -> None:
-    """The A40 linkage: a prior id is keyed with the same kind as the field it was the value of."""
+def test_each_new_mrg_field_takes_the_kind_of_its_current_value(module: Any) -> None:
+    """The merge linkage for the MRG fields this pass maps: each prior id is keyed with the same
+    kind as the field it was the value of. MRG-3 and MRG-4 are not this pass's (see BACKLOG #5533)."""
     kinds = {rule.path: rule.kind for rule in module.DEFAULT_RULES}
-    for prior, current in (("MRG-1", "PID-3"), ("MRG-2", "PID-4"), ("MRG-5", "PV1-19")):
+    for prior, current in _MRG_PAIRS:
         assert kinds[prior] == kinds[current], prior
-    assert kinds["MRG-6"] == kinds["PV1-50"]
+
+
+@pytest.mark.parametrize(("prior", "current"), _MRG_PAIRS)
+@_EACH_ADAPTER
+def test_a_shared_value_gets_one_surrogate_across_the_merge(
+    adapter: Callable[..., str], prior: str, current: str
+) -> None:
+    """The same id in an MRG field and in the field it was the value of maps to one surrogate."""
+    shared = "SHAREDID4242^^^HOSP^AN"
+    pv1 = "|".join(["PV1", "1"] + [shared if f"PV1-{i}" == current else "" for i in range(2, 51)])
+    pid = "|".join(["PID", "1", "", "12345^^^HOSP^MR", shared if current == "PID-4" else ""])
+    mrg = "|".join(["MRG", "1"] + [shared if f"MRG-{i}" == prior else "" for i in range(2, 7)])
+    message = "\r".join(
+        (r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A40|MSGCTRL|P|2.5.1", pid, mrg, pv1)
+    )
+    out = adapter(message, salt=_SALT)
+    assert _field_of(message, prior) == _field_of(message, current) == shared
+    assert _field_of(out, prior) == _field_of(out, current) != shared
 
 
 @pytest.mark.parametrize("address", sorted(_VALUES))
