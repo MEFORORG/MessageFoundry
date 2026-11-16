@@ -18688,13 +18688,15 @@ class AuthService:
         second call finds nothing.
 
         ``POST /ui/login`` calls it BEFORE the sign-in limiter and skips its own charge only when
-        the result is ``paid``: the begin leg's control-2 hit for this sign-in was still in the
-        window, and this call MOVED it to now (``SlidingWindowRateLimiter.renew``), so the sign-in
+        the result is ``paid``. While the login limiter is on, ``paid`` means the begin leg's
+        control-2 hit for this sign-in was still in the window, and this call MOVED it to now
+        (``SlidingWindowRateLimiter.renew``), so the sign-in
         is counted once and from the moment it is spent (BACKLOG #3937 item 2, ADR 0197 Amendment
         A). A hit that had left the window is not renewed and the POST charges afresh, so begin
         legs cannot be banked and spent later. A forged or absent handle finds nothing and is
-        charged like any other request. The route passes the challenge to :meth:`login` as
-        ``passkey_challenge``."""
+        charged like any other request. With ``login_rate_limit_enabled = false`` there is no
+        limiter, so every staged challenge reads ``paid`` and nothing is charged. The route passes
+        the challenge to :meth:`login` as ``passkey_challenge``."""
         taken = self._preauth_challenges.pop(hash_token(handle))
         if taken is None:
             return None

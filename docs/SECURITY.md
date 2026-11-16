@@ -4167,11 +4167,16 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
 and the assertion together. **How control 2 counts that POST is stated here** (BACKLOG #3937);
-the limiter paragraphs and rows elsewhere in this document and in CONFIGURATION.md point here.
+at least control 2's row and the `POST /ui/login` and `POST /ui/login/passkey` rows of the [Route
+→ limiter map](#route--limiter-map) in this document, and the `login_rate_limit_per_ip` and
+`login_rate_limit_global` rows in CONFIGURATION.md, point here.
 Once the route runs and its same-origin and configured-authentication checks pass, it pops the
 challenge its handle cookie names, whatever the sign-in's outcome, before it consults the sign-in
 limiter. The POST is **paid** when that pop finds the challenge still staged and the begin leg's
-hit still in the window. A paid POST passes control 2 without the limiter checking room in, or
+hit still in the window. That is decided from the staged challenge alone, by
+`take_passkey_challenge`, before the form is parsed or any account is read, so a POST whose handle
+cookie names such a challenge is paid with or without an assertion in the form, and whatever
+username it names. A paid POST passes control 2 without the limiter checking room in, or
 charging, either dimension, per address or global, for it, so it passes even while the limiter is
 refusing the POST's own address or the global ceiling is full, and the POST's own address is not
 charged. Instead the begin leg's hit is re-stamped to now, counting no new attempt: in the begin
@@ -7146,11 +7151,12 @@ option E, owner ruling 2026-09-27.* (3) A holder of one factor can hold a local 
 `lockout_max_minutes` per cycle, and a leaked-password list can do that to many accounts at once.
 *Accepted with option E, owner ruling 2026-09-27.* (4) **Control 2's global ceiling is its own
 denial lever**: 60 attempts a minute across all clients refuse every sign-in on the engine, the
-owner's combined sign-in included, except a paid passkey sign-in POST ([WebAuthn
-passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*), so a username-only
-caller can still keep a TOTP-enrolled owner out, or a passkey owner, whose begin leg the full
-ceiling refuses, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
-requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27.* (5) The owner's own typos
+owner's combined sign-in included, so a username-only caller can still keep a TOTP-enrolled owner
+out, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
+requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27.* Note: this residual
+predates the paid passkey sign-in POST skip (engine PR 2616, 2026-10-28), which passes control 2
+even while the global ceiling is full; see [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068),
+*The combined passkey sign-in*. (5) The owner's own typos
 can reach the escalating second-step lock: a combined sign-in with one factor wrong counts there,
 including a code that missed its 30-second step or was already used. *Named after the ruling;
 mitigated by the notice's "if these attempts were your own" wording, which keeps it from telling an
