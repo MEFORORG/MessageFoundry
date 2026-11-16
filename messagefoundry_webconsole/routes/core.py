@@ -212,8 +212,8 @@ def _form_fits(
     Each caller runs this after its rate limiter, so a refused value has already been charged
     whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
     passkey sign-in that charge was taken at the begin leg. A refusal is logged in the JSON 422
-    handler's own words, with the method, the path and the error count, and never a value: the
-    fields are credentials."""
+    handler's own words, with the method, the path and the count of the errors that counted, which
+    can be fewer than that handler counts, and never a value: the fields are credentials."""
     try:
         model(**fields)
     except ValidationError as exc:

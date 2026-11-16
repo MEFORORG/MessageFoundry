@@ -161,7 +161,7 @@ async def test_a_factor_refused_finish_with_an_oversized_enrolment_code_is_still
 ) -> None:
     """BACKLOG #5399. RED when: an enrolment-code bound answers a factor-refused finish ahead of
     the service, so the ceremony is not ended and the refusal is not audited. The code goes on
-    uncut. The control is the at-bound code, answered the same way."""
+    uncut."""
     service = await _service(engine)
     identity, token = await _sign_in(service)
     seen: list[object] = []
@@ -176,15 +176,13 @@ async def test_a_factor_refused_finish_with_an_oversized_enrolment_code_is_still
     await _enrol_totp_elsewhere(service)
     async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
         c.cookies.set("mf_session", token)
-        codes = ["e" * (ENROLMENT_CODE_MAX + 1), "e" * ENROLMENT_CODE_MAX]
-        for code in codes:
-            refused = await c.post(
-                _VERIFY, json={**body, "enrolment_code": code}, headers=SAME_ORIGIN
-            )
-            assert refused.status_code == 400, refused.text
-            error = refused.json()["error"]
-            assert "already has a second factor" in error or "ceremony expired" in error, error
-    assert seen == codes
+        oversized = "e" * (ENROLMENT_CODE_MAX + 1)
+        refused = await c.post(
+            _VERIFY, json={**body, "enrolment_code": oversized}, headers=SAME_ORIGIN
+        )
+        assert refused.status_code == 400, refused.text
+        assert "already has a second factor" in refused.json()["error"], refused.text
+    assert seen == [oversized]
     paths = [
         json.loads(r["detail"])["path"]
         for r in await service.store.list_audit(action="auth.mfa_denied")

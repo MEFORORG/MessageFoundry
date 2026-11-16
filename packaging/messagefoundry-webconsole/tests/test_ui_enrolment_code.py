@@ -135,8 +135,10 @@ async def test_an_oversized_passkey_enrolment_code_is_refused_where_the_engine_r
     monkeypatch.setattr(service, "finish_webauthn_registration", spy)
     async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
         c.cookies.set("mf_session", token)
-        # The issued code with junk after it: cut to the bound, the old handler kept a prefix.
-        oversized = (issued.code + "x" * ENROLMENT_CODE_MAX)[: ENROLMENT_CODE_MAX + 1]
+        # The issued code padded with spaces past the bound. It normalises to the issued code, so
+        # only the bound refuses it; the old handler's cut to the bound would have accepted it.
+        oversized = issued.code.ljust(ENROLMENT_CODE_MAX + 1)
+        assert enrolment_code_digest(oversized) == enrolment_code_digest(issued.code)
         at_bound = "x" * ENROLMENT_CODE_MAX
         for code in (oversized, at_bound):
             refused = await c.post(

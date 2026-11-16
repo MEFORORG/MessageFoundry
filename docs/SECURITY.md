@@ -4402,9 +4402,11 @@ listed in [BROWSER-SUPPORT.md](BROWSER-SUPPORT.md#two-configurations-turn-the-wa
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
 and OIDC appear as links when available (`kerberos_available`, `oidc_available`). A POST that still carries `provider=ad` is charged to the
 sign-in window first (a paid passkey sign-in POST is counted as [WebAuthn
-passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*, states). Once admitted, it reaches the **same** `auth.login` seam as the JSON
-surface, and the engine refuses it and audits the attempt, so the engine is the single place that
-refuses. Directory
+passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*, states). Once admitted, one whose username, password and
+authenticator code are within the JSON `LoginRequest`'s length bounds reaches the **same**
+`auth.login` seam as the JSON surface, and the engine refuses it and audits the attempt. One past
+those bounds is refused by the console first, as the JSON route's 422 refuses it, and is logged
+with no value but **not audited** (BACKLOG #5397). Directory
 accounts sign in by **Windows SSO** (`GET /ui/sso`) or **OIDC** (`/ui/oidc/start`), and each such
 sign-in mints one session, so the AD role-resync and revocation side effect fires once at login,
 never per navigation. The directory bind **as the user** survives only as the step-up re-bind at
