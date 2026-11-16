@@ -23,7 +23,7 @@ an instrument.
     repo root it never runs, the guard reads as enforced in the file, and nothing reports it. The
     fix is `${CLAUDE_PROJECT_DIR}` in exec form, and this file pins it.
   * **A deny rule anchored at `./` covers one directory.** Bare patterns follow gitignore semantics
-    and match at any depth when they carry no slash before the end; `Read(./.env)` matches `<cwd>/.env` and nothing below it. The `./` form
+    and match at any depth; `Read(./.env)` matches `<cwd>/.env` and nothing below it. The `./` form
     looks equivalent and is strictly narrower, which is the worst combination for a control whose
     whole job is to be broad.
   * **A matcher that reads as a regex may not be one.** Claude Code evaluates a matcher whose
@@ -71,8 +71,6 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     ".env": (".env",),
     ".env.*": (".env.*",),
-    # A slash before the end anchors a gitignore pattern at its base, so `secrets/**` reaches only
-    # the session's own top level. The ignore line matches at any depth, and so does `**/secrets/**`.
     "secrets/": ("secrets/**", "**/secrets/**"),
     "*.key": ("*.key",),
     "*.pem": ("*.pem",),
@@ -386,7 +384,7 @@ def test_every_read_denied_path_is_denied_to_every_file_tool() -> None:
 
 
 def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
-    """Exact output, so a detector that also flagged a non-file rule, or a write-only deny, fails."""
+    """Exact output: a detector that also flagged a non-file rule or a write-only deny fails."""
     planted = {
         "permissions": {
             "deny": [
