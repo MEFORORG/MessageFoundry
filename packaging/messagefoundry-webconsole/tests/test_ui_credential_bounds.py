@@ -24,6 +24,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import PASSKEY_SIGN_IN_COOKIE_NAME
 
 _REVOKE_OTHERS = "/ui/account/sessions/revoke-others"
 
@@ -99,6 +100,23 @@ async def test_an_oversized_sign_in_credential_never_reaches_login(
         # At the bound the credential is checked, as the JSON route checks it.
         await c.post("/ui/login", data={"username": "op", "password": PW, field: "a" * bound})
     assert len(calls) == 1 and calls[0][arg] == "a" * bound
+
+
+async def test_an_oversized_sign_in_clears_the_passkey_handle_it_consumed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the oversized-credential exit stops clearing the passkey sign-in cookie, as every
+    other refused sign-in clears it. The handle was popped before the bound was checked."""
+    service = await _service(engine)
+    calls = _spy(monkeypatch, service, "login")
+    async with ui_client(engine, service) as c:
+        c.cookies.set(PASSKEY_SIGN_IN_COOKIE_NAME, "a-forged-handle")
+        r = await c.post(
+            "/ui/login", data={"username": "op", "password": "a" * (_PASSWORD_MAX + 1)}
+        )
+        assert r.headers["location"] == "/ui/login?e=bad" and calls == []
+        cleared = [h for h in r.headers.get_list("set-cookie") if PASSKEY_SIGN_IN_COOKIE_NAME in h]
+        assert cleared and all("Max-Age=0" in h or "expires=" in h.lower() for h in cleared)
 
 
 # --- BACKLOG #5398: POST /ui/mfa --------------------------------------------------------------
