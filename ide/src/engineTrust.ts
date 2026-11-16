@@ -475,7 +475,7 @@ async function askCli(
 ): Promise<void> {
   // The same guard the three sibling CLI calls in extension.ts use. Without it, opening a loose .py
   // file with no folder spawns a Python interpreter for a command that can only fail: isExecGated()
-  // is false when there is no workspace, so it does not cover this on its own.
+  // is false in a trusted window with no folder, so it does not cover this on its own.
   //
   // Captured ONCE, and every use below is this constant. The workspace is both the cwd the reading is
   // taken in and the base a relative certificate path is resolved against, so two calls that could

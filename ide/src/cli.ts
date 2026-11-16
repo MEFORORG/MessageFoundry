@@ -71,12 +71,16 @@ export function pythonPath(): string {
 }
 
 /**
- * True when there IS a workspace and it is NOT trusted: in that state the CLI must not exec a
- * (possibly repo-supplied) interpreter. run()/runJson() short-circuit on this rather than launching
- * anything, so neither activation nor save-triggered refreshes can run a workspace binary (SEC-004).
+ * True when the window is NOT trusted: in that state the CLI must not exec a (possibly repo-supplied)
+ * interpreter. run()/runJson() short-circuit on this rather than launching anything, so neither
+ * activation nor save-triggered refreshes can run a workspace binary (SEC-004).
+ *
+ * Trust alone decides it, with or without a workspace folder (BACKLOG #5408). A Restricted Mode
+ * window with no folder open (an empty window under `security.workspace.trust.emptyWindow: false`)
+ * is untrusted too, and gating only when a folder existed let the extension spawn Python there.
  */
 export function isExecGated(): boolean {
-  return Boolean(workspaceDir()) && !vscode.workspace.isTrusted;
+  return !vscode.workspace.isTrusted;
 }
 
 export function configDir(): string {
