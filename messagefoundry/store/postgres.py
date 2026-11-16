@@ -10083,13 +10083,19 @@ class PostgresStore:
             cipher.active_marker_prefix,
             lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
         )
-        # Only records the pass has work on; store.py's reseal_user_records says why.
+        # Only records the pass has work on; store.py's reseal_user_records says why, and why the
+        # prefixes are compared byte-exact rather than with LIKE, which reads `_` as a wildcard
+        # (BACKLOG #5738).
+        seal_prefix = f"{SEAL_PREFIX}{sealer.key_id}:"
+        marker = cipher.active_marker_prefix
         rows = await self._fetchall(
-            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE $1"
-            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE $2))"
+            "SELECT id FROM users WHERE authz_seal <> '' AND (left(authz_seal, $1) <> $2"
+            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND left(totp_secret, $3) <> $4))"
             " ORDER BY id",
-            f"{SEAL_PREFIX}{sealer.key_id}:%",
-            f"{cipher.active_marker_prefix}%",
+            len(seal_prefix),
+            seal_prefix,
+            len(marker),
+            marker,
         )
         resealed = refused = 0
         for row in rows:
@@ -10098,11 +10104,12 @@ class PostgresStore:
             except RowSealError:
                 refused += 1
                 continue
-            resealed += written is not None
-        if resealed:
-            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-            # 11.3.4); charged here, as each generic rotation batch charges its own.
-            await self._charge_bound_batch()
+            if written is not None:
+                resealed += 1
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
+                # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
+                await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -11366,13 +11373,24 @@ class PostgresStore:
         conn: Any,
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
+        *,
+        owner: str | None = None,
     ) -> SessionRecord | None:
         """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
-        ``MessageStore._write_session`` states the contract. Call it inside ``conn``'s transaction.
-        The read takes the row lock, so the compare on the seal is a second guard, not the only one."""
-        row = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
-        )
+        ``MessageStore._write_session`` states the contract, ``owner`` included (BACKLOG #5742).
+        Call it inside ``conn``'s transaction. The read takes the row lock, so the compare on the
+        seal is a second guard, not the only one; with ``owner`` set, a row of another account does
+        not match the read, so ``FOR UPDATE`` does not lock it."""
+        if owner is None:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE token_hash=$1 AND user_id=$2 FOR UPDATE",
+                token_hash,
+                owner,
+            )
         if row is None:
             return None
         current = SessionRecord.from_mapping(dict(row))
@@ -11585,7 +11603,9 @@ class PostgresStore:
         ``MessageStore._keep_or_end_session`` states the contract."""
         if not outcome.tripped and restamp.kept(
             await write_kept_session(
-                self._write_session(conn, token_hash, restamp), outcome, token_hash
+                self._write_session(conn, token_hash, restamp, owner=restamp.user_id),
+                outcome,
+                token_hash,
             )
         ):
             return RevokeResult(revoked, kept=True)
@@ -12034,16 +12054,17 @@ class PostgresStore:
         Track B Step 6b: when clustered, bump the version of each DISTINCT namespace a row was purged from
         (atomically with the delete) so a follower's converge_state_cache() re-reads it and drops the same
         keys (the version-scan reload re-seeds the surviving rows, leaving the purged keys gone). Gated, so
-        single-node writes no state_version rows and stays byte-identical."""
+        single-node writes no state_version rows and stays byte-identical.
+
+        One ``DELETE ... RETURNING`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
+        expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
+        between the two, so the cache would drop a key whose row survives."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             rows = await conn.fetch(
-                "SELECT namespace, key FROM state WHERE set_at < $1", older_than
+                "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
             )
             purged_keys = [(r["namespace"], r["key"]) for r in rows]
-            if not purged_keys:
-                return 0
-            await conn.execute("DELETE FROM state WHERE set_at < $1", older_than)
             bumped: list[tuple[str, int]] = []
             if self._cluster_state_convergence:
                 for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable

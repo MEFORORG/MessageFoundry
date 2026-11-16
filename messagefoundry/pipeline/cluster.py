@@ -774,6 +774,18 @@ def lease_release_unconfirmed(node_id: str) -> str:
     )
 
 
+def log_epoch_change_demotion(node_id: str, held: int | None, prior: int | None) -> None:
+    """The WARNING both coordinators log when a leader's claim held at an epoch other than the one
+    it led on, and it demotes (BACKLOG #5746)."""
+    log.warning(
+        "cluster: node %s demoted itself: its lease claim held at epoch %s, not the epoch %s it"
+        " led on, so the lease row changed hands or was recreated since its last renew",
+        node_id,
+        held,
+        prior,
+    )
+
+
 def past_fence(baseline: float, now: float, fence_timeout_seconds: float) -> bool:
     """Whether more than the fence timeout has passed since ``baseline``, a lease claim's issue
     instant on the node's monotonic clock. The one test both coordinators' fence watchdogs apply,
@@ -1919,7 +1931,9 @@ class DbCoordinator:
 
         On hold: stamp ``_last_renew_ok`` (monotonic) so the fence watchdog knows we are fresh, and
         promote if we weren't already leader, unless the claim returned past the fence timeout, when
-        :meth:`_refuse_late_hold` demotes and pauses instead (BACKLOG #5711). No claim at all while
+        :meth:`_refuse_late_hold` demotes and pauses instead (BACKLOG #5711). A leader whose claim held at
+        another epoch demotes, and promotes on the next tick (:meth:`_demote_on_epoch_change`, BACKLOG
+        #5746). No claim at all while
         this node's own heartbeat has lapsed (:meth:`_stand_down_if_lapsed`, BACKLOG #5710). On not-hold: demote if we were leader (someone else holds
         it / our lease expired). A DB error propagates to the loop, which logs and retries — we do NOT
         demote on an error here; ``_last_renew_ok`` simply isn't advanced, so the fence watchdog demotes
@@ -1946,6 +1960,7 @@ class DbCoordinator:
                 return
             # ADR 0157 Inc 0 — read the paragraph above before moving this below the claim.
             issued_at = self._monotonic()
+            prior_epoch = self._leader_epoch
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at
@@ -1959,6 +1974,9 @@ class DbCoordinator:
                     # The watchdog can find the heartbeat lapsed while the claim is in flight, and
                     # demote; promoting on the claim's return would undo that. The row is ours, so
                     # the baseline stays stamped, as after the lapse check before the claim.
+                    return
+                if self._is_leader and self._leader_epoch != prior_epoch:
+                    self._demote_on_epoch_change(prior_epoch)
                     return
                 if not self._is_leader:
                     self._is_leader = True
@@ -1979,6 +1997,29 @@ class DbCoordinator:
                     "lease taken or expired"
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
+
+    def _demote_on_epoch_change(self, prior_epoch: int | None) -> None:
+        """Demote a leader whose claim held at an epoch other than the one it led on (BACKLOG
+        #5746), so the engine gets the demotion edge now and the promotion edge on the next tick.
+
+        The epoch moves when a claim takes the row from another owner, and also when the INSERT arm
+        recreates a missing row at epoch 1. In the first case another node took the row and lost it
+        while this one was paused for longer than the lease TTL; after such a pause every due timer
+        fires at once, so this tick can run before the fence watchdog. The tick's opening heartbeat
+        check (BACKLOG #5710) already stands the node down when its last beat is older than
+        ``node_timeout_seconds``, so this branch is reached when a beat landed first after the pause
+        or the node timeout exceeds the pause. Either way the demotion is the conservative
+        direction. Leading on would skip both edges: the
+        engine would neither tear down the graph the pause froze nor run the promotion recovery for
+        the rows the other node left in flight. The row is this node's again, so the baseline the
+        tick stamped stays, and the next tick renews it at the same epoch and promotes. The epoch is
+        compared rather than the time since the last renew, because one failed renew already puts
+        that past the fence on the default timings without anyone else having led."""
+        log_epoch_change_demotion(self.node_id, self._leader_epoch, prior_epoch)
+        self._is_leader = False
+        self._leader_epoch = None
+        self._alert_leadership_lost("lease epoch moved since the last renew")
+        self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _refuse_late_hold(self, issued_at: float) -> None:
         """Act on a hold whose claim returned more than the fence timeout after it was issued

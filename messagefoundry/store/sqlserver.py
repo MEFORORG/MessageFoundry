@@ -10491,21 +10491,17 @@ class SqlServerStore:
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state rows last set before ``older_than`` (ADR 0005 retention), evicting
-        them from the read-through cache post-commit. Returns the number deleted."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "SELECT namespace, [key] FROM state WHERE set_at < ?", (older_than,)
-                )
-                purged_keys = [(r[0], r[1]) for r in await cur.fetchall()]
-                if not purged_keys:
-                    await self._commit(conn)
-                    return 0
-                await cur.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        them from the read-through cache post-commit. Returns the number deleted.
+
+        One ``DELETE ... OUTPUT`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
+        expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
+        between the two, so the cache would drop a key whose row survives."""
+        rows = await self._execute_output(
+            "DELETE FROM state OUTPUT deleted.namespace, deleted.[key] AS state_key"
+            " WHERE set_at < ?",
+            (older_than,),
+        )
+        purged_keys = [(r["namespace"], r["state_key"]) for r in rows]
         for ck in purged_keys:
             # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
             if ck in self._state_cache:
@@ -15106,12 +15102,17 @@ class SqlServerStore:
         if not isinstance(cipher, AesGcmCipher):  # no in-process keys: a Transit sealer, if any
             return 0, 0
         change = rotation_reseal(sealer, cipher.active_marker_prefix, self._reencrypt_value)
-        # Only records the pass has work on; store.py's reseal_user_records says why.
+        # Only records the pass has work on; store.py's reseal_user_records says why, and why the
+        # prefixes are compared byte-exact: a case-insensitive collation would fold them under LIKE
+        # (BACKLOG #5738).
+        seal_prefix = f"{SEAL_PREFIX}{sealer.key_id}:"
+        marker = cipher.active_marker_prefix
         rows = await self._fetchall(
-            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
-            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+            "SELECT id FROM users WHERE authz_seal <> '' AND (LEFT(authz_seal, ?)"
+            " COLLATE Latin1_General_100_BIN2 <> ? OR (totp_secret IS NOT NULL"
+            " AND totp_secret <> '' AND LEFT(totp_secret, ?) COLLATE Latin1_General_100_BIN2 <> ?))"
             " ORDER BY id",
-            (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+            (len(seal_prefix), seal_prefix, len(marker), marker),
         )
         resealed = refused = 0
         for row in rows:
@@ -15120,11 +15121,12 @@ class SqlServerStore:
             except RowSealError:
                 refused += 1
                 continue
-            resealed += written is not None
-        if resealed:
-            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-            # 11.3.4); charged here, as each generic rotation batch charges its own.
-            await self._charge_bound_batch()
+            if written is not None:
+                resealed += 1
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
+                # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
+                await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -16611,15 +16613,25 @@ class SqlServerStore:
         cur: Any,
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
+        *,
+        owner: str | None = None,
     ) -> SessionRecord | None:
         """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
-        ``MessageStore._write_session`` states the contract. Call it on ``cur`` inside an open
-        transaction. The read takes ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
-        guard, not the only one. The write reports through ``OUTPUT``, which a session-wide
-        ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
-        await cur.execute(
-            "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
-        )
+        ``MessageStore._write_session`` states the contract, ``owner`` included (BACKLOG #5742).
+        Call it on ``cur`` inside an open transaction. The read takes ``UPDLOCK, ROWLOCK``, so the
+        compare on the seal is a second guard, not the only one. ``owner`` filters that read;
+        :meth:`_keep_or_end_session` probes the owner unlocked first, so a foreign row normally
+        never reaches the ``UPDLOCK`` read at all. The write reports through ``OUTPUT``,
+        which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        if owner is None:
+            await cur.execute(
+                "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=?", (token_hash,)
+            )
+        else:
+            await cur.execute(
+                "SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK) WHERE token_hash=? AND user_id=?",
+                (token_hash, owner),
+            )
         columns = [c[0] for c in cur.description]
         rows = await cur.fetchall()
         if not rows:
@@ -16902,10 +16914,25 @@ class SqlServerStore:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, on ``cur``
         inside an open transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
-        ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
+        ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283).
+
+        A kept session of another account is left untouched (BACKLOG #5742): its owner is read
+        first, without a lock hint, as :meth:`_write_session_txn` reads it, and a foreign row is
+        neither seal-checked, re-sealed, nor locked under ``UPDLOCK`` outside the documented lock
+        order. A row the probe does not see, such as one whose insert had not committed, still
+        meets the owner filter on :meth:`_write_session`'s read before its seal check."""
+        # Compared in SQL, under the column's collation, as the sweep and the end compare it.
+        await cur.execute(
+            "SELECT 1 FROM sessions WHERE token_hash=? AND user_id<>?",
+            (token_hash, restamp.user_id),
+        )
+        if await cur.fetchall():
+            return RevokeResult(revoked)
         if not outcome.tripped and restamp.kept(
             await write_kept_session(
-                self._write_session(cur, token_hash, restamp), outcome, token_hash
+                self._write_session(cur, token_hash, restamp, owner=restamp.user_id),
+                outcome,
+                token_hash,
             )
         ):
             return RevokeResult(revoked, kept=True)

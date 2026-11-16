@@ -5799,6 +5799,20 @@ def validate_alert_template(template: str, *, where: str) -> None:
             )
 
 
+#: Upper bound for ``[alerts].webhook_timeout`` and ``email_timeout`` (BACKLOG #5770). Each is a
+#: socket timeout, so it bounds each wait on the peer, not a whole send: a peer that answers a little
+#: at a time can still hold a send longer. The alert worker handles one event at a time, so each wait
+#: holds every event queued behind it. Five minutes is a JUDGMENT with no measured anchor: ten times
+#: the larger default, and far past any healthy relay or webhook round trip.
+_ALERT_SEND_TIMEOUT_MAX_SECONDS = 300.0
+
+#: Upper bound for ``[alerts].realert_seconds`` and a rule's ``cooldown_seconds`` (BACKLOG #5770). A
+#: cooldown far longer than the process lives acts as an infinite one: the first page is the last.
+#: Seven days is a JUDGMENT with no measured anchor. It still lets a daily certificate or secret
+#: check page once a week, and at the cap a repeat of the same alert stays silent for a week.
+_ALERT_COOLDOWN_MAX_SECONDS = 604800.0
+
+
 class EscalationTier(BaseModel):
     """One **occurrence-driven escalation tier** of an :class:`AlertRule` (#81, ADR 0133). Once the
     matched alert instance has fired at least ``after_count`` times, the tier's overrides apply over the
@@ -5854,8 +5868,9 @@ class AlertRule(BaseModel):
     # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
     # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
     min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
+    # BACKLOG #5770: finite only. An infinite age never matches, and NaN compares False with all.
     min_oldest_seconds: float | None = Field(
-        default=None, ge=0
+        default=None, ge=0, allow_inf_nan=False
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -5863,7 +5878,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        default=None, gt=0
+        default=None, gt=0, le=_ALERT_COOLDOWN_MAX_SECONDS, allow_inf_nan=False
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -5989,7 +6004,10 @@ class AlertsSettings(_Section):
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
-    webhook_timeout: float = 10.0  # seconds per POST
+    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why).
+    webhook_timeout: float = Field(
+        default=10.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
+    )  # seconds per POST
     # Optional egress allowlist for the webhook host (ASVS 1.3.6, SSRF defense-in-depth). Empty =
     # any host (the URL is operator-configured, not request-derived). When set, the webhook_url host
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
@@ -6005,7 +6023,7 @@ class AlertsSettings(_Section):
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
-    email_smtp_port: int = 587
+    email_smtp_port: int = Field(default=587, ge=1, le=65535)
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
@@ -6035,7 +6053,9 @@ class AlertsSettings(_Section):
     # as before (byte-identical). A reference/label, not the value, so it may live in the config file.
     # Fail-closed: a reference with no [secrets].provider, or an unresolvable one, raises at startup.
     email_password_secret: str | None = None
-    email_timeout: float = 30.0  # seconds per send
+    email_timeout: float = Field(
+        default=30.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
+    )  # seconds per send
     # Egress allowlist for the SMTP host (WP-11c, parity with webhook_allowed_hosts). Empty = any.
     smtp_allowed_hosts: list[str] = []
     # #138 (ADR 0127): OPTIONAL operator-editable alert-email templates. All None (the default) = the
@@ -6048,8 +6068,10 @@ class AlertsSettings(_Section):
     email_html_template: str | None = None
 
     # Re-alert throttle: the same (event, connection) won't re-notify more often than this, so a
-    # flapping lane can't spam the channel.
-    realert_seconds: float = 300.0
+    # flapping lane can't spam the channel. 0 = no throttle. BACKLOG #5770: bounded and finite.
+    realert_seconds: float = Field(
+        default=300.0, ge=0, le=_ALERT_COOLDOWN_MAX_SECONDS, allow_inf_nan=False
+    )
 
     # --- security signals (vault BACKLOG #2613) ------------------------------------------------
     # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count
