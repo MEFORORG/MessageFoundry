@@ -2782,11 +2782,11 @@ _HELD_MARKER_NAME = ".lock-held"
 #: some FUSE and SMB mounts), as opposed to a lock someone else holds.
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
-#: A restore's record, beside a file in its staging directory, that no teardown or sweep may unlink
-#: or truncate that file (BACKLOG #5617): the file's name plus this suffix, holding one of the
-#: reasons below. Held in memory alone, the decision lasted one run, and the next run's sweep of the
-#: leftover handed the file to the fail-safe, which on a volume that hard-links and reports one
-#: link truncated the restored store through it.
+#: A restore's record, beside a file in its staging directory, that no sweep in any later run may
+#: unlink or truncate that file (BACKLOG #5617): the file's name plus this suffix, holding one of
+#: the reasons below. Held in memory alone, the decision lasted one run, and the next run's sweep
+#: of the leftover handed the file to the fail-safe, which on a volume that hard-links and reports
+#: one link truncated the restored store through it.
 _SPARE_SUFFIX = ".mefor-spared"
 #: The file is still a name for the restored store.
 _SPARE_RESTORED = "restored-store"
@@ -2867,7 +2867,7 @@ def _fsync_dir(directory: Path) -> None:
 
 
 def _write_spare_marker(item: Path, reason: str) -> bool:
-    """Record, beside ``item``, that no teardown or sweep may unlink or truncate it, and why.
+    """Record, beside ``item``, that no sweep in any later run may unlink or truncate it, and why.
     Atomic: written whole to a temporary name and renamed over the marker, so a reader finds the
     old reason or the new one, never part of one. Never raises; ``False``, logged, when it did not
     land."""
@@ -2909,7 +2909,9 @@ def _withhold_from_sweep(staging: Path) -> None:
     in :meth:`_Staging.release`. Two callers run after the lock dropped, when a sweep can already
     hold the directory: the teardown, for a spare the release could not read, and the relabel to
     ``rolled-back`` a late rollback makes (:func:`_finish_rollback`). Never raises; a marker that
-    could not be removed is logged at ERROR, and the directory then stays sweepable."""
+    could not be removed is logged at ERROR. The directory stays sweepable in at least that case:
+    a removal that worked can also be undone, as by a sweep that already held the directory and
+    re-marks it."""
     try:
         os.unlink(staging / _HELD_MARKER_NAME)
     except FileNotFoundError:
@@ -3133,9 +3135,9 @@ class _Staging:
         records (:func:`_spared_items`).
 
         Where a spare in ``spared`` is unrecorded (:func:`_spare_records`), removing the
-        directory's ``.lock-held`` is tried again here, BEFORE the lock drops. What this read found is
-        handed to the teardown, which neither reads those spares again nor re-marks the directory
-        (BACKLOG #5617). The unlock and the teardown run whatever this does."""
+        directory's ``.lock-held`` is tried again here, BEFORE the lock drops. What this read
+        found is handed to the teardown, which neither reads those spares again nor re-marks the
+        directory (BACKLOG #5617). The unlock and the teardown run whatever this does."""
         with self._mutex:
             if self._released or (unless_claimed and self._claimed):
                 return None
