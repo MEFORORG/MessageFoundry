@@ -145,9 +145,11 @@ _IPV4_EMBEDDING_RANGES: Final = (
     (ipaddress.IPv6Network("::/96"), 96),  # IPv4-compatible, deprecated but parseable
     (ipaddress.IPv6Network("64:ff9b::/96"), 96),  # NAT64 well-known prefix, RFC 6052
     (ipaddress.IPv6Network("64:ff9b:1::/48"), 96),  # NAT64 local-use prefix, RFC 8215
+    (ipaddress.IPv6Network("::ffff:0:0:0/96"), 96),  # IPv4-translated (SIIT), RFC 6145
     (ipaddress.IPv6Network("2001::/32"), 96),  # Teredo, RFC 4380
-    (ipaddress.IPv6Network("2002::/16"), 16),  # 6to4, RFC 3056
 )
+# 6to4 (2002::/16, IPv4 from bit 16) is left out: an entry the IPv6 floor admits fixes at least
+# 16 of its IPv4 bits. A network-specific NAT64 prefix is the operator's own and cannot be listed.
 
 
 def allowlist_restricts(allowlist: Any) -> bool:
@@ -164,7 +166,7 @@ def allowlist_restricts(allowlist: Any) -> bool:
     would iterate as characters, and ``"1"`` parses as ``0.0.0.1/32``. Only a string or an
     :mod:`ipaddress` object counts as an entry, since ``str(5)`` parses too.
 
-    **An IPv6 entry is judged by the IPv4 space it embeds.** ``::ffff:0:0/96`` is a /96, far past
+    **An IPv6 entry is also judged by the IPv4 space it embeds.** ``::ffff:0:0/96`` is a /96, far past
     the IPv6 floor, yet a dual-stack listener sees every IPv4 peer inside it. So an entry that
     overlaps a range in :data:`_IPV4_EMBEDDING_RANGES` must leave at least
     :data:`ALLOWLIST_MIN_PREFIX_V4` bits of the embedded IPv4 address fixed, and one that contains a

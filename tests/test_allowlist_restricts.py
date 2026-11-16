@@ -56,6 +56,7 @@ def test_a_narrow_list_restricts(allowlist: Any) -> None:
         ["64:ff9b::/96"],
         ["64:ff9b:1::/48"],
         ["2001::/32"],  # every Teredo client
+        ["::ffff:0:0:0/96"],  # IPv4-translated, every client behind a SIIT translator
         # Not a list of network strings.
         "10.0.0.0/8",  # iterates as characters, and "1" parses as 0.0.0.1/32
         "1",
