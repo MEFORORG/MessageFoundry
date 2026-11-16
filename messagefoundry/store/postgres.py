@@ -185,6 +185,7 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
@@ -5123,7 +5124,7 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                await self._dead_letter_unopenable(row, exc)
+                await self._dead_letter_unopenable(row, exc, claimed=rows)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5272,7 +5273,7 @@ class PostgresStore:
                         )
                         await self._maybe_finalize_message(conn, row["message_id"], now)
                         row = None
-        return await self._fifo_item_or_dead_letter(row)
+        return await self._fifo_item_or_dead_letter(row, claimed=[row])
 
     async def claim_next_fifo_batch(
         self,
@@ -5376,7 +5377,7 @@ class PostgresStore:
         ordered = sorted(rows, key=lambda r: r["seq"])
         items: list[OutboxItem] = []
         for row in ordered:
-            item = await self._fifo_item_or_dead_letter(row)
+            item = await self._fifo_item_or_dead_letter(row, claimed=ordered)
             if item is not None:
                 items.append(item)
         return items
@@ -5561,7 +5562,7 @@ class PostgresStore:
         for lane, lane_rows in by_lane_rows.items():
             items: list[OutboxItem] = []
             for row in sorted(lane_rows, key=lambda r: r["seq"]):
-                item = await self._fifo_item_or_dead_letter(row)
+                item = await self._fifo_item_or_dead_letter(row, claimed=kept_rows)
                 if item is not None:
                     items.append(item)
             if items:
@@ -5656,7 +5657,9 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                 )
 
-    async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
+    async def _fifo_item_or_dead_letter(
+        self, row: Any, *, claimed: Sequence[Any]
+    ) -> OutboxItem | None:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
         and return ``None`` so the lane advances on the next poll (mirrors SQLite). Runs AFTER the claim
         txn so the dead-letter is its own transaction."""
@@ -5667,16 +5670,40 @@ class PostgresStore:
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            await self._dead_letter_unopenable(row, exc)
+            await self._dead_letter_unopenable(row, exc, claimed=claimed)
             return None
 
-    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> None:
+    async def _dead_letter_unopenable(
+        self, row: Any, exc: CipherError, *, claimed: Sequence[Any]
+    ) -> None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way.
+
+        A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
+        the row, so it is not dead-lettered (BACKLOG #5735): every row of the claim, ``claimed``,
+        goes back to ``pending`` and the error is raised, so the worker backs off. So does a
+        dead-letter write that fails, rather than leave the claim ``inflight``. The whole claim goes
+        back so a FIFO lane never delivers past its head; the SQLite twin says more."""
+        if is_transient_open_failure(exc):
+            await self._hand_back_claimed(claimed)
+            raise exc
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        try:
+            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        except Exception:
+            await self._hand_back_claimed(claimed)
+            raise
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
+
+    async def _hand_back_claimed(self, claimed: Sequence[Any]) -> None:
+        """Return a claim's rows to ``pending`` when its open raised out of the claim (BACKLOG
+        #5735). A failed hand-back is logged and the claim's own error propagates; the lease and
+        startup recovery re-pend what it left ``inflight``."""
+        try:
+            await self.release_claimed([r["id"] for r in claimed])
+        except Exception:  # noqa: BLE001 -- the claim's own error is the one the worker must see
+            log.exception("could not hand %d claimed queue row(s) back to pending", len(claimed))
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite

@@ -182,6 +182,7 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
@@ -14554,7 +14555,7 @@ class MessageStore:
             except Exception as exc:
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
-                await self._dead_letter_unopenable(row, exc)
+                await self._dead_letter_unopenable(row, exc, claimed=rows)
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -14599,15 +14600,42 @@ class MessageStore:
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
         return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
-    async def _dead_letter_unopenable(self, row: aiosqlite.Row, exc: Exception) -> None:
+    async def _dead_letter_unopenable(
+        self, row: aiosqlite.Row, exc: Exception, *, claimed: Iterable[aiosqlite.Row]
+    ) -> None:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593). The lane moves on either way."""
+        (BACKLOG #2593). The lane moves on either way.
+
+        A failure that says nothing about the row is not dead-lettered (BACKLOG #5735): a key
+        service that gave no verdict (:func:`is_transient_open_failure`) or a failed read of the
+        store. Every row of the claim, ``claimed``, goes back to ``pending`` and the error is
+        raised, so the worker backs off. So does a dead-letter write that fails, rather than leave
+        the claim's rows ``inflight`` until a restart. The whole claim goes back, not just this
+        row, so a FIFO lane never delivers past its head; :meth:`release_claimed` leaves a row that
+        already resolved, a dead-lettered one, as it is."""
+        if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
+            await self._hand_back_claimed(claimed)
+            raise exc
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        try:
+            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
+        except Exception:
+            await self._hand_back_claimed(claimed)
+            raise
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
+
+    async def _hand_back_claimed(self, claimed: Iterable[aiosqlite.Row]) -> None:
+        """Return a claim's rows to ``pending`` when its open raised out of the claim (BACKLOG
+        #5735). A failed hand-back is logged and the claim's own error propagates; startup recovery
+        (``reset_stale_inflight``) re-pends what it left ``inflight``."""
+        ids = [r["id"] for r in claimed]
+        try:
+            await self.release_claimed(ids)
+        except Exception:  # noqa: BLE001 -- the claim's own error is the one the worker must see
+            log.exception("could not hand %d claimed queue row(s) back to pending", len(ids))
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -14729,7 +14757,7 @@ class MessageStore:
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
             # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
-            await self._dead_letter_unopenable(claimed, exc)
+            await self._dead_letter_unopenable(claimed, exc, claimed=[claimed])
             return None
 
     async def claim_next_fifo_batch(
@@ -14807,7 +14835,7 @@ class MessageStore:
             try:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
-                await self._dead_letter_unopenable(row, exc)
+                await self._dead_letter_unopenable(row, exc, claimed=claimed_rows)
         return items
 
     async def claim_fifo_heads(
@@ -14922,13 +14950,14 @@ class MessageStore:
         # Decrypt per row OUTSIDE the lock; a single undecryptable payload must not blow up the whole
         # claim — dead-letter the bad row STANDALONE and deliver the rest (mirrors the batch claim).
         by_lane: dict[str, list[OutboxItem]] = {}
+        all_claimed = [r for rs in claimed_by_lane.values() for r in rs]
         for lane, lane_rows in claimed_by_lane.items():
             items: list[OutboxItem] = []
             for row in lane_rows:
                 try:
                     items.append(await self._outbox_item_from_row(row))
                 except Exception as exc:
-                    await self._dead_letter_unopenable(row, exc)
+                    await self._dead_letter_unopenable(row, exc, claimed=all_claimed)
             if items:
                 by_lane[lane] = items
             else:
