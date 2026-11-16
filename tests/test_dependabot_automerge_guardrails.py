@@ -6,8 +6,8 @@ Most of these assert the YAML wiring of ``.github/workflows/dependabot-auto-merg
 behavioural ones go further and **execute the shipped ``run:`` bodies under ``bash -e``** — the shell
 GitHub Actions applies by default on Linux — because the guardrails are shell logic and "the YAML
 names a step" is a much weaker claim than "the step holds what it must hold". That is possible only
-because both new steps take every input through ``env:`` and interpolate nothing — asserted by
-``test_new_steps_take_every_input_through_env_not_interpolation``, which is a precondition for the
+because every ``run:`` step takes every input through ``env:`` and interpolates nothing — asserted by
+``test_every_run_step_takes_every_input_through_env_not_interpolation``, a precondition for the
 behavioural tests as much as it is zizmor template-injection parity.
 
 The guardrail numbers below are DEPENDENCY-POSTURE-REVIEW.md's, carried with two corrections that
@@ -723,9 +723,11 @@ def test_the_token_permissions_are_exactly_what_each_job_needs() -> None:
     assert got == expected, got
 
 
-#: A ``gh`` call on a line that is not a comment. ``gh`` reads ``GH_TOKEN`` without the body ever
-#: naming it, so the ``$VAR`` check below cannot see that key go missing.
-_GH_CALL = re.compile(r"(?m)^[^#\n]*(?<![\w-])gh\s+(?:api|pr)\b")
+#: ``gh`` as a command word, anywhere in the body, comments included. ``gh`` reads ``GH_TOKEN``
+#: without the body ever naming it, so the ``$VAR`` check below cannot see that key go missing. It
+#: over-matches on purpose: a step that only mentions gh must still declare the token, which costs
+#: one env line, where an under-match would let a real call run without it.
+_GH_CALL = re.compile(r"(?<![\w./$-])gh(?=\s)")
 
 
 def _assert_inputs_come_through_env(label: str, step: dict) -> None:
@@ -770,6 +772,10 @@ def test_every_run_step_takes_every_input_through_env_not_interpolation() -> Non
         ('echo "$DEPS_JSON"\n', {"GH_TOKEN": "t"}, "undeclared env var"),
         ("gh api -X GET /advisories\n", {}, "declares no GH_TOKEN"),
         ('gh pr merge --auto "$PR_URL"\n', {"PR_URL": "u"}, "declares no GH_TOKEN"),
+        ('gh -R o/r pr merge --auto "$PR_URL"\n', {"PR_URL": "u"}, "declares no GH_TOKEN"),
+        ("gh release view v1\n", {}, "declares no GH_TOKEN"),
+        ("gh \\\n  api /x\n", {}, "declares no GH_TOKEN"),
+        ('n="${#X}"; echo "PR #1" && gh pr view 1\n', {"X": "x"}, "declares no GH_TOKEN"),
     ],
 )
 def test_the_env_check_refuses_each_planted_seam(body: str, env: dict, message: str) -> None:
@@ -778,9 +784,9 @@ def test_the_env_check_refuses_each_planted_seam(body: str, env: dict, message: 
         _assert_inputs_come_through_env("planted", {"run": body, "env": env})
 
 
-def test_the_env_check_does_not_count_a_commented_gh_call() -> None:
-    """The comment form appears in the shipped ghsa body, and must not count as a call."""
-    _assert_inputs_come_through_env("comment", {"run": "# `gh api` copies the JSON\n"})
+@pytest.mark.parametrize("body", ["echo high\n", "./bin/gh-check\n", 'echo "$SIGH"\n'])
+def test_the_gh_token_check_does_not_fire_without_a_gh_command(body: str) -> None:
+    _assert_inputs_come_through_env("plain", {"run": body, "env": {"SIGH": "s"}})
 
 
 # --------------------------------------------------------------------------------------------------

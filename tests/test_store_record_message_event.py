@@ -7,8 +7,8 @@ before this neither ``pipeline/`` nor ``transports/`` could record a disposition
 
 The load-bearing test here is ``test_an_unknown_kind_is_refused``. The shipped static guard
 (``test_message_event_constant_matches_the_literal_emit_sites``) AST-walks the backends for a
-*constant* first argument to ``_event``; this method forwards a **variable**, so that guard is blind
-to every kind written through it and passes vacuously. The runtime check is what actually keeps the
+*constant* in the ``event`` slot of each ``_event`` helper; this method forwards a **variable**, so
+that guard is blind to every kind written through it and passes vacuously. The runtime check is what actually keeps the
 vocabulary closed on this path.
 """
 

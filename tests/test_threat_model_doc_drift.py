@@ -1076,6 +1076,7 @@ def _checks() -> list[tuple[str, object, object]]:
         # document would trade a stale row for an unverifiable anchor.
         ("15.1.3 outbound retry cap = 100 attempts by default", RetryPolicy().max_attempts, 100),
         ("15.1.3 retry backoff = 5.0 s", RetryPolicy().backoff_seconds, 5.0),
+        ("15.1.3 retry backoff multiplier = 2.0", RetryPolicy().backoff_multiplier, 2.0),
         ("15.1.3 retry backoff cap = 300.0 s", RetryPolicy().max_backoff_seconds, 300.0),
         ("15.1.3 queue_buildup depth dimension OFF", BuildupThreshold().max_depth, None),
         ("15.1.3 queue_buildup age = 300.0 s", BuildupThreshold().max_oldest_seconds, 300.0),
@@ -1711,7 +1712,9 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
     buildup_age = BuildupThreshold().max_oldest_seconds
     claim_limit = _claim_limit_default()
     db_poll = _db_poll_seconds_default()
+    tail_min = _get_route_query_bound("/logs/tail", "limit", "ge")
     tail_max = _get_route_query_bound("/logs/tail", "limit", "le")
+    export_min = _get_route_query_bound("/messages/export", "limit", "ge")
     export_max = _get_route_query_bound("/messages/export", "limit", "le")
     return [
         ("**HL7 parse**", peek.DEFAULT_MAX_MESSAGE_BYTES, "16 MiB"),
@@ -1830,10 +1833,19 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
         ("**argon2 verification**", _ARGON2_MAX_CONCURRENCY, "cpu_count"),
         ("**Per-actor PHI reads**", s.auth.phi_read_rate_limit_per_actor, "120"),
         ("**Per-actor admin writes**", s.auth.admin_write_rate_limit_per_actor, "12"),
-        ("**`GET /logs/tail`**", tail_max, f"`limit` **1..{tail_max:,}** lines"),
-        ("**`GET /messages/export`**", export_max, f"`limit` **1..{export_max:,}**"),
+        ("**`GET /logs/tail`**", tail_max, f"`limit` **{tail_min}..{tail_max:,}** lines"),
+        ("**`GET /logs/tail`**", tail_min, f"`limit` **{tail_min}..{tail_max:,}** lines"),
+        ("**`GET /messages/export`**", export_max, f"`limit` **{export_min}..{export_max:,}**"),
+        ("**`GET /messages/export`**", export_min, f"`limit` **{export_min}..{export_max:,}**"),
         ("**`POST /uploads`**", s.store.max_upload_bytes, "25 MiB"),
+        (
+            "**Outbound retry**",
+            retry.max_attempts,
+            f"`max_attempts` **defaults to a finite `{retry.max_attempts}`**",
+        ),
         ("**Outbound retry**", retry.backoff_seconds, f"backoff **{retry.backoff_seconds} s**"),
+        # U+00D7, the multiplication sign the row writes, escaped so this file adds no glyph.
+        ("**Outbound retry**", retry.backoff_multiplier, f"× **{retry.backoff_multiplier}**"),
         (
             "**Outbound retry**",
             retry.max_backoff_seconds,
@@ -1873,7 +1885,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         ("**Sandbox IPC deserialization**", sandbox._MAX_FRAME, "64 MiB"),
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS),
+            oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS,
             "**10 s** per round trip",
         ),
         (
@@ -1883,12 +1895,12 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         ),
         ("**OIDC token-endpoint POST + JWKS GET**", jwks._MAX_JWKS_BYTES, "512 KiB"),
         ("**OIDC token-endpoint POST + JWKS GET**", jwks._MIN_RSA_BITS, "2048"),
-        ("**OIDC token-endpoint POST + JWKS GET**", int(jwks.DEFAULT_JWKS_TTL_SECONDS), "3600"),
+        ("**OIDC token-endpoint POST + JWKS GET**", jwks.DEFAULT_JWKS_TTL_SECONDS, "3600"),
         # Rendered as the FULL phrase, not the bare number: the row carries two independent 300 s
         # constants and three "512"s, so a bare token let a planted lie be satisfied by its sibling.
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(jwks.DEFAULT_JWKS_MIN_REFETCH_SECONDS),
+            jwks.DEFAULT_JWKS_MIN_REFETCH_SECONDS,
             "min-refetch floor of 300 s",
         ),
         (
@@ -1898,7 +1910,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         ),
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(s.auth.oidc_flow_ttl_seconds),
+            s.auth.oidc_flow_ttl_seconds,
             "`[auth].oidc_flow_ttl_seconds` **300 s**",
         ),
         ("**Operator-configured SHELL execution**", s.dr.takeover_timeout_seconds, "30.0 s"),
@@ -1951,7 +1963,7 @@ _RENDERED_NUMBER_RE = re.compile(r"(?<!\w)(?<!\d\.)\d[\d,]*(?:\.\d+)?(?!\w)")
 
 #: Doc-side entries whose rendered form states the bound as a formula, not a number. Each is pinned
 #: by value elsewhere: the argon2 clamp by ``_checks``' ``max(2, min(8, cpu_count))`` row.
-_RENDERED_WITHOUT_A_NUMBER = frozenset({"**argon2 verification**"})
+_RENDERED_WITHOUT_A_NUMBER: dict[str, set[str]] = {"15.1.3": {"**argon2 verification**"}}
 
 
 def _rendered_numbers(rendered: str) -> set[float]:
@@ -1959,14 +1971,14 @@ def _rendered_numbers(rendered: str) -> set[float]:
 
 
 def _rendered_units(rendered: str) -> set[float]:
-    """The divisors that turn a live value into the phrase's unit. A size entry carries its live
-    value in bytes and renders it in the binary unit it names; any other entry renders as it is."""
-    named = {
+    """The divisors that may turn a live value into the phrase's number. A size entry may carry its
+    live value in bytes and render it in the binary unit it names, or carry it already in that unit,
+    as ``s.sandbox.mem_mb`` is (see :func:`_bounds_from_label`); so both readings are admitted."""
+    return {1} | {
         multiplier
         for unit, multiplier in _UNIT_MULTIPLIER.items()
         if unit.endswith("iB") and re.search(rf"\b{unit}\b", rendered)
     }
-    return named or {1}
 
 
 @pytest.mark.parametrize("which", ["15.1.3", "15.1.5"])
@@ -1992,9 +2004,10 @@ def test_every_doc_side_bound_renders_its_live_value(which: str) -> None:
             numberless.add(label)
         elif not {live / unit for unit in _rendered_units(rendered)} & stated:
             problems.append(f"{label!r}: renders {rendered!r}, but the live value is {live!r}")
-    assert numberless <= _RENDERED_WITHOUT_A_NUMBER, (
-        f"doc-side entries render no number, so nothing ties them to code: "
-        f"{sorted(numberless - _RENDERED_WITHOUT_A_NUMBER)}"
+    # Equality, not a subset, so an exemption whose entry was re-rendered or removed goes stale loudly.
+    assert numberless == _RENDERED_WITHOUT_A_NUMBER.get(which, set()), (
+        f"doc-side entries rendering no number, so nothing ties them to code: {sorted(numberless)}; "
+        f"exempted: {sorted(_RENDERED_WITHOUT_A_NUMBER.get(which, set()))}"
     )
     assert not problems, (
         f"{which} doc-side entries whose rendered phrase no longer states the live bound: "
@@ -2008,8 +2021,8 @@ def test_the_rendered_number_reader_reads_the_forms_the_tables_use() -> None:
     assert _rendered_numbers("backoff **5.0 s**") == {5.0}
     assert _rendered_numbers("`DEFAULT_MAX_CONNECTIONS_PER_HOST` allows **32**") == {32.0}
     assert _rendered_numbers("min(2, cpu_count)") == {2.0}
-    assert _rendered_units("`MAX_TOKEN_RESPONSE_BYTES` **256 KiB**") == {1024}
-    assert _rendered_units("**16 MiB** binary ingress") == {1024 * 1024}
+    assert _rendered_units("`MAX_TOKEN_RESPONSE_BYTES` **256 KiB**") == {1, 1024}
+    assert _rendered_units("**16 MiB** binary ingress") == {1, 1024 * 1024}
     assert _rendered_units("min-refetch floor of 300 s") == {1}
     assert _rendered_numbers("cpu_count") == set()
     assert 1024.0 not in _rendered_numbers("2048")
