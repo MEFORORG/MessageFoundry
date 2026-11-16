@@ -8936,13 +8936,17 @@ class RegistryRunner:
         and markers stand. A lane running now that was parked before is stopped the cooperative
         way, as :meth:`_dr_park_outbound` parks a live lane, so it reads quiesced only once a send
         in flight resolves. Step 2a's consumer decisions stay, for the reason its comment gives.
-        A lane only the refused graph declares is left as step 3 built it, so rows queued to it
-        drain, as a lane a reload drops does."""
+        A lane only the refused graph declares, and that had no connector before, is left as step
+        3 built it, so rows queued to it drain, as a lane a reload drops does. Every connector step 3
+        retired that no lane holds after the restore is returned for closing."""
         to_close: list[tuple[str, Any]] = []
         kept = {id(snap.connector) for snap in state.lanes.values() if snap.connector is not None}
         passive = self._dr_passive
         for name, snap in state.lanes.items():
-            if name not in old.outbound:
+            if name not in old.outbound and snap.connector is None:
+                # Only the refused graph declares it, and it had no connector before: keep what
+                # step 3 built, so its rows drain. One that had a connector, a lane an earlier
+                # reload dropped and that was still draining, is put back below like any other.
                 continue
             current = self._destinations.get(name)
             if current is not snap.connector:
@@ -8988,6 +8992,12 @@ class RegistryRunner:
                     members.discard(name)
         if state.dr_unbuilt is not None:
             self._dr_unbuilt = dict(state.dr_unbuilt)
+        # A connector step 3 retired that no lane holds again is closed too, never left open.
+        closing = {id(connector) for _name, connector in to_close}
+        for name, connector in state.retired:
+            if connector is not self._destinations.get(name) and id(connector) not in closing:
+                closing.add(id(connector))
+                to_close.append((name, connector))
         return to_close
 
     async def _close_retired(self, retired: list[tuple[str, Any]]) -> list[tuple[str, str]]:
@@ -9462,8 +9472,12 @@ class RegistryRunner:
                 self._outbound_pass = None
                 # The connectors the refused graph built close detached, scheduled before any await
                 # so a second cancellation cannot skip them, and so a close that hangs does not
-                # hold the reload lock.
-                self._close_detached(self._restore_outbound_lanes(outbound_pass, old))
+                # hold the reload lock. Guarded, as each rollback step below is: a restore that
+                # raises must not stop the intake restore after it.
+                try:
+                    self._close_detached(self._restore_outbound_lanes(outbound_pass, old))
+                except Exception:
+                    log.exception("rollback: could not put the outbound lanes back")
                 self._restore_dr_markers(cleared)
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
                 # the first await below, so no worker that reads them after the restore pairs the old
@@ -9510,7 +9524,13 @@ class RegistryRunner:
             # graph, so an added schedule starts, an edited one changes and a removed one stops
             # (BACKLOG #2069). After the rollback point on purpose,
             # so a failed reload leaves every scheduler running against the graph it restored.
-            await self._reconcile_schedulers()
+            try:
+                await self._reconcile_schedulers()
+            except BaseException:
+                # The only await before the closes below: a raise or a cancellation here must not
+                # leave what step 3 retired open with nothing holding it (BACKLOG #5755).
+                self._close_detached(outbound_pass.retired)
+                raise
 
             # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
             # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has

@@ -348,3 +348,89 @@ async def test_the_lane_anchor_check_reads_the_reloads_one_schedule_time(
         assert judged and set(judged) == {build_times[0]}
     finally:
         await rr.stop()
+
+
+def _record_closes(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    closed: list[Any] = []
+    real_close = runner._close_replaced
+
+    async def record(name: str, replaced: Any, failures: list[tuple[str, str]]) -> None:
+        closed.append(replaced)
+        await real_close(name, replaced, failures)
+
+    monkeypatch.setattr(runner, "_close_replaced", record)
+    return closed
+
+
+async def _settle(runner: RegistryRunner) -> None:
+    """Let the detached closes a reload or its rollback scheduled run."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+    if runner._lookup_close_tasks:
+        await asyncio.wait(runner._lookup_close_tasks, timeout=10)
+
+
+def _fail_after_forward(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    real = runner._reconcile_outbounds
+
+    async def fail_after_forward(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
+        await real(*args, **kwargs)
+        raise RuntimeError("step 3 failed after its last lane")
+
+    monkeypatch.setattr(runner, "_reconcile_outbounds", fail_after_forward)
+
+
+async def test_a_raise_after_the_swap_still_closes_the_retired_connectors(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closes ran at the end of the commit tail, so a raise in the scheduler reconcile, the
+    one await before them, left the connectors step 3 retired open with nothing holding them."""
+    before = runner._destinations[_OB]
+    closed = _record_closes(runner, monkeypatch)
+
+    async def schedulers_fail() -> None:
+        raise RuntimeError("scheduler reconcile failed")
+
+    monkeypatch.setattr(runner, "_reconcile_schedulers", schedulers_fail)
+    with pytest.raises(RuntimeError, match="scheduler reconcile"):
+        await runner.reload(_registry(tmp_path, "out_v2", second="out2"))
+    await _settle(runner)
+
+    assert runner._destinations[_OB] is not before
+    assert before in closed
+
+
+async def test_a_rollback_puts_back_a_dropped_lane_still_draining(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane an earlier reload dropped keeps draining on its connector. A refused reload that
+    re-adds it changed retires that connector; the rollback puts it back rather than leak it."""
+    await runner.reload(_registry(tmp_path, "out"))  # drops file_out_2, which keeps draining
+    assert "file_out_2" not in runner.registry.outbound
+    draining = runner._destinations["file_out_2"]
+    closed = _record_closes(runner, monkeypatch)
+    _fail_after_forward(runner, monkeypatch)
+    with pytest.raises(RuntimeError, match="after its last lane"):
+        await runner.reload(_registry(tmp_path, "out", second="out2_v2"))
+    await _settle(runner)
+
+    assert runner._destinations["file_out_2"] is draining
+    assert draining not in closed
+    assert closed  # the connector the refused graph built for it is closed
+
+
+async def test_a_restore_that_raises_does_not_stop_the_rollback(
+    runner: RegistryRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def restore_fails(*_args: Any) -> list[tuple[str, Any]]:
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(runner, "_restore_outbound_lanes", restore_fails)
+    _fail_after_forward(runner, monkeypatch)
+    old = runner.registry
+    # Before the fix the restore's raise replaced the reload's error and left intake down.
+    with pytest.raises(RuntimeError, match="after its last lane"):
+        await runner.reload(_registry(tmp_path, "out_v2", second="out2"))
+
+    assert runner.registry is old
+    assert runner.inbound_running("file_in")
