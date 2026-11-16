@@ -74,6 +74,8 @@ from messagefoundry.config.ai_policy import (
 from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
 from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
+    SATURATION_MIN_GROWTH_DEFAULT,
+    SATURATION_MIN_GROWTH_MAX,
     AckAfter,
     BuildupThreshold,
     InternalErrorPolicy,
@@ -2272,6 +2274,14 @@ class InboundSettings(_Section):
         return value
 
 
+def _refuse_a_bool(value: object, info: ValidationInfo) -> object:
+    """Refuse a TOML boolean for a numeric setting (BACKLOG #5770). Lax pydantic reads ``true`` as
+    1, so ``email_smtp_port = true`` would load as port 1 and pass the range check."""
+    if isinstance(value, bool):
+        raise ValueError(f"{info.field_name} must be a number, not a boolean")
+    return value
+
+
 class DeliverySettings(_Section):
     """Global outbound-delivery defaults. An outbound connection that declares no ``retry=``/
     ``ordering=`` of its own inherits these; an explicit per-connection value overrides them
@@ -2332,6 +2342,12 @@ class DeliverySettings(_Section):
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
     saturation_sustain_samples: int | None = None
+    # BACKLOG #5768: the net rise, in messages, a saturation window must clear before it fires, so
+    # one arrival on an idle lane does not page. SaturationThreshold.min_growth states the default
+    # and the cap.
+    saturation_min_growth: int = Field(
+        default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX
+    )
     # Global DR / priority tier default for every connection (#61, ADR 0048). A connection that declares
     # no priority= of its own inherits this (resolution order: per-connection override > [delivery]
     # global default > built-in NORMAL); the DR run-profile then starts only connections whose resolved
@@ -2360,10 +2376,17 @@ class DeliverySettings(_Section):
         Corepoint "Max Message Stall"). ``None`` keeps the stall alert off by default."""
         return StallThreshold(max_oldest_seconds=self.stall_max_oldest_seconds)
 
+    _no_bool_saturation_floor = field_validator("saturation_min_growth", mode="before")(
+        _refuse_a_bool
+    )
+
     def saturation_threshold(self) -> SaturationThreshold:
         """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
         amendment). ``None`` keeps the saturation (rising-backlog derivative) alert off by default."""
-        return SaturationThreshold(sustain_samples=self.saturation_sustain_samples)
+        return SaturationThreshold(
+            sustain_samples=self.saturation_sustain_samples,
+            min_growth=self.saturation_min_growth,
+        )
 
 
 class PipelineSettings(_Section):
@@ -5940,6 +5963,10 @@ class AlertRule(BaseModel):
                 raise ValueError(f"transports must be a subset of [{allowed}]; unknown: {bad}")
         return v
 
+    _no_bool_numbers = field_validator(
+        "min_depth", "min_oldest_seconds", "cooldown_seconds", mode="before"
+    )(_refuse_a_bool)
+
     @field_validator("recipients")
     @classmethod
     def _check_recipients(cls, v: list[str] | None) -> list[str] | None:
@@ -6004,10 +6031,11 @@ class AlertsSettings(_Section):
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
-    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why).
+    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why). A socket
+    # timeout: it bounds each wait on the webhook host during a POST, not the whole POST.
     webhook_timeout: float = Field(
         default=10.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
-    )  # seconds per POST
+    )
     # Optional egress allowlist for the webhook host (ASVS 1.3.6, SSRF defense-in-depth). Empty =
     # any host (the URL is operator-configured, not request-derived). When set, the webhook_url host
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
@@ -6023,7 +6051,8 @@ class AlertsSettings(_Section):
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
-    email_smtp_port: int = Field(default=587, ge=1, le=65535)
+    # 0 is smtplib's "use the default": port 25, or the port a ``host:port`` email_smtp_host names.
+    email_smtp_port: int = Field(default=587, ge=0, le=65535)
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
@@ -6053,9 +6082,10 @@ class AlertsSettings(_Section):
     # as before (byte-identical). A reference/label, not the value, so it may live in the config file.
     # Fail-closed: a reference with no [secrets].provider, or an unresolvable one, raises at startup.
     email_password_secret: str | None = None
+    # A socket timeout: it bounds each wait on the SMTP relay during a send, not the whole send.
     email_timeout: float = Field(
         default=30.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
-    )  # seconds per send
+    )
     # Egress allowlist for the SMTP host (WP-11c, parity with webhook_allowed_hosts). Empty = any.
     smtp_allowed_hosts: list[str] = []
     # #138 (ADR 0127): OPTIONAL operator-editable alert-email templates. All None (the default) = the
@@ -6114,6 +6144,10 @@ class AlertsSettings(_Section):
     # per event + connection. Empty = today's behaviour (every event → every transport, global throttle).
     # Authored as ``[[alerts.rules]]`` tables in the config file. First match wins.
     rules: list[AlertRule] = []
+
+    _no_bool_numbers = field_validator(
+        "webhook_timeout", "email_smtp_port", "email_timeout", "realert_seconds", mode="before"
+    )(_refuse_a_bool)
 
     @field_validator("email_to", "webhook_allowed_hosts", "smtp_allowed_hosts", mode="before")
     @classmethod

@@ -26,6 +26,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
+from messagefoundry.config.models import SATURATION_MIN_GROWTH_DEFAULT
+
 __all__ = ["SaturationSignal", "SaturationDetector"]
 
 
@@ -52,22 +54,30 @@ class SaturationDetector:
 
     The decision (evaluated over the full window once it is primed):
 
-    * **net rise** — the newest depth is strictly greater than the oldest in the window (``dN > d0``),
-      i.e. arrivals exceeded departures over the window (ingest > drain); and
+    * **net rise past the floor** — the newest depth exceeds the oldest in the window by at least
+      ``min_growth`` messages (``dN - d0 >= min_growth``), i.e. arrivals exceeded departures over the
+      window (ingest > drain) by more than one arrival or a small burst would (BACKLOG #5768). Depth
+      samples alone cannot tell one arrival on an idle lane from slow growth, so the floor, not the
+      window's shape, is what keeps ``[0, 0, 0, 1]`` from paging; and
     * **sustained** — no step in the window *decreased* (every ``d[i+1] >= d[i]``). A single drop means
       the worker drained at some point in the window, so the growth is a burst being cleared, not
       saturation — and it does **not** fire.
 
-    A flat window (``dN == d0``) or a window with any decrease returns ``None``.
+    A window whose rise is below the floor, or with any decrease, returns ``None``.
     """
 
-    __slots__ = ("_sustain", "_samples")
+    __slots__ = ("_sustain", "_min_growth", "_samples")
 
-    def __init__(self, sustain_samples: int) -> None:
+    def __init__(
+        self, sustain_samples: int, *, min_growth: int = SATURATION_MIN_GROWTH_DEFAULT
+    ) -> None:
         if sustain_samples < 2:
             # Fewer than two rising steps can't distinguish a burst from sustained growth.
             raise ValueError(f"sustain_samples must be >= 2, got {sustain_samples}")
+        if min_growth < 1:
+            raise ValueError(f"min_growth must be >= 1, got {min_growth}")
         self._sustain = sustain_samples
+        self._min_growth = min_growth
         self._samples: deque[tuple[float, int]] = deque(maxlen=sustain_samples + 1)
 
     def observe(self, now: float, depth: int) -> SaturationSignal | None:
@@ -78,8 +88,8 @@ class SaturationDetector:
             return None  # window not yet primed — need sustain_samples + 1 observations
         window = list(self._samples)
         depths = [d for _, d in window]
-        if depths[-1] <= depths[0]:
-            return None  # no net rise across the window → not becoming overloaded
+        if depths[-1] - depths[0] < self._min_growth:
+            return None  # no rise past the floor across the window → not becoming overloaded
         for prev, cur in zip(depths, depths[1:]):  # noqa: B905
             if cur < prev:
                 # A decrease anywhere in the window = the lane drained during it. That is a

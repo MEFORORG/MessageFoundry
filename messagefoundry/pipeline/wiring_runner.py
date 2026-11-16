@@ -13185,7 +13185,7 @@ class RegistryRunner:
         depth, _oldest = await self.store.pending_depth(name, stage=stage)
         detector = self._saturation_detectors.get(key)
         if detector is None:
-            detector = SaturationDetector(sustain)
+            detector = SaturationDetector(sustain, min_growth=self._saturation_default.min_growth)
             self._saturation_detectors[key] = detector
         # Sample EVERY tick (even when throttled) so the depth window stays continuous; the throttle
         # only gates the notification, never the sampling.

@@ -541,6 +541,17 @@ class StallThreshold(BaseModel):
     max_oldest_seconds: float | None = None
 
 
+#: BACKLOG #5768: the net rise, in messages, a saturation window must clear before it counts as
+#: sustained. Depth samples alone cannot tell one arrival on an idle lane ([0, 0, 0, 1]) from a lane
+#: growing slowly while sampled faster than its arrivals ([5, 5, 5, 6]), so a rise below the floor
+#: never fires. Five is a JUDGMENT with no measured anchor: past a single message or a small burst,
+#: and small beside the depth a buildup alert is usually set at.
+SATURATION_MIN_GROWTH_DEFAULT = 5
+#: The largest floor that loads. A floor this high already makes the alert a depth ceiling in
+#: disguise, which ``queue_buildup`` does better.
+SATURATION_MIN_GROWTH_MAX = 1_000_000
+
+
 class SaturationThreshold(BaseModel):
     """When to raise a ``saturation`` alert for a lane (BACKLOG #93, ADR 0014 amendment): the lane is
     *becoming* overloaded — its pending backlog is **rising sustained** across the sampling window.
@@ -556,9 +567,15 @@ class SaturationThreshold(BaseModel):
     that many observations to prime). ``None`` (the default) **disables** the saturation alert for the
     connection — deny-by-default/off unless an operator opts in (it overlaps ``queue_buildup``'s age
     dimension, so it is opt-in to avoid double-paging). Resolution mirrors the other per-lane policies:
-    the ``[delivery]`` global default > built-in (off)."""
+    the ``[delivery]`` global default > built-in (off).
+
+    ``min_growth`` is the net rise, in messages, across the window that the alert needs before it
+    fires (BACKLOG #5768, :data:`SATURATION_MIN_GROWTH_DEFAULT`)."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
+    min_growth: int = Field(
+        default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX, strict=True
+    )
 
 
 class ActiveWindow(BaseModel):

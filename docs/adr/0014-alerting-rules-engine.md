@@ -147,7 +147,8 @@ exactly *arrivals > departures* (**ingest > drain**) held over it — so a lane 
 (depth falls back) never fires, while one whose depth climbs monotonically does. That "does **not**
 fire on a bursty-but-draining lane" is the defining property, enforced by `SaturationDetector` (a
 `deque(maxlen=sustain_samples+1)` of `(ts, depth)`; fires only when the newest depth strictly exceeds
-the oldest **and** no step in the window decreased). The detector is pure/synchronous and unit-tested
+the oldest **and** no step in the window decreased; since BACKLOG #5768 the rise must also reach
+`[delivery].saturation_min_growth` messages, so one arrival on an idle lane does not fire). The detector is pure/synchronous and unit-tested
 directly. It rides the existing per-lane buildup tick (`_maybe_alert_buildup` → `_maybe_alert_saturation`),
 so it adds **no new sampler** — and returns before any store read when disabled (zero cost when off).
 
