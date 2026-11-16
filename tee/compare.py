@@ -30,6 +30,12 @@ DEFAULT_IGNORE_FIELDS: frozenset[tuple[str, int]] = frozenset(
 )
 
 
+#: The :attr:`FieldDiff.location` of a segment-order difference: both sides hold the same segments
+#: but in a different sequence (an OBX moved between OBR groups, say). Its ``left``/``right`` are the
+#: space-joined segment ids in each side's order, which carry no field content.
+SEGMENT_ORDER = "segment-order"
+
+
 @dataclass(frozen=True)
 class CompareConfig:
     """Tunable comparison policy. ``ignore_fields`` are the ``(segment id, field number)`` pairs
@@ -42,7 +48,8 @@ class CompareConfig:
 class FieldDiff:
     """One differing field, or a whole-segment presence difference. ``location`` is an HL7 address like
     ``PID-5`` / ``MSH-10`` (a repeated segment's occurrence is appended as ``#2``, ``#3``, …; a
-    whole-segment difference omits the field number). ``ignored`` marks a difference in an ignore-list
+    whole-segment difference omits the field number, and a segment-order difference is
+    :data:`SEGMENT_ORDER`). ``ignored`` marks a difference in an ignore-list
     field — surfaced for transparency but not counted as a mismatch."""
 
     location: str
@@ -141,6 +148,22 @@ def compare(left: str, right: str, config: CompareConfig | None = None) -> Compa
                         ignored=(seg_id, n) in cfg.ignore_fields,
                     )
                 )
+
+    # The (id, occurrence) keys align repeated segments but carry no position, so an OBX or NTE that
+    # moved into another OBR group keeps its key and its fields, and the loop above sees nothing.
+    # Compare the order of the segments both sides hold; a one-side-only segment is already a
+    # presence diff above, so it is left out here rather than reported twice.
+    left_order = [key for key in li if key in ri]
+    right_order = [key for key in ri if key in li]
+    if left_order != right_order:
+        diffs.append(
+            FieldDiff(
+                location=SEGMENT_ORDER,
+                left=" ".join(seg_id for seg_id, _ in left_order),
+                right=" ".join(seg_id for seg_id, _ in right_order),
+                ignored=False,
+            )
+        )
 
     material = any(not d.ignored for d in diffs)
     if _canonical(left) == _canonical(right):
