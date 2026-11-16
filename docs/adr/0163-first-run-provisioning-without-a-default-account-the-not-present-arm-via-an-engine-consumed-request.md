@@ -379,8 +379,8 @@ time can read as an account that does not exist. On any lookup failure, 1332 or 
 directory is refused as not hardened, so no trio DACL is written, and each store file takes the
 existing owner-only fallback, `_secure_file` (decision d20261106T140017335-d24848). That start still
 opens the store, but the fallback can bring back the Wave 0 lockout between the service and the
-provisioning operator. The fallback grants full control to the account `_current_user` names, read
-from the environment, and keeps a file's explicit entries, because it replaces only the principal
+provisioning operator. The fallback grants full control to the account `_current_user_sid` reads
+from the process token (vault BACKLOG #5612; it read a name from the environment before), and keeps a file's explicit entries, because it replaces only the principal
 it names (measured, above). A file that already exists keeps any trio entries it carries: the main
 database file, and a `-wal` or `-shm` still on disk because another process has the store open or a
 crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit
