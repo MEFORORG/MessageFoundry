@@ -22,6 +22,7 @@ import {
   evaluatedPermission,
   heldAuthoritativeAnswer,
   mergeAuthoritativePolicy,
+  narrowMode,
   pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineTargetIsSet, engineUrl, environments, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
@@ -66,7 +67,7 @@ export interface AiPolicyWire {
  */
 function fromWire(w: AiPolicyWire): AiPolicy {
   return {
-    mode: w.mode,
+    mode: narrowMode(w.mode),
     dataScope: w.data_scope,
     environment: w.environment,
     assistPermitted: evaluatedPermission(w.assist_permitted),
