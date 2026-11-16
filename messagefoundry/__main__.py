@@ -2399,9 +2399,9 @@ def _start_logging_gates(
             # here refuses the start, since no record would take the hop then (BACKLOG #5390).
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
-                f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so the "
-                "evidence stream crosses the network unprotected on a PHI instance whenever the "
-                "forwarder is connected. Set "
+                f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so every "
+                "record forwarded there crosses the network unprotected on a PHI instance, over UDP "
+                "with no connection needed. Set "
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
                 "(ADR 0080) to a collector on another host."
             )

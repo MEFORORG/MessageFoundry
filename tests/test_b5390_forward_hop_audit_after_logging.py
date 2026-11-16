@@ -101,7 +101,7 @@ def test_hop_audit_is_logged_once_after_configure(
     assert rc is None
     assert _hop_audit(seen) == [True]
     # The record states the posture the start accepted, not that a record crossed.
-    assert "unprotected on a PHI instance whenever the forwarder is connected" in next(
+    assert "crosses the network unprotected on a PHI instance, over UDP with no" in next(
         m for m, _ in seen if "AUDIT:" in m
     )
     err = capsys.readouterr().err

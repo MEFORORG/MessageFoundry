@@ -348,15 +348,16 @@ def test_a_written_audit_record_names_its_caller_and_respects_logging_disable() 
 
     recorder = _Keep()
     logger = logging.getLogger("messagefoundry.__main__")
+    previous = logging.root.manager.disable
     logger.addHandler(recorder)
     try:
+        # Cleared first, so a floor an earlier test left cannot drop the positive arm.
+        logging.disable(logging.NOTSET)
         cli._write_start_audit(["AUDIT: one"])
         logging.disable(logging.CRITICAL)
-        try:
-            cli._write_start_audit(["AUDIT: two"])
-        finally:
-            logging.disable(logging.NOTSET)
+        cli._write_start_audit(["AUDIT: two"])
     finally:
+        logging.disable(previous)
         logger.removeHandler(recorder)
     assert [r.getMessage() for r in records] == ["AUDIT: one"]
     assert records[0].funcName == (
