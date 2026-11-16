@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import builtins
 import errno
+import functools
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -5705,29 +5706,133 @@ HandlerAccepts = Callable[[Payload], bool]
 _ACCEPTS_FORBIDDEN_ACCESSORS = frozenset({"state_get", "response_get"})
 
 
+def _accepts_callees(obj: object) -> list[object]:
+    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, a bound method's
+    function, a ``functools.wraps`` wrapper's ``__wrapped__``, or a callable instance's ``__call__``.
+    Empty for a plain function, or for anything with none of these."""
+    if isinstance(obj, functools.partial):
+        return [obj.func]
+    if inspect.ismethod(obj):
+        return [obj.__func__]
+    if inspect.isfunction(obj):
+        wrapped = getattr(obj, "__wrapped__", None)
+        return [wrapped] if wrapped is not None else []
+    if callable(obj) and not isinstance(obj, type):
+        call = inspect.getattr_static(type(obj), "__call__", None)
+        return [call] if inspect.isfunction(call) else []
+    return []
+
+
+def _accepts_is_async(pred: object) -> bool:
+    """Whether ``pred``, or what it runs through :func:`_accepts_callees`, is a coroutine or
+    async-generator function: calling it returns an object that is always truthy."""
+    stack: list[object] = [pred]
+    seen: set[int] = set()
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if inspect.iscoroutinefunction(obj) or inspect.isasyncgenfunction(obj):
+            return True
+        stack += _accepts_callees(obj)
+    return False
+
+
+def _accepts_run_scoped_reads(pred: object) -> set[str]:
+    """The fail-open run-scoped accessors ``pred`` can reach, by name (BACKLOG #5514).
+
+    The walk starts at ``pred`` and follows at least these edges: a ``functools.partial``'s function,
+    arguments and keywords; a bound method's function; a ``__wrapped__`` chain; a callable instance's
+    ``__call__``; a function's default values, keyword defaults and closure cells; the code objects
+    nested in its own (a lambda or an inner ``def``); and a global it names that is a function defined
+    in a loaded config module or in the predicate's own module. An accessor counts when a reached
+    object IS ``state_get`` or ``response_get``, so an alias is caught, or when a reached code object
+    names one, as the earlier one-level check did. It does not see at least: a call through
+    ``getattr`` or another computed name, a global function in any other module, an object's other
+    methods, or a value the predicate builds while it runs."""
+    # Lazy: both modules sit beside this one and are imported by handler code, not by the loader.
+    from messagefoundry.config.response import response_get
+    from messagefoundry.config.state import state_get
+
+    accessors = {id(state_get): "state_get", id(response_get): "response_get"}
+    root = pred
+    while (callees := _accepts_callees(root)) and not inspect.isfunction(root):
+        root = callees[0]
+    home = getattr(root, "__module__", None)
+    if str(home).startswith("messagefoundry."):
+        # A shipped predicate such as message_type_of's: its module's globals are engine code, which
+        # this walk is not for, and following them would walk the engine.
+        home = None
+    found: set[str] = set()
+    stack: list[object] = [pred]
+    seen: set[int] = set()
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if id(obj) in accessors:
+            found.add(accessors[id(obj)])
+            continue
+        stack += _accepts_callees(obj)
+        if isinstance(obj, functools.partial):
+            stack += [*obj.args, *obj.keywords.values()]
+        if not inspect.isfunction(obj):
+            continue
+        stack += obj.__defaults__ or ()
+        stack += (obj.__kwdefaults__ or {}).values()
+        for cell in obj.__closure__ or ():
+            with suppress(ValueError):  # an empty cell: a free variable not yet bound
+                stack.append(cell.cell_contents)
+        codes: list[CodeType] = [obj.__code__]
+        while codes:
+            code = codes.pop()
+            codes += [const for const in code.co_consts if isinstance(const, CodeType)]
+            found |= _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
+            for name in code.co_names:
+                target = obj.__globals__.get(name)
+                if id(target) in accessors:
+                    found.add(accessors[id(target)])
+                elif inspect.isfunction(target) and (
+                    target.__module__ == home
+                    or str(target.__module__).startswith(_CONFIG_MODULE_PREFIX)
+                ):
+                    stack.append(target)
+    return found
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
-    Two static checks, both at load/``check`` time so a broken predicate is a :class:`WiringError`
-    rather than a per-message routing-stage dead-letter storm:
+    Three static checks, all at load/``check`` time so a broken predicate is a :class:`WiringError`
+    rather than a per-message routing-stage dead-letter storm or a filter that passes everything:
 
     * **Non-callable** — ``accepts=True`` (passing the intended default instead of a predicate, a
       plausible typo) would pass the orphan check yet ``pred(msg)`` raises ``TypeError: 'bool' object is
       not callable`` on the FIRST message, dead-lettering every message on that inbound.
-    * **Fail-open run-scoped read** — a predicate whose code names ``state_get``/``response_get`` (ADR
+    * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
+      runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
+      truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
+      an awaitable is not seen.
+    * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
       catches it at runtime; refuse it here (a filter that needs run-scoped state stays in the Handler).
+      :func:`_accepts_run_scoped_reads` says which edges it follows and, at least, which it does not.
     """
     if not callable(pred):
         raise WiringError(
             f"accepts= predicate for handler {hname!r} is not callable ({pred!r}); it must be a "
             "function (msg) -> bool"
         )
-    code = getattr(inspect.unwrap(pred), "__code__", None)
-    if code is None:
-        return  # a callable with no analyzable code object (e.g. a callable instance) — can't inspect
-    named = _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
+    if _accepts_is_async(pred):
+        raise WiringError(
+            f"accepts= predicate for handler {hname!r} is async; the router stage calls it without "
+            "awaiting, so its coroutine would read as True and accept every message. Make it a plain "
+            "function (msg) -> bool"
+        )
+    named = _accepts_run_scoped_reads(pred)
     if named:
         raise WiringError(
             f"accepts= predicate for handler {hname!r} reads run-scoped state "

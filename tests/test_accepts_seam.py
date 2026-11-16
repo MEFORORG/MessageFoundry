@@ -22,6 +22,7 @@ Synthetic HL7 only (fabricated ids/names — no PHI).
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -770,3 +771,106 @@ def test_response_get_accepts_fails_validate(tmp_path: Path) -> None:
         reg.validate()
     assert "run-scoped state" in str(exc.value)
     assert "response_get" in str(exc.value)
+
+
+# --- BACKLOG #5514: an async predicate, and a run-scoped read reached indirectly ---
+
+
+async def _async_accepts(msg: Any) -> bool:
+    return False  # never awaited by the router stage: its coroutine reads as True
+
+
+class _AsyncCallable:
+    async def __call__(self, msg: Any) -> bool:
+        return False
+
+
+class _StateCallable:
+    def __call__(self, msg: Any) -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+
+def _accepts_with(msg: Any, getter: Any) -> bool:
+    # The accessor arrives as an argument, so its name is not in this code object's co_names.
+    return getter("ns", "k", default=None) is not None
+
+
+def _accepts_with_default(msg: Any, getter: Any = state_get) -> bool:
+    return getter("ns", "k", default=None) is not None
+
+
+def _closure_over(getter: Any) -> Any:
+    def pred(msg: Any) -> bool:
+        return getter("OB", default=None) is not None
+
+    return pred
+
+
+def _helper_reads_state(msg: Any) -> bool:
+    return state_get("ns", "k", default=None) is not None
+
+
+def _calls_a_helper(msg: Any) -> bool:
+    return _helper_reads_state(msg)
+
+
+def _inner_def_reads_state(msg: Any) -> bool:
+    def inner() -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+    return inner()
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _async_accepts,
+        functools.partial(_async_accepts),
+        _AsyncCallable(),
+    ],
+    ids=["async_def", "partial_of_async", "async_call_instance"],
+)
+def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="is async"):
+        reg.validate()
+
+
+@pytest.mark.parametrize(
+    ("pred", "accessor"),
+    [
+        (functools.partial(_accepts_with, getter=state_get), "state_get"),
+        (functools.partial(state_get, "ns"), "state_get"),
+        (_accepts_with_default, "state_get"),
+        (_closure_over(response_get), "response_get"),
+        (_StateCallable(), "state_get"),
+        (_calls_a_helper, "state_get"),
+        (_inner_def_reads_state, "state_get"),
+    ],
+    ids=["partial_kw", "partial_of_accessor", "default", "closure", "instance", "helper", "inner"],
+)
+def test_an_indirect_run_scoped_read_fails_validate(
+    tmp_path: Path, pred: Any, accessor: str
+) -> None:
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="run-scoped state") as exc:
+        reg.validate()
+    assert accessor in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _is_adt,
+        functools.partial(_accepts_with, getter=lambda *a, **k: None),
+        _closure_over(lambda *a, **k: None),
+    ],
+    ids=["plain", "partial_harmless", "closure_harmless"],
+)
+def test_a_pure_indirect_accepts_still_validates(tmp_path: Path, pred: Any) -> None:
+    # The control: the walk must not refuse a predicate that reaches no accessor.
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    reg.validate()
