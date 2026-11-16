@@ -6,7 +6,7 @@
 // validated before each step advances, so the wizard never emits invalid config.
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { configDir, workspaceDir } from "./cli";
+import { configDirSetting, workspaceDir } from "./cli";
 import { nonce } from "./cspNonce";
 import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
 import { resolveInsideWorkspace } from "./workspaceContainment";
@@ -70,7 +70,10 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     void vscode.window.showErrorMessage("MessageFoundry: inbound/router/handler/outbound names are all required.");
     return;
   }
-  const dir = resolveInsideWorkspace(ws, configDir());
+  // A workspace value cli.ts's containment dropped (BACKLOG #5404) refuses too, rather than the
+  // route landing in the default folder used in its place.
+  const setting = configDirSetting();
+  const dir = setting.dropped ? undefined : resolveInsideWorkspace(ws, setting.value);
   if (dir === undefined) {
     // The setting's value is not echoed: a checked-in settings file controls it, and a notification
     // renders markdown command links.

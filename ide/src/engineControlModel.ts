@@ -83,7 +83,7 @@ function aiPolicyServiceFile(setting: unknown, isSet: boolean): string {
  * The {@link aiPolicyCliArgs} argv and the directory it runs in, or undefined when it must not run
  * (BACKLOG #5405). With no workspace folder the CLI would run in the extension host's own working
  * directory, and a relative service-settings path would be read from there, where a stray file could
- * enable assistance. So with no folder only an absolute path runs, the way engine trust's
+ * enable assistance. So with no folder only a fully qualified path runs, the way engine trust's
  * `cert inventory` asks the CLI only with a folder. Refused, the caller has no CLI answer and
  * pickOfflinePolicy fails closed to the unverified policy.
  */
@@ -93,8 +93,11 @@ export function aiPolicyCliPlan(
   workspace: string | undefined,
 ): { readonly args: string[]; readonly cwd: string | undefined } | undefined {
   const file = aiPolicyServiceFile(setting, isSet);
-  // `!workspace`, not `=== undefined`: an empty string is no folder either.
-  if (!workspace && !path.isAbsolute(file)) {
+  // `!workspace`, not `=== undefined`: an empty string is no folder either. Fully qualified, not
+  // just absolute: on Windows a root-relative `\svc\x.toml` is absolute but still takes the
+  // current drive, so it must resolve to itself.
+  const qualified = path.isAbsolute(file) && path.resolve(file) === path.normalize(file);
+  if (!workspace && !qualified) {
     return undefined;
   }
   return { args: aiPolicyCliArgs(setting, isSet), cwd: workspace || undefined };

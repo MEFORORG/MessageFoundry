@@ -72,6 +72,8 @@ suite("resolveInsideWorkspace keeps a configured folder inside the workspace (BA
 let stubWorkspace: string | undefined;
 let stubTrusted = true;
 let stubConfigDir = "samples/config";
+/** The scope `stubConfigDir` is set in: the user's settings, or the workspace's own. */
+let stubConfigScope: "globalValue" | "workspaceValue" = "globalValue";
 let writes: string[];
 let messages: { level: string; text: string }[];
 let handler: ((m: unknown) => Promise<void>) | undefined;
@@ -109,10 +111,10 @@ const vscodeStub = {
     },
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown => (key === "configDir" ? stubConfigDir : fallback),
-      // User-set, so cli.ts's own containment (BACKLOG #5404) passes it through and this suite
-      // still drives newRoute's check on it.
-      inspect: (key: string): { globalValue?: unknown } | undefined =>
-        key === "configDir" ? { globalValue: stubConfigDir } : undefined,
+      // User-set by default, so cli.ts's own containment (BACKLOG #5404) passes it through and this
+      // suite still drives newRoute's check on it; the workspace scope is driven last.
+      inspect: (key: string): Record<string, unknown> | undefined =>
+        key === "configDir" ? { defaultValue: "samples/config", [stubConfigScope]: stubConfigDir } : undefined,
     }),
     fs: {
       stat: (uri: { fsPath: string }): Promise<fs.Stats> => fs.promises.stat(uri.fsPath),
@@ -203,6 +205,7 @@ wizardSuite("The New Route wizard writes only inside a trusted workspace (BACKLO
     stubWorkspace = ws;
     stubTrusted = true;
     stubConfigDir = "samples/config";
+    stubConfigScope = "globalValue";
     writes = [];
     messages = [];
     handler = undefined;
@@ -251,5 +254,22 @@ wizardSuite("The New Route wizard writes only inside a trusted workspace (BACKLO
     }
     assert.ok(!fs.existsSync(path.join(root, "outside")));
     assert.ok(!fs.existsSync(path.join(root, "elsewhere")));
+  });
+
+  test("a workspace configDir outside the workspace writes nothing, not even to the default folder (BACKLOG #5404)", async () => {
+    // cli.ts's containment does not use the value; the wizard refuses rather than write the route
+    // into samples/config, which exists here, in its place.
+    stubConfigScope = "workspaceValue";
+    stubConfigDir = "../outside";
+    await create();
+    assert.deepStrictEqual(writes, []);
+    assert.ok(messages.some((m) => m.level === "error" && /does not resolve inside/.test(m.text)), JSON.stringify(messages));
+  });
+
+  test("control: the same workspace configDir inside the workspace writes the module", async () => {
+    stubConfigScope = "workspaceValue";
+    stubConfigDir = "samples/config";
+    await create();
+    assert.strictEqual(writes.length, 1, JSON.stringify(messages));
   });
 });

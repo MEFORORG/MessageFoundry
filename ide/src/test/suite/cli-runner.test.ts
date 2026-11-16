@@ -87,6 +87,10 @@ suite("the AI-policy CLI fallback names the configured service settings (BACKLOG
     assert.strictEqual(aiPolicyCliPlan("conf/prod.toml", true, undefined), undefined);
     assert.strictEqual(aiPolicyCliPlan("conf/prod.toml", true, ""), undefined);
     assert.strictEqual(aiPolicyCliPlan(42, true, undefined), undefined);
+    if (process.platform === "win32") {
+      // Absolute but root-relative: it still takes the extension host's current drive.
+      assert.strictEqual(aiPolicyCliPlan("\\svc\\messagefoundry.toml", true, undefined), undefined);
+    }
   });
 
   test("control: with a folder the same path runs there, and with none an absolute path runs", () => {
@@ -179,9 +183,9 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
     new RegExp(`^\\s*return pathSetting\\("${name}", "[^"]+"\\)\\.value;\\s*$`).test(body(src, name));
 
   test("configDir, serviceConfig and messageSetsDir read through pathSetting, which contains them", () => {
-    for (const name of ["configDir", "messageSetsDir"]) {
-      assert.ok(contained(CLI, name), `${name} does not read through pathSetting`);
-    }
+    assert.ok(contained(CLI, "messageSetsDir"), "messageSetsDir does not read through pathSetting");
+    assert.match(body(CLI, "configDir"), /^\s*return configDirSetting\(\)\.value;\s*$/);
+    assert.match(body(CLI, "configDirSetting"), /^\s*return pathSetting\("configDir", "samples\/config"\);\s*$/);
     assert.match(body(CLI, "serviceConfig"), /^\s*return serviceConfigSetting\(\)\.value;\s*$/);
     assert.match(body(CLI, "serviceConfigSetting"), /^\s*return pathSetting\("serviceConfig", "messagefoundry\.toml"\);\s*$/);
     assert.ok(/containedPathSetting\(seen, workspaceDir\(\), fallback\)/.test(CLI), "pathSetting no longer contains");

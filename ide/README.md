@@ -203,11 +203,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   value or the default applies instead, with a warning, in a trusted window too. To use a path
   elsewhere, set it in user settings. The check reads the spelling only, so it does not catch a link
   or junction inside the folder that leads out of it; the New Route wizard and the security editor
-  make their own link checks before they write.
+  make their own link checks before they write, and refuse a workspace value that is not used
+  rather than write to the path used in its place.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
-  editor never sees a workspace-set value whose spelling is outside the workspace folder, since that
-  value is not used (above), and it refuses any path inside the folder
+  editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. The workspace
   folder itself is taken as given, a link included: it is the first folder the workspace opens,
   which a repository's `.code-workspace` file can set to any folder, the repository's own or not,

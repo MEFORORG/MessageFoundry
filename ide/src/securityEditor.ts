@@ -92,11 +92,12 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
   // Trust is passed in and checked first, so an untrusted workspace makes no file-system call here.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
   // Unread scope counts as the workspace's, so the check is never skipped by a missing answer. A
-  // workspace value cli.ts's containment dropped is not the value handed here (BACKLOG #5404), so
-  // the scope is the one the handed value came from, not whether the workspace set any.
+  // workspace value cli.ts's containment dropped (BACKLOG #5404) is checked as written, so it is
+  // refused here as before rather than this editor reading and saving the file used in its place.
   const setting = serviceConfigSetting();
-  const fromWorkspace = seen === undefined || setting.source === "workspace";
-  const target = securityConfigTarget(ws, setting.value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+  const value = setting.dropped ? seen?.workspaceValue : setting.value;
+  const fromWorkspace = seen === undefined || setting.dropped || setting.source === "workspace";
+  const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,
   });

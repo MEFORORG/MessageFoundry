@@ -100,20 +100,26 @@ function pathSetting(
 ): ContainedPathSetting {
   const seen = config().inspect(key);
   const contained = containedPathSetting(seen, workspaceDir(), fallback);
-  const seenKey = `${key}\u0000${String(seen?.workspaceValue)}`;
+  const seenKey = `${key}\u0000${JSON.stringify(seen?.workspaceValue) ?? ""}`;
   if (contained.dropped && !droppedPathSettings.has(seenKey)) {
     droppedPathSettings.add(seenKey);
     // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
     void vscode.window.showWarningMessage(
-      `messagefoundry.${key}, set in workspace settings, names no path inside the workspace folder, ` +
-        "so it is not used. To use a path elsewhere, set it in user settings.",
+      `messagefoundry.${key}, set in workspace settings, is not used: it is not a path inside the ` +
+        "workspace folder, or no folder is open. To use a path elsewhere, set it in user settings.",
     );
   }
   return contained;
 }
 
 export function configDir(): string {
-  return pathSetting("configDir", "samples/config").value;
+  return configDirSetting().value;
+}
+
+/** {@link configDir} with its scope and whether a workspace value was dropped, for a writer that
+ *  refuses rather than write into the folder used in its place (newRoute.ts). */
+export function configDirSetting(): ContainedPathSetting {
+  return pathSetting("configDir", "samples/config");
 }
 
 /** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative,
