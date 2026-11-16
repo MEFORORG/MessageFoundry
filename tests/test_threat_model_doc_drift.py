@@ -70,7 +70,7 @@ from types import MappingProxyType
 
 import pytest
 
-from tests._ast_sites import call_sites, code_strings, keyword_value, parse_source
+from tests._ast_sites import call_sites, code_strings, keyword_value, named_func, parse_source
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
@@ -986,8 +986,8 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 HL7 parse cap = 16 MiB", peek.DEFAULT_MAX_MESSAGE_BYTES, 16 * mib),
         ("15.1.3 HL7 segment cap = 10,000", peek.DEFAULT_MAX_SEGMENTS, 10_000),
         ("15.1.3 escape repeat clamp = 512", _builtin_hl7.MAX_ESCAPE_REPEAT, 512),
-        # BACKLOG #5499: the next five had a doc-side entry and no row here, so on a checkout
-        # without the document nothing pinned them.
+        # BACKLOG #5499: the rows from here to the export floor had a doc-side entry and no row
+        # here, so on a checkout without the document nothing pinned them.
         (
             "15.1.3 counted escape-opener budget = 100,000",
             _builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS,
@@ -1004,6 +1004,16 @@ def _checks() -> list[tuple[str, object, object]]:
             "15.1.3 /messages/export limit = 100,000",
             _get_route_query_bound("/messages/export", "limit", "le"),
             100_000,
+        ),
+        (
+            "15.1.3 /logs/tail page floor = 1",
+            _get_route_query_bound("/logs/tail", "limit", "ge"),
+            1,
+        ),
+        (
+            "15.1.3 /messages/export limit floor = 1",
+            _get_route_query_bound("/messages/export", "limit", "ge"),
+            1,
         ),
         (
             "15.1.3 strict-validate backstop = 5.0 s",
@@ -1845,7 +1855,7 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
         ),
         ("**Outbound retry**", retry.backoff_seconds, f"backoff **{retry.backoff_seconds} s**"),
         # U+00D7, the multiplication sign the row writes, escaped so this file adds no glyph.
-        ("**Outbound retry**", retry.backoff_multiplier, f"× **{retry.backoff_multiplier}**"),
+        ("**Outbound retry**", retry.backoff_multiplier, f"\u00d7 **{retry.backoff_multiplier}**"),
         (
             "**Outbound retry**",
             retry.max_backoff_seconds,
@@ -1971,14 +1981,15 @@ def _rendered_numbers(rendered: str) -> set[float]:
 
 
 def _rendered_units(rendered: str) -> set[float]:
-    """The divisors that may turn a live value into the phrase's number. A size entry may carry its
-    live value in bytes and render it in the binary unit it names, or carry it already in that unit,
-    as ``s.sandbox.mem_mb`` is (see :func:`_bounds_from_label`); so both readings are admitted."""
-    return {1} | {
+    """The divisors that turn a live value into the phrase's number. A size entry carries its live
+    value in bytes and renders it in the binary unit it names; any other entry renders as it is.
+    A value already denominated in MiB, as ``s.sandbox.mem_mb`` is, is rendered without a unit."""
+    named = {
         multiplier
         for unit, multiplier in _UNIT_MULTIPLIER.items()
         if unit.endswith("iB") and re.search(rf"\b{unit}\b", rendered)
     }
+    return named or {1}
 
 
 @pytest.mark.parametrize("which", ["15.1.3", "15.1.5"])
@@ -2015,14 +2026,29 @@ def test_every_doc_side_bound_renders_its_live_value(which: str) -> None:
     )
 
 
+def test_no_doc_side_entry_carries_a_literal_live_value() -> None:
+    """The check above compares a phrase with its live value, so a live value written as a literal
+    beside a matching literal phrase would satisfy it while reaching no code (BACKLOG #5499)."""
+    tree = parse_source(Path(__file__).read_text(encoding="utf-8"))
+    literal: list[str] = []
+    for name in ("_doc_side_bounds", "_dangerous_doc_side_bounds"):
+        returns = [n for n in ast.walk(named_func(tree, name)) if isinstance(n, ast.Return)]
+        assert len(returns) == 1 and isinstance(returns[0].value, ast.List), name
+        for entry in returns[0].value.elts:
+            assert isinstance(entry, ast.Tuple) and len(entry.elts) == 3, ast.unparse(entry)
+            if isinstance(entry.elts[1], ast.Constant):
+                literal.append(ast.unparse(entry))
+    assert not literal, f"doc-side entries whose live value is a literal, not code: {literal}"
+
+
 def test_the_rendered_number_reader_reads_the_forms_the_tables_use() -> None:
     """Prove the reader above can tell a stated bound from a stale one."""
     assert _rendered_numbers("`limit` **1..2,000** lines") == {1.0, 2000.0}
     assert _rendered_numbers("backoff **5.0 s**") == {5.0}
     assert _rendered_numbers("`DEFAULT_MAX_CONNECTIONS_PER_HOST` allows **32**") == {32.0}
     assert _rendered_numbers("min(2, cpu_count)") == {2.0}
-    assert _rendered_units("`MAX_TOKEN_RESPONSE_BYTES` **256 KiB**") == {1, 1024}
-    assert _rendered_units("**16 MiB** binary ingress") == {1, 1024 * 1024}
+    assert _rendered_units("`MAX_TOKEN_RESPONSE_BYTES` **256 KiB**") == {1024}
+    assert _rendered_units("**16 MiB** binary ingress") == {1024 * 1024}
     assert _rendered_units("min-refetch floor of 300 s") == {1}
     assert _rendered_numbers("cpu_count") == set()
     assert 1024.0 not in _rendered_numbers("2048")

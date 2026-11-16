@@ -727,7 +727,11 @@ def test_the_token_permissions_are_exactly_what_each_job_needs() -> None:
 #: without the body ever naming it, so the ``$VAR`` check below cannot see that key go missing. It
 #: over-matches on purpose: a step that only mentions gh must still declare the token, which costs
 #: one env line, where an under-match would let a real call run without it.
-_GH_CALL = re.compile(r"(?<![\w./$-])gh(?=\s)")
+_GH_CALL = re.compile(r"(?<![\w./$-])gh(?![\w./-])")
+
+
+def _step_label(step: dict) -> str:
+    return str(step.get("id") or step.get("name"))
 
 
 def _assert_inputs_come_through_env(label: str, step: dict) -> None:
@@ -756,9 +760,9 @@ def test_every_run_step_takes_every_input_through_env_not_interpolation() -> Non
     today so a broken walk cannot pass on nothing.
     """
     run_steps = [s for s in _steps() if "run" in s]
-    labelled = {str(s.get("id") or s.get("name")): s for s in run_steps}
+    labelled = {_step_label(s): s for s in run_steps}
     assert len(labelled) == len(run_steps), f"two run steps share a label: {list(labelled)}"
-    expected = {"disarm", "allowset", "ghsa", "age", "authors", str(_merge_step().get("name"))}
+    expected = {"disarm", "allowset", "ghsa", "age", "authors", _step_label(_merge_step())}
     missing = sorted(expected - set(labelled))
     assert not missing, f"run steps {list(labelled)} miss {missing}"
     for label, step in labelled.items():
@@ -776,6 +780,8 @@ def test_every_run_step_takes_every_input_through_env_not_interpolation() -> Non
         ("gh release view v1\n", {}, "declares no GH_TOKEN"),
         ("gh \\\n  api /x\n", {}, "declares no GH_TOKEN"),
         ('n="${#X}"; echo "PR #1" && gh pr view 1\n', {"X": "x"}, "declares no GH_TOKEN"),
+        ('"gh" api /x\n', {}, "declares no GH_TOKEN"),
+        ("out=$(gh)\n", {}, "declares no GH_TOKEN"),
     ],
 )
 def test_the_env_check_refuses_each_planted_seam(body: str, env: dict, message: str) -> None:

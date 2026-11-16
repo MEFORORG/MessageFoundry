@@ -370,8 +370,12 @@ def _literal_event_kinds(source: str) -> set[str]:
     file does not define, fails here rather than being skipped, because a skipped helper is the
     blind spot this guard exists to close.
 
+    A call whose ``event`` argument cannot be placed (a starred argument at or before the slot, or
+    ``event`` passed through ``**kwargs``) fails too.
+
     Scope, which this does NOT read: a kind passed as a variable or a name rather than a string
-    literal at the call (the routed/filtered/unrouted mapping, for one), and a raw
+    literal at the call (the routed/filtered/unrouted mapping, for one), a helper reached under
+    another name (an alias or a ``functools.partial``), and a raw
     ``INSERT INTO message_events`` that bypasses the helpers, as three of SQLite's do. Nothing in
     this module checks a kind written on those paths. ``check_caller_event_kind`` refuses an
     undeclared kind at run time only on the public ``record_message_event`` path, not inside the
@@ -393,16 +397,18 @@ def _literal_event_kinds(source: str) -> set[str]:
         f"calls to {undefined}, which this source does not define; re-aim the scan"
     )
     kinds: set[str] = set()
+    unread: list[str] = []
     for name, call in calls:
         slot = slots[name]
-        if slot < len(call.args) and not any(
-            isinstance(arg, ast.Starred) for arg in call.args[: slot + 1]
-        ):
-            value: ast.expr | None = call.args[slot]
-        else:
-            value = keyword_value(call, "event")
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        if any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1]):
+            unread.append(ast.unparse(call))  # the event's position is known only at run time
+            continue
+        value = call.args[slot] if slot < len(call.args) else keyword_value(call, "event")
+        if value is None:
+            unread.append(ast.unparse(call))  # passed through **kwargs, or not at all
+        elif isinstance(value, ast.Constant) and isinstance(value.value, str):
             kinds.add(value.value)
+    assert not unread, f"event helper calls whose `event` argument the scan cannot place: {unread}"
     return kinds
 
 
@@ -464,6 +470,10 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
         _literal_event_kinds("def _event(self, conn, message_id, kind): ...\n")
     with pytest.raises(AssertionError, match="does not define"):
         _literal_event_kinds("self._event_sync(cur, 'mid', 'moved_kind', None, None, 0.0)\n")
+    helper = "def _event(self, conn, message_id, event, destination, detail, now): ...\n"
+    for call in ("_event(*head, 'starred_kind', None, None, 0.0)", "_event(conn, **parts)"):
+        with pytest.raises(AssertionError, match="cannot place"):
+            _literal_event_kinds(helper + call + "\n")
 
 
 def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
