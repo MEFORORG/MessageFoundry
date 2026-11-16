@@ -407,7 +407,9 @@ _MEFOR_SECRET = re.compile(
 #
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``,
 # ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``, ``_DSN_PASSWORD`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated
-# in both files. This module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
+# in both files, though this ``_DSN_PASSWORD`` is the narrow reading and no longer equals
+# secretscrub's; the widened one is imported, as ``_WIDE_DSN_PASSWORD`` (BACKLOG #5386). This
+# module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
 # #2694), but it does not build this copy from that one's fragments. Doing so would change this
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as
 # printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses

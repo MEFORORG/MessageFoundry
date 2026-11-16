@@ -1314,9 +1314,10 @@ _KEY_MATERIAL = re.compile(
 # ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and a review measured the token's tail
 # print where the old pattern, matching nothing, left the query label to the member pass. The
 # lookbehind ``(?<=//:)`` is what tells the two cases apart. Residuals, at least these: a password
-# whose own "@" is followed by one of those characters before the host's "@" is cut at that "@" and
-# its tail prints, as the whole tail did before; and an empty user's password holding one of
-# ``? # & ; ,`` is not read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "="
+# whose own "@" is followed, before the host's "@", by a character the run after the first segment
+# stops at (the class above: at least ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=")
+# is cut at that "@" and its tail prints, as the whole tail did before; and an empty user's
+# password holding one of ``? # & ; ,`` is not read at all, as before #5386, so ``redis://:p;ss@host`` prints whole. An "="
 # is not one of those: the run after the first segment may hold it, so ``redis://:p=ss@host`` is
 # read and hidden.
 #

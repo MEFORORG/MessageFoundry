@@ -3207,7 +3207,11 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
 
     The connection-string member pass (BACKLOG #5030) is a source with no arm, read without it and
     counted apart the same way: each text only it changes must hold its match, and there must be
-    some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why."""
+    some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why.
+
+    The URL arm's narrowing (BACKLOG #5386: an empty user, or a password that is empty or starts
+    with "@") is not counted apart, and this corpus is not known to reach it, so this test does not
+    gate that narrowing."""
     fragments = (
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,

@@ -6,9 +6,8 @@
 ``__version__``, a config summary of registry COUNTS and names only (never a settings value or a
 secret), a ``/status`` snapshot built from the real status models, and a **best-effort redacted**
 app-log tail. The rule for the code is no raw message body and no secret this package puts in itself.
-The archive is not thereby PHI-free or secret-free: values survive the log-tail redaction, at least a
-single-token identifier such as an operator username, so the bundle is handled as a copy of the app
-log. The manifest's ``phi_contract`` states that once (BACKLOG #5385); see
+That rule is not a claim that the archive is PHI-free or secret-free; what it does and does not
+hold is stated once, in the manifest's ``phi_contract`` (BACKLOG #5385). See
 :mod:`messagefoundry.support.redact` for the log-line scrubber and
 :func:`messagefoundry.support.bundle.build_bundle` for the assembly.
 

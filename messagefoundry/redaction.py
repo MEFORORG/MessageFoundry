@@ -275,9 +275,10 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: ``a%7Cb%7Cc;sslpassword=x y``, the run takes the token and the value's tail after a space prints,
 #: as it did before #5030. This module is stdlib-only and cannot
 #: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
-#: that this pattern matches every text either filter changes when the filters start a label at
-#: ``\b`` alone. A plain literal, so the static regex gate reads it. The prefix bound keeps the scan
-#: linear, as it does there.
+#: that this pattern matches every text of a seeded corpus either filter changes when the filters
+#: start a label at ``\b`` alone. The URL arm's narrowing above is not counted apart there, and
+#: that corpus is not known to reach it, so that test does not gate it. A plain literal, so the
+#: static regex gate reads it. The prefix bound keeps the scan linear, as it does there.
 _CREDENTIAL_AHEAD = re.compile(
     r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
