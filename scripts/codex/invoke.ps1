@@ -18,18 +18,21 @@ function Resolve-BridgePython {
 if ($args.Count -gt 0 -and $args[0] -eq 'hook') {
     # The bridge decides with exit 0, or with 10 (BLOCK_EXIT in bridge.py) for a block, which
     # becomes 2 here. Anything else, a missing .venv, a crash, or the 2 that Python and argparse
-    # exit with, is no decision: it blocks on the PreToolUse registration and is a non-blocking 1
-    # on every other event. docs/CODEX.md, "Who decides a block", states the rule.
-    $noDecision = 1
-    for ($i = 1; $i -lt $args.Count - 1; $i++) {
-        if ($args[$i] -eq '--event' -and $args[$i + 1] -eq 'PreToolUse') { $noDecision = 2 }
-    }
-    $code = $noDecision
+    # exit with, is no decision: reported, and a non-blocking 1 on every event.
+    # docs/CODEX.md, "Who decides a block", states the rule.
+    $code = 1
+    $why = ''
     try {
         & (Resolve-BridgePython) (Join-Path $PSScriptRoot 'bridge.py') @args
         if ($LASTEXITCODE -eq 0) { $code = 0 } elseif ($LASTEXITCODE -eq 10) { $code = 2 }
+        else { $why = "the bridge exited $LASTEXITCODE" }
     } catch {
-        [Console]::Error.WriteLine("Codex bridge launcher: $_")
+        $why = "$_"
+    }
+    if ($code -eq 1) {
+        $message = "Codex bridge launcher: no decision, not blocking: $why"
+        [Console]::Error.WriteLine($message)
+        [Console]::Out.WriteLine((@{ systemMessage = $message } | ConvertTo-Json -Compress))
     }
     # Codex starts this through pwsh -Command, which reports a script's exit 2 as 1. Ending the
     # process keeps the code. Hook mode only: an interactive caller's window must survive `run`.

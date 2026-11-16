@@ -174,13 +174,9 @@ MATCHER_FIELDS = {
 }
 # Claude Code adds a hook's plain exit-0 stdout as context for these events only.
 PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
-# A guard group is one whose hooks exist to refuse a tool call. A bridge fault blocks only where a
-# guard group could have run; see docs/CODEX.md, "Who decides a block".
-GUARD_SCRIPTS = ("scripts/hooks/shell-guard-dispatch.ps1",)
-
-
-# Hook mode's exit code for run_hook's block. invoke.ps1 turns it into 2 and maps every other
-# non-zero, the interpreter's and argparse's 2 included, to the event's no-decision code.
+# Hook mode's exit code for run_hook's block. invoke.ps1 turns it into 2 and every other non-zero,
+# the interpreter's and argparse's 2 included, into a non-blocking 1. See docs/CODEX.md, "Who
+# decides a block".
 BLOCK_EXIT = 10
 
 
@@ -281,46 +277,13 @@ def group_selected(group: dict, discriminator: set[str] | None) -> bool:
     )
 
 
-def is_guard(group: dict) -> bool:
-    for hook in group.get("hooks", []):
-        words = [str(hook.get("command", "")), *(str(arg) for arg in hook.get("args", []))]
-        if hook.get("onFailure") == "block" or any(
-            word.replace("\\", "/").endswith(script) for word in words for script in GUARD_SCRIPTS
-        ):
-            return True
-    return False
-
-
-def group_is_guard(group: dict) -> bool:
-    try:
-        return is_guard(group)
-    except (AttributeError, TypeError):
-        return True  # A group too malformed to read may be a guard.
-
-
-def fault_blocks(root: Path, payload: object, event: str) -> bool:
-    """Whether a bridge fault must block: only on PreToolUse, and only where a guard could run."""
-    if not event and isinstance(payload, dict):
-        event = str(payload.get("hook_event_name") or "")
-    if event != "PreToolUse":
-        return False  # A fault never stops Codex from stopping, starting or prompting.
-    if not isinstance(payload, dict):
-        return True  # No tool to judge, so a guard may have been skipped.
-    try:
-        discriminator = discriminator_for(event, payload)
-        groups = read_settings(root).get("hooks", {}).get(event, [])
-        return any(is_guard(group) and group_selected(group, discriminator) for group in groups)
-    except Exception:  # noqa: BLE001 - settings or a matcher that cannot be judged may hide a guard
-        return True
-
-
 def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> int:
     """Decide one Codex hook event: 0 to proceed or 2 to block, never anything else.
 
     With no stdin given, the payload is read from this process's stdin as UTF-8 bytes; the text
     stream would decode it with the console code page. `event` is the event Codex registered.
     """
-    payload: object = None
+    result: dict = {}
     try:
         if stdin is None:
             stdin = sys.stdin.buffer.read()
@@ -329,23 +292,20 @@ def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> i
             raise ValueError("the hook payload must be a JSON object")
         named = str(payload.get("hook_event_name") or "")
         if event:
-            if named.lower() != event.lower():
+            canonical = next((known for known in EVENTS if known.lower() == event.lower()), None)
+            if canonical is None or named.lower() != event.lower():
                 raise ValueError(f"the payload names event {named!r}, registered as {event!r}")
-            payload["hook_event_name"] = event  # The registered spelling selects the settings.
-        result = dispatch(root, payload)
+            payload["hook_event_name"] = canonical  # The canonical spelling selects the settings.
+        dispatch(root, payload, result)
     except HookBlocked as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    except Exception as exc:  # noqa: BLE001 - every bridge fault is decided here, not by a crash
-        message = f"Codex bridge fault: {type(exc).__name__}: {exc}"
-        if fault_blocks(root, payload, event):
-            print(
-                f"{message} (blocking: a guard hook could have run for this tool)", file=sys.stderr
-            )
-            return 2
-        print(f"{message} (not blocking)", file=sys.stderr)
-        print(json.dumps({"systemMessage": f"{message} (not blocking)"}))
-        return 0
+    except Exception as exc:  # noqa: BLE001 - a bridge fault is reported here, never a block
+        # A fault never blocks, on any event, but a decision already gathered, such as an
+        # earlier hook's deny, still stands.
+        message = f"Codex bridge fault: {type(exc).__name__}: {exc} (not blocking)"
+        print(message, file=sys.stderr)
+        merge_output(result, {"systemMessage": message})
     if result:
         print(json.dumps(result))
     return 0
@@ -409,13 +369,19 @@ def run_group(root: Path, payload: dict, env: dict[str, str], group: dict, resul
         merge_output(result, update)
 
 
-def dispatch(root: Path, payload: dict) -> dict:
+def blocks_on_failure(group: dict) -> bool:
+    hooks = group.get("hooks", []) if isinstance(group, dict) else []
+    return any(isinstance(hook, dict) and hook.get("onFailure") == "block" for hook in hooks)
+
+
+def dispatch(root: Path, payload: dict, result: dict | None = None) -> dict:
+    """Run the event's hooks, gathering their output into `result`, which a fault leaves intact."""
+    result = {} if result is None else result
     event = payload["hook_event_name"]
     env = child_environment(root, payload.get("session_id", ""))
     config = read_settings(root)
     if config.get("disableAllHooks"):
-        return {}
-    result: dict = {}
+        return result
     if event == "SessionStart":
         unknown = set(config.get("hooks", {})) - set(EVENTS)
         context = (
@@ -439,14 +405,13 @@ def dispatch(root: Path, payload: dict) -> dict:
         except HookBlocked:
             raise
         except (AttributeError, KeyError, TypeError, ValueError, re.error) as exc:
-            # Each group is judged on its own. A defect in a guard group is a bridge fault, which
-            # run_hook decides; one in an advisory group is reported and skipped, so a guard group
-            # after it still runs.
-            if group_is_guard(group):
-                raise
+            # Each group is judged on its own: a defect is reported and that group skipped, so
+            # the groups after it still run. A hook in it that set onFailure to block has failed.
             message = (
                 f"Codex bridge: skipped a hook group with a defect: {type(exc).__name__}: {exc}"
             )
+            if blocks_on_failure(group):
+                raise HookBlocked(f"{message} (onFailure is block)") from exc
             print(f"{message} (not blocking)", file=sys.stderr)
             merge_output(result, {"systemMessage": f"{message} (not blocking)"})
     return result

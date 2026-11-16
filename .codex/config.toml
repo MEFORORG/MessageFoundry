@@ -1,8 +1,8 @@
 # Claude Code remains the source of hook policy. The bridge reads it on each event.
-# Each command names its event, so a launcher failure that leaves no decision blocks on
-# PreToolUse (the inner exit 2) and is a non-blocking 1 elsewhere. The trailing exit passes
-# the code on where PowerShell runs the line, since pwsh -Command reports a native exit 2 as 1;
-# under sh it exits with pwsh's status, and under cmd pwsh receives it as more -Command text.
+# Only a hook's block reaches Codex as exit 2. A launcher that cannot run the bridge (the inner
+# exit 1) is a non-blocking error on every event. The trailing exit passes the code on where
+# PowerShell runs this line, since pwsh -Command reports a native exit 2 as 1; under sh it exits
+# with pwsh's status, and under cmd pwsh receives it as more -Command text.
 # docs/CODEX.md, "Who decides a block", states the rule.
 [features]
 hooks = true
@@ -22,7 +22,7 @@ timeout = 90
 [[hooks.PreToolUse]]
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PreToolUse; exit 2"; exit $LASTEXITCODE'''
+command = '''pwsh -NoProfile -NonInteractive -Command "& (Join-Path (git rev-parse --show-toplevel) 'scripts/codex/invoke.ps1') hook --event PreToolUse; exit 1"; exit $LASTEXITCODE'''
 timeout = 90
 
 [[hooks.PostToolUse]]

@@ -125,9 +125,9 @@ def test_new_unsupported_hook_is_reported(bridge, tmp_path):
     settings(tmp_path, [{"type": "prompt", "prompt": "review"}])
     # In an advisory group it is reported and the group skipped.
     assert "prompt" in bridge.dispatch(tmp_path, payload)["systemMessage"]
-    # In a guard group it is a fault, which run_hook decides.
+    # A hook that set onFailure to block has failed, so it blocks.
     settings(tmp_path, [{"type": "prompt", "prompt": "review", "onFailure": "block"}])
-    with pytest.raises(ValueError, match="prompt"):
+    with pytest.raises(bridge.HookBlocked, match="prompt"):
         bridge.dispatch(tmp_path, payload)
 
 
@@ -536,20 +536,10 @@ def test_registered_command_runs_from_a_subdirectory(tmp_path):
     assert json.loads(completed.stdout) == {"probe": True}
 
 
-# --- Who decides a block: the bridge for its own faults, the launcher when there is no decision.
+# --- Who decides a block: only a hook. A bridge fault or a launcher with no decision never blocks.
 
-GUARD_GROUP = {
-    "matcher": "^(Bash|PowerShell)$",
-    "hooks": [
-        {
-            "type": "command",
-            "command": "pwsh",
-            "args": ["-File", "${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1"],
-        }
-    ],
-}
-ADVISORY_GROUP = {"matcher": "^(Task|Agent|Workflow)$", "hooks": [handler("{}")]}
 UNSUPPORTED = {"type": "prompt", "prompt": "review"}
+DENY_GROUP = {"matcher": "^(Bash|PowerShell)$", "hooks": [handler(json.dumps(DENIAL))]}
 
 
 def write_settings(root, hooks):
@@ -562,64 +552,57 @@ def run(bridge, root, payload, event=""):
     return bridge.run_hook(root, text, event)
 
 
-@pytest.mark.parametrize(
-    ("tool", "code"),
-    [("Bash", 2), ("PowerShell", 2), ("Agent", 0)],
-    ids=["guarded-bash", "guarded-powershell", "advisory-agent"],
-)
-def test_a_bridge_fault_blocks_only_where_a_guard_could_have_run(
-    bridge, tmp_path, capsys, tool, code
-):
-    write_settings(tmp_path, {"PreToolUse": [ADVISORY_GROUP, GUARD_GROUP]})
-    payload = {"hook_event_name": "PreToolUse", "tool_name": tool}  # no session_id: a fault
-    assert run(bridge, tmp_path, payload) == code
+def reported(capsys, text="Codex bridge fault"):
+    """The fault reached stderr and the systemMessage Codex reads; returns the printed result."""
     captured = capsys.readouterr()
-    assert "Codex bridge fault: ValueError" in captured.err
-    if code == 0:
-        assert "(not blocking)" in json.loads(captured.out)["systemMessage"]
-    else:
-        assert "blocking: a guard hook could have run" in captured.err
+    assert text in captured.err
+    result = json.loads(captured.out.splitlines()[-1])
+    assert text in result["systemMessage"]
+    assert "(not blocking)" in result["systemMessage"]
+    return result
 
 
-@pytest.mark.parametrize("event", ["Stop", "SubagentStop", "SessionStart", "UserPromptSubmit"])
-def test_a_bridge_fault_never_blocks_another_event(bridge, tmp_path, capsys, event):
-    """A fault on Stop must not stop Codex from stopping."""
-    write_settings(tmp_path, {event: [{"hooks": [UNSUPPORTED]}]})
-    assert run(bridge, tmp_path, {"session_id": "x", "hook_event_name": event}) == 0
-    assert "(not blocking)" in json.loads(capsys.readouterr().out)["systemMessage"]
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell", "Agent", "EnterWorktree", "Read"])
+def test_a_fault_under_the_tracked_settings_is_reported_and_never_blocks(
+    bridge, tmp_path, capsys, tool
+):
+    """A missing session id would have blocked the guarded shell call; nothing blocks now."""
+    tracked = _tracked_settings()
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/settings.json").write_text(json.dumps(tracked), encoding="utf-8")
+    payload = {"hook_event_name": "PreToolUse", "tool_name": tool}  # no session_id: a fault
+    assert run(bridge, tmp_path, payload, "PreToolUse") == 0
+    reported(capsys)
 
 
-@pytest.mark.parametrize(("event", "code"), [("PreToolUse", 2), ("Stop", 0)])
-def test_settings_that_cannot_be_parsed_block_only_pretooluse(bridge, tmp_path, event, code):
+@pytest.mark.parametrize(
+    "event", ["PreToolUse", "PermissionRequest", "Stop", "SubagentStop", "SessionStart"]
+)
+def test_a_fault_on_any_event_is_reported_and_never_blocks(bridge, tmp_path, capsys, event):
+    write_settings(tmp_path, {event: [DENY_GROUP], "disableAllHooks": True})
+    assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == 0
+    reported(capsys)
+
+
+@pytest.mark.parametrize("event", ["PreToolUse", "Stop"])
+def test_settings_that_cannot_be_parsed_are_reported_and_never_block(
+    bridge, tmp_path, capsys, event
+):
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude/settings.json").write_text("{ not json", encoding="utf-8")
-    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Read"}
-    assert run(bridge, tmp_path, payload) == code
+    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Bash"}
+    assert run(bridge, tmp_path, payload, event) == 0
+    reported(capsys)
 
 
-@pytest.mark.parametrize(
-    ("event", "group", "code"),
-    [
-        ("PreToolUse", GUARD_GROUP, 2),
-        ("PreToolUse", ADVISORY_GROUP, 0),
-        ("SessionStart", GUARD_GROUP, 0),
-    ],
-    ids=["guard", "advisory", "other-event"],
-)
-def test_a_guard_matcher_that_cannot_be_judged_blocks_only_pretooluse(
-    bridge, tmp_path, event, group, code
+@pytest.mark.parametrize("text", ["{ not json", '["a list"]', ""])
+@pytest.mark.parametrize("event", ["PreToolUse", "Stop", ""])
+def test_a_payload_that_cannot_be_parsed_is_reported_and_never_blocks(
+    bridge, tmp_path, capsys, event, text
 ):
-    write_settings(tmp_path, {event: [{**group, "matcher": "(["}]})
-    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Read", "source": "x"}
-    assert run(bridge, tmp_path, payload) == code
-
-
-@pytest.mark.parametrize(
-    ("event", "code"), [("PreToolUse", 2), ("Stop", 0), ("", 0)], ids=["pre", "stop", "unknown"]
-)
-def test_a_payload_that_cannot_be_parsed_uses_the_registered_event(bridge, tmp_path, event, code):
-    write_settings(tmp_path, {})
-    assert run(bridge, tmp_path, "{ not json", event) == code
+    write_settings(tmp_path, {"PreToolUse": [DENY_GROUP]})
+    assert run(bridge, tmp_path, text, event) == 0
+    reported(capsys)
 
 
 def test_a_deliberate_block_and_a_clean_run_exit_2_and_0(bridge, tmp_path, capsys):
@@ -631,23 +614,35 @@ def test_a_deliberate_block_and_a_clean_run_exit_2_and_0(bridge, tmp_path, capsy
 
 
 @pytest.mark.parametrize(
-    ("tool", "code"),
-    [("Bash", 2), ("PowerShell", 2), ("Agent", 0), ("EnterWorktree", 0), ("Read", 0)],
+    ("event", "decision", "kept"),
+    [
+        ("PreToolUse", DENIAL, ("hookSpecificOutput", DENIAL["hookSpecificOutput"])),
+        ("Stop", {"decision": "block", "reason": "not yet"}, ("decision", "block")),
+    ],
+    ids=["deny", "stop-block"],
 )
-def test_in_the_tracked_settings_only_the_shell_guard_makes_a_fault_block(
-    bridge, tmp_path, tool, code
+def test_a_decision_gathered_before_a_fault_still_stands(
+    bridge, tmp_path, capsys, monkeypatch, event, decision, kept
 ):
-    """Advisory PreToolUse hooks (usage-headroom-inject, enter-worktree-check) stay non-blocking."""
-    tracked = _tracked_settings()
-    guards = [g for g in tracked["hooks"]["PreToolUse"] if bridge.is_guard(g)]
-    assert [g["matcher"] for g in guards] == ["^(Bash|PowerShell)$"]
-    (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude/settings.json").write_text(json.dumps(tracked), encoding="utf-8")
-    # A payload with no session_id is a bridge fault before any hook runs.
-    assert run(bridge, tmp_path, {"hook_event_name": "PreToolUse", "tool_name": tool}) == code
+    first = {"matcher": "", "hooks": [handler(json.dumps(decision))]}
+    write_settings(tmp_path, {event: [first, {"matcher": "", "hooks": [handler("{}")]}]})
+    real_run_group = bridge.run_group
+    calls = []
+
+    def fault_on_second(*args):
+        calls.append(args)
+        if len(calls) == 2:
+            raise RuntimeError("a fault after a decision")
+        real_run_group(*args)
+
+    monkeypatch.setattr(bridge, "run_group", fault_on_second)
+    payload = {"session_id": "x", "hook_event_name": event, "tool_name": "Bash"}
+    assert run(bridge, tmp_path, payload, event) == 0
+    result = reported(capsys, "a fault after a decision")
+    assert result[kept[0]] == kept[1]
 
 
-# --- The launcher and the registered commands: a missing decision blocks only on PreToolUse.
+# --- The launcher and the registered commands: no decision is a non-blocking 1 on every event.
 
 _STUB_BRIDGE = "import os, sys\nsys.exit(int(os.environ['STUB_BRIDGE_EXIT']))\n"
 
@@ -688,10 +683,11 @@ def _link_python(root):
     [
         ("PreToolUse", "0", 0),
         ("PreToolUse", "10", 2),
-        ("PreToolUse", "2", 2),
-        ("PreToolUse", "1", 2),
-        ("PreToolUse", "no-venv", 2),
-        ("PreToolUse", "no-repo", 2),
+        # A launcher that cannot run the bridge would lock Codex out of the fix if it blocked.
+        ("PreToolUse", "2", 1),
+        ("PreToolUse", "1", 1),
+        ("PreToolUse", "no-venv", 1),
+        ("PreToolUse", "no-repo", 1),
         ("Stop", "0", 0),
         ("Stop", "10", 2),
         # Python's "can't open file", argparse and a crash exit 2: no decision, never a block.
@@ -704,8 +700,8 @@ def _link_python(root):
 def test_a_registered_command_passes_a_decision_and_maps_no_decision(
     tmp_path, shell, event, setup, expected
 ):
-    """No decision (a crash, a missing .venv, no repo) blocks on PreToolUse and is a
-    non-blocking 1 elsewhere, never 0. The real invoke.ps1 runs a stub bridge."""
+    """No decision (a crash, a missing .venv, no repo) is a non-blocking 1 on every event, never 0
+    and never 2. The real invoke.ps1 runs a stub bridge."""
     import tomllib
 
     assert bridge_block_exit() == 10, "invoke.ps1 hardcodes the bridge's BLOCK_EXIT"
@@ -734,6 +730,8 @@ def test_a_registered_command_passes_a_decision_and_maps_no_decision(
         timeout=60,
     )
     assert completed.returncode == expected, (shell, completed.stdout, completed.stderr)
+    if expected == 1 and setup != "no-repo":  # invoke.ps1 ran and reported it.
+        assert "no decision, not blocking" in json.loads(completed.stdout)["systemMessage"]
 
 
 def bridge_block_exit():
@@ -794,32 +792,28 @@ def test_run_mode_leaves_a_target_scripts_own_event_flag(bridge, monkeypatch):
     assert calls[0][-6:] == ["--event", "push", "--even", "x", "--limit", "3"]
 
 
-GUARD_DENY = {
-    "matcher": "^(Bash|PowerShell)$",
-    "hooks": [{**handler(json.dumps(DENIAL)), "onFailure": "block"}],
-}
-
-
 @pytest.mark.parametrize(
-    ("registered", "named", "code"),
-    [("PreToolUse", "Stop", 2), ("PreToolUse", None, 2), ("Stop", "PreToolUse", 0)],
-    ids=["pre-named-stop", "pre-unnamed", "stop-named-pre"],
+    ("registered", "named"),
+    [("PreToolUse", "Stop"), ("PreToolUse", None), ("Stop", "PreToolUse"), ("PreToolUze", None)],
+    ids=["pre-named-stop", "pre-unnamed", "stop-named-pre", "unknown-registration"],
 )
-def test_a_payload_naming_another_event_is_a_fault_under_the_registered_one(
-    bridge, tmp_path, capsys, registered, named, code
+def test_a_payload_naming_another_event_is_a_reported_fault(
+    bridge, tmp_path, capsys, registered, named
 ):
-    write_settings(tmp_path, {"PreToolUse": [GUARD_DENY], "Stop": [{"hooks": [handler("{}")]}]})
+    write_settings(tmp_path, {"PreToolUse": [DENY_GROUP], "Stop": [{"hooks": [exits(2)]}]})
     payload = {"session_id": "x", "tool_name": "Bash"}
     if named:
         payload["hook_event_name"] = named
-    assert run(bridge, tmp_path, payload, registered) == code
-    assert "registered as" in capsys.readouterr().err
+    if registered == "PreToolUze":
+        payload["hook_event_name"] = "PreToolUze"
+    assert run(bridge, tmp_path, payload, registered) == 0
+    reported(capsys, "registered as")
 
 
-def test_an_event_name_in_another_case_still_runs_the_guard(bridge, tmp_path, capsys):
-    write_settings(tmp_path, {"PreToolUse": [GUARD_DENY]})
+def test_an_event_name_in_another_case_still_runs_the_hooks(bridge, tmp_path, capsys):
+    write_settings(tmp_path, {"PreToolUse": [DENY_GROUP]})
     payload = {**BASH_CALL, "hook_event_name": "pretooluse"}
-    assert run(bridge, tmp_path, payload, "PreToolUse") == 0
+    assert run(bridge, tmp_path, payload, "PRETOOLUSE") == 0
     assert json.loads(capsys.readouterr().out) == DENIAL
 
 
@@ -828,18 +822,21 @@ def test_an_event_name_in_another_case_still_runs_the_guard(bridge, tmp_path, ca
     [{"matcher": "^(Task|Agent|Workflow$|spawn_task"}, {"hooks": [UNSUPPORTED]}],
     ids=["bad-matcher", "unsupported-hook"],
 )
-def test_a_defective_advisory_group_is_skipped_and_the_guard_still_runs(
-    bridge, tmp_path, capsys, defect
-):
-    advisory = {"matcher": ".*", "hooks": [handler("{}")], **defect}
-    write_settings(tmp_path, {"PreToolUse": [advisory, GUARD_DENY]})
+def test_a_defective_group_is_skipped_and_later_groups_still_run(bridge, tmp_path, capsys, defect):
+    defective = {"matcher": ".*", "hooks": [handler("{}")], **defect}
+    write_settings(tmp_path, {"PreToolUse": [defective, DENY_GROUP]})
     assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 0
-    result = json.loads(capsys.readouterr().out)
+    result = reported(capsys, "skipped a hook group with a defect")
     assert result["hookSpecificOutput"] == DENIAL["hookSpecificOutput"]
-    assert "skipped a hook group with a defect" in result["systemMessage"]
 
 
-def test_a_defect_in_the_guard_group_itself_still_blocks(bridge, tmp_path):
-    guard = {**GUARD_DENY, "hooks": [*GUARD_DENY["hooks"], UNSUPPORTED]}
-    write_settings(tmp_path, {"PreToolUse": [guard]})
+@pytest.mark.parametrize(
+    "defect",
+    [{"matcher": "(["}, {"hooks": [{**UNSUPPORTED, "onFailure": "block"}]}],
+    ids=["bad-matcher", "unsupported-hook"],
+)
+def test_a_defective_group_whose_hook_sets_on_failure_block_blocks(bridge, tmp_path, defect):
+    group = {"matcher": ".*", "hooks": [{**handler("{}"), "onFailure": "block"}], **defect}
+    # PreToolUse, because Stop ignores a matcher and would never read the bad one.
+    write_settings(tmp_path, {"PreToolUse": [group]})
     assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 2

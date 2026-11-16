@@ -29,44 +29,40 @@ claim a failed hook ran.
 
 ### Who decides a block
 
-The hooks decide first. As in Claude Code, a hook's exit 2 blocks. Any other
-non-zero exit, a timeout, or a command that cannot start is a non-blocking error,
-unless the hook sets `"onFailure": "block"`. The bridge reports a non-blocking
-error on stderr and as a `systemMessage`, naming the hook, ignores that hook's
-output, and runs the remaining hooks.
+Only a hook blocks. As in Claude Code, a hook's exit 2 blocks. So does a hook
+that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
+command that cannot start, or a defect in its group. Any other hook failure is a
+non-blocking error. The bridge reports it on stderr and as a `systemMessage`,
+naming the hook, ignores that hook's output, and runs the remaining hooks. A JSON
+`permissionDecision` deny from a hook is a decision, not a failure, and is passed
+on as before.
 
-The bridge decides its own faults. A fault is anything that keeps it from
-running the hooks: settings that cannot be parsed, a missing session id, a
-payload that cannot be read as UTF-8 JSON, a payload whose `hook_event_name`
-differs from the registered event in more than case, or any other exception. A
-fault blocks only on `PreToolUse`, judged under the registered event, and only
-where a guard group could have run for the tool, or where that cannot be judged
-because the settings or the payload cannot be parsed. A guard group is one that
-runs `scripts/hooks/shell-guard-dispatch.ps1` or holds a hook with
-`"onFailure": "block"`; today that is the `^(Bash|PowerShell)$` group. Every other
-fault is reported on stderr and as a `systemMessage` and does not block, so a
-fault never stops Codex from stopping, starting or taking a prompt.
+A bridge fault never blocks, on any event. A fault is anything that keeps the
+bridge from running the hooks: settings that cannot be parsed, a missing session
+id, a payload that cannot be read as UTF-8 JSON, a payload whose
+`hook_event_name` differs from the registered event in more than case, or any
+other exception. The bridge reports it on stderr and as a `systemMessage`, and
+keeps any decision already gathered, such as an earlier hook's deny. Each hook
+group is judged on its own: a defect in a group, such as a matcher that is not a
+valid regex or an unsupported handler type or shell, is reported and that group
+skipped, so the groups after it still run.
 
-Each hook group is judged on its own. A defect in a group, such as a matcher that
-is not a valid regex or an unsupported handler type or shell, is a fault when the
-group is a guard group. In any other group it is reported and that group is
-skipped, so a guard group after it still runs. The advisory `PreToolUse` hooks,
-such as `usage-headroom-inject.ps1` and `enter-worktree-check.ps1`, stay
-non-blocking. **A future guard on any other event must set
-`"onFailure": "block"`**, or its failures will not block.
-
-The launcher decides when the bridge returns no decision. In hook mode the
+A launcher that cannot run the bridge never blocks either. In hook mode the
 bridge exits 0 to proceed or 10 to block, and `invoke.ps1` turns 10 into 2. Any
 other outcome is no decision: another bridge exit, including the 2 that Python
-and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. Each
-command in `.codex/config.toml` names its event, and no decision maps to exit 2
-on the `PreToolUse` command and to a non-blocking exit 1 on every other event,
-never to 0. `invoke.ps1` ends its process with that code, and the command line
-passes it on, because `pwsh -Command` would report an exit 2 as 1. This is tested
-with PowerShell, `cmd` and `sh` as the outer shell. Codex's documentation does
-not say which shell runs a hook command. One case is not covered: when `pwsh`
-itself cannot start. Under Windows PowerShell 5.1 the line would then exit 0,
-under `cmd` 9009, and under `sh` 127. This is reasoned, not measured.
+and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. No
+decision is reported and maps to a non-blocking exit 1 on every event, never to
+0 or 2. `invoke.ps1` ends its process with its code, and the command line passes
+it on, because `pwsh -Command` would report an exit 2 as 1. This is tested with
+PowerShell, `cmd` and `sh` as the outer shell. Codex's documentation does not
+say which shell runs a hook command. When `pwsh` itself cannot start, the line
+would exit 0 under Windows PowerShell 5.1, 9009 under `cmd` and 127 under `sh`;
+this is reasoned, not measured.
+
+At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
+reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
+unaffected. **A future guard that must block when it fails sets
+`"onFailure": "block"`.**
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
