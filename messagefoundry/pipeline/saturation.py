@@ -12,7 +12,8 @@ identical until the ceiling trips — and by then the operator is already behind
 trigger is *sustained rising backlog*, which — by conservation of the queue — is exactly *ingest >
 drain sustained over the window*: for a lane whose depth goes ``d0 → … → dN``, ``dN > d0`` iff
 arrivals exceeded departures across the window. So a lane that spikes then drains (its depth falls
-back) never trips, while a lane whose depth climbs monotonically does. That is the whole point of the
+back) never trips, while a lane whose depth climbs monotonically, by at least a growth floor since it
+last fell, does (BACKLOG #5768; :class:`SaturationDetector` says why the floor exists). That is the whole point of the
 signal, and it needs **only depth samples** — no second rate sampler, no extra per-lane store read
 beyond the one the buildup check already performs.
 
@@ -48,25 +49,29 @@ class SaturationDetector:
     """A bounded per-lane depth-sample history that fires when the backlog is RISING SUSTAINED.
 
     ``sustain_samples`` is how many consecutive non-decreasing steps (with a net rise end-to-end) must
-    be observed before :meth:`observe` returns a :class:`SaturationSignal`. The history is capped at
+    be observed before :meth:`observe` returns a :class:`SaturationSignal`, once the rise has cleared
+    ``min_growth`` (below). The history is capped at
     ``sustain_samples + 1`` samples (constant memory), so an old spike ages out of the window and a
     lane that has since drained stops firing on its own.
 
     The decision (evaluated over the full window once it is primed):
 
-    * **net rise past the floor** — the newest depth exceeds the oldest in the window by at least
-      ``min_growth`` messages (``dN - d0 >= min_growth``), i.e. arrivals exceeded departures over the
-      window (ingest > drain) by more than one arrival or a small burst would (BACKLOG #5768). Depth
-      samples alone cannot tell one arrival on an idle lane from slow growth, so the floor, not the
-      window's shape, is what keeps ``[0, 0, 0, 1]`` from paging; and
+    * **net rise** — the newest depth is strictly greater than the oldest in the window (``dN > d0``),
+      i.e. arrivals exceeded departures over the window (ingest > drain);
+    * **past the floor** — the depth has risen by at least ``min_growth`` messages since the lane last
+      fell (BACKLOG #5768). Depth samples alone cannot tell one arrival on an idle lane,
+      ``[0, 0, 0, 1]``, from a lane growing slowly while sampled faster than its arrivals,
+      ``[5, 5, 5, 6]``; the floor is what keeps the first from paging. It is measured from the start
+      of the current non-decreasing run, not the window, so steady growth slower than
+      ``min_growth`` per window still fires once it has built up; and
     * **sustained** — no step in the window *decreased* (every ``d[i+1] >= d[i]``). A single drop means
       the worker drained at some point in the window, so the growth is a burst being cleared, not
       saturation — and it does **not** fire.
 
-    A window whose rise is below the floor, or with any decrease, returns ``None``.
+    A flat window, a rise below the floor, or a window with any decrease returns ``None``.
     """
 
-    __slots__ = ("_sustain", "_min_growth", "_samples")
+    __slots__ = ("_sustain", "_min_growth", "_samples", "_run_start")
 
     def __init__(
         self, sustain_samples: int, *, min_growth: int = SATURATION_MIN_GROWTH_DEFAULT
@@ -79,17 +84,23 @@ class SaturationDetector:
         self._sustain = sustain_samples
         self._min_growth = min_growth
         self._samples: deque[tuple[float, int]] = deque(maxlen=sustain_samples + 1)
+        # The depth at the start of the current non-decreasing run: the lane's depth when it last fell.
+        self._run_start: int | None = None
 
     def observe(self, now: float, depth: int) -> SaturationSignal | None:
         """Record one ``(timestamp, pending_depth)`` sample and, if the window now shows sustained
         rising backlog, return the :class:`SaturationSignal`; otherwise ``None``. Cheap and pure."""
+        if self._run_start is None or (self._samples and depth < self._samples[-1][1]):
+            self._run_start = depth  # a fall (or the first sample) starts a new run
         self._samples.append((now, depth))
         if len(self._samples) < self._sustain + 1:
             return None  # window not yet primed — need sustain_samples + 1 observations
         window = list(self._samples)
         depths = [d for _, d in window]
-        if depths[-1] - depths[0] < self._min_growth:
-            return None  # no rise past the floor across the window → not becoming overloaded
+        if depths[-1] <= depths[0]:
+            return None  # no net rise across the window → not becoming overloaded
+        if depths[-1] - self._run_start < self._min_growth:
+            return None  # not yet past the floor since the lane last fell (BACKLOG #5768)
         for prev, cur in zip(depths, depths[1:]):  # noqa: B905
             if cur < prev:
                 # A decrease anywhere in the window = the lane drained during it. That is a
@@ -108,3 +119,4 @@ class SaturationDetector:
     def reset(self) -> None:
         """Drop the sample history (called on connection teardown/reload so a fresh lane starts clean)."""
         self._samples.clear()
+        self._run_start = None

@@ -2341,7 +2341,7 @@ class DeliverySettings(_Section):
     # burst from sustained growth). Global-only for now (per-connection saturation= override is a
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
-    saturation_sustain_samples: int | None = None
+    saturation_sustain_samples: int | None = Field(default=None, ge=2)
     # BACKLOG #5768: the net rise, in messages, a saturation window must clear before it fires, so
     # one arrival on an idle lane does not page. SaturationThreshold.min_growth states the default
     # and the cap.
@@ -2376,9 +2376,9 @@ class DeliverySettings(_Section):
         Corepoint "Max Message Stall"). ``None`` keeps the stall alert off by default."""
         return StallThreshold(max_oldest_seconds=self.stall_max_oldest_seconds)
 
-    _no_bool_saturation_floor = field_validator("saturation_min_growth", mode="before")(
-        _refuse_a_bool
-    )
+    _no_bool_saturation_numbers = field_validator(
+        "saturation_sustain_samples", "saturation_min_growth", mode="before"
+    )(_refuse_a_bool)
 
     def saturation_threshold(self) -> SaturationThreshold:
         """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
@@ -6051,7 +6051,7 @@ class AlertsSettings(_Section):
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
-    # 0 is smtplib's "use the default": port 25, or the port a ``host:port`` email_smtp_host names.
+    # 0 is smtplib's "use the default", port 25.
     email_smtp_port: int = Field(default=587, ge=0, le=65535)
     email_from: str | None = None
     email_to: list[str] = []

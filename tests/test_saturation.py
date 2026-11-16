@@ -83,7 +83,7 @@ def test_window_is_bounded_so_old_spike_ages_out() -> None:
 
 
 def test_reset_clears_history() -> None:
-    det = SaturationDetector(sustain_samples=2)
+    det = SaturationDetector(sustain_samples=2, min_growth=1)
     _feed(det, [1, 2, 3])  # would be primed
     det.reset()
     assert det.observe(0.0, 4) is None  # history cleared → not primed again yet
@@ -116,6 +116,28 @@ def test_slow_growth_past_the_floor_fires_with_flat_steps() -> None:
     assert depths[-1] - depths[0] >= SATURATION_MIN_GROWTH_DEFAULT
     sig = _feed(SaturationDetector(sustain_samples=len(depths) - 1), depths)
     assert sig is not None and sig.depth_start == 5 and sig.depth == 10
+
+
+def test_steady_growth_slower_than_the_floor_per_window_still_fires() -> None:
+    # +1 a sample over a 3-step window: each window rises 3, under the floor of 5, but the run since
+    # the lane last fell clears it.
+    det = SaturationDetector(sustain_samples=3)
+    results = [det.observe(float(i), i) for i in range(8)]
+    assert results[:5] == [None] * 5
+    assert results[5] is not None and results[5].depth == 5
+
+
+def test_a_fall_restarts_the_run_the_floor_is_measured_from() -> None:
+    det = SaturationDetector(sustain_samples=2)
+    assert _feed(det, [0, 2, 4, 1, 2, 3]) is None  # rose 4, fell, rose 2: neither run clears 5
+    assert det.observe(6.0, 6) is not None  # the run from 1 now rose 5
+
+
+def test_reset_restarts_the_run() -> None:
+    det = SaturationDetector(sustain_samples=2)
+    _feed(det, [0, 1, 2, 3])
+    det.reset()
+    assert _feed(det, [3, 4, 5]) is None  # the run starts again at 3, so a rise of 2
 
 
 def test_the_floor_is_exact() -> None:

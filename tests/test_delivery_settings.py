@@ -132,6 +132,10 @@ def test_saturation_min_growth_default_bounds_and_toml_override(tmp_path: Path) 
     for bad in (0, SATURATION_MIN_GROWTH_MAX + 1, True):
         with pytest.raises(ValidationError, match="saturation_min_growth"):
             DeliverySettings.model_validate({"saturation_min_growth": bad})
+    # The key that turns the alert on is refused at load by its own name too.
+    for bad in (1, True):
+        with pytest.raises(ValidationError, match="saturation_sustain_samples"):
+            DeliverySettings.model_validate({"saturation_sustain_samples": bad})
 
 
 def test_outbound_stall_override_kept_when_set(tmp_path: Path) -> None:
