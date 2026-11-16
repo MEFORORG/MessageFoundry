@@ -331,18 +331,23 @@ def test_the_subject_table_is_bounded() -> None:
     ] * 5
 
 
-def test_the_overflow_stays_below_the_threshold_between_hits() -> None:
-    """The overflow's memory bound, checked after every hit: subjects of three entries each are
-    evicted into an overflow with a threshold of 7, so carries both stop short of it and pass it.
-    Its running total must match its entries throughout, and it must raise."""
-    window = security_signals._Window(7, 10.0**6)
-    raised = []
+def test_the_overflow_expires_and_stays_bounded_between_hits() -> None:
+    """The overflow's expiry and memory bound, checked after every hit on a clock that only moves
+    forward. Subjects of three entries each are evicted, and the window leaves a carried entry about
+    six seconds, so each carry must expire the entries of the subject carried two before it. With
+    that expiry the overflow settles at eight entries and never reaches the threshold of 10; without
+    it the carried entries would pile up and raise. At each carry no entry at or before the cutoff
+    may still be counted, and the running total must match the entries."""
+    window_seconds = 3.0 * MAX_SUBJECTS + 6
+    window = security_signals._Window(10, window_seconds)
     for i in range(MAX_SUBJECTS + 50):
-        for t in (1.0, 2.0, 3.0):
-            raised.append(window.hit(f"s-{i}", 1000.0 + i + t)[1])
-            assert len(window._overflow) < 7
-            assert window._overflow_total == sum(w for _t, w in window._overflow) < 7
-    assert [r for r in raised if r is not None], "the carries must raise"
+        for t in (0.0, 1.0, 2.0):
+            now = 3.0 * i + t
+            assert window.hit(f"s-{i}", now) == (None, None)
+            assert window._overflow_total == sum(w for _t, w in window._overflow) <= 8
+            if window._overflow and t == 0.0:
+                assert min(window._overflow)[0] > now - window_seconds
+    assert len(window._overflow) == 8, "the carries must have reached the overflow"
 
 
 def test_a_signin_burst_spread_past_the_subject_table_still_raises() -> None:
@@ -359,7 +364,7 @@ def test_a_signin_burst_spread_past_the_subject_table_still_raises() -> None:
     assert (signal, subject, count) == ("signin_failure_burst", "signin:*", 20)
     assert "10." not in detail
     assert detail.startswith("at least 20 refused sign-ins")
-    assert f"the {MAX_SUBJECTS} this detector counts one by one" in detail
+    assert f"the {MAX_SUBJECTS} sources this detector counts one by one" in detail
 
 
 def test_a_spread_burst_cycling_through_more_addresses_than_the_table_raises() -> None:
@@ -387,9 +392,9 @@ def test_a_carried_count_expires_with_the_window(gap: int, expected: list[tuple[
 
 
 def test_an_evicted_subject_older_than_the_overflow_merges_in_time_order() -> None:
-    """The one carry that cannot append: the evicted subject holds an entry older than the newest
-    already carried. The overflow must stay in time order, or expiry off its front would leave a
-    stale entry counted, and its running total must match its entries."""
+    """The carry that interleaves: the evicted subject holds an entry older than the newest already
+    carried. Expiry must still find it first, or a stale entry would stay counted, and the running
+    total must match the entries."""
     window = security_signals._Window(10**6, 60.0)
     window.hit("a", 1000.0)
     for i in range(MAX_SUBJECTS - 1):
@@ -397,10 +402,9 @@ def test_an_evicted_subject_older_than_the_overflow_merges_in_time_order() -> No
     window.hit("a", 1002.0)  # "a" now holds 1000 and 1002, and is the most recent subject
     for i in range(MAX_SUBJECTS):  # evicts every b-*, then "a", whose 1000 is older than 1001
         window.hit(f"c-{i}", 1003.0)
-    times = [t for t, _w in window._overflow]
-    assert times == sorted(times) and times[0] == 1000.0
+    assert min(window._overflow)[0] == 1000.0
     window.hit("d", 1060.5)  # cutoff 1000.5: the 1000 entry expires, the 1001 entries do not
-    assert window._overflow[0][0] == 1001.0
+    assert min(window._overflow)[0] == 1001.0
     assert window._overflow_total == sum(w for _t, w in window._overflow) == MAX_SUBJECTS + 1
 
 
@@ -1575,3 +1579,10 @@ def test_the_logging_sink_logs_posture_restored_at_debug(caplog: pytest.LogCaptu
         LoggingAlertSink().posture_restored("posture:start")
     (record,) = caplog.records
     assert record.levelno == logging.DEBUG and "posture_restored" in record.getMessage()
+
+
+def test_security_md_states_the_live_subject_table_size() -> None:
+    """docs/SECURITY.md gives operators the table size, since the overflow alert starts past it;
+    pinned so the figure moves with the constant (BACKLOG #5508)."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text("utf-8")
+    assert f"at most {MAX_SUBJECTS} subjects one by one (`MAX_SUBJECTS`)" in doc

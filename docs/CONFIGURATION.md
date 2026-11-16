@@ -2217,9 +2217,9 @@ resolve it by hand, is in [SECURITY.md](SECURITY.md#audit-1).
 `log_level_debug` does not resolve itself, and neither do the counting detectors: an operator
 resolves them.
 Past five subjects alerting from one counting detector inside one window, later ones share a
-`<prefix>:*` subject. That subject has a second source: the counts of subjects pushed out of a full
-table inside the window, summed until they reach the threshold, so a `signin:*` alert need not mean
-any one address reached it (SECURITY.md §Audit). An account lock raises no alert: the lock rows are withheld from readers
+`<prefix>:*` subject. That subject also carries the counts of subjects pushed out of a full table,
+so a `signin:*` alert need not mean any one address reached the threshold
+([SECURITY.md](SECURITY.md#audit-1) says when it raises). An account lock raises no alert: the lock rows are withheld from readers
 without `users:manage`, and the alert list is readable under `monitoring:diagnose`.
 `docs/SECURITY.md` §Audit says how the layer reads the audit stream.
 

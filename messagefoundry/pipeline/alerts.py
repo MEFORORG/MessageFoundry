@@ -1049,8 +1049,10 @@ class AlertSink(Protocol):
         ``SECURITY_SIGNAL_TYPES``, so each detector routes on its own. ``name`` is the subject that
         stands in for "connection": ``signin:<client address>``, ``account:<username>``,
         ``inbound:<name>``, ``logging:debug`` or ``posture:start``, the last with ``@node:<id>``
-        or ``@shard:<id>`` appended where several engine processes share the store. ``count`` is
-        how many rows or refusals tripped it. ``detail`` is a fixed sentence built from counts, a
+        or ``@shard:<id>`` appended where several engine processes share the store. A windowed
+        detector also raises under a shared ``<prefix>:*``, such as ``signin:*``, which names no
+        one subject. ``count`` is how many rows or refusals tripped it; under ``<prefix>:*`` it can
+        be a floor, the counts carried from subjects pushed out of a full table. ``detail`` is a fixed sentence built from counts, a
         level name or switch names.
 
         Never a message body, a message id, a typed username, a peer's address for
