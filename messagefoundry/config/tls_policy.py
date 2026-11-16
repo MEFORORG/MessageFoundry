@@ -309,7 +309,9 @@ def harden_crl_check(
     client under it is refused with ``unable to get certificate CRL``: that fails closed. So a
     loaded CA with no CRL of its own in the file refuses here, at start
     (:func:`messagefoundry.pki.own_crl_reason`), a root that only signs intermediates included.
-    A single-tier CA, whose own CRL covers its leaves, behaves as without it.
+    A single-tier CA's own CRL covers its leaves, unless an Issuing Distribution Point scopes it
+    so it does not cover the root: the chain check then refuses every client at the handshake,
+    and nothing here models that scope.
 
     The listeners that require a client certificate pass it: the API listener (#5627) and, since
     vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. On each,
@@ -382,7 +384,8 @@ def harden_crl_check(
     its own in the file (:func:`messagefoundry.pki.own_crl_reason`). It is the last refusal. It
     is raised inside :func:`_check_crl_signatures`, after a proven bad signature refuses and before
     the warning for a signature short of proof, so a refused start never first logs that the file
-    is loaded. The running-hop reload checks in the same order.
+    is loaded. The running-hop reload checks in the same order, except where the signature
+    judgment itself raises: a start then refuses on this rule, and the reload retries.
 
     **``capath=`` IS MEASURED AND IT WORKS -- and the guard above would REFUSE it.** OpenSSL's
     hashed directory (``c_rehash`` producing ``<hash>.0`` + ``<hash>.r0``) is the natural shape for
@@ -834,9 +837,10 @@ def judge_crl_bytes(
 #: issues a CRL that is "not yet valid" here for that long. Refusing it would fail a start, or hold
 #: a reload back, over ordinary clock skew. The cost: OpenSSL itself allows no skew, so a lone CRL
 #: inside this window refuses every peer it judges until its ``thisUpdate`` passes. A reload is
-#: spared that, because the copy it adds to stays in effect and OpenSSL keeps choosing it until then.
-#: So a revocation only the new CRL lists waits until then too, and the reload logs that at WARNING
-#: (vault BACKLOG #5507). Loading it only once in effect would enforce it no sooner.
+#: spared that only for an issuer whose CRL the hop already holds in effect: OpenSSL keeps choosing
+#: that copy until then. So a revocation only the new CRL lists waits until then too, and on a hop
+#: that checks CRL time the reload logs that at WARNING (vault BACKLOG #5507). Loading it only once
+#: in effect would enforce it no sooner.
 CRL_CLOCK_SKEW_SECONDS = 300.0
 
 

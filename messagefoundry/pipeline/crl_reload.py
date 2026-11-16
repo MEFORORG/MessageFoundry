@@ -66,7 +66,9 @@ retried next pass.
 CA's clock running a little fast does not hold a reload back. OpenSSL itself allows no skew, so
 such a CRL is loaded but not used until its ``thisUpdate``: a revocation only it lists is not
 enforced before then. A reload that applies a file holding any CRL not yet in effect says so at
-WARNING, and says when (vault BACKLOG #5507). Waiting for ``thisUpdate`` to load it would enforce it no sooner.
+WARNING, and says when, only where some reloaded context checks CRL time (vault BACKLOG #5507);
+a context that skips it (``tls_allow_expired``) uses the newer CRL at once. Waiting for
+``thisUpdate`` to load it would enforce it no sooner.
 
 **A context's trust store only grows.** Each reload adds the file's CRLs and nothing removes the old
 ones, so memory and per-handshake CRL scoring grow with every reload. ``[cert_monitor].crl_max_reloads``
