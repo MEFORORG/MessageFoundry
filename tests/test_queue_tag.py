@@ -328,6 +328,14 @@ def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
     assert not is_transient_open_failure(QueueTagError("integrity"))
     assert not is_transient_open_failure(OSError("not a cipher error"))
 
+    # A refusal that is not Vault's AEAD verdict on the value keeps the cipher's own error too, as
+    # cell_tag reads it: a key-version policy refusal is a key problem, not drift.
+    transit.error = InvalidRequest(errors=["ciphertext version is disallowed by policy (too old)"])
+    with pytest.raises(CipherError) as policy:
+        open_queue_cell(cipher, row)
+    assert not isinstance(policy.value, QueueTagError)
+    assert not is_transient_open_failure(policy.value)
+
     # Control: Transit's AEAD refusal of a cell moved to another row is still a tag failure.
     transit.error = InvalidRequest(errors=["cipher: message authentication failed"])
     with pytest.raises(QueueTagError) as moved:

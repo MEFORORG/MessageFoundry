@@ -50,10 +50,13 @@ All notable changes to MessageFoundry are documented here. The format follows
   integrity alert.** On a `vault_transit` store, a queue payload that could not be opened because
   Vault gave no verdict (unreachable, a 5xx, a refused token) was read as the row failing its queue
   tag: the claim dead-lettered a healthy message and wrote an `integrity_drift` alert and audit row.
-  Now that failure, and on SQLite a failed read of the store, returns every row of the claim to
-  `pending` and the claim raises, so the worker backs off and retries. A dead-letter write that
-  fails hands the claim back too, rather than leaving its rows `inflight` until a restart. A real
-  tag failure is dead-lettered and reported as before. (`BACKLOG #5765`, `BACKLOG #5735`)
+  Now that failure, and on SQLite a failed read of the store, puts the row back to `pending` five
+  seconds ahead, and in a FIFO claim every later row of its lane with it, so the lane never
+  delivers past it; the claim's other rows and lanes go on. A dead-letter write that fails sets the
+  row aside the same way, rather than leaving it `inflight` until a restart. On Vault Transit only
+  Vault's own authentication refusal of a value counts as a tag failure, as it already did for the
+  message cells, so a key-version policy refusal no longer raises a false alert either. A real tag
+  failure is dead-lettered and reported as before. (`BACKLOG #5765`, `BACKLOG #5735`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

@@ -54,6 +54,7 @@ __all__ = [
     "QUEUE_TAG_COLUMNS",
     "QUEUE_TAG_SELECT",
     "QUEUE_TAG_FAILED_ACTION",
+    "TRANSIENT_OPEN_BACKOFF_SECONDS",
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
@@ -101,6 +102,11 @@ QUEUE_TAG_COLUMNS: Final = (
 )
 #: :data:`QUEUE_TAG_COLUMNS` as a SELECT list.
 QUEUE_TAG_SELECT: Final = ", ".join(QUEUE_TAG_COLUMNS)
+
+#: How long a claim sets a row aside when opening it failed for a reason that is not the row
+#: (BACKLOG #5735): the row goes back to ``pending`` with ``next_attempt_at`` this far ahead, so a
+#: key-service outage is retried at this cadence rather than on every sweep.
+TRANSIENT_OPEN_BACKOFF_SECONDS: Final = 5.0
 
 #: The audit action written when a queue row's payload does not open under its own tag.
 QUEUE_TAG_FAILED_ACTION: Final = "integrity.queue_tag_failed"
@@ -186,7 +192,8 @@ def is_transient_open_failure(exc: BaseException) -> bool:
     :func:`~messagefoundry.store.crypto.gave_no_verdict` decides it: a
     :class:`~messagefoundry.store.crypto.CipherUnavailableError`, or a Transit error caused by an
     unreachable Vault or a refusal of the service's own (a token refused, a 5xx). Such a failure is
-    never a tag failure, and a claim hands the row back rather than dead-lettering it. A
+    never a tag failure, and a claim sets the row aside with a backoff rather than dead-lettering
+    it (:data:`TRANSIENT_OPEN_BACKOFF_SECONDS`). A
     :class:`QueueTagError` is never transient: it is raised only after this check passed."""
     return (
         isinstance(exc, CipherError) and not isinstance(exc, QueueTagError) and gave_no_verdict(exc)
@@ -212,13 +219,32 @@ def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | 
     return cipher.encrypt(plaintext, aad=aad)
 
 
+def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
+    """Whether ``exc``, raised opening the marked value ``stored``, says the cell failed its tag.
+
+    The rule :func:`~messagefoundry.store.cell_tag.open_tagged_cell` applies (BACKLOG #5765). An
+    outage says nothing about the cell. Under a cipher that holds the value's key, any failure is
+    the tag's. Vault Transit cannot name its keys, so :func:`is_tag_failure` counts every marked
+    value as held there; only its :class:`UnauthenticatedCipherError`, Vault's AEAD refusal of the
+    value itself, is a tag failure, and a key-version or policy refusal or a malformed reply keeps
+    the cipher's own error."""
+    if is_transient_open_failure(exc) or not is_tag_failure(cipher, stored):
+        return False
+    if callable(getattr(cipher, "holds_key_for", None)):
+        return True
+    return (
+        isinstance(exc, UnauthenticatedCipherError)
+        and getattr(cipher, "names_no_keys", False) is True
+    )
+
+
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
     """Open ``row``'s ``payload`` under its own tag: the body for an inline row, the sealed
     ``shared_body`` key for a ``ref`` row.
 
     Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
-    :func:`is_tag_failure`; a key or format problem raises the cipher's own error, and so does a key
-    service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
+    :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and so does
+    a key service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
     differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
@@ -234,9 +260,7 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
-        # An outage says nothing about the cell. Vault Transit cannot name its keys, so without
-        # this check a transient outage would read as every marked cell failing its tag (#5765).
-        if is_transient_open_failure(exc) or not is_tag_failure(cipher, payload):
+        if not _names_tag_failure(cipher, payload, exc):
             raise  # a key, format or key-service problem, which the cipher's own error names
         raise QueueTagError(
             f"integrity: the queue row's payload does not open under its own tag ({exc})"

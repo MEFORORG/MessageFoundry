@@ -175,6 +175,7 @@ from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
+    TRANSIENT_OPEN_BACKOFF_SECONDS,
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
@@ -10736,14 +10737,12 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         items = []
-        id_at = columns.index("id")
-        ids = [r[id_at] for r in rows]
         for row in rows:
             d = dict(zip(columns, row))  # noqa: B905
             try:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                await self._dead_letter_unopenable(d, stage, exc, claimed_ids=ids)
+                await self._dead_letter_unopenable(d, stage, exc, tail=[d])
                 continue
             items.append(
                 OutboxItem(
@@ -10772,36 +10771,48 @@ class SqlServerStore:
         return open_queue_cell(self._cipher, {**d, "stage": stage, "body_ref": None})
 
     async def _dead_letter_unopenable(
-        self, d: dict[str, Any], stage: str, exc: CipherError, *, claimed_ids: Sequence[str]
-    ) -> None:
+        self,
+        d: dict[str, Any],
+        stage: str,
+        exc: CipherError,
+        *,
+        tail: Sequence[dict[str, Any]],
+    ) -> bool:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way.
+        tag is also audited and alerted (BACKLOG #2593). Returns ``False`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
-        the row, so it is not dead-lettered (BACKLOG #5735): every row of the claim,
-        ``claimed_ids``, goes back to ``pending`` and the error is raised, so the worker backs off.
-        So does a dead-letter write that fails, rather than leave the claim ``inflight``. The whole
-        claim goes back so a FIFO lane never delivers past its head; the SQLite twin says more."""
+        the row, so it is set aside instead (BACKLOG #5735), and so is a row whose dead-letter
+        write fails. ``tail`` (the row, then every later row of its lane in a FIFO claim) goes back
+        to ``pending`` with a durable backoff, and this returns ``True``, so a FIFO caller stops at
+        the row. The SQLite twin says more."""
         if is_transient_open_failure(exc):
-            await self._hand_back_claimed(claimed_ids)
-            raise exc
+            log.warning(
+                "setting aside %d claimed queue row(s) from %s: opening it failed with %s",
+                len(tail),
+                d["id"],
+                type(exc).__name__,
+            )
+            await self._set_aside_claimed(tail)
+            return True
         log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
         try:
             await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
         except Exception:
-            await self._hand_back_claimed(claimed_ids)
-            raise
+            log.exception("could not dead-letter queue row %s; setting it aside", d["id"])
+            await self._set_aside_claimed(tail)
+            return True
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, {**d, "stage": stage})
+        return False
 
-    async def _hand_back_claimed(self, ids: Sequence[str]) -> None:
-        """Return a claim's rows to ``pending`` when its open raised out of the claim (BACKLOG
-        #5735). A failed hand-back is logged and the claim's own error propagates; the lease and
-        startup recovery re-pend what it left ``inflight``."""
-        try:
-            await self.release_claimed(ids)
-        except Exception:  # noqa: BLE001 -- the claim's own error is the one the worker must see
-            log.exception("could not hand %d claimed queue row(s) back to pending", len(ids))
+    async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]]) -> None:
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735). If
+        this write fails too, its error propagates out of the claim, and on this backend only
+        ``reset_stale_inflight`` at the next start re-pends the rows: a claim here sets no lease."""
+        await self.reschedule_claimed(
+            [d["id"] for d in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
+        )
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
@@ -10947,7 +10958,7 @@ class SqlServerStore:
         try:
             payload = self._open_claimed(d, stage)
         except CipherError as exc:
-            await self._dead_letter_unopenable(d, stage, exc, claimed_ids=[d["id"]])
+            await self._dead_letter_unopenable(d, stage, exc, tail=[d])
             return None
         return OutboxItem(
             id=d["id"],
@@ -11092,12 +11103,12 @@ class SqlServerStore:
         # read as created_at. The worker then iterates strictly oldest-first (it never re-sorts).
         decoded = sorted((dict(zip(columns, r)) for r in rows), key=lambda d: d["seq"])  # noqa: B905
         items: list[OutboxItem] = []
-        ids = [r["id"] for r in decoded]
-        for d in decoded:
+        for i, d in enumerate(decoded):
             try:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                await self._dead_letter_unopenable(d, stage, exc, claimed_ids=ids)
+                if await self._dead_letter_unopenable(d, stage, exc, tail=decoded[i:]):
+                    break  # set aside with the rest of the lane: never deliver past it (#5735)
                 continue
             items.append(
                 OutboxItem(
@@ -11604,14 +11615,15 @@ class SqlServerStore:
         for d in claimed_rows:
             by_lane_rows.setdefault(d[lane_col], []).append(d)
         by_lane: dict[str, list[OutboxItem]] = {}
-        ids = [r["id"] for r in claimed_rows]
         for lane, lane_rows in by_lane_rows.items():
             items: list[OutboxItem] = []
-            for d in sorted(lane_rows, key=lambda r: r["seq"]):
+            in_order = sorted(lane_rows, key=lambda r: r["seq"])
+            for i, d in enumerate(in_order):
                 try:
                     payload = self._open_claimed(d, stage)
                 except CipherError as exc:
-                    await self._dead_letter_unopenable(d, stage, exc, claimed_ids=ids)
+                    if await self._dead_letter_unopenable(d, stage, exc, tail=in_order[i:]):
+                        break  # set aside with the rest of the lane: never deliver past it (#5735)
                     continue
                 items.append(
                     OutboxItem(
