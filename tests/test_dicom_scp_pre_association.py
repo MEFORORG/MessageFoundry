@@ -82,25 +82,25 @@ async def _until_ended(scp: Any, baseline: int, *, within: float = 5.0) -> None:
     """Wait until no association is left and the thread count is back at ``baseline``.
 
     Both are awaited, never one awaited and the other read once (vault BACKLOG #5141, #5167). The
-    thread count can reach the baseline while an ``Association`` thread is still alive: the
-    baseline can hold a dying thread of the test before, and that thread outlives the close its
-    peer reads. A slot held for good still runs this wait out, and the red says what was held."""
-    last: list[tuple[int, int]] = []
+    thread count can reach the baseline while an ``Association`` thread is still alive: an
+    ``Association`` thread outlives the close its peer reads, and the baseline can hold a dying
+    thread of the test before. A slot held for good still runs this wait out, and the red names
+    the threads still alive."""
+    last: list[tuple[int, list[str]]] = []
 
     def ended() -> bool:
-        reading = (
-            len(scp._server.active_associations),
-            len(_threads_outside_the_test()) - baseline,
-        )
-        last[:] = [reading]
-        return reading[0] == 0 and reading[1] <= 0
+        associations = len(scp._server.active_associations)
+        threads = [t.name for t in _threads_outside_the_test()]
+        last[:] = [(associations, threads)]
+        return associations == 0 and len(threads) <= baseline
 
     try:
         await _until(ended, within=within)
     except AssertionError:
-        associations, added = last[0]
+        associations, threads = last[0]
         raise AssertionError(
-            f"after {within}s, {associations} associations and {added} threads over the baseline"
+            f"after {within}s, {associations} associations and"
+            f" {len(threads) - baseline} threads over the baseline; alive: {threads}"
         ) from None
 
 
@@ -506,12 +506,34 @@ async def test_the_end_wait_reds_while_an_association_is_held() -> None:
     # CONTROL for _until_ended: a slot still held runs the wait out, even once the thread count
     # alone would pass, so waiting on the state rather than reading it once loosens nothing.
     async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        baseline = await _thread_baseline()
         sock = await _a_held_association(scp.sockport)
         try:
-            with pytest.raises(AssertionError, match="1 associations"):
+            with pytest.raises(AssertionError, match=r"after 0\.5s, 1 associations and"):
                 await _until_ended(scp, len(_threads_outside_the_test()) + 10, within=0.5)
         finally:
             sock.close()
+        await _until_ended(scp, baseline)  # leaves no thread for the next test's baseline
+
+
+async def test_the_end_wait_reds_while_a_thread_over_the_baseline_is_alive() -> None:
+    # CONTROL for _until_ended: with no association at all, one thread over the baseline still
+    # runs the wait out, and the red names it.
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        baseline = await _thread_baseline()
+        release = threading.Event()
+        extra = threading.Thread(target=release.wait, name="held-by-the-control")
+        extra.start()
+        try:
+            with pytest.raises(
+                AssertionError,
+                match=r"after 0\.5s, 0 associations and 1 threads over the baseline;"
+                r" alive: .*held-by-the-control",
+            ):
+                await _until_ended(scp, baseline, within=0.5)
+        finally:
+            release.set()
+            extra.join()
 
 
 async def test_a_dribble_mid_pdu_on_an_established_association_is_ended_on_time() -> None:
@@ -545,10 +567,9 @@ async def test_a_refused_peer_that_stalls_after_its_request_goes_round_nothing()
             # never sends it.
             closed = [await asyncio.to_thread(_closed_within, sock, 8.0) for sock in held]
             assert all(closed), f"{closed.count(False)} of {len(held)} peers not closed within 8 s"
-            # An Association thread outlives the close its peer reads, and the baseline can hold a
-            # dying thread of the test before, so the count below may not wait for this one. A slot
-            # still held here runs this wait out, as a slot held for good always has.
-            await _until_ended(scp, baseline, within=8.0)
+            # Why the thread count alone is not awaited: _until_ended. The 16 s is the two 8 s waits
+            # this test held before they were one.
+            await _until_ended(scp, baseline, within=16.0)
             assert await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()) == (
                 True,
                 0x0000,
