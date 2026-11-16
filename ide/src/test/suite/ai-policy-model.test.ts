@@ -693,7 +693,7 @@ suite("chat.ts no-reply notice for an engine-brokered request (BACKLOG #5407)", 
     const notice = brokeredNoReplyNotice(true);
     assert.ok(!notice.includes("Nothing was sent"), notice);
     assert.ok(notice.includes("was sent to the MessageFoundry engine"), notice);
-    assert.ok(notice.includes("your prompt and the attached code"), notice);
+    assert.ok(notice.includes("your prompt and any code attached to it"), notice);
   });
 
   test("chat.ts marks the request sent inside the call withAuth makes, and names that in the notice", () => {

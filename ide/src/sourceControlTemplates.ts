@@ -109,13 +109,13 @@ export function setupText(hookWritten: boolean): SetupText {
   }
   return {
     done:
-      "MessageFoundry: version control is set up, but no commit hook was written, so commits are not checked. Set the path settings to folders inside the workspace and run setup again to add it.",
+      "MessageFoundry: version control is set up, but this setup wrote no commit hook and did not set core.hooksPath, so it did not turn on checks on commit. Set the path settings to folders inside the workspace and run setup again to add it.",
     hasHistory,
     commitMessage: "Initial commit",
     commitFailed: "MessageFoundry: the commit failed — see the 'MessageFoundry Checks' output.",
     offerBaseline:
-      "A required check hasn't passed yet. You can still commit this as your baseline snapshot. No commit hook was set up, so later commits are not checked; run the checks yourself after fixing the flagged items. Details are in the 'MessageFoundry Checks' output.",
+      "A required check hasn't passed yet. You can still commit this as your baseline snapshot. This setup set up no commit hook, so it did not turn on checks for later commits; run the checks yourself after fixing the flagged items. Details are in the 'MessageFoundry Checks' output.",
     committedAnyway:
-      "MessageFoundry: baseline committed. No commit hook was set up, so later commits are not checked — fix the flagged items in 'MessageFoundry Checks'.",
+      "MessageFoundry: baseline committed. This setup set up no commit hook, so it did not turn on checks for later commits — fix the flagged items in 'MessageFoundry Checks'.",
   };
 }

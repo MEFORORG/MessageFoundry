@@ -519,7 +519,8 @@ async function askCli(
       droppedSkipped(
         "serviceConfig",
         setting.dropped,
-        `\`cert inventory\` was not run and no engine certificate is trusted for ${url}`,
+        `\`cert inventory\` was not run and no certificate it would name is trusted for ${url} ` +
+          "(a caFile pin in messagefoundry.environments still applies)",
       ),
     );
     return;
@@ -814,6 +815,9 @@ function cliCouldAnchor(key: string): boolean {
     // askCli's own guard: with no workspace, or an untrusted one, the CLI is never asked.
     !!workspaceDir() &&
     !isExecGated() &&
+    // And its refusal of a dropped serviceConfig (BACKLOG #5404), so a failure does not schedule
+    // refreshes that can only refuse again.
+    writerCheckSetting("serviceConfig").dropped === false &&
     !claimedKeys.has(key) &&
     // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
     !configuredPins().has(key) &&

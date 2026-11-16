@@ -480,14 +480,14 @@ export function carryDeniesOffline(store: PolicyStore, offline: AiPolicy): Promi
  * What the chat says when an engine-brokered request got no reply because `withAuth` answered
  * undefined (BACKLOG #5407). `sent` is whether the request itself went out. Before it goes, that
  * answer means a cancelled sign-in or a target the gate refused. After it, it means the engine
- * refused the token with a 401 and signing in again was cancelled, so the prompt and the code with
- * it did reach the engine, and saying nothing was sent would be false.
+ * refused the token with a 401 and signing in again was cancelled or failed, so the prompt and any
+ * code attached to it did reach the engine, and saying nothing was sent would be false.
  */
 export function brokeredNoReplyNotice(sent: boolean): string {
   return sent
-    ? "_The request was sent to the MessageFoundry engine, with your prompt and the attached code, but the " +
-        "engine refused the sign-in it carried and signing in again was cancelled, so no reply was received. " +
-        "Sign in to the engine and ask again._"
+    ? "_The request was sent to the MessageFoundry engine, with your prompt and any code attached to it, but " +
+        "the engine refused the sign-in it carried and signing in again did not complete, so no reply was " +
+        "received. Sign in to the engine and ask again._"
     : "_Nothing was sent: sign in to the MessageFoundry engine to use engine-brokered AI assistance, " +
         "or, if an error said the engine address was refused, correct that address._";
 }

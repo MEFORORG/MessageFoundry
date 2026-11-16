@@ -347,7 +347,7 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       for (const m of shown) {
         assert.ok(!/checks are set up|checks enabled|checks run on every commit|Checks are active|pre-commit/.test(m), m);
       }
-      assert.ok(shown.some((m) => m.includes("no commit hook was written")), JSON.stringify(shown));
+      assert.ok(shown.some((m) => m.includes("wrote no commit hook")), JSON.stringify(shown));
     }
   });
 
