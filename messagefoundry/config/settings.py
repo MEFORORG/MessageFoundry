@@ -44,14 +44,13 @@ import os
 import re
 import string
 import tomllib
-import types
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal, Union, get_args, get_origin
+from typing import Any, Final, Literal
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
@@ -61,6 +60,7 @@ from pydantic import (
     PrivateAttr,
     ValidationError,
     ValidationInfo,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
@@ -353,21 +353,41 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
-def _is_numeric_annotation(annotation: Any) -> bool:
-    """``int``, ``float`` or an optional one, never a union that also admits ``bool`` (#5509)."""
-    union = get_origin(annotation) in (Union, types.UnionType)
-    members = get_args(annotation) if union else (annotation,)
-    return bool not in members and any(member in (int, float) for member in members)
+def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
+    """Where a bool in ``given`` came out of validation as a number in ``got``, or ``None`` (#5509).
 
-
-@functools.cache
-def _numeric_field_names(model: type[BaseModel]) -> frozenset[str]:
-    """The fields of ``model`` that :meth:`_Section._refuse_a_bool_on_a_number` guards (#5509)."""
-    return frozenset(
-        name
-        for name, field in model.model_fields.items()
-        if _is_numeric_annotation(field.annotation)
-    )
+    Read off the validated value rather than the annotation, so it holds for every numeric shape
+    pydantic coerces a bool into: a constrained or optional int, an int subclass, a list, set or
+    dict of numbers, and the fields of a nested model such as ``[[alerts.rules]]``. A field that
+    deliberately keeps a bool keeps it here too, since its validated value is still a bool."""
+    if isinstance(given, bool):
+        return where if isinstance(got, int | float) and not isinstance(got, bool) else None
+    if isinstance(given, Mapping):
+        if isinstance(got, BaseModel):
+            fields = type(got).model_fields
+            pairs = [(k, v, getattr(got, k)) for k, v in given.items() if k in fields]
+        elif isinstance(got, Mapping):
+            pairs = [(k, v, got[k]) for k, v in given.items() if k in got]
+        else:
+            return None
+        for key, inner_given, inner_got in pairs:
+            if found := _bool_read_as_number(inner_given, inner_got, f"{where}.{key}"):
+                return found
+        return None
+    if isinstance(given, list | tuple):
+        if isinstance(got, list | tuple) and len(got) == len(given):
+            for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
+                if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
+                    return found
+        # A set reorders and merges, so no element pairs with its input: a bool given where none
+        # survived was read as a number.
+        elif (
+            isinstance(got, set | frozenset)
+            and any(isinstance(item, bool) for item in given)
+            and not any(isinstance(item, bool) for item in got)
+        ):
+            return where
+    return None
 
 
 class _Section(_InputHidingModel):
@@ -408,18 +428,25 @@ class _Section(_InputHidingModel):
                     raise ValueError(refusal)
         return data
 
-    @field_validator("*", mode="before")
+    @field_validator("*", mode="wrap")
     @classmethod
-    def _refuse_a_bool_on_a_number(cls, value: Any, info: ValidationInfo) -> Any:
+    def _refuse_a_bool_on_a_number(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> Any:
         """Refuse ``true``/``false`` on a numeric key rather than read it as 1 or 0 (BACKLOG #5509).
 
         pydantic's lax mode coerces a bool to an int or float, so
         ``delete_message_bodies_after_days = false`` would read as 0, "keep indefinitely", and a
         byte cap set to ``true`` as one byte. Lax mode stays on for everything else, because the
-        environment layer hands every value over as a string."""
-        if isinstance(value, bool) and info.field_name in _numeric_field_names(cls):
-            raise ValueError("expects a number, not a boolean (true or false); write the number")
-        return value
+        environment layer hands every value over as a string. A subclass ``before`` validator
+        that turns a bool into a number itself runs ahead of this one and is not seen."""
+        validated = handler(value)
+        if (found := _bool_read_as_number(value, validated, str(info.field_name))) is not None:
+            raise ValueError(
+                f"{found} expects a number, not a boolean (true or false); write a number, or "
+                "remove the key to keep its default"
+            )
+        return validated
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
