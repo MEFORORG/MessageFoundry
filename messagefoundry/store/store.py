@@ -3024,7 +3024,9 @@ class UserRecord:
     row: UserRow | None = field(default=None, compare=False, repr=False)
     #: Set only on the stand-in :meth:`unreadable_row` builds for a listed row whose cells do not
     #: parse (BACKLOG #5505). ``AuthService._verified`` answers it as a record that fails its seal,
-    #: on a keyless store too, so a list keeps showing the account as failing and reports it.
+    #: on a keyless store too, so a list keeps showing the account as failing and reports it. Its
+    #: other fields are invented closed values: a caller that is not the seal check must not read
+    #: them as the account's state.
     unreadable: bool = field(default=False, compare=False)
 
     def sign_in_locked(self, now: float) -> bool:
@@ -3137,12 +3139,10 @@ class UserRecord:
         )
 
 
-def user_or_unreadable(d: Mapping[str, Any]) -> UserRecord:
-    """The account a user read returned (BACKLOG #5505): :meth:`UserRecord.from_mapping`, or, for
-    a row whose cells do not parse, :meth:`UserRecord.unreadable_row`, so every user reader hands
-    the service a record it fails and reports, as it does one that fails its seal, rather than an
-    error. A row whose id is itself unreadable still raises the :class:`RowSealError`: nothing
-    could name it. The write helpers read through :meth:`UserRow.from_mapping` and still refuse."""
+def _listed_user(d: Mapping[str, Any]) -> UserRecord:
+    """One row of a list read: :meth:`UserRecord.from_mapping`, or, for a row whose cells do not
+    parse, :meth:`UserRecord.unreadable_row`. A row whose id is itself unreadable still raises the
+    :class:`RowSealError`, which :func:`decoded_rows` leaves out: nothing could name it."""
     try:
         return UserRecord.from_mapping(d)
     except RowSealError:
@@ -3153,10 +3153,13 @@ def user_or_unreadable(d: Mapping[str, Any]) -> UserRecord:
 
 
 def listed_users(rows: Iterable[Mapping[str, Any]]) -> list[UserRecord]:
-    """The accounts a list read returned, in order, each read by :func:`user_or_unreadable`, so
-    an account whose row does not parse stays in the list (BACKLOG #5505). Only a row whose id is
-    itself unreadable is left out, after :func:`decode_or_refuse` has logged it."""
-    return decoded_rows(rows, user_or_unreadable)
+    """The accounts a list read returned, in order (BACKLOG #5505). An account whose row does not
+    parse stays in the list as :meth:`UserRecord.unreadable_row`, so the admin list shows it as
+    failing. The list is the only reader that returns the stand-in: the single-row user readers
+    raise :class:`RowSealError` for such a row, which the service's loaders answer as a failed
+    seal, and the write helpers refuse it. A caller iterating a list read checks ``unreadable``
+    before it acts on a field."""
+    return decoded_rows(rows, _listed_user)
 
 
 @dataclass(frozen=True)
@@ -19387,7 +19390,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return user_or_unreadable(dict(row)) if row else None
+        return UserRecord.from_mapping(dict(row)) if row else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
         """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
@@ -19576,7 +19579,7 @@ class MessageStore:
                 f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
             )
             row = await cur.fetchone()
-        return user_or_unreadable(dict(row)) if row else None
+        return UserRecord.from_mapping(dict(row)) if row else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read: it asks the directory's IMMUTABLE id
@@ -19586,13 +19589,13 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
             row = await cur.fetchone()
-        return user_or_unreadable(dict(row)) if row else None
+        return UserRecord.from_mapping(dict(row)) if row else None
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         async with self._read() as db:
             cur = await db.execute(f"{USER_READ_SQL} WHERE username=?", (username,))
             row = await cur.fetchone()
-        return user_or_unreadable(dict(row)) if row else None
+        return UserRecord.from_mapping(dict(row)) if row else None
 
     async def set_user_username(
         self,

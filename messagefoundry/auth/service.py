@@ -2245,6 +2245,24 @@ class UserSealRefused(RuntimeError):
     refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
+async def read_user_or_unreadable(read: Awaitable[UserRecord | None]) -> UserRecord | None:
+    """One store user read, with a row whose cells do not parse answered as the store's list
+    answers it (BACKLOG #5505): :meth:`UserRecord.unreadable_row`. The single-row readers raise
+    :class:`RowSealError` for such a row, whose subject is the row's bounded id; one with no
+    readable id is raised as it is.
+
+    The stand-in's fields other than ``id`` are invented, so only two kinds of caller may take it:
+    ``AuthService``'s loaders, whose ``_verified`` fails and reports it as a record that fails its
+    seal, and an id or existence question, which reads it as held. Nothing else may read it."""
+    try:
+        return await read
+    except RowSealError as exc:
+        if exc.kind != USER_KIND or not exc.subject:
+            raise
+        subject = exc.subject
+    return UserRecord.unreadable_row(subject)
+
+
 @dataclass(frozen=True)
 class ListedUser:
     """One account as :meth:`AuthService.list_checked_users` reads it (BACKLOG #5520): ``user`` with
@@ -13117,7 +13135,7 @@ class AuthService:
         caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
         ``refused`` also reads true for a row deleted or re-keyed between the row and role reads;
         :meth:`checked_user` tells those apart."""
-        raw = await self._store.get_user(user_id)
+        raw = await read_user_or_unreadable(self._store.get_user(user_id))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
@@ -13127,19 +13145,21 @@ class AuthService:
     async def _lookup_by_username(self, username: str) -> _UserLookup:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
         the same read: a row that fails its seal still holds its name."""
-        raw = await self._store.get_user_by_username(username)
+        raw = await read_user_or_unreadable(self._store.get_user_by_username(username))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
-        raw = await self._store.get_user_by_directory_object_id(object_id)
+        raw = await read_user_or_unreadable(self._store.get_user_by_directory_object_id(object_id))
         return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
     ) -> VerifiedUser | None:
         """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
-        raw = await self._store.get_user_by_federated_subject(issuer, subject)
+        raw = await read_user_or_unreadable(
+            self._store.get_user_by_federated_subject(issuer, subject)
+        )
         return (await self._verified(raw)).user
 
     async def _load_users(self) -> list[VerifiedUser]:
@@ -13197,7 +13217,7 @@ class AuthService:
         raw = listed
         for _ in range(_CHECKED_READ_PASSES):
             if raw is None:
-                raw = await self._store.get_user(user_id)
+                raw = await read_user_or_unreadable(self._store.get_user(user_id))
                 if raw is None:
                     return _SealCheck()
             try:
@@ -13214,7 +13234,7 @@ class AuthService:
             if found.settled:
                 return found
             raw = None
-        still_there = await self._store.get_user(user_id)
+        still_there = await read_user_or_unreadable(self._store.get_user(user_id))
         if still_there is None:
             return _SealCheck()
         # Keyed by the stored id, as _verified reports, so a caller's other spelling of the id on a
@@ -13277,17 +13297,20 @@ class AuthService:
         """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not
         an authority one: a row that fails its seal still holds its name against a new account, and
         only a ``bool`` leaves here, never the unchecked row."""
-        return await self._store.get_user_by_username(username) is not None
+        return await read_user_or_unreadable(self._store.get_user_by_username(username)) is not None
 
     async def _directory_object_id_held(self, object_id: str) -> bool:
         """:meth:`_username_held`, for the directory's immutable id."""
-        return await self._store.get_user_by_directory_object_id(object_id) is not None
+        return (
+            await read_user_or_unreadable(self._store.get_user_by_directory_object_id(object_id))
+            is not None
+        )
 
     async def _user_id_held(self, user_id: str) -> bool:
         """:meth:`_username_held`, for the account id: whether the row exists at all, sealed or not,
         so a caller can tell an account deleted from one whose record fails its check (BACKLOG
         #3068)."""
-        return await self._store.get_user(user_id) is not None
+        return await read_user_or_unreadable(self._store.get_user(user_id)) is not None
 
     async def _federated_subject_held_elsewhere(
         self, issuer: str, subject: str, user_id: str
@@ -13296,7 +13319,9 @@ class AuthService:
         holds it, sealed or not (BACKLOG #5625). The unique index refuses a second holder whatever
         its seal says, so a bind must ask the raw row, not :meth:`_load_user_by_federated_subject`,
         which reads a failing holder as none."""
-        holder = await self._store.get_user_by_federated_subject(issuer, subject)
+        holder = await read_user_or_unreadable(
+            self._store.get_user_by_federated_subject(issuer, subject)
+        )
         if holder is None or holder.id == user_id:
             return False
         # Checked too: a holder whose record fails its seal is reported as the checked loader
@@ -13337,7 +13362,7 @@ class AuthService:
             if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
                 return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
             if attempt == 0:
-                reread = await self._store.get_user(user.id)
+                reread = await read_user_or_unreadable(self._store.get_user(user.id))
                 if reread is None:
                     return _SealCheck()  # deleted meanwhile: nothing to report
                 if _lookup_keys(reread) != _lookup_keys(user):

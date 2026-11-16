@@ -163,8 +163,9 @@ async def test_a_corrupt_account_is_listed_as_failing_beside_the_others(
         assert set(listed_raw) == {"u-good", "u-bad"}
         assert listed_raw["u-bad"].unreadable and listed_raw["u-bad"].disabled
         assert not listed_raw["u-good"].unreadable
-        single = await store.get_user("u-bad")
-        assert single is not None and single.unreadable
+        # Only the list returns the stand-in; a single-row read raises.
+        with pytest.raises(RowSealError):
+            await store.get_user("u-bad")
         # The admin list keeps the account, failing, on a keyless store as on a keyed one.
         service = AuthService(store, AuthSettings())
         listed = await service.list_checked_users()

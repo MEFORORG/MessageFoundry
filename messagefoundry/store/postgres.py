@@ -417,7 +417,6 @@ from messagefoundry.store.store import (
     unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
-    user_or_unreadable,
     user_reseal_params,
     verify_audit_rows,
     way_past_passkeys,
@@ -9945,7 +9944,7 @@ class PostgresStore:
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone(f"{USER_READ_SQL} WHERE id=$1", user_id)
-        return user_or_unreadable(dict(d)) if d else None
+        return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
         """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
@@ -10117,13 +10116,13 @@ class PostgresStore:
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone(f"{USER_READ_SQL} WHERE username=$1", username)
-        return user_or_unreadable(dict(d)) if d else None
+        return UserRecord.from_mapping(dict(d)) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
         # rather than the recyclable sAMAccountName. A lookup, not a scan: it is on the sign-in path.
         d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=$1", object_id)
-        return user_or_unreadable(dict(d)) if d else None
+        return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
         self,
@@ -10232,7 +10231,7 @@ class PostgresStore:
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=$1 AND oidc_subject=$2", issuer, subject
         )
-        return user_or_unreadable(dict(d)) if d else None
+        return UserRecord.from_mapping(dict(d)) if d else None
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")

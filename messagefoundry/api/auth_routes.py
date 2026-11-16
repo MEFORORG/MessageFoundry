@@ -169,6 +169,7 @@ from messagefoundry.auth.service import (
     TemporaryPasswordUnavailable,
     UsernameTaken,
     UserSealRefused,
+    read_user_or_unreadable,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
@@ -328,7 +329,7 @@ async def _refuse_if_self(
     When it is None the row is read here, and only when the path spelling did not match."""
     if user_id != identity.user_id:
         if target is None:
-            target = await service.store.get_user(user_id)
+            target = await read_user_or_unreadable(service.store.get_user(user_id))
         if target is None or target.id != identity.user_id:
             return
     # Soft, with no defect re-raised: a raise here would replace the 400 the caller is owed with a
@@ -1628,7 +1629,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        target = await service.store.get_user(user_id)
+        target = await read_user_or_unreadable(service.store.get_user(user_id))
         await _refuse_if_self(
             request,
             service,
@@ -1661,7 +1662,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         window, so on yourself it would end every session you hold with no fresh proof. The
         self-service ``DELETE /me/sessions`` ends your other sessions behind a single-use
         ``session_terminate`` grant, and sign-out ends the current one."""
-        target = await service.store.get_user(user_id)
+        target = await read_user_or_unreadable(service.store.get_user(user_id))
         await _refuse_if_self(
             request,
             service,

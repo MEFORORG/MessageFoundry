@@ -425,7 +425,6 @@ from messagefoundry.store.store import (
     unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
-    user_or_unreadable,
     user_reseal_params,
     verify_audit_rows,
     way_past_passkeys,
@@ -14916,7 +14915,7 @@ class SqlServerStore:
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone(f"{USER_READ_SQL} WHERE id=?", (user_id,))
-        return user_or_unreadable(d) if d else None
+        return UserRecord.from_mapping(d) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
         """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
@@ -15139,7 +15138,7 @@ class SqlServerStore:
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone(f"{USER_READ_SQL} WHERE username=?", (username,))
-        return user_or_unreadable(d) if d else None
+        return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
@@ -15151,7 +15150,7 @@ class SqlServerStore:
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.
         d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
-        return user_or_unreadable(d) if d else None
+        return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
@@ -15160,7 +15159,7 @@ class SqlServerStore:
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )
-        return user_or_unreadable(d) if d else None
+        return UserRecord.from_mapping(d) if d else None
 
     async def list_users(self) -> list[UserRecord]:
         rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
