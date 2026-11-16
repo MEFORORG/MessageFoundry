@@ -44,13 +44,14 @@ import os
 import re
 import string
 import tomllib
+import types
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Union, get_args, get_origin
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
@@ -352,6 +353,23 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
+def _is_numeric_annotation(annotation: Any) -> bool:
+    """``int``, ``float`` or an optional one, never a union that also admits ``bool`` (#5509)."""
+    union = get_origin(annotation) in (Union, types.UnionType)
+    members = get_args(annotation) if union else (annotation,)
+    return bool not in members and any(member in (int, float) for member in members)
+
+
+@functools.cache
+def _numeric_field_names(model: type[BaseModel]) -> frozenset[str]:
+    """The fields of ``model`` that :meth:`_Section._refuse_a_bool_on_a_number` guards (#5509)."""
+    return frozenset(
+        name
+        for name, field in model.model_fields.items()
+        if _is_numeric_annotation(field.annotation)
+    )
+
+
 class _Section(_InputHidingModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
@@ -389,6 +407,19 @@ class _Section(_InputHidingModel):
                 if key in data:
                     raise ValueError(refusal)
         return data
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _refuse_a_bool_on_a_number(cls, value: Any, info: ValidationInfo) -> Any:
+        """Refuse ``true``/``false`` on a numeric key rather than read it as 1 or 0 (BACKLOG #5509).
+
+        pydantic's lax mode coerces a bool to an int or float, so
+        ``delete_message_bodies_after_days = false`` would read as 0, "keep indefinitely", and a
+        byte cap set to ``true`` as one byte. Lax mode stays on for everything else, because the
+        environment layer hands every value over as a string."""
+        if isinstance(value, bool) and info.field_name in _numeric_field_names(cls):
+            raise ValueError("expects a number, not a boolean (true or false); write the number")
+        return value
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
