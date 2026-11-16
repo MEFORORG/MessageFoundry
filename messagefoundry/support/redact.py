@@ -410,8 +410,9 @@ _MEFOR_SECRET = re.compile(
 #
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``,
 # ``_CREDENTIAL_KV``, ``_KEY_MATERIAL`` and ``_NOT_BEFORE_QUOTED_LABEL`` are stated in both files;
-# both DSN readings are secretscrub's own objects, imported, since neither uses a shared fragment
-# or this copy's case fold (BACKLOG #5386). This
+# both DSN readings are secretscrub's own objects, imported (BACKLOG #5386). The narrow one uses no
+# shared fragment or case fold; the widened one is built from secretscrub's query keys and label
+# words under its global fold, so a word added there reaches the bundle's last DSN pass too. This
 # module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
 # #2694), but it does not build this copy from that one's fragments. Doing so would change this
 # copy's case fold, and that change is what the comment above ``redact_log_line`` records as

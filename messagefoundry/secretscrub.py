@@ -1363,8 +1363,10 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # THE FIRST SEGMENT IS POSSESSIVE (``*+``, ``++``) BECAUSE THE TWO CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
-# not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
-# reads no nested quantifier.
+# not as a repeated "@"-led group, so no quantifier nests under another. The static ReDoS gate in
+# ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
+# so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
+# stated there.
 #
 # NEITHER RUN CROSSES A LABEL ANOTHER PASS HIDES A VALUE UNDER (code review, round 5). A character
 # of the empty user's first segment, or of the run after the first segment, is taken only where no

@@ -84,11 +84,12 @@ from messagefoundry.redaction import (
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
 # about what a credential looks like. Stdlib ``re`` only, so no cycle. Deliberately NOT the engine's
 # credential REGISTRIES, which ``config/settings.py`` holds -- that module imports LOG_LEVELS from
-# here, so the dependency must not go the other way.
-# Query-string parameters that carry a credential: secretscrub's own tuple, re-exported, so the
-# widened DSN reading there stops at the keys this filter hides (BACKLOG #5386). The BACKLOG #1184
-# ruling is on the tuple there.
-from messagefoundry.secretscrub import _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS
+# here, so the dependency must not go the other way. The query-string keys the query filter below
+# hides are secretscrub's tuple too, re-exported, so the widened DSN reading there stops at the keys
+# this filter hides (BACKLOG #5386); the BACKLOG #1184 ruling is on the tuple there.
+from messagefoundry.secretscrub import (
+    _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS,
+)
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
