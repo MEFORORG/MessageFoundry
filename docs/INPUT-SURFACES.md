@@ -159,8 +159,12 @@ registered today are at least these. Read the `register_source(...)` calls in
 
 **A Loopback body does not pass the shared handlers.** A captured reply comes from outside the
 engine, so treat it as untrusted. `_process_response_item` holds it to the size ceiling
-(`reingress_size_error`) and, for `hl7v2`, to `Peek.parse`. It does not run the other checks in the
-table above. A reply that fails is recorded with status `ERROR`.
+(`reingress_size_error`), then to at least checks 2 to 4 and 6 in the table above
+(`reingress_body_error`, BACKLOG #5616): check 2 on any text type, checks 3 and 4 on `hl7v2`, and
+check 6 on any type but `hl7v2`, binary included, unless the reply is empty or all white space. An `hl7v2` reply over the engine's default ceiling skips checks 2 to 4 and is refused as
+oversize by check 7, `Peek.parse`, which every `hl7v2` reply meets, followed by the document handle
+marker check the HL7 v2 row further down names. Check 1 does not run, because the reply is already
+text, and check 8 does not run. A reply that fails is recorded with status `ERROR`.
 [ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 
 The two file sources run the type check themselves, before the shared handler. They call the same
@@ -270,7 +274,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At least these. At ingress, both shared handlers and the Loopback re-ingress refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses. What else strict validation holds the segments to, and what it lets through, segment order and Z-segments among them, is stated in [HL7-VALIDATION.md](HL7-VALIDATION.md). On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`, called by both handlers and `RegistryRunner._peek_for_loopback`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
+| HL7 v2 | At least these. At ingress, both shared handlers and the Loopback re-ingress refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses. What else strict validation holds the segments to, and what it lets through, segment order and Z-segments among them, is stated in [HL7-VALIDATION.md](HL7-VALIDATION.md). On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`, called by both handlers and by `_peek_for_loopback`, a module-level function in `pipeline/wiring_runner.py`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
@@ -320,16 +324,19 @@ It does hold them to a structure when it loads them. The rules live in
 [`config/wiring.py`](../messagefoundry/config/wiring.py), at least these:
 
 - The loader runs each top-level `.py` file whose name does not start with `_`. A `_` file is a
-  helper, loaded only when a sibling imports it. A helper that has the name of a module already
-  there is refused: a standard-library module, an installed module, or one the process has already
-  imported (`_refuse_shadowing_helper`).
-- Before any module runs, `_assert_safe_config_source` refuses at least a configuration directory,
-  or a file in it, that it reads as writable by another account, and on Windows one whose owner or
-  access list it cannot read. A dev and test escape,
-  `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same
-  environment, turns the refusal into a warning; under `enforce` the escape does nothing.
-  [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2) states what the check reads and
-  what it leaves out.
+  helper, loaded only when a sibling imports it. When a sibling imports a helper that has the name
+  of a module already there, the import is refused: a standard-library module, an installed module,
+  or one the process has already imported (`_refuse_shadowing_helper`, called by
+  `_HelperImporter._load`). A helper no sibling imports is not checked.
+- Before any module runs, `_assert_safe_config_source` refuses at least a path that
+  `config_source_trust_paths` lists and that it reads as writable by another account, and on
+  Windows one whose owner or access list it cannot read. That list is the configuration directory,
+  its top-level `*.py` files, helpers included, and, where they exist, its `__pycache__` folder and
+  the entries in it, `connections.toml`, and the `codesets` folder and the code-set tables the
+  loader reads from it. Any other path in the directory is not on it. A dev and test escape turns
+  the refusal into a warning; the conditions it needs are stated once, under *Dev/test escape* in
+  [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
+  check reads and what it leaves out.
 - A module declares nothing by being loaded. It registers objects by calling `inbound()`,
   `outbound()`, `@router` and `@handler`, at least. Those calls outside a load are refused.
 - Two objects of one kind may not share a name, and that covers a name declared both in a module
@@ -502,7 +509,7 @@ help. Each rule is in the script's `param()` block or its body.
 | `uninstall-net-helper.ps1` | `-ServiceName` | The `-ServiceName` rule above |
 | `measure-store-access.ps1` | `-Order` | Required. One of `ProvisionFirst`, `StartFirst`, `StartFirstEndToEnd` |
 | | `-DataDir` | Required |
-| `import-db-ca.ps1` | `-CaPath` | Required. A certificate file holding a self-signed root, in which every certificate is a CA with no private key. The script's help lists the shapes it reads and, with "at least", what it refuses |
+| `import-db-ca.ps1` | `-CaPath` | Required. A certificate file holding a self-signed root, in which every certificate is a CA with no private key. The help block at the top of the script, which `Get-Help` does not print, as the paragraph above says, lists the shapes it reads and, with "at least", what it refuses |
 
 `install-service.ps1` also relates parameters to each other. `-EngineWheel` refuses `-AppExe` and
 `-PythonExe`. `-EngineWheelSha256`, `-RequirementsLock`, `-RequirementsLockSha256` and

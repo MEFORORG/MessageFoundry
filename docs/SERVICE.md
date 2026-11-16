@@ -696,8 +696,10 @@ NSSM environment.
   A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
   active environment's value file if it is not a secret and is the same for every instance (the
   previous bullet's link says when and why).
-  **Off Windows, no installer creates the directory.** In `docker/compose.yaml` the container's
-  bind mount and its `MEFOR_SECRETS_DIRECTORY` line are both commented out, so uncomment both.
+  **Off Windows, no installer creates the directory.** In `docker/compose.yaml` the `engine`
+  service's bind mount and its `MEFOR_SECRETS_DIRECTORY` line are both commented out, so uncomment
+  both. The `ha` profile's `engine-ha` and `engine-standby` services carry neither line, so add
+  both there to use the directory.
   Where each platform's directory goes, a systemd unit's included, and what the engine refuses
   there are in [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
   Linux, on a host or in a container, is not a supported v1 deployment target
