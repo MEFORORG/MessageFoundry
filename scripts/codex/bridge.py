@@ -161,18 +161,34 @@ def merge_output(result: dict, update: dict) -> None:
                 target["permissionDecisionReason"] = source["permissionDecisionReason"]
 
 
-def git_bash() -> Path:
-    """Git for Windows' bash, which Claude Code runs a `shell: bash` hook with on Windows."""
+TOOL_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest")
+# The payload field a matcher is compared with. Claude Code ignores a matcher on every other event,
+# UserPromptSubmit and Stop among them, so the bridge runs those groups unconditionally.
+MATCHER_FIELDS = {
+    "SessionStart": "source",
+    "SessionEnd": "reason",
+    "PreCompact": "trigger",
+    "PostCompact": "trigger",
+    "SubagentStart": "agent_type",
+    "SubagentStop": "agent_type",
+}
+# Claude Code adds a hook's plain exit-0 stdout as context for these events only.
+PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
+
+
+def git_bash() -> str | None:
+    """The Git Bash that Claude Code runs a bash hook with on Windows, or None if there is none."""
+    configured = os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")
+    if configured and Path(configured).is_file():
+        return configured
     git = shutil.which("git")
     if git:
-        # git.exe sits in Git/cmd, Git/bin or Git/mingw64/bin. The real shell, usr/bin/bash.exe, goes
-        # before the bin/bash.exe wrapper that rewrites PATH; tests/_bash_resolver.py is the
-        # reference copy of this walk, which a standalone script cannot import.
-        for parent in Path(git).resolve().parents[:3]:
-            for rel in ("usr/bin/bash.exe", "bin/bash.exe"):
-                if (parent / rel).is_file():
-                    return parent / rel
-    raise FileNotFoundError("Git Bash not found beside git; a shell: bash hook cannot run")
+        # git.exe sits in Git/cmd, Git/bin or Git/mingw64/bin. Git/bin/bash.exe is the wrapper that
+        # puts Git's usr/bin and mingw64/bin on PATH, so a hook's own cat or grep resolves.
+        for parent in Path(git).resolve().parents:
+            if (parent / "bin/bash.exe").is_file():
+                return str(parent / "bin/bash.exe")
+    return None
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
@@ -182,17 +198,38 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
             command,
             *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
         ]
-    # Command-only sources run in the shell they name, else the current platform's shell.
-    # Environment expansion belongs to that shell; structured args above need no shell parsing.
+    # A command-only source runs in the shell it names. Claude Code's default is bash, and on
+    # Windows PowerShell when Git Bash is not installed. Environment expansion belongs to that
+    # shell; structured args above need no shell parsing.
     shell = hook.get("shell")
-    if shell == "powershell" or (shell is None and os.name == "nt"):
+    bash = git_bash() if os.name == "nt" else "bash"
+    if shell == "bash" or (shell is None and bash):
+        if not bash:
+            raise FileNotFoundError("Git Bash not found; a shell: bash hook cannot run")
+        return [bash, "-c", command]
+    if shell in ("powershell", None):
         command = command.replace("${CLAUDE_PROJECT_DIR}", "$env:CLAUDE_PROJECT_DIR")
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
-    if shell == "bash":
-        return [str(git_bash()) if os.name == "nt" else "bash", "-c", command]
-    if shell is None:
-        return ["sh", "-c", command]
+        # -Command reports a native program's exit 2 as 1, which would turn a block into a
+        # non-blocking error; passing $LASTEXITCODE on keeps it.
+        return [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{command}\nexit $LASTEXITCODE",
+        ]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
+
+
+def hook_failed(hook: dict, why: str) -> None:
+    """Report a failure Claude Code treats as non-blocking, unless the hook opts into blocking."""
+    label = hook.get("statusMessage") or " ".join(
+        [hook["command"], *(str(arg) for arg in hook.get("args", []))]
+    )
+    message = f"Codex bridge: hook {why}: {label}"
+    if hook.get("onFailure") == "block":
+        raise PermissionError(f"{message} (onFailure is block)")
+    print(f"{message} (not blocking)", file=sys.stderr)
 
 
 def dispatch(root: Path, payload: dict) -> dict:
@@ -217,30 +254,21 @@ def dispatch(root: Path, payload: dict) -> dict:
         merge_output(
             result, {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
         )
-    aliases = {str(payload.get("tool_name", ""))}
-    if "Bash" in aliases:
-        aliases.add("PowerShell")
-    if "apply_patch" in aliases:
-        aliases.update(("Edit", "Write"))
-    discriminator = (
-        aliases
-        if event in ("PreToolUse", "PostToolUse", "PermissionRequest")
-        # The first key with a value: a key Codex sends as null or empty falls through to the next.
-        else {
-            next(
-                (
-                    str(payload[key])
-                    for key in ("source", "trigger", "agent_type", "reason")
-                    if payload.get(key)
-                ),
-                "",
-            )
-        }
-    )
+    discriminator: set[str] | None = None
+    if event in TOOL_EVENTS:
+        discriminator = {str(payload.get("tool_name", ""))}
+        if "Bash" in discriminator:
+            discriminator.add("PowerShell")
+        if "apply_patch" in discriminator:
+            discriminator.update(("Edit", "Write"))
+    elif event in MATCHER_FIELDS:
+        discriminator = {str(payload.get(MATCHER_FIELDS[event]) or "")}
     for group in config.get("hooks", {}).get(event, []):
         matcher = group.get("matcher", "")
-        if matcher not in ("", "*") and not any(
-            re.search(matcher, value) for value in discriminator
+        if (
+            discriminator is not None
+            and matcher not in ("", "*")
+            and not any(re.search(matcher, value) for value in discriminator)
         ):
             continue
         for hook in group.get("hooks", []):
@@ -248,9 +276,9 @@ def dispatch(root: Path, payload: dict) -> dict:
                 raise ValueError(
                     f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
                 )
-            # Claude Code's hook contract: exit 2 blocks; any other failure, a timeout or a command
-            # that cannot start included, is a non-blocking error reported on stderr, and the
-            # remaining hooks still run. Only a successful hook's stdout is read.
+            # Claude Code's hook contract: exit 2 blocks. Any other failure, a timeout or a command
+            # that cannot start included, is a non-blocking error unless the hook sets onFailure to
+            # block, and the remaining hooks still run. Only a successful hook's stdout is read.
             try:
                 completed = subprocess.run(  # nosec B603 - trusted repo hook; stdin carries event data
                     hook_argv(root, hook),
@@ -264,19 +292,23 @@ def dispatch(root: Path, payload: dict) -> dict:
                     timeout=hook.get("timeout", 30),
                     check=False,
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                print(f"Codex bridge: hook did not complete, not blocking: {exc}", file=sys.stderr)
+            except subprocess.TimeoutExpired as exc:
+                if exc.stderr:
+                    captured = exc.stderr
+                    if isinstance(captured, bytes):
+                        captured = captured.decode("utf-8", "replace")
+                    print(captured, file=sys.stderr, end="")
+                hook_failed(hook, f"timed out after {exc.timeout} seconds")
                 continue
+            except OSError as exc:
+                hook_failed(hook, f"could not start ({exc})")
+                continue
+            if completed.returncode == 2:
+                raise PermissionError(completed.stderr.strip() or "Claude hook blocked this event")
             if completed.stderr:
                 print(completed.stderr, file=sys.stderr, end="")
-            if completed.returncode == 2:
-                raise PermissionError(completed.stderr or "Claude hook blocked this event")
             if completed.returncode:
-                print(
-                    f"Codex bridge: hook exited {completed.returncode}, not blocking: "
-                    f"{hook['command']}",
-                    file=sys.stderr,
-                )
+                hook_failed(hook, f"exited {completed.returncode}")
                 continue
             output = completed.stdout.strip()
             if not output:
@@ -284,8 +316,9 @@ def dispatch(root: Path, payload: dict) -> dict:
             try:
                 update = json.loads(output)
             except json.JSONDecodeError:
-                # Claude Code adds plain exit-0 stdout as context for these two events only.
-                if event not in ("SessionStart", "UserPromptSubmit"):
+                update = None
+            if not isinstance(update, dict):
+                if event not in PLAIN_CONTEXT_EVENTS:
                     print(output, file=sys.stderr)
                     continue
                 output = output.replace(
@@ -295,8 +328,6 @@ def dispatch(root: Path, payload: dict) -> dict:
                 update = {
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
                 }
-            if not isinstance(update, dict):
-                raise ValueError("Hook JSON output must be an object")
             merge_output(result, update)
     return result
 

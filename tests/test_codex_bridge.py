@@ -122,10 +122,10 @@ def test_new_unsupported_hook_is_reported(bridge, tmp_path):
 
 def test_hook_timeout_is_reported_without_blocking_later_hooks(bridge, tmp_path, capsys):
     """Claude Code treats a timed-out hook as a non-blocking error, and so must the bridge."""
-    slow = python("import time; time.sleep(5)", timeout=0.1)
+    slow = python("import time; time.sleep(5)", timeout=0.1, statusMessage="the slow hook")
     settings(tmp_path, [slow, handler(json.dumps(DENIAL))])
     assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
-    assert "not blocking" in capsys.readouterr().err
+    assert "timed out after 0.1 seconds: the slow hook (not blocking)" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("code", [1, 3, 127])
@@ -136,44 +136,91 @@ def test_non_blocking_exit_is_reported_and_later_hooks_still_run(bridge, tmp_pat
     assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
     err = capsys.readouterr().err
     assert f"hook says {code}" in err
-    assert f"exited {code}, not blocking" in err
+    assert f"exited {code}: " in err
+    assert "(not blocking)" in err
 
 
 def test_unstartable_hook_is_reported_without_blocking(bridge, tmp_path, capsys):
     missing = {"type": "command", "command": str(tmp_path / "no-such-hook.exe"), "args": []}
     settings(tmp_path, [missing, handler(json.dumps(DENIAL))])
     assert bridge.dispatch(tmp_path, BASH_CALL) == DENIAL
-    assert "not blocking" in capsys.readouterr().err
+    assert "could not start" in capsys.readouterr().err
 
 
-def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path):
+@pytest.mark.parametrize(
+    "failing",
+    [exits(1), python("import time; time.sleep(5)", timeout=0.1)],
+    ids=["exit-1", "timeout"],
+)
+def test_on_failure_block_turns_a_non_blocking_failure_into_a_block(bridge, tmp_path, failing):
+    settings(tmp_path, [{**failing, "onFailure": "block"}, handler(json.dumps(DENIAL))])
+    with pytest.raises(PermissionError, match="onFailure is block"):
+        bridge.dispatch(tmp_path, BASH_CALL)
+
+
+def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
     marker = tmp_path / "later-hook-ran"
     settings(tmp_path, [exits(2), python(f"open({str(marker)!r}, 'w').close()")])
     with pytest.raises(PermissionError, match="hook says 2"):
         bridge.dispatch(tmp_path, BASH_CALL)
     assert not marker.exists()
+    # The reason travels once, in the PermissionError main() prints, not also as raw stderr.
+    assert "hook says 2" not in capsys.readouterr().err
 
 
-def test_null_discriminator_key_falls_through_to_the_next(bridge, tmp_path):
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+def test_a_native_exit_2_inside_a_powershell_hook_still_blocks(bridge, tmp_path):
+    """pwsh -Command reports a native program's exit 2 as 1, which would fail open."""
+    command = f"& '{sys.executable}' -c 'import sys; sys.exit(2)'"
+    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command}])
+    with pytest.raises(PermissionError):
+        bridge.dispatch(tmp_path, BASH_CALL)
+
+
+def test_each_event_matches_its_own_discriminator_field(bridge, tmp_path):
     settings(tmp_path, [handler(json.dumps(DENIAL))], event="SubagentStart", matcher="^worker$")
-    payload = {
-        "session_id": "x",
-        "hook_event_name": "SubagentStart",
-        "source": None,
-        "agent_type": "worker",
-    }
-    assert bridge.dispatch(tmp_path, payload) == DENIAL
+    payload = {"session_id": "x", "hook_event_name": "SubagentStart", "agent_type": "worker"}
+    # A null, or another event's field, must not stand in for SubagentStart's agent_type.
+    for other in (None, "", "startup"):
+        assert bridge.dispatch(tmp_path, {**payload, "source": other}) == DENIAL
 
 
-def test_plain_prompt_hook_output_becomes_context(bridge, tmp_path):
-    settings(tmp_path, [handler("remember the brief")], event="UserPromptSubmit", matcher="")
+def test_a_matcher_on_an_event_without_one_is_ignored(bridge, tmp_path):
+    """Claude Code ignores a matcher on UserPromptSubmit, so the bridge must still run the group."""
+    settings(tmp_path, [handler("remember the brief")], event="UserPromptSubmit", matcher=".+")
     result = bridge.dispatch(tmp_path, {"session_id": "x", "hook_event_name": "UserPromptSubmit"})
     assert result["hookSpecificOutput"]["additionalContext"] == "remember the brief"
 
 
-# Tool names a tracked tool-event matcher is tried against. A new matcher that selects none of
-# them fails the test below and names itself, rather than going undispatched.
+@pytest.mark.parametrize("stdout", ["remember the brief", "3", "true", '["a list"]'])
+def test_plain_or_non_object_prompt_hook_output_becomes_context(bridge, tmp_path, stdout):
+    settings(tmp_path, [handler(stdout)], event="UserPromptSubmit", matcher="")
+    result = bridge.dispatch(tmp_path, {"session_id": "x", "hook_event_name": "UserPromptSubmit"})
+    assert result["hookSpecificOutput"]["additionalContext"] == stdout
+
+
+def test_non_object_json_on_a_tool_event_is_not_a_block(bridge, tmp_path, capsys):
+    settings(tmp_path, [handler("3")])
+    assert bridge.dispatch(tmp_path, BASH_CALL) == {}
+    assert "3" in capsys.readouterr().err
+
+
+def test_a_command_only_hook_defaults_to_bash_then_powershell(bridge, tmp_path, monkeypatch):
+    """Claude Code's default shell is bash, or PowerShell on Windows when Git Bash is missing."""
+    hook = {"type": "command", "command": "echo hi"}
+    monkeypatch.setattr(bridge, "git_bash", lambda: "git/bin/bash.exe")
+    assert Path(bridge.hook_argv(tmp_path, hook)[0]).stem == "bash"
+    if os.name == "nt":
+        monkeypatch.setattr(bridge, "git_bash", lambda: None)
+        assert bridge.hook_argv(tmp_path, hook)[0] == "pwsh"
+        with pytest.raises(FileNotFoundError):
+            bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})
+
+
+# Values a tracked matcher is tried against, per event's discriminator. A new matcher that selects
+# none of them fails the test below and names itself, rather than going undispatched.
 _TOOL_NAMES = ("Bash", "PowerShell", "Agent", "Task", "Workflow", "EnterWorktree", "Edit", "Write")
+_FIELD_VALUES = ("startup", "resume", "clear", "compact", "manual", "auto", "logout", "other")
 
 
 def _tracked_settings():
@@ -197,7 +244,7 @@ def test_every_hook_in_the_tracked_settings_dispatches_to_a_runnable_argv(
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(bridge.subprocess, "run", record)
-    monkeypatch.setattr(bridge, "git_bash", lambda: Path("git-bash/bin/bash.exe"))
+    monkeypatch.setattr(bridge, "git_bash", lambda: "git/bin/bash.exe")
     assert tracked["hooks"], "the tracked settings wire no hooks; this test proves nothing"
     for event, groups in tracked["hooks"].items():
         assert event in bridge.EVENTS, f"{event} has no Codex adapter"
@@ -205,32 +252,32 @@ def test_every_hook_in_the_tracked_settings_dispatches_to_a_runnable_argv(
             payload = {"session_id": "x", "hook_event_name": event}
             matcher = group.get("matcher", "")
             if matcher not in ("", "*"):
-                assert event in ("PreToolUse", "PostToolUse", "PermissionRequest"), event
-                names = [name for name in _TOOL_NAMES if re.search(matcher, name)]
-                assert names, f"no tool name in _TOOL_NAMES selects matcher {matcher!r}"
-                payload["tool_name"] = names[0]
+                if event in bridge.TOOL_EVENTS:
+                    field, values = "tool_name", _TOOL_NAMES
+                else:
+                    field, values = bridge.MATCHER_FIELDS.get(event, "ignored"), _FIELD_VALUES
+                names = [value for value in values if re.search(matcher, value)]
+                assert names, f"no value in the test's lists selects {event} matcher {matcher!r}"
+                payload[field] = names[0]
             calls.clear()
             bridge.dispatch(tmp_path, payload)
             for hook in group["hooks"]:
+                argv = bridge.hook_argv(tmp_path, hook)
+                assert argv in calls, (event, hook["command"], calls)
                 if "args" in hook:
-                    expected = [
-                        hook["command"],
-                        *(a.replace("${CLAUDE_PROJECT_DIR}", str(tmp_path)) for a in hook["args"]),
-                    ]
-                    assert expected in calls, (event, hook["command"])
+                    assert argv[0] == hook["command"]
+                    assert not any("${CLAUDE_PROJECT_DIR}" in arg for arg in argv), argv
                 else:
-                    shell = hook.get("shell")
-                    assert shell in (None, "bash", "powershell"), shell
-                    runs = [argv for argv in calls if hook["command"] in argv[-1]]
-                    assert len(runs) == 1, (event, hook["command"], calls)
-                    if shell == "bash":
-                        assert Path(runs[0][0]).stem == "bash"
-                        assert runs[0][1:] == ["-c", hook["command"]]
+                    assert hook.get("shell") in (None, "bash", "powershell"), hook
+                    if hook.get("shell", "bash") == "bash":
+                        assert Path(argv[0]).stem == "bash"
+                        assert argv[1:] == ["-c", hook["command"]]
 
 
 def test_tracked_command_only_hooks_run_cleanly_through_their_shell(bridge, tmp_path, capsys):
     """Run each tracked command-only hook for real. The bridge strips CLAUDE_*, so the cloud-only
-    gate exits 0 before its script runs; under the wrong shell it would exit non-zero instead."""
+    gate exits 0 before its script runs. On Windows the wrong shell, pwsh, cannot parse it and
+    exits 1; on POSIX sh would exit 0 too, so the argv test above is the control there."""
     hooks = [
         hook
         for groups in _tracked_settings()["hooks"].values()
@@ -240,11 +287,8 @@ def test_tracked_command_only_hooks_run_cleanly_through_their_shell(bridge, tmp_
     ]
     if not hooks:
         pytest.skip("the tracked settings carry no command-only hook")
-    if os.name == "nt" and any(hook.get("shell") == "bash" for hook in hooks):
-        try:
-            bridge.git_bash()
-        except FileNotFoundError:
-            pytest.skip("Git Bash is not installed")
+    if os.name == "nt" and bridge.git_bash() is None:
+        pytest.skip("Git Bash is not installed")
     for hook in hooks:
         settings(tmp_path, [hook], event="SessionStart", matcher="")
         bridge.dispatch(tmp_path, {"session_id": "x", "hook_event_name": "SessionStart"})
