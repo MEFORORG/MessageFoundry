@@ -76,8 +76,9 @@ class ConnectorType(str, Enum):  # noqa: UP042
 # DatabaseLookup, DatabaseRef) and the value the connector falls back to when a mapping omits it.
 # Defined once so the declared default and the applied default cannot drift (BACKLOG #2089).
 DEFAULT_DB_CONNECT_TIMEOUT = 15
-#: The default DATABASE ``statement_timeout``, in seconds (BACKLOG #5756): the store's own
-#: ``[store].command_timeout`` default. 0 is no limit.
+#: The default DATABASE ``statement_timeout`` on the SQL Server preset, in seconds (BACKLOG #5756):
+#: the store's own ``[store].command_timeout`` default. 0 is no limit. The generic dialect
+#: defaults to 0, since a driver it reaches may refuse the setting (``_statement_timeout``).
 DEFAULT_DB_STATEMENT_TIMEOUT = 30
 
 

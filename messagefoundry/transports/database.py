@@ -2893,9 +2893,21 @@ def _statement_timeout(s: Mapping[str, Any], label: str) -> int:
     :func:`_make_pool` records it on the pool and :func:`_acquire` applies it to every borrow, as
     pyodbc's ``Connection.timeout``, the ODBC ``SQL_ATTR_QUERY_TIMEOUT`` of each cursor made on the
     connection after it. A statement that runs past it fails with ``HYT00``, a transient error, so a
-    hung statement no longer holds its connection, its lane, its poll or a stop without bound."""
+    hung statement no longer holds its connection, its lane, its poll or a stop without bound.
+
+    **Unset, the default depends on the dialect.** The SQL Server preset defaults to
+    :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT`: Microsoft's ODBC driver
+    takes the setter, which the SQL Server store already uses for ``[store].command_timeout``.
+    The generic dialect defaults to ``0``, no limit, so a default generic connection sets nothing
+    and behaves as before: a driver it reaches may refuse the connection attribute pyodbc's
+    setter writes, as psqlODBC is reported to. A value the operator sets is applied on either
+    dialect, and a driver that refuses it stops the lane (:func:`_apply_statement_timeout`)."""
+    value = s.get("statement_timeout")
+    if value is None:
+        generic = str(s.get("dialect", "sqlserver")).lower() == "generic"
+        return 0 if generic else DEFAULT_DB_STATEMENT_TIMEOUT
     return whole_seconds(
-        s.get("statement_timeout", DEFAULT_DB_STATEMENT_TIMEOUT),
+        value,
         f"{label} statement_timeout must be a whole number of seconds, 0 for no limit, at most "
         f"{_MAX_STATEMENT_TIMEOUT} (value withheld)",
         minimum=0,
@@ -3442,26 +3454,41 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
-    so the lane stops rather than running with a bound the operator believes is set. A
-    connection with no driver handle to write to is left to the call gate, which refuses it, and
-    a driver connection with no ``timeout`` at all, not pyodbc's shape, is logged and used as is."""
+    so the lane stops rather than running with a bound the operator believes is set.
+
+    **A transient driver state from the setter, class 08 or ``HYT00`` among them, is the
+    connection's failure, not a refusal.** It is classified as a connect failure is
+    (:func:`_classify_db_error`), and the connection is discarded, not lent again. A read of the
+    current value that raises, as pyodbc does on a closed handle, discards the connection and
+    retries too, so the pool slot is never left held.
+
+    A connection with no driver handle to write to is left to the call gate, which refuses it,
+    and a driver connection with no ``timeout`` at all, not pyodbc's shape, is used as is, with
+    one warning per pool."""
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
     raw = getattr(conn, "_conn", None)
     if seconds is None or raw is None:
         return
-    current = getattr(raw, "timeout", None)
+    try:
+        current = getattr(raw, "timeout", None)
+    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
+        await _close_and_release(pool, conn, None, discard=True)
+        raise DeliveryError(
+            f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
+        ) from exc
     if current is None:
-        logger.warning(
-            "DATABASE: a pooled connection has no driver timeout to set, so its statements run "
-            "with no statement_timeout"
-        )
+        _warn_no_driver_timeout(pool)
+        return
+    if current == seconds:
         return
     try:
-        if current != seconds:
-            raw.timeout = seconds
+        raw.timeout = seconds
     except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
-        await _return_to_pool(pool, conn)
         state = _log_sqlstate(exc)
+        if state is not None and _is_transient(state):
+            await _close_and_release(pool, conn, None, discard=True)
+            raise _classify_db_error(state, str(exc), connecting=True) from exc
+        await _return_to_pool(pool, conn)
         raise NegativeAckError(
             "database driver refused statement_timeout"
             + (f" [{state}]" if state else f" ({type(exc).__name__})")
@@ -3470,6 +3497,25 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
             permanent=True,
             config_fault=True,
         ) from exc
+
+
+#: Pools already warned that their driver connection has no ``timeout`` (BACKLOG #5756), so the
+#: warning is logged once per pool, not on every borrow.
+_NO_DRIVER_TIMEOUT_WARNED: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+
+
+def _warn_no_driver_timeout(pool: Any) -> None:
+    try:
+        key = _pool_key(pool)
+        if _NO_DRIVER_TIMEOUT_WARNED.get(key):
+            return
+        _NO_DRIVER_TIMEOUT_WARNED[key] = True
+    except TypeError:
+        pass  # an untrackable pool warns on each borrow rather than never
+    logger.warning(
+        "DATABASE: a pooled connection has no driver timeout to set, so its statements run "
+        "with no statement_timeout"
+    )
 
 
 def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:

@@ -387,4 +387,114 @@ def test_the_factories_declare_the_statement_timeout() -> None:
     spec = Database(server="db.example", database="d", statement="SELECT 1", statement_timeout=5)
     assert spec.settings["statement_timeout"] == 5
     poll = DatabasePoll(server="db.example", database="d", poll_statement="SELECT a FROM q")
-    assert poll.settings["statement_timeout"] == DEFAULT_DB_STATEMENT_TIMEOUT
+    assert poll.settings["statement_timeout"] is None  # the connector picks the dialect's default
+
+
+# --- the Manager's repair of 2026-11-16: findings A, B and H -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected"),
+    [
+        ({}, DEFAULT_DB_STATEMENT_TIMEOUT),
+        ({"statement_timeout": None}, DEFAULT_DB_STATEMENT_TIMEOUT),
+        ({"dialect": "generic"}, 0),
+        ({"dialect": "Generic", "statement_timeout": None}, 0),
+        ({"dialect": "generic", "statement_timeout": 5}, 5),
+        ({"dialect": "sqlserver", "statement_timeout": 0}, 0),
+    ],
+)
+def test_an_unset_statement_timeout_takes_the_dialects_default(
+    settings: dict[str, Any], expected: int
+) -> None:
+    """Finding A: psqlODBC is reported to refuse the attribute pyodbc's setter writes, so a
+    default of 30 on the generic dialect would stop every default generic lane. Unset there, the
+    connector sets nothing, as before #5756; a value the operator sets is still applied."""
+    assert database._statement_timeout(settings, "t") == expected
+
+
+class _TimeoutSetterFails(RawConn):
+    """A connection whose driver fails the ``timeout`` write with ``state``."""
+
+    state = "08S01"
+
+    @property
+    def timeout(self) -> int:
+        return 0
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        if value:  # the fake's own __init__ writes 0
+            raise _DriverError(self.state, f"[{self.state}] the stand-in driver failed")
+
+
+class _TimeoutSetterTimesOut(_TimeoutSetterFails):
+    state = "HYT00"
+
+
+@pytest.mark.parametrize("raw_type", [_TimeoutSetterFails, _TimeoutSetterTimesOut])
+async def test_a_transient_setter_failure_retries_and_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, raw_type: type[RawConn]
+) -> None:
+    """Finding B: a class 08 or HYT failure of the write is the connection's, not a refusal of
+    the setting. Before the repair it stopped the lane as a config_fault and lent the handle
+    again."""
+    _aioodbc_serving(monkeypatch, rig, pool_type=_WakingPool, raw_type=raw_type, blocks=never)
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError), caught.value
+    pool = rig.pools[0]
+    assert pool.returned and pool.free == [] and rig.conn.closed
+    assert "execute:start" not in rig.log
+
+
+class _ClosedHandle(Exception):
+    """pyodbc's shape for a closed connection: a message, no SQLSTATE."""
+
+
+class _TimeoutReadFails(RawConn):
+    @property
+    def timeout(self) -> int:
+        raise _ClosedHandle("Attempt to use a closed connection.")
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        pass
+
+
+async def test_a_timeout_read_that_raises_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """Finding H: the read sat outside the try, so a closed handle raised out of the borrow and
+    the connection never went back, a leaked pool slot."""
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_TimeoutReadFails, blocks=never
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError)
+    pool = rig.pools[0]
+    assert pool.returned and pool.free == [] and rig.conn.closed
+
+
+class _NoDriverTimeout(RawConn):
+    @property
+    def timeout(self) -> int:
+        raise AttributeError("timeout")
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        pass
+
+
+async def test_a_driver_with_no_timeout_warns_once_per_pool(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding H: the warning was logged on every borrow."""
+    _aioodbc_serving(monkeypatch, rig, raw_type=_NoDriverTimeout, blocks=never)
+    dest = _destination()
+    with caplog.at_level("WARNING", logger=database.logger.name):
+        for _ in range(3):
+            await dest.send('{"a": 1}')
+    warned = [r for r in caplog.records if "no driver timeout" in r.getMessage()]
+    assert len(warned) == 1
