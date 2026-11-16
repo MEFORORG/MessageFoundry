@@ -14,7 +14,7 @@ import * as path from "path";
 // retargeting promote at an attacker's host, or pointing the CLI at a repo-supplied interpreter). Below,
 // every declared key must be *classified*, and anything that smells like a target must be machine-scoped.
 function pkg(): {
-  capabilities?: { untrustedWorkspaces?: { supported?: unknown } };
+  capabilities?: { untrustedWorkspaces?: { supported?: unknown; restrictedConfigurations?: unknown[] } };
   contributes: { configuration: { properties: Record<string, { scope?: string }> } };
 } {
   const pkgPath = path.join(__dirname, "..", "..", "..", "package.json");
@@ -42,6 +42,16 @@ const REVIEWED_NON_TARGET = [
   "messagefoundry.liveStatus.enabled",
   "messagefoundry.liveStatus.intervalSeconds",
   "messagefoundry.revealViewOnStartup",
+];
+
+/** Window-scoped settings whose WORKSPACE value an untrusted workspace must not supply (BACKLOG
+ *  #5404): the paths the extension reads and writes, and the switch and rate of the live-status poll. */
+const WORKSPACE_RESTRICTED = [
+  "messagefoundry.configDir",
+  "messagefoundry.serviceConfig",
+  "messagefoundry.messageSetsDir",
+  "messagefoundry.liveStatus.enabled",
+  "messagefoundry.liveStatus.intervalSeconds",
 ];
 
 suite("settings scope (SEC-005)", () => {
@@ -112,5 +122,34 @@ suite("caFile is reachable only through a machine-scoped setting (SEC-005, BACKL
 suite("untrusted-workspace capability (SEC-004)", () => {
   test("the extension declares untrustedWorkspaces.supported === 'limited'", () => {
     assert.strictEqual(pkg().capabilities?.untrustedWorkspaces?.supported, "limited");
+  });
+
+  // BACKLOG #5404. "limited" alone leaves every window-scoped setting overridable by an untrusted
+  // workspace's own settings file. VS Code ignores the workspace value of a key named in
+  // restrictedConfigurations until the workspace is trusted, so the keys that name a path the
+  // extension reads or writes, or that switch on network activity, must be listed there.
+  test("an untrusted workspace cannot set a path setting or switch on live status", () => {
+    const restricted = pkg().capabilities?.untrustedWorkspaces?.restrictedConfigurations;
+    assert.ok(Array.isArray(restricted), "untrustedWorkspaces declares no restrictedConfigurations");
+    for (const key of WORKSPACE_RESTRICTED) {
+      assert.ok(restricted.includes(key), `${key} is not in restrictedConfigurations`);
+    }
+    const declared = Object.keys(pkg().contributes.configuration.properties);
+    for (const key of restricted) {
+      assert.ok(declared.includes(String(key)), `restrictedConfigurations names an undeclared key: ${key}`);
+    }
+  });
+
+  test("every window-scoped setting that names a path or turns on polling is restricted", () => {
+    // A family check over the hand list above, as the scope suite does for targets: a new path or
+    // polling setting trips it until someone files it.
+    const smellsLikeAPathOrPoll = /dir|path|config|file|liveStatus|poll|interval/i;
+    const props = pkg().contributes.configuration.properties;
+    const restricted = pkg().capabilities?.untrustedWorkspaces?.restrictedConfigurations ?? [];
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.scope !== "machine" && smellsLikeAPathOrPoll.test(key.replace(/^messagefoundry\./, ""))) {
+        assert.ok(restricted.includes(key), `${key} names a path or polling; restrict it (BACKLOG #5404)`);
+      }
+    }
   });
 });
