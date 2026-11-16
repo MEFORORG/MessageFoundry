@@ -58,12 +58,12 @@ def test_a_narrow_list_restricts(allowlist: Any) -> None:
         ["2001::/32"],  # every Teredo client
         ["::ffff:0:0:0/96"],  # IPv4-translated, every client behind a SIIT translator
         # Not a list of network strings.
-        "10.0.0.0/8",  # iterates as characters, and "1" parses as 0.0.0.1/32
+        "10.0.0.0/8",
         "1",
         b"10.0.0.0/8",
-        {"10.0.0.0/8": True},
-        [5],  # str(5) parses as 0.0.0.5/32
-        [True],
+        {"10.0.0.0/8": True},  # a mapping would read as its keys
+        [5],  # ip_network(5) is 0.0.0.5/32
+        [True],  # ip_network(True) is 0.0.0.1/32
         [None],
     ],
 )

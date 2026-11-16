@@ -162,15 +162,16 @@ def allowlist_restricts(allowlist: Any) -> bool:
     An empty or missing list restricts nobody, and so does an unparseable entry, which cannot be
     shown to restrict anyone.
 
-    **Fail closed on shape** (vault BACKLOG #5393). Only a list, tuple or set counts: a bare string
-    would iterate as characters, and ``"1"`` parses as ``0.0.0.1/32``. Only a string or an
-    :mod:`ipaddress` object counts as an entry, since ``str(5)`` parses too.
+    **Fail closed on shape** (vault BACKLOG #5393). Only a list, tuple or set counts, so a mapping
+    is not read as its keys. Only a string or an :mod:`ipaddress` object counts as an entry, since
+    ``ip_network`` reads the integer ``5`` and ``True`` as host addresses. The gates hand this a
+    list of strings today, so these refusals guard a direct caller.
 
     **An IPv6 entry is also judged by the IPv4 space it embeds.** ``::ffff:0:0/96`` is a /96, far past
     the IPv6 floor, yet a dual-stack listener sees every IPv4 peer inside it. So an entry that
     overlaps a range in :data:`_IPV4_EMBEDDING_RANGES` must leave at least
-    :data:`ALLOWLIST_MIN_PREFIX_V4` bits of the embedded IPv4 address fixed, and one that contains a
-    whole range does not count at all."""
+    :data:`ALLOWLIST_MIN_PREFIX_V4` bits of the embedded IPv4 address fixed, counted from the bit
+    that table names, and one that contains a whole range does not count at all."""
     if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
         return False
     for entry in allowlist:
