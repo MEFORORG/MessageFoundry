@@ -946,7 +946,7 @@ def test_the_runner_reads_the_resolved_budget_not_the_env_reference(value: objec
         intake_auth_rate_limit=env("budget"), intake_auth_rate_limit_global=0
     )
     cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
-    check_intake_budgets(cfg, ic.name)
+    check_intake_budgets(cfg, ic.name, ic.spec.settings)
     assert runner._make_intake_rate_limiter(ic, cfg.settings) is not None
     # Its control: the same wiring with the environment resolving to 0 builds no limiter.
     off = _source_config(ic, "127.0.0.1", {"budget": "0", "k": "synthetic-key"})
@@ -960,9 +960,37 @@ def test_the_runner_refuses_a_resolved_budget_that_is_no_count(value: object) ->
     runner, ic = _budget_runner(intake_auth_rate_limit_global=env("budget"))
     cfg = _source_config(ic, "127.0.0.1", {"budget": value, "k": "synthetic-key"})
     for refuse in (
-        lambda: check_intake_budgets(cfg, ic.name),
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
         lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
     ):
         with pytest.raises(WiringError, match="intake_auth_rate_limit_global") as exc:
             refuse()
         assert "IB_HTTP" in str(exc.value) and str(value) not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("budget", "values"),
+    [(env("budget"), {"budget": ""}), (env("budget", default=None), {})],
+)
+def test_an_env_budget_that_resolves_to_no_value_is_refused(
+    budget: object, values: dict[str, object]
+) -> None:
+    # BACKLOG #5677: a set-but-empty variable, or an unset one whose default= is None, would turn
+    # the brute-force bound off with nobody having written None or 0. Refused, as on main, where
+    # int() raised on it.
+    from messagefoundry.pipeline.wiring_runner import _source_config, check_intake_budgets
+
+    runner, ic = _budget_runner(intake_auth_rate_limit=budget)
+    cfg = _source_config(ic, "127.0.0.1", {**values, "k": "synthetic-key"})
+    assert cfg.settings["intake_auth_rate_limit"] in ("", None)
+    for refuse in (
+        lambda: check_intake_budgets(cfg, ic.name, ic.spec.settings),
+        lambda: runner._make_intake_rate_limiter(ic, cfg.settings),
+    ):
+        with pytest.raises(WiringError, match="intake_auth_rate_limit.*resolved to no value"):
+            refuse()
+    # Its control: a None or 0 written in the config still disables that budget.
+    for literal in (None, 0):
+        runner, ic = _budget_runner(intake_auth_rate_limit=literal)
+        cfg = _source_config(ic, "127.0.0.1", {"k": "synthetic-key"})
+        check_intake_budgets(cfg, ic.name, ic.spec.settings)

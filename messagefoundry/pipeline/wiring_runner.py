@@ -109,6 +109,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import (
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
+    EnvRef,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -2893,8 +2894,9 @@ class RegistryRunner:
             )
         if not self._intake_auth_enabled(ic):
             return None
-        per_peer = _intake_budget(settings, "intake_auth_rate_limit", ic.name)
-        glob = _intake_budget(settings, "intake_auth_rate_limit_global", ic.name)
+        written = ic.spec.settings
+        per_peer = _intake_budget(settings, "intake_auth_rate_limit", ic.name, written)
+        glob = _intake_budget(settings, "intake_auth_rate_limit_global", ic.name, written)
         if not per_peer and not glob:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
@@ -5841,7 +5843,7 @@ class RegistryRunner:
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
         # BACKLOG #5677: the resolved budgets, before the off-loop build below does any TLS work.
-        check_intake_budgets(source_cfg, ic.name)
+        check_intake_budgets(source_cfg, ic.name, ic.spec.settings)
         # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
         # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
         # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
@@ -14039,18 +14041,30 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(created_at))
 
 
-def _intake_budget(settings: Mapping[str, Any], knob: str, name: str) -> int:
+def _intake_budget(
+    settings: Mapping[str, Any], knob: str, name: str, written: Mapping[str, Any]
+) -> int:
     """One intake-auth failed-attempt budget, read from env()-RESOLVED settings (BACKLOG #5677).
 
     Read by :func:`~messagefoundry.transports.base.cap_setting`, the rule every other int cap
-    follows: ``None``, ``""`` and a zero disable the arm, and digit text from an uncast env() is a
-    count. A bool, a fraction or other text is refused there, and a negative here, since a negative
-    budget would refuse every intake request. Refused as a ``WiringError`` naming the connection
-    and the setting, with the value withheld."""
+    follows: ``None`` and a zero disable the arm, and digit text from an uncast env() is a count. A
+    bool, a fraction or other text is refused there, and a negative here, since a negative budget
+    would refuse every intake request. ``written`` is the inbound's settings as configured: where
+    the budget was an env() reference that resolved to ``""`` or ``None`` (a set-but-empty
+    variable, or an unset one with ``default=None``), it is refused too, so only a ``None`` or a
+    zero written in the config, or a zero the environment resolves to, turns the bound off.
+    Refused as a ``WiringError`` naming the connection and the setting, with the value withheld."""
     refusal: str | None = None
     budget: int | None = None
+    value = settings.get(knob)
+    if isinstance(written.get(knob), EnvRef) and (value is None or value == ""):
+        raise WiringError(
+            f"inbound connection {name!r}: HTTP {knob} is an env() reference that resolved to no "
+            "value, which would turn that budget off. Set it to a whole number of failed attempts "
+            "per minute, or write None or 0 to disable that budget"
+        )
     try:
-        budget = cap_setting(settings.get(knob), int, knob=knob, transport="HTTP")
+        budget = cap_setting(value, int, knob=knob, transport="HTTP")
     except ValueError as exc:
         refusal = str(exc)  # withholds the value; raised below, outside this handler
     if refusal is None and budget is not None and budget < 0:
@@ -14063,17 +14077,18 @@ def _intake_budget(settings: Mapping[str, Any], knob: str, name: str) -> int:
     return budget or 0
 
 
-def check_intake_budgets(source: Source, name: str) -> None:
+def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) -> None:
     """Refuse an HTTP inbound whose resolved failed-attempt budgets are no count (BACKLOG #5677).
 
     Run beside :func:`check_http_intake_auth` at start AND in the build check, so `messagefoundry
     check`, promote and a reload's pre-swap check refuse what serve would refuse, before anything
     stops. The ``Http()`` factory checks a literal and an env() ``default=`` at load; this sees the
-    value the environment resolved."""
+    value the environment resolved; ``written`` is the inbound's configured settings, which say
+    whether a budget was an env() reference."""
     if source.type is not ConnectorType.HTTP:
         return
     for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
-        _intake_budget(source.settings, knob, name)
+        _intake_budget(source.settings, knob, name, written)
 
 
 def _source_config(
@@ -14703,7 +14718,7 @@ def _build_check_connectors(
         # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
         # would leave this gate weaker at check time than every posture-keyed neighbour.
         check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
-        check_intake_budgets(source_cfg, ic.name)  # BACKLOG #5677, as at start
+        check_intake_budgets(source_cfg, ic.name, ic.spec.settings)  # BACKLOG #5677, as at start
         build_source(source_cfg, egress=egress)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a

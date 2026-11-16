@@ -385,8 +385,9 @@ def test_the_setting_is_refused_with_the_per_peer_budget_off(per_peer: int | Non
 def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
     knob: str, budget: object
 ) -> None:
-    """The runner reads each budget with ``int()``, so 0.5 passed the truthiness test and turned
-    that arm off. Red on b6ed93ab18, which tested only truthiness."""
+    """With trusted_proxies set, each budget must be a whole number of at least 1 written in the
+    config, so neither arm can be off. Once read with ``int()``, 0.5 passed the truthiness test and
+    turned that arm off. Red on b6ed93ab18, which tested only truthiness."""
     knobs: dict[str, Any] = {knob: budget}
     with pytest.raises(WiringError, match=f"{knob} is not an integer of at least 1") as exc:
         Http(
