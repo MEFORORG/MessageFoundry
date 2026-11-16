@@ -4555,8 +4555,9 @@ class AuthService:
 
         A constant, never the bucket's own wait (owner ruling 2026-10-20). The sign-in surface is
         unauthenticated, and callers behind one address share a bucket, so an exact wait would tell
-        one of them when another's oldest attempt was made. The whole window is an estimate, and it
-        can be early: another caller's charge can refill the bucket or the global window meanwhile,
+        one of them when another's oldest attempt was made. The whole window is that constant, not
+        a promise of admission, and it can be early: another caller's charge can refill the bucket
+        or the global window meanwhile,
         and a paid passkey sign-in POST re-stamps its begin leg's hit to now
         (:meth:`SlidingWindowRateLimiter.renew`), so the bucket or window it lands in can still be
         full when the window has passed (docs/SECURITY.md, *The combined passkey sign-in*). The

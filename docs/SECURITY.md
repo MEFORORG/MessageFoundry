@@ -793,7 +793,7 @@ can refill the bucket or the global window meanwhile, and [WebAuthn
 passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*, states one more
 case. Before this, the PHI-read `429` sent a literal `10` and
 `POST /ui/login` a literal `30`, each against a default 60 s window, so a client that honoured
-either could have retried too early. The routes that send no `Retry-After`
+either could have retried too early even with no other charge. The routes that send no `Retry-After`
 are unchanged; the [Route → limiter map](#route--limiter-map) names them.
 
 **The console's refusal differs from the JSON floor's.** `require_ui` writes no WARNING line naming
@@ -4166,32 +4166,34 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 2) first, then stages an assertion challenge with **no username and an empty `allowCredentials`
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
-and the assertion together. **How control 2 counts that POST is stated here, once** (BACKLOG
-#3937); every other place that mentions it points here. `POST /ui/login` pops the challenge its handle
-cookie names on arrival, whatever the outcome, before it consults the sign-in limiter. The POST is
-**paid** when that pop finds the challenge still staged and the begin leg's hit still in the
-window. A paid POST passes control 2 without the limiter consulting or charging either dimension,
-per address or global, for it, so it passes even while the limiter is refusing the POST's own
-address or the global ceiling is full, and the POST's own address is not charged. Instead the begin
-leg's hit is re-stamped to now, counting no new attempt: in the begin leg's per-address bucket
-where per-address buckets are kept, and in the global window where the global budget is on. That
-bucket is the one the begin leg was charged under, keyed by its limiter key, which folds some
-spellings of an address together: at least every loopback form is one key and an IPv4-mapped
-address is its plain IPv4 form, and a request with no address is `"unknown"`. So where the two legs' addresses fold to different keys, the hit stays
-under the begin leg's key, not the POST's. With `login_rate_limit_per_ip = 0` no per-address
-bucket exists, and the global window alone holds the hit. One passkey sign-in thus costs one unit
-of control 2, as a password sign-in does, counted from the moment it is spent, so a begin leg's
-hit cannot be spent in a later window. A caller holding only the handle cookie spends the begin
-leg's hit instead of one of its own, and a caller holding both addresses gains no attempt. A POST
-that is not paid is charged like any other request: one whose begin leg's hit has aged out (a
-challenge outlives the window, 120 seconds against 60 by default), one whose handle finds nothing
-staged, such as a forged, expired, evicted or already taken one, or one staged before a restart or
-by another API process, and a POST with no handle. A re-stamp moves a hit later, so the bucket or
-global window it lands in can still be full when the whole-window `Retry-After` a refused caller
-was sent has passed. The POST also pops the challenge, so a later POST of the begin leg's own ceremony finds none:
-it is charged like a request with no staged challenge, and if it reaches the verify on an account
-holding a discoverable passkey under the request's `rp_id`, its assertion fails and the refusal
-counts on that account's sign-in counter. The path
+and the assertion together. **How control 2 counts that POST is stated here** (BACKLOG #3937);
+the limiter paragraphs and rows elsewhere in this document and in CONFIGURATION.md point here.
+Once the route runs and its same-origin and configured-authentication checks pass, it pops the
+challenge its handle cookie names, whatever the sign-in's outcome, before it consults the sign-in
+limiter. The POST is **paid** when that pop finds the challenge still staged and the begin leg's
+hit still in the window. A paid POST passes control 2 without the limiter checking room in, or
+charging, either dimension, per address or global, for it, so it passes even while the limiter is
+refusing the POST's own address or the global ceiling is full, and the POST's own address is not
+charged. Instead the begin leg's hit is re-stamped to now, counting no new attempt: in the begin
+leg's per-address bucket where per-address buckets are kept, and in the global window where the
+global budget is on. That bucket is the one the begin leg was charged under, keyed by its limiter
+key, which folds some spellings of an address together: at least every loopback form, IPv4-mapped
+ones included, is one key, any other IPv4-mapped address is its plain IPv4 form, and a request
+with no address is `"unknown"`. So where the two legs' addresses fold to different keys, the hit
+stays under the begin leg's key, not the POST's. With `login_rate_limit_per_ip = 0` no per-address
+bucket exists to hold it, and with `login_rate_limit_global = 0` no global window does. The hit is
+counted once, so a caller holding both addresses gains no attempt, and a caller holding only the
+handle cookie spends the begin leg's hit instead of one of its own. It is held from the begin leg
+until a full window after the POST, so a begin leg's hit cannot be spent in a later window, and the
+begin leg's bucket and the global window carry it for up to almost two windows where a password
+sign-in's hit is carried for one. The POSTs that are not paid are charged like any other request,
+at least one whose begin leg's hit has aged out (a challenge outlives the window, 120 seconds
+against 60 by default), one whose handle finds nothing staged, such as a forged, expired, evicted
+or already taken one, or one staged before a restart or by another API process, and a POST with no
+handle. A re-stamp moves a hit later, so the bucket or global window it lands in can still be full
+when the whole-window `Retry-After` a refused caller was sent has passed. The POST also pops the
+challenge, so a later POST of the begin leg's own ceremony finds none, and is charged like a
+request with no staged challenge. The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
@@ -7146,8 +7148,8 @@ option E, owner ruling 2026-09-27.* (3) A holder of one factor can hold a local 
 denial lever**: 60 attempts a minute across all clients refuse every sign-in on the engine, the
 owner's combined sign-in included, except a paid passkey sign-in POST ([WebAuthn
 passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*), so a username-only
-caller can still keep a TOTP-enrolled owner
-out, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
+caller can still keep a TOTP-enrolled owner out, or a passkey owner, whose begin leg the full
+ceiling refuses, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
 requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27.* (5) The owner's own typos
 can reach the escalating second-step lock: a combined sign-in with one factor wrong counts there,
 including a code that missed its 30-second step or was already used. *Named after the ruling;
