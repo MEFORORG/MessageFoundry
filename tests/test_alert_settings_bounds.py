@@ -29,7 +29,7 @@ _NON_FINITE = [math.inf, -math.inf, math.nan]
 @pytest.mark.parametrize("value", [*_NON_FINITE, 0.0, -1.0, _ALERT_SEND_TIMEOUT_MAX_SECONDS + 1])
 def test_a_send_timeout_out_of_range_is_refused(field: str, value: float) -> None:
     with pytest.raises(ValidationError, match=field):
-        AlertsSettings(**{field: value})
+        AlertsSettings.model_validate({field: value})
 
 
 @pytest.mark.parametrize("value", [*_NON_FINITE, -1.0, _ALERT_COOLDOWN_MAX_SECONDS + 1])
@@ -57,7 +57,7 @@ def test_an_smtp_port_out_of_range_is_refused(value: int) -> None:
     ],
 )
 def test_in_range_alert_settings_load(kwargs: dict[str, Any]) -> None:
-    AlertsSettings(**kwargs)
+    AlertsSettings.model_validate(kwargs)
 
 
 @pytest.mark.parametrize("value", [*_NON_FINITE, 0.0, _ALERT_COOLDOWN_MAX_SECONDS + 1])

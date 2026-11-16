@@ -49,7 +49,12 @@ def _sink(store: Any) -> tuple[NotifierAlertSink, list[dict[str, Any]], _Control
     )
     sink = NotifierAlertSink([], rules=[rule], store=store, realert_seconds=3600.0)
     pages: list[dict[str, Any]] = []
-    sink._enqueue = lambda event, **_kw: pages.append(event)  # type: ignore[method-assign]
+
+    def record(event: dict[str, Any], *, dropped: str | None) -> bool:
+        pages.append(event)
+        return True
+
+    setattr(sink, "_enqueue", record)  # noqa: B010 - an instance attribute shadows the method
     control = _Control()
     sink.set_control_callback(control)
     return sink, pages, control
