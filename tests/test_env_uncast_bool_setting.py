@@ -164,8 +164,27 @@ _LITERAL_CASES = [
         "from messagefoundry.transports.smart import with_smart_backend\n"
         "outbound('OB_X', with_smart_backend(Rest(url='https://partner.example.org/in'), "
         "token_url='https://t', client_id='c', private_key='k', enabled=None))\n",
-        "outbound connection 'OB_X': setting 'smart_enabled' must be true or false, not NoneType",
+        "outbound connection 'OB_X': setting 'smart_enabled' must be true or false, not NoneType"
+        " (the key with_smart_backend(enabled=) writes)",
         id="composer-none",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "from messagefoundry.transports.http_auth import with_oauth2_client_credentials\n"
+        "outbound('OB_X', with_oauth2_client_credentials(Rest(url='https://partner.example.org/in'),"
+        " token_url='https://t', client_id='c', client_secret='s', enabled=None))\n",
+        "outbound connection 'OB_X': setting 'oauth2_enabled' must be true or false, not NoneType"
+        " (the key with_oauth2_client_credentials(enabled=) writes)",
+        id="oauth2-composer-none",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "from messagefoundry.transports.signing import with_signing\n"
+        "outbound('OB_X', with_signing(Rest(url='https://partner.example.org/in'), "
+        "private_key='k', enabled=None))\n",
+        "outbound connection 'OB_X': setting 'sign_enabled' must be true or false, not NoneType"
+        " (the key with_signing(enabled=) writes)",
+        id="signing-composer-none",
     ),
     pytest.param(
         "from messagefoundry import Rest, outbound\n"
@@ -273,6 +292,130 @@ def test_a_literal_none_or_bool_loads_and_none_reads_as_the_setting_default(tmp_
     reg = load_config(tmp_path, allow_empty=True)
     assert bool_setting(_dest(reg, "OB_R", {}), "verify_tls", default=True) is True
     assert _dest(reg, "OB_M", {})["persistent"] is False
+
+
+def test_a_lookup_encrypt_none_loads_and_reads_as_on(tmp_path: Path) -> None:
+    # A database lookup's encrypt has one default, on, on every factory, so None is that default.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import DatabaseLookup\n"
+        "DatabaseLookup('clar', server='db.example.org', database='d', encrypt=None)\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    assert bool_setting(reg.lookups["clar"].settings, "encrypt", default=True) is True
+
+
+def test_every_bad_literal_on_one_connection_is_named_in_one_error(tmp_path: Path) -> None:
+    # One error per connection, not one per bad literal: the author fixes them in one pass.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, persistent='false', no_ack='no'))\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    msg = str(ei.value)
+    assert "setting 'persistent' must be true or false, not str" in msg
+    assert "setting 'no_ack' must be true or false, not str" in msg
+    assert msg.count("outbound connection 'OB_X'") == 1
+    # A problem can hold a ";" before its remedy, so problems are split by a separator none holds.
+    assert len(msg.split(" | ")) == 2
+
+
+@pytest.mark.parametrize("value", ["'yes'", "'false'"])
+def test_a_hop_flag_literal_past_its_factory_is_not_told_to_use_env(
+    tmp_path: Path, value: str
+) -> None:
+    # A hop-policy flag refuses env() (refuse_unresolved_hop_flags), so its refusal must not advise
+    # one; it gets the hop flags' own remedy. No reader takes a quoted false on it as true, so the
+    # quoted-false hint would be untrue there.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        "spec = FhirLookup('epic', url='https://fhir.example.org/fhir')\n"
+        f"spec.settings['tls_hop_attested'] = {value}\n",
+        encoding="utf-8",
+    )
+    messages = [d.message for d in wiring.validate_config(tmp_path, allow_empty=True)]
+    (msg,) = [m for m in messages if "setting 'tls_hop_attested'" in m]
+    assert "fhir lookup 'epic': setting 'tls_hop_attested' must be true or false, not str" in msg
+    assert "(write a literal True or False)" in msg
+    assert "env() reference" not in msg
+    assert _QUOTED_FALSE_HINT not in msg
+
+
+_RAW_HOP_MODULES = {
+    "outbound": "from messagefoundry import Rest, outbound\n"
+    "spec = Rest(url='https://partner.example.org/in')\n"
+    "spec.settings['tls_hop_attested'] = {value}\n"
+    "outbound('OB_X', spec)\n",
+    "inbound": "from messagefoundry import MLLP, inbound\n"
+    "spec = MLLP(port=0)\n"
+    "spec.settings['tls_hop_attested'] = {value}\n"
+    "inbound('IB_X', spec, router='r')\n",
+}
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+@pytest.mark.parametrize("value", ["'yes'", "1", "True"])
+def test_a_raw_hop_attestation_in_transport_settings_gets_its_own_refusal(
+    tmp_path: Path, value: str, direction: str
+) -> None:
+    # The raw-key refusal names the declaration that should carry it. A non-bool value used to get
+    # the generic bool refusal first, which sent the author to fix the value instead of moving it.
+    # True is the control: it was always refused as a raw key.
+    (tmp_path / "cfg.py").write_text(
+        _RAW_HOP_MODULES[direction].format(value=value), encoding="utf-8"
+    )
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    msg = str(ei.value)
+    assert "tls_hop_attested is not a transport setting" in msg
+    assert "must be true or false" not in msg
+
+
+_FACTORY_CASES = [
+    pytest.param(
+        "from messagefoundry import DICOMweb, outbound\n"
+        "outbound('OB_X', DICOMweb(url='https://pacs.example.org/dicomweb', verify_tls=0, "
+        "tls_ca_file='ca.pem'))\n",
+        "DICOMweb: setting 'verify_tls' must be true or false, not int",
+        id="dicomweb-verify-tls-int",
+    ),
+    pytest.param(
+        "from messagefoundry import MLLP, inbound\n"
+        "inbound('IB_X', MLLP(port=0, tls=0, tls_ca_file='ca.pem', "
+        "tls_client_subjects={'CN=Acme CA': ['CN:partner']}), router='r')\n",
+        "MLLP: setting 'tls' must be true or false, not int",
+        id="mllp-tls-int",
+    ),
+    pytest.param(
+        "from messagefoundry import Http, inbound\n"
+        "inbound('IB_X', Http(port=0, tls=0, tls_ca_file='ca.pem', intake_auth='mtls_subject', "
+        "intake_client_subjects={'CN=Acme CA': ['CN:partner']}), router='r')\n",
+        "Http: setting 'tls' must be true or false, not int",
+        id="http-tls-int",
+    ),
+    pytest.param(
+        # The control: with no check in the factory reading it, the declaration refuses the flag
+        # and names the connection.
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, tls=0))\n",
+        "outbound connection 'OB_X': setting 'tls' must be true or false, not int",
+        id="mllp-tls-int-no-subjects",
+    ),
+]
+
+
+@pytest.mark.parametrize(("module", "says"), _FACTORY_CASES)
+def test_a_factory_refuses_a_non_bool_flag_before_its_own_checks_read_it(
+    tmp_path: Path, module: str, says: str
+) -> None:
+    # A check inside the factory read the flag by truthiness first, so 0 was refused with an error
+    # about the flag's effect (verification off, or "needs tls=True").
+    (tmp_path / "cfg.py").write_text(module, encoding="utf-8")
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    assert says in str(ei.value)
 
 
 @pytest.mark.parametrize(("value", "want"), [(None, True), (False, False), (True, True)])
@@ -448,6 +591,7 @@ def test_every_composer_bool_parameter_writes_a_listed_key() -> None:
     params = _composer_bool_params()
     assert params, "the census found no composer flag, so it is reading nothing"
     written: set[str] = set()
+    writers: dict[str, set[str]] = {}
     for module, composer, param in params:
         fn = getattr(importlib.import_module(module), composer)
         default = inspect.signature(fn).parameters[param].default
@@ -459,7 +603,13 @@ def test_every_composer_bool_parameter_writes_a_listed_key() -> None:
         )
         (key,) = [k for k in on.settings if on.settings[k] != off.settings.get(k)]
         written.add(key)
+        # The refusal names the key "<composer>(enabled=) writes", so the parameter is enabled=.
+        writers.setdefault(key, set()).add(f"{composer}({param}=)")
     assert written == set(_COMPOSER_BOOL_SETTINGS)
+    # One writer per key, compared as sets so a second writer fails on every run.
+    assert writers == {
+        key: {f"{composer}(enabled=)"} for key, composer in wiring._COMPOSER_OF_BOOL_SETTING.items()
+    }
     assert {key: _bool_settings().defaults[key] for key in written} == _COMPOSER_BOOL_SETTINGS
 
 
