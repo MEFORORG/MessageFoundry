@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import __main__ as cli
-from messagefoundry.config.settings import ServiceSettings, load_settings
+from messagefoundry.config.settings import ServiceSettings, SyslogProtocol, load_settings
 from messagefoundry.logging_setup import SyslogForward
 from tests._log_absence import assert_capture_sees
 
@@ -86,12 +86,11 @@ def _start(
     return rc, recorder.seen
 
 
+_HOP_AUDIT_PREFIX = "AUDIT: off-box log/audit forwarding"
+
+
 def _hop_audit(seen: list[tuple[str, bool]]) -> list[bool]:
-    return [
-        after
-        for message, after in seen
-        if message.startswith("AUDIT: off-box log/audit forwarding")
-    ]
+    return [after for message, after in seen if message.startswith(_HOP_AUDIT_PREFIX)]
 
 
 def test_hop_audit_is_logged_once_after_configure(
@@ -101,7 +100,7 @@ def test_hop_audit_is_logged_once_after_configure(
     assert rc is None
     assert _hop_audit(seen) == [True]
     # The record states the posture the start accepted, not that a record crossed.
-    assert "crosses the network unprotected on a PHI instance, over UDP with no" in next(
+    assert "crosses the network unprotected, in cleartext over UDP" in next(
         m for m, _ in seen if "AUDIT:" in m
     )
     err = capsys.readouterr().err
@@ -263,3 +262,46 @@ def test_a_refusal_on_an_empty_root_reaches_stderr_through_the_filtered_last_res
     assert rc == 2
     err = capsys.readouterr().err.splitlines()
     assert len([line for line in err if "AUDIT: the posture line" in line]) == 1
+
+
+def _with_protocol(protocol: SyslogProtocol, *, verify: bool = True) -> ServiceSettings:
+    settings = _listed()
+    return settings.model_copy(
+        update={
+            "logging": settings.logging.model_copy(
+                update={"forward_protocol": protocol, "forward_tls_verify": verify}
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("protocol", "verify", "how"),
+    [
+        (SyslogProtocol.UDP, True, "unprotected, in cleartext over UDP with no connection needed."),
+        (SyslogProtocol.TCP, True, "unprotected, in cleartext over TCP."),
+        (
+            SyslogProtocol.TLS,
+            False,
+            "encrypted, but to a collector whose certificate is not verified",
+        ),
+    ],
+)
+def test_hop_audit_names_how_each_protocol_crosses(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    protocol: SyslogProtocol,
+    verify: bool,
+    how: str,
+) -> None:
+    # WARN is reached for plaintext udp and tcp and for tls with verification off; the AUDIT line
+    # and the stderr warning name the transport this start accepted, not always UDP.
+    rc, seen = _start(_with_protocol(protocol, verify=verify), tmp_path)
+    assert rc is None
+    (audit,) = [m for m, _ in seen if m.startswith(_HOP_AUDIT_PREFIX)]
+    assert how in audit
+    assert how in capsys.readouterr().err
+    if protocol is not SyslogProtocol.UDP:
+        # The control: the UDP clause is not carried onto a hop that is not UDP.
+        assert "UDP" not in audit
+        assert "no connection needed" not in audit

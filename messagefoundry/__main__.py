@@ -2217,8 +2217,10 @@ def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) 
     the lines reach the handlers and the forwarder (BACKLOG #1989). A warn-mode refusal too.
 
     The audit lines go through :func:`_write_start_audit`, so ``[logging].level`` does not filter
-    them, as it does not filter the start's other AUDIT lines (BACKLOG #5391). The warn-mode
-    refusal is an ordinary WARNING, which that level governs."""
+    them (BACKLOG #5391). That is not true of every AUDIT line the start writes: the ones ``serve``
+    logs after configure through ``logger.warning``, at least five that
+    :func:`_write_start_audit` counts, still pass through the configured level, which filters them.
+    The warn-mode refusal is an ordinary WARNING, which that level governs too."""
     if outcome is None:
         return
     _write_start_audit(list(outcome.audit))
@@ -2370,13 +2372,24 @@ def _start_logging_gates(
     _hop_warning: str | None = None
     if log_forward is not None:
         _forward_hop = forward_hop_disposition(settings.logging, _forward_posture)
-        # Name WHY the hop is unprotected: a plaintext protocol, or tls with verification opted out
-        # (encrypted but unauthenticated => MITM-able). Both land on the gradient.
-        _forward_why = (
-            "certificate verification is disabled (forward_tls_verify=false)"
-            if settings.logging.forward_protocol is SyslogProtocol.TLS
-            else f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
+        # Name WHY the hop is unprotected and HOW each record crosses it, per protocol: WARN is
+        # reached for plaintext udp and tcp and for tls with verification opted out (encrypted but
+        # unauthenticated => MITM-able), so the text names the transport this start accepted.
+        _forward_plain = (
+            f"forward_protocol={settings.logging.forward_protocol.value!r} is plaintext"
         )
+        _forward_why, _forward_how = {
+            SyslogProtocol.UDP: (
+                _forward_plain,
+                "unprotected, in cleartext over UDP with no connection needed",
+            ),
+            SyslogProtocol.TCP: (_forward_plain, "unprotected, in cleartext over TCP"),
+            SyslogProtocol.TLS: (
+                "certificate verification is disabled (forward_tls_verify=false)",
+                "encrypted, but to a collector whose certificate is not verified, so a host in "
+                "the path can pose as the collector and read it",
+            ),
+        }[settings.logging.forward_protocol]
         if _forward_hop is HopDisposition.REFUSE:
             print(
                 "error: [logging] off-box forwarding to "
@@ -2399,9 +2412,8 @@ def _start_logging_gates(
             # here refuses the start, since no record would take the hop then (BACKLOG #5390).
             _hop_warning = (
                 f"off-box log/audit forwarding to {settings.logging.forward_host}:"
-                f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so every "
-                "record forwarded there crosses the network unprotected on a PHI instance, over UDP "
-                "with no connection needed. Set "
+                f"{settings.logging.forward_port} is NOT a verified-TLS hop ({_forward_why}), so on a PHI "
+                f"instance every record forwarded there crosses the network {_forward_how}. Set "
                 "[logging].forward_protocol='tls' with forward_tls_ca_file and forward_tls_crl_file "
                 "(ADR 0080) to a collector on another host."
             )

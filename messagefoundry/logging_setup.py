@@ -1100,8 +1100,8 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
     filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling's AUDIT record,
-    which ``serve`` and ``supervise`` write after ``configure_logging`` through a path no level
-    filters (``__main__._write_start_audit``, BACKLOG #5390, #5391), with a stderr warning at the
+    which ``serve`` and ``supervise`` write after ``configure_logging`` through a path ``[logging].level``
+    does not filter (``__main__._write_start_audit``, BACKLOG #5390, #5391), with a stderr warning at the
     decision.
     The REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
