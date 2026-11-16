@@ -999,7 +999,13 @@ SITES: dict[str, Site] = {
         2, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),
     "messagefoundry/transports/remotefile.py::RemoteFileSource.__init__": Site(
-        2, OPERATOR, "The operator's processed and error subdirectory settings."
+        1, OPERATOR, "The operator's error subdirectory setting."
+    ),
+    "messagefoundry/transports/remotefile.py::_remote_processed_dir": Site(
+        2,
+        OPERATOR,
+        "The operator's processed subdirectory setting, refused when it names the poll directory "
+        "or one above it (BACKLOG #5682).",
     ),
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"

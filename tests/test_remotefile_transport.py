@@ -722,38 +722,56 @@ async def test_source_utf16_drop_is_sniffed_through_its_encoding(
     assert h.bodies, "the drop was quarantined"
 
 
-async def test_source_leave_failed_ledger_write_is_retried_not_cached(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_source_leave_failing_ledger_hands_each_file_over_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # BACKLOG #5685: the durable ledger write goes before the seen cache. Red on the unfixed code:
-    # the key was cached first, so after a failed write the next poll skipped the file on the cache
-    # and the ledger never got its row, which a restart would then read as never ingested.
-    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
+    # BACKLOG #5685. Red on 896db80ea9: the failed write escaped before the key was cached, so every
+    # poll aborted at the first file and handed it over again. Now the failure is logged, the key is
+    # cached for this process, and the poll goes on to the next file.
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/b.hl7": b"MSH|^~\\&|B"})
     src = _src(monkeypatch, client, after_read="leave")
     ledger = _FakeLedger()
-    real_mark = ledger.mark_processed
-    fail = [True]
 
     async def mark(file_key: str) -> None:
-        if fail[0]:
-            raise OSError("synthetic ledger write failure")
-        await real_mark(file_key)
+        raise OSError("synthetic ledger write failure")
 
     ledger.mark_processed = mark  # type: ignore[method-assign]
     src.processed_ledger = ledger
     h = _RecordingHandler()
     src._handler = h
     await _settle(src)
-    with pytest.raises(OSError):
+    for _ in range(3):
         await src._poll_once()
-    assert len(src._processed_seen) == 0, "a failed ledger write must leave nothing cached"
-    fail[0] = False
-    await _settle(src)  # the read file must settle again from a fresh sighting (BACKLOG #2071)
-    await src._poll_once()
-    assert h.bodies == [b"MSH|^~\\&|A", b"MSH|^~\\&|A"]  # handed over again (at-least-once)
-    assert len(ledger.keys) == 1, "the retry recorded the file durably"
-    await src._poll_once()
-    assert len(h.bodies) == 2, "once recorded, it is not read again"
+    assert sorted(h.bodies) == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"], "each handed over exactly once"
+    assert len(ledger.keys) == 0
+    assert "processed-ledger write failed (OSError)" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["", "  ", ".", "./", "..", "a/..", "a/../..", "../in"])
+def test_source_processed_subdir_at_or_above_the_poll_dir_is_refused(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # Red on 896db80ea9: each was accepted, and a "moved" file stayed where the next poll lists it.
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+
+
+@pytest.mark.parametrize("value", ["/", "/in", "/in/x/.."])
+def test_source_absolute_processed_subdir_at_or_above_the_poll_dir_is_refused(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(".done", "/in/.done"), ("a/../b", "/in/a/../b"), ("/arch", "/arch")]
+)
+def test_source_processed_subdir_below_or_beside_the_poll_dir_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+) -> None:
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+    assert src._processed_dir == expected
 
 
 async def test_source_leave_untagged_ledger_row_still_skips(

@@ -1298,7 +1298,11 @@ its own policy block below):
   type** before its bytes reach the pipeline: an `hl7v2` drop (the default, and how an inbound that
   declares nothing is treated) must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`, after an
   optional UTF-8 BOM / MLLP start byte / leading whitespace), and each other structured type must lead
-  with its own format signature. A file whose content **contradicts** its declaration — a PDF on a
+  with its own format signature. The sniff reads the file's raw bytes first. Only when they fail, and
+  only for a type that is not binary (`binary`, `dicom`) on an `encoding` that does not spell the
+  signatures as ASCII, such as `utf-16` or `utf-32`, it reads again the file's first 64 KiB decoded
+  with that `encoding`, so such a drop is not refused for its byte order mark and NULs (BACKLOG
+  #5684, `_content_matches_encoded` in `transports/file.py`). A file whose content **contradicts** its declaration — a PDF on a
   `json` inbound, a headerless body on an `hl7v2` one — is rejected on **content, not extension**
   (ASVS 5.2.2). It is a declared-type **conformance** check, not an HL7-only gate: an inbound declaring
   a non-HL7 `content_type` bypasses HL7 handling entirely and its exact bytes reach the

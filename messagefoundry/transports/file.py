@@ -806,15 +806,23 @@ def _decoded_sniff_head(raw: bytes, encoding: str) -> bytes:
     file. Only the first ``_SNIFF_DECODE_MAX`` bytes are decoded, in one ``bytes.decode`` as the
     runner decodes, so a large file is not decoded whole here. The text goes back to the sniff as
     UTF-8 bytes, so the sniff strips exactly the leading noise it strips from a UTF-8 file (a
-    decoded BOM is a UTF-8 BOM again), and the same text gets the same verdict on either encoding.
-    A character cut at the edge, an undecodable byte or a lone surrogate becomes a replacement,
+    decoded BOM is a UTF-8 BOM again). The same text usually gets the same verdict on either
+    encoding, but not always: the bound is in bytes, so it holds fewer characters of a wider
+    encoding, and text whose magic sits behind more than about 32K leading whitespace characters can
+    be admitted as UTF-8 and refused as UTF-16. A character cut at the edge, an undecodable byte or a lone surrogate becomes a replacement,
     which no magic matches. A codec that refuses the bytes or the error handler outright yields an
     empty head, which matches nothing either."""
     try:
         text = raw[:_SNIFF_DECODE_MAX].decode(encoding, errors="replace")
-    except (LookupError, UnicodeError):
+    except (LookupError, UnicodeError) as exc:
         # No such codec (config load refuses one), or one that refuses the bytes or the error
-        # handler: nothing decodes, so nothing matches.
+        # handler: nothing decodes, so nothing matches. Logged without the bytes.
+        logger.debug(
+            "file content sniff: encoding %r refused the decode (%s); the drop matches nothing "
+            "decoded",
+            encoding,
+            type(exc).__name__,
+        )
         return b""
     return text.encode("utf-8", errors="replace")
 
@@ -824,7 +832,13 @@ def _reads_as_ascii(encoding: str) -> bool:
     """Whether ``encoding`` spells the sniff's noise and magics as ASCII, a UTF-8 BOM aside."""
     try:
         spelled = _SNIFF_PROBE.encode(encoding)
-    except (LookupError, UnicodeError):
+    except (LookupError, UnicodeError) as exc:
+        # Cached, so logged once per encoding name.
+        logger.debug(
+            "file content sniff: encoding %r cannot spell the sniff probe (%s); it is read decoded",
+            encoding,
+            type(exc).__name__,
+        )
         return False
     return spelled.removeprefix(codecs.BOM_UTF8) == _SNIFF_PROBE.encode("ascii")
 
@@ -1775,10 +1789,22 @@ class FileSource(SourceConnector):
     async def _leave_record(self, file_key: str) -> None:
         """Mark a leave-in-place file ingested: the durable ledger (a HASHED key, no cleartext filename)
         plus the bounded in-process cache. Idempotent on the store side. The ledger goes first, so a
-        failed write leaves no cached key to short-circuit the ledger read and the file is handed
-        over again rather than never recorded durably (BACKLOG #5685, as the remote source)."""
+        crash between the two leaves no cached key ahead of a durable row (BACKLOG #5685, as the
+        remote source). A ledger write that fails is logged, without the key or the file name, and
+        the key is still cached: the file is then handed over at most once in this process, and the
+        rest of the scan goes on, rather than the file being handed over again on every scan while
+        the ledger stays broken. With no durable row, a restart or a cache eviction hands it over
+        once more, which at-least-once allows."""
         if self.processed_ledger is not None:
-            await self.processed_ledger.mark_processed(file_key)
+            try:
+                await self.processed_ledger.mark_processed(file_key)
+            except Exception as exc:  # noqa: BLE001 -- any store fault; the scan must go on
+                logger.warning(
+                    "file source %s: processed-ledger write failed (%s); the file is remembered "
+                    "for this process only",
+                    self.directory,
+                    type(exc).__name__,
+                )
         self._seen_add(file_key)
 
     async def _emit(self, raw: bytes) -> bool:

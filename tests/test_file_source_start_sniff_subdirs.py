@@ -308,15 +308,38 @@ class _FailingLedger:
         return None
 
 
-async def test_a_failed_leave_ledger_write_leaves_no_cached_key(tmp_path: Path) -> None:
-    """Red on the unfixed code: the key was cached before the write, so it stayed cached."""
+async def test_a_persistently_failing_leave_ledger_hands_each_file_over_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on 896db80ea9: the key was cached only after a successful write and the failure escaped,
+    so every scan aborted at the first file and handed it over again, and the second file was never
+    reached. Now the failure is logged, the key cached, and the scan goes on (BACKLOG #5685)."""
+    (tmp_path / "a.hl7").write_bytes(_HL7.encode())
+    (tmp_path / "b.hl7").write_bytes(_HL7.replace("CTL5684", "CTL5685").encode())
     src = _source(tmp_path, after_read="leave")
     ledger = _FailingLedger()
     src.processed_ledger = ledger
-    with pytest.raises(OSError):
-        await src._leave_record("fk1:" + "0" * 64)
-    assert "fk1:" + "0" * 64 not in src._processed_seen
-    ledger.fail = False
+    rec = _Recorder()
+    src._handler = rec
+    src._prepare_subdirs()
+    for _ in range(4):
+        await src._scan_once()
+    assert len(rec.bodies) == 2, "each drop handed over exactly once in this process"
+    assert ledger.keys == set()
+    assert "processed-ledger write failed (OSError)" in caplog.text
+    assert "CTL568" not in caplog.text, "no body in the log"
+
+
+async def test_a_successful_leave_ledger_write_comes_before_the_cache(tmp_path: Path) -> None:
+    src = _source(tmp_path, after_read="leave")
+    seen_when_written: list[bool] = []
+
+    class _Ledger(_FailingLedger):
+        async def mark_processed(self, file_key: str) -> None:
+            seen_when_written.append(file_key in src._processed_seen)
+            self.keys.add(file_key)
+
+    src.processed_ledger = _Ledger()
     await src._leave_record("fk1:" + "0" * 64)
-    assert ledger.keys == {"fk1:" + "0" * 64}
+    assert seen_when_written == [False]
     assert "fk1:" + "0" * 64 in src._processed_seen
