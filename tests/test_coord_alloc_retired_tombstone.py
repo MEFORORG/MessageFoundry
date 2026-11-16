@@ -296,6 +296,32 @@ def test_the_tombstone_refuses_to_overwrite_a_real_record(tmp_path: Path) -> Non
     assert occupied.returncode == 2, occupied.stdout + occupied.stderr
 
 
+def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5492. Every stale copy predates the shared root and reads only the LOCAL registry, so
+    with a shared root configured the tombstone must land there as well, and -Check must report
+    ABSENT while the local copy is missing. The root is a temp directory, never a real one."""
+    repo = _stale_clone(tmp_path, _stale_alloc(_STALE_REVISIONS["4c68c28eb-blob"]))
+    _seed_registry(repo, [1769, 1771])
+    shared = tmp_path / "shared-root"
+    shared.mkdir()
+    # Every pwsh child inherits it; the stale copy ignores it, as a real one would.
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
+
+    wrote = _tombstone(repo)
+    assert wrote.returncode == 0, wrote.stdout + wrote.stderr
+    local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    assert (shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json").is_file()
+    assert local.is_file(), wrote.stdout
+    assert _allocate_with_stale_copy(repo) == _TOMBSTONE_NUMBER + 1
+
+    local.unlink()
+    absent = _tombstone(repo, "-Check")
+    assert absent.returncode == 1, absent.stdout + absent.stderr
+    assert f"ABSENT: {local}" in absent.stdout
+
+
 def test_the_tombstone_replaces_an_empty_record(tmp_path: Path) -> None:
     """An empty file at that path is a crashed write, and remove.ps1 refuses every removal over it."""
     repo = _stale_clone(tmp_path, _stale_alloc(_STALE_REVISIONS["4c68c28eb-blob"]))

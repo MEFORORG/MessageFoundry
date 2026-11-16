@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Write the retirement tombstone into this clone's shared BACKLOG allocation registry, so a stale
-    pre-retirement copy of alloc.ps1 issues an absurd number instead of one the vault already uses.
+    Write the retirement tombstone into this clone's BACKLOG allocation registry, and into the shared
+    root's when one is configured, so a stale pre-retirement copy of alloc.ps1 issues an absurd number
+    instead of one the vault already uses.
 
 .DESCRIPTION
     THE PROBLEM (BACKLOG #1829). `11a3934c1` retired the engine backlog allocator by narrowing
@@ -55,8 +56,8 @@
     sits in. A linked worktree's own git dir is resolved to the common dir. Tests point it at a fixture.
 
 .PARAMETER Check
-    Report whether the tombstone is present, and write nothing. Exit 0 when present, 1 when absent,
-    2 when something else holds that number.
+    Report whether the tombstone is present, and write nothing. Exit 0 when every registry above holds
+    it, 2 when something else holds that number in any of them, and otherwise 1, for an absence.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\tombstone-retired-backlog-allocator.ps1 -Check
@@ -105,16 +106,22 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 . $coordRootScript
 $thisHost = Get-CoordHost
 
-# The allocation registry may live on the shared root, and a tombstone written beside a local copy
-# would lift no allocator that reads the shared one. It refuses rather than fall back, -Check
+# TWO REGISTRIES WHEN A SHARED ROOT IS CONFIGURED (BACKLOG #5492). Every pre-retirement alloc.ps1
+# predates the shared root (docs/COORD-SHARED-ROOT.md, approved 2026-10-21) and reads only the LOCAL
+# registry, <common>/mefor-coord/alloc/backlog, so that one carries the tombstone whatever is
+# configured: a tombstone on the shared root alone lifts no stale copy. The shared registry gets one
+# too, for the readers that resolve alloc through coord-root.ps1. With no root configured the two are
+# one path, written once. A shared root that cannot be resolved refuses rather than fall back, -Check
 # included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
-$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
+$localRoot = Join-Path $GitCommonDir 'mefor-coord'
+$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot $localRoot
 if ($allocDir.Error) {
     [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
     exit 4
 }
-$registry = Join-Path $allocDir.Path "backlog"
-$file = Join-Path $registry "$TombstoneNumber.json"
+$registries = @(Join-Path $localRoot 'alloc' 'backlog')
+$sharedRegistry = Join-Path $allocDir.Path 'backlog'
+if ($sharedRegistry -ne $registries[0]) { $registries += $sharedRegistry }
 
 function Test-IsTombstone([string]$Path) {
     try { $c = Get-Content -LiteralPath $Path -Raw -EA Stop | ConvertFrom-Json -EA Stop }
@@ -123,17 +130,23 @@ function Test-IsTombstone([string]$Path) {
     return ($c.PSObject.Properties.Name -contains 'tombstone') -and ($c.tombstone -eq $true)
 }
 
+# PRESENT only when every registry carries it. Something else holding the number in any of them
+# outranks an absence, because a rerun of the writer cannot repair that one.
 if ($Check) {
-    if (-not (Test-Path -LiteralPath $file)) {
-        Write-Host "ABSENT: $file"
-        exit 1
+    $code = 0
+    foreach ($registry in $registries) {
+        $file = Join-Path $registry "$TombstoneNumber.json"
+        if (-not (Test-Path -LiteralPath $file)) {
+            Write-Host "ABSENT: $file"
+            if ($code -eq 0) { $code = 1 }
+        } elseif (Test-IsTombstone $file) {
+            Write-Host "PRESENT: $file"
+        } else {
+            Write-Host "OCCUPIED BY SOMETHING ELSE: $file"
+            $code = 2
+        }
     }
-    if (Test-IsTombstone $file) {
-        Write-Host "PRESENT: $file"
-        exit 0
-    }
-    Write-Host "OCCUPIED BY SOMETHING ELSE: $file"
-    exit 2
+    exit $code
 }
 
 # The guard that keeps this away from the vault. Read the clone's PUBLISHED allocator rather than any
@@ -154,21 +167,6 @@ if ($m.Groups[1].Value -match 'backlog') {
         "backlog allocator is LIVE. A tombstone here would push it to #$($TombstoneNumber + 1). Refusing.")
 }
 
-New-Item -ItemType Directory -Force -Path $registry | Out-Null
-
-if (Test-Path -LiteralPath $file) {
-    if (Test-IsTombstone $file) {
-        Write-Host "ALREADY PRESENT, nothing written: $file"
-        exit 0
-    }
-    if ((Get-Item -LiteralPath $file).Length -ne 0) {
-        throw "$file exists and is NOT the tombstone. Refusing to overwrite an allocation record."
-    }
-    # Empty: a crashed write. Nothing is lost by replacing it, and leaving it makes remove.ps1 refuse
-    # every worktree removal in the clone.
-    Remove-Item -LiteralPath $file
-}
-
 $record = [ordered]@{
     number    = "$TombstoneNumber"
     kind      = "backlog"
@@ -182,22 +180,40 @@ $record = [ordered]@{
     tombstone = $true
 } | ConvertTo-Json -Compress
 
-# Write beside it, then move into place. File.Move without overwrite fails when the target exists, so a
-# concurrent second run loses cleanly and then finds a COMPLETE record, and no reader ever sees a
-# partial one. The temp name does not end in .json, so no reader globbing *.json can pick it up.
-$temp = Join-Path $registry ".tombstone-$([System.Guid]::NewGuid().ToString('N')).tmp"
-[System.IO.File]::WriteAllText($temp, $record, [System.Text.UTF8Encoding]::new($false))
-try {
-    [System.IO.File]::Move($temp, $file)
-} catch [System.IO.IOException] {
-    Remove-Item -LiteralPath $temp -EA SilentlyContinue
-    if (Test-IsTombstone $file) {
-        Write-Host "ALREADY PRESENT, nothing written: $file"
-        exit 0
+foreach ($registry in $registries) {
+    $file = Join-Path $registry "$TombstoneNumber.json"
+    New-Item -ItemType Directory -Force -Path $registry | Out-Null
+
+    if (Test-Path -LiteralPath $file) {
+        if (Test-IsTombstone $file) {
+            Write-Host "ALREADY PRESENT, nothing written: $file"
+            continue
+        }
+        if ((Get-Item -LiteralPath $file).Length -ne 0) {
+            throw "$file exists and is NOT the tombstone. Refusing to overwrite an allocation record."
+        }
+        # Empty: a crashed write. Nothing is lost by replacing it, and leaving it makes remove.ps1
+        # refuse every worktree removal in the clone.
+        Remove-Item -LiteralPath $file
     }
-    throw
+
+    # Write beside it, then move into place. File.Move without overwrite fails when the target exists,
+    # so a concurrent second run loses cleanly and then finds a COMPLETE record, and no reader ever sees
+    # a partial one. The temp name does not end in .json, so no reader globbing *.json can pick it up.
+    $temp = Join-Path $registry ".tombstone-$([System.Guid]::NewGuid().ToString('N')).tmp"
+    [System.IO.File]::WriteAllText($temp, $record, [System.Text.UTF8Encoding]::new($false))
+    try {
+        [System.IO.File]::Move($temp, $file)
+    } catch [System.IO.IOException] {
+        Remove-Item -LiteralPath $temp -EA SilentlyContinue
+        if (Test-IsTombstone $file) {
+            Write-Host "ALREADY PRESENT, nothing written: $file"
+            continue
+        }
+        throw
+    }
+    Write-Host "WROTE TOMBSTONE: $file"
 }
 
-Write-Host "WROTE TOMBSTONE: $file"
 Write-Host "  A pre-retirement alloc.ps1 in any worktree of this clone now issues #$($TombstoneNumber + 1) or above."
 exit 0
