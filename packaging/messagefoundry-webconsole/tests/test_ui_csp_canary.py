@@ -704,14 +704,8 @@ _SUPPORT_DOC_SECTION = "## What each absence does"
 _SUPPORT_DOC_SECTION_END = "### Request headers the browser sends"
 
 
-def _support_doc_rows() -> str:
-    """The TABLE ROWS of the operator-facing browser-support statement.
-
-    Rows only, not the whole section: a feature named in the surrounding prose has been mentioned, and
-    the requirement this guards ("behaves as documented when a feature is missing") is a per-feature
-    statement. That is the same rule the ``_security.py`` bucket check applies to the in-code
-    contract, applied to the shipped document.
-    """
+def _support_doc_text() -> str:
+    """``docs/BROWSER-SUPPORT.md``, or the copy :data:`_SUPPORT_DOC_ENV` points at."""
     override = os.environ.get(_SUPPORT_DOC_ENV, "").strip()
     doc = (
         Path(override)
@@ -722,13 +716,30 @@ def _support_doc_rows() -> str:
         f"{doc} is absent. The operator-facing browser-support contract is public and in-tree by "
         f"design (BACKLOG #1116); set {_SUPPORT_DOC_ENV} if this checkout carries it elsewhere."
     )
-    text = doc.read_text(encoding="utf-8")
+    return doc.read_text(encoding="utf-8")
+
+
+def _support_doc_rows() -> str:
+    """The TABLE ROWS of the operator-facing browser-support statement.
+
+    Rows only, not the whole section: a feature named in the surrounding prose has been mentioned, and
+    the requirement this guards ("behaves as documented when a feature is missing") is a per-feature
+    statement. That is the same rule the ``_security.py`` bucket check applies to the in-code
+    contract, applied to the shipped document.
+    """
+    text = _support_doc_text()
     assert _SUPPORT_DOC_SECTION in text, _SUPPORT_DOC_SECTION
     # without the end marker the split silently runs to the end of the file and counts every later
     # table, which is the widening the marker exists to prevent
     assert _SUPPORT_DOC_SECTION_END in text, _SUPPORT_DOC_SECTION_END
     section = text.split(_SUPPORT_DOC_SECTION, 1)[1].split(_SUPPORT_DOC_SECTION_END, 1)[0]
     return "\n".join(line for line in section.splitlines() if line.startswith("|"))
+
+
+def _session_cookie_attributes() -> set[str]:
+    """The :data:`COOKIE_SECURITY_ATTRIBUTES` the session-cookie code sets, as the page names them."""
+    source = Path(webconsole_auth.__file__).read_text(encoding="utf-8")
+    return {doc.strip("`") for code, doc in COOKIE_SECURITY_ATTRIBUTES if code in source}
 
 
 def test_the_shipped_browser_support_doc_carries_every_relied_on_feature() -> None:
@@ -754,13 +765,9 @@ def test_the_shipped_browser_support_doc_carries_every_relied_on_feature() -> No
             f"window.{feature} is feature-detected by the console but has no row in "
             f"docs/BROWSER-SUPPORT.md"
         )
-    source = Path(webconsole_auth.__file__).read_text(encoding="utf-8")
-    for code_token, doc_token in COOKIE_SECURITY_ATTRIBUTES:
-        if code_token not in source:
-            continue
-        assert doc_token.strip("`") in rows, (
-            f"{doc_token.strip('`')} is set on the session cookie but no docs/BROWSER-SUPPORT.md "
-            f"row names it"
+    for attribute in sorted(_session_cookie_attributes()):
+        assert attribute in rows, (
+            f"{attribute} is set on the session cookie but no docs/BROWSER-SUPPORT.md row names it"
         )
     # positive control: the section split found real table rows, so a green run above means the
     # document names these features rather than that the extraction returned an empty string every
@@ -769,32 +776,24 @@ def test_the_shipped_browser_support_doc_carries_every_relied_on_feature() -> No
 
 
 def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
-    """The version rows are UNRESOLVED, and that has to stay a stated finding rather than an omission.
+    """The floor rests on CSP nonce-source support, and the version table is derived, not authored.
 
-    An unresolved row and a forgotten row look identical in a document. This pins the two claims the
-    derivation actually rests on -- that the floor is CSP nonce-source support, and that
-    ``'strict-dynamic'`` is not part of it -- plus the explicit statement that no version table is
-    stated. Authoring one later without a pinned dataset reds here.
+    This pins the two claims the derivation rests on -- that the floor is CSP nonce-source support,
+    and that ``'strict-dynamic'`` is not part of it -- plus the statement that the minimum versions
+    are derived from the features and that nothing enforces them. The two tests below hold the
+    version table itself to the code.
 
-    **The pinned phrase is "not STATED" rather than "not published", and that is constrained by a
-    second gate rather than a preference** (BACKLOG #1116). ``tests/test_install_instruction_provenance.py``
-    reds when tracked prose asserts a distribution is unpublished while it classifies that
-    distribution PUBLISHED, and its pattern matches a bare ``not published``. The sibling sentence in
-    ``docs/SYSTEM-REQUIREMENTS.md`` sits beside the ``messagefoundry-webconsole`` wheel name and
-    tripped exactly that, on three platforms. The claim here is about VERSION NUMBERS not being
-    named; it was never about a wheel's absence from an index. Do not "restore" the older wording.
+    **Never write "not published" on this page** (BACKLOG #1116).
+    ``tests/test_install_instruction_provenance.py`` reds when tracked prose asserts a distribution
+    is unpublished while it classifies that distribution PUBLISHED, and its pattern matches a bare
+    ``not published``. A sibling sentence in ``docs/SYSTEM-REQUIREMENTS.md`` sits beside the
+    ``messagefoundry-webconsole`` wheel name and tripped exactly that, on three platforms.
     """
-    override = os.environ.get(_SUPPORT_DOC_ENV, "").strip()
-    doc = (
-        Path(override)
-        if override
-        else Path(__file__).resolve().parents[3] / "docs/BROWSER-SUPPORT.md"
-    )
-    text = " ".join(doc.read_text(encoding="utf-8").split())
+    text = " ".join(_support_doc_text().split())
     assert "nonce sources" in text
     assert "'strict-dynamic'` is not part of the floor" in text
-    assert "Minimum browser versions are deliberately not stated" in text
-    assert "Unresolved" in text
+    assert "Minimum browser versions are derived from the features, not chosen" in text
+    assert "**Nothing enforces these versions.**" in text
     # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
     assert "not published" not in text
     # Both halves of the 3.1.1 verb (warn the user OR block access), plus the named control. This
@@ -803,6 +802,241 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     for answer in ("**Warns.**", "**Fails closed.**", "**Named control.**"):
         assert answer in text, answer
     assert "it never blocks" not in text
+
+
+# --- the supported-browser version table (BACKLOG #3316 item 11, #1124) ----------------------------
+
+_VERSION_TABLE_HEADING = "## Supported browser versions"
+_FLOOR_TABLE_HEADING = "### The floor"
+_FEATURE_TABLE_HEADING = "### Each feature"
+_BROWSERS = ("Chrome", "Edge", "Firefox", "Safari")
+_COUNTS_COLUMN = "Counts toward the floor"
+#: A version cell is a dotted version, or one of these two words.
+_NO_VERSION = ("none", "not verified")
+_VERSION_CELL_RE = re.compile(r"\d+(?:\.\d+)*")
+#: The rows that do not count toward a browser's floor. A literal on purpose: leaving a row out of
+#: the floor lowers a floor without touching a number, so a new exclusion has to be made here as
+#: well as on the page, which states each reason in the row.
+_OUT_OF_FLOOR = frozenset({"'strict-dynamic'", "report-uri", "report-to", "Reporting-Endpoints"})
+#: Every cell of the feature table with no version, as (browser, the row's lead feature). A literal
+#: for the same reason as :data:`_OUT_OF_FLOOR`: turning a counted cell into ``none`` and moving it
+#: to the floor table's last column lowers a floor with every recomputation still agreeing.
+_NO_VERSION_CELLS = frozenset(
+    {
+        ("Chrome", "Clear-Site-Data"),
+        ("Edge", "Clear-Site-Data"),
+        ("Safari", "residentKey"),
+        ("Safari", "credProps"),
+        ("Safari", "Sec-Fetch-User"),
+    }
+    | {(browser, "Secure") for browser in _BROWSERS}
+)
+#: Where the version section lists the policy directives that have no row of their own.
+_OTHER_DIRECTIVES_LEAD = (
+    "The console's and the attachment download's policies have other directives"
+)
+#: A trailing ``(note N)`` or ``(not verified)`` on an item of a floor-table cell.
+_ITEM_SUFFIX_RE = re.compile(r"\s*\((?:note \d+|not verified)\)$")
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _version_table(heading: str) -> tuple[list[str], list[list[str]]]:
+    """The header and body rows of the one table under ``heading`` in the version section."""
+    text = _support_doc_text()
+    assert _VERSION_TABLE_HEADING in text, _VERSION_TABLE_HEADING
+    section = text.split(_VERSION_TABLE_HEADING, 1)[1]
+    section = re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0]
+    assert heading in section, heading
+    body = section.split(heading, 1)[1]
+    body = re.split(r"^#{1,3} ", body, maxsplit=1, flags=re.MULTILINE)[0]
+    lines = [line for line in body.splitlines() if line.startswith("|")]
+    assert len(lines) >= 3 and set(lines[1].strip()) <= set("|-: "), lines[:2]
+    return _cells(lines[0]), [_cells(line) for line in lines[2:]]
+
+
+def _row_features(first_cell: str) -> set[str]:
+    """The feature names a row's first cell carries: each backticked token, cut at ``:`` or ``=``,
+    so ``Cache-Control: no-store`` names ``Cache-Control`` and ``SameSite=Strict`` names
+    ``SameSite``."""
+    return {
+        re.split(r"[:=]", token, maxsplit=1)[0].strip()
+        for token in re.findall(r"`([^`]+)`", first_cell)
+    }
+
+
+def _lead(first_cell: str) -> str:
+    """The feature a row is FOR: its first backticked token, cut like :func:`_row_features`. The
+    nonce row's lead is the nonce source, not the ``script-src`` it also mentions."""
+    tokens = re.findall(r"`([^`]+)`", first_cell)
+    assert tokens, f"a version row must name its feature in backticks: {first_cell!r}"
+    return re.split(r"[:=]", tokens[0], maxsplit=1)[0].strip()
+
+
+def _items(cell: str) -> dict[str, str]:
+    """A floor-table cell's items, each a feature table row's first cell, mapped to the item as
+    written. Exact names rather than substrings, so ``Clear-Site-Data`` and ``Clear-Site-Data``
+    with ``"cache"`` stay two features."""
+    items = [item.strip() for item in cell.rstrip(".").split(". ") if item.strip()]
+    return {_ITEM_SUFFIX_RE.sub("", item): item for item in items}
+
+
+def _policy_directives() -> set[str]:
+    """Every directive name in the console's policies, the nonce one and the static one served under
+    the opt-out, and the attachment download's policy."""
+    policies = (security.build_ui_csp("n"), webconsole_auth.UI_CSP, engine_app._ATTACHMENT_CSP)
+    return {part.split()[0] for policy in policies for part in policy.split(";") if part.strip()}
+
+
+def _version(cell: str) -> tuple[int, ...] | None:
+    if cell in _NO_VERSION:
+        return None
+    assert _VERSION_CELL_RE.fullmatch(cell), (
+        f"a version cell must be a version number or one of {_NO_VERSION}, not {cell!r}"
+    )
+    parts = [int(part) for part in cell.split(".")]
+    # "16" and "16.0" are one version, so trailing zeros do not make two
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> None:
+    """Every feature the degrade contract derives from the CODE needs a row, with a version or a
+    stated absence in each browser's column and a named source.
+
+    The sets are the same ones the degrade-table check derives: the emitted browser-security headers,
+    the ``window.<Feature>`` detects and the session-cookie attributes. Each directive of the two
+    policies needs a row or a place in the section's list of other directives, and the in-page
+    referrer tag and the two passkey registration options each need a row. So a header, detect or
+    directive the console starts using reds here until the table names it, and a row for a header,
+    detect, cookie attribute, referrer tag or passkey option cannot be deleted to lift a floor. A
+    directive's row CAN be: moving the directive into the list of other directives keeps this green,
+    because the test cannot tell that move from a directive that needs no row, so a reviewer checks
+    such a move against the dataset. The request headers the server reads are held to the
+    same table by ``test_browser_support_doc.py``, which derives them.
+
+    Names are matched against each row's lead, its first backticked token, rather than by substring,
+    because this table splits ``Content-Security-Policy`` into one row per directive."""
+    header, rows = _version_table(_FEATURE_TABLE_HEADING)
+    columns = {browser: header.index(browser) for browser in _BROWSERS}
+    source = header.index("Source")
+    # a feature is covered by a row FOR it, never by a row that only mentions it, and no two rows
+    # are for one feature, so a cell keyed by its row's lead names exactly one row
+    leads = {_lead(row[0]) for row in rows}
+    assert len(leads) == len(rows), sorted(_lead(row[0]) for row in rows)
+    required = set(_emitted_browser_security_headers())
+    required |= {f"window.{feature}" for feature in _detected_browser_security_features()}
+    required |= _session_cookie_attributes()
+    # positive control: every derivation found what ships today, so a green run is not a set of
+    # empty extractions each trivially covered
+    assert {"Content-Security-Policy", "window.PublicKeyCredential", "__Host-"} <= required, (
+        required
+    )
+    missing = sorted(required - leads)
+    assert not missing, (
+        f"docs/BROWSER-SUPPORT.md's version table has no row for {missing}, which the console uses, "
+        f"so the floor it states was not derived from every feature"
+    )
+    directives = _policy_directives()
+    assert {"script-src", "frame-ancestors", "sandbox"} <= directives, directives
+    section = _support_doc_text().split(_VERSION_TABLE_HEADING, 1)[1]
+    section = " ".join(re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0].split())
+    assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
+    listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
+    assert directives, directives
+    unnamed = sorted(d for d in directives if d not in leads and f"`{d}`" not in listed)
+    assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
+    # The referrer tag and the two passkey options are read from source text. Each read asserts
+    # that it found its marker, so a refactor that renames one reds here instead of switching the
+    # row requirement off.
+    shell = (_PACKAGE_DIR / "_html.py").read_text(encoding="utf-8")
+    assert 'name="referrer"' in shell, "the page shell's referrer tag moved; re-derive this check"
+    passkeys = (Path(messagefoundry.__file__).parent / "auth/webauthn.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, feature in (
+        ("ResidentKeyRequirement.REQUIRED", "residentKey"),
+        ('"credProps"', "credProps"),
+    ):
+        assert marker in passkeys, f"{marker} moved in the registration options; re-derive this"
+        assert feature in leads, f"the registration options use {feature}, which has no row"
+    assert any('`<meta name="referrer">`' in row[0] for row in rows), "the referrer tag row"
+    nonce_rows = [row for row in rows if "'nonce-...'" in _row_features(row[0])]
+    assert len(nonce_rows) == 1, (
+        "the CSP nonce-source row, the one feature the console needs to run"
+    )
+    for row in rows:
+        assert len(row) == len(header), row
+        cells = [row[column] for column in columns.values()]
+        for cell in cells:
+            _version(cell)
+        assert row[source].startswith(("BCD `", "caniuse `")) or (
+            all(cell == "not verified" for cell in cells)
+        ), f"{row[0]} names no dataset entry for its numbers: {row[source]!r}"
+
+
+def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
+    """The floor table is computed from the feature table, not written beside it.
+
+    For each browser, ``Supported from`` must equal the latest version among the rows that count,
+    ``Set by`` must name every row at that version and no other, and the last column must name every
+    counted row with no version (``none`` or ``not verified``) and no row that has one. The rows that
+    do not count must be exactly :data:`_OUT_OF_FLOOR`, each with its reason, and the cells with no
+    version exactly :data:`_NO_VERSION_CELLS`."""
+    header, rows = _version_table(_FEATURE_TABLE_HEADING)
+    counts = header.index(_COUNTS_COLUMN)
+    counted = [row for row in rows if row[counts] == "yes"]
+    left_out = [row for row in rows if row[counts] != "yes"]
+    for row in left_out:
+        assert re.fullmatch(r"no: \S.{10,}", row[counts]), (row[0], row[counts])
+        features = _row_features(row[0])
+        assert features and features <= _OUT_OF_FLOOR, (
+            f"{row[0]} is left out of the floor but _OUT_OF_FLOOR does not name it"
+        )
+    assert set().union(*(_row_features(row[0]) for row in left_out)) == _OUT_OF_FLOOR, (
+        "the rows left out of the floor changed; leaving a row out lowers a floor without changing "
+        "a number, so the page must say why and _OUT_OF_FLOOR must name it"
+    )
+    no_version = {
+        (browser, _lead(row[0]))
+        for row in rows
+        for browser in _BROWSERS
+        if _version(row[header.index(browser)]) is None
+    }
+    assert no_version == _NO_VERSION_CELLS, (
+        "the cells with no version changed; a counted cell turned into 'none' lowers a floor "
+        "without any recomputation disagreeing, so _NO_VERSION_CELLS must name the change: "
+        f"added {sorted(no_version - _NO_VERSION_CELLS)}, gone {sorted(_NO_VERSION_CELLS - no_version)}"
+    )
+    floor_header, floor_rows = _version_table(_FLOOR_TABLE_HEADING)
+    assert [row[0] for row in floor_rows] == list(_BROWSERS), floor_rows
+    supported = floor_header.index("Supported from")
+    set_by = floor_header.index("Set by")
+    gaps = floor_header.index("No version fully supports, or not verified")
+    for floor_row in floor_rows:
+        column = header.index(floor_row[0])
+        known = [(_version(row[column]), row) for row in counted]
+        latest = max(version for version, _ in known if version is not None)
+        # positive control: the column is read, so a floor equal to `latest` is a comparison
+        assert latest > (1,), (floor_row[0], latest)
+        assert _version(floor_row[supported]) == latest, (
+            f"{floor_row[0]}'s floor reads {floor_row[supported]}, but the latest version among the "
+            f"rows that count is {'.'.join(map(str, latest))}"
+        )
+        setters, missing = _items(floor_row[set_by]), _items(floor_row[gaps])
+        assert set(setters) | set(missing) <= {row[0] for row in counted}, (setters, missing)
+        for version, row in known:
+            assert (row[0] in setters) == (version == latest), (floor_row[0], row[0])
+            assert (row[0] in missing) == (version is None), (floor_row[0], row[0])
+            if version is None:
+                # the suffix says "not verified" exactly where the cell does, so a known "none"
+                # cannot be passed off as merely unverified
+                assert missing[row[0]].endswith("(not verified)") == (
+                    row[column] == "not verified"
+                ), (floor_row[0], row[0])
 
 
 def _runbook_contract_table() -> str:

@@ -162,8 +162,9 @@ down with it, so the enumeration shipping in this wheel was checked by nothing a
   ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui. The
   check FAILS CLOSED on a write that carries neither header (BACKLOG #1116, #1124).
 * **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
-  :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
-  has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
+  :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; which
+  browsers apply its ``"cache"`` value, and which only in part, is the version table in
+  ``docs/BROWSER-SUPPORT.md``. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
   the cookie is explicitly deleted, every /ui HTML response carries ``Cache-Control: no-store``, and
   the 14.3.1 watchdog blanks the rendered document synchronously before navigating away.
 * **``Cache-Control: no-store``** on /ui HTML and PHI JSON (engine middleware) — DEGRADES SILENTLY: a
@@ -272,7 +273,8 @@ def build_ui_csp(nonce: str) -> str:
     """The /ui CSP for an effective-https response: the static self-only base with ``script-src``
     upgraded to a per-response nonce + ``strict-dynamic`` (3.4.7/3.4.8) and CSP reporting wired to
     :data:`CSP_REPORT_PATH`. ``strict-dynamic`` intentionally drops the host allowlist for scripts —
-    only the nonce'd first-party ``app.js`` (and anything it loads) runs; there is no inline script."""
+    only nonce'd first-party scripts (``app.js``, the shell's inline nonce'd scripts, and anything
+    they load) run."""
     return (
         f"default-src 'self'; script-src 'nonce-{nonce}' 'strict-dynamic'; style-src 'self'; "
         "img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; "
@@ -299,9 +301,11 @@ def _is_ui_fetch_scope(path: str) -> bool:
 
 
 #: A cross-site request that is a SAFE TOP-LEVEL NAVIGATION is allowed -- an intranet link into the
-#: console is one, and so is the OIDC callback, where the IdP's redirect back is cross-site BY
-#: CONSTRUCTION. METHOD is part of safe: a cross-site navigation carrying a POST is a CSRF form
-#: submission, and no supported flow makes one.
+#: console is one, and so is the OIDC callback, where the IdP's redirect back is cross-site UNLESS
+#: the IdP is on the console's own site, such as a sibling subdomain. That return is same-site, and
+#: :func:`_is_safe_top_level_navigation` then demands ``Sec-Fetch-User: ?1`` of it
+#: (``docs/BROWSER-SUPPORT.md``, federated sign-in). METHOD is part of safe: a cross-site navigation
+#: carrying a POST is a CSRF form submission, and no supported flow makes one.
 _SAFE_NAVIGATION_METHODS = frozenset({"GET", "HEAD"})
 
 
@@ -357,7 +361,8 @@ class UiFetchMetadataMiddleware:
     NAVIGATIONS, which those callers never see.
 
     **A CROSS-SITE TOP-LEVEL NAVIGATION IS LEGITIMATE AND MUST PASS.** An intranet link into the
-    console is one; so is the OIDC callback. Without reading ``Sec-Fetch-Mode`` as well, every real
+    console is one; so is the OIDC callback when the IdP is on another site (a same-site IdP's return
+    falls under the same-site half below). Without reading ``Sec-Fetch-Mode`` as well, every real
     SSO login would 403 while every hermetic test still passed.
 
     **ABSENT IS ALLOWED, AND THAT IS THE LOAD-BEARING HALF.** ``Sec-Fetch-Site`` is browser-populated:
@@ -380,9 +385,11 @@ class UiFetchMetadataMiddleware:
     **EVERY REQUIREMENT BELOW IS CONDITIONAL ON THE BROWSER HAVING ALREADY PROVED IT SPEAKS FETCH
     METADATA (BACKLOG #1122).** None of them is reached until ``Sec-Fetch-Site`` arrived and said
     cross-site or same-site, so a client that omits the family is unaffected by all of them. That is
-    what lets them ship with no supported-browser matrix in the tree -- ``docs/SYSTEM-REQUIREMENTS.md``
-    says only "A modern browser" -- and it is exactly what an ABSENCE rule could not claim. Measured
-    2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
+    what lets them ship without assuming any browser sends fetch metadata -- the version table in
+    ``docs/BROWSER-SUPPORT.md`` documents a floor, and nothing enforces it -- and it is exactly what
+    an ABSENCE rule could not claim. A browser can speak only PART of the family; which browsers do
+    is that table's ``Sec-Fetch-User`` row, and what that costs is the request-header table's, not
+    restated here (SDS-3.5). Measured 2026-09-04 by inverting this one condition and running the suite: making absence itself refuse
     reds **231 of the 408 console tests**, and would refuse the tray probe; that limb is a
     browser-support decision, not a code change, and it is not taken here.
 
@@ -392,12 +399,14 @@ class UiFetchMetadataMiddleware:
     * ``SameSite=Strict`` strips the session cookie from every CROSS-site request, so a cross-site
       navigation reaches us with no authority and the carve-out costs nothing. It is also the half
       that must stay open -- an intranet link is one, and so is the IdP's redirect back to the OIDC
-      callback.
+      callback when the IdP is on another site.
     * It does NOT strip the cookie from a SAME-site request. "Site" ignores the port, so on the
       shipped loopback default ``http://127.0.0.1:9999`` is same-site to the console: a page there can
       script ``window.open`` at a /ui URL and the operator's cookie rides along. ``Sec-Fetch-User``
-      is what separates the operator's own click from that script, and it is safe to demand HERE
-      precisely because no federated-login leg is same-site.
+      is what separates the operator's own click from that script. It was judged safe to demand
+      HERE because a federated-login leg is cross-site, which does NOT hold for an IdP on the same
+      site as the console, such as a sibling subdomain: its redirect back to the callback is then
+      same-site and refused without ``?1`` (``docs/BROWSER-SUPPORT.md``, federated sign-in).
 
     **WHY ``Sec-Fetch-User`` IS NOT DEMANDED ON THE CROSS-SITE HALF, THOUGH IT WOULD LOOK SYMMETRICAL.**
     The IdP's redirect back is a server-driven 302. When the IdP session is already established there
