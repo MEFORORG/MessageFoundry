@@ -694,7 +694,10 @@ class QueueStore(StoreLifecycle, Protocol):
         DONE in place (never returned, never re-sent) and its lane is reported in
         ``ClaimedHeads.rearm`` so the caller re-queues it immediately. Decryption happens after
         commit; an undecryptable row is dead-lettered standalone and dropped, and a lane whose whole
-        claimed prefix was consumed (H2/poison) also joins ``rearm``.
+        claimed prefix was consumed (H2/poison) also joins ``rearm``. A row that could not be opened
+        for a reason that is not the row (BACKLOG #5735) is returned, with every later row of its
+        lane, as an item whose ``open_fault`` is set and whose ``payload`` is empty and must not be
+        read: the caller treats it as an infra fault at that item, and nothing is written for it.
 
         **The lane set is always explicit** (the caller's ready-lane subset, registry-intersected).
         There is deliberately no all-lanes-of-stage claim form: disjoint-inbound sharding runs

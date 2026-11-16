@@ -30,7 +30,11 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION
+from messagefoundry.store.queue_tag import (
+    QUEUE_TAG_FAILED_ACTION,
+    QueueOpenFault,
+    queue_open_fault,
+)
 
 _DEST = "OB_T"
 
@@ -300,7 +304,15 @@ async def test_the_pooled_claim_returns_the_fault_and_writes_nothing(
         items = heads.by_lane[_LANE]
         assert [i.payload for i in items] == ["MSH|0", "", ""]
         assert items[0].open_fault is None
-        assert all(isinstance(i.open_fault, CipherUnavailableError) for i in items[1:])
+        faults = [i.open_fault for i in items[1:]]
+        assert all(isinstance(f, QueueOpenFault) for f in faults)
+        # The fault names the outage but carries no chain or frames: a log of it with
+        # exc_info must not print the raw key-service error or reach the claim's locals.
+        assert all("CipherUnavailableError" in str(f) for f in faults)
+        assert all(
+            f is not None and (f.__cause__, f.__context__, f.__traceback__) == (None, None, None)
+            for f in faults
+        )
         assert _ingress(db) == [("inflight", 1)] * 3  # nothing set aside or dead-lettered here
         assert _audited(db) == 0
     finally:
@@ -392,7 +404,8 @@ async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
 
     outage = CipherUnavailableError("down")
     fake = _FakeServer(None)
-    assert await _classify(backend, _server_store(backend, fake), outage) is outage
+    fault = await _classify(backend, _server_store(backend, fake), outage)
+    assert isinstance(fault, QueueOpenFault) and str(fault) == "CipherUnavailableError: down"
     assert fake.dead_lettered == [] and fake.audited == []  # an outage writes nothing
 
     fake = _FakeServer(None)  # control: a tag failure is dead-lettered and reported
@@ -401,7 +414,8 @@ async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
 
     store_fault = OSError("connection reset")
     fake = _FakeServer(store_fault)  # the dead-letter write fails: still reported, then returned
-    assert await _classify(backend, _server_store(backend, fake), QueueTagError("t")) is store_fault
+    fault = await _classify(backend, _server_store(backend, fake), QueueTagError("t"))
+    assert isinstance(fault, QueueOpenFault) and str(fault) == "OSError: connection reset"
     assert fake.audited == [QUEUE_TAG_FAILED_ACTION]
 
     fake = _FakeServer(TypeError("bug"))  # an engine bug stays loud
@@ -412,7 +426,7 @@ async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
 def test_the_postgres_unopened_item_carries_the_fault() -> None:
     from messagefoundry.store.postgres import PostgresStore  # noqa: PLC0415
 
-    fault = CipherUnavailableError("down")
+    fault = queue_open_fault(CipherUnavailableError("down"))
     row = {
         "id": "r",
         "message_id": "m",

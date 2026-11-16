@@ -182,10 +182,12 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
@@ -1179,7 +1181,7 @@ class OutboxItem:
     # write), and on every later row of its lane; ``payload`` is then empty and must not be read.
     # The pooled dispatcher raises it before the item's body runs, so the row takes the ADR 0070
     # T17 infra-fault path (BACKLOG #5735). Never set on an item any other claim returns.
-    open_fault: BaseException | None = field(default=None, compare=False, repr=False)
+    open_fault: QueueOpenFault | None = field(default=None, compare=False, repr=False)
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row, payload: str) -> OutboxItem:
@@ -14564,7 +14566,7 @@ class MessageStore:
                 # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
                 # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
                 if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed([row])
+                    await self._set_aside_claimed([row], now)
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -14611,7 +14613,7 @@ class MessageStore:
 
     async def _dead_letter_unopenable(
         self, row: aiosqlite.Row, exc: Exception
-    ) -> BaseException | None:
+    ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
@@ -14625,7 +14627,7 @@ class MessageStore:
         it to the dispatcher's T17 path, and the other claims set it aside
         (:meth:`_set_aside_claimed`)."""
         if is_transient_open_failure(exc) or isinstance(exc, (sqlite3.OperationalError, OSError)):
-            return exc
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
@@ -14641,12 +14643,12 @@ class MessageStore:
                 await report_queue_tag_failure(
                     self, self._cipher, row, outcome="could not be dead-lettered"
                 )
-            return failed
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
         return None
 
-    async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row]) -> None:
+    async def _set_aside_claimed(self, tail: Sequence[aiosqlite.Row], now: float | None) -> None:
         """Re-pend claimed rows with a durable backoff (BACKLOG #5735): ``attempts`` loses the
         claim's increment, as for any fault that is not the message's, and ``next_attempt_at``
         moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead, so a sweep does not re-claim them at
@@ -14655,13 +14657,14 @@ class MessageStore:
         its error propagates out of the claim and the rows stay ``inflight`` until
         ``reset_stale_inflight`` at the next start."""
         log.warning(
-            "setting aside %d claimed queue row(s) for %.0fs: opening the first failed for a"
-            " reason that is not the row",
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed(
-            [r["id"] for r in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
+            [r["id"] for r in tail],
+            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -14785,7 +14788,7 @@ class MessageStore:
             # is audited and alerted too (BACKLOG #2593).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             if await self._dead_letter_unopenable(claimed, exc) is not None:
-                await self._set_aside_claimed([claimed])
+                await self._set_aside_claimed([claimed], now)
             return None
 
     async def claim_next_fifo_batch(
@@ -14865,7 +14868,7 @@ class MessageStore:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
                 if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed(ordered[i:])
+                    await self._set_aside_claimed(ordered[i:], now)
                     break  # set aside with the rest of the lane: never deliver past it (#5735)
         return items
 

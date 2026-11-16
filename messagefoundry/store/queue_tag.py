@@ -56,6 +56,8 @@ __all__ = [
     "PROGRAMMING_ERRORS",
     "QUEUE_TAG_FAILED_ACTION",
     "TRANSIENT_OPEN_BACKOFF_SECONDS",
+    "QueueOpenFault",
+    "queue_open_fault",
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
@@ -114,6 +116,21 @@ TRANSIENT_OPEN_BACKOFF_SECONDS: Final = 5.0
 #: The errors a claim never contains as a failed dead-letter write (BACKLOG #5735): each names a
 #: fault in the engine's own code, which must stay loud, never one in the store or the key service.
 PROGRAMMING_ERRORS: Final = (AssertionError, AttributeError, LookupError, NameError, TypeError)
+
+
+class QueueOpenFault(Exception):
+    """A claimed queue row that could not be opened for a reason that is not the row (BACKLOG
+    #5735): a key service that gave no verdict, a failed store read, or a failed dead-letter write.
+    Built by :func:`queue_open_fault` with no cause, context or traceback, so a handler that logs
+    it with ``exc_info`` prints neither the raw key-service error, which can echo a URL or a
+    request body (BACKLOG #2318), nor the claim's frames, which hold other rows' plaintext (BACKLOG
+    #6706)."""
+
+
+def queue_open_fault(exc: BaseException) -> QueueOpenFault:
+    """:class:`QueueOpenFault` naming ``exc`` by its type and its own text only."""
+    return QueueOpenFault(f"{type(exc).__name__}: {exc}")
+
 
 #: The audit action written when a queue row's payload does not open under its own tag.
 QUEUE_TAG_FAILED_ACTION: Final = "integrity.queue_tag_failed"

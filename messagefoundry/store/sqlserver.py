@@ -177,10 +177,12 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
@@ -10744,7 +10746,7 @@ class SqlServerStore:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
                 if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                    await self._set_aside_claimed([d])
+                    await self._set_aside_claimed([d], now)
                 continue
             items.append(
                 OutboxItem(
@@ -10774,7 +10776,7 @@ class SqlServerStore:
 
     async def _dead_letter_unopenable(
         self, d: dict[str, Any], stage: str, exc: CipherError
-    ) -> BaseException | None:
+    ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
 
@@ -10784,7 +10786,7 @@ class SqlServerStore:
         the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
         the caller does with it."""
         if is_transient_open_failure(exc):
-            return exc
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
         row = {**d, "stage": stage}
         try:
@@ -10801,24 +10803,25 @@ class SqlServerStore:
                 await report_queue_tag_failure(
                     self, self._cipher, row, outcome="could not be dead-lettered"
                 )
-            return failed
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
         return None
 
-    async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]]) -> None:
+    async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735), for a
         per-lane claim. If this write fails too, its error propagates out of the claim, and on
         this backend only ``reset_stale_inflight`` at the next start re-pends the rows: a claim
         here sets no lease."""
         log.warning(
-            "setting aside %d claimed queue row(s) for %.0fs: opening the first failed for a"
-            " reason that is not the row",
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed(
-            [d["id"] for d in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
+            [d["id"] for d in tail],
+            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
@@ -10966,7 +10969,7 @@ class SqlServerStore:
             payload = self._open_claimed(d, stage)
         except CipherError as exc:
             if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                await self._set_aside_claimed([d])
+                await self._set_aside_claimed([d], now)
             return None
         return OutboxItem(
             id=d["id"],
@@ -11116,7 +11119,7 @@ class SqlServerStore:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
                 if await self._dead_letter_unopenable(d, stage, exc) is not None:
-                    await self._set_aside_claimed(decoded[i:])
+                    await self._set_aside_claimed(decoded[i:], now)
                     break  # set aside with the rest of the lane: never deliver past it (#5735)
                 continue
             items.append(

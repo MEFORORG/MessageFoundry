@@ -185,10 +185,12 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
     TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
@@ -5127,7 +5129,7 @@ class PostgresStore:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
                 if await self._dead_letter_unopenable(row, exc) is not None:
-                    await self._set_aside_claimed([row])
+                    await self._set_aside_claimed([row], now)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5276,7 +5278,7 @@ class PostgresStore:
                         )
                         await self._maybe_finalize_message(conn, row["message_id"], now)
                         row = None
-        item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row])
+        item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
         return item
 
     async def claim_next_fifo_batch(
@@ -5381,7 +5383,7 @@ class PostgresStore:
         ordered = sorted(rows, key=lambda r: r["seq"])
         items: list[OutboxItem] = []
         for i, row in enumerate(ordered):
-            item, set_aside = await self._fifo_item_or_dead_letter(row, tail=ordered[i:])
+            item, set_aside = await self._fifo_item_or_dead_letter(row, tail=ordered[i:], now=now)
             if set_aside:
                 break  # set aside with the rest of the lane: never deliver past it (#5735)
             if item is not None:
@@ -5670,7 +5672,7 @@ class PostgresStore:
                 )
 
     async def _fifo_item_or_dead_letter(
-        self, row: Any, *, tail: Sequence[Any]
+        self, row: Any, *, tail: Sequence[Any], now: float | None
     ) -> tuple[OutboxItem | None, bool]:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
         and return ``None`` so the lane advances on the next poll (mirrors SQLite). Runs AFTER the claim
@@ -5685,10 +5687,10 @@ class PostgresStore:
             # advance, rather than raising into the worker (mirrors SQLite).
             if await self._dead_letter_unopenable(row, exc) is None:
                 return None, False
-            await self._set_aside_claimed(tail)
+            await self._set_aside_claimed(tail, now)
             return None, True
 
-    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> BaseException | None:
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
         tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
 
@@ -5698,7 +5700,7 @@ class PostgresStore:
         the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
         the caller does with it."""
         if is_transient_open_failure(exc):
-            return exc
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
@@ -5714,23 +5716,24 @@ class PostgresStore:
                 await report_queue_tag_failure(
                     self, self._cipher, row, outcome="could not be dead-lettered"
                 )
-            return failed
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
         return None
 
-    async def _set_aside_claimed(self, tail: Sequence[Any]) -> None:
+    async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
         """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` ahead (BACKLOG #5735), for a
         per-lane claim. If this write fails too, its error propagates out of the claim; the rows'
         lease and startup recovery re-pend them."""
         log.warning(
-            "setting aside %d claimed queue row(s) for %.0fs: opening the first failed for a"
-            " reason that is not the row",
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
             len(tail),
             TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
         await self.reschedule_claimed(
-            [r["id"] for r in tail], time.time() + TRANSIENT_OPEN_BACKOFF_SECONDS
+            [r["id"] for r in tail],
+            (time.time() if now is None else now) + TRANSIENT_OPEN_BACKOFF_SECONDS,
         )
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
@@ -5774,7 +5777,7 @@ class PostgresStore:
         )
 
     @staticmethod
-    def _unopened_item(row: Any, fault: BaseException) -> OutboxItem:
+    def _unopened_item(row: Any, fault: QueueOpenFault) -> OutboxItem:
         """A claimed row whose body was not opened, carrying ``fault`` for the pooled dispatcher's
         T17 path (BACKLOG #5735). ``payload`` is empty and must not be read."""
         return OutboxItem(
