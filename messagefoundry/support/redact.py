@@ -524,7 +524,7 @@ _KEY_MATERIAL = re.compile(
 # Why the user may be empty and the password may hold an "@", and why the user still may not hold one
 # (BACKLOG #5386), is stated on the same pattern in ``messagefoundry/secretscrub.py``.
 _DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()|^~{}<>\[\]\x27\x22]*@"
 )
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.

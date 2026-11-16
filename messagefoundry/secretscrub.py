@@ -1304,7 +1304,9 @@ _KEY_MATERIAL = re.compile(
 # ``svc:<placeholder>@Secret9``, because the label the member pass needed was inside the match, so
 # the tail printed where the old pattern let that pass mask it. So the run after the first segment
 # holds none of ``; ? # & , ( )`` or a quote, the characters a member, a query or a quoted value
-# starts after. The first segment is the old class, so every match the old pattern made, this one
+# starts after, nor any of ``| ^ ~ { } < > [ ]``: a review measured ``|dbPassword=Tail@Sec`` print
+# its tail, an HL7 run after the host lose the separators the PHI pass reads it by, and
+# ``:587|cc=admin@corp`` name the wrong host, each where the run reached a later "@". The first segment is the old class, so every match the old pattern made, this one
 # makes. The residual: a password whose own "@" is followed by one of those characters before the
 # host's "@" is cut at that "@", and its tail prints, as the whole tail did before.
 #
@@ -1314,7 +1316,7 @@ _KEY_MATERIAL = re.compile(
 # not as a repeated "@"-led group, so the static ReDoS gate in ``tests/test_security_static.py``
 # reads no nested quantifier.
 _DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()\x27\x22]*@"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):[^\s/@]++[^\s/;?#&,()|^~{}<>\[\]\x27\x22]*@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

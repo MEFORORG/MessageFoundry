@@ -135,9 +135,9 @@ def test_a_long_detail_is_bounded_and_a_credential_near_the_bound_hidden() -> No
 @pytest.mark.parametrize("sep", ["=", ": ", "='", " = "])
 def test_a_capitalized_two_word_label_keeps_its_value_hidden(label: str, sep: str) -> None:
     """The PHI name pass reads ``Login Password`` as a name and takes it. Run before any credential
-    pass that needs the label, the value printed; the value is masked before the PHI pass now. The
-    second control is the PHI-first order with no pre-mask, the order the review of BACKLOG #5395
-    asked for, which prints the value on this text."""
+    pass that needs the label, the value printed; the label word is lower-cased first now, so the
+    pair is no longer a name. The second control is the PHI-first order with no such step, which
+    prints the value on this text."""
     from messagefoundry.redaction import _REDACTED, redact, safe_exc
     from messagefoundry.secretscrub import scrub_credentials
 
@@ -161,6 +161,11 @@ _MRN = "MRN7712345"
         f"session=s-1,mrn: {_MRN}",
         f"Access Token=tk-1,mrn: {_MRN}",
         f"password=pw-1,mrn: {_MRN} rest",
+        # A PHI label glued on by a character a credential value class does not stop at.
+        f"token=tk-1|mrn: {_MRN}",
+        f"password=pw-1/mrn: {_MRN}",
+        f"token=tk-1:mrn: {_MRN}",
+        f"token=tk-1.mrn: {_MRN}",
     ],
 )
 def test_a_credential_value_does_not_swallow_a_phi_label(text: str) -> None:
@@ -191,6 +196,77 @@ def test_a_scheme_word_after_a_token_label_does_not_shield_the_token(text: str) 
     from messagefoundry.verify.model import safe_detail_text
 
     assert _PLANTED not in safe_detail_text(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        # The PHI pass rewrites part of the DSN or the value; the credential pass must still read it.
+        ("connection to postgresql://19800505:Zq7_Secret-Kv9@db.invalid:5432/mefor failed", "Kv9"),
+        ("postgresql://svc:Zq7-19800505-Kv9@db.invalid/mefor", "Kv9"),
+        ("MEFOR_STORE_KEY=Zq7-19800505-Kv9 x", "Kv9"),
+        ("private_key=Zq7-19800505-Kv9 x", "Kv9"),
+        ("Bearer Zq7-19800505-Kv9 x", "Kv9"),
+    ],
+)
+def test_a_credential_the_phi_pass_cut_into_is_still_hidden(text: str, secret: str) -> None:
+    """The credential pass reads the PHI pass's whole result, not the pieces between its
+    placeholders. Control: the pieces, as the bundle's second layer reads them, print the tail."""
+    from messagefoundry.redaction import _REDACTED, redact
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify.model import safe_detail_text
+
+    pieces = _REDACTED.join(scrub_credentials(x) for x in redact(text).split(_REDACTED))
+    assert secret in pieces, pieces
+    detail = safe_detail_text(text)
+    assert secret not in detail, detail
+
+
+@pytest.mark.parametrize(
+    "text", ["password=Jane Doe failed", "Password: Jane Doe failed", "session: Jane Doe x"]
+)
+def test_a_name_after_a_credential_label_is_hidden_whole(text: str) -> None:
+    """No pass takes only the first word of a value before the PHI pass, so a two-word name after a
+    label is still a name run. Control: the PHI pass alone hides the surname."""
+    from messagefoundry.redaction import safe_text
+    from messagefoundry.verify.model import safe_detail_text
+
+    assert "Doe" not in safe_text(text)
+    detail = safe_detail_text(text)
+    assert "Doe" not in detail and "Jane" not in detail, detail
+
+
+def test_a_name_before_a_credential_label_is_still_a_name() -> None:
+    """Lower-casing the label word breaks the label's pair, not a real name before it."""
+    from messagefoundry.verify.model import safe_detail_text
+
+    detail = safe_detail_text(f"Patient Jane Doe Password={_PLANTED} y")
+    assert "Jane" not in detail and "Doe" not in detail and _PLANTED not in detail, detail
+
+
+def test_the_paired_label_words_are_secretscrubs() -> None:
+    """The label words are spelled as a literal for the static ReDoS gate; they must stay
+    ``secretscrub``'s password and token families."""
+    import re
+
+    from messagefoundry import secretscrub
+    from messagefoundry.verify.model import _PAIRED_CREDENTIAL_LABEL
+
+    words = re.search(r"\(\?i:([^)]*)\)", _PAIRED_CREDENTIAL_LABEL.pattern)
+    assert words is not None
+    assert set(words[1].split("|")) == {*secretscrub._CREDENTIAL_WORDS, *secretscrub._TOKEN_WORDS}
+
+
+def test_a_cut_input_keeps_its_unscanned_note() -> None:
+    """The window's note says what no pass read; the length bound must not drop it. Control: the
+    input is past the window."""
+    from messagefoundry.redaction import _REDACT_WINDOW
+    from messagefoundry.verify.model import safe_detail_text
+
+    text = "word " * _REDACT_WINDOW
+    detail = safe_detail_text(text)
+    assert "unscanned" in detail, detail[-200:]
+    assert "unscanned" not in safe_detail_text("word " * 10)
 
 
 def test_the_credential_pass_reads_only_the_work_window(monkeypatch: pytest.MonkeyPatch) -> None:

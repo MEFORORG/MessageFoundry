@@ -7,7 +7,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
 from typing import Final
 
 
@@ -32,9 +31,24 @@ FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 DRIVER_DETAIL_LIMIT: Final = 2000
 
 
+#: A credential label word right after a capitalized word and a space, as in ``Login Password=`` or
+#: ``Access Token:``. The PHI name pass reads two capitalized words as a name and takes both, and
+#: the credential pass after it then finds no label, so the value printed. Lower-casing the label
+#: word alone breaks that pair and changes nothing else; after a lower-case word there is no pair,
+#: so ``word PWD=`` keeps its spelling. The words are ``secretscrub``'s password and token
+#: families, spelled here so the static ReDoS gate reads a literal;
+#: ``tests/test_verify_detail_redaction.py`` holds them to ``secretscrub``. Each match starts at a
+#: word boundary and the word runs are not nested, so the scan is linear.
+_PAIRED_CREDENTIAL_LABEL: Final = re.compile(
+    r"\b([A-Z][A-Za-z0-9]*[ \t]+)"
+    r"((?i:password|passwd|passphrase|pass|pwd|secret|credential"
+    r"|authorization|bearer|token|session|api_key|api-key|apikey))\b(?=['\"]?\s*[:=])"
+)
+
+
 def safe_detail_text(text: str, *, limit: int | None = None) -> str:
-    """``text`` for a :class:`CheckResult` detail: bounded, then PHI, then credentials, then the
-    length bound (BACKLOG #5395).
+    """``text`` for a :class:`CheckResult` detail: bounded, then PHI, then credentials over the whole
+    result, then the length bound (BACKLOG #5395).
 
     A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
     leaves the box. The text a check quotes is a driver's, a config module's or the OS's: a store
@@ -45,57 +59,36 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
     log filter and wiring's own diagnostics use.
 
-    THE ORDER IS THE SUPPORT BUNDLE'S (``redact_log_line``), which measured it. The input is cut to
-    :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass reads it. Then a
-    labelled credential's value is masked with a value class that stops at a comma, so a capitalized
-    label such as ``Login Password``, which the PHI pass reads as a name and replaces, has already
-    lost its value. Then the PHI pass, then the shared vocabulary over the text between the PHI
-    pass's placeholders. That vocabulary ran first before, and its value class runs past a comma:
-    ``token=tk-1,mrn: MRN7712345`` lost the ``mrn:`` label inside the token's value, and the MRN
-    printed. Split at the placeholders, it can no longer reach across a span the PHI pass took.
+    THE PHI PASS RUNS FIRST, AND THE CREDENTIAL PASS READS ITS WHOLE RESULT. Run first, the
+    credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's value, the
+    PHI pass then found no ``mrn:`` label, and the MRN printed. Run after, over the whole text, it can
+    only hide more than the PHI pass did. Not split at the PHI placeholders, as the support bundle's
+    second layer is: the placeholder is a run of non-space characters, so ``postgresql://19800505:<pw>@``
+    still reads as a DSN once the PHI pass has replaced the user, where a split cut it in two and the
+    password printed.
 
-    Not ``redact_log_line`` itself, though that was the first choice: its long-base64 sweep blanked
-    any 24-character run, which is an exception class name such as ``SSLCertVerificationError`` and
-    the segments of a POSIX path, the words an operator needs here. This is best-effort, with at
-    least the residuals ``secretscrub`` states, and the PHI pass can blank a capitalized two-word path
-    segment such as ``Program Files``."""
-    from messagefoundry.redaction import _REDACTED, clamp_untrusted, redact, safe_text
+    The one thing the PHI pass takes that the credential pass needs is a label read as a name, such
+    as ``Login Password``. :data:`_PAIRED_CREDENTIAL_LABEL` lower-cases its label word first, so the
+    name pass leaves it. The input is cut to
+    :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass reads it, and its note
+    is kept past the length bound.
+
+    Not the support bundle's ``redact_log_line``: its long-base64 sweep blanked any 24-character run,
+    which is an exception class name such as ``SSLCertVerificationError`` and the segments of a POSIX
+    path, the words an operator needs here. This is best-effort, with at least the residuals
+    ``secretscrub`` states, and the PHI pass can blank a capitalized two-word phrase such as ``Program
+    Files``."""
+    from messagefoundry.redaction import clamp_untrusted, redact, safe_text
     from messagefoundry.secretscrub import scrub_credentials
 
     bounded = clamp_untrusted(text)
-    masked = _premask_labelled_values(bounded)
-    phi = redact(masked)
-    # A text that already held the placeholder is read whole, as the bundle reads such a line: a
-    # split there would cut wherever the text's own author wrote it.
-    pieces = [phi] if _REDACTED in bounded else phi.split(_REDACTED)
-    cleaned = _REDACTED.join(scrub_credentials(piece) for piece in pieces)
-    return safe_text(cleaned) if limit is None else safe_text(cleaned, limit=limit)
-
-
-def _premask_labelled_values(text: str) -> str:
-    """``text`` with the value after a password or token label masked, the label kept, before the
-    PHI pass can take the label. The password family is the support bundle's ``_CREDENTIAL_KV``,
-    quoted and ODBC-braced values included; the token family, which that pattern does not carry, is
-    :func:`_token_label_value`. Both write ``secretscrub``'s placeholder."""
-    from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, _keep_label
-    from messagefoundry.support.redact import _CREDENTIAL_KV
-
-    text = _CREDENTIAL_KV.sub(lambda m: _keep_label(m, CREDENTIAL_PLACEHOLDER), text)
-    return _token_label_value().sub(lambda m: f"{m[1]}{m[2]}{CREDENTIAL_PLACEHOLDER}", text)
-
-
-@cache
-def _token_label_value() -> re.Pattern[str]:
-    """A ``<token word>`` label and its separator, an optional auth-scheme word, then a quoted value
-    whole, or a plain one that stops at whitespace, a quote, a comma, ``;`` or ``&``. The scheme word
-    is taken with the value, so ``Authorization: Bearer <tok>`` hides the token and not the word
-    ``Bearer``. The words are ``secretscrub``'s token family."""
-    from messagefoundry.secretscrub import _TOKEN_WORDS
-
-    words = "|".join(re.escape(word) for word in _TOKEN_WORDS)
-    scheme = r"(?:(?:bearer|basic|digest|negotiate|ntlm|token)\s+)?"
-    value = r"""(?:'[^']*'|"[^"]*"|[^\s'",;&]+)"""
-    return re.compile(rf"(?i)\b({words})\b(['\"]?\s*[:=]\s*){scheme}{value}")
+    # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it
+    # must outlive the length bound below, which would otherwise drop it with the tail.
+    head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
+    lowered = _PAIRED_CREDENTIAL_LABEL.sub(lambda m: m[1] + m[2].lower(), head)
+    cleaned = scrub_credentials(redact(lowered))
+    shown = safe_text(cleaned) if limit is None else safe_text(cleaned, limit=limit)
+    return f"{shown} {note}" if note else shown
 
 
 def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:
