@@ -307,8 +307,8 @@ def test_a_shim_that_answers_bare_is_refused_before_any_side_effect(
 
     real = tls_client_cert.client_cert_http_protocol_class
 
-    def _shadowing_shim(base: Any) -> Any:
-        shim: Any = real(base=base)
+    def _shadowing_shim(base: Any, **kwargs: Any) -> Any:
+        shim: Any = real(base=base, **kwargs)
         shim.send_400_response = base.__mro__[1].send_400_response  # the server's own writer
         return shim
 
@@ -2701,11 +2701,11 @@ def test_extract_verified_peercert_variants() -> None:
 def test_enriched_app_state_snapshots_only_with_cert() -> None:
     base = {"shared": 1}
     # No cert → the SAME dict is returned (byte-identical; nothing stashed, no mutation).
-    same = enriched_app_state(base, _FakeTransport(_FakeSSL({})))  # type: ignore[arg-type]
+    same = enriched_app_state(base, _FakeTransport(_FakeSSL({})), trusted_proxies=())  # type: ignore[arg-type]
     assert same is base
     # A verified cert → a fresh per-connection copy carrying the cert; the shared dict is untouched.
     cert = _peercert("svc.internal")
-    enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
+    enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)), trusted_proxies=())  # type: ignore[arg-type]
     assert enriched is not base
     assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == {
         **cert,
@@ -2728,7 +2728,7 @@ class _StubProtocolBase:
 
 
 def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
-    cls = client_cert_http_protocol_class(base=_StubProtocolBase)
+    cls = client_cert_http_protocol_class(base=_StubProtocolBase, trusted_proxies=())
     proto = cls()
     transport = _FakeTransport(_FakeSSL(_peercert("svc.internal")))
     proto.connection_made(transport)  # type: ignore[attr-defined]
@@ -2744,7 +2744,7 @@ def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
 
 
 def test_client_cert_protocol_no_cert_is_byte_identical() -> None:
-    cls = client_cert_http_protocol_class(base=_StubProtocolBase)
+    cls = client_cert_http_protocol_class(base=_StubProtocolBase, trusted_proxies=())
     proto = cls()
     before = proto.app_state  # type: ignore[attr-defined]
     proto.connection_made(_FakeTransport(_FakeSSL({})))  # type: ignore[attr-defined]
@@ -2872,12 +2872,14 @@ def _client_bundle(
     leaf_issuer: x509.Name | None = None,
     sent: tuple[x509.Certificate, ...] = (),
     san: tuple[x509.GeneralName, ...] = (),
+    client_auth: bool = True,
 ) -> Path:
     """A client cert + key PEM in ``tmp_path``: a leaf ``cn`` signed by ``signer``, then ``sent``.
 
     ``leaf_issuer`` overrides the leaf's issuer FIELD (the signer still signs it); ``sent`` are
-    intermediates the client presents; ``san``, when given, is the leaf's subjectAltName. Shared
-    with ``tests/test_inbound_http_intake_issuer.py``."""
+    intermediates the client presents; ``san``, when given, is the leaf's subjectAltName. The leaf
+    carries a ``clientAuth`` extended key usage unless ``client_auth`` is false, which leaves the
+    extension out (BACKLOG #5628). Shared with ``tests/test_inbound_http_intake_issuer.py``."""
     leaf_key = ec.generate_private_key(ec.SECP256R1())
     builder = (
         x509.CertificateBuilder()
@@ -2894,6 +2896,10 @@ def _client_bundle(
     )
     if san:
         builder = builder.add_extension(x509.SubjectAlternativeName(list(san)), critical=False)
+    if client_auth:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False
+        )
     leaf = builder.sign(signer[1], hashes.SHA256())
     bundle = tmp_path / f"client-{len(list(tmp_path.iterdir()))}.pem"
     bundle.write_bytes(
@@ -2917,12 +2923,21 @@ def _shim_view(
     leaf_issuer: x509.Name | None = None,
     sent: tuple[x509.Certificate, ...] = (),
     san: tuple[x509.GeneralName, ...] = (),
+    client_auth: bool = True,
 ) -> dict[str, Any]:
     """What the mTLS shim records for a leaf ``cn`` signed by ``signer``, verified against ``trusted``.
 
     The leaf and its arguments are :func:`_client_bundle`'s. Fails the test if the handshake itself
     does not verify."""
-    bundle = _client_bundle(tmp_path, signer, cn=cn, leaf_issuer=leaf_issuer, sent=sent, san=san)
+    bundle = _client_bundle(
+        tmp_path,
+        signer,
+        cn=cn,
+        leaf_issuer=leaf_issuer,
+        sent=sent,
+        san=san,
+        client_auth=client_auth,
+    )
     client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client.check_hostname = False
     client.verify_mode = ssl.CERT_NONE  # the ENGINE side is the verifier under test
@@ -3127,6 +3142,9 @@ def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
         .serial_number(x509.random_serial_number())
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
+        .add_extension(  # the shim maps only a clientAuth leaf (BACKLOG #5628)
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False
+        )
         .sign(ca[1], hashes.SHA256())
     )
     bundle = tmp_path / "client.pem"

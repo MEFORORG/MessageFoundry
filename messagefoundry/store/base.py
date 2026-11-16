@@ -2003,7 +2003,11 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
-    ) -> ConnectionMetrics: ...
+    ) -> ConnectionMetrics:
+        """Per-channel inbound and per-(channel_id, destination_name) outbound aggregates for the
+        connections dashboard. A pass-through marker is not a delivery, so it is in no destination's
+        aggregate (BACKLOG #5614)."""
+        ...
 
     async def delivery_latency_histogram(
         self, *, buckets: Sequence[float], now: float | None = None
@@ -2011,7 +2015,8 @@ class QueueStore(StoreLifecycle, Protocol):
         """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
         reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
         skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
-        event loop."""
+        event loop. A pass-through marker is not a delivery and is excluded, as it is from
+        :meth:`connection_metrics`' destinations (BACKLOG #5614)."""
         ...
 
 
@@ -3237,8 +3242,24 @@ class AuthStore(Protocol):
         seeing a SECOND ACCOUNT already holding the same subject. The database enforces the same rule
         underneath -- every backend declares a filtered UNIQUE ``ux_users_federated_subject`` -- and
         this lookup is what lets the caller answer cleanly instead of surfacing that refusal as an
-        integrity error. :meth:`AuthService._complete_ad_login`'s subject-exclusivity guard carries
-        why that pairing is worded the way it is, and what it replaced.
+        integrity error.
+
+        Its callers include at least: :meth:`AuthService._complete_oidc_login`, which SELECTS the
+        signing-in account through it (ADR 0184); :meth:`AuthService._complete_ad_login`, which names
+        the holder when a federated mint finds the pair moved; and
+        :meth:`AuthService.bind_federated_subject`, which refuses a pair another account holds.
+
+        **Case and accent are exact on every backend** (BACKLOG #5613). SQLite and Postgres compare
+        text byte for byte by default; SQL Server's columns and ``ux_users_federated_subject`` are
+        declared ``Latin1_General_100_BIN2``, because under a case-insensitive default two subjects
+        differing only in case would be one key. BIN2 still pads trailing spaces, so ``abc`` and
+        ``abc `` match there; the bind refuses a subject with surrounding space, and a caller that
+        SELECTS an account through this compares the pair itself. On SQL Server the schema batch
+        gives BIN2 only to a pair it creates, adds, or re-types from NVARCHAR(MAX). It converts no
+        other pair, such as one already NVARCHAR(256) under any collation but
+        ``Latin1_General_100_BIN2``: an open that runs the batch refuses it instead
+        (:mod:`~messagefoundry.store.server_schema_verify` says what that check compares and when
+        it runs).
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).
@@ -3298,6 +3319,7 @@ class AuthStore(Protocol):
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
 
@@ -3333,6 +3355,12 @@ class AuthStore(Protocol):
 
         A caller that passes no guard still has its account read, for the session epoch, and still
         takes the missing-row refusal above; only the binding comparison is skipped.
+
+        ``mfa_verified`` writes the row with ``mfa_verified_at`` set to its ``created_at``, in the
+        same INSERT (BACKLOG #5624). A sign-in that owes no second factor used to stamp it with
+        :meth:`mark_session_mfa_verified` afterwards, a second transaction that wrote nothing on a
+        row revoked in between and said nothing, so the sign-in went on to supersede the caller's
+        prior session and return a dead token as a success.
         """
         ...
 

@@ -89,7 +89,7 @@ from messagefoundry.parsing.peek import (
     Peek,
     enforce_size_limits,
 )
-from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_head
+from messagefoundry.parsing.sniff import _content_matches_declared, b64_head, text_sniff_head
 from messagefoundry.parsing.split import _holds_more_than_one_message
 from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
@@ -123,6 +123,7 @@ __all__ = [
     "ingress_size_error",
     "peek_max_bytes",
     "raise_if_strictly_invalid",
+    "reingress_body_error",
     "reingress_size_error",
     "store_safe_raw",
     "streaming_over_threshold",
@@ -288,6 +289,66 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
         if carried is not None:
             return ingress_size_error(carried)
     return ingress_size_error(len(body))
+
+
+#: How much of a re-ingressed body the declared-type sniff decodes or encodes. It reads at most
+#: DICOM's 132 bytes, so these bound the work to a head however long the body is. The carriage
+#: slice leaves room for line-wrapped base64, which :func:`b64_head` compacts.
+_SNIFF_HEAD_BYTES = 384
+_CARRIAGE_SNIFF_CHARS = 4096
+
+
+def _reply_sniff_head(ic: InboundConnection, body: str) -> bytes:
+    """The leading bytes of a binary loopback reply for the declared-type sniff. Carriage is decoded
+    from a head, whitespace inside it tolerated. A body that is not carriage is the decoded text a
+    capturing transport hands over, encoded in the inbound's declared charset as an operator resend
+    encodes it. Either fails closed: a head that does not decode, or a charset that cannot encode
+    it, gives ``b""``, which every sniffed type refuses, as :func:`b64_head` intends."""
+    if is_marked(body):
+        start = len(CARRIAGE_MARKER)
+        return b64_head(body[start : start + _CARRIAGE_SNIFF_CHARS], _SNIFF_HEAD_BYTES)
+    try:
+        return body[:_SNIFF_HEAD_BYTES].encode(ingress_encoding(ic), "replace")
+    except (
+        LookupError,
+        UnicodeError,
+    ):  # UnicodeError: ``undefined``, or a codec refusing "replace"
+        return b""
+
+
+def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
+    """The refusal text for a loopback re-ingress ``body`` the listener's content guards would refuse
+    (BACKLOG #5616), or ``None`` when they admit it. Run after :func:`reingress_size_error` passes.
+
+    A loopback has no listener, so a captured reply never met them. At least these run here: for a
+    text loopback, :func:`decode_ingress`, the listener's own sequence (HL7 line endings collapsed,
+    then the NUL, MLLP frame-byte and second-``MSH`` rules); for a non-HL7 loopback, the declared-type
+    sniff of :func:`check_declared_type`, on the head :func:`_reply_sniff_head` gives for a binary
+    one. An empty or all-whitespace reply (a ``no_reply`` capture, ADR 0013) has nothing to sniff
+    and is admitted, as before. An HL7 body whose collapsed length is over the ceiling the
+    re-ingress peek applies (the engine default) is left to ``Peek.parse``, which refuses it as
+    oversize, so the scans never run over it. The document-marker refusal needs the parsed message,
+    so the re-ingress step runs it after the peek.
+
+    The reason is the guard's own, which carries no byte of the body."""
+    blank = not body or body.isspace()
+    try:
+        if ic.content_type.is_binary:
+            if not blank:
+                check_declared_type(ic, _reply_sniff_head(ic, body))
+            return None
+        # Collapsing CRLF to CR is the only change the normalize makes to a body's length.
+        if (
+            ic.content_type is ContentType.HL7V2
+            and len(body) - body.count("\r\n") > DEFAULT_MAX_MESSAGE_BYTES
+        ):
+            return None
+        decode_ingress(body, ic)
+        if ic.content_type is not ContentType.HL7V2 and not blank:
+            check_declared_type(ic, text_sniff_head(body))
+    except IngressGuardError as exc:
+        return exc.reason
+    return None
 
 
 class IngressTooLarge(IngressGuardError):

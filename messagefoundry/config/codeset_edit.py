@@ -226,6 +226,13 @@ def rename_code_set(
             rewritten = len(impact.apply_rename(plan))
             if rewritten:
                 result["referents_rewritten"] = rewritten
+            # A referrer the planner could not rewrite still reads the old name, so the rename left
+            # it dangling; say so rather than report only what was rewritten (BACKLOG #5620).
+            if plan.unresolved:
+                result["referents_unresolved"] = [
+                    {"referrer_kind": r.referrer_kind, "referrer": r.referrer}
+                    for r in plan.unresolved
+                ]
     return result
 
 

@@ -604,6 +604,141 @@ def test_the_folding_does_not_reach_a_bounded_command(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# ============================================ DENY: a walk the quote masker blanked (BACKLOG #5607)
+
+# THE QUOTE MASKER USED TO BLANK A WHOLE QUOTED SPAN AND IGNORE BACKSLASHES, and each row below was
+# allowed by it. Inside double quotes bash still runs a `$(...)` or backtick substitution, so
+# blanking the span hid a real walk from program position. And a backslash-escaped quote opens or
+# closes nothing, so treating it as a quote shifted every later span by one: the separator and the
+# walk after it fell inside a span that bash never opened. `$'...'` takes backslash escapes too, so
+# `$'\''` is one quote character, not the end of a span.
+QUOTED_SUBSTITUTION_DENY = [
+    pytest.param('echo "$(find /proc)"', id="dollar-substitution-inside-double-quotes"),
+    pytest.param('echo "`find /proc`"', id="backtick-substitution-inside-double-quotes"),
+    pytest.param('echo "x $(grep -r p /proc) y"', id="recursive-grep-substitution-in-prose"),
+    pytest.param('echo "$(echo "inner") $(find /)"', id="second-substitution-after-nested-quotes"),
+    pytest.param('echo "$( (find /proc) )"', id="subshell-inside-a-quoted-substitution"),
+    pytest.param(r"echo \"; find /proc; echo \"", id="escaped-quotes-outside-any-span"),
+    pytest.param(r'echo "a\"b"; find /proc', id="escaped-quote-inside-a-double-quoted-span"),
+    pytest.param(r"echo $'\''; find /proc", id="escaped-quote-inside-ansi-c-quotes"),
+    # The other side of the same rule: an ESCAPED dollar starts no `$'...'`, so the single quotes
+    # after it are plain ones, in which a backslash escapes nothing.
+    pytest.param(r"echo \$'\'; find /proc", id="escaped-dollar-before-plain-single-quotes"),
+    # `$$` is the PID, so the quote after it is a plain one, not a `$'...'`.
+    pytest.param(r"echo $$'\'; find /proc", id="pid-before-plain-single-quotes"),
+    # A quote inside a heredoc body is data, in the commit-message form and at the top level.
+    pytest.param(
+        "git commit -m \"$(cat <<'EOF'\nFix: don't break it\nEOF\n)\" && grep -r foo /proc",
+        id="apostrophe-in-a-heredoc-inside-a-quoted-substitution",
+    ),
+    pytest.param("cat <<EOF\ndon't\nEOF\nfind /proc", id="apostrophe-in-a-top-level-heredoc"),
+    # Arithmetic is not a heredoc opener.
+    pytest.param('echo "$((1 << n))"\nfind /proc', id="shift-inside-quoted-arithmetic"),
+    # Arithmetic still runs a substitution, and a comment's apostrophe opens no span. In each the
+    # walk sits inside the double-quoted span, where the plain toggle blanks it too.
+    pytest.param(
+        'echo "logs: $(( $(find / -name x | wc -l) + 0 ))"', id="substitution-in-quoted-arithmetic"
+    ),
+    pytest.param(
+        'echo "$(echo a # don\'t\n) $(find /proc)"', id="comment-apostrophe-before-a-substitution"
+    ),
+]
+
+
+@pytest.mark.parametrize("command", QUOTED_SUBSTITUTION_DENY)
+def test_a_walk_the_quote_masker_used_to_blank_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROL FOR THE LIST ABOVE. The cheapest way to pass it is to stop blanking quoted spans at
+# all, which would deny every commit message that names this guard. Each row is prose bash never
+# runs: an escaped quote, an escaped backtick or dollar, and a substitution inside single quotes.
+QUOTED_PROSE_ALLOW = [
+    pytest.param(r'git commit -m "say \"find /proc\" is blocked"', id="escaped-quotes-in-prose"),
+    pytest.param(r'git commit -m "a \`find /proc\` mention"', id="escaped-backticks-in-prose"),
+    pytest.param(r'echo "cost: \$(find /proc)"', id="escaped-dollar-in-prose"),
+    pytest.param("echo '$(find /proc)'", id="substitution-inside-single-quotes"),
+    pytest.param("echo \"$(echo 'find /proc')\"", id="single-quoted-word-inside-a-substitution"),
+    pytest.param(r"echo $'it\'s find /proc'", id="ansi-c-quoted-prose"),
+    pytest.param('echo "$(echo a # it\'s a find /proc mention\n)"', id="walk-named-in-a-comment"),
+]
+
+
+@pytest.mark.parametrize("command", QUOTED_PROSE_ALLOW)
+def test_quoted_prose_naming_a_walk_is_still_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+# THE POWERSHELL TOOL KEEPS THE PLAIN QUOTE TOGGLE. Its escape is the backtick and a backslash is
+# literal, so reading these as bash would open a substitution or an escape that never closes and
+# blank the walk after it. Each was denied before the bash masker and must stay denied.
+POWERSHELL_QUOTE_DENY = [
+    pytest.param('Write-Host "done`n"; grep -r x /proc', id="backtick-escape-in-a-string"),
+    pytest.param('Get-ChildItem "D:\\Code\\"; grep -r x /proc', id="trailing-backslash-path"),
+]
+
+
+def test_a_payload_without_a_tool_name_is_still_screened() -> None:
+    """Strict mode throws on a missing property, and the guard's catch allows."""
+    assert_denied(run_guard('{"tool_input": {"command": "find /proc"}}'))
+
+
+@pytest.mark.parametrize("command", POWERSHELL_QUOTE_DENY)
+def test_a_powershell_string_does_not_hide_the_walk_after_it(command: str) -> None:
+    assert_denied(run_guard(bash(command, tool="PowerShell")))
+
+
+# THE BASH READING MUST NEVER ALLOW WHAT THE PLAIN TOGGLE DENIED. Each row was denied by the toggle
+# alone, before the bash reading existed, and allowed once the bash reading replaced it: its own
+# misreading blanked a walk the toggle left visible. The quote in each row is what sends it through
+# the masker at all; a command with none is never masked.
+TOGGLE_FLOOR_DENY = [
+    # `$((` opens arithmetic, whose body was blanked whole, substitution and all.
+    pytest.param(
+        "x='a'; echo $(( $(find /proc | wc -l) + 1 ))", id="substitution-inside-arithmetic"
+    ),
+    # `$((cmd) )` is a subshell in a substitution, not arithmetic: the `) )` never closes `$((`.
+    pytest.param("echo 'a'; echo $((find /proc) )", id="subshell-substitution-read-as-arithmetic"),
+    # `cat<<` with no space was no heredoc opener, so the apostrophe in its body opened a span.
+    pytest.param(
+        "git commit -m \"$(cat<<'EOF'\nFix: don't break it\nEOF\n)\" && grep -r foo /proc",
+        id="unspaced-heredoc-inside-a-quoted-substitution",
+    ),
+    # Only the second delimiter was kept, so the first terminator line was blanked as body.
+    pytest.param(
+        'echo "a"; cat <<A <<B\nx\nA\ny\nB\nfind /proc', id="two-heredocs-opened-on-one-line"
+    ),
+    # A comment is not quoting, so the apostrophe in it opened a span.
+    pytest.param(
+        'echo "$(echo a # don\'t\n)" && grep -r x /proc',
+        id="apostrophe-in-a-comment-inside-a-quoted-substitution",
+    ),
+]
+
+
+# A `#` STARTS A COMMENT ONLY WHERE BASH STARTS A WORD. Each `#` below carries a word on, so blanking
+# from it as a comment would hide the walk after it, which sits where the plain toggle blanks it too.
+# The last row's comment is real, but it ends at the closing backtick, not the newline.
+COMMENT_BOUNDARY_DENY = [
+    pytest.param('echo "$(echo $(echo a)#b; find /proc)"', id="hash-after-a-substitution"),
+    pytest.param('echo "$(echo $((1+2))#b; find /proc)"', id="hash-after-arithmetic"),
+    pytest.param(r'echo "$(echo a\ #b; find /proc)"', id="hash-after-an-escaped-space"),
+    pytest.param('echo "$(echo a\\\n#b; find /proc)"', id="hash-after-a-line-continuation"),
+    pytest.param('echo "$(echo ${x:- #a}; find /proc)"', id="hash-inside-a-parameter-expansion"),
+    pytest.param(r"echo \"`echo a #x`; find /proc #\"", id="comment-ends-at-a-top-level-backtick"),
+]
+
+
+@pytest.mark.parametrize("command", COMMENT_BOUNDARY_DENY)
+def test_a_hash_that_carries_a_word_on_hides_no_walk(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+@pytest.mark.parametrize("command", TOGGLE_FLOOR_DENY)
+def test_a_walk_the_plain_toggle_denied_is_still_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
 # ============================================ the corpora must not quietly shrink
 
 
@@ -628,6 +763,11 @@ EXPECTED_ROW_COUNTS = {
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
     "FOLDING_ALLOW": 20,
+    "QUOTED_SUBSTITUTION_DENY": 15,
+    "QUOTED_PROSE_ALLOW": 7,
+    "POWERSHELL_QUOTE_DENY": 2,
+    "TOGGLE_FLOOR_DENY": 5,
+    "COMMENT_BOUNDARY_DENY": 6,
 }
 
 

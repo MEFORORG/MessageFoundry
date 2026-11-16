@@ -9933,16 +9933,23 @@ _WIN_REJECTED_SIDS = frozenset(
 # BUILTIN\Administrators, the group a foreign owner must resolve into to be trusted.
 _WIN_ADMINISTRATORS_SID = "S-1-5-32-544"
 
+# NT SERVICE\TrustedInstaller, the Windows servicing identity. It can replace any system file
+# already and owns ``C:\`` and ``C:\Program Files`` as Windows ships them, so refusing it as an
+# owner or a grantee would refuse on no evidence. ``auth/anchor_path.py`` trusts it the same way.
+_WIN_TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
 # Literal SIDs whose holder administers this machine whatever domain it is joined to.
 _WIN_ADMIN_SIDS = frozenset(
     {
         "S-1-5-18",  # NT AUTHORITY\SYSTEM
         _WIN_ADMINISTRATORS_SID,
+        _WIN_TRUSTED_INSTALLER_SID,
     }
 )
 
-# SIDs trusted to hold write on executed config (the current process user and the directory owner are
-# added at evaluation time): the admin SIDs above, plus two owner-relative placeholders.
+# SIDs trusted to hold write on executed config (the directory owner, and the current process user
+# unless it is LocalService or NetworkService, are added at evaluation time): the admin SIDs above,
+# plus two owner-relative placeholders.
 #
 # CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) are trusted because neither names a principal
 # this ACL can be read against, so refusing them would refuse on no evidence: S-1-3-4 carries the
@@ -9974,8 +9981,23 @@ _WIN_ADMIN_RIDS = frozenset(
     }
 )
 
-# ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE — the only type that grants rights.
+# The admin RIDs above that name a GROUP (Domain, Schema, Enterprise Admins): the only ones a
+# grantee may carry (:func:`_is_domain_admin_group_sid`). 500 is an account.
+_WIN_ADMIN_GROUP_RIDS = frozenset({512, 518, 519})
+
+# ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE, the only granting type whose
+# trustee the reader parses.
 _WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
+
+# ACE types that can GRANT a right in a DACL: allowed, compound, object, callback and callback-object.
+# A callback or object entry grants conditionally, so the policy cannot say whom it applies to and
+# refuses one that carries a write-class right (BACKLOG #5622; ``auth/anchor_path.py`` reads the
+# same set). Deny entries are not here: they can only take a right away.
+_WIN_GRANTING_ACE_TYPES = frozenset({0x00, 0x04, 0x05, 0x09, 0x0B})
+
+# LocalService and NetworkService run many services, so the engine running as one of them does not
+# make that SID the engine's alone: self-trust skips them, as a grantee and as an owner.
+_WIN_SHARED_SERVICE_SIDS = frozenset({"S-1-5-19", "S-1-5-20"})
 
 
 def _is_well_known_admin_sid(sid: str) -> bool:
@@ -10009,6 +10031,22 @@ def _is_well_known_admin_sid(sid: str) -> bool:
     return int(rid_text) in _WIN_ADMIN_RIDS
 
 
+def _is_domain_admin_group_sid(sid: str) -> bool:
+    """Whether ``sid`` is a Domain, Schema or Enterprise Admins group SID by its form alone.
+
+    These are the only domain-relative grantees the DACL pass trusts, and only once the local
+    Administrators lookup resolves them (BACKLOG #5622). A group, not an account: UAC marks these
+    groups deny-only in an unelevated token, so a write grant to one is usable only by an elevated
+    administrator, who could take ownership anyway. A user account's own SID is never deny-only, so
+    a grant to one does not depend on elevation, and a non-owner account stays refused as a grantee
+    (the built-in Administrator, RID 500, included)."""
+    return (
+        _is_well_known_admin_sid(sid)
+        and sid not in _WIN_ADMIN_SIDS
+        and int(sid.rsplit("-", 1)[1]) in _WIN_ADMIN_GROUP_RIDS
+    )
+
+
 def _evaluate_config_dacl(
     owner_sid: str,
     aces: Sequence[tuple[int, int, str]],
@@ -10018,23 +10056,31 @@ def _evaluate_config_dacl(
     """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
     ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
-    form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
-    that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID —
-    and unconditionally when a broad/low-privilege SID (Everyone/Authenticated Users/Users/…) holds
-    such a right.
+    form), with an empty trustee for every type but 0x00. A source is refused when any **ALLOWED**
+    ACE grants a **write-class** right to a principal that is neither the file owner, nor the current
+    process user, nor a trusted admin/SYSTEM/TrustedInstaller SID, nor a Domain/Schema/Enterprise
+    Admins group that resolves as a direct member of Administrators
+    (:func:`_is_domain_admin_group_sid`) — and unconditionally when a broad/low-privilege SID
+    (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
+    (compound, object, callback) carrying a write-class right refuses too, because its trustee or
+    condition cannot be judged here. A LocalService or NetworkService process user is not
+    self-trusted: other services share that SID (BACKLOG #5622).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
     this loader executes as the service account no matter what the DACL currently says. The owner
-    passes as the current process user, as a well-known admin SID (:func:`_is_well_known_admin_sid`),
-    or as a resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
+    passes as the current process user (unless that user is LocalService or NetworkService, which
+    other services share), as a well-known admin SID (:func:`_is_well_known_admin_sid`), or as a
+    resolved member of Administrators. ``owner_in_admins`` returning ``None`` means the
     membership could **not** be determined, and that is a **refusal**, not a warning-and-proceed —
     ASVS v5.0.0 V16.5.3 (fail gracefully and securely, no fail-open when validation logic errors).
     The refusal carries the documented ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape because it is
     raised through :func:`_refuse_unsafe_config_source`, which says where that escape is honoured.
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
-    reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
+    reported as itself instead of being masked by the owner verdict, and the scan runs past an entry
+    it cannot judge, so a definite insecure entry later in the list is reported ahead of it. A
+    ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
     :func:`_enforce_windows_paths` refuses an unreadable token before any path is evaluated
@@ -10043,33 +10089,77 @@ def _evaluate_config_dacl(
     for that load.
 
     Kept free of ctypes so the policy is unit-testable on every platform."""
+    # The engine's own SID earns self-trust only when no other service can hold it.
+    engine_sid = self_sid if self_sid not in _WIN_SHARED_SERVICE_SIDS else None
     trusted = set(_WIN_TRUSTED_SIDS)
     trusted.add(owner_sid)
-    if self_sid is not None:
-        trusted.add(self_sid)
+    if engine_sid is not None:
+        trusted.add(engine_sid)
+    unsure: str | None = None  # the first entry that cannot be judged, reported if none is worse
     for ace_type, access_mask, trustee_sid in aces:
-        if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-            continue  # DENY/audit/etc. ACEs never grant a right
+        if ace_type not in _WIN_GRANTING_ACE_TYPES:
+            continue  # DENY ACEs never grant a right
         if not access_mask & _WIN_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
+        if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
+            unsure = unsure or (
+                f"a compound, object or callback access entry (type 0x{ace_type:02x}) grants write "
+                "access, and this check cannot tell whom it applies to"
+            )
+            continue
         if trustee_sid in _WIN_REJECTED_SIDS:
             return f"a broad/low-privilege principal ({trustee_sid}) has write access"
-        if trustee_sid not in trusted:
-            return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
-    if self_sid is None or owner_sid == self_sid or _is_well_known_admin_sid(owner_sid):
+        if trustee_sid in trusted:
+            continue
+        if trustee_sid == self_sid:
+            return (
+                f"the account the engine runs as ({trustee_sid}) has write access, but other "
+                "services share that identity, so it is not trusted as the engine's own"
+            )
+        # The RID arm alone would trust an admin group of any domain (ADR 0036 Amendment A accepted
+        # that for owners only), so a grantee must also resolve as a member of Administrators here.
+        if _is_domain_admin_group_sid(trustee_sid):
+            member = owner_in_admins(trustee_sid)
+            if member is True:
+                continue
+            if member is None:
+                unsure = unsure or (
+                    f"an administrators group ({trustee_sid}) has write access, and its "
+                    "Administrators membership could not be resolved"
+                )
+                continue
+        return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    # A definite owner refusal is reported ahead of an entry the scan could not judge.
+    return _config_owner_problem(owner_sid, self_sid, engine_sid, owner_in_admins) or unsure
+
+
+def _config_owner_problem(
+    owner_sid: str,
+    self_sid: str | None,
+    engine_sid: str | None,
+    owner_in_admins: Callable[[str], bool | None],
+) -> str | None:
+    """The owner arm of :func:`_evaluate_config_dacl`: a refusal reason, or ``None``."""
+    if self_sid is None or owner_sid == engine_sid or _is_well_known_admin_sid(owner_sid):
         return None
     owner_is_admin = owner_in_admins(owner_sid)
+    if owner_is_admin:
+        return None
+    if owner_sid == self_sid:
+        who = "is the account the engine runs as, but other services share that identity"
+    else:
+        who = "is not the account the engine runs as"
     if owner_is_admin is None:
         return (
-            f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
-            f"membership could not be resolved"
+            f"the owner ({owner_sid}) {who}, and its Administrators membership could not be "
+            "resolved"
         )
-    if not owner_is_admin:
-        return (
-            f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
-            f"so it can rewrite the code this loader executes"
-        )
-    return None
+    if owner_sid == self_sid:
+        return f"the owner ({owner_sid}) {who}, so it can rewrite the code this loader executes"
+    return (
+        f"the owner ({owner_sid}) is neither the account the engine runs as nor an administrator, "
+        f"so it can rewrite the code this loader executes"
+    )
 
 
 # ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
@@ -10449,7 +10539,8 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         member SID and a short read alike, with no way to tell which."""
         _logger.warning(
             "config-source trust guard could not resolve local Administrators membership (%s); an "
-            "owner that is neither the run-as account nor a well-known admin SID will be REFUSED "
+            "owner that is neither the run-as account nor a well-known admin SID, or an admins "
+            "group holding write, will be REFUSED "
             "(see docs/SERVICE.md for the required config-dir ownership)",
             why,
         )
@@ -10583,16 +10674,19 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
                     return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
-                if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-                    aces.append((header.AceType, 0, ""))  # non-allow ACE: policy ignores it
-                    continue
+                # Every ACE type carries its access mask right after the 4-byte header, so the mask
+                # is read for all of them: the policy refuses a callback or object entry granting a
+                # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
-                # The trustee SID begins at the SidStart field offset within the ACE structure.
-                sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
-                sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
-                trustee = _sid_to_str(sid_ptr) if sid_ptr else None
-                if trustee is None:
-                    return _WinPathSecurity(owner_sid=owner_sid, aces=None)
+                trustee = ""  # parsed for type 0x00 only
+                if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
+                    # The trustee SID begins at the SidStart field offset within the ACE structure.
+                    sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
+                    sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
+                    parsed = _sid_to_str(sid_ptr) if sid_ptr else None
+                    if parsed is None:
+                        return _WinPathSecurity(owner_sid=owner_sid, aces=None)
+                    trustee = parsed
                 aces.append((header.AceType, int(allowed.Mask), trustee))
             return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:

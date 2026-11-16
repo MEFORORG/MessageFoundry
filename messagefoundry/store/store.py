@@ -164,6 +164,7 @@ from messagefoundry.store.gcm_bound import (
     bounded_cipher,
     checkpoint_invocations,
     counts_under_dek,
+    idle_checkpoint_total,
     reserve_invocations_ahead,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -181,11 +182,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -1438,7 +1439,7 @@ _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
     " user_epoch, global_epoch, seal)"
-    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?,?)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)"
 )
 
 # BACKLOG #2592: the one statement that rewrites a session's sealed columns, used only by the store's
@@ -1519,6 +1520,7 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.last_used_at,
         record.client,
         record.reauth_at,
+        record.mfa_verified_at,
         record.auth_mechanism,
         record.idp_auth_time,
         record.user_epoch,
@@ -2235,13 +2237,17 @@ def new_session_record(
     idp_auth_time: float | None,
     user_epoch: int,
     global_epoch: int,
+    mfa_verified: bool = False,
 ) -> SessionRecord:
     """The row ``create_session`` writes, with every float as the backend will read it back, so the
     seal made over it verifies after the round trip (BACKLOG #2592).
 
     ``reauth_at = now`` seeds the step-up window from sign-in (ASVS 7.5.3). ``seed_reauth=False``
     (an MFA-pending session, WP-14) leaves it NULL, so enrolment or step-up needs an explicit
-    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness."""
+    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness.
+
+    ``mfa_verified`` stamps ``mfa_verified_at = now`` in the row itself (BACKLOG #5624), so a
+    sign-in that owes no factor needs no second write that could miss a revoked row."""
     now = float(now)
     return SessionRecord(
         token_hash=token_hash,
@@ -2252,7 +2258,7 @@ def new_session_record(
         revoked_at=None,
         client=client,
         reauth_at=now if seed_reauth else None,
-        mfa_verified_at=None,
+        mfa_verified_at=now if mfa_verified else None,
         auth_mechanism=auth_mechanism,
         idp_auth_time=_opt_float(idp_auth_time),
         user_epoch=int(user_epoch),
@@ -11571,8 +11577,9 @@ class MessageStore:
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
                 # itself a large burst. A no-op when the cipher carries no bound (keyless /
-                # `vault_transit`).
-                await store.checkpoint_cipher_invocations()
+                # `vault_transit`). Strict, so the open reads THIS store's row rather than trusting a
+                # figure another handle left in the cipher (BACKLOG #5608).
+                await store.checkpoint_cipher_invocations(strict=True)
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
@@ -12503,8 +12510,9 @@ class MessageStore:
         SAME cell AAD (ASVS 11.3.3). A retired-key v2 value decrypts with its cell AAD and re-encrypts
         under the active key with the identical AAD (the read AAD never drifts across a rotation); a v1
         value decrypts with None AAD (the cipher dispatches v1→None internally, ignoring ``aad``) and,
-        under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
-        loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
+        under the cell-bound writer, upgrades to a cell-bound v4 value. The seam every untagged
+        rotation loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt
+        AADs; the tagged loops use :func:`reseal_unless_tag_failure`, the same pair (BACKLOG #5610)."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
     async def _reencrypt_tagged_to_active(
@@ -12523,9 +12531,10 @@ class MessageStore:
         preset's owner; BACKLOG #2593); caller holds ``self._lock``. ``select`` names the tag's
         columns, ``id`` among them, so the decrypt and the encrypt share one tag. All identifiers
         are code constants. A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no read can ever open it,
-        and re-sealing it would make it look genuine. Any other failure, a retired key that was not
-        supplied above all, still stops the rotation. Pages by ``id``, since a skipped row still
+        (:func:`reseal_unless_tag_failure`) is left as it is and counted in a WARNING: no read can ever
+        open it, and re-sealing it would make it look genuine. Any other failure still stops the
+        rotation, at least a retired key that was not supplied, a malformed envelope, and the active
+        key's invocation ceiling on the re-encrypt (BACKLOG #5610). Pages by ``id``, since a skipped row still
         matches the marker filter."""
         total = skipped = 0
         after = ""
@@ -12541,12 +12550,11 @@ class MessageStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(cipher, r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
                 await self._commit()
@@ -14235,7 +14243,7 @@ class MessageStore:
         produces — **in this same transaction** — a new, independent INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to this message),
         which the PT inbound's own router worker then re-routes. The Send-into-PT also stamps a single
-        **already-``done`` outbound marker row** on *this* (parent) message keyed by the PT inbound name,
+        **already-``done`` outbound marker row** on *this* (parent) message sent to the PT inbound name,
         so the parent finalizes ``PROCESSED`` (the Send was delivered — into the PT) and never collapses
         to ``FILTERED``. Atomicity makes "child produced" and "routed row consumed" one durable fact, so a
         crash/re-run is an idempotent no-op (the content-addressed child id + the guarded routed-row
@@ -14307,12 +14315,14 @@ class MessageStore:
                         now,
                         inherits,
                     )
-                    # The parent's disposition for this Send: a marker outbound row keyed by the PT
+                    # The parent's disposition for this Send: a marker outbound row sent to the PT
                     # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
                     # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
                     # claims take PENDING rows only), so it is inert; it exists solely so the
                     # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
-                    await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+                    await self._insert_passthrough_marker(
+                        message_id, channel_id, pt_name, produced, now
+                    )
                 # Every child's documents in one pass, after the children exist (BACKLOG #5099).
                 await self._inherit_attachments(message_id, inherits)
             # JSON-encode + apply each declared state write in the SAME transaction as the outbound
@@ -15486,11 +15496,11 @@ class MessageStore:
         return True
 
     async def _insert_passthrough_marker(
-        self, parent_id: str, pt_name: str, produced: bool, now: float
+        self, parent_id: str, channel_id: str, pt_name: str, produced: bool, now: float
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
-        A single ``stage='outbound'`` row keyed by the PT inbound name, inserted already-terminal: ``done``
+        A single ``stage='outbound'`` row sent to the PT inbound name, inserted already-terminal: ``done``
         when the child was produced (the Send was *delivered* into the PT → the parent finalizes
         ``PROCESSED``, not ``FILTERED``), or ``dead`` when the depth cap was breached (→ the parent
         finalizes ``ERROR``). It is **never claimed** — there is no delivery worker for a PT inbound name,
@@ -15500,7 +15510,11 @@ class MessageStore:
         ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline.
 
         ``handler_name`` carries :data:`PASSTHROUGH_MARKER_HANDLER`, which is how replay, dead-letter
-        replay, resend and the attachment clean-up tell this row from real outbound work (#1580)."""
+        replay, resend and the attachment clean-up tell this row from real outbound work (#1580).
+
+        ``channel_id`` is the parent's inbound, as on every outbound row the handoff writes, and only
+        ``destination_name`` names the PT inbound. So a dead marker is listed and counted in the
+        dead-letter view under the parent's channel scope, never the PT channel's (BACKLOG #5614)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
@@ -15515,7 +15529,7 @@ class MessageStore:
                 marker_id,
                 parent_id,
                 Stage.OUTBOUND.value,
-                pt_name,
+                channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
                 self._cipher.encrypt(
@@ -15524,7 +15538,7 @@ class MessageStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -18965,11 +18979,32 @@ class MessageStore:
             row = await cur.fetchone()
         return int(row["n"]) if row is not None else 0
 
-    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
-        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
-        return await checkpoint_invocations(
-            self._cipher, self.add_cipher_invocations, settle=settle
-        )
+    async def checkpoint_cipher_invocations(
+        self, *, settle: bool = False, strict: bool = False
+    ) -> int | None:
+        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`.
+
+        Takes the writer lock BEFORE the bound's own per-cipher pass lock (BACKLOG #5608). A burst
+        that charges the bound with the writer lock already held, a rotation batch above all, takes
+        the two in that order; a checkpoint taking the pass lock first and then waiting on the writer
+        lock inside its add would deadlock against it. A failed add is rolled back inside the guard,
+        so the bound's own contract decides. One exception: a rollback that outruns its timeout
+        leaves the transaction open, and the guard then raises :class:`UncommittedWriteError`."""
+        if not strict:
+            idle = idle_checkpoint_total(self._cipher, settle=settle)
+            if idle is not None:
+                return idle  # nothing to add, so no reason to queue behind a writer
+        if bounded_cipher(self._cipher) is None:
+            return None
+
+        async def add(key_id: str, count: int) -> int:
+            try:
+                return await self._add_cipher_invocations_locked(key_id, count)
+            except BaseException as exc:
+                await _unwind_and_raise(self._db, exc, role="writer")
+
+        async with _writer_guard(self._db, self._lock):
+            return await checkpoint_invocations(self._cipher, add, settle=settle, strict=strict)
 
     async def reserve_upload_quota(
         self,
@@ -20785,6 +20820,7 @@ class MessageStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
@@ -20816,6 +20852,7 @@ class MessageStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
             )
@@ -20909,10 +20946,12 @@ class MessageStore:
         now: float | None = None,
         anchor: PendingFactorAnchor | None = None,
     ) -> bool:
-        """Stamp a session's second-factor as satisfied (WP-14): at least after a TOTP/recovery
-        verify, a factor enrolment confirm, a passkey assertion (the one caller that passes an
-        ``anchor``), or at issuance for a sign-in that owes no second factor. See
-        :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
+        """Stamp a session's second-factor as satisfied (WP-14), after a factor ceremony: at least a
+        TOTP/recovery verify, a factor enrolment confirm, or a passkey assertion, which passes an
+        ``anchor`` on any session but an OIDC one. Session issuance does not call this;
+        :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
+        (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
+        answer."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):
             written = await self._write_session(token_hash, stamp)
@@ -22107,6 +22146,7 @@ class MessageStore:
 
         # Reads every outbound row the store holds (BACKLOG #1726, left open): no queue index carries
         # updated_at or the (channel, destination) pair, so no rewrite over the existing indexes helps.
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         cur = await db.execute(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -22115,7 +22155,7 @@ class MessageStore:
             " MIN(CASE WHEN status=? THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=? AND updated_at>=? THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=? THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=? GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=? AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             (
                 OutboxStatus.PENDING.value,
                 OutboxStatus.INFLIGHT.value,
@@ -22163,7 +22203,7 @@ class MessageStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            " FROM queue WHERE stage=? AND status=?"
+            f" FROM queue WHERE stage=? AND status=? AND {_NOT_PT_MARKER}"  # BACKLOG #5614
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

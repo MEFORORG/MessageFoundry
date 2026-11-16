@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +73,10 @@ def sandbox(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def run(sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run(
+    sandbox: Path, *args: str, config_root: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """``config_root`` is a root the box-activity reads can find transcripts under."""
     return subprocess.run(
         [
             "pwsh",
@@ -83,7 +88,7 @@ def run(sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
             "-CoordDir",
             str(sandbox / "coord"),
             "-ConfigRoot",
-            str(sandbox / "noroot"),
+            str(config_root or sandbox / "noroot"),
         ],
         capture_output=True,
         text=True,
@@ -253,6 +258,146 @@ class TestTheFourHolds:
         dest = retired_dir(sandbox) / "handoffs"
         assert (dest / "RESUME-HERE.md.zip").is_file()
         assert not (dest / "RESUME-HERE.md").exists()
+
+
+def put_box(sandbox: Path, box: str, age_hours: float = 0.0) -> Path:
+    """A per-box handoff directory holding its own HANDOFF.md, aged by ``age_hours``."""
+    d = sandbox / "coord" / "handoffs" / box
+    d.mkdir(parents=True)
+    doc = d / "HANDOFF.md"
+    doc.write_text("plain body, nothing imperative here\n", encoding="utf-8")
+    if age_hours:
+        when = time.time() - age_hours * 3600
+        os.utime(doc, (when, when))
+    return d
+
+
+class TestPerBoxDirectoriesAreHeld:
+    """BACKLOG #5598. A per-box directory is one entry, ``handoffs/<box>/``, but a seat points at the
+    document INSIDE it, so a pointer keyed by its leaf (``HANDOFF.md``) never named the entry. And
+    the live-box hold read the box's activity with no worktree, so the transcript signal, the one
+    that survives disabled hooks, was never read. Each refusal is paired with the case that moves.
+    """
+
+    def test_a_pointer_into_a_box_directory_holds_the_box(self, sandbox: Path) -> None:
+        put_box(sandbox, "box-aaaa")
+        d = sandbox / "coord" / "seats" / "other-box"
+        d.mkdir(parents=True)
+        # Another spelling of the same path: forward slashes, a different case. Windows paths are
+        # case-insensitive, so this names the same file.
+        pointer = str(sandbox / "coord" / "handoffs" / "BOX-AAAA" / "HANDOFF.md").replace("\\", "/")
+        (d / "sess.json").write_text(
+            json.dumps({"handoff": {"path": pointer, "bytes": 1}}), encoding="utf-8"
+        )
+        proc = run(sandbox, "-Retire", "box-aaaa")
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "POINTED-AT" in proc.stdout
+        assert (sandbox / "coord" / "handoffs" / "box-aaaa" / "HANDOFF.md").is_file()
+
+    def test_a_pointer_through_another_root_still_holds_the_box(self, sandbox: Path) -> None:
+        """Another PC's name for the share does not resolve under this handoffs/, so the segment
+        after the pointer's last ``handoffs`` folder is keyed too."""
+        put_box(sandbox, "box-aaaa")
+        d = sandbox / "coord" / "seats" / "other-box"
+        d.mkdir(parents=True)
+        pointer = r"\\otherhost\Shared\mefor-coord\handoffs\box-aaaa\HANDOFF.md"
+        (d / "sess.json").write_text(
+            json.dumps({"handoff": {"path": pointer, "bytes": 1}}), encoding="utf-8"
+        )
+        proc = run(sandbox, "-Retire", "box-aaaa")
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "POINTED-AT" in proc.stdout
+
+    def test_and_a_box_nobody_points_into_moves(self, sandbox: Path) -> None:
+        """PAIR: a pointer into a DIFFERENT box does not hold this one."""
+        put_box(sandbox, "box-aaaa")
+        put_box(sandbox, "box-bbbb")
+        point_at(sandbox, "box-bbbb/HANDOFF.md")
+        proc = run(sandbox, "-Retire", "box-aaaa")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not (sandbox / "coord" / "handoffs" / "box-aaaa").exists()
+
+    def _live_box(self, sandbox: Path, transcript_age_hours: float) -> Path:
+        """A box whose seat record names its worktree, with no heartbeat and a transcript."""
+        wt = sandbox / "wt-of-box"
+        d = sandbox / "coord" / "seats" / "box-aaaa"
+        d.mkdir(parents=True)
+        (d / "sess.json").write_text(
+            json.dumps({"boxKey": "box-aaaa", "worktree": str(wt), "asOf": "2026-11-14T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        root = sandbox / "cfg"
+        slug = re.sub(r"[:\\/.]", "-", str(wt))
+        proj = root / "projects" / slug
+        proj.mkdir(parents=True)
+        t = proj / "s.jsonl"
+        t.write_text("{}\n", encoding="utf-8")
+        when = time.time() - transcript_age_hours * 3600
+        os.utime(t, (when, when))
+        return root
+
+    def test_a_stale_document_in_a_box_with_a_fresh_transcript_is_held(self, sandbox: Path) -> None:
+        """No heartbeat (hooks off), a transcript an hour old, a document three days old."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=1)
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" in proc.stdout
+
+    _NO_WORKTREE_BODIES = (
+        "null",
+        "",
+        "{}",
+        '{"sessionId": "11111111-2222-3333-4444-555555555555"}',
+        '{"worktree": "   "}',
+        '{"worktree": false}',
+    )
+
+    def _plant_newer(self, sandbox: Path, body: str) -> None:
+        """A seat file in the box, written after the box's real record."""
+        newer = sandbox / "coord" / "seats" / "box-aaaa" / "zz-newer.json"
+        newer.write_text(body, encoding="utf-8")
+        when = time.time() + 60
+        os.utime(newer, (when, when))
+
+    @pytest.mark.parametrize("body", _NO_WORKTREE_BODIES)
+    def test_a_newer_seat_file_naming_no_worktree_does_not_empty_the_box_worktree(
+        self, sandbox: Path, body: str
+    ) -> None:
+        """A newer seat file that parses to null, or names no worktree, does not empty the worktree
+        an older record named. Taken as the box's record, it did, so the fresh transcript went unread
+        and the stale document retired (BACKLOG #5598)."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=1)
+        self._plant_newer(sandbox, body)
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" in proc.stdout
+        assert (sandbox / "coord" / "handoffs" / "box-aaaa" / "HANDOFF.md").is_file()
+
+    @pytest.mark.parametrize("body", _NO_WORKTREE_BODIES)
+    def test_and_the_same_box_moves_once_its_transcript_is_old(
+        self, sandbox: Path, body: str
+    ) -> None:
+        """PAIR: the newer seat file does not hold the box by itself."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=72)
+        self._plant_newer(sandbox, body)
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" not in proc.stdout
+        assert not (sandbox / "coord" / "handoffs" / "box-aaaa").exists()
+
+    def test_and_it_moves_once_the_transcript_is_as_old_as_the_document(
+        self, sandbox: Path
+    ) -> None:
+        """PAIR: the same box, its transcript as old as its document, is not a live box."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=72)
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" not in proc.stdout
+        assert not (sandbox / "coord" / "handoffs" / "box-aaaa").exists()
 
 
 class TestWriteCopiesOneDocumentIn:

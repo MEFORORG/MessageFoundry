@@ -1611,7 +1611,7 @@ async def test_a_pin_refused_open_settles_nothing(tmp_path, monkeypatch) -> None
     open runs settles once."""
     settles: list[bool] = []
 
-    async def record(self: MessageStore, *, settle: bool = False) -> None:
+    async def record(self: MessageStore, *, settle: bool = False, strict: bool = False) -> None:
         settles.append(settle)
 
     async def refused(*_args: object, **_kwargs: object) -> None:
@@ -1629,7 +1629,7 @@ async def test_a_failed_open_after_the_bind_still_settles(tmp_path, monkeypatch)
     settles the block the open reserved, as on main."""
     settles: list[bool] = []
 
-    async def record(self: MessageStore, *, settle: bool = False) -> None:
+    async def record(self: MessageStore, *, settle: bool = False, strict: bool = False) -> None:
         settles.append(settle)
 
     async def boom(self: MessageStore) -> None:

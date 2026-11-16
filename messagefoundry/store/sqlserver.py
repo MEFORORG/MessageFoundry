@@ -177,11 +177,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -1225,17 +1225,25 @@ def _insert_queue_ingress_params(
 
 
 def _insert_marker_params(
-    row_id: str, parent_id: str, pt_name: str, enc_body: str, status: str, now: float
+    row_id: str,
+    parent_id: str,
+    channel_id: str,
+    pt_name: str,
+    enc_body: str,
+    status: str,
+    now: float,
 ) -> tuple[Any, ...]:
-    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (lane = the PT inbound name),
-    # never claimed. Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
-    # ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
-    # produced, DEAD on a depth-cap breach) rather than PENDING.
+    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (its lane, destination_name,
+    # is the PT inbound name), never claimed. ``channel_id`` is the parent's inbound, as on every
+    # outbound row the handoff writes, so a dead marker is scoped to the parent's channel in the
+    # dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the
+    # marker stamp in ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when
+    # the child was produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
         parent_id,
         Stage.OUTBOUND.value,
-        pt_name,
+        channel_id,
         pt_name,
         PASSTHROUGH_MARKER_HANDLER,
         enc_body,
@@ -2634,7 +2642,12 @@ _SCHEMA: list[str] = [
         -- read-then-write atomic. 256 is this file's dominant width (55 uses); the composite
         -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
         -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
-        oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
+        -- BACKLOG #5613: BIN2, so the pair and that index compare case- and accent-exactly, as
+        -- SQLite and Postgres do. Under a case-insensitive default two OIDC subjects differing only in case
+        -- were one key: the second could neither be bound nor sign in. state.[key] says what BIN2
+        -- leaves alone (trailing spaces); the bind refuses a subject with surrounding space.
+        oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL,
+        oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL,
         -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID).
         -- SIZED rather than MAX for this file's ordinary reason (256 is its dominant width), though
         -- nothing here needs it as an index key: the column carries NO uniqueness constraint, so the
@@ -2679,9 +2692,9 @@ _SCHEMA: list[str] = [
     # Federated (issuer, sub) identity keying (BACKLOG #1015): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "not yet federated" (username stays the sole key). Idempotent.
     """IF COL_LENGTH('users','oidc_issuer') IS NULL
-        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
+        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
-        ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+        ALTER TABLE users ADD oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     # Directory-immutable identity binding (BACKLOG #1471): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "no directory binding", and such a row is REFUSED rather
     # than adopted by an AD login presenting an objectGUID -- not byte-identical to before, and that
@@ -2735,9 +2748,9 @@ _SCHEMA: list[str] = [
     #
     # MUST RUN BEFORE the index. _SCHEMA is applied in order, so position here is load-bearing.
     """IF COL_LENGTH('users','oidc_issuer') = -1
-        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) NULL""",
+        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     """IF COL_LENGTH('users','oidc_subject') = -1
-        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) NULL""",
+        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     # The atomicity the application guard cannot provide: auth/service.py reads the current holder and
     # writes the binding in two separate awaits, so two concurrent FIRST logins for one subject can
     # both observe "no holder" and both bind. FILTERED so unfederated rows coexist -- and on SQL Server
@@ -4289,8 +4302,9 @@ class SqlServerStore:
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
                 # itself a large burst. A no-op when the cipher carries no bound (keyless /
-                # `vault_transit`).
-                await store.checkpoint_cipher_invocations()
+                # `vault_transit`). Strict, so the open reads THIS store's row rather than trusting a
+                # figure another handle left in the cipher (BACKLOG #5608).
+                await store.checkpoint_cipher_invocations(strict=True)
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
@@ -7185,12 +7199,18 @@ class SqlServerStore:
         return True
 
     async def _insert_passthrough_marker_mssql(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         SQL Server twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -7202,6 +7222,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7209,7 +7230,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7225,7 +7246,13 @@ class SqlServerStore:
             await self._event(cur, parent_id, "dead", pt_name, "passthrough depth cap", now)
 
     def _insert_passthrough_marker_mssql_sync(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Synchronous twin of :meth:`_insert_passthrough_marker_mssql` (ADR 0071 B5)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
@@ -7235,6 +7262,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7242,7 +7270,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7659,7 +7687,7 @@ class SqlServerStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound**. For each, this produces —
         **in this same transaction** — a new INGRESS-stage child message on the PT channel (a content-
         addressed id; ``RECEIVED`` per count-and-log; correlated to the parent), plus a single already-
-        terminal outbound marker row on *this* (parent) message keyed by the PT inbound name, so the
+        terminal outbound marker row on *this* (parent) message sent to the PT inbound name, so the
         parent finalizes ``PROCESSED`` (delivered into the PT) rather than collapsing to ``FILTERED``. A
         ``correlation_depth`` breach drops the child and dead-letters the parent's marker (``ERROR``).
         Byte-identical to the pre-feature path when ``pt_deliveries`` is empty. Mirrors
@@ -7758,7 +7786,7 @@ class SqlServerStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_mssql(
-                            cur, message_id, pt_name, produced, now
+                            cur, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(cur, message_id, inherits)
@@ -7969,7 +7997,7 @@ class SqlServerStore:
                         inherits,
                     )
                     self._insert_passthrough_marker_mssql_sync(
-                        cur, message_id, pt_name, produced, now
+                        cur, message_id, channel_id, pt_name, produced, now
                     )
                 # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                 self._inherit_attachments_sync(cur, message_id, inherits)
@@ -10084,12 +10112,11 @@ class SqlServerStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(self._cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(self._cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
@@ -10145,8 +10172,9 @@ class SqlServerStore:
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
-        (ASVS 11.3.3) — the single seam every rotation loop funnels through so none can pair a mismatched
-        decrypt/encrypt AAD. Mirrors MessageStore._reencrypt_value."""
+        (ASVS 11.3.3) — the seam every untagged rotation loop funnels through so none can pair a
+        mismatched decrypt/encrypt AAD; the tagged loops use ``reseal_unless_tag_failure``, the same
+        pair (BACKLOG #5610). Mirrors MessageStore._reencrypt_value."""
         return self._cipher.encrypt(self._cipher.decrypt(stored, aad=aad), aad=aad)
 
     async def _reencrypt_identity_composite(
@@ -14175,10 +14203,12 @@ class SqlServerStore:
         )
         return int(row["n"]) if row is not None else 0
 
-    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+    async def checkpoint_cipher_invocations(
+        self, *, settle: bool = False, strict: bool = False
+    ) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
         return await checkpoint_invocations(
-            self._cipher, self.add_cipher_invocations, settle=settle
+            self._cipher, self.add_cipher_invocations, settle=settle, strict=strict
         )
 
     async def audit_anchor(self) -> tuple[int, str]:
@@ -15108,9 +15138,10 @@ class SqlServerStore:
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
-        # rather than the recyclable sAMAccountName. NOTE, as with get_user_by_federated_subject
-        # below, that the comparison is the DATABASE's and this column carries no explicit COLLATE:
-        # under a case-insensitive server default two ids differing only in case would match here.
+        # rather than the recyclable sAMAccountName. NOTE that the comparison is the DATABASE's and
+        # this column carries no explicit COLLATE, unlike the pair get_user_by_federated_subject
+        # below reads, which is BIN2 since BACKLOG #5613. Under a case-insensitive server default
+        # two ids differing only in case would match here.
         # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.
@@ -15119,11 +15150,8 @@ class SqlServerStore:
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
-        # issuer. NOTE the comparison is the DATABASE's, and these columns carry no explicit COLLATE:
-        # under a case-insensitive server default two subjects differing only in case would match
-        # here, which is SAFE for this predicate (it can only refuse MORE) but is the opposite of the
-        # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
-        # `reference_sets.[key]` is the fix if that divergence ever needs closing.
+        # issuer. Case-exact through the columns' BIN2 collation (BACKLOG #5613); the base
+        # protocol's docstring says what that leaves (trailing spaces).
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )
@@ -16273,16 +16301,15 @@ class SqlServerStore:
                     # Nothing written, so nothing is revoked. The rollback frees the connection.
                     await conn.rollback()
                     return None
-                await cur.execute(
-                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
-                    (now, user_id),
-                )
-                revoked = cur.rowcount
+                # Counted from OUTPUT, never cursor.rowcount, which a session-wide SET NOCOUNT ON
+                # reports as -1 (BACKLOG #5625): the count is audited and returned to the caller.
+                await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                revoked = len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return int(revoked) if revoked is not None else 0
+        return revoked
 
     async def clear_user_federated_subject(
         self,
@@ -16350,11 +16377,9 @@ class SqlServerStore:
                         webauthn_enrolled=webauthn_enrolled,
                     )
                 await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
-                await cur.execute(
-                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
-                    (now, user_id),
-                )
-                count = cur.rowcount
+                # From OUTPUT, as set_user_federated_subject counts it (BACKLOG #5625).
+                await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                count = len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -16363,7 +16388,7 @@ class SqlServerStore:
             username=username,
             issuer=issuer,
             subject=subject,
-            sessions_revoked=int(count) if count is not None else 0,
+            sessions_revoked=count,
             totp_enrolled=totp_enrolled,
             webauthn_enrolled=webauthn_enrolled,
         )
@@ -16518,6 +16543,7 @@ class SqlServerStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
@@ -16565,6 +16591,7 @@ class SqlServerStore:
                     seed_reauth=seed_reauth,
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
                     user_epoch=int(rows[0][2]),
                     # BACKLOG #5091: its own statement, after the row lock, for the reason
                     # postgres.py's create_session gives; revoke_all_sessions says why it cannot
@@ -17210,6 +17237,7 @@ class SqlServerStore:
         for cid, (read, errored) in counts.items():
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         dest_rows = await self._fetchall(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -17218,7 +17246,7 @@ class SqlServerStore:
             " MIN(CASE WHEN status=? THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=? AND updated_at>=? THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=? THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=? GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=? AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             (
                 OutboxStatus.PENDING.value,
                 OutboxStatus.INFLIGHT.value,
@@ -17265,7 +17293,7 @@ class SqlServerStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            " FROM queue WHERE stage=? AND status=?"
+            f" FROM queue WHERE stage=? AND status=? AND {_NOT_PT_MARKER}"  # BACKLOG #5614
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

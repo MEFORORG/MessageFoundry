@@ -41,6 +41,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
+    parse_trusted_proxies,
+    peer_is_trusted_proxy,
     peercert_from_ssl_object,
 )
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
@@ -1645,13 +1647,24 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
         if isinstance(stashed, Mapping) and stashed:
             return stashed
     # Fallback: a server/shim that puts the transport directly in scope['transport'].
-    transport = request.scope.get("transport")
+    transport: Any = request.scope.get("transport")
     get_extra_info = getattr(transport, "get_extra_info", None)
     if get_extra_info is None:
         return None
     ssl_object = get_extra_info("ssl_object")
     if ssl_object is None:
         return None
+    # Vault BACKLOG #5628: the shim's proxy rule holds here too. A declared proxy forwards other
+    # callers, so its certificate names none of them.
+    app = request.scope.get("app")
+    proxies = getattr(getattr(app, "state", None), "trusted_proxies", ())
+    if proxies:
+        try:
+            parsed = parse_trusted_proxies(proxies)
+        except ValueError:
+            return None  # a list that cannot be read: deny rather than fail the request
+        if peer_is_trusted_proxy(transport, parsed):
+            return None
     # The same read the shim makes, verified issuer included (BACKLOG #2237).
     return peercert_from_ssl_object(ssl_object)
 

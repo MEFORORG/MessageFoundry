@@ -37,6 +37,7 @@ from tests.test_worktree_remove_path import (
     _git,
     _out,
     build_rig,
+    copy_real_scripts,
     pytestmark,  # noqa: F401  (the same Windows-and-pwsh skip)
     settle_worktrees,
     start_live_process,
@@ -395,8 +396,19 @@ def test_name_refuses_a_target_holding_a_registered_worktree(rig: Rig) -> None:
 # --- vault BACKLOG #2985, part B item 1: a claim that names the PARENT tree ----------------------------
 
 
+@pytest.mark.parametrize(
+    "cache_file",
+    [
+        ".pytest_cache/v/cache/nodeids",
+        # A mypy run rewrites only its own cache (BACKLOG #5603), the cache list
+        # worktree-gates.ps1 Get-WorkingTreeActivity reads too.
+        ".mypy_cache/3.14/cache.db",
+    ],
+)
 @pytest.mark.parametrize("route", ROUTES)
-def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(rig: Rig, route: str) -> None:
+def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(
+    rig: Rig, route: str, cache_file: str
+) -> None:
     """The residue the Lander's review named. A tree two days quiet and clean, whose worker's claim
     names the PARENT tree, was removed with exit 0 while the worker only read files and ran tests:
     no commit, checkout or fetch, so no git state moved. A test run rewrites .pytest_cache, and
@@ -408,11 +420,11 @@ def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(rig: Rig, rou
     parent = rig.add(rig.primary / ".claude" / "worktrees" / "parent")
     wt = _sibling(rig, "reused")
     _claim(rig, "9301", parent)
-    nodeids = wt / ".pytest_cache" / "v" / "cache" / "nodeids"
+    nodeids = wt / cache_file
     nodeids.parent.mkdir(parents=True)
     nodeids.write_text("[]\n", encoding="utf-8")
     settle_worktrees(rig.primary)
-    # What the worker's test run leaves behind, and nothing else.
+    # What the worker's run leaves behind, and nothing else.
     nodeids.write_text('["tests/test_x.py::test_y"]\n', encoding="utf-8")
 
     proc = rig.run(*_target(route, wt), "-Force", settle=False)
@@ -424,6 +436,29 @@ def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(rig: Rig, rou
 
     # Control: the same tree once the cache is as old as the rest.
     proc = rig.run(*_target(route, wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_an_unset_cache_list_refuses(rig: Rig) -> None:
+    """BACKLOG #5603. The caches to date come from worktree-gates.ps1. Lost, the loop would date no
+    cache, so a tree a test run just wrote to would read quiet: the script refuses instead."""
+    wt = _sibling(rig, "nolist")
+    copy_real_scripts(rig.root / "copy")
+    gates = rig.root / "copy" / "scripts" / "worktree" / "worktree-gates.ps1"
+    src = gates.read_text(encoding="utf-8")
+    line = re.search(r"^\$WORKING_TREE_ACTIVITY_CACHES = .*$", src, re.M)
+    assert line, "the instrument found no list to unset"
+    gates.write_text(src.replace(line.group(0), "$WORKING_TREE_ACTIVITY_CACHES = @()"), "utf-8")
+
+    script = rig.root / "copy" / "scripts" / "worktree" / "remove.ps1"
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode != 0
+    assert "list of caches to date" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: the real list, and the same tree is removed.
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

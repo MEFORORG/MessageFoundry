@@ -1333,6 +1333,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.set_ciphersuites()",
             "tls_context:.verify_flags |=",
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_LEAF",
+            # Vault BACKLOG #5627: harden_crl_check(chain=True), the API listener's whole-chain CRL.
+            "tls_context:.verify_flags |= VERIFY_CRL_CHECK_CHAIN",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",
@@ -1658,8 +1660,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
-    # tag its row's routing fields build.
-    "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
+    # tag its row's routing fields build. BACKLOG #5610: reseal_unless_tag_failure re-seals a rotated
+    # tagged cell under the active key with the same tag (AES-GCM encrypt through the store cipher).
+    "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()", "cipher:.encrypt()"}),
     # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed,
     # several per call to a batch cipher (decrypt_many, vault BACKLOG #6706), else one at a time
     # through store.crypto's decrypt_or_error.

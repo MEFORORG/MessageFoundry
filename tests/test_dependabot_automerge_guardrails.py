@@ -33,7 +33,10 @@ true, so the day someone widens it, a test has to be edited deliberately.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
+import functools
+import itertools
 import os
 import re
 import shutil
@@ -80,8 +83,14 @@ _ENV_REF = re.compile(r"\$\{?([A-Z][A-Z0-9_]*)\}?")
 _RUNNER_PROVIDED = frozenset({"GITHUB_OUTPUT"})
 
 
-def _load() -> dict:
+@functools.cache
+def _parsed() -> dict:
     return yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def _load() -> dict:
+    # Parsed once; each caller gets its own copy, so no test can change what another reads.
+    return copy.deepcopy(_parsed())
 
 
 def _steps() -> list[dict]:
@@ -372,10 +381,7 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     """The merge step's ``if`` must require the allow-set guard AND the two security-track guards,
     while still invoking ``gh pr merge --auto`` for the eligible path."""
     steps = _steps()
-    merge = next((s for s in steps if "gh pr merge --auto" in str(s.get("run", ""))), None)
-    assert merge is not None, (
-        "the gh pr merge --auto step was removed (auto-merge must be preserved)"
-    )
+    merge = _merge_step()
     cond = str(merge.get("if", ""))
     assert "steps.allowset.outputs.eligible == 'true'" in cond, (
         "merge not gated on the allow-set guard"
@@ -403,6 +409,318 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     text = _WORKFLOW.read_text(encoding="utf-8")
     assert "steps.denylist" not in text, "dangling reference to the removed deny-list step"
     assert not any(s.get("id") == "denylist" for s in steps), "the deny-list step is still present"
+
+
+# THE SUBSTRING CHECKS ABOVE CANNOT SEE THE OPERATORS BETWEEN THE GUARDS (BACKLOG #5605). Swap one
+# `&&` for `||`, drop the dev-only scoping of a minor bump, or move a parenthesis, and every substring
+# is still present. So the merge condition is EVALUATED, over every combination of the outputs it
+# reads, and compared with the policy stated once in `_merge_policy`. The evaluator covers only the
+# expression subset GitHub documents and this workflow uses; anything else fails the parse, so a
+# condition rewritten in another form has to extend it here rather than pass unread.
+
+_EXPR_TOKEN = re.compile(
+    r"\s*(?:(?P<op>==|!=|&&|\|\||[()!])|'(?P<str>(?:[^']|'')*)'|(?P<ref>[A-Za-z_][\w.\-]*))"
+)
+
+
+@functools.cache
+def _tokenize_expression(text: str) -> tuple[tuple[str, str], ...]:
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    text = text.strip()
+    while pos < len(text):
+        m = _EXPR_TOKEN.match(text, pos)
+        assert m and m.end() > pos, f"unparsed expression text at {text[pos:]!r}"
+        pos = m.end()
+        if m.group("op"):
+            tokens.append(("op", m.group("op")))
+        elif m.group("str") is not None:
+            tokens.append(("str", m.group("str").replace("''", "'")))
+        else:
+            ref = m.group("ref")
+            assert ref not in {"true", "false", "null"}, f"unsupported literal {ref!r}"
+            tokens.append(("ref", ref))
+    return tuple(tokens)
+
+
+def _evaluate_expression(text: str, context: dict[str, str]) -> bool:
+    """Evaluate an Actions ``if:`` as GitHub does for this subset: ``==``/``!=`` compare strings
+    case-insensitively, ``&&``/``||``/``!`` coerce to truthiness, and an output that is not set (its
+    step was skipped) reads as the empty string, which is falsy."""
+    tokens = _tokenize_expression(text)
+    at = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[at] if at < len(tokens) else None
+
+    def take(expected: str | None = None) -> tuple[str, str]:
+        nonlocal at
+        tok = peek()
+        assert tok is not None, f"expression ended early: {text!r}"
+        if expected is not None:
+            assert tok == ("op", expected), f"expected {expected!r}, got {tok!r} in {text!r}"
+        at += 1
+        return tok
+
+    def primary() -> str | bool:
+        tok = take()
+        if tok == ("op", "("):
+            value = disjunction()
+            take(")")
+            return value
+        if tok == ("op", "!"):
+            return not bool(primary())
+        if tok[0] == "str":
+            return tok[1]
+        if tok[0] == "ref":
+            return context.get(tok[1], "")
+        raise AssertionError(f"unexpected token {tok!r} in {text!r}")
+
+    def comparison() -> str | bool:
+        left = primary()
+        tok = peek()
+        if tok in (("op", "=="), ("op", "!=")):
+            take()
+            right = primary()
+            assert isinstance(left, str) and isinstance(right, str), f"non-string compare: {text!r}"
+            equal = left.casefold() == right.casefold()
+            return equal if tok[1] == "==" else not equal
+        return left
+
+    def conjunction() -> str | bool:
+        value = comparison()
+        while peek() == ("op", "&&"):
+            take()
+            right = comparison()
+            value = bool(value) and bool(right)
+        return value
+
+    def disjunction() -> str | bool:
+        value = conjunction()
+        while peek() == ("op", "||"):
+            take()
+            right = conjunction()
+            value = bool(value) or bool(right)
+        return value
+
+    result = disjunction()
+    assert at == len(tokens), f"trailing tokens {tokens[at:]!r} in {text!r}"
+    return bool(result)
+
+
+_TRI = ("true", "false", "")
+
+
+def _merge_policy(c: dict[str, str]) -> bool:
+    """The merge policy, stated once: on the allow-set; a Dependabot push of one Dependabot commit
+    at the pinned head (BACKLOG #5593); a security-track PR also needs a confirmed advisory AND an
+    aged release; any patch, or a minor bump of a DEVELOPMENT dependency only."""
+    on_allow_set = c["steps.allowset.outputs.eligible"] == "true"
+    sole_author = c["steps.authors.outputs.sole_author"] == "true"
+    security_ok = c["steps.ghsa.outputs.security_track"] != "true" or (
+        c["steps.ghsa.outputs.advisory_ok"] == "true" and c["steps.age.outputs.age_ok"] == "true"
+    )
+    update = c["steps.meta.outputs.update-type"]
+    in_scope = update == "version-update:semver-patch" or (
+        update == "version-update:semver-minor"
+        and c["steps.meta.outputs.dependency-type"] == "direct:development"
+    )
+    return on_allow_set and sole_author and security_ok and in_scope
+
+
+def _merge_contexts() -> list[dict[str, str]]:
+    axes = {
+        "steps.allowset.outputs.eligible": _TRI,
+        "steps.authors.outputs.sole_author": _TRI,
+        "steps.ghsa.outputs.security_track": _TRI,
+        "steps.ghsa.outputs.advisory_ok": _TRI,
+        "steps.age.outputs.age_ok": _TRI,
+        "steps.meta.outputs.update-type": (
+            "version-update:semver-patch",
+            "version-update:semver-minor",
+            "version-update:semver-major",
+            "",
+        ),
+        "steps.meta.outputs.dependency-type": ("direct:development", "direct:production", ""),
+    }
+    return [dict(zip(axes, combo, strict=True)) for combo in itertools.product(*axes.values())]
+
+
+_GH_PR_MERGE = re.compile(r"gh pr merge[^;\n]*")
+
+# The two bodies that run `gh pr merge`, pinned WHOLE (BACKLOG #5593, #5605). A check on the
+# gh calls alone sees only the spellings it knows, so any edit to either body has to edit this
+# text deliberately, as the one-line pin of the arm body this replaced did.
+_ARM_BODY = (
+    "set -u\n"
+    'if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"; then\n'
+    "  exit 0\n"
+    "fi\n"
+    'now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || '
+    'now="ERR"\n'
+    'case "$now" in *[!0-9a-f]*) now_ok=false ;; *) now_ok=true ;; esac\n'
+    '[ "${#now}" -eq 40 ] || now_ok=false\n'
+    'if [ "$now_ok" != true ]; then\n'
+    '  echo "::error::arming failed and the PR head could not be read (got '
+    "'${now}').\"\n"
+    "  exit 1\n"
+    "fi\n"
+    'if [ "$now" != "$HEAD_SHA" ]; then\n'
+    '  echo "::notice::the head moved from $HEAD_SHA to $now while this run '
+    'evaluated; the run for the new head decides."\n'
+    "  exit 0\n"
+    "fi\n"
+    'echo "::error::arming failed on the head this run evaluated."\n'
+    "exit 1\n"
+)
+
+_DISARM_BODY = (
+    "set -u\n"
+    "# `||` outside the substitution, for the reason the ghsa step gives: `gh` "
+    "writes an error\n"
+    "# body to stdout, and the shape check below must see the sentinel, not that "
+    "body.\n"
+    'armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq \'.autoMergeRequest '
+    '!= null\' 2>/dev/null)" || armed="ERR"\n'
+    'case "$armed" in\n'
+    "  false)\n"
+    '    echo "::notice::no auto-merge request is armed on this PR (a merge-queue '
+    'entry is not read here)."\n'
+    "    exit 0\n"
+    "    ;;\n"
+    "  true) ;;\n"
+    "  *)\n"
+    '    # Unknown is not "not armed": an arm on an earlier head may still be live, '
+    "so disarm\n"
+    "    # anyway. The read-back below decides whether the job passes.\n"
+    "    echo \"::warning::could not read this PR's auto-merge state \u2014 disarming "
+    'anyway."\n'
+    "    ;;\n"
+    "esac\n"
+    'gh pr merge --disable-auto "$PR_URL"\n'
+    'after="$(gh pr view "$PR_URL" --json autoMergeRequest --jq \'.autoMergeRequest '
+    '!= null\' 2>/dev/null)" || after="ERR"\n'
+    'if [ "$after" != "false" ]; then\n'
+    "  echo \"::error::auto-merge still reads '${after}' after the disarm \u2014 failing "
+    'closed, nothing re-arms."\n'
+    "  exit 1\n"
+    "fi\n"
+    'echo "::warning::disarmed auto-merge armed on an earlier head; it re-arms only '
+    'if the guardrails admit this head."\n'
+)
+
+
+def _merge_step() -> dict:
+    """The one step that ARMS auto-merge, found with its whitespace collapsed."""
+    arms = [s for s in _steps() if "gh pr merge --auto" in " ".join(str(s.get("run", "")).split())]
+    assert len(arms) == 1, f"expected exactly one arming gh pr merge step, found {len(arms)}"
+    return arms[0]
+
+
+def test_one_step_arms_in_the_arming_job_and_the_disarm_step_only_disarms() -> None:
+    """Exactly two steps run ``gh pr merge``: the arm step, in the ``auto-merge`` job, and the
+    ``disarm`` job's step (BACKLOG #5593), whose every ``gh pr merge`` call may only DISARM. A third
+    ``gh pr merge`` step, or an arm call inside the disarm step, fails here, so neither role can
+    hide behind the other."""
+    merges = [s for s in _steps() if "gh pr merge" in " ".join(str(s.get("run", "")).split())]
+    assert len(merges) == 2, f"expected exactly two gh pr merge steps, found {len(merges)}"
+    disarm = _step("disarm")
+    assert disarm in merges, "the disarm step no longer runs gh pr merge"
+    assert disarm["run"] == _DISARM_BODY, "the disarm body changed; re-read it and edit the pin"
+    assert _GH_PR_MERGE.findall(_DISARM_BODY) == ['gh pr merge --disable-auto "$PR_URL"']
+    assert _merge_step() in _load()["jobs"]["auto-merge"]["steps"], "the arm step left the job"
+
+
+def test_the_arming_job_runs_only_its_known_steps() -> None:
+    """The job holding ``contents: write`` runs these steps and no others, and the one action it
+    uses is fetch-metadata, so a NEW step, an unconditioned third-party arm action for one, cannot
+    be added unread. What an existing step's body calls is not limited here."""
+    steps = _load()["jobs"]["auto-merge"]["steps"]
+    assert [s.get("id") for s in steps] == ["meta", "allowset", "ghsa", "age", "authors", None]
+    uses = [str(s["uses"]) for s in steps if "uses" in s]
+    assert len(uses) == 1 and uses[0].startswith("dependabot/fetch-metadata@"), uses
+
+
+def test_the_merge_condition_evaluates_to_the_policy_over_every_input() -> None:
+    cond = str(_merge_step().get("if", ""))
+    assert cond, "the merge step has no if:, so it merges every Dependabot PR"
+    # Five tri-state axes, four update types and three dependency types: 3**5 * 4 * 3. An empty
+    # product would leave `wrong` empty and pass the absence assertion below on nothing.
+    contexts = _merge_contexts()
+    assert len(contexts) >= 2916, f"only {len(contexts)} merge contexts; expected 2916"
+    wrong = [c for c in contexts if _evaluate_expression(cond, c) != _merge_policy(c)]
+    assert not wrong, (
+        f"the merge condition disagrees with the policy on {len(wrong)} input combinations; "
+        f"first: {wrong[0]} (condition says {_evaluate_expression(cond, wrong[0])})"
+    )
+
+
+def test_the_expression_evaluator_can_tell_a_loosened_condition_apart() -> None:
+    """The instrument check for the test above: each loosening the row names must disagree."""
+    cond = str(_merge_step().get("if", ""))
+    loosened = {
+        "operator swapped": cond.replace(
+            "steps.allowset.outputs.eligible == 'true' &&",
+            "steps.allowset.outputs.eligible == 'true' ||",
+            1,
+        ),
+        # `>-` keeps the newline before a more-indented line, so match any whitespace.
+        "dev-only minor scoping dropped": re.sub(
+            r"\s*&&\s*steps\.meta\.outputs\.dependency-type == 'direct:development'",
+            "",
+            cond,
+            count=1,
+        ),
+        "equality inverted": cond.replace("advisory_ok == 'true'", "advisory_ok != 'true'", 1),
+        "Dependabot-push gate dropped": re.sub(
+            r"steps\.authors\.outputs\.sole_author == 'true'\s*&&\s*", "", cond, count=1
+        ),
+    }
+    contexts = _merge_contexts()
+    for label, variant in loosened.items():
+        assert variant != cond, f"the {label} mutation no longer applies to the condition text"
+        assert any(_evaluate_expression(variant, c) != _merge_policy(c) for c in contexts), (
+            f"the evaluator could not tell the {label} condition from the policy"
+        )
+
+
+def test_the_job_runs_only_for_dependabot_authored_prs() -> None:
+    job = _load()["jobs"]["auto-merge"]
+    cond = str(job.get("if", ""))
+    assert cond, "the auto-merge job has no if:, so it runs for every pull request"
+    for login, expected in (("dependabot[bot]", True), ("someone", False), ("", False)):
+        got = _evaluate_expression(cond, {"github.event.pull_request.user.login": login})
+        assert got is expected, f"job if: {cond!r} gives {got} for author {login!r}"
+
+
+def test_the_merge_step_squashes_the_triggering_pr_and_nothing_else() -> None:
+    """The arm body is the pinned text and nothing else: its one arm call is a head-pinned squash
+    of the triggering PR. The env holds only the PR, the evaluated head and the token."""
+    merge = _merge_step()
+    assert merge["run"] == _ARM_BODY, "the arm body changed; re-read it and edit the pin"
+    assert _GH_PR_MERGE.findall(_ARM_BODY) == [
+        'gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"'
+    ]
+    env = merge.get("env") or {}
+    assert env == {
+        "PR_URL": "${{ github.event.pull_request.html_url }}",
+        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    }, env
+
+
+def test_the_token_permissions_are_exactly_what_each_job_needs() -> None:
+    """Nothing at workflow level, and each job names its own set: the arming job the three it needs,
+    the disarm job (BACKLOG #5593) no write to contents. A job this map does not name fails, so a new
+    job cannot inherit or declare a grant unread."""
+    doc = _load()
+    assert doc.get("permissions") == {}, doc.get("permissions")
+    expected = {
+        "auto-merge": {"contents": "write", "pull-requests": "write", "security-events": "read"},
+        "disarm": {"contents": "read", "pull-requests": "write"},
+    }
+    got = {name: job.get("permissions") for name, job in doc["jobs"].items()}
+    assert got == expected, got
 
 
 def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
@@ -950,7 +1268,7 @@ def test_merge_step_pins_the_evaluated_head() -> None:
     Without it GitHub arms auto-merge on whatever the head is when the call lands, which can be a
     commit pushed after the guardrails evaluated the earlier one.
     """
-    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    merge = _merge_step()
     run = str(merge["run"])
     assert '--match-head-commit "$HEAD_SHA"' in run, f"the arm call is not head-pinned: {run!r}"
     assert "${{" not in run, "the merge body interpolates an Actions expression; pass it via env:"
@@ -1199,7 +1517,7 @@ def test_merge_step_passes_only_a_head_moved_refusal(
     label: str, arm_ok: bool, head: str | None, rc: int, tmp_path: Path
 ) -> None:
     """The benign race (a push while this run evaluated) is not a red run; anything else is."""
-    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    merge = _merge_step()
     bash = require_bash(tmp_path)
     script = tmp_path / "merge.sh"
     script.write_text(str(merge["run"]), encoding="utf-8", newline="\n")

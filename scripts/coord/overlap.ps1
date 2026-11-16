@@ -591,9 +591,13 @@ function Build-Map {
         # EVERY INPUT THE COMMITTED HALF READS GOES IN THE KEY, or the memo answers a question it was
         # not asked. Those inputs are exactly three commit ids plus the one flag that decides whether
         # the third diff runs at all. Any of them unknown yields an empty key, which means "compute it".
+        #
+        # The leading `nrz|` names the diff FORM (--no-renames -z, see the committed half below). An
+        # entry written by the earlier form is a different answer for the same commits -- it dropped a
+        # renamed-away path and C-quoted a non-ASCII one -- so it must never be read back as this one.
         $key = ""
         if ($originMain -and $w.Head -and $myHead) {
-            $key = "$originMain|$($w.Head)|$myHead|$(if ($mayHaveMine) { 1 } else { 0 })"
+            $key = "nrz|$originMain|$($w.Head)|$myHead|$(if ($mayHaveMine) { 1 } else { 0 })"
         }
         $jobs += [pscustomobject]@{
             Path = $w.Path; Branch = $w.Branch; Norm = $norm; Key = $key
@@ -641,18 +645,31 @@ function Build-Map {
             # squash, rebase and merge-commit alike. Measured 2026-07-30: two landed branches claimed 8
             # and 4 files under three-dot and 0 under the intersection, while every branch with real
             # outstanding work was unchanged (101/101, 21/21, 11/11).
+            #
+            # --no-renames -z ON ALL THREE, for the two reasons the dirty half below already answers.
+            # Rename detection is ON by default (diff.renames), and a detected rename lists only its
+            # DESTINATION -- so a peer that committed `git mv old new` would not be reported against
+            # `old`, the path it emptied. And --name-only C-quotes a non-ASCII path (core.quotePath),
+            # so the committed half would never equal the raw path a caller asks about. Both fail by
+            # under-reporting, which prints nothing. --no-renames lists a rename as a delete plus an
+            # add, so both sides arrive; -z emits every path raw. The -join restores a path that holds
+            # a newline before the NUL split, as for the status read below. BACKLOG #5600.
+            function Get-DiffNames([string]$Path, [string]$Range) {
+                $raw = @(& git -C $Path diff --no-renames --name-only -z $Range 2>$null)
+                return @(($raw -join "`n") -split "`0" | Where-Object { $_ })
+            }
             if ($null -ne $Job.Memo) { $r.Committed = @($Job.Memo) }
             else {
                 $files = @()
                 $ok = $true
-                $authored = @(& git -C $Job.Path diff --name-only origin/main...HEAD 2>$null)
+                $authored = @(Get-DiffNames $Job.Path 'origin/main...HEAD')
                 if ($LASTEXITCODE -ne 0) { $ok = $false }
                 # An EMPTY authored set makes both remaining terms dead: an intersection with nothing is
                 # nothing, and the third term can only shrink it further. Skipping them is not a
                 # heuristic or a sampling trade -- it is the same answer for two fewer git processes,
                 # and process count is what this walk costs. Measured 2026-08-30: 33 of 162 worktrees.
                 if ($ok -and $authored.Count -gt 0) {
-                    $outstanding = @(& git -C $Job.Path diff --name-only origin/main..HEAD 2>$null)
+                    $outstanding = @(Get-DiffNames $Job.Path 'origin/main..HEAD')
                     if ($LASTEXITCODE -eq 0) {
                         $still = [System.Collections.Generic.HashSet[string]]::new(
                             [string[]]$outstanding, [System.StringComparer]::Ordinal)
@@ -692,7 +709,7 @@ function Build-Map {
                     # leaves the wider set -- the same choice the two-dot fallback makes, for the same
                     # reason: an over-report is loud and annoying, an under-report is a silent collision.
                     if ($Job.MyHead -and $files.Count -gt 0 -and $Job.MayHaveMine) {
-                        $beyondMine = @(& git -C $Job.Path diff --name-only "$($Job.MyHead)...HEAD" 2>$null)
+                        $beyondMine = @(Get-DiffNames $Job.Path "$($Job.MyHead)...HEAD")
                         if ($LASTEXITCODE -eq 0) {
                             $theirs = [System.Collections.Generic.HashSet[string]]::new(
                                 [string[]]$beyondMine, [System.StringComparer]::Ordinal)

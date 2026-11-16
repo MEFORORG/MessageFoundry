@@ -599,9 +599,6 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
 
 _FLOOR_CALLS = frozenset({"_second_factor_too_early", "_enrolment_too_early"})
 _STAMP = "mark_session_mfa_verified"
-#: Stamps a session's factor at its mint, where no sign-in precedes it, so there is no pair to floor.
-#: Named here so the test fails if it goes, rather than keep an exemption nobody needs.
-_STAMPS_AT_MINT = frozenset({"_issue_session"})
 
 
 @functools.cache
@@ -627,7 +624,7 @@ def _unfloored_legs(tree: ast.Module) -> tuple[set[str], list[str]]:
     The guard must be a statement of the function's OWN body, not one nested in a branch, a loop,
     a ``try`` or an inner function, and it must come before the function's first stamp in source
     order, so it runs on every path that reaches a stamp. Direct stamps only: a stamp through a
-    helper is not followed, because the mint is such a helper and every sign-in calls it. Nor is
+    helper is not followed, so a helper's callers do not each count as stamping. Nor is
     what the guard's body returns read, so a body that returns into a stamping helper passes."""
     first_stamp = {
         node.name: min(call.lineno for call in sites)
@@ -637,7 +634,7 @@ def _unfloored_legs(tree: ast.Module) -> tuple[set[str], list[str]]:
     }
     unfloored = [
         name
-        for name in sorted(first_stamp.keys() - _STAMPS_AT_MINT)
+        for name in sorted(first_stamp)
         if not any(
             _is_floor_guard(stmt) and stmt.lineno < first_stamp[name]
             for stmt in named_func(tree, name).body
@@ -654,7 +651,9 @@ def test_every_leg_that_stamps_a_sessions_factor_asks_the_floor_first() -> None:
     ``tests/test_auth_session_lifecycle.py`` follows stamps through helpers for its own question,
     which ceremonies stamp."""
     stamping, unfloored = _unfloored_legs(parse_source(_service_source()))
-    assert stamping >= _STAMPS_AT_MINT, "the mint no longer stamps; drop its exemption"
+    # BACKLOG #5624: the mint stamps a factor in its own INSERT now, not through a second write, so
+    # it holds no exemption here, and a stamp added back to it would have to pass the floor.
+    assert "_issue_session" not in stamping
     # Positive control: the four factor legs the floor was built for are found, so an empty walk
     # cannot pass.
     assert {

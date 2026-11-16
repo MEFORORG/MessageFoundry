@@ -823,7 +823,34 @@ SITES: dict[str, Site] = {
         "Fixed lock and marker names inside directories listed by this module's own prefix, after "
         "link and owner checks.",
     ),
-    "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(1, INTERNAL, _STAGING),
+    "messagefoundry/pipeline/dr_backup.py::_teardown_staging": Site(
+        3,
+        INTERNAL,
+        "Fixed lock and marker names, and the names of files a restore spared, inside a staging "
+        "directory; lstat'ed, read or created unfollowed.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_spare_records": Site(
+        2,
+        INTERNAL,
+        "The names of files a restore spared, and their markers, inside a staging directory this "
+        "module created; lstat'ed and read only.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place._is_spared": Site(
+        1,
+        INTERNAL,
+        "A spare marker's name, listed by the fail-safe's own walk at the top of a restore's "
+        "staging directory, lstat'ed as a plain file (_not_a_plain_marker) and read only.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_spare_marker": Site(
+        1, INTERNAL, "A fixed suffix on the name of a file in a staging directory this module made."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_spared_items": Site(
+        2,
+        INTERNAL,
+        "Names listed from, or spared by this module's restore in, a staging directory this "
+        "module created; a marker is lstat'ed as a plain file (_not_a_plain_marker) and read only.",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_withhold_from_sweep": Site(1, INTERNAL, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_tree_size": Site(
         1, INTERNAL, "Names from walking a directory this module measures; lstat only."
     ),

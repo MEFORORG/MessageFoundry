@@ -185,11 +185,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -1582,7 +1582,7 @@ _PG_SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
     " user_epoch, global_epoch, seal)"
-    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11,$12)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12,$13)"
 )
 _PG_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
@@ -2222,8 +2222,9 @@ class PostgresStore:
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
                 # itself a large burst. A no-op when the cipher carries no bound (keyless /
-                # `vault_transit`).
-                await store.checkpoint_cipher_invocations()
+                # `vault_transit`). Strict, so the open reads THIS store's row rather than trusting a
+                # figure another handle left in the cipher (BACKLOG #5608).
+                await store.checkpoint_cipher_invocations(strict=True)
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
@@ -3847,12 +3848,11 @@ class PostgresStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(cipher, r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 async with self._timed_acquire() as conn, conn.transaction():
                     for new_value, rid in updates:
@@ -4110,8 +4110,9 @@ class PostgresStore:
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
-        (ASVS 11.3.3) — the single seam every rotation loop funnels through so none can accidentally pair a
-        mismatched decrypt/encrypt AAD. Mirrors MessageStore._reencrypt_value."""
+        (ASVS 11.3.3) — the seam every untagged rotation loop funnels through so none can pair a
+        mismatched decrypt/encrypt AAD; the tagged loops use ``reseal_unless_tag_failure``, the same
+        pair (BACKLOG #5610). Mirrors MessageStore._reencrypt_value."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
     # --- internal write helpers ----------------------------------------------
@@ -4508,12 +4509,18 @@ class PostgresStore:
         return True
 
     async def _insert_passthrough_marker_pg(
-        self, conn: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        conn: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         Postgres twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -4530,7 +4537,7 @@ class PostgresStore:
             marker_id,
             parent_id,
             Stage.OUTBOUND.value,
-            pt_name,
+            channel_id,
             pt_name,
             PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
             self._cipher.encrypt(
@@ -4539,7 +4546,7 @@ class PostgresStore:
                     row_id=marker_id,
                     message_id=parent_id,
                     stage=Stage.OUTBOUND.value,
-                    channel_id=pt_name,
+                    channel_id=channel_id,
                     destination_name=pt_name,
                     handler_name=PASSTHROUGH_MARKER_HANDLER,
                     body_ref=None,
@@ -4864,7 +4871,7 @@ class PostgresStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound** (not an outbound). For
         each, this produces — **in this same transaction** — a new INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to the parent),
-        plus a single already-terminal outbound marker row on *this* (parent) message keyed by the PT
+        plus a single already-terminal outbound marker row on *this* (parent) message sent to the PT
         inbound name, so the parent finalizes ``PROCESSED`` (the Send was delivered into the PT) rather
         than collapsing to ``FILTERED``. A ``correlation_depth`` breach drops the child and dead-letters
         the parent's marker (``ERROR``). Byte-identical to the pre-feature path when ``pt_deliveries`` is
@@ -4930,7 +4937,7 @@ class PostgresStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_pg(
-                            conn, message_id, pt_name, produced, now
+                            conn, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(conn, message_id, inherits)
@@ -9838,10 +9845,12 @@ class PostgresStore:
         )
         return int(row["n"]) if row is not None else 0
 
-    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+    async def checkpoint_cipher_invocations(
+        self, *, settle: bool = False, strict: bool = False
+    ) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
         return await checkpoint_invocations(
-            self._cipher, self.add_cipher_invocations, settle=settle
+            self._cipher, self.add_cipher_invocations, settle=settle, strict=strict
         )
 
     async def audit_anchor(self) -> tuple[int, str]:
@@ -11296,6 +11305,7 @@ class PostgresStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
@@ -11339,6 +11349,7 @@ class PostgresStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
                 user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A
@@ -12154,6 +12165,7 @@ class PostgresStore:
         for cid, (read, errored) in counts.items():
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         dest_rows = await self._fetchall(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN ($1,$2) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -12162,7 +12174,7 @@ class PostgresStore:
             " MIN(CASE WHEN status=$7 THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=$8 AND updated_at>=$9 THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=$10 THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=$11 GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=$11 AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             OutboxStatus.PENDING.value,
             OutboxStatus.INFLIGHT.value,
             OutboxStatus.DONE.value,
@@ -12209,7 +12221,8 @@ class PostgresStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2}"
+            # A pass-through marker is not a delivery (BACKLOG #5614).
+            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2} AND {_NOT_PT_MARKER}"
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

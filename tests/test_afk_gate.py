@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,15 +83,38 @@ def rec(kind: str = "decision", at: datetime | None = None, **fields: Any) -> di
     return base
 
 
-def calibrated(seat: str) -> list[dict[str, Any]]:
-    """60 Class B decisions by ``seat``, 20 days old, each rated agree: calibrated, all on one day
-    so the gate reads one more issue for them, and outside the 14-day reversal window."""
-    decided = [rec(at=ago(days=20, minutes=i), seat=seat, item="calib") for i in range(60)]
+def _rated(
+    seat: str,
+    days: int,
+    disagree: tuple[int, ...] = (),
+    count: int = 60,
+    start: int = 0,
+    stride: int = 1,
+) -> list[dict[str, Any]]:
+    """``count`` Class B decisions by ``seat``, ``days`` old, each rated, the ``disagree`` indexes
+    rated disagree and the rest agree. Index ``i`` takes minute slot ``start + stride * i``: its
+    RATING falls that many minutes plus one after the ``days`` mark, so ratings run oldest first and
+    two calls with stride 2 and starts 0 and 1 interleave; its DECISION falls that many minutes
+    before it, so decisions run newest first. Calibration orders by the rating."""
+    slots = [start + stride * i for i in range(count)]
+    decided = [rec(at=ago(days=days, minutes=m), seat=seat, item="calib") for m in slots]
     rated = [
-        rec("rating", at=ago(days=20, minutes=-1 - i), seat="owner", ref=d["id"], rating="agree")
+        rec(
+            "rating",
+            at=ago(days=days, minutes=-1 - slots[i]),
+            seat="owner",
+            ref=d["id"],
+            rating="disagree" if i in disagree else "agree",
+        )
         for i, d in enumerate(decided)
     ]
     return decided + rated
+
+
+def calibrated(seat: str) -> list[dict[str, Any]]:
+    """60 Class B decisions by ``seat``, 20 days old, each rated agree: calibrated, all on one day
+    so the gate reads one more issue for them, and outside the 14-day reversal window."""
+    return _rated(seat, 20)
 
 
 def reversal(decision: dict[str, Any], at: datetime, by: str = "lander") -> dict[str, Any]:
@@ -1046,6 +1070,183 @@ def test_a_reversal_of_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> 
     assert code == REVIEW and "the log does not hold and names no item" in why(doc)
 
 
+# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT FOR REVERSALS AND OWNER-RATING BREACHES,
+# NOT SAMPLES (BACKLOG #5604, #5597; owner ruling 2026-11-15, option c). A decision logged as `mgr`
+# is the manager's, so its reversal is charged to the manager's budget and rate, and an owner-rating
+# breach under any name of the seat closes every name of it. Its CALIBRATION SAMPLES are its own:
+# pooling them would let a name with no record of its own borrow its seat's calibration.
+
+
+def test_an_alias_keeps_its_own_samples_and_takes_its_seats_breach(sb: Sandbox) -> None:
+    """Option c in one place: `mgr`'s own calibrated 60 do not save it from the manager's breach,
+    and `manager2`, with no samples of its own, does not borrow the calibrated manager's."""
+    seed_vault(sb, calibrated("mgr") + calibrated("builder"))
+    assert gate(sb, seat="mgr")[0] == NO_REVIEW, "the control: mgr's own 60 calibrate it"
+    seed_vault(sb, calibrated("manager"))
+    assert gate(sb)[0] == NO_REVIEW, "the control: the manager itself is calibrated"
+    code, doc = gate(sb, seat="manager2")
+    assert code == REVIEW, why(doc)
+    assert "manager2's Class B is not calibrated (review path, 0/60 samples" in why(doc), why(doc)
+    seed_vault(sb, _rated("manager", 19, disagree=(10, 20, 30, 40)))
+    code, doc = gate(sb, seat="mgr")
+    assert code == REVIEW, why(doc)
+    assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
+    assert gate(sb, seat="builder")[0] == NO_REVIEW, "a breach closed a seat it does not belong to"
+
+
+@pytest.mark.parametrize(
+    ("theirs", "expected"), [((0, 1), REVIEW), ((0,), NO_REVIEW)], ids=["four", "three"]
+)
+def test_disagreements_split_across_a_seats_names_are_one_breach(
+    sb: Sandbox, theirs: tuple[int, ...], expected: int
+) -> None:
+    """Two under `manager`, at the end of its 60, and two under `manager1`, at the start of its 60:
+    neither name alone holds more than 3, but one trailing 60 of the seat holds all four. Three
+    split the same way are no breach, the control."""
+    seed_vault(
+        sb, _rated("manager", 19, disagree=(58, 59)) + _rated("manager1", 18, disagree=theirs)
+    )
+    code, doc = gate(sb, seat="manager1")
+    assert code == expected, why(doc)
+    if expected == REVIEW:
+        assert "BREACH in seat manager's history (all of manager's names together)" in why(doc)
+
+
+def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> None:
+    """The manager's own history holds a breach, so 120 newer clean ratings under `manager1` leave
+    the alias closed, and a breach under the alias closes the manager just the same."""
+    seed_vault(sb, _rated("manager", 19, disagree=(0, 1, 2, 3)) + _rated("manager1", 18, count=120))
+    seed_vault(sb, calibrated("builder") + _rated("builder2", 19, disagree=(56, 57, 58, 59)))
+    code, doc = gate(sb, seat="builder")
+    assert code == REVIEW, why(doc)
+    assert "BREACH in seat builder's history (builder2)" in why(doc), why(doc)
+    code, doc = gate(sb, seat="manager1")
+    assert code == REVIEW, why(doc)
+    assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
+
+
+# THE BAR FOR OPTION C IS MAIN'S POOLED READING (BACKLOG #5604): every history the seat-pooled
+# calibration this ruling replaced answers REVIEW for must still be REVIEW. When these tests were
+# written, each history below was also run once, by hand, through origin/main's decision.ps1 and
+# _decisionlog.ps1 at 73d9236f3b, which answered as each test expects. The suite runs only this
+# branch's copy, so it pins these verdicts, not the parity itself: option c may be stricter than the
+# pooled reading, never looser, and it does not lock a seat on one name's short history that the
+# pooled reading passes.
+
+
+def test_a_breach_under_a_name_that_drops_below_60_still_closes_its_alias(sb: Sandbox) -> None:
+    """The manager's ratings end in 4 disagreements, but it holds 59 rated decisions in the 60-day
+    window, which is what a name holds once its 60th has aged out (the gate reads no decision
+    logged before the window), so its own history is no breach. Read with `mgr`'s 60 clean ratings
+    before them, the seat's pooled history still is, so `mgr` stays closed."""
+    manager = _rated("manager", 19, disagree=(55, 56, 57, 58), count=59)
+    seed_vault(sb, calibrated("builder") + _rated("mgr", 20) + manager)
+    code, doc = gate(sb, seat="mgr")
+    msg = why(doc)
+    assert code == REVIEW, msg
+    assert "BREACH in seat manager's history (all of manager's names together)" in msg, msg
+    assert gate(sb, seat="builder")[0] == NO_REVIEW, "a breach closed a seat it does not belong to"
+
+
+@pytest.mark.parametrize(
+    ("disagree", "expected"),
+    [((55, 56, 57, 58), REVIEW), ((0, 20, 40, 58), NO_REVIEW)],
+    ids=["inside-one-pooled-60", "spread-past-every-pooled-60"],
+)
+def test_disagreements_under_a_short_name_interleaved_with_an_alias(
+    sb: Sandbox, disagree: tuple[int, ...], expected: int
+) -> None:
+    """Four disagreements under `manager`, which holds fewer than 60 ratings, interleaved one for one
+    with `mgr`'s 60. Inside one trailing 60 of the seat's pooled order they are a breach, so `mgr`
+    is closed. Spread so that no pooled 60 holds more than 3, the pooled reading passes them and so
+    does option c: a short history's disagreements alone close no seat."""
+    seed_vault(
+        sb,
+        _rated("manager", 19, disagree, count=59, stride=2)
+        + _rated("mgr", 19, count=60, start=1, stride=2),
+    )
+    code, doc = gate(sb, seat="mgr")
+    assert code == expected, why(doc)
+    if expected == REVIEW:
+        assert "BREACH in seat manager's history (all of manager's names together)" in why(doc)
+
+
+def test_a_reversal_logged_under_a_seat_alias_is_charged_to_the_seat(sb: Sandbox) -> None:
+    mine = [rec(at=ago(days=20), seat="mgr", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
+
+
+def test_a_gate_asked_under_an_alias_reads_the_seats_budget(sb: Sandbox) -> None:
+    mine = [rec(at=ago(days=20), seat="manager", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    code, doc = gate(sb, seat="mgr")
+    assert code == REVIEW and "two reversals of mgr's decisions" in why(doc), why(doc)
+    # Option c: the manager's 60 samples do not calibrate `mgr`, which has none of its own.
+    assert "mgr's Class B is not calibrated (review path, 0/60 samples" in why(doc), why(doc)
+
+
+def test_an_alias_with_no_samples_does_not_inherit_its_seats_calibration(sb: Sandbox) -> None:
+    """Nothing else stands against `mgr`, so pooling the manager's samples would answer NO-REVIEW."""
+    seed_vault(sb, calibrated("manager"))
+    assert gate(sb)[0] == NO_REVIEW, "the control: the manager itself is calibrated"
+    code, doc = gate(sb, seat="mgr")
+    assert code == REVIEW, why(doc)
+    assert "mgr's Class B is not calibrated (review path, 0/60 samples" in why(doc), why(doc)
+
+
+def test_an_aliass_unreversed_decisions_do_not_dilute_the_seats_rate(sb: Sandbox) -> None:
+    """The manager's one decision in the window was reversed; nineteen acted `mgr` ones beside it
+    would put the rate at 5.0 percent, inside the breach line, if the alias's samples were pooled."""
+    mine = rec(at=ago(days=4), seat="manager", item="x")
+    theirs = [rec(at=ago(days=4, minutes=i + 1), seat="mgr", item=f"y{i}") for i in range(19)]
+    seed_vault(sb, [*calibrated("manager"), mine, *theirs, reversal(mine, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
+
+
+def test_a_reversal_under_an_alias_counts_in_the_seats_14_day_rate(sb: Sandbox) -> None:
+    """Three days old, so outside the 24-hour budget: only the rate can see it."""
+    mine = rec(at=ago(days=4), seat="mgr", item="x")
+    seed_vault(sb, [*calibrated("manager"), mine, reversal(mine, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
+
+
+# A DECISION THE GATE ANSWERED HALT FOR WAS DEFERRED, NOT ACTED ON (BACKLOG #5604), so it is not a
+# decision the 14-day reversal rate can be diluted by. One reversal against nineteen deferred
+# records read as 5.0 percent, inside the 5 percent breach line, and kept the seat calibrated.
+
+
+@pytest.mark.parametrize(
+    ("gate_answer", "expected"), [("HALT", REVIEW), ("", NO_REVIEW)], ids=["halted", "acted"]
+)
+def test_halted_decisions_do_not_dilute_the_14_day_reversal_rate(
+    sb: Sandbox, gate_answer: str, expected: int
+) -> None:
+    """The acted case is the control: nineteen acted decisions really do put the rate at 5.0%."""
+    reversed_one = rec(at=ago(days=4), seat="manager", item="x")
+    others = [
+        rec(at=ago(days=4, minutes=i + 1), seat="manager", item=f"y{i}", gate=gate_answer)
+        for i in range(19)
+    ]
+    seed_vault(sb, [*calibrated("manager"), reversed_one, *others])
+    seed_vault(sb, [reversal(reversed_one, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == expected, why(doc)
+
+
+def test_a_reversed_halted_decision_still_counts_in_the_rate(sb: Sandbox) -> None:
+    """Deferred and then reversed is still a reversal: excluding it would under-report."""
+    halted = rec(at=ago(days=4), seat="manager", item="x", gate="HALT")
+    seed_vault(sb, [*calibrated("manager"), halted, reversal(halted, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
+
+
 # --- the chain limit (plan 4.6) --------------------------------------------------------------
 
 
@@ -1613,6 +1814,54 @@ def _git(repo: Path, *args: str, stdin: str = "") -> str:
         env={**os.environ, **env},
     )
     return proc.stdout.strip()
+
+
+def test_the_digest_folds_a_seat_alias_as_the_gate_does(sb: Sandbox) -> None:
+    """As the gate reads them (owner ruling 2026-11-15, option c): `mgr`'s reversals are charged to
+    the manager's budget and rate, while each name keeps its own calibration row."""
+    mine = [rec(at=ago(days=4), seat="mgr", item=f"x{i}") for i in range(2)]
+    own = rec(at=ago(days=4), seat="manager", item="y")
+    seed_vault(sb, [*mine, own])
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    out = proc.stdout
+    # The manager's row: its one acted decision plus `mgr`'s two reversed ones.
+    assert "| manager | B | 0 | 0 | review path, 0/60 samples | 3 | 2 | 66.7% BREACH |" in out, out
+    assert "| mgr | B | 0 | 0 | review path, 0/60 samples | 2 | 2 | 100.0% BREACH |" in out, out
+    assert "| manager | 2 of 2 in the trailing 24 hours; CLOSED" in out, out
+
+
+def test_the_digest_closes_an_alias_on_its_seats_breach_as_the_gate_does(sb: Sandbox) -> None:
+    """Option c: `mgr`'s own 60 are clean, but the manager's breach closes it in the digest's
+    calibration row and gate-state table, as the gate answers. A padded spelling is the same row."""
+    seed_vault(sb, calibrated(" MGR ") + _rated("manager", 19, disagree=(10, 20, 30, 40)))
+    assert gate(sb, seat="mgr")[0] == REVIEW
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    out = proc.stdout
+    assert "| mgr | B | 60 | 0 | BREACH in seat manager's history (manager" in out, out
+    assert not re.search(r"\|\s*MGR\s*\|", out), out
+    gate_row = next(line for line in out.splitlines() if line.startswith("| mgr | 0 of 2"))
+    assert gate_row.endswith("| no |"), out
+
+
+def test_the_digest_without_the_roster_reads_no_seat_calibrated(sb: Sandbox) -> None:
+    """The gate answers REVIEW for every seat when docs/roles/seats.json cannot be read, so the
+    digest says so and reads no seat calibrated. The roster present is the control."""
+    seed_vault(sb, calibrated("manager"))
+    with_roster = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert with_roster.returncode == 0, (with_roster.stdout, with_roster.stderr)
+    assert "| manager | 0 of 2 in the trailing 24 hours; open | yes |" in with_roster.stdout
+    (sb.repo / "docs" / "roles" / "seats.json").unlink()
+    assert gate(sb)[0] == REVIEW
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert "The seat roster docs/roles/seats.json could not be read" in proc.stdout, proc.stdout
+    assert "| manager | 0 of 2 in the trailing 24 hours; open | no |" in proc.stdout, proc.stdout
+    assert (
+        "| manager | B | 60 | 0 | roster unread, so the gate reviews; calibrated |" in proc.stdout
+    )
 
 
 def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(

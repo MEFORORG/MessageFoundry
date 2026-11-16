@@ -12,15 +12,16 @@
     prune-merged.ps1, so the nightly removal judges a tree exactly the way the report that listed it
     did. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
 
-    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $REGENERABLE_IGNORED_PATTERN,
+    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $WORKING_TREE_ACTIVITY_CACHES,
+    $REGENERABLE_IGNORED_PATTERN,
     Test-PresentOrThrow, Get-EntriesOrThrow (both moved here from remove.ps1, which dot-sources this file
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
-    says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
+    says what it can and cannot see), Test-WorktreeClean, Get-HiddenWorkReasons, Get-SetGitRedirects, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, Get-AllocationRefusal, Get-TreeClaimsDirs
     and Get-OwnershipHolds (moved here from finished-worktree-removal.ps1, so hygiene-report.ps1 reads
     them too), Get-FlaggedFiles,
-    $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
+    $CACHE_DATA_NAME_PATTERN, $MYPY_CACHE_DB_PATTERN, Test-MypyCacheFile, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
     Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
@@ -37,8 +38,13 @@ $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX
 
 # Refused rather than cleared, as in remove.ps1: a dot-sourced caller shares the operator's process, so
 # clearing them would change the operator's shell.
+# The redirect names set in this process. Wrap the call in @(): one name unrolls to a string.
+function Get-SetGitRedirects {
+    $GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) }
+}
+
 function Assert-NoGitRedirect([string]$Who) {
-    $set = @($GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+    $set = @(Get-SetGitRedirects)
     if ($set.Count -gt 0) {
         throw "$Who refuses: $($set -join ', ') is set, so git's readings of the tree named could come from another repository, working tree or index. Unset it and re-run. Nothing was removed."
     }
@@ -67,6 +73,11 @@ $IDLE_FLOOR_HOURS = 12
 #: Metadata whose MTIME is the activity reading. `logs/HEAD` is deliberately NOT in this list; it is
 #: read by content instead, for the reason written out over Get-ReflogLastEntry.
 $ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
+
+#: The caches a test, lint or type-check run rewrites in place, whose files the working-tree activity
+#: reads date: Get-WorkingTreeActivity here, and remove.ps1's twin of it. One list, so the two read the
+#: same caches; how they read them still differs (the cap, folders, links), so the list is all they share.
+$WORKING_TREE_ACTIVITY_CACHES = @('.pytest_cache', '.ruff_cache', '.mypy_cache')
 
 #: The ignored entries a removal may delete without asking: a `git status --porcelain --ignored` line
 #: for an IGNORED DIRECTORY named node_modules, __pycache__, .pytest_cache, .mypy_cache or .ruff_cache
@@ -163,26 +174,40 @@ function Get-ReflogLastEntry {
 
 function Get-WorktreeActivity {
     param([string]$Path)
-    # The worktree's PRIVATE git metadata only. Deliberately NOT the working files: a venv install or a
-    # test run churns those, so their mtimes would veto everything forever and the veto would stop
-    # meaning anything. The cost is that a session which only edits files and runs no git command is
-    # invisible to this signal too -- stated in the header rather than papered over.
+    # The worktree's PRIVATE git metadata only. Deliberately NOT every working file: a venv install
+    # churns thousands of them, so reading them all would veto far longer than any session works. The
+    # cost is that a session which only edits files and runs no git command is invisible to this
+    # signal -- stated in the header rather than papered over. Its callers that remove a tree pair it
+    # with Get-WorkingTreeActivity, a narrower working-tree read that a test or mypy run moves and an
+    # install does not (BACKLOG #5603); a run that wrote within the window meant to hold the tree.
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $gitdir = & git -C $Path rev-parse --absolute-git-dir 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $gitdir) { return $null }
     $gitdir = ([string]$gitdir).Trim()
     if (-not (Test-Path -LiteralPath $gitdir)) { return $null }
     $newest = $null
-    foreach ($rel in $ACTIVITY_MTIME_FILES) {
-        $f = Join-Path $gitdir $rel
-        if (Test-Path -LiteralPath $f) {
-            $t = (Get-Item -LiteralPath $f -Force).LastWriteTime
-            if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
+    # A git command can delete ORIG_HEAD, MERGE_MSG or the reflog between Test-Path and Get-Item. A
+    # failed read of these files is an UNKNOWN reading, which vetoes: under a caller's
+    # $ErrorActionPreference = 'Stop' a throw ended prune-merged.ps1 mid -Apply loop with no receipt
+    # (BACKLOG #5603). Caught: ItemNotFoundException (a vanished file), DriveNotFoundException (a
+    # dropped drive), IOException and UnauthorizedAccessException. Anything else still throws, so a
+    # defect is not hidden.
+    try {
+        foreach ($rel in $ACTIVITY_MTIME_FILES) {
+            $f = Join-Path $gitdir $rel
+            if (Test-Path -LiteralPath $f) {
+                $t = (Get-Item -LiteralPath $f -Force -ErrorAction Stop).LastWriteTime
+                if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
+            }
         }
+        $log = Join-Path $gitdir 'logs/HEAD'
+        $item = $null
+        if (Test-Path -LiteralPath $log) { $item = Get-Item -LiteralPath $log -Force -ErrorAction Stop }
     }
-    $log = Join-Path $gitdir 'logs/HEAD'
-    if (Test-Path -LiteralPath $log) {
-        $item = Get-Item -LiteralPath $log -Force
+    catch [System.Management.Automation.ItemNotFoundException], [System.Management.Automation.DriveNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+        return $null
+    }
+    if ($null -ne $item) {
         $t = Get-ReflogLastEntry -LogPath $log
         if ($null -eq $t -and $item.Length -gt 0) {
             # Non-empty, and it would not parse. FALL BACK TO THE MTIME, which is the reading this
@@ -210,8 +235,23 @@ function Get-WorktreeActivity {
 # could not open: git warns on stderr, skips it and still exits 0, so its contents are unknown.
 # -AllUntracked adds `--untracked-files=all`, so an untracked file inside an untracked directory is
 # counted as a file rather than folded into one directory line. The verdict is the same either way.
+#
+# GIT STATUS ALONE IS NOT "CLEAN" (BACKLOG #5603). It cannot see, and a forced removal deletes: an edit
+# to a file flagged skip-worktree or assume-unchanged, an ignored file that is not a regenerable cache
+# (a .env, a dev *.db), and a nested checkout, link or data file below an ignored directory, which status
+# never reads into. And a GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE inherited from the
+# caller makes every reading below come from another repository, tree or index. So all four are read
+# here, by default (Get-HiddenWorkReasons holds the three content reads). -Primary is the primary checkout, which Get-UnsafeIgnoredEntries compares
+# the leak-gate token list with; without it that copy is unsafe. -StatusOnly reads status alone, for a
+# caller that runs the content reads itself (prune-merged.ps1's venv receipt, conjunct C6, and
+# finished-worktree-removal.ps1, which splits them around its idle readings): the redirect refusal still
+# applies there.
 function Test-WorktreeClean {
-    param([string]$Path, [switch]$AllUntracked)
+    param([string]$Path, [switch]$AllUntracked, [string]$Primary, [switch]$StatusOnly)
+    $redirects = @(Get-SetGitRedirects)
+    if ($redirects.Count -gt 0) {
+        return @{ Clean = $false; Reasons = @("$($redirects -join ', ') is set in this process, so git's readings of the tree could come from another repository, working tree or index -- unset it and re-run") }
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ Clean = $false; Reasons = @('directory is missing (already half-removed? investigate before pruning)') }
     }
@@ -221,7 +261,8 @@ function Test-WorktreeClean {
     # git one character per argument, which git reads as pathspecs; a dirty tree read clean.
     # The "could not open" warning below is matched as TEXT, so git is run untranslated: a localised
     # build would print it in another language, the match would miss, and an unreadable folder would
-    # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway.
+    # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway. The untracked
+    # mode is always named, so a status.showUntrackedFiles=no in some config cannot hide untracked files.
     $savedLocale = @{}
     foreach ($k in 'LC_ALL', 'LANG', 'LANGUAGE') { $savedLocale[$k] = [Environment]::GetEnvironmentVariable($k) }
     try {
@@ -229,7 +270,7 @@ function Test-WorktreeClean {
         [Environment]::SetEnvironmentVariable('LANG', 'C')
         [Environment]::SetEnvironmentVariable('LANGUAGE', $null)
         if ($AllUntracked) { $raw = @(& git -C $Path --no-optional-locks status --porcelain --untracked-files=all 2>&1) }
-        else { $raw = @(& git -C $Path --no-optional-locks status --porcelain 2>&1) }
+        else { $raw = @(& git -C $Path --no-optional-locks status --porcelain --untracked-files=normal 2>&1) }
         $statusExit = $LASTEXITCODE
     }
     finally {
@@ -252,7 +293,40 @@ function Test-WorktreeClean {
     if ($untracked.Count -gt 0) {
         $r += "$($untracked.Count) untracked file(s) present -- --force would delete them unrecoverably"
     }
+    if (-not $StatusOnly) { $r += @(Get-HiddenWorkReasons -Path $Path -Primary $Primary) }
     return @{ Clean = ($r.Count -eq 0); Reasons = $r }
+}
+
+# The work git status cannot see, as reasons: 'flagged' (skip-worktree or assume-unchanged edits),
+# 'ignored' (an ignored entry that is not a regenerable cache) and 'nested' (Get-NestedHazard's walk),
+# in the order -Checks names them. Test-WorktreeClean reads all three; finished-worktree-removal.ps1
+# splits them around its idle readings, so it names the ones it wants. Wrap the call in @().
+function Get-HiddenWorkReasons {
+    param([string]$Path, [string]$Primary, [string[]]$Checks = @('flagged', 'ignored', 'nested'))
+    $r = @()
+    foreach ($check in $Checks) {
+        switch ($check) {
+            'flagged' {
+                $flagged = Get-FlaggedFileCount $Path
+                if ($flagged -lt 0) { $r += 'its flagged files could not be read' }
+                elseif ($flagged -gt 0) { $r += "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }
+            }
+            'ignored' {
+                $ignored = Get-UnsafeIgnoredEntries $Path $Primary
+                if ($null -eq $ignored) { $r += 'its ignored files could not be listed' }
+                elseif ($ignored.Count -gt 0) { $r += "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
+            }
+            'nested' {
+                try {
+                    $hazard = Get-NestedHazard $Path
+                    if ($hazard) { $r += "it holds $hazard, which git status does not read into" }
+                }
+                catch { $r += $_.Exception.Message }
+            }
+            default { throw "Get-HiddenWorkReasons: unknown check '$check'." }
+        }
+    }
+    return $r
 }
 
 # The refs of -Repo that contain the worktree's HEAD, for a DETACHED tree: once it is removed, its
@@ -294,18 +368,30 @@ function Get-FlaggedFiles([string]$Path) {
 }
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
-# files inside .pytest_cache and .ruff_cache (a test or lint run rewrites those in place, moving no
-# top-level mtime), up to -CacheCap of them. The idle reading above sees only git metadata, so a session
-# that edits files and runs no git command is invisible to it. Not every write moves one of these: a
-# file edited in place two levels down moves none. $null when it cannot be read.
+# files inside each cache $WORKING_TREE_ACTIVITY_CACHES names (a test, lint or type-check run rewrites
+# those in place, moving no top-level mtime). The idle reading above sees only git metadata, so a
+# session that edits files and runs no git command is invisible to it. Not every write moves one of
+# these: a file edited in place two levels down moves none. Since Get-NestedHazard passes mypy's cache
+# files, this read is what holds a tree a mypy run wrote to.
+# Callers, at least: finished-worktree-removal.ps1 (Get-ContentRefusal) and prune-merged.ps1
+# (Get-TreeActivity, its occupancy signal 2, in the decision, report, venv and -Apply re-check passes,
+# where -IdleHours 0 and -Name lift a recent reading but not an unreadable one, as for the git
+# reading). remove.ps1 makes its own twin. Only caches at the tree's root are read, and a run that
+# writes nothing to its cache (ruff, with no file changed) moves none of this.
+# $null when it cannot be read, when the cache list is unset, and when a cache holds more than
+# -CacheCap files, which it does not sample: a cache too big to read to the end cannot be dated.
 function Get-WorkingTreeActivity {
     param([string]$Path, [int]$CacheCap = 2000)
+    # A lost list would read no cache at all, so a tree a test run just wrote to would read idle.
+    if (-not $WORKING_TREE_ACTIVITY_CACHES) { return $null }
     try {
         $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
-        foreach ($cache in '.pytest_cache', '.ruff_cache') {
+        foreach ($cache in $WORKING_TREE_ACTIVITY_CACHES) {
             $dir = Join-Path $Path $cache
             if (Test-Path -LiteralPath $dir -PathType Container) {
-                $items += @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First $CacheCap)
+                $inCache = @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First ($CacheCap + 1))
+                if ($inCache.Count -gt $CacheCap) { return $null }
+                $items += $inCache
             }
         }
     }
@@ -542,14 +628,33 @@ function Get-OwnershipHolds {
 #: denylist, so it catches only these names; it does not make a cache directory safe to delete.
 $CACHE_DATA_NAME_PATTERN = '(?i)\A(?:\.env(?:\..*)?|.*\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3))\z'
 
+#: mypy's own SQLite cache, the one carve-out from $CACHE_DATA_NAME_PATTERN: a file named `cache.db`, or
+#: the sharded `cache.N.db`, whose folder is named like a Python version and sits directly in a folder
+#: named `.mypy_cache` (Test-MypyCacheFile reads the folders, not the path text). Case-sensitive, as the
+#: cache directory names are. Read as data, they vetoed most real clean trees. Their -wal, -shm and
+#: -journal sidecars are NOT exempt: one is there while a connection holds the cache open, which a
+#: removal cannot delete through on Windows. Any other data-named file in a cache directory,
+#: .mypy_cache included, still refuses.
+$MYPY_CACHE_DB_PATTERN = '\Acache(?:\.[0-9]+)?\.db\z'
+
+# True only for a file of mypy's own cache, as $MYPY_CACHE_DB_PATTERN says. An unset pattern exempts
+# nothing, so a lost variable refuses rather than passing every data file in every cache.
+function Test-MypyCacheFile([System.IO.FileSystemInfo]$Entry) {
+    if (-not $MYPY_CACHE_DB_PATTERN -or $Entry -isnot [System.IO.FileInfo]) { return $false }
+    $dir = $Entry.Directory
+    return ($Entry.Name -cmatch $MYPY_CACHE_DB_PATTERN) -and ($dir.Name -cmatch '\A[0-9]+\.[0-9]+\z') -and
+        ($null -ne $dir.Parent) -and ($dir.Parent.Name -ceq '.mypy_cache')
+}
+
 # The first thing in the working tree that git status cannot see and the removal must not take, walked
 # from the tree's own root: a nested git checkout (an entry named `.git`, file or directory, at any depth
 # below the tree's own), a link of any kind (git does not delete through one, so the removal ends
 # deregistered with the directory left behind, ORPHANED; remove.ps1 records the measurement), or, inside
-# a tolerated cache directory, a file named like data ($CACHE_DATA_NAME_PATTERN). git status never reads
-# into an IGNORED directory, and one holding nothing but nested repositories is not even listed
-# (measured, remove.ps1), so the whole tree is walked rather than the directories git lists: about
-# 20,000 entries in a tenth of a second on a tree with a .venv (measured 2026-11-05). The walk stops at
+# a tolerated cache directory, a file named like data ($CACHE_DATA_NAME_PATTERN, less mypy's own cache
+# files, $MYPY_CACHE_DB_PATTERN). git status never reads into an IGNORED directory, and one holding
+# nothing but nested repositories is not even listed (measured, remove.ps1), so the whole tree is
+# walked rather than the directories git lists: about 20,000 entries in a tenth of a second on a tree
+# with a .venv (measured 2026-11-05). The walk stops at
 # the first hit and never descends a link or a nested .git. Returns '' or what it found, and THROWS when
 # any directory cannot be listed, so the caller refuses.
 function Get-NestedHazard([string]$Path) {
@@ -573,7 +678,7 @@ function Get-NestedHazard([string]$Path) {
                     $cache = $inCache -or ($e.Name -cin $cacheNames) -or ($here -ieq $root -and $e.Name -ceq '.venv')
                     $pending.Push(@($e.FullName, $cache))
                 }
-                elseif ($inCache -and $e.Name -match $CACHE_DATA_NAME_PATTERN) { return "a data file inside a cache directory at $rel" }
+                elseif ($inCache -and $e.Name -match $CACHE_DATA_NAME_PATTERN -and -not (Test-MypyCacheFile $e)) { return "a data file inside a cache directory at $rel" }
             }
         }
     }

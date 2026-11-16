@@ -275,7 +275,9 @@ def _http_arms() -> list[Any]:
 
 def _shipped_http(base: type[Any], client_cert: bool) -> type[Any]:
     floored = floored_http_protocol_class(base=base)
-    return client_cert_http_protocol_class(base=floored) if client_cert else floored
+    if not client_cert:
+        return floored
+    return client_cert_http_protocol_class(base=floored, trusted_proxies=())
 
 
 def _assert_protocol_family(
@@ -1330,7 +1332,9 @@ def test_serve_refuses_to_start_without_the_pinned_parser(
 
 def test_the_parser_readout_names_the_class_chain() -> None:
     assert http_parser_in_force(floored_http_protocol_class()).startswith("httptools ")
-    shimmed = client_cert_http_protocol_class(base=floored_http_protocol_class())
+    shimmed = client_cert_http_protocol_class(
+        base=floored_http_protocol_class(), trusted_proxies=()
+    )
     assert http_parser_in_force(shimmed).startswith("httptools ")
     assert http_parser_in_force(floored_http_protocol_class(base=H11Protocol)).startswith("h11 ")
     assert http_parser_in_force(asyncio.Protocol) == "unrecognised (asyncio.protocols.Protocol)"

@@ -462,7 +462,6 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
     # engine runs as, and the token seam reports another account as the editor.
     import messagefoundry.restricted_file as restricted_mod
     import messagefoundry.store.store as store_mod
-    from messagefoundry.config.wiring import _evaluate_config_dacl, _win32_config_source_probes
 
     path = tmp_path / "connections.toml"
     path.write_text(CONNECTIONS_TOML, encoding="utf-8")
@@ -472,17 +471,7 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
-    probes = _win32_config_source_probes()
-
-    def _verdict() -> str | None:
-        security = probes.read_path(path)
-        assert security.status == 0 and security.owner_sid is not None
-        assert security.aces is not None
-        return _evaluate_config_dacl(
-            security.owner_sid, security.aces, owner, probes.owner_in_admins
-        )
-
-    assert _verdict() is None
+    assert _config_verdict(path, owner) is None
     assert path.read_bytes() == b"x = 1\n"
     assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FR", _EDITOR_SID)]
     # The control: the same reader and check refuse this file once the editor may write it, the
@@ -491,7 +480,10 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
         path, f"D:P(A;;FA;;;{owner})(A;;FA;;;{_EDITOR_SID})", protected=True
     )
     assert written.failure is None and written.dacl_status == 0, written
-    assert _verdict() == f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access"
+    assert (
+        _config_verdict(path, owner)
+        == f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access"
+    )
 
 
 #: A service account no real account here is: the live file's foreign owner where this process

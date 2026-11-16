@@ -1575,8 +1575,9 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
 
     ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
     :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a
-    certificate to the trust store (BACKLOG #1890). The CRL file carries no pin or ACL check:
-    whoever can write it can change what is revoked, but not what is trusted.
+    certificate to the trust store (BACKLOG #1890). A CRL file carries no pin: whoever can write it
+    can change what is revoked, but not what is trusted. The API listener's CRL takes the ACL and
+    path check (:func:`api_client_crl_spec`, vault BACKLOG #5627); the other hops' CRLs do not.
 
     It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
     verdict = enforced_anchor(spec, enforcing=enforcing)
@@ -1613,6 +1614,24 @@ def api_client_anchor_spec(api: ApiSettings) -> AnchorSpec | None:
         api.tls_client_ca_file,
         api.tls_client_ca_pin,
         "[api].tls_client_ca_pin",
+    )
+
+
+def api_client_crl_spec(api: ApiSettings) -> AnchorSpec | None:
+    """The ``[api].tls_client_crl_file`` spec, or ``None`` when unset (vault BACKLOG #5627).
+
+    Checked for its ACL and path at the API context's construction, as the client CA is, because
+    whoever can replace it can restore an older CRL from before a revocation. It carries no pin,
+    since a CRL is refreshed, and it is read again by path when loaded, so ``loads_verified_bytes``
+    is ``False``. It is not in :func:`collect_anchor_specs`: the audited preflight records each
+    change of fingerprint, and a CRL changes at every refresh."""
+    if not api.tls_client_crl_file:
+        return None
+    return AnchorSpec(
+        "api_client_crl",
+        "[api].tls_client_crl_file",
+        api.tls_client_crl_file,
+        loads_verified_bytes=False,
     )
 
 
