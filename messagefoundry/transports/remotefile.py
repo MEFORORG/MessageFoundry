@@ -80,6 +80,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import PurePath
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
@@ -2737,9 +2738,12 @@ def _remote_processed_dir(remote_dir: str, value: object) -> str:
     ``"a/.."``. A directory above it (``".."``) is refused too, to keep the rule the same as the
     local source's, where an ancestor hides every drop. Purely lexical on POSIX paths, with no server call. An absolute value under a
     relative ``remote_dir`` cannot be placed against it without the server, so it is let through.
-    An ``os.PathLike`` value is read through ``os.fspath`` and checked the same way. The value is
+    An ``os.PathLike`` value is read as a POSIX path (``as_posix`` for a ``pathlib`` path, so a
+    Windows ``Path`` keeps its separators, else ``os.fspath``) and checked the same way. The value is
     withheld from the error, as the other setting refusals here do."""
-    if isinstance(value, os.PathLike):
+    if isinstance(value, PurePath):
+        value = value.as_posix()
+    elif isinstance(value, os.PathLike):
         value = os.fspath(value)
     if not isinstance(value, str) or not value.strip():
         raise ValueError("REMOTEFILE processed_subdir must name a directory (value withheld)")

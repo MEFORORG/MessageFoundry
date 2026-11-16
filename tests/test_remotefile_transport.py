@@ -778,12 +778,16 @@ def test_source_pathlike_processed_subdir_is_accepted_and_checked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Red on c0df8be6c2: a PurePosixPath was refused as not naming a directory; main joined it.
-    from pathlib import PurePosixPath
+    # A Windows path is read through as_posix, so its parts are split and checked too.
+    from pathlib import PurePosixPath, PureWindowsPath
 
     src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=PurePosixPath(".done"))
     assert src._processed_dir == "/in/.done"
-    with pytest.raises(ValueError, match="processed_subdir"):
-        _src(monkeypatch, _FakeClient(files={}), processed_subdir=PurePosixPath(".."))
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=PureWindowsPath("arch\\done"))
+    assert src._processed_dir == "/in/arch/done"
+    for value in (PurePosixPath(".."), PureWindowsPath("a\\.."), PureWindowsPath("..\\in")):
+        with pytest.raises(ValueError, match="processed_subdir"):
+            _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
 
 
 @pytest.mark.parametrize("value", ["", "  ", ".", "./", "..", "a/..", "a/../..", "../in"])
