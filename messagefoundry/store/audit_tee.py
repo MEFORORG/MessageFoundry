@@ -425,7 +425,8 @@ def emit_audit_tee(
     them as making the audit log unmodifiable.
 
     ``client`` (ADR 0150) is the caller's network address, or ``None`` for an engine-internal write. It
-    is forwarded verbatim — it is an infrastructure identifier, not message content, and the whole point
+    is forwarded verbatim unless it holds a C0 control, which the field scrub below can rewrite or
+    hide as ``[redacted]`` — it is an infrastructure identifier, not message content, and the whole point
     of the off-box copy is that attribution survives a host/DB compromise, which it cannot do if the
     "from where" is dropped on the way out. It is emitted as a discrete field (never folded into
     ``detail``) so a SIEM can index it without parsing the redacted blob.
@@ -482,11 +483,15 @@ def emit_audit_tee(
       it here too.
     * Where a reading finds more than the plain passes, the whole field ships as ``[redacted]``, so
       that record loses at least one of its ``action``, ``actor``, ``channel_id``, ``client`` or
-      ``detail``. Where :func:`_tee_line` finds the scrubbed line would show a word the line before
-      #3045 hid, every field the scrub changed ships as ``[redacted]``, the one that did not cause
-      it included; and in the rarer case where even that would, the record ships as the line
-      before #3045 did, so the scrub is lost for it. A typed sign-in name of ``CORP`` and
-      ``JONES`` joined by a control is one: it reads as the two-word name the patterns redact.
+      ``detail``. A typed sign-in name of ``CORP`` and ``JONES`` joined by a control is one: it
+      reads as the two-word name the patterns redact. Where :func:`_tee_line` finds the scrubbed
+      line would show a word the line before #3045 hid, every field the scrub changed ships as
+      ``[redacted]``, the one that did not cause it included; and where even that would, the
+      record ships as the line before #3045 did, so the scrub is lost for it. A field holding a
+      segment-shaped token, such as ``ABC|``, does that: on the old line the HL7 segment pattern
+      ran from it to the end of the line and hid the record's keys and anchors after it, which
+      hiding the field shows again. So a client can switch the scrub off for its own record by
+      typing a few characters, and its text beside a control then passes, as before #3045.
       A client can use this on purpose: a failed sign-in sets ``actor`` to the typed name, so a
       client that types a control beside a name- or credential-shaped word makes its own typed
       name ship as ``[redacted]`` in the off-box copy, and that copy then holds no typed name to
@@ -523,7 +528,11 @@ def emit_audit_tee(
       sink, with no escaped character involved. When two fields carry attacker-influenced text,
       the document can instead still parse, with the fields between them missing. Those can be
       at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
-      such as ``actor``, can then carry another field's text.
+      such as ``actor``, can then carry another field's text. The field scrub adds cases of its
+      own: where it writes a credential placeholder, as in ``Bearer <redacted>``, just before an
+      escape on the line, the chain over the line can take the placeholder and the escape's
+      backslash as one credential value, and a quote that backslash escaped then ends the string,
+      so a record that parsed before #3045 can fail to.
     * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
       run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
       ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,

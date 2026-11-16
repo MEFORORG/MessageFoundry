@@ -33,19 +33,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
-- **A C0 control in an off-box audit record field no longer hides the text beside it, in the
-  cases measured.** `json.dumps` escapes the 32 C0 controls before the log filters run, and each
-  escape ends in a word character, so on a first deployment a name, a date, a bearer token, an
-  MRN or a `password=` value beside one, as in a typed sign-in name, would have reached the tee
-  line unredacted. Now each text field holding a C0 control is scrubbed by the same filters
-  before it is encoded. Where that finds more than the plain filters, the whole field ships as
-  `[redacted]`, so that record loses at least one of its `action`, `actor`, `channel_id`,
-  `client` or `detail`. The line is then held to what the filters hid of the whole record as it
-  was encoded before this change, so on the first handler it redacts no less than that line did;
-  where it would, the changed fields ship as `[redacted]`. A later handler, such as the
-  forwarder, runs the filters again and is not held to that bar. The `emit_audit_tee` docstring
-  says what is covered and what is left, at least text that needs two controls read differently
-  and a field longer than the 64 KiB window, which does not ship scrubbed. (`BACKLOG #3045`)
 
 ### Fixed
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
