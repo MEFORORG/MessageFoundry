@@ -473,6 +473,7 @@ def test_with_no_usable_startedat_the_file_age_decides(
         ("dot-dot-out-of-tree", "UNREADABLE"),
         ("relative", "UNREADABLE"),
         ("sibling-prefix", "DEAD"),
+        ("drive-root", "DEAD"),
     ],
     ids=[
         "same-worktree",
@@ -485,6 +486,7 @@ def test_with_no_usable_startedat_the_file_age_decides(
         "dot-dot-out-of-the-tree-still-vetoes",
         "relative-cwd-fails-closed",
         "sibling-sharing-a-prefix",
+        "drive-root-does-not-reach",
     ],
 )
 def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
@@ -509,6 +511,7 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
         "dot-dot-out-of-tree": str(here / ".." / "wt-elsewhere"),
         "relative": "wt-elsewhere",
         "sibling-prefix": str(checkout / "wt-here-too"),
+        "drive-root": tmp_path.anchor,
     }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
     record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}

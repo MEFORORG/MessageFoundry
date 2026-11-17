@@ -357,7 +357,9 @@ function Test-AnonymousRecordReaches {
     $w = ConvertTo-RegistryNormPath $Worktree
     if (-not $Anonymous.Cwd -or -not $w) { return $true }
     $c = $Anonymous.Cwd
-    if (-not [System.IO.Path]::IsPathFullyQualified($c)) { return $true }
+    # With the separator put back: normalizing turns a drive root `C:\` into `c:`, which alone is not
+    # fully qualified.
+    if (-not [System.IO.Path]::IsPathFullyQualified($c + '\')) { return $true }
     if (($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal')) { return $true }
     # A string, not Join-Path, which throws on a drive this process does not have.
     return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath "$c\.git")
