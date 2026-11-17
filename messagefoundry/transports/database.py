@@ -2827,7 +2827,7 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
 
 class RedactedDbError(Exception):
     """Stands in for one exception of a logged chain: the original's frames, and
-    :func:`_safe_db_error`'s line as its message (BACKLOG #1661). Never raised. Unprefixed because
+    :func:`_poll_log_line`'s line as its message (BACKLOG #1661, #5348). Never raised. Unprefixed because
     its name prints on every line it stands in for."""
 
 
@@ -2836,14 +2836,15 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
 
     ``logger.exception`` ends each exception of the chain with its ``str()``, and a driver error's
     ``str()`` is the text that embeds the offending value: a 2627 duplicate key, a 245 conversion.
-    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_safe_db_error`'s
+    So each link is copied as a :class:`RedactedDbError` whose message is :func:`_poll_log_line`'s
     line, with the original's traceback and its cause, context and suppression wired the same way.
     The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
     ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
 
     What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
-    (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and ``safe_exc``'s
-    200-character bound applies to every non-driver line.
+    (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
+    every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
+    every non-driver line it keeps.
 
     It never raises, because it runs in the poll loop's error arm, which must not kill the poller.
     A copy that fails gives one :class:`RedactedDbError` with no frames, whose message names the
@@ -2868,7 +2869,7 @@ def _redacted_copy(
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_safe_db_error(exc, withhold=under)).with_traceback(exc.__traceback__)
+    copy = RedactedDbError(_poll_log_line(exc, under=under)).with_traceback(exc.__traceback__)
     made[id(exc)] = copy
     below = under or _raised_by_a_driver(exc)
     if exc.__cause__ is not None:
@@ -2877,6 +2878,25 @@ def _redacted_copy(
         copy.__context__ = _redacted_copy(exc.__context__, made, under=below)
     copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
     return copy
+
+
+def _poll_log_line(exc: BaseException, *, under: bool) -> str:
+    """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
+    with no SQLSTATE is named by its type alone unless it is the engine's own fixed-text error
+    (BACKLOG #5348).
+
+    The poll arm meets connect failures, and a connect error can carry DSN attributes, the server
+    and the credentials among them, so the rule :func:`_lookup_connect_failure` and
+    :func:`_probe_failure_cause` state applies here too: ``safe_exc``'s bounded, redacted text is
+    not credential-free. A ``DeliveryError`` (the pool-acquire timeout, a classified driver error)
+    and the missing-extra error are this module's own text, built without a driver message, so
+    they keep it. What this costs is the text of any other error with no SQLSTATE, a bug's message
+    included; its frames still locate it."""
+    if not under and _log_sqlstate(exc) is None and not _raised_by_a_driver(exc):
+        if isinstance(exc, (DeliveryError, _DriverMissingError)):
+            return _safe_db_error(exc)
+        return f"{type(exc).__name__} [message withheld]"
+    return _safe_db_error(exc, withhold=under)
 
 
 class _DriverMissingError(RuntimeError):

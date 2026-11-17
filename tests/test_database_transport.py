@@ -1729,8 +1729,46 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
         await _run_one_failed_poll(src, wrapped)
     assert "direct cause of the following exception" in caplog.text
     assert "Exception [23000] driver error 2627" in caplog.text
-    assert "RuntimeError: poll step failed" in caplog.text
+    # No SQLSTATE and not the engine's own error, so its text is withheld (BACKLOG #5348).
+    assert "RedactedDbError: RuntimeError [message withheld]" in caplog.text
+    # The frame's source line still shows the literal; the exception line no longer does.
+    assert "RuntimeError: poll step failed" not in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+#: A connect failure's text quoting DSN attributes back; synthetic, no real server or credential.
+_DSN_ECHO = "login failed for DSN 'SERVER=db.invalid;UID=mefor_svc;PWD=SyntheticSecret1'"
+
+
+@pytest.mark.parametrize("kind", [OSError, RuntimeError, ValueError])
+async def test_source_poll_failure_withholds_a_no_sqlstate_error_text(
+    caplog: pytest.LogCaptureFixture, kind: type[Exception]
+) -> None:
+    """BACKLOG #5348. A poll failure with no SQLSTATE, raised by no driver, logged ``safe_exc``'s
+    bounded, redacted text, and a connect error of that shape can quote the DSN. It is named by its
+    type alone now, as ``_lookup_connect_failure`` names one; the frames are kept.
+
+    Red mutation: return ``_safe_db_error(exc, withhold=under)`` unconditionally in
+    ``_poll_log_line``. The secret prints and every case reds."""
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), kind(_DSN_ECHO))
+    assert "poll failed" in caplog.text
+    assert f"RedactedDbError: {kind.__name__} [message withheld]" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+    assert "mefor_svc" not in caplog.text
+    assert "in _select" in caplog.text  # the frames are kept
+
+
+async def test_source_poll_failure_keeps_the_engines_own_fixed_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Control for #5348: a ``DeliveryError`` is this module's own text, such as the pool-acquire
+    timeout, and is still printed. Red mutation: drop the ``DeliveryError`` arm in
+    ``_poll_log_line``. Reds here."""
+    text = "DATABASE pool acquire timed out after 5s (pool exhausted or DB unresponsive)"
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), DeliveryError(text))
+    assert f"RedactedDbError: DeliveryError: {text}" in caplog.text
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
