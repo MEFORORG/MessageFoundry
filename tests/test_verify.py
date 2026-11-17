@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import importlib
 import json
 import socket
@@ -150,7 +151,7 @@ def _listen(family: socket.AddressFamily, address: str, v6only: int | None = Non
         if v6only is not None:
             s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
         s.bind((address, 0))
-        if address not in ("0.0.0.0", "::") or sys.platform.startswith("linux"):  # nosec B104
+        if address not in ("0.0.0.0", "::") or sys.platform.startswith("linux"):
             s.listen()
     except OSError:
         s.close()
@@ -209,6 +210,67 @@ def test_listener_ports_reads_a_released_port_as_free() -> None:
     with _listen(socket.AF_INET, "127.0.0.1") as held:
         port = held.getsockname()[1]
     assert _evidence_for(port) == "free"
+
+
+class _RefusingSocket:
+    """A socket stand-in whose bind() raises ``exc`` for ``family``; other families bind."""
+
+    def __init__(self, family: int, refuse: int, exc: OSError) -> None:
+        self._refuse = family == refuse
+        self._exc = exc
+
+    def setsockopt(self, *args: object) -> None:
+        pass
+
+    def bind(self, address: object) -> None:
+        if self._refuse:
+            raise self._exc
+
+    def close(self) -> None:
+        pass
+
+
+def _refuse_bind(
+    monkeypatch: pytest.MonkeyPatch, family: socket.AddressFamily, exc: OSError
+) -> None:
+    def _factory(fam: int, kind: int = 0) -> _RefusingSocket:
+        return _RefusingSocket(fam, family, exc)
+
+    monkeypatch.setattr(socket, "socket", _factory)
+
+
+def test_listener_ports_skips_ipv6_when_its_family_is_not_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse_bind(monkeypatch, socket.AF_INET6, OSError(errno.EADDRNOTAVAIL, "not available"))
+    assert _evidence_for(2575) == "free"
+
+
+def test_listener_ports_does_not_skip_ipv4_on_a_family_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse_bind(monkeypatch, socket.AF_INET, OSError(errno.EADDRNOTAVAIL, "not available"))
+    assert _evidence_for(2575) == "in use/bound"
+
+
+def test_listener_ports_reads_a_failed_socket_call_as_not_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Out of descriptors used to skip both families and read every port free.
+    def _no_sockets(*args: object) -> object:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(socket, "socket", _no_sockets)
+    assert _evidence_for(2575).startswith("could not be probed")
+
+
+def test_listener_ports_names_a_permission_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    _refuse_bind(monkeypatch, socket.AF_INET, PermissionError(13, "denied"))
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _evidence_for(104).startswith("not bindable by this user")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(socket, "SO_EXCLUSIVEADDRUSE", 0, raising=False)
+    assert _evidence_for(104) == "in use/bound or reserved"
 
 
 @pytest.mark.parametrize("port", [0, -1, 65536, 70000, "2575", 25.75, True, None])

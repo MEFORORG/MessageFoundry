@@ -18,7 +18,6 @@ manufactured by the check.
 from __future__ import annotations
 
 import ast
-import contextlib
 import errno
 import importlib
 import importlib.metadata
@@ -358,21 +357,22 @@ def check_postgres_driver() -> CheckResult:
     )
 
 
-# Bind errors that mean the family is not enabled here, not that the port is held. The engine's MLLP
-# listener skips a family on the same two (transports/mllp.py, _FAMILY_NOT_ENABLED).
+# Errors that mean IPv6 is not enabled here, not that the port is held. The engine's MLLP listener
+# skips a family on the same two bind errors (transports/mllp.py, _FAMILY_NOT_ENABLED).
 _FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
 
 
 def _port_state(port: object) -> str:
     """Report whether a listener could take ``port``: ``free``, ``in use/bound``, ``not bindable by
-    this user``, or ``invalid port``.
+    this user``, ``could not be probed``, or ``invalid port``.
 
     The probe binds the IPv4 wildcard and the IPv6 wildcard (BACKLOG #5389). A wildcard bind
     conflicts with a listener on any address of its family, so a loopback, one-interface or
     all-interface listener reads as held, which is conservative for an engine bound to one address.
     The IPv6 probe is dual-stack (``IPV6_V6ONLY`` off) because on Windows a dual-stack listener on
     ``::`` lets an IPv4 bind and an IPv6-only bind succeed beside it, exclusive or not; only a
-    dual-stack bind sees it.
+    dual-stack bind sees it. Only IPv6 is skipped when its family is not enabled; IPv4 always has
+    to bind for the port to read free.
 
     On Windows the probe sets ``SO_EXCLUSIVEADDRUSE``, never ``SO_REUSEADDR``: there,
     ``SO_REUSEADDR`` lets a bind share a port another socket holds, which read a held port as free.
@@ -380,36 +380,45 @@ def _port_state(port: object) -> str:
     listening socket still refuses it. Elsewhere (BSD, macOS) it lets a wildcard bind succeed beside
     a listener on one address, so the probe sets neither, and a TIME_WAIT port may read held there.
 
-    A free result says nothing about an external firewall.
+    The answer is for the account running verify, which may not be the service account. A free
+    result says nothing about an external firewall.
     """
     # bool is an int subclass, and True would otherwise probe port 1.
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         return "invalid port (must be an integer from 1 to 65535)"
     # The wildcard is bound and closed, never listened on, so nothing is exposed.
     for family, wildcard in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):  # nosec B104
+        ipv6 = family == socket.AF_INET6
         try:
             s = socket.socket(family, socket.SOCK_STREAM)
-        except OSError:
-            # The family is not enabled on this host (IPv6 disabled), so no listener can hold it.
-            continue
+        except OSError as exc:
+            if ipv6 and exc.errno in _FAMILY_NOT_ENABLED:
+                _log.debug("port probe skipped IPv6, its family is not enabled: %s", exc)
+                continue
+            # Out of descriptors, or a sandbox denying socket(): nothing was probed, so not free.
+            return f"could not be probed ({exc.strerror or exc})"
         try:
             if sys.platform == "win32":
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             elif sys.platform.startswith("linux"):
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if family == socket.AF_INET6:
+            if ipv6:
                 # Only a host with no dual-stack sockets refuses this, and no dual-stack listener can
                 # exist there: the IPv4 probe covers IPv4, and an IPv6-only bind sees IPv6 listeners.
-                with contextlib.suppress(OSError):
+                try:
                     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError as exc:
+                    _log.debug("port probe kept the IPv6 socket's default IPV6_V6ONLY: %s", exc)
             s.bind((wildcard, port))
         except PermissionError:
-            # On Windows a port another socket holds exclusively refuses with WSAEACCES, which
-            # Python raises as PermissionError. On POSIX it means a port below 1024 for an
-            # unprivileged user: the service account may still bind it.
-            return "in use/bound" if sys.platform == "win32" else "not bindable by this user"
+            if sys.platform == "win32":
+                # WSAEACCES: another socket holds the port exclusively, or the OS reserves it.
+                return "in use/bound or reserved"
+            # POSIX checks privilege before conflict, so this cannot tell held from free.
+            return "not bindable by this user (privileged port; it may also be in use)"
         except OSError as exc:
-            if exc.errno in _FAMILY_NOT_ENABLED:
+            if ipv6 and exc.errno in _FAMILY_NOT_ENABLED:
+                _log.debug("port probe skipped IPv6, its family is not enabled: %s", exc)
                 continue
             return "in use/bound"
         finally:
