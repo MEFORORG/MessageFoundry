@@ -176,8 +176,8 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 
 # --- text-only upload gate (ASVS 14.2.8) ------------------------------------------------------------
 # The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.hl7v2/.txt/
-# .xml). Its chokepoint enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
-# metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
+# .xml). Its chokepoint enforces that format contract with HTTP 415 by rejecting any body that is
+# either (a) a known metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
 # incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses) — or (b) not
 # plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
 # the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
@@ -308,7 +308,7 @@ def _member_extension(name: str) -> str:
     return leaf[dot:].lower() if dot > 0 else ""
 
 
-def archive_member_name_reason(name: object, *, windows_names: bool = True) -> str | None:
+def archive_member_name_reason(name: object) -> str | None:
     """Return a human reason when an archive member's name is not a safe RELATIVE path, else ``None``
     (ASVS 5.3.2). The name is chosen by whoever built the archive — for an inbound feed, a remote party —
     so it is untrusted data that a Handler will join onto a directory.
@@ -329,22 +329,7 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
     not a reason to drop them. ``zipfile._sanitize_filename`` runs inside ``ZipInfo.__init__`` on the read
     path as well as the write path: it truncates a member name at the first NUL everywhere, and replaces
     ``os.sep`` with ``/`` — so the backslash arm is live wherever ``os.sep`` is not a backslash and dead on
-    Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both.
-
-    With ``windows_names`` (the default), three more arms run, because a Handler may write a member
-    on Windows (BACKLOG #5369). A colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of
-    ``a.hl7``) and a component ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension
-    would read as ``.`` and skip the content check) are refused. So is a component
-    :func:`ntpath.isreserved` names: a reserved device stem (``NUL``, ``con.hl7``, ``COM1``,
-    ``CONIN$``) or a character Windows refuses in a name. That arm is a static list and deliberately
-    over-refuses, since which names Windows rewrites differs by build; the measurement is recorded
-    once, on :func:`messagefoundry.pipeline.dr_backup._win_opens_another`. The arms run on every
-    platform, since an archive's name is judged for where it may be written, not where it was read.
-    They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
-    a long name beside its 8.3 short form still pass, so a Handler writing members on Windows keeps
-    its own collision check. ``windows_names=False`` turns off only these arms; the drive-relative
-    and backslash arms above still bind. The DR config restore passes it, for the reason its own
-    docstring gives."""
+    Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both."""
     if not isinstance(name, str) or not name:
         return "member name is empty"
     if has_control_char(name):
@@ -353,16 +338,35 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
         return "member name contains a backslash, which a slash-only containment check cannot see"
     if len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":":
         return "member name is drive-relative"
-    # The colon and trailing dot-or-space arms overlap ntpath.isreserved; they stay for their reasons.
-    if windows_names and ":" in name:
-        return "member name contains a colon, which Windows reads as a drive or a data stream"
     if name.startswith("/"):
         return "member name is an absolute path"
     for part in name.split("/"):
         if part in ("", ".", ".."):
             return "member name has an empty or relative path component"
-        if not windows_names:
-            continue
+    return None
+
+
+def windows_member_name_reason(name: str) -> str | None:
+    """Return a human reason when an archive member's name has a shape Windows reads specially, else
+    ``None`` (BACKLOG #5369). Call it after :func:`archive_member_name_reason`, which it does not
+    repeat. :func:`~messagefoundry.parsing.compression.zip_decompress` calls it, because a Handler
+    may write a member on Windows; it runs on every platform, since an archive's name is judged for
+    where it may be written, not where it was read.
+
+    A colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of ``a.hl7``) and a component
+    ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and
+    skip the content check) are refused. So is a component :func:`ntpath.isreserved` names: a
+    reserved device stem (``NUL``, ``con.hl7``, ``COM1``, ``CONIN$``) or a character Windows refuses
+    in a name. That arm is a static list and deliberately over-refuses, since which names Windows
+    rewrites differs by build; the measurement is recorded once, on
+    :func:`messagefoundry.pipeline.dr_backup._win_opens_another`. These arms do NOT refuse every
+    alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its
+    8.3 short form still pass, so a Handler writing members on Windows keeps its own collision
+    check."""
+    # The colon and trailing dot-or-space arms overlap ntpath.isreserved; they stay for their reasons.
+    if ":" in name:
+        return "member name contains a colon, which Windows reads as a drive or a data stream"
+    for part in name.split("/"):
         if part.endswith((".", " ")):
             return "member name has a component ending in a dot or space, which Windows drops"
         if ntpath.isreserved(part):

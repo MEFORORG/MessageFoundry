@@ -41,7 +41,7 @@ from messagefoundry.parsing.compression import (
     zip_compress,
     zip_decompress,
 )
-from messagefoundry.parsing.sniff import archive_member_name_reason
+from messagefoundry.parsing.sniff import archive_member_name_reason, windows_member_name_reason
 
 _BODY = b"MSH|^~\\&|SEND|FAC|RECV|FAC|20260717||ADT^A01|1|P|2.5\rPID|1||123^^^MRN\r" * 200
 
@@ -605,11 +605,11 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
         ("a?b.hl7", "refuses"),  # a character Windows refuses in a name
     ],
 )
-def test_archive_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
+def test_windows_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
     """BACKLOG #5369: a colon, a trailing dot or space, and a reserved device stem or refused
     character are refused on every platform, and the reason does not echo the name. The device
     arm deliberately over-refuses; see dr_backup._win_opens_another for the measurement."""
-    reason = archive_member_name_reason(name)
+    reason = windows_member_name_reason(name)
     assert reason is not None and fragment in reason
     assert name not in reason
 
@@ -618,18 +618,18 @@ def test_archive_member_name_reason_refuses_windows_name_shapes(name: str, fragm
     "name",
     ["CONFIG.hl7", "console.txt", "COM10.hl7", "nullable.hl7", "a. b.hl7", "auxiliary/x.hl7"],
 )
-def test_archive_member_name_reason_admits_near_miss_windows_names(name: str) -> None:
+def test_windows_member_name_reason_admits_near_miss_windows_names(name: str) -> None:
     # The must-not-fire arm for BACKLOG #5369: a stem that only starts like a device, and a dot-space
     # inside a component, are ordinary names.
-    assert archive_member_name_reason(name) is None
+    assert windows_member_name_reason(name) is None
 
 
 @pytest.mark.parametrize("name", ["aux.py", "sub/con.toml", "x/a:b.toml", "trailing.", "y/z "])
-def test_archive_member_name_reason_windows_arms_can_be_turned_off(name: str) -> None:
-    # The DR config restore passes windows_names=False; the traversal arms still bind there.
-    assert archive_member_name_reason(name) is not None
-    assert archive_member_name_reason(name, windows_names=False) is None
-    assert archive_member_name_reason("../" + name, windows_names=False) is not None
+def test_archive_member_name_reason_keeps_its_earlier_arms(name: str) -> None:
+    # BACKLOG #5369 adds the Windows-name arms in their own function, so the shared guard, which
+    # the DR config restore also calls, refuses only what it refused before.
+    assert archive_member_name_reason(name) is None
+    assert archive_member_name_reason("../" + name) is not None
 
 
 @pytest.mark.parametrize(
@@ -643,35 +643,6 @@ def test_zip_decompress_refuses_windows_name_shapes(name: str, fragment: str) ->
         assert zf.namelist() == [name]
     with pytest.raises(CompressionError, match=fragment):
         zip_decompress(blob, max_output_bytes=None)
-
-
-def test_dr_config_restore_passes_windows_names_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #5369: the DR config restore keeps its earlier name check, so it calls the shared
-    guard with the Windows-name arms off. The guard is imported inside the function, so the
-    module attribute is what it reads."""
-    import tarfile
-
-    from messagefoundry.parsing import sniff
-    from messagefoundry.pipeline import dr_backup
-
-    seen: list[object] = []
-    real = sniff.archive_member_name_reason
-
-    def recording(name: object, **kwargs: bool) -> str | None:
-        seen.append(kwargs.get("windows_names", "default"))
-        return real(name, **kwargs)
-
-    monkeypatch.setattr(sniff, "archive_member_name_reason", recording)
-    tar_path = tmp_path / "bundle.tar"
-    with tarfile.open(tar_path, "w") as tar:
-        info = tarfile.TarInfo("config/plain.toml")
-        info.size = 3
-        tar.addfile(info, io.BytesIO(b"x=1"))
-    landed = dr_backup._extract_config_members(tar_path, tmp_path / "out")
-    assert landed == 1
-    assert seen == [False]
 
 
 def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:
