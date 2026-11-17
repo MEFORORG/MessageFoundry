@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIWebSocketRoute
 from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
-from starlette.routing import Host, Mount, Route, WebSocketRoute
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -967,10 +967,9 @@ def _spy_on_the_refusal(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     seen: list[Any] = []
     refuse = route_gates._refuse_low_priority_routes
 
-    def spy(owner: Any, at: str = "") -> None:
-        nested = isinstance(owner, Mount | Host)
-        seen.append(route_gates._app_beneath(owner) if nested else owner)
-        refuse(owner, at)
+    def spy(source: Any, at: str = "") -> None:
+        seen.append(source)
+        refuse(source, at)
 
     monkeypatch.setattr(route_gates, "_refuse_low_priority_routes", spy)
     return seen
@@ -997,10 +996,26 @@ def test_a_host_or_a_wrapped_mount_with_no_frontend_group_passes(
     route_gates.route_rows(app)
 
 
-def _frontend_in_a_root_mount(app: FastAPI, directory: str) -> None:
+def _frontend_alone_mounted_at(app: FastAPI, path: str, directory: str) -> None:
     inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     inner.frontend("/", directory=directory, check_dir=False)
-    app.mount("/", inner)
+    app.mount(path, inner)
+
+
+def _frontend_in_a_root_mount(app: FastAPI, directory: str) -> None:
+    _frontend_alone_mounted_at(app, "/", directory)
+
+
+def _frontend_in_a_mount_under_a_root_mount(app: FastAPI, directory: str) -> None:
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    _frontend_alone_mounted_at(outer, "/inner", directory)
+    app.mount("/", outer)
+
+
+def _frontend_under_a_host_in_a_mount(app: FastAPI, directory: str) -> None:
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    _frontend_under_a_host(outer, directory)
+    app.mount("/o", outer)
 
 
 @pytest.mark.parametrize(
@@ -1010,6 +1025,8 @@ def _frontend_in_a_root_mount(app: FastAPI, directory: str) -> None:
         (_frontend_under_a_host, "'[host api.example.test]'"),
         (_frontend_in_an_app_mounted_inside_middleware, "'/wrapped'"),
         (_frontend_in_a_root_mount, "'/'"),
+        (_frontend_in_a_mount_under_a_root_mount, "'/inner'"),
+        (_frontend_under_a_host_in_a_mount, "'/o [host api.example.test]'"),
     ],
 )
 def test_the_refusal_names_where_the_nested_group_sits(
@@ -1043,7 +1060,25 @@ class _EndlessWrapper:
 def test_a_mount_wrapped_without_end_is_refused_rather_than_unwrapped_forever() -> None:
     app = FastAPI(openapi_url=None)
     app.mount("/stub", _EndlessWrapper())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="more than 64 middleware layers"):
+    with pytest.raises(ValueError, match="under '/stub' is wrapped in more than 64"):
+        list(route_gates._effective_routes(app))
+
+
+@pytest.mark.parametrize(("layers", "refused"), [(64, False), (65, True)])
+def test_the_middleware_cap_refuses_only_past_64_layers(
+    layers: int, refused: bool, tmp_path: Path
+) -> None:
+    """The boundary control for the cap: 64 layers are unwrapped down to the app, which is refused
+    for its frontend group; 65 are refused for the layers themselves."""
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=str(tmp_path), check_dir=False)
+    wrapped: Any = inner
+    for _ in range(layers):
+        wrapped = _PassThrough(wrapped)
+    app = FastAPI(openapi_url=None)
+    app.mount("/w", wrapped)
+    expected = "middleware layers" if refused else "low-priority route"
+    with pytest.raises(ValueError, match=expected):
         list(route_gates._effective_routes(app))
 
 

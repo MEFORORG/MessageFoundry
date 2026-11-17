@@ -210,14 +210,7 @@ def _seed_compare(
     corepoint_body = msh + "PID|1||100^^^H^MR||DOE^JANE\r"
     mefor_body = msh + f"PID|1||100^^^H^MR||{mefor_name}\r"
 
-    async def _seed_capture() -> None:
-        store = await RelayStore.open(db)
-        await store.record_capture(
-            direction="corepoint_copy", control_id="C1", raw=corepoint_body.encode()
-        )
-        await store.close()
-
-    asyncio.run(_seed_capture())
+    seed_capture(db, corepoint_body.encode())
     monkeypatch.setattr(
         mefor_api,
         "fetch_mefor_outputs",

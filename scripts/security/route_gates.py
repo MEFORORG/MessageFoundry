@@ -534,8 +534,9 @@ def _mounted_app(mount: Mount) -> Any:
     return getattr(mount, "_base_app", mount.app)
 
 
-def _app_beneath(route: Mount | Host) -> Any:
-    """The app ``route`` serves, as the low-priority refusal reads it.
+def _app_beneath(route: Mount | Host, at: str) -> Any:
+    """The app ``route`` serves, as the low-priority refusal reads it; ``at`` names ``route`` in
+    an error.
 
     That is a ``Mount``'s app beneath any middleware the mount wraps around it, or a ``Host``'s app,
     then unwrapped through each ASGI middleware layer that keeps the next app as ``.app``, down to
@@ -549,7 +550,7 @@ def _app_beneath(route: Mount | Host) -> Any:
     while not isinstance(app, Starlette | Router) and id(app) not in seen:
         if len(seen) >= _MAX_MIDDLEWARE_LAYERS:
             raise ValueError(
-                f"the app under {_place(route)!r} is wrapped in more than "
+                f"the app under {at!r} is wrapped in more than "
                 f"{_MAX_MIDDLEWARE_LAYERS} middleware layers, so the route walk cannot reach it"
             )
         seen[id(app)] = app
@@ -564,20 +565,22 @@ def _app_beneath(route: Mount | Host) -> Any:
 _MAX_MIDDLEWARE_LAYERS = 64
 
 
-def _place(route: Mount | Host) -> str:
-    """How a refusal names where ``route`` sits beneath its parent. Starlette strips a mount at
-    ``/`` to an empty path, so that one is named ``/``."""
-    return (route.path or "/") if isinstance(route, Mount) else f"[host {route.host}]"
+def _place(route: Mount | Host, at: str = "") -> str:
+    """How a refusal names ``route``, beneath the parent ``at`` names. Starlette strips a mount at
+    ``/`` to an empty path, so that one is named ``/``; a host follows its parent after a space."""
+    if isinstance(route, Host):
+        return f"{at} [host {route.host}]" if at else f"[host {route.host}]"
+    path = route.path or "/"
+    return at.rstrip("/") + path if at else path
 
 
-def _refuse_low_priority_routes(owner: Starlette | Router | Mount | Host, at: str = "") -> None:
-    """Raise when ``owner`` holds a route FastAPI tries only after its ordinary ones.
+def _refuse_low_priority_routes(source: Any, at: str = "") -> None:
+    """Raise when the app ``source`` holds a route FastAPI tries only after its ordinary ones.
 
     ``APIRouter.frontend`` registers such a group, and an included router's group comes along with
     it. ``iter_route_contexts`` never yields one, so the walk would serve it unseen (vault BACKLOG
     #3055). None is registered today; teach the walk to read one before registering it. ``at`` is
-    where ``owner`` sits beneath the walked app, for the message."""
-    source = _app_beneath(owner) if isinstance(owner, Mount | Host) else owner
+    where ``source`` sits beneath the walked app, for the message."""
     router = source.router if isinstance(source, FastAPI) else source
     if not isinstance(router, APIRouter):
         return
@@ -623,14 +626,13 @@ def _effective_routes(
 
     ``_at`` is where ``owner`` sits beneath the app the walk started from; a ``Mount`` or ``Host``
     walked from the top is placed by its own path or host."""
-    if not _at and isinstance(owner, Mount | Host):
-        _at = _place(owner)
-    _refuse_low_priority_routes(owner, _at)
-    routes: Sequence[BaseRoute] = (
-        getattr(_app_beneath(owner), "routes", [])
-        if isinstance(owner, Mount | Host)
-        else owner.routes
-    )
+    if isinstance(owner, Mount | Host):
+        _at = _at or _place(owner)
+        source: Any = _app_beneath(owner, _at)
+    else:
+        source = owner
+    _refuse_low_priority_routes(source, _at)
+    routes: Sequence[BaseRoute] = getattr(source, "routes", [])
     # One entry at a time, so a context with no rebuilt copy is known to be the entry itself only
     # when its original IS that entry. A count of direct registrations could not say which context
     # was the direct one: a shared route object included before it is registered here would spend
@@ -661,7 +663,7 @@ def _effective_routes(
             served = original
         if isinstance(served, Mount | Host):
             # Walked through only for its refusals; the docstring says what that covers.
-            for _ in _effective_routes(served, _at=_at + _place(served)):
+            for _ in _effective_routes(served, _at=_place(served, _at)):
                 pass
         yield original, served
 
