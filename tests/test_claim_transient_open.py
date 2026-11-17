@@ -416,7 +416,7 @@ async def test_the_set_aside_deadline_runs_from_the_fault_not_the_claim(
             " WHERE destination_name=?)",
             (_DEST,),
         )
-        assert float(head[0][0]) == pytest.approx(start + 65.0)
+        assert float(head[0][0]) == pytest.approx(start + 65.0, abs=0.5)
     finally:
         await store.close()
 
