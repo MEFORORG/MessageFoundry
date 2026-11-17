@@ -1058,8 +1058,10 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
-A record the sink cannot format is replaced by a notice naming its logger, and when the sink takes
-that notice neither stage runs.
+A record the sink cannot format is replaced by a notice naming its logger where the formatter can
+format that notice, and when the sink takes it neither stage runs. Where the formatter cannot,
+nothing is written for the record and neither stage runs. Either way, stderr says so when that
+sink has not said so in the last minute.
 
 **Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
 `stopped`. The difference is the one that decides what you do next: `stopped` means the lane is

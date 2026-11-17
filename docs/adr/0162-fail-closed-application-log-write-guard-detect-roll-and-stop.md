@@ -481,9 +481,10 @@ record whose message cannot be rendered, so this path needs a formatter that fai
 did not. Now such a record's place is taken by a fixed notice naming its logger and level. When the
 sink takes the notice, neither stage runs. When it refuses it, the sink is the fault and the two
 stages decide as before. A formatter that cannot format even that notice is a formatter fault, not
-a sink failure: neither stage runs, and nothing is written for the record. Either kind of format
-fault is reported on the stderr last-resort line, at most once a minute per sink, with a count of
-the faults since the last such line.
+a sink failure: neither stage runs, and nothing is written for the record. A format fault of either
+kind writes a stderr last-resort line when that sink has written none in the last minute. A fault
+inside that minute is only counted, and the count goes on the next such line, if a later fault
+writes one.
 
 **Part of the side-by-side check is now committed.**
 `test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on

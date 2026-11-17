@@ -46,11 +46,12 @@ scope available. See ADR 0162 section 4.
   ``record.args``; the only rendering of a record it performs is ``self.format(record)`` — the record
   has already passed the handler's :class:`~messagefoundry.logging_setup.RedactionFilter` chain by then
   (filters run in ``Handler.handle``, before ``emit``) — and that rendering is written only to the
-  sink's own stream, never to the last-resort channel. When that rendering raises, the record is
-  replaced on the sink by a notice that renders only its logger and level names, escaped, and the
-  exception's type (BACKLOG #5813). The stderr last-resort line carries the sink label, a
-  :func:`~messagefoundry.redaction.safe_exc` reason or an exception's type, and **nothing from the
-  record**. The guard also never raises the service level to DEBUG.
+  sink's own stream, never to the last-resort channel. When that rendering raises, the guard writes
+  in the record's place, where the formatter can format it, a notice that renders only the record's
+  logger and level names, escaped, and the exception's type (BACKLOG #5813). The stderr
+  last-resort line carries the sink label, a :func:`~messagefoundry.redaction.safe_exc` reason or
+  an exception's type, and **nothing from the record**. The guard also never raises the service
+  level to DEBUG.
 * **The guard scrubs its OWN diagnostics, because nothing downstream reliably will (BACKLOG
   #1591).** THE CONSUMER LIST, stated here once and referred to rather than repeated: a failure
   reason travels to (1) the notice written onto the rolled sink, (2) ``GET /status``'s
@@ -721,7 +722,7 @@ def _escape_only(text: str, *, fallback: str) -> str:
 _RECORD_LABEL_DROPPED = "<unnameable>"
 
 #: The formatter-fault line on stderr is written at most once per this many seconds per sink; the
-#: faults in between are counted into the next line (BACKLOG #5813).
+#: faults in between are only counted, into the next line if one is written (BACKLOG #5813).
 _FORMAT_FAULT_REPORT_SECONDS = 60.0
 
 
@@ -903,10 +904,10 @@ class _GuardedSinkMixin(_SinkBase):
 
     def _report_format_fault(self, detail: str) -> None:
         """Say on the stderr last-resort line that this sink could not format a record, at most
-        once per :data:`_FORMAT_FAULT_REPORT_SECONDS`; faults in between are counted into the next
-        line. Called from :meth:`handleError`, which ``Handler.handle`` runs under the handler's lock.
-        Never raises: ``detail``
-        is built from literals and :func:`_type_name` output, and carries nothing from the record."""
+        once per :data:`_FORMAT_FAULT_REPORT_SECONDS`; faults in between are only counted, into the
+        next line if a later fault writes one. Called from :meth:`handleError`, which
+        ``Handler.handle`` runs under the handler's lock. Never raises: ``detail`` is built from
+        literals and :func:`_type_name` output, and carries nothing from the record."""
         self._format_faults += 1
         now = time.monotonic()
         last = self._format_fault_reported_at
