@@ -232,21 +232,11 @@ def _checked_header(cell: str, field: str, checked: list[str], what: str) -> lis
 
 
 def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
-    """Refuse a configured subject that a header would carry as, or decode to, a control character.
+    """Refuse at least a subject holding a C0 control character, DEL or a Unicode line break, raw
+    or inside an encoded word, and a subject holding a lone surrogate (vault BACKLOG #5360).
 
-    The Email and Direct outbounds both call this at load, so the two cannot drift (vault BACKLOG
-    #5360).
-
-    Three checks, in order. First, a control character in the text. Second, a lone surrogate, for
-    the reason :func:`~messagefoundry.controlchars.has_lone_surrogate` gives (vault BACKLOG #2842).
-    Third, the header parse: ``policy.default`` parses the ``Subject:`` it is given and decodes RFC 2047
-    encoded words, so ``=?utf-8?b?AA==?=`` holds no control character as configured, reads back
-    as a NUL, and the generator writes that NUL raw into the header (vault BACKLOG #3206). This
-    sets the subject on a scratch message, as :func:`_checked_header` does for an address, and
-    checks what reads back.
-
-    Only the exception's type is kept, and the refusal is raised outside the handler, so neither
-    the text nor the chain quotes the subject. Raises :class:`ValueError` naming the setting, never its value."""
+    Raises :class:`ValueError` whose text starts with ``transport``, the outbound's label such as
+    ``"Email destination"``, and holds no subject text."""
     if _holds_control_char(subject):
         raise ValueError(f"{transport} 'subject' holds a control character")
     if has_lone_surrogate(subject):
