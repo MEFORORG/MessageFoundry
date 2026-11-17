@@ -621,14 +621,15 @@ def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> No
 
 
 @pytest.mark.parametrize(
-    "suffix", [f";jsessionid={_SECRET}", f"#access_token={_SECRET}", f"?a=1?api_key={_SECRET}"]
+    "suffix",
+    [f";jsessionid={_SECRET}", f";jsessionid={_SECRET}/next", f"?a=1?api_key={_SECRET}"],
 )
 @pytest.mark.parametrize("cell", _CELLS)
 def test_a_url_segment_credential_the_query_misses_is_refused_over_verify_off(
     cell: str, suffix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5353: a ``;``-split segment, a fragment or a second ``?`` holds a credential the
-    ``&``-split query reader does not reach, and it used to cross a verify-off hop."""
+    """BACKLOG #5353: a ``;``-split segment or a second ``?`` holds a credential the ``&``-split
+    query reader does not reach, and it used to cross a verify-off hop."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     url = f"{_HTTPS[cell][2]}{suffix}"
     with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
@@ -679,6 +680,12 @@ def test_url_segment_and_conditional_query_readings() -> None:
     from messagefoundry.transports.rest import _query_credentials_sent, http_credentials_sent
 
     assert http_credentials_sent(ConnectorType.REST, {"url": "https://h.example/x;v=1?f=j#t"}) == []
+    # The path before any ';' or '?' is not read, so an OData key predicate is no credential, and
+    # urllib never sends a fragment, so a name there does not cross the hop.
+    odata = "https://odata.example/Orders(OrderKey=5)/Items(token=1)"
+    assert http_credentials_sent(ConnectorType.REST, {"url": odata}) == []
+    fragment = f"https://h.example/x?fmt=json#access_token={_SECRET}"
+    assert http_credentials_sent(ConnectorType.REST, {"url": fragment}) == []
     assert _query_credentials_sent("conditional_query", "identifier=s|1", query_only=True) == []
     secret = f"_id=1&client_secret={_SECRET}"
     assert _query_credentials_sent("conditional_query", secret, query_only=True) == [

@@ -164,11 +164,11 @@ _HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
 #: Lowercased header names a message may never set under ``dynamic_headers``, beside the
 #: proxy-credential spellings (BACKLOG #5352). ``Authorization`` is connection config only (vault
-#: BACKLOG #3416). ``Host`` names the upstream, and on an ECH
-#: connection the sidecar routes by it. ``Content-Length`` and ``Transfer-Encoding`` frame the body,
-#: which ``http.client`` already frames, so a second value would send conflicting framing. The RFC
-#: 9110 section 7.6.1 hop-by-hop fields belong to the connection, not to one message. ``Cookie`` is a
-#: session credential the redaction screen does not read by name.
+#: BACKLOG #3416). ``Host`` names the upstream, and on an ECH connection the sidecar routes by it.
+#: ``Content-Length`` and ``Transfer-Encoding`` frame the body, which ``http.client`` already
+#: frames, so a second value would send conflicting framing. The hop-by-hop fields of RFC 9110
+#: section 7.6.1, RFC 2616's ``Trailer`` and ``Expect`` belong to the connection, not to one
+#: message. ``Cookie`` is a session credential the redaction screen does not read by name.
 PER_MESSAGE_DENIED_HEADERS = frozenset(
     {
         "authorization",
@@ -181,6 +181,7 @@ PER_MESSAGE_DENIED_HEADERS = frozenset(
         "te",
         "trailer",
         "upgrade",
+        "expect",
         "cookie",
     }
 )
@@ -308,10 +309,21 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() in PER_MESSAGE_DENIED_HEADERS or is_proxy_credential_header_name(name):
-            # Auth, routing, framing and hop-by-hop fields are the connection's alone. A proxy
-            # handler's admission covers the connection's own proxy_user header, so a message must
-            # not be able to supply one (vault BACKLOG #3416, #5352).
+        if (lowered := name.lower()) in PER_MESSAGE_DENIED_HEADERS:
+            # Auth, routing, framing and hop-by-hop fields are the connection's alone (vault
+            # BACKLOG #3416, #5352). Logged by the set's own spelling, never the Handler's key.
+            logger.warning(
+                # No ':' or '=' after the name, so the log scrubber never reads it as a label
+                # (BACKLOG #4998, on egress.warn_url_query_credentials).
+                "a Handler set the per-message header %r, which dynamic_headers never sends; "
+                "it was dropped",
+                lowered,
+            )
+            continue
+        if is_proxy_credential_header_name(name):
+            # A proxy handler's admission covers the connection's own proxy_user header, so a
+            # message must not be able to supply one (vault BACKLOG #3416). Its spelling may carry
+            # a credential, so nothing about it is logged.
             continue
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
@@ -1350,7 +1362,7 @@ def http_credentials_sent(
     hop that already turned verification off that is the cheaper error. A credential-looking query
     parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
     ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). So does a
-    credential-looking name in a ``;``-split segment, a fragment or after a second ``?`` of
+    credential-looking name in a ``;``-split segment or after a second ``?`` of
     ``url`` (:func:`_query_credentials_sent`, BACKLOG #5353). The FHIR destination adds its
     ``conditional_query``, which crosses the hop too, by the same reader at its own call sites. A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
@@ -1375,8 +1387,8 @@ def http_credentials_sent(
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
     not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
-    the path of ``url``; docs/SECURITY-LOOSENING.md lists it among the hops the rule does not
-    reach."""
+    the path of ``url`` before its first ``;``; docs/SECURITY-LOOSENING.md lists it among the
+    hops the rule does not reach."""
     # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
 
@@ -1409,7 +1421,7 @@ def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> li
 
     A credential-looking query parameter is named, by the reader ``credential_query_params`` gives
     the refusals. A name the ``&``-split query does not reach is counted too, unnamed: a ``;``-split
-    segment (``;jsessionid=``), a fragment or a second ``?``, by
+    segment (``;jsessionid=``) or one after a second ``?``, by
     :func:`~messagefoundry.secretscrub.has_credential_like_segment` (BACKLOG #5353). That reader
     knows no ``code`` parameter, so a ``;code=`` segment is not counted. Nor is ``code`` in a
     bare query: there it is FHIR's own search parameter (``Observation?code=...``), not the
@@ -1424,9 +1436,23 @@ def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> li
     if names:
         noun = "parameter" if query_only else "query parameter"
         return [f"{setting} {noun} {', '.join(names)}"]
-    if has_credential_like_segment(value):
+    if has_credential_like_segment(value if query_only else _url_segments_sent(value)):
         return [f"{setting} segment with a credential-looking name"]
     return []
+
+
+#: Where a ``name=value`` segment of a whole URL can start: a ``;`` path parameter or the query.
+_URL_SEGMENT_START = re.compile(r"[;?]")
+
+
+def _url_segments_sent(url: str) -> str:
+    """The part of ``url`` :func:`_query_credentials_sent` screens for a segment credential: from
+    the first ``;`` or ``?`` up to any ``#``. The scheme, host and the path before them are left
+    out, so a path predicate such as OData's ``Orders(OrderKey=5)`` is not read as one (the rule
+    does not read the path, owner ruling 2026-10-26). So is the fragment, which urllib never sends."""
+    sent = url.partition("#")[0]
+    start = _URL_SEGMENT_START.search(sent)
+    return "" if start is None else sent[start.start() :]
 
 
 def refuse_verify_off(
@@ -2752,7 +2778,7 @@ def ech_readdressed_request(
         path += "?" + parsed.query
     # Any spelling of Host goes first (BACKLOG #5352): urllib folds header names with capitalize(),
     # so a ``host`` entry after ``Host`` in this dict would replace the pinned upstream.
-    h = {name: value for name, value in headers.items() if name.lower() != "host"}
+    h = {name: value for name, value in headers.items() if name.strip().lower() != "host"}
     h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
     return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
         sidecar + path, data=data, headers=h, method=method
@@ -3114,10 +3140,12 @@ class RestDestination(DestinationConnector):
         extra = s.get("headers") or {}
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
-        # _refuse_unsendable_static_auth has refused a half pair and bearer_token beside Basic.
-        token, user = s.get("bearer_token"), s.get("basic_user")
-        if user:
-            raw = f"{user}:{s.get('basic_password')}".encode()
+        # The constructor's _refuse_unsendable_static_auth refuses a half pair and bearer_token
+        # beside Basic; the guard stays so a direct call never builds 'user:None'.
+        token = s.get("bearer_token")
+        user, password = s.get("basic_user"), s.get("basic_password")
+        if user and password:
+            raw = f"{user}:{password}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         elif token:
             headers["Authorization"] = f"Bearer {token}"

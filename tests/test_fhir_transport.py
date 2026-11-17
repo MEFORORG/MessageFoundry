@@ -412,6 +412,27 @@ def test_conditional_query_credential_is_warned(
     assert _QUERY_SECRET not in caplog.text
 
 
+@pytest.mark.parametrize("conditional", ["if-match", None])
+def test_an_unsent_conditional_query_is_not_warned_or_refused(
+    conditional: str | None, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only if-none-exist and conditional-update send conditional_query, so with any other
+    conditional a credential in it never crosses, and neither the warning nor a refusal reads it."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    query = f"identifier=sys|1&api_key={_QUERY_SECRET}"
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.fhir"),
+    ):
+        _dest(
+            interaction="update",
+            conditional=conditional,
+            conditional_query=query,
+            verify_tls=False,
+        )
+    assert not [r for r in caplog.records if "conditional_query" in r.getMessage()]
+
+
 @pytest.mark.parametrize(
     "query", ["identifier=sys|1", "code=http://loinc.org|1234-5&subject=Patient/1"]
 )

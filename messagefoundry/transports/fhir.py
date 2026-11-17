@@ -1132,20 +1132,6 @@ class FhirDestination(DestinationConnector):
             _refuse_unsendable_conditional_query(
                 self.conditional_query, self.conditional, url.rstrip("/")
             )
-        # BACKLOG #5350/#5353: the query rides the request line or the If-None-Exist header, so a
-        # credential in it lands in the server's and any proxy's log. Warned on every hop, as a url
-        # query credential is, and a verify-off or off-box cleartext hop refuses it below.
-        query_credentials = _query_credentials_sent(
-            "conditional_query", self.conditional_query, query_only=True
-        )
-        for found in query_credentials:
-            logger.warning(
-                "FHIR destination %s carries a credential in its conditional_query (%s). It is "
-                "sent in the request URL or the If-None-Exist header, so the server's and any "
-                "proxy's log will hold it; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
-                config.name,
-                found,
-            )
         # BACKLOG #5911: the If-None-Exist value is this connection's setting, bounded above, so _post
         # leaves it out of the message-derived set. Belt and braces: the check above already keeps an
         # over-length value from reaching the send-time gate.
@@ -1235,6 +1221,24 @@ class FhirDestination(DestinationConnector):
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())
+        # BACKLOG #5350/#5353: a conditional query rides the request line or the If-None-Exist
+        # header, so a credential in it reaches the server, and any proxy or log that records it.
+        # Read only where _resolve_request sends it, and after the construction refusals above, so
+        # a connection that never builds logs nothing. Warned on every hop, as a url query
+        # credential is; a verify-off or off-box cleartext hop refuses it below.
+        query_credentials = (
+            _query_credentials_sent("conditional_query", self.conditional_query, query_only=True)
+            if self.conditional in ("if-none-exist", "conditional-update")
+            else []
+        )
+        for found in query_credentials:
+            logger.warning(
+                "FHIR destination %s carries a credential in its conditional_query (%s). It is "
+                "sent in the request URL or the If-None-Exist header, which the server or a proxy "
+                "may log; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
+                config.name,
+                found,
+            )
         enforce_outbound_length_limits(self.base_url, self._headers)
         refuse_cleartext_credentials(
             scheme,

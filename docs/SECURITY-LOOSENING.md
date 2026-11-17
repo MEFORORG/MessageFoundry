@@ -82,7 +82,7 @@ pointed at one of those levers.
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter
-or `name=value` segment after a `;`, a `#` or a second `?`, the same in a FHIR `conditional_query`, and
+or `name=value` segment after a `;` or a second `?`, the same in a FHIR `conditional_query`, and
 a static header that settings views would mask, such as `Authorization` or an API key, in any
 letter case. On a `verify_tls = false` hop the engine also refuses any other static header,
 unless its name is
@@ -111,7 +111,8 @@ engine has not verified, when the lever named beside each is set:
 - an HTTP-family secret in the `url` that the refusal cannot see as a credential, on a
   `verify_tls = false` hop or over plain `http`, under that hop's own levers. That covers at least a
   query parameter with a neutral name, such as `?sid=`. The query test reads only names that look
-  like a credential. A secret anywhere in the path crosses unrefused too. A path secret cannot be
+  like a credential. A secret in the path crosses unrefused too, unless it is a `;name=` path
+  parameter under a name that looks like a credential, such as `;jsessionid=`. A path secret cannot be
   told apart from a legitimate path, so the rule does not try (owner ruling 2026-10-26);
 - a secret that is not
   [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under

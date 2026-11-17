@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import email.message
 import http.client
+import logging
 import urllib.error
 import urllib.request
+from typing import Any
 
 import pytest
 
@@ -157,7 +159,7 @@ _AUTH_SECRET = "ZZAUTHSECRET5354"
         {"basic_user": "", "basic_password": _AUTH_SECRET},
     ],
 )
-def test_rest_half_basic_pair_is_refused(over: dict[str, str]) -> None:
+def test_rest_half_basic_pair_is_refused(over: dict[str, Any]) -> None:
     """BACKLOG #5354: one Basic half alone used to build and send no Authorization at all."""
     with pytest.raises(rest_mod.HttpAuthError, match="must be set together") as ei:
         _dest(**over)
@@ -663,15 +665,21 @@ def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:
         "TE",
         "Trailer",
         "Upgrade",
+        "Expect",
+        "Authorization",
         "Cookie",
         "cookie",
     ],
 )
-def test_a_message_cannot_set_routing_framing_hop_by_hop_or_cookie_headers(name: str) -> None:
-    """BACKLOG #5352: these are dropped in any letter case, as Authorization is; the rest of the
-    bag still projects."""
+def test_a_message_cannot_set_routing_framing_hop_by_hop_or_cookie_headers(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5352: these are dropped in any letter case, as Authorization is, and each drop is
+    logged by the set's own spelling; the rest of the bag still projects."""
     bag = {f"http.header.{name}": "v", "http.header.X-Trace-Id": "t-1"}
-    assert outbound_headers_from_metadata(bag) == {"X-Trace-Id": "t-1"}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+        assert outbound_headers_from_metadata(bag) == {"X-Trace-Id": "t-1"}
+    assert f"per-message header {name.lower()!r}" in caplog.text
 
 
 def test_the_per_message_denied_headers_are_pinned() -> None:
@@ -691,6 +699,7 @@ def test_the_per_message_denied_headers_are_pinned() -> None:
                 "te",
                 "trailer",
                 "upgrade",
+                "expect",
                 "cookie",
             }
         )
@@ -698,7 +707,7 @@ def test_the_per_message_denied_headers_are_pinned() -> None:
     )
 
 
-@pytest.mark.parametrize("spelling", ["host", "HOST", "Host"])
+@pytest.mark.parametrize("spelling", ["host", "HOST", "Host", "Host ", " host"])
 def test_ech_readdressing_pins_the_upstream_host_over_any_spelling(spelling: str) -> None:
     """BACKLOG #5352: urllib folds header names with capitalize(), so a lowercase ``host`` after the
     pinned ``Host`` used to replace it, and the sidecar would route to the wrong upstream."""
