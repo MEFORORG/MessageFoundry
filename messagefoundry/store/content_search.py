@@ -69,6 +69,10 @@ class SearchSpec:
             )
         # The needle rules make_spec enforces, held here too, so a spec built any other way cannot
         # carry two needles, none, a blank one, or a field_value with no field path (#6700).
+        for name in ("substring", "field_path", "field_value"):
+            _text(name, getattr(self, name))
+        if not isinstance(self.target, SearchTarget):
+            raise ContentSearchError("target must be a SearchTarget")
         if (self.substring is None) == (self.field_path is None):
             raise ContentSearchError("a spec holds exactly one of a substring or a field path")
         if self.substring is not None and _sent(self.substring) is None:

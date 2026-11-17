@@ -256,6 +256,24 @@ def test_a_spec_built_outside_make_spec_refuses_a_malformed_field_path() -> None
         )
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"substring": 5, "field_path": None, "field_value": None, "target": SearchTarget.BOTH},
+        {"substring": None, "field_path": b"PID-3", "field_value": None, "target": "both"},
+        {"substring": "x", "field_path": None, "field_value": None, "target": "bogus"},
+    ],
+    ids=["non-text-needle", "bytes-path", "bad-target"],
+)
+def test_a_spec_built_outside_make_spec_refuses_what_make_spec_refuses(
+    fields: dict[str, Any],
+) -> None:
+    """A non-text needle or a target that is not a ``SearchTarget`` is a 400, not a 500 or a scan
+    that silently matches nothing."""
+    with pytest.raises(ContentSearchError):
+        SearchSpec(**fields, scan_limit=10)
+
+
 def test_an_out_of_range_cap_is_a_content_search_error() -> None:
     """The range refusal is the type the routes catch for a 400, as the type refusal is (item 16)."""
     with pytest.raises(ContentSearchError, match="scan_limit must be in"):

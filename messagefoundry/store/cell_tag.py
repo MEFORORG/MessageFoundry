@@ -459,9 +459,13 @@ _OWN_BUGS: Final = (TypeError, AttributeError, NameError, KeyError, IndexError)
 
 
 def _frames(exc: BaseException) -> str:
-    """``exc``'s traceback frames (file, line, function, source line), without its message or its
-    chain, which may carry a driver's text."""
-    return "\nTraceback (frames only):\n" + "".join(traceback.format_tb(exc.__traceback__))
+    """``exc``'s traceback frames as file, line and function, without its message or its chain,
+    which may carry a driver's text. No source line is read, so no file is opened on the event
+    loop."""
+    return "\nTraceback (frames only):" + "".join(
+        f"\n  {frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+        for frame, lineno in traceback.walk_tb(exc.__traceback__)
+    )
 
 
 #: The shape of SQLite's own error names (``SQLITE_BUSY``). Any other ``sqlite_errorname`` value is
@@ -476,11 +480,12 @@ def _error_code(exc: BaseException) -> str | None:
         from messagefoundry.store.base import driver_sqlstate  # lazy: base imports this module
 
         code = driver_sqlstate(exc)
-    except Exception:  # noqa: BLE001 -- a code is a nicety; the refusal is still logged without it
-        code = None
-    if code:
-        return code
-    name = getattr(exc, "sqlite_errorname", None)
+        if code:
+            return code
+        name = getattr(exc, "sqlite_errorname", None)
+    except Exception as lookup:  # noqa: BLE001 -- a code is a nicety; the refusal still logs
+        _log.debug("could not read the error code (%s)", type(lookup).__name__)
+        return None
     return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
@@ -586,15 +591,16 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     (BACKLOG #6698)."""
     # Read off the code object rather than inspect.signature, which would evaluate annotations (a
     # TYPE_CHECKING-only one raises NameError at decoration) unless asked not to.
+    name = getattr(fn, "__qualname__", repr(fn))
     target = inspect.unwrap(fn)
     code = getattr(target, "__code__", None)
     if code is None:
-        raise TypeError(f"{fn.__qualname__} must be a plain function or method")
+        raise TypeError(f"{name} must be a plain function or method")
     keyword_only = code.co_varnames[code.co_argcount : code.co_argcount + code.co_kwonlyargcount]
     if "routed_id" not in keyword_only:
-        raise TypeError(f"{fn.__qualname__} must take routed_id as a keyword-only parameter")
+        raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
     if "routed_id" in (getattr(target, "__kwdefaults__", None) or {}):
-        raise TypeError(f"{fn.__qualname__} must give its keyword-only routed_id no default")
+        raise TypeError(f"{name} must give its keyword-only routed_id no default")
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:

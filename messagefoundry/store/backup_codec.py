@@ -203,7 +203,8 @@ def encrypt_stream(
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
     caller). Streaming: a small, fixed number of chunk-sized buffers is held at a time (the one-ahead
-    read below, the frame being sealed and its ciphertext), and never the whole archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
+    read below, the frame being sealed and its ciphertext), and never the whole archive.
+    Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
     drawing its own 96-bit nonce under the SAME key the store cipher seals with (the store's data
@@ -330,22 +331,23 @@ def _header_int(obj: dict[str, object], name: str) -> int:
     return value
 
 
-def _read_once(src: BinaryIO, n: int, what: str) -> bytes | bytearray:
+def _read_once(src: BinaryIO, n: int, what: str) -> bytes:
     """One ``src.read(n)``, refused where it breaks the stream contract the codec relies on.
 
     ``None`` is a non-blocking source with no data ready: refused rather than read as EOF, which on
     the write side would seal a silently truncated backup as a complete one. More than ``n`` bytes
     would let a frame outgrow the ``chunk_size`` its header declares, and so would let the writer
-    produce an archive its own reader rejects. A ``memoryview`` is copied to ``bytes``; anything else
-    that is not ``bytes`` or ``bytearray`` is refused."""
+    produce an archive its own reader rejects. A ``memoryview`` or ``bytearray`` is copied to
+    ``bytes``, because the source may reuse its buffer for the next read while this chunk is still
+    held for the one-ahead read; anything else that is not ``bytes`` is refused."""
     chunk = src.read(n)
     if chunk is None:
         raise BackupCodecError(
             f"the source stream had no data ready reading the {what} (non-blocking source)"
         )
-    if isinstance(chunk, memoryview):
-        chunk = chunk.tobytes()
-    elif not isinstance(chunk, (bytes, bytearray)):
+    if isinstance(chunk, (memoryview, bytearray)):
+        chunk = bytes(chunk)
+    elif not isinstance(chunk, bytes):
         raise BackupCodecError(
             f"the source stream returned {type(chunk).__name__}, not bytes, reading the {what}"
         )

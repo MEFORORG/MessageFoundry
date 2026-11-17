@@ -423,6 +423,11 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
 
     with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
         dead_letters_on_cell_tag(absent)
+
+    import functools
+
+    with pytest.raises(TypeError, match="must be a plain function or method$"):
+        dead_letters_on_cell_tag(functools.partial(absent, other="x"))
     # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
     # evaluated at decoration.
     namespace: dict[str, Any] = {}

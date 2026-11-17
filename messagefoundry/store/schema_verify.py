@@ -112,7 +112,10 @@ _INDEXES_SQL = (
     f" WHERE {_ORDINARY_TABLE} AND ix.key = 1"
 )
 # Whether the name bound as the one parameter is an ordinary table.
-_ORDINARY_TABLE_EXISTS_SQL = f"SELECT EXISTS (SELECT 1 FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND lower(m.name) = ?)"
+_ORDINARY_TABLE_EXISTS_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master AS m"
+    f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = ?)"
+)
 _TABLES_SQL = (
     "SELECT m.name FROM sqlite_master AS m"
     f" WHERE {_ORDINARY_TABLE} AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
@@ -382,8 +385,9 @@ def is_schema_step_error(exc: BaseException) -> bool:
     file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
     code. And the message must name a missing or clashing table, column or index, or a virtual
     table's module, because a syntax error is ``SQLITE_ERROR`` too. A missing module is always an
-    object some other tool left in the file (see ``_ORDINARY_TABLE``, BACKLOG #6719). None of the others is fixed by recreating the store, so each keeps its own error rather
-    than getting this remedy (BACKLOG #2101)."""
+    object some other tool left in the file (see ``_ORDINARY_TABLE``, BACKLOG #6719). None of the
+    others is fixed by recreating the store, so each keeps its own error rather than getting this
+    remedy (BACKLOG #2101)."""
     code = getattr(exc, "sqlite_errorcode", None)
     return (
         isinstance(exc, sqlite3.OperationalError)
@@ -432,18 +436,15 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
     row on its first keyed open, so a counted file without one never had its data key derived.
 
-    The two tables are read separately, and each only when it is an ordinary table: a view or a
-    virtual table under either name is not one this build made (see ``_ORDINARY_TABLE``, BACKLOG
-    #6719). So a foreign ``cipher_meta`` holds no count to reset, as a missing one holds none, and a
-    foreign ``store_salt`` holds no salt this build minted, as a missing one holds none. When the
-    schema script itself failed (BACKLOG #2101), an older file may have no ``store_salt`` table at
-    all, which reads the same way."""
+    The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
+    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted.
+    So does a view or a virtual table under its name (see ``_ORDINARY_TABLE``, BACKLOG #6719): only
+    an ordinary table can hold a salt this build minted. ``cipher_meta`` is read whatever object
+    holds the name, so a readable count leans toward the new-key remedy rather than a reset."""
     try:
-        if not await _is_ordinary_table(db, "cipher_meta"):
-            return False
         async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()
-    except sqlite3.OperationalError:  # an unreadable or incompatible count table: no count to reset
+    except sqlite3.OperationalError:  # no count table, or an incompatible one: no count to reset
         return False
     if not (row and row[0]):
         return False

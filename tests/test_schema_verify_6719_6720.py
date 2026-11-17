@@ -256,28 +256,26 @@ async def test_a_virtual_table_whose_sql_hides_its_kind_is_still_skipped(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("cipher_meta", "counted"),
+    "cipher_meta",
     [
-        ("CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)", True),  # control
-        ("CREATE VIEW cipher_meta AS SELECT 'k' AS key_id, 1 AS invocations", False),
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)",
+        "CREATE VIEW cipher_meta AS SELECT 'k' AS key_id, 1 AS invocations",
     ],
     ids=["ordinary-table", "view"],
 )
-async def test_a_foreign_count_table_holds_no_count_to_reset(
-    tmp_path: Path, cipher_meta: str, counted: bool
+async def test_a_readable_count_leans_to_the_new_key_remedy(
+    tmp_path: Path, cipher_meta: str
 ) -> None:
-    # BACKLOG #6719 item 2: cipher_meta is read only when it is an ordinary table, as store_salt is.
+    # A readable count, whatever object holds the name, picks the remedy that cannot zero a DEK's
+    # count. Pinned so the store_salt ordinary-table rule is not copied onto cipher_meta unread.
     from messagefoundry.store.schema_verify import _counts_under_a_dek
 
     path = tmp_path / "count.db"
     _sql(path, cipher_meta)
-    if counted:
+    if cipher_meta.startswith("CREATE TABLE"):
         _sql(path, "INSERT INTO cipher_meta VALUES ('k', 1)")
     async with _connected(path) as db:
-        async with db.execute("SELECT count(*) FROM cipher_meta") as cur:
-            row = await cur.fetchone()
-        assert row is not None and row[0] == 1  # each holds one count row
-        assert await _counts_under_a_dek(db) is counted
+        assert await _counts_under_a_dek(db) is True
 
 
 @_NEEDS_FTS5
