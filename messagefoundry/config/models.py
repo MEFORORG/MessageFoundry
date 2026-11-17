@@ -246,7 +246,11 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
     ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
     default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). ``bool("")`` does the same,
     so an empty string is unset too (vault BACKLOG #3533 item 11); for a default-off setting that
-    reads as it did. Any other value is read with ``bool()``, as before.
+    reads as it did. Any other value is read with ``bool()``, as before. On a setting that every
+    factory taking it annotates ``bool``, the load and the build's ``env()`` resolution refuse an
+    empty string or any other value that is not a ``bool`` or ``None`` (vault BACKLOG #3234), so
+    there the empty-string rule and the ``bool()`` read serve only a mapping that reached this
+    reader some other way.
 
     Use it for a transport setting with a default, such as a TLS check, and read it the same way in
     every connector and every reader that reports on it, so the two cannot disagree. Use

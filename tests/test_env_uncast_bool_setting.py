@@ -145,9 +145,24 @@ def test_a_none_on_a_bool_setting_takes_the_setting_default(key: str, want: bool
 def test_a_literal_is_not_read_here() -> None:
     # Every pre-resolve reader (the loosening registers, the build-time capture checks) reads the
     # spec's literal, so reading it differently in the resolved copy would split one setting. A
-    # literal that is not a bool is refused at load instead (the tests below).
-    out = resolve_env_settings({"tls_allow_expired": "false", "verify_tls": None}, {})
-    assert out == {"tls_allow_expired": "false", "verify_tls": None}
+    # literal that is not a bool is refused at load instead (the tests below), and here too
+    # (test_resolve_refuses_a_non_bool_literal).
+    out = resolve_env_settings({"tls_allow_expired": True, "verify_tls": None}, {})
+    assert out == {"tls_allow_expired": True, "verify_tls": None}
+
+
+def test_resolve_refuses_a_non_bool_literal() -> None:
+    # #3234 added step 8: a Registry built in code, or settings changed after the load, never
+    # passed Registry.bool_literal_problems, so the build's resolve refuses the literal by the same
+    # rule, every one in one error, naming the connection and withholding the value.
+    settings = {"tls_allow_expired": "false", "persistent": 2, "verify_tls": None, "port": 1}
+    with pytest.raises(WiringError) as caught:
+        resolve_env_settings(settings, {}, connection="OB_X")
+    text = str(caught.value)
+    assert "connection 'OB_X': non-bool literal on a boolean setting" in text
+    assert "setting 'tls_allow_expired' must be true or false, not str" in text
+    assert "setting 'persistent' must be true or false, not int" in text
+    assert "verify_tls" not in text and "'false'" not in text
 
 
 # --- a code-first literal that is not a bool is refused at load (#3234 step 1, code-first route) ----
@@ -371,6 +386,84 @@ def test_a_raw_hop_attestation_in_transport_settings_gets_its_own_refusal(
     msg = str(ei.value)
     assert "tls_hop_attested is not a transport setting" in msg
     assert "must be true or false" not in msg
+
+
+_RAW_DECLARATION_KEYS: list[tuple[str, object]] = [
+    ("cleartext_accepted", True),
+    ("cleartext_reason", "synthetic reason"),
+    ("tls_revocation_attested", True),
+    ("tls_revocation_attested_reason", "synthetic reason"),
+]
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+@pytest.mark.parametrize(("key", "value"), _RAW_DECLARATION_KEYS)
+def test_a_raw_cleartext_or_revocation_key_in_transport_settings_is_refused(
+    tmp_path: Path, direction: str, key: str, value: object
+) -> None:
+    # Vault BACKLOG #8253 item 2: these loaded clean and the build stripped them, so the author's
+    # declaration did nothing and nothing said so. Refused as tls_hop_attested is.
+    module = _RAW_HOP_MODULES[direction].replace("tls_hop_attested", key)
+    (tmp_path / "cfg.py").write_text(module.format(value=repr(value)), encoding="utf-8")
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    assert f"{key} is not a transport setting" in str(ei.value)
+
+
+def _loaded_rest_outbound(tmp_path: Path) -> Any:
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in'))\n",
+        encoding="utf-8",
+    )
+    return load_config(tmp_path, allow_empty=True)
+
+
+@pytest.mark.parametrize(("key", "value"), [*_RAW_DECLARATION_KEYS, ("tls_hop_attested", True)])
+def test_a_raw_declaration_key_written_after_the_declaration_is_refused_at_build(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    # Vault BACKLOG #8253 items 2 and 10: written into the settings after outbound() returned, the
+    # key never meets the declaration's refusal; the build refuses it rather than strip it.
+    reg = _loaded_rest_outbound(tmp_path)
+    reg.outbound["OB_X"].spec.settings[key] = value
+    with pytest.raises(WiringError) as ei:
+        _dest(reg, "OB_X", {})
+    assert f"outbound connection 'OB_X': {key} is not a transport setting" in str(ei.value)
+
+
+def test_a_raw_declaration_key_on_an_inbound_after_the_declaration_is_refused_at_build() -> None:
+    from messagefoundry.pipeline.wiring_runner import _source_config
+
+    ic = build_inbound_connection("IB_X", MLLP(port=0), router="r")
+    _source_config(ic, "127.0.0.1", {})  # the control builds
+    ic.spec.settings["tls_revocation_attested"] = True
+    with pytest.raises(WiringError, match="tls_revocation_attested is not a transport setting"):
+        _source_config(ic, "127.0.0.1", {})
+
+
+def test_a_non_bool_literal_written_after_the_load_is_refused_at_build(tmp_path: Path) -> None:
+    # #3234 added step 8: the load's Registry.bool_literal_problems never saw it, and the
+    # connector reads tls_allow_expired by truthiness, so "false" would have read as on.
+    reg = _loaded_rest_outbound(tmp_path)
+    reg.outbound["OB_X"].spec.settings["tls_allow_expired"] = "false"
+    with pytest.raises(WiringError) as ei:
+        _dest(reg, "OB_X", {})
+    text = str(ei.value)
+    assert "connection 'OB_X': non-bool literal on a boolean setting" in text
+    assert "setting 'tls_allow_expired' must be true or false, not str" in text
+
+
+def test_a_registry_built_in_code_meets_the_literal_rule_at_build() -> None:
+    # #3234 added step 8: a Registry assembled by hand is never validated, so its build is where
+    # the rule applies.
+    registry = wiring.Registry()
+    spec = Rest(url="https://partner.example.org/in")
+    registry.add_outbound(build_outbound_connection("OB_X", spec))
+    assert _dest(registry, "OB_X", {})["tls_allow_expired"] is False  # the control builds
+    spec.settings["tls_allow_expired"] = "no"
+    with pytest.raises(WiringError, match="setting 'tls_allow_expired' must be true or false"):
+        _dest(registry, "OB_X", {})
 
 
 _FACTORY_CASES = [

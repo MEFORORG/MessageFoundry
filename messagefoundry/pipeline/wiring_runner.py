@@ -107,6 +107,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    CLEARTEXT_REVOCATION_KEYS,
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     EnvRef,
@@ -124,6 +125,7 @@ from messagefoundry.config.wiring import (
     read_intake_budget,
     read_lax_flag,
     refuse_capture_conflicts,
+    refuse_raw_declarations,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -14591,8 +14593,10 @@ def _source_config(
         ic.spec.settings, env_values, connection=inbound_record_name(ic.name)
     )
     # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
-    # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
-    # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
+    # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, the
+    # cleartext and revocation ones too (vault BACKLOG #8253 item 2), then mirror a declared pair for
+    # the settings-driven seams, as _dest_config does for cleartext_accepted.
+    refuse_raw_declarations(settings, f"inbound connection {ic.name!r}")
     apply_hop_attestation(
         settings, f"inbound connection {ic.name!r}", ic.tls_hop_attested, ic.tls_hop_attested_reason
     )
@@ -14649,12 +14653,9 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
 
 #: The settings keys mirrored from a connection's typed declarations (ADR 0153, ADR 0173) and its
 #: name, by `_dest_config` for an outbound and `_fhir_lookup_settings` for a lookup. Named once so the
-#: strip and the writes cannot drift apart.
+#: strip and the writes cannot drift apart, and from the keys a connection's build refuses raw.
 _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
-    "cleartext_accepted",
-    "cleartext_reason",
-    "tls_revocation_attested",
-    "tls_revocation_attested_reason",
+    *CLEARTEXT_REVOCATION_KEYS,
     MIRRORED_CONNECTION_SETTING,
 )
 
@@ -14744,6 +14745,9 @@ def _dest_config(
     # is the single choke point feeding start, check and a reload's dry run, so a bad key fails loud at
     # all three. `messagefoundry dryrun` builds no connector, so it never reaches here.
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
+    # Vault BACKLOG #8253 item 2: a raw declaration key written after outbound() is refused, not
+    # stripped by the mirror below, which would drop the author's declaration with no word.
+    refuse_raw_declarations(settings, f"outbound connection {oc.name!r}")
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
@@ -14766,7 +14770,7 @@ def _dest_config(
         tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
     )
     # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
-    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
+    # setting. Its raw keys were refused above; mirror a declared pair for the same seams.
     apply_hop_attestation(
         settings,
         f"outbound connection {oc.name!r}",

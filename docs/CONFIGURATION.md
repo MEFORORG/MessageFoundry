@@ -539,7 +539,10 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   `False`, since these flags take no `env()` reference. A raw `tls_hop_attested` written into a
   connection's transport settings before the declaration is refused there as not a transport
   setting, whatever its value. Written after the declaration, the load refuses only a value that
-  is not a `bool`, and the connection's build refuses the key whatever its value. The
+  is not a `bool`, and the connection's build refuses the key whatever its value.
+  `cleartext_accepted`, `tls_revocation_attested` and their reasons are refused the same way in a
+  connection's transport settings, at the declaration and at the build; before vault BACKLOG
+  #8253 the build dropped them without a word. The
   flags `inbound()` and `outbound()` take themselves, such as
   `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
   `False` as well. Any other value there, such as a string or a number, stops the load when the
@@ -549,9 +552,11 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   already refused anything but `true` or `false` for the ones it takes. Not every reading is
   covered. The rule covers the settings a connection, lookup or reference factory takes and the
   composers' `enabled` flags, in a graph the loader validates, and the flags `inbound()` and
-  `outbound()` take, whenever a connection is declared. A check inside a factory that reads one
+  `outbound()` take, whenever a connection is declared. Where the engine resolves a carrier's
+  settings to build it, a non-bool literal on such a setting is refused too, so one in a graph
+  built in code, or written after the load, stops that build. A check inside a factory that reads one
   of the factory's own settings before this one does can stop the load with an error about the
-  flag's effect instead. `MLLP`, `DICOMweb` and `Http` refuse a non-bool `tls` or `verify_tls`
+  flag's effect instead. `MLLP`, `DICOMweb`, `Http` and `Ftp` refuse a non-bool `tls` or `verify_tls`
   before such a check of theirs reads it, naming the factory and not the connection. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
