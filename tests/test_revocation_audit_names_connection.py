@@ -346,7 +346,7 @@ outbound(
     for name in ("OB_RAW", "OB_DECLARED"):
         spec_settings = reg.outbound[name].spec.settings
         spec_settings.update({"tls_revocation_attested": True, "cleartext_accepted": True})
-        with pytest.raises(WiringError, match="is not a transport setting"):
+        with pytest.raises(WiringError, match="are not transport settings"):
             _dest_config(reg.outbound[name], {}, None, EgressSettings(deny_by_default=False))
 
 

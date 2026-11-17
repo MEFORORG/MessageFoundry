@@ -1040,8 +1040,9 @@ def refuse_raw_declarations(
     the declared settings, at the declaration and at the build."""
     raw = [key for key in keys if key in settings]
     if raw:
+        verb = "is not a transport setting" if len(raw) == 1 else "are not transport settings"
         raise WiringError(
-            f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested or "
+            f"{where}: {', '.join(raw)} {verb}. Declare tls_hop_attested or "
             "tls_revocation_attested on inbound() or outbound(), and cleartext_accepted on "
             "outbound() only, each with its _reason, or as top-level keys on the connections.toml "
             "table, so the declaration is validated and reported"
@@ -1736,10 +1737,17 @@ def refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
 
     A factory calls it too, on one of its own arguments, where a check inside the factory reads
     that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
-    itself as ``where``, since it runs before the declaration has a name. Each carrier's build
-    calls it again on the declared settings, before they resolve, because the dict stays mutable
-    and a Registry built in code was never loaded (vault BACKLOG #3234 added step 8). Problems are
-    joined with `` | ``, because a problem can hold a ``;`` before its remedy."""
+    itself as ``where``, since it runs before the declaration has a name.
+
+    It runs again at least where these build, on the declared settings before ``env()`` resolves,
+    because the dict stays mutable and a Registry built in code was never loaded (vault BACKLOG
+    #3234 added step 8): an inbound or outbound connection (``_source_config``, ``_dest_config``),
+    a database lookup (the executor build and the build check), a FHIR lookup
+    (``_fhir_lookup_settings``) and a reference set (the build check, ``refuse_reference_hop_flags``
+    at start, and the sync). This is the one place that list is kept. A caller that resolves
+    settings for any other reason, such as a check or a census, is not covered by it.
+
+    Problems are joined with `` | ``, because a problem can hold a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
         raise WiringError(f"{where}: " + " | ".join(problems))
 
@@ -1873,9 +1881,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings. The loader
-            # refuses one that is not a bool, and so does each carrier's build, before it resolves
-            # (Registry.bool_literal_problems says where).
+            # a literal only in this copy would split one setting into two readings. Nothing here
+            # refuses a non-bool literal either, so a caller must not assume one was refused before
+            # it got here; refuse_bool_literals says which builds refuse one first.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -6948,8 +6956,7 @@ class Registry:
 
         Only a graph that is validated sees this, as the loader's is. A :class:`Registry` built in
         code and handed straight to a runner, or settings changed after the load, meet the same
-        rule at least where a connection, a database or FHIR lookup, or a reference set is built
-        (:func:`refuse_bool_literals`), before its settings resolve."""
+        rule at the builds :func:`refuse_bool_literals` names."""
         problems: list[str] = []
         try:
             for kind, name, settings, _deployed in self.settings_carriers():

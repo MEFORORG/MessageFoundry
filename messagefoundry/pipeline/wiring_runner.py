@@ -14587,9 +14587,9 @@ def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) 
 
 def _refuse_declared_settings(settings: Mapping[str, Any], where: str) -> None:
     """What a connection's declaration refuses in its transport settings, run again at its build on
-    the settings as declared, since the dict stays mutable and a Registry built in code was never
-    loaded (vault BACKLOG #3234 added step 8, #8253 item 2). The raw declaration keys first, as at
-    declaration, so such a key is named as misplaced rather than as a bad value."""
+    the settings as declared (vault BACKLOG #8253 item 2; :func:`refuse_bool_literals` says why).
+    The raw declaration keys first, as at declaration, so such a key is named as misplaced rather
+    than as a bad value."""
     refuse_raw_declarations(settings, where)
     refuse_bool_literals(settings, where)
 
@@ -14761,8 +14761,8 @@ def _dest_config(
     _refuse_declared_settings(oc.spec.settings, f"outbound connection {oc.name!r}")
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
     # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
-    # setting. Refuse the raw keys, then mirror a declared pair for the settings-driven seams,
-    # before the cleartext and revocation mirror below writes keys this refuses.
+    # setting. Refuse a raw attestation pair, then mirror a declared one for the settings-driven
+    # seams.
     apply_hop_attestation(
         settings,
         f"outbound connection {oc.name!r}",
@@ -15393,8 +15393,8 @@ def refuse_reference_hop_flags(registry: Registry) -> None:
     ``DatabaseRef`` or ``FileRef`` source after its factory was refused only at the set's first
     sync, after start, where it surfaced as a failed sync (vault BACKLOG #3139). It is the same
     :func:`refuse_unresolved_hop_flags` call :func:`build_check_registry` and the sync make, so the
-    three cannot disagree. Every source kind, and it needs no resolved value. A non-bool literal on
-    a boolean source setting is refused here too, as at the sync (vault BACKLOG #3234)."""
+    three cannot disagree. Every source kind, and it needs no resolved value. It runs
+    :func:`~messagefoundry.config.wiring.refuse_bool_literals` too (vault BACKLOG #3234)."""
     for rname, rspec in registry.references.items():
         refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
         refuse_bool_literals(rspec.source.settings, f"reference set {rname!r}")
