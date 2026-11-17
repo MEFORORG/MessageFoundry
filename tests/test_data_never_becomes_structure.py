@@ -324,6 +324,31 @@ def test_the_lens_keeps_set_for_a_whole_field_or_an_expression_source(
     assert len(_copy_rows(out)) == 1
 
 
+def test_the_lens_inserts_a_whole_field_copy_into_a_component_as_the_action_call() -> None:
+    # Round-6f70971d finding 2 (BACKLOG #5821). A native msg.set would escape the field's escape
+    # sequences a second time, so the insert is the copy_field call, which reads back as the row.
+    # NEGATIVE CONTROL: on d97051786 the insert was msg.set("NK1-2.1", msg.field("PID-5") or "").
+    out = _lens_insert_copy("PID-5", "NK1-2.1")
+    assert '    copy_field(msg, "PID-5", "NK1-2.1")\n' in out
+    assert "from messagefoundry import copy_field\n" in out
+    assert "msg.set" not in out
+    ast.parse(out)
+    rows = _copy_rows(out)
+    assert len(rows) == 1 and rows[0]["params"] == {"src": "PID-5", "dst": "NK1-2.1"}
+    with pytest.raises(LensRewriteError, match="occurrence"):
+        rewrite_source(
+            LENS_SOURCE,
+            {
+                "op": "insert_row",
+                "line_start": parse_source(LENS_SOURCE)[0]["rows"][0]["line_start"],
+                "line_end": parse_source(LENS_SOURCE)[0]["rows"][0]["line_end"],
+                "position": "after",
+                "action": "copy_field",
+                "params": {"src": "PID-5", "dst": "NK1-2.1", "occurrence": 2},
+            },
+        )
+
+
 def test_a_set_data_call_that_is_not_a_copy_is_a_code_row() -> None:
     source = LENS_SOURCE + '    msg.set_data("PV1-19", "A")\n'
     rows = parse_source(source)[0]["rows"]

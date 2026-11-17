@@ -35,6 +35,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from messagefoundry.parsing import _builtin_hl7
+from messagefoundry.parsing._builtin_hl7 import _HEX_ESCAPED_CONTROLS
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import parse_path
 from messagefoundry.timezone import _TIME_PRECISIONS, _offset_to_timedelta, parse_hl7_timestamp
@@ -66,8 +67,8 @@ def _writer(msg: Message, src: str) -> Callable[[str, str], None]:
     or subcomponent, whose read is decoded (ADR 0206 rule 1). A whole field's read is raw text: it
     goes into a whole-field destination through :meth:`Message.set`, as the structure it already
     is. A component write would escape it, escape sequences included, a second time (BACKLOG
-    #5821), so a component or subcomponent destination gets it as one leaf's raw text instead, its
-    escapes kept as sent and its separators written as data, spliced into the field. Either way, a
+    #5821), so a component or subcomponent destination gets it as one leaf's raw text instead
+    (:func:`_as_one_leaf`), spliced into the field. Either way, a
     component or subcomponent of field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is refused."""
     from_leaf = parse_path(src)[2] is not None
 
@@ -95,11 +96,11 @@ def copy_field(msg: Message, src: str, dst: str) -> None:
     ``src`` is read decoded, so it is written as data at every ``dst`` level, a whole field included:
     a value carrying a ``^``, ``~`` or ``&`` rides across as data, not new structure (ADR 0206). A
     whole-field ``src`` is raw text, structure and all, and is copied as it is into a whole-field
-    ``dst``. Into a component or subcomponent ``dst`` its escape sequences are kept as sent and its
-    separators are written as escaped ones, so it reads back from ``dst`` as a read decodes the
-    whole field: a field sent as ``O\\S\\Brien`` reads back as ``O^Brien``, not as its escape
-    sequence. A component or subcomponent ``dst`` in field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``
-    raises :class:`ValueError`, whatever ``src`` is."""
+    ``dst``. Into a component or subcomponent ``dst`` it is written as one leaf that reads back as
+    the field's leaves, each decoded, joined by its separators read as data: a field sent as
+    ``O\\S\\Brien`` reads back as ``O^Brien``, not as its escape sequence, and one sent as ``A^B``
+    reads back as ``A^B``. A component or subcomponent ``dst`` in field 1 or 2 of ``MSH``, ``BHS``
+    or ``FHS`` raises :class:`ValueError`, whatever ``src`` is."""
     _writer(msg, src)(dst, msg.field(src) or "")
 
 
@@ -187,8 +188,8 @@ def split_field(msg: Message, src: str, sep: str, dests: Sequence[str]) -> None:
     destination. Pieces of a component or subcomponent ``src`` are decoded data, so each is written as
     data at every destination level, as :func:`copy_field` does (ADR 0206). A whole-field ``src`` is
     split as raw text, and each piece is written as :func:`copy_field` writes a whole-field ``src``:
-    as it is into a whole field, and into a component or subcomponent with its escapes kept and its
-    separators escaped."""
+    as it is into a whole field, and into a component or subcomponent as one leaf that reads back as
+    the piece's leaves, each decoded, joined by its separators read as data."""
     write = _writer(msg, src)
     parts = (msg.field(src) or "").split(sep)
     for i, dest in enumerate(dests):
@@ -223,11 +224,16 @@ def trim_field(msg: Message, path: str) -> None:
 
     Whitespace is read from the **decoded** value, at the start of its first leaf and the end of its
     last, so a whole-field or component path keeps its structure. An escape sequence wholly inside
-    the stripped whitespace, such as a trailing ``\\.br\\``, goes with it; every other escape is
-    kept as sent rather than decoded and written back (BACKLOG #5928), and one that decodes to
-    nothing, such as ``\\.fi\\``, is kept wherever it sits unless the leaf is left empty. A no-op on
-    an absent field. Raises :class:`ValueError` on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, as
-    :func:`substring_field` does."""
+    the stripped whitespace, such as a trailing ``\\.br\\``, goes with it, and one the strip cuts,
+    such as a leading ``\\X2041\\`` (a space and an ``A``), is written as the data it keeps, or kept
+    whole, as sent, when that data holds a CR or LF. Every
+    other escape is kept as sent rather than decoded and written back (BACKLOG #5928), and one that
+    decodes to nothing, such as ``\\.fi\\``, is kept wherever it sits unless the leaf is left empty.
+    A no-op where a read of ``path`` returns ``None``, as it does for field 1 or 2 of an absent
+    ``BHS`` or ``FHS``. Otherwise raises :class:`ValueError` on field 1 or 2 of ``MSH``, ``BHS`` or
+    ``FHS``."""
+    if msg.field(path) is None:
+        return
     _edit_value(msg, path, _trim_value, scope="value")
 
 
@@ -639,16 +645,20 @@ def _splice_part(text: str, comp: int, sub: int | None, part: str, seps: _Seps) 
 
 
 def _as_one_leaf(raw: str, seps: _Seps) -> str:
-    """A whole field's raw text as one leaf's raw text that decodes as the whole field does: each
-    leaf's escape sequences kept as sent, its literal text and the separators between leaves
-    escaped as data, and an unclosed trailing escape character written as data."""
+    """A whole field's raw text as one leaf's raw text that reads back as the field's leaves, each
+    decoded, joined by its separators read as data. An escape sequence is kept as sent unless it
+    holds a control character: a component write never carries a raw control (ADR 0205 rule 2), and
+    a hex escape cannot sit inside another sequence, so such a sequence is written as the data it
+    decodes to. Literal text, the separators between leaves and an unclosed trailing escape
+    character are written as data, with their control characters hex-escaped."""
     out: list[str] = []
     for index, token in enumerate(_split_leaves(raw, seps)):
         if index % 2:
             out.append(_escape_data(token, seps))
             continue
         for unit_raw, decoded, kind in _leaf_units(token, seps):
-            out.append(unit_raw if kind == "esc" else _escape_data(decoded, seps))
+            keep = kind == "esc" and not any(ch in unit_raw for ch in _HEX_ESCAPED_CONTROLS)
+            out.append(unit_raw if keep else _escape_data(decoded, seps))
     return "".join(out)
 
 
@@ -748,19 +758,21 @@ def _trim_value(value: str, seps: _Seps) -> str:
 
 
 def _strip_leaf(raw: str, seps: _Seps, *, left: bool, right: bool) -> str:
-    """One leaf with its decoded whitespace stripped at the ends asked for. An escape sequence the
-    strip would cut, such as ``\\X2041\\`` (a space and an ``A``), is kept whole, as sent."""
+    """One leaf with its decoded whitespace stripped at the ends asked for, as :meth:`str.strip`
+    strips the decoded leaf. An escape sequence the strip cuts, such as ``\\X2041\\`` (a space and
+    an ``A``), is written as the data it keeps, so ``\\X2041\\`` at the start becomes ``A``, unless
+    that data holds a CR or LF, which no data write carries: that sequence is kept whole, as sent."""
     leaf = _Leaf(raw, seps)
     decoded = _decoded(leaf.units)
     lo = len(decoded) - len(decoded.lstrip()) if left else 0
     hi = len(decoded.rstrip()) if right else leaf.total
-    for (_raw, _decoded_unit, kind), unit_lo, unit_hi in zip(
+    for (_raw, unit_text, kind), unit_lo, unit_hi in zip(
         leaf.units, leaf.los, leaf.his, strict=True
     ):
-        if kind == "esc" and unit_lo < lo < unit_hi:
-            lo = unit_lo
-        if kind == "esc" and unit_lo < hi < unit_hi:
-            hi = unit_hi
+        cut = unit_lo < lo < unit_hi or unit_lo < hi < unit_hi
+        kept = unit_text[max(lo, unit_lo) - unit_lo : min(hi, unit_hi) - unit_lo]
+        if kind == "esc" and cut and ("\r" in kept or "\n" in kept):
+            lo, hi = min(lo, unit_lo), max(hi, unit_hi)
     if (lo, hi) == (0, leaf.total):
         return raw
     if lo >= hi:

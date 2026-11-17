@@ -259,10 +259,19 @@ def test_copy_field_into_a_component_of_an_absent_segment_raises_key_error() -> 
         copy_field(m, "PID-5", "NK1-2.1")
 
 
-def test_trim_field_keeps_an_escape_the_strip_would_cut() -> None:
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1"])
+def test_trim_field_strips_whitespace_an_escape_decodes_to_at_an_end(path: str) -> None:
+    # Round-6f70971d finding 5: the whitespace an escape decodes to at an edge is trimmed, as
+    # origin/main's component trim did. NEGATIVE CONTROL: on d97051786 the leading space was kept.
     m = Message.parse(MSH_ONLY + "PID|1||1||\\X2041\\x  \r")
-    trim_field(m, "PID-5")
-    assert m["PID-5"] == "\\X2041\\x"
+    trim_field(m, path)
+    assert m["PID-5"] == "Ax"
+    m = Message.parse(MSH_ONLY + "PID|1||1||y\\X4120\\\r")
+    trim_field(m, path)
+    assert m["PID-5"] == "yA"
+
+
+def test_trim_field_keeps_an_escape_whose_kept_part_holds_a_cr() -> None:
     m = Message.parse(MSH_ONLY + "PID|1||1||\\X0D410D42\\x|F\r")
     trim_field(m, "PID-5")  # the escape's CR is not cut out, so nothing raises
     assert m["PID-5"] == "\\X0D410D42\\x"
@@ -346,6 +355,32 @@ def test_trim_field_absent_is_noop() -> None:
     m = _msg()
     trim_field(m, "PID-99.1")  # absent
     assert m["PID-99.1"] is None
+
+
+@pytest.mark.parametrize("path", ["BHS-1", "BHS-2", "FHS-1", "FHS-2.1"])
+def test_trim_field_on_a_delimiter_field_of_an_absent_header_is_a_noop(path: str) -> None:
+    # Round-6f70971d finding 9. NEGATIVE CONTROL: on d97051786 this raised ValueError.
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\r")
+    before = m.encode()
+    trim_field(m, path)
+    assert m.encode() == before
+    with pytest.raises(ValueError, match="delimiters"):
+        trim_field(m, "MSH-2")
+
+
+def test_copy_field_never_writes_a_raw_control_into_a_component() -> None:
+    # Round-6f70971d finding 3 (ADR 0205 rule 2). An escape sequence holding a raw control was kept
+    # as sent. origin/main hex-escaped such a control rather than refusing the copy, so it is still
+    # written, as the data the sequence decodes to. NEGATIVE CONTROL: on d97051786 NK1-2 held 0x01.
+    m = Message.parse(MSH_ONLY + "PID|1||1||x\rNK1|1|X^Y\r")
+    m.set("PID-5", "a\\X" + chr(1) + "41\\b")
+    copy_field(m, "PID-5", "NK1-2.1")
+    nk1 = m.field("NK1-2") or ""
+    assert chr(1) not in nk1
+    assert nk1 == "ab^Y"
+    m.set("PID-5", "a" + chr(1) + "\\Z" + chr(0x7F) + "\\")
+    copy_field(m, "PID-5", "NK1-2.2")
+    assert m.field("NK1-2") == "ab^a\\X01\\"
 
 
 def test_substring_field() -> None:
