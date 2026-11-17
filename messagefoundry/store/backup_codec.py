@@ -322,9 +322,10 @@ def _header_salt(obj: dict[str, object], version: int) -> bytes | None:
 def _header_int(obj: dict[str, object], name: str) -> int:
     """The header's integer field ``name``, taken as written.
 
-    ``int()`` would accept ``1024.0``, ``"1024"`` or ``true`` and turn each into a number the writer
-    never wrote, so a header that is not this build's own reached the first frame's tag check
-    rather than the header refusal."""
+    ``int()`` would accept ``1024.0``, ``"1024"`` or ``true`` and turn each into a number. The
+    header bytes are not authenticated; the frames' associated data hashes the header as this code
+    re-serializes it. So a coerced value that re-serialized to the writer's bytes passed the tag and
+    decrypted. Refusing it here makes such a header a header refusal."""
     value = obj[name]
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")

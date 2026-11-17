@@ -612,8 +612,8 @@ def _with_header_field(name: str, value: object) -> bytes:
 @pytest.mark.parametrize("name", ["chunk_size", "format_version"])
 @pytest.mark.parametrize("kind", ["float", "string", "bool"])
 def test_a_header_integer_field_that_is_not_an_int_is_refused(name: str, kind: str) -> None:
-    # int() turned 1024.0, "1024" and true into numbers the writer never wrote, so a header that is
-    # not this build's own got past the header checks and failed later, at the first frame's tag.
+    # int() turned 1024.0, "1024" and true into numbers. The tag covers the re-serialized header,
+    # not the bytes read, so a coerced value that re-serialized to the writer's bytes passed it.
     good = 1024 if name == "chunk_size" else bc.FORMAT_VERSION
     value: object = {"float": float(good), "string": str(good), "bool": True}[kind]
     with pytest.raises(bc.BackupCodecError, match="missing/invalid field"):
@@ -623,6 +623,8 @@ def test_a_header_integer_field_that_is_not_an_int_is_refused(name: str, kind: s
 def test_a_header_with_its_integer_fields_as_written_still_reads() -> None:
     # Negative control for the test above: the helper's rewrite alone does not trip the refusal.
     assert bc.read_header(io.BytesIO(_with_header_field("chunk_size", 1024))).chunk_size == 1024
+    rewritten = _with_header_field("format_version", bc.FORMAT_VERSION)
+    assert bc.read_header(io.BytesIO(rewritten)).format_version == bc.FORMAT_VERSION
 
 
 # --- BACKLOG #6687 items 3 and 7: memoryview reads, non-bytes reads, the field named ---------------

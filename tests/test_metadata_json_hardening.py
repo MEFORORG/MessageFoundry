@@ -97,8 +97,8 @@ def test_a_nested_value_too_deep_to_encode_is_refused_as_unencodable() -> None:
     ids=["non-finite", "oversized-int", "unencodable-type"],
 )
 def test_the_refusal_names_the_kind_of_value_and_carries_no_notes(value: Any, cause: str) -> None:
-    """BACKLOG #6711 items 4 and 6: the sync alert can say why, and json's notes naming the dict
-    keys on the path ride on nothing."""
+    """BACKLOG #6711 items 4 and 6: the error's own text names the kind of value, and json's notes
+    naming the dict keys on the path ride on nothing."""
     with pytest.raises(TypeError, match=cause) as info:
         encode_reference_value(value)
     assert not getattr(info.value, "__notes__", None)
