@@ -31,8 +31,8 @@ EVERY commit, paging on ``hasNextPage``:
      signature file the action keeps (below). The action's list is built as the action builds it,
      from the FIRST PAGE only, first commit seen under each key.
 
-It faults when the pull request's head moved while it read, and when it read fewer distinct
-commits than GitHub's ``totalCount``.
+It faults in at least these cases: the pull request's head moved while it read, it read fewer
+distinct commits than GitHub's ``totalCount``, or a commit it does not refuse is malformed.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -157,9 +157,6 @@ class Attribution:
     committer_linked: bool
     #: The raw git author name, whoever the action attributes the commit to.
     author_name: str = ""
-    #: Set when the author is unlinked and the committer could not be read. Rule 1 refuses the
-    #: commit anyway; the key the action would file it under is unknown.
-    committer_fault: str | None = None
 
 
 @dataclass(frozen=True)
@@ -203,16 +200,8 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     author = _person(commit, "author")
     author_user = _user(author)
     # The action never reads the committer when the author is linked, so neither does this: a
-    # malformed committer there must not fault the run and drop every other commit's refusal.
-    committer_user: Mapping[str, Any] | None = None
-    committer_fault: str | None = None
-    if author_user is None:
-        # An unlinked author is refused whatever the committer, so a null or malformed committer
-        # must not turn that refusal into a fault, which the workflow passes.
-        try:
-            committer_user = _user(_person(commit, "committer"))
-        except PrecheckFault as exc:
-            committer_fault = str(exc)
+    # malformed committer there must not fault that commit.
+    committer_user = _user(_person(commit, "committer")) if author_user is None else None
     if author_user is not None:
         chosen = author_user
     elif committer_user is not None:
@@ -228,8 +217,22 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
         author_linked=author_user is not None,
         committer_linked=committer_user is not None,
         author_name=str(author.get("name") or ""),
-        committer_fault=committer_fault,
     )
+
+
+def unlinked_author(commit: Mapping[str, Any]) -> str | None:
+    """Rule 1's input, read from the author alone: the git author name when no account is linked
+    to the author (a null or absent author counts), or None when one is or the author is malformed.
+
+    Kept apart from :func:`attribute`, so a fault while working out the action's key for a commit
+    can never drop the refusal rule 1 already owes it.
+    """
+    author = commit.get("author")
+    if author is None:
+        return ""
+    if isinstance(author, Mapping) and author.get("user") is None:
+        return str(author.get("name") or "")
+    return None
 
 
 def matches_allowlist(name: str, patterns: Iterable[str]) -> bool:
@@ -379,31 +382,28 @@ def evaluate(
     # second-page commit into the action's view.
     slots: list[Attribution | None] = []
     for commit in read.commits:
+        unlinked = unlinked_author(commit)
+        if unlinked is not None:
+            # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed. Judged
+            # before the key below, so a commit whose committer cannot be read is still refused.
+            refusals.append(
+                f"commit {commit.get('oid', '')} has a git author, {unlinked!r}, linked to no "
+                "GitHub account, so that author cannot be shown to have signed the CLA; link the "
+                "author's email to an account, or re-author the commit"
+            )
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            faults.append(str(exc))
+            if unlinked is None:  # a refused commit's unreadable key changes no verdict
+                faults.append(f"commit {commit.get('oid', '')}: {exc}")
             slots.append(None)
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
-    # A commit whose committer could not be read has no known key, so it shields nobody.
-    seen_by_action = {
-        slot.name
-        for slot in slots[: read.first_page]
-        if slot is not None and slot.committer_fault is None
-    }
+    seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
     checked: set[int] = set()  # linked accounts already judged under rule 2
     for who in (slot for slot in slots if slot is not None):
-        if who.committer_fault is not None:
-            faults.append(who.committer_fault)
         if not who.author_linked:
-            # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed.
-            refusals.append(
-                f"commit {who.oid} has a git author, {who.author_name!r}, linked to no GitHub "
-                "account, so that author cannot be shown to have signed the CLA; link the "
-                "author's email to an account, or re-author the commit"
-            )
-            continue
+            continue  # rule 1 judged it above
         if who.name in seen_by_action or who.database_id is None or who.database_id in checked:
             continue
         # Rule 2: a linked author the action never reads, unless it would skip them anyway.
