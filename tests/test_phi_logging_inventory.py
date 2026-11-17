@@ -319,9 +319,10 @@ def test_guard_detects_a_planted_omission() -> None:
 def test_every_message_event_kind_is_named_in_row_6() -> None:
     """Row 6's "what events are logged" cell — the exact column 16.1.1 words — must be complete.
 
-    RULE: the cell enumerated 9 kinds and read as exhaustive; the engine emits 19. Derived from
-    ``MESSAGE_EVENT_KINDS``, itself cross-checked against the literal ``_event`` / ``_event_stmt``
-    call sites below, so a new kind cannot ship undocumented.
+    RULE: the cell enumerated 9 kinds and read as exhaustive, while the engine emitted more. Derived
+    from ``MESSAGE_EVENT_KINDS``, itself cross-checked against the string-literal kinds at the
+    ``_event`` / ``_event_stmt`` / ``_event_sync`` call sites below. A kind passed to those helpers
+    by variable, or written by a raw INSERT, is not cross-checked.
     """
     from messagefoundry.store.store import MESSAGE_EVENT_KINDS
 
@@ -430,30 +431,28 @@ def test_message_event_constant_matches_the_literal_emit_sites() -> None:
         )
         for name in ("store.py", "postgres.py", "sqlserver.py")
     }
-    # The backend count cannot fail (``emitted`` is built over a fixed three-name tuple); it is here
-    # for the vacuous-absence lint, which does not see that. The floor that can fail is the union
-    # count below, measured 2026-11-16 at 13 literal kinds: it, not the backend count, is what stops
-    # a scan gone equally blind on all three backends from passing the parity check. It bounds the
-    # union; each backend reaches 13 only through that parity check.
-    assert len(emitted) >= 3, f"expected the three store backends, scanned {sorted(emitted)}"
-    assert all(emitted.values()), (
-        f"the emit-site scan found no literal kind in a backend: {emitted}"
-    )
     union = set().union(*emitted.values())
-    assert len(union) >= 13, f"only {len(union)} literal message_events kinds found: {union}"
-    partial = {name: sorted(union - kinds) for name, kinds in emitted.items() if kinds != union}
-    assert not partial, (
-        f"the backends' literal message_events kinds differ; each lacks {partial}. Either the scan "
-        "went blind on part of a backend, or one backend writes a kind its twins do not"
+    assert all(kinds == union for kinds in emitted.values()), (
+        "the backends' literal message_events kinds differ; each backend lacks: "
+        f"{ {name: sorted(union - kinds) for name, kinds in emitted.items()} }"
     )
-    undeclared = {
-        name: extra
-        for name, kinds in emitted.items()
-        if (extra := sorted(kinds - set(MESSAGE_EVENT_KINDS)))
+    # The declared kinds that no helper call in any backend spells as a string literal.
+    non_literal = {
+        "error",
+        "failed",
+        "filtered",
+        "not_deployed",
+        "reply_returned",
+        "reply_timeout",
+        "routed",
+        "unrouted",
+        "viewed",
     }
-    assert not undeclared, (
-        "message_events kind(s) written by the store but absent from MESSAGE_EVENT_KINDS: "
-        f"{undeclared}. Add them to the constant AND to docs/PHI.md §7 row 6."
+    expected = set(MESSAGE_EVENT_KINDS) - non_literal
+    assert union == expected, (
+        f"literal kinds written but not expected: {sorted(union - expected)} (an undeclared one "
+        "goes into MESSAGE_EVENT_KINDS AND docs/PHI.md §7 row 6); expected literal kinds no longer "
+        f"seen: {sorted(expected - union)}. Update `non_literal` only for a kind that moved."
     )
 
 
