@@ -546,7 +546,8 @@ def _pythonapi_uses(source: str) -> int:
 def _process_symbol_loads(source: str) -> int:
     """How many ``ctypes`` reaches in ``source`` load no library and reach the symbols already in
     the process: a load handed ``None`` or ``""`` (``CDLL(None)`` and its kin), and each use of
-    ``ctypes.pythonapi``, which is ``PyDLL(None)`` (vault BACKLOG #6674 item 17)."""
+    ``ctypes.pythonapi``, which is ``PyDLL(None)`` on POSIX and the Python DLL's own exports on
+    Windows (vault BACKLOG #6674 item 17)."""
     loads = sum(1 for call in _library_load_calls(source) if call.is_literal and not call.literal)
     return loads + _pythonapi_uses(source)
 

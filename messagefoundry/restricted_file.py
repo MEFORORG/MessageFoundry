@@ -549,8 +549,10 @@ def _windows_access_problem(
 def _windows_holder_problem(security: WinSecurity) -> str | None:
     """Why the directory this owner and access list belong to lets a broad group or an application
     package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
-    #5657). The same owner and entry rules as :func:`_windows_access_problem`, read with the entry
-    flags: an inherit-only entry grants nothing on the directory, so it is skipped. A list that
+    #5657). The owner and entry rules of :func:`_windows_access_problem`, read with the entry
+    flags, with two differences: an inherit-only entry grants nothing on the directory, so it is
+    skipped, and a conditional entry is counted only when its mask holds a right in
+    :data:`_HOLDER_REPLACE_MASK`, where that function refuses any conditional entry. A list that
     could not be read is the caller's to report. Kept free of ctypes so the decision is testable on
     every platform."""
     if security.aces is None:
@@ -735,8 +737,8 @@ def _share_server(path: str) -> str:
 
 
 _LOOPBACK_SHARE = (
-    "it is reached through a network share on this host itself, whose folders this check does "
-    "not walk; name it by its local path instead"
+    "it is reached through a network share that may be on this host itself, whose folders this "
+    "check does not walk; name it by its local path if it is on this host"
 )
 
 
@@ -781,8 +783,7 @@ def _loopback_share_problem(
     if source is None:
         return (
             "it is on a network share named by an address whose route this host could not read, "
-            "so the share cannot be told apart from this host; name it by a local path or a host "
-            "name"
+            "so the share cannot be told apart from this host; name it by a local path"
         )
     if int(source) == int(addr) and source.version == addr.version:
         return _LOOPBACK_SHARE
@@ -817,8 +818,9 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
     are judged even when it resolves to a volume root. The holder is the folder that holds where
     the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
-    entries are read there. Each volume is first asked ``host.volume_cause``, and a volume it
-    answers, or whose drive type cannot be read, ends the walk and is refused. A mapped network
+    entries are read there. Each volume not read as a mapped network drive is asked
+    ``host.volume_cause``, and a volume it answers, or whose drive type cannot be read, ends the
+    walk and is refused. A mapped network
     drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at it, as at a
     UNC share, and follows no junction or link on it. A walk that reached a share the path names,
     by a UNC path or a mapped drive letter, reads the holder through the share by its path as
@@ -921,14 +923,14 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         holder_is_root = ntpath.dirname(holder_path) == holder_path
         if substituted:
             # A subst letter is spliced in with no link entry, but the folders above its target can
-            # rename what lies below, as those above a link can. The walk does not say where the
-            # target was, so every folder above the holder is judged by the link rule: stricter
-            # than for a link, whose rule starts at the link. The holder is judged below.
+            # rename what lies below, as those above a link can. The target is matched only where
+            # the walk ends on it, so every folder above the holder is judged by the link rule:
+            # stricter than for a link, whose rule starts at the link. The holder is judged below.
             targets = [] if holder_is_root else _folders_above(holder_path, set())
             subject = _SUBST_FOLDER_SUBJECT
             if chain[-1][0].lower() in subst_targets:
-                # The walk ends on a subst drive's target, however that drive's root was reached
-                # (named, or through a junction or link), so the holder holds the target and can
+                # The walk ends on a subst drive's target text, the drive's root named or reached
+                # through a junction or link, so the holder holds the target and can
                 # rename it, as the folder holding a link can: it gets the link rule too, a volume
                 # root included.
                 targets = [(holder_path, DIRECTORY), *targets]

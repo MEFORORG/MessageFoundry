@@ -160,27 +160,31 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   junction, link and `subst` drive.
 
   - A mapped network drive is read as a share: the walk stops at it.
-  - A volume `volume_cause` in `messagefoundry/auth/anchor_path.py` cannot judge, or whose drive
-    type cannot be read, ends the walk and is refused.
+  - Any other volume that `volume_cause` in `messagefoundry/auth/anchor_path.py` cannot judge,
+    or whose drive type cannot be read, ends the walk and is refused.
   - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
     through the share at `full.parent`. It is refused when it is a junction or link there.
   - Inherit-only entries are skipped.
   - Where a `subst` drive is on the path, every folder above that folder is judged by the link
-    rule. Where the walk ends on a `subst` drive's target, by the drive's root named or reached
-    through a junction or link, that folder is judged by the link rule too.
+    rule. Where the walk ends on a `subst` drive's target as its text names it, by the drive's
+    root named or reached through a junction or link, that folder is judged by the link rule too.
+    A target that leads on, through another `subst` drive or a junction in it, is not matched,
+    and that folder then gets only the holder rule.
   - A link or `subst` drive onto a network share or a mapped network drive is refused.
   - A share spelled with at least some of this host's own names or addresses is refused.
     `_loopback_share_problem` says which. A mapped drive letter is judged through the share
     `WNetGetConnectionW` names for it, and refused when that cannot be read.
 
-  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root. A mapped
-  network drive root is read as a share root, so nothing on this host holds it. A broad group's
-  `DELETE` on any holder is still not counted. The code is the record of the rest. The check is
+  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root whose target
+  is matched as above. A mapped network drive root is read as a share root, so nothing on this
+  host holds it. By the holder rule, a broad group's `DELETE` on the holder is still not counted;
+  the link rule, where it judges the holder, counts it, except on a volume root. The code is the record of the rest. The check is
   still not a complete check of the directory's surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
   #5657).** On Windows, `_windows_surroundings_problem` in `messagefoundry/restricted_file.py`
   reads the owner and access list of `full.parent`, the folder just above the directory in its
-  path as written, and refuses the directory when a broad group or an application package
+  path as written (superseded by the 2026-11-17 amendment, which reads the folder where the path
+  resolves to), and refuses the directory when a broad group or an application package
   may delete a file in that folder, change its access list or take it over, or when that
   folder's owner is such a group or cannot be read. The check also judges some junctions and links
   on the path; the code is the record of which. It is not a complete check of the directory's

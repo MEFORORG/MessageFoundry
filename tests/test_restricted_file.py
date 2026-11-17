@@ -894,7 +894,7 @@ def test_a_share_that_is_this_host_itself_is_refused(path: str) -> None:
     """Vault BACKLOG #5657: a loopback spelling stops the walk at the share, so a junction on the
     local path would go unjudged."""
     problem = str(restricted_file._loopback_share_problem(path, "myhost", _routes_to_itself))
-    assert "a network share on this host itself" in problem
+    assert "a network share that may be on this host itself" in problem
     assert "keys" not in problem  # names no path
 
 
@@ -1868,7 +1868,7 @@ def test_windows_a_mapped_drive_onto_this_host_is_refused_as_a_loopback_share(
             restricted_file, "_mapped_drive_share", lambda _d, s=share: s, raising=False
         )
         problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
-        assert "a network share on this host itself" in problem, share
+        assert "a network share that may be on this host itself" in problem, share
 
     def unreadable(_drive: str) -> str:
         raise OSError(errno.EIO, "no connection")
