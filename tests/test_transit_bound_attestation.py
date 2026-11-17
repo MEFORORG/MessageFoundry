@@ -1933,12 +1933,12 @@ def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixtur
     assert len(logged) == 1, logged
 
 
-@pytest.mark.parametrize("fault", [MemoryError])
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
 def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
     fault: type[Exception], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #6707: the failure the read is known to raise on a reply it cannot read picks the
-    unconfirmed label rather than escaping, and the log names the fault by its class alone."""
+    """BACKLOG #6707: a read that runs short of memory or stack picks the unconfirmed label rather
+    than escaping, as on main, and the log names the fault by its class alone."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
@@ -1956,14 +1956,13 @@ def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
 
 @pytest.mark.parametrize(
     "fault",
-    [TypeError, NameError, AttributeError, AssertionError, KeyError, ValueError, RecursionError],
+    [TypeError, NameError, AttributeError, AssertionError, KeyError, ValueError],
 )
 def test_a_programming_error_reading_the_400_propagates(
     fault: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #6707: only ``MemoryError`` labels the 400 unconfirmed; any other exception from
-    the reader, ``ValueError`` and ``RecursionError`` included since the parser returns those
-    refusals rather than raising them, is a defect and propagates."""
+    """BACKLOG #6707: only ``MemoryError`` and ``RecursionError`` label the 400 unconfirmed; any
+    other exception from the reader, ``ValueError`` included, is a defect and propagates."""
     from messagefoundry.store import crypto_transit
 
     def broken(*_a: Any, **_kw: Any) -> Any:
@@ -1972,6 +1971,24 @@ def test_a_programming_error_reading_the_400_propagates(
     monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
     with pytest.raises(fault):
         _verify_refusal("vault:v2:AAAA")
+
+
+def test_a_memory_error_making_the_unconfirmed_warning_keeps_the_label(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a ``MemoryError`` raised while the unconfirmed warning's closures are made,
+    outside :func:`_warn_when_due`'s own guard, writes a fixed literal on stderr in place of the
+    warning, and the label, so the row's break, still stands."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def short_of_memory(*_a: Any, **_kw: Any) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert crypto_transit._WARNING_UNBUILT in capsys.readouterr().err
 
 
 def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:

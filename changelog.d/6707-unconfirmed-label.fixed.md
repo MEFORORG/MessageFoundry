@@ -1,11 +1,12 @@
 - **A Transit audit MAC 400 reads "refused" only when its errors list names a version refusal.**
   At least unknown Vault wording, an empty list and a body past the re-parse bound that hvac
   parsed now take the "could not be confirmed" text instead. The row is still a break with the
-  tamper alert. A MemoryError while reading the 400 still leaves the row a break. A
-  RecursionError there now makes the walk unable to run, as any other exception there does: the
-  parser returns its refusals rather than raising them. An exception while building or logging a warning the
-  audit check logs beside a break also leaves the row a break now; before, any such exception
-  made the walk unable to run. (vault `BACKLOG #6707`)
+  tamper alert. The warning logged beside such a 400 is logged at most once an hour for each audit
+  key and cause, so a later such 400 in that hour logs nothing; it names neither the body's length
+  nor a suppressed 400's key version. An exception raised while building or logging that warning,
+  or the one beside a malformed stored MAC whose cost-only call failed, now leaves the row a
+  break. Before, an exception from either log call ended the walk with that exception, so it could
+  not run. (vault `BACKLOG #6707`)
 - **The data-key decrypt's warning about an unread oversized 400 body is reported when its log
   call raises.** Its exception class goes to stderr, and a later such decrypt tries the warning
   again rather than holding it back for the interval. (vault `BACKLOG #6707`)

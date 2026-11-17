@@ -149,12 +149,12 @@ _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bou
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
-#: The failures that, raised while a 400 is read, label it unconfirmed (BACKLOG #6707): anything
-#: else the read raises propagates. ``MemoryError`` is the one a reply is known to cause, on a huge
-#: body. The parser, :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its
-#: ``ValueError`` and ``RecursionError`` refusals rather than raising them, so either class raised
-#: here is a defect and propagates.
-_READ_FAULTS = (MemoryError,)
+#: The failures that, raised while a 400 is read, label it unconfirmed (BACKLOG #6707): a read
+#: short of memory or stack. Anything else the read raises propagates. No reply is known to cause
+#: either: a body past :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
+#: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
+#: rather than raising it.
+_READ_FAULTS = (MemoryError, RecursionError)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
@@ -397,7 +397,9 @@ def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
     :data:`_WARNING_LOG_INTERVAL_S`. A warning whose log call raised does not count as logged, so
     a later call tries it again. The slot is taken before the warning, so concurrent callers emit
-    it at most once. Never raises: a failure building the key, or in the slot's bookkeeping, is
+    it at most once. When building or logging the warning fails, the slot is given back, to the
+    time it held before or to empty, unless a later caller has taken it since; when giving it back
+    fails too, the slot stays taken for the interval. Never raises: a failure building the key, or in the slot's bookkeeping, is
     reported by :func:`_report_unlogged` naming that step, and the warning is then not logged."""
     try:
         key = kind()
@@ -926,21 +928,25 @@ class TransitCipher(_UnmarkedPolicy):
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
             cause = reason  # narrowed to str for the closures below
-            # The key and the text are built inside _warn_when_due's guard, so nothing the log
-            # needs can escape here and drop the row's break.
-            _warn_when_due(
-                lambda: ("unconfirmed", self._audit_key, cause, raised),
-                lambda: (
-                    "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
-                    "because %s%s (key=%r); logged at most once in %d seconds for this key "
-                    "and this cause",
-                    version,
-                    cause,
-                    " " + raised if raised else "",
-                    self._audit_key,
-                    _WARNING_LOG_INTERVAL_S,
-                ),
-            )
+            # The key and the text are built inside _warn_when_due's guard, which never raises.
+            # Making its two closures allocates outside that guard, so a MemoryError there writes
+            # a fixed literal on stderr in place of the warning, and the row's break still returns.
+            try:
+                _warn_when_due(
+                    lambda: ("unconfirmed", self._audit_key, cause, raised),
+                    lambda: (
+                        "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
+                        "because %s%s (key=%r); logged at most once in %d seconds for this key "
+                        "and this cause",
+                        version,
+                        cause,
+                        " " + raised if raised else "",
+                        self._audit_key,
+                        _WARNING_LOG_INTERVAL_S,
+                    ),
+                )
+            except MemoryError:
+                _last_resort(_WARNING_UNBUILT)
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
