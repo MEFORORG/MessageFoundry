@@ -1566,6 +1566,56 @@ def _builds_in(value: object) -> int:
     return _wheel_builds(str(value))
 
 
+#: An engine-wheel install with ``--no-deps`` in the same command, before or after the wheel: the
+#: tripwire that says BACKLOG #1583 option (c) has landed. A ``;``, ``&``, ``|`` or ``#`` ends the
+#: command, so a flag on another command or in a trailing comment does not trip it.
+_ENGINE_NO_DEPS = re.compile(r"pip install(?=[^\n;&|#]*--no-deps)[^\n;&|#]*dist/\S*\.whl")
+
+
+@pytest.mark.parametrize(
+    ("line", "hit"),
+    [
+        ("/tmp/v/bin/pip install --quiet --no-deps dist/*.whl", True),
+        ("/tmp/v/bin/pip install --quiet dist/*.whl --no-deps", True),
+        ("/tmp/v/bin/pip install --quiet dist/*.whl", False),
+        ("/tmp/v/bin/pip install --quiet dist/*.whl\necho --no-deps", False),
+        ("/tmp/v/bin/pip install --quiet dist/*.whl  # not --no-deps: see #1583", False),
+        ("pip install --no-deps packaging && /tmp/v/bin/pip install dist/*.whl", False),
+    ],
+    ids=[
+        "flag-first",
+        "flag-last",
+        "no-flag",
+        "flag-on-another-line",
+        "flag-in-a-comment",
+        "flag-on-another-command",
+    ],
+)
+def test_the_engine_no_deps_tripwire_reads_either_order(line: str, hit: bool) -> None:
+    assert bool(_ENGINE_NO_DEPS.search(line)) is hit
+
+
+def test_each_half_of_the_wheel_build_count_counts_a_build_the_other_misses() -> None:
+    """The negative control for :func:`_wheel_builds`'s two halves. The raw substring count alone
+    misses ``python3 -m build``; the regex alone misses a name ending ``python``, which main's
+    substring count saw. Dropping either half undercounts one of these, and the whole counts both."""
+    raw_only, regex_only = "mypython -m build --wheel", "python3 -m build --wheel"
+    assert raw_only.count("python -m build") == 1 and not _BUILD_CALL.findall(raw_only)
+    assert regex_only.count("python -m build") == 0 and len(_BUILD_CALL.findall(regex_only)) == 1
+    assert _wheel_builds(raw_only) == 1 and _wheel_builds(regex_only) == 1
+
+
+def test_the_wheel_build_cases_red_a_counter_that_reads_one_call_per_line() -> None:
+    """The negative control for :data:`_WHEEL_BUILD_CASES`: a counter that reads one call per line,
+    the shape this replaced, must disagree with at least one case, or the cases cannot catch it."""
+
+    def one_per_line(shell: str) -> int:
+        return sum(1 for line in shell.split("\n") if _BUILD_CALL.search(line))
+
+    caught = [p.id for p in _WHEEL_BUILD_CASES if one_per_line(str(p.values[0])) != p.values[1]]
+    assert caught, "no case tells a one-call-per-line counter from _wheel_builds"
+
+
 #: ``(shell, expected)`` for :func:`test_wheel_builds_counts_every_build_on_one_line`, by id.
 _WHEEL_BUILD_CASES = [
     pytest.param("python -m build --wheel a && python -m build --wheel b", 2, id="and"),
@@ -1836,7 +1886,7 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
             # holding `id-token: write`. A bare --no-deps is not the fix: the same step's PYEXPOSE
             # check imports messagefoundry.__main__, which needs those dependencies. What this does
             # pin is that the engine installs its OWN built wheel into the throwaway venv.
-            assert not re.search(r"pip install[^\n]*--no-deps[^\n]*dist/\S*\.whl", shell), (
+            assert not _ENGINE_NO_DEPS.search(shell), (
                 "the engine smoke has gained --no-deps, so BACKLOG #1583 option (c) has landed: "
                 "delete this carve-out so the engine is held to the --no-deps assertion below"
             )
@@ -3077,14 +3127,20 @@ def test_the_engine_wheel_smoke_refuses_an_empty_version_read() -> None:
     that changed nothing.
     """
     script = _engine_wheel_smoke_script()
-    assert re.search(r'-z\s+"?\$\{?built', script), (
+    # The guard's line and up to three after it, stopping at its `fi`, so a then/echo/exit split
+    # over lines still reads and a later statement's annotation does not.
+    guard = re.search(r'-z\s+"?\$\{?built\b[^\n]*(?:\n(?!\s*fi\b)[^\n]*){0,3}', script)
+    assert guard, (
         "the wheel smoke no longer rejects an empty __version__ read — on the workflow_dispatch "
         "dry-run (the arm that exists to validate this path before a tag) an empty version is not "
         "compared against anything, so the step would exit 0 having proved nothing"
     )
-    assert "::error::" in script, (
-        "the empty-version guard no longer emits a ::error:: annotation, so a failure here would be "
-        "invisible in the run summary"
+    # The guard's OWN line, or the line after it: the step holds other ::error:: lines, so a search
+    # over the whole script stays green with this guard's annotation gone.
+    own = guard.group(0)
+    assert "::error::" in own and "exit 1" in own, (
+        "the empty-version guard no longer emits a ::error:: annotation and exits, so a failure "
+        f"here would be invisible in the run summary: {own!r}"
     )
 
 
@@ -3181,7 +3237,8 @@ def test_the_engine_wheel_smoke_cannot_read_its_version_from_the_checkout(tmp_pa
         f"the engine wheel smoke's flags ({flags or 'none'}) leave an INSTALLED distribution "
         f"unreachable (or the interpreter refuses them outright), so the arm above proved nothing "
         f"and the release step would die on every run. The wheel is installed into the relsmoke "
-        f"venv's site-packages and this same step imports `packaging` from it a few lines later."
+        f"venv's site-packages, and the same inspection that reads the version imports "
+        f"`packaging` from it."
         f"\n  rc={alive.returncode}\n  stdout={alive.stdout!r}\n  stderr={alive.stderr!r}"
     )
 

@@ -369,16 +369,17 @@ function Get-WorktreeOccupancy {
         $rec = $entry.Record
         $match = $p.Match
 
-        # A record we cannot even evaluate (e.g. a non-numeric pid, which throws in the fence) must
-        # VETO, not vanish and not crash the caller. UNREADABLE is in the veto set for that reason.
+        # A record we cannot even evaluate (e.g. a non-numeric pid, which the fence reads UNREADABLE)
+        # must VETO, not vanish and not crash the caller. UNREADABLE is in the veto set for that
+        # reason, and the catch stays for any throw the fence still has.
         $live = $null
         try { $live = Test-RecordLiveness -Record $rec -StartSkewMinutes $StartSkewMinutes }
         catch { $live = @{ State = "UNREADABLE"; Detail = "record could not be fenced: $($_.Exception.Message)" } }
 
         $matchNorm = ConvertTo-Norm $match.Path
         $sid = [string]$rec.sessionId
-        # A non-numeric pid is exactly the record that throws above; keep it reportable rather than
-        # letting the cast take the whole caller down.
+        # A non-numeric pid would throw on this cast; keep it reportable rather than letting the cast
+        # take the whole caller down.
         $recPid = 0
         try { $recPid = [int]$rec.pid } catch { $recPid = 0 }
         $sessions += [pscustomobject]@{

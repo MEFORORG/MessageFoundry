@@ -97,6 +97,7 @@ __all__ = [
     "code_strings",
     "delete_keeping_a_mention",
     "find_funcs",
+    "keyword_value",
     "named_func",
     "outermost_def_sites",
     "package_sources",
@@ -152,6 +153,11 @@ def call_sites(node: ast.AST, name: str, *, bare_only: bool = False) -> list[ast
         for sub in ast.walk(node)
         if isinstance(sub, ast.Call) and callee_name(sub, bare_only=bare_only) == name
     ]
+
+
+def keyword_value(call: ast.Call, name: str) -> ast.expr | None:
+    """The expression ``call`` passes as keyword ``name``, or ``None`` when it passes none."""
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
 def code_names(node: ast.AST) -> set[str]:

@@ -79,6 +79,9 @@ keep = [
     "OBR-4", "OBR-24", "OBR-25", "OBR-30", "OBR-31",
     # Values that are only a placeholder here: MSA-2 is the literal msgCtrlId, IN1-14 and DST-5
     # hold N/A or a run of zeros, DST-1 holds zeros, and GT1-4 and DST-10 hold only separators.
+    # GT1-4 has been a default name rule since BACKLOG #5533, so this keep turns that scrub off,
+    # with a warning, on purpose: a name rule writes a made-up name into a field that held only
+    # separators. Do not copy it to a corpus whose GT1-4 holds a name.
     "MSA-2", "IN1-14", "DST-5", "DST-1", "GT1-4", "DST-10",
     # Times. QRD-1 is the query time, a second from MSH-7, which ADR 0030 keeps for correlation.
     # ORC-7's quantity and timing repeats the requested time, and no kind rewrites one component

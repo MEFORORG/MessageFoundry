@@ -6,8 +6,7 @@ that no linter, type checker, test or hook makes for you. Each one says what a v
 in a diff and where its source of record is. Read the source for the reasoning; this sheet does not
 repeat it.
 
-Cite the rule number in a finding, for example "R5: full body logged at INFO". Do not duplicate the
-exact CI slice in the closing table; review everything outside that slice.
+Cite the rule number in a finding, for example "R5: full body logged at INFO".
 
 ## Prose: deployment status and security writing
 
@@ -26,9 +25,11 @@ migration whose only purpose is to protect a running site. Prefer the simple end
 **R4. Review security prose for what a reader would do with it.** Apply SDS-3.1 to SDS-3.10 to any
 added or changed security sentence -- at least unapproved alignment wording, a "NIST certified" or
 unbacked claim, a restated fact, a closed enumeration, a control on a false premise, an adjacent
-instrument, an unanchored surface list, or a record cleared past its capacity. Source:
+instrument, an unanchored surface list, or a record cleared past its capacity. In added or changed
+prose, flag for deletion, not qualifying, a sentence whose absence changes nothing a reader does
+(SDS-3.4). Fix any other false or overstated one by rewriting it true or per SDS-3.5; add caveats or
+cases only where another rule requires them or the claim cannot shrink. Source:
 [Secure_Development_Standards.md](Secure_Development_Standards.md), *A note on claims and wording*.
-Cite the SDS identifier instead of copying the rule.
 
 ## PHI
 

@@ -60,6 +60,7 @@ from pydantic import (
     PrivateAttr,
     ValidationError,
     ValidationInfo,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
@@ -74,6 +75,8 @@ from messagefoundry.config.ai_policy import (
 from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
 from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
+    SATURATION_MIN_GROWTH_DEFAULT,
+    SATURATION_MIN_GROWTH_MAX,
     AckAfter,
     BuildupThreshold,
     InternalErrorPolicy,
@@ -352,6 +355,75 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
+#: pydantic error types a number's own bound raises. One raised where a bool was given means the
+#: bool was read as a number first, so the bool refusal names it instead (BACKLOG #5509).
+_NUMBER_BOUND_ERRORS: Final = frozenset(
+    {"greater_than", "greater_than_equal", "less_than", "less_than_equal", "multiple_of"}
+)
+
+
+def _bool_on_a_number_refusal(where: str) -> str:
+    """The refusal of a bool on a number at ``where``. It quotes no value (BACKLOG #5509)."""
+    return f"{where} expects a number, not a boolean (true or false); write a number in its place"
+
+
+def _bool_at(given: Any, loc: tuple[int | str, ...], where: str) -> str | None:
+    """The path of ``loc`` inside ``given`` when a bool sits there, or ``None`` (#5509).
+
+    ``loc`` cannot tell a model field from a dict key, so a key that is not a plain identifier is
+    left out of the path rather than echoed."""
+    for part in loc:
+        if isinstance(given, Mapping) and part in given:
+            given = given[part]
+            where = f"{where}.{part}" if isinstance(part, str) and part.isidentifier() else where
+        elif isinstance(given, list | tuple) and isinstance(part, int) and part < len(given):
+            given = given[part]
+            where = f"{where}[{part}]"
+        else:
+            return None
+    return where if isinstance(given, bool) else None
+
+
+def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
+    """Where a bool in ``given`` came out of validation as a number in ``got``, or ``None`` (#5509).
+
+    Read off the validated value rather than the annotation, so it holds for at least a constrained
+    or optional int, an int subclass, a list, tuple, set or dict of numbers, and the fields of a
+    nested model such as ``[[alerts.rules]]``. It misses at least a dict whose keys validation
+    rewrites, a list an inner validator shortens, and a bool read as a ``timedelta`` or an enum
+    member. A field that deliberately keeps a bool keeps it, since its validated value is still a
+    bool. The path names model fields and list positions only, never a dict key the operator
+    wrote."""
+    if isinstance(given, bool):
+        return where if isinstance(got, int | float) and not isinstance(got, bool) else None
+    if isinstance(given, Mapping):
+        if isinstance(got, BaseModel):
+            fields = type(got).model_fields
+            pairs = [(f"{where}.{k}", v, getattr(got, k)) for k, v in given.items() if k in fields]
+        elif isinstance(got, Mapping):
+            pairs = [(f"{where}[a key]", v, got[k]) for k, v in given.items() if k in got]
+        else:
+            return None
+        for path, inner_given, inner_got in pairs:
+            if found := _bool_read_as_number(inner_given, inner_got, path):
+                return found
+        return None
+    if isinstance(given, list | tuple):
+        if isinstance(got, list | tuple) and len(got) == len(given):
+            for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
+                if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
+                    return found
+        # A set reorders and merges, so no element pairs with its input: a bool given where none
+        # survived was read as a number.
+        elif (
+            isinstance(got, set | frozenset)
+            and any(isinstance(item, bool) for item in given)
+            and not any(isinstance(item, bool) for item in got)
+        ):
+            return where
+    return None
+
+
 class _Section(_InputHidingModel):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
@@ -389,6 +461,43 @@ class _Section(_InputHidingModel):
                 if key in data:
                     raise ValueError(refusal)
         return data
+
+    @field_validator("*", mode="wrap")
+    @classmethod
+    def _refuse_a_bool_on_a_number(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> Any:
+        """Refuse ``true``/``false`` on a numeric key rather than read it as 1 or 0 (BACKLOG #5509).
+
+        pydantic's lax mode coerces a bool to an int or float, so
+        ``delete_message_bodies_after_days = false`` would read as 0, "keep indefinitely", and a
+        byte cap set to ``true`` as one byte. Lax mode stays on for everything else, because the
+        environment layer hands every value over as a string. A subclass ``before`` validator
+        that turns a bool into a number itself runs ahead of this one and is not seen."""
+        where = str(info.field_name)
+        try:
+            validated = handler(value)
+        except ValidationError as exc:
+            # A bool read as 0 can then fail the number's own bound (``gt=0``), and that message
+            # would hide the coercion: name the bool instead.
+            found = next(
+                (
+                    path
+                    for err in exc.errors(include_url=False)
+                    if err["type"] in _NUMBER_BOUND_ERRORS
+                    and (path := _bool_at(value, err["loc"], where))
+                ),
+                None,
+            )
+            if found is None:
+                raise
+        else:
+            found = _bool_read_as_number(value, validated, where)
+            if found is None:
+                return validated
+        # Raised outside the handler, so the bound error, whose input a nested plain model does not
+        # hide, is not chained onto the refusal (BACKLOG #1796).
+        raise ValueError(_bool_on_a_number_refusal(found))
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
@@ -2331,7 +2440,14 @@ class DeliverySettings(_Section):
     # burst from sustained growth). Global-only for now (per-connection saturation= override is a
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
-    saturation_sustain_samples: int | None = None
+    saturation_sustain_samples: int | None = Field(default=None, ge=2)
+    # BACKLOG #5768: how many messages a lane's depth must rise above the lowest depth sampled since
+    # the engine started watching the lane before saturation fires, so one arrival on an idle lane
+    # does not page.
+    # SaturationThreshold.min_growth states the default and the cap.
+    saturation_min_growth: int = Field(
+        default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX
+    )
     # Global DR / priority tier default for every connection (#61, ADR 0048). A connection that declares
     # no priority= of its own inherits this (resolution order: per-connection override > [delivery]
     # global default > built-in NORMAL); the DR run-profile then starts only connections whose resolved
@@ -2363,7 +2479,10 @@ class DeliverySettings(_Section):
     def saturation_threshold(self) -> SaturationThreshold:
         """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
         amendment). ``None`` keeps the saturation (rising-backlog derivative) alert off by default."""
-        return SaturationThreshold(sustain_samples=self.saturation_sustain_samples)
+        return SaturationThreshold(
+            sustain_samples=self.saturation_sustain_samples,
+            min_growth=self.saturation_min_growth,
+        )
 
 
 class PipelineSettings(_Section):
@@ -5799,6 +5918,20 @@ def validate_alert_template(template: str, *, where: str) -> None:
             )
 
 
+#: Upper bound for ``[alerts].webhook_timeout`` and ``email_timeout`` (BACKLOG #5770). Each is a
+#: socket timeout, so it bounds each wait on the peer, not a whole send: a peer that answers a little
+#: at a time can still hold a send longer. The alert worker handles one event at a time, so each wait
+#: holds every event queued behind it. Five minutes is a JUDGMENT with no measured anchor: ten times
+#: the larger default, and far past any healthy relay or webhook round trip.
+_ALERT_SEND_TIMEOUT_MAX_SECONDS = 300.0
+
+#: Upper bound for ``[alerts].realert_seconds`` and a rule's ``cooldown_seconds`` (BACKLOG #5770). A
+#: cooldown far longer than the process lives acts as an infinite one: the first page is the last.
+#: Seven days is a JUDGMENT with no measured anchor. It still lets a daily certificate or secret
+#: check page once a week, and at the cap a repeat of the same alert stays silent for a week.
+_ALERT_COOLDOWN_MAX_SECONDS = 604800.0
+
+
 class EscalationTier(BaseModel):
     """One **occurrence-driven escalation tier** of an :class:`AlertRule` (#81, ADR 0133). Once the
     matched alert instance has fired at least ``after_count`` times, the tier's overrides apply over the
@@ -5854,8 +5987,9 @@ class AlertRule(BaseModel):
     # the field as REQUIRED and every `AlertRule(...)` call that omits it reads as a missing
     # argument. Runtime is identical either way (BACKLOG #1799 measured 207 such false errors).
     min_depth: int | None = Field(default=None, ge=1)  # queue_buildup: match at/over this depth
+    # BACKLOG #5770: finite only. An infinite age never matches, and NaN compares False with all.
     min_oldest_seconds: float | None = Field(
-        default=None, ge=0
+        default=None, ge=0, allow_inf_nan=False
     )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
@@ -5863,7 +5997,7 @@ class AlertRule(BaseModel):
         None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
     )
     cooldown_seconds: float | None = Field(
-        default=None, gt=0
+        default=None, gt=0, le=_ALERT_COOLDOWN_MAX_SECONDS, allow_inf_nan=False
     )  # override realert_seconds for matching events
     # #146 (ADR 0014 amendment): per-rule EMAIL recipient override. None = the global [alerts].email_to
     # is used, byte-identical to before. A non-empty list re-targets the email transport for events this
@@ -5989,7 +6123,11 @@ class AlertsSettings(_Section):
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
-    webhook_timeout: float = 10.0  # seconds per POST
+    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why). A socket
+    # timeout: it bounds each wait on the webhook host during a POST, not the whole POST.
+    webhook_timeout: float = Field(
+        default=10.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
+    )
     # Optional egress allowlist for the webhook host (ASVS 1.3.6, SSRF defense-in-depth). Empty =
     # any host (the URL is operator-configured, not request-derived). When set, the webhook_url host
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
@@ -6005,7 +6143,8 @@ class AlertsSettings(_Section):
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
-    email_smtp_port: int = 587
+    # 0 is smtplib's "use the default", port 25.
+    email_smtp_port: int = Field(default=587, ge=0, le=65535)
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
@@ -6035,7 +6174,10 @@ class AlertsSettings(_Section):
     # as before (byte-identical). A reference/label, not the value, so it may live in the config file.
     # Fail-closed: a reference with no [secrets].provider, or an unresolvable one, raises at startup.
     email_password_secret: str | None = None
-    email_timeout: float = 30.0  # seconds per send
+    # A socket timeout: it bounds each wait on the SMTP relay during a send, not the whole send.
+    email_timeout: float = Field(
+        default=30.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
+    )
     # Egress allowlist for the SMTP host (WP-11c, parity with webhook_allowed_hosts). Empty = any.
     smtp_allowed_hosts: list[str] = []
     # #138 (ADR 0127): OPTIONAL operator-editable alert-email templates. All None (the default) = the
@@ -6048,8 +6190,10 @@ class AlertsSettings(_Section):
     email_html_template: str | None = None
 
     # Re-alert throttle: the same (event, connection) won't re-notify more often than this, so a
-    # flapping lane can't spam the channel.
-    realert_seconds: float = 300.0
+    # flapping lane can't spam the channel. 0 = no throttle. BACKLOG #5770: bounded and finite.
+    realert_seconds: float = Field(
+        default=300.0, ge=0, le=_ALERT_COOLDOWN_MAX_SECONDS, allow_inf_nan=False
+    )
 
     # --- security signals (vault BACKLOG #2613) ------------------------------------------------
     # A rule layer over the audit stream (pipeline/security_signals.py) raises an alert when a count

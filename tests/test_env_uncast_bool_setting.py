@@ -779,6 +779,24 @@ def test_ftp_tls_env_reads_strictly_end_to_end(
     assert _dest(reg, name, {"ftp_tls": spelling})["protocol"] == want
 
 
+@pytest.mark.parametrize(
+    ("filename", "body", "name"),
+    [("cfg.py", _FTP_MODULE, "OB_FTP"), ("connections.toml", _FTP_TOML, "OB_SYNTH_FTP")],
+    ids=["code-first", "connections.toml"],
+)
+def test_an_unset_env_ftp_tls_with_no_default_is_refused_not_read_as_either_protocol(
+    tmp_path: Path, filename: str, body: str, name: str
+) -> None:
+    # BACKLOG #5760: plain FTP only on an explicit false. A reference the environment does not set,
+    # with no default, names no protocol, so the build refuses it as missing rather than pick one.
+    # The control: the same graph resolves once the key is set.
+    (tmp_path / filename).write_text(textwrap.dedent(body), encoding="utf-8")
+    reg = load_config(tmp_path, allow_empty=True)
+    with pytest.raises(WiringError, match="missing: ftp_tls"):
+        _dest(reg, name, {})
+    assert _dest(reg, name, {"ftp_tls": "false"})["protocol"] == "ftp"
+
+
 def test_a_pin_beside_a_ca_that_an_env_plain_ftp_never_reads_is_refused(tmp_path: Path) -> None:
     # Ftp() refuses a CA beside a literal tls=False. With an env() tls it cannot know, so the check
     # after resolution reads the resolved protocol. The control: the same graph with TLS on.

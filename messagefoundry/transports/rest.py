@@ -1317,7 +1317,8 @@ def http_credentials_sent(
 
     The settings half is :func:`~messagefoundry.config.static_credentials.http_hop_credentials`, the
     static-credential inventory's own reader, so the two agree on every auth setting. The two
-    additions below are this refusal's alone; the inventory does not count them yet. A
+    additions below are this refusal's own reading; the inventory counts a credential in the same
+    two places by a rule of its own (``static_credentials._http_literal_static``, BACKLOG #5510). A
     static ``headers`` entry counts when the redaction screen (``config.wiring._is_secret_header``)
     would mask it, by name or by value, or when its name is not on
     :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`. That over-refuses on purpose: a header whose name

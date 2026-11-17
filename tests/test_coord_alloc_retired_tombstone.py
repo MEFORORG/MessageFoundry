@@ -296,6 +296,88 @@ def test_the_tombstone_refuses_to_overwrite_a_real_record(tmp_path: Path) -> Non
     assert occupied.returncode == 2, occupied.stdout + occupied.stderr
 
 
+def test_a_shared_root_does_not_leave_the_local_registry_untombstoned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5492. Every stale copy predates the shared root and reads only the LOCAL registry, so
+    with a shared root configured the tombstone must land there and not on the share, and -Check
+    must report ABSENT while the local copy is missing. The root is a temp directory, never a real
+    one."""
+    repo = _stale_clone(tmp_path, _stale_alloc(_STALE_REVISIONS["4c68c28eb-blob"]))
+    _seed_registry(repo, [1769, 1771])
+    shared = tmp_path / "shared-root"
+    shared.mkdir()
+    # Every pwsh child inherits it; the stale copy ignores it, as a real one would.
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
+    assert _allocate_with_stale_copy(repo) == 1772, "the paired control"
+
+    wrote = _tombstone(repo)
+    assert wrote.returncode == 0, wrote.stdout + wrote.stderr
+    local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    assert json.loads(local.read_text(encoding="utf-8"))["tombstone"] is True
+    assert not (shared / "alloc").exists(), (
+        "the share is another clone's and PC's, so it is not touched"
+    )
+    assert _allocate_with_stale_copy(repo) == _TOMBSTONE_NUMBER + 1
+
+    local.unlink()
+    absent = _tombstone(repo, "-Check")
+    assert absent.returncode == 1, absent.stdout + absent.stderr
+    assert f"ABSENT: {local}" in absent.stdout
+
+
+@pytest.mark.parametrize("on_share", [True, False], ids=["record-on-share", "share-clean"])
+def test_check_warns_of_a_record_on_the_share_and_never_touches_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_share: bool
+) -> None:
+    """A tombstone an older revision left on a configured share could lift a live allocator there,
+    so -Check names it. The exit code stays the local registry's, and the share file is untouched."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    shared = tmp_path / "shared-root"
+    share_file = shared / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    share_file.parent.mkdir(parents=True)
+    if on_share:
+        share_file.write_text(json.dumps({"tombstone": True}), encoding="utf-8")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(shared))
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 1, checked.stdout + checked.stderr
+    assert ("WARNING" in checked.stdout) is on_share, checked.stdout
+    assert share_file.exists() is on_share
+
+
+def test_check_does_not_warn_when_the_root_is_the_local_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root naming this clone's own mefor-coord is the local registry. A warning there would send
+    an operator to delete the one tombstone stale copies read."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    assert _tombstone(repo).returncode == 0
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(_common_dir(repo) / "mefor-coord").upper())
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert "PRESENT" in checked.stdout and "WARNING" not in checked.stdout, checked.stdout
+
+
+def test_an_unresolvable_shared_root_does_not_block_the_local_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local registry does not depend on the share, so a root that cannot be resolved neither
+    stops the write nor turns -Check into a refusal."""
+    repo = _stale_clone(tmp_path, b"# stale\n")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", str(tmp_path / "no-such-root"))
+
+    wrote = _tombstone(repo)
+    assert wrote.returncode == 0, wrote.stdout + wrote.stderr
+    local = _common_dir(repo) / "mefor-coord" / "alloc" / "backlog" / f"{_TOMBSTONE_NUMBER}.json"
+    assert json.loads(local.read_text(encoding="utf-8"))["tombstone"] is True
+
+    checked = _tombstone(repo, "-Check")
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert f"PRESENT: {local}" in checked.stdout
+
+
 def test_the_tombstone_replaces_an_empty_record(tmp_path: Path) -> None:
     """An empty file at that path is a crashed write, and remove.ps1 refuses every removal over it."""
     repo = _stale_clone(tmp_path, _stale_alloc(_STALE_REVISIONS["4c68c28eb-blob"]))

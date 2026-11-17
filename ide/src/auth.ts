@@ -113,6 +113,10 @@ export async function signOut(ctx: vscode.ExtensionContext, url: string): Promis
  * It first waits, bounded, for a sign-in in flight for `url`. That sign-in has the engine end the
  * cached token inside its request, so reading before its reply is stored would hand out a dead token
  * (BACKLOG #2281; signInSession.ts says why). Every reader of the cache goes through here for that.
+ *
+ * The wait can last up to SIGN_IN_WAIT_MS, past two minutes, behind a sign-in to an engine that has
+ * stopped answering (vault BACKLOG #2950). That is kept: it ends as soon as the sign-in settles, and
+ * a reader that stopped waiting sooner would read the token that sign-in is ending.
  */
 export async function peekToken(
   ctx: vscode.ExtensionContext,
@@ -316,7 +320,12 @@ export async function withStepUpAuth<T>(
       if (purpose !== undefined) {
         body.purpose = purpose;
       }
-      const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token);
+      // It rotates the token and queues behind the account's re-proof lock, as the sign-in does,
+      // so it gets the sign-in's timeout (vault BACKLOG #2950); postJson has none unless given one.
+      // Unlike a sign-in it is not tracked in signInSession.ts, so peekToken does not wait for it.
+      // A timeout after the engine finished leaves the cached token dead, as a lost sign-in reply
+      // does: the next call gets a 401 and signs in again.
+      const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token, SIGN_IN_TIMEOUT_MS);
       return typeof reply.token === "string" ? reply.token : undefined;
     },
     storeToken: async (token) => {

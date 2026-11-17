@@ -1590,7 +1590,9 @@ class SourceConnector(abc.ABC):
 
     The FILE source's handler-failure arm and the DATABASE source's ``_ingest_row`` are worked
     examples, and so is the MLLP listener's ``handler_error`` arm for a sender that waits for an
-    answer; the raw-TCP and X12 listeners close with no reply for such a sender. A sender that
+    answer; the raw-TCP and X12 listeners close with no reply for such a sender, and the HTTP
+    listener answers an error status by the exception's type, as docs/CONNECTIONS.md Table B
+    states (BACKLOG #5680). A sender that
     waits for none cannot be told to resend, so the frame in hand is its only copy. The MLLP,
     raw-TCP and X12 listeners hold the frame and retry the handler until it is recorded or the
     listener stops (:func:`hold_and_retry`, BACKLOG #5022). At least two things lose it, together

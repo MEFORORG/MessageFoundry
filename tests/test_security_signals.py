@@ -320,11 +320,92 @@ def test_unwatched_actions_and_lock_rows_raise_nothing() -> None:
 
 
 def test_the_subject_table_is_bounded() -> None:
+    """The table holds MAX_SUBJECTS. Ten evictions at a threshold of 2 carry five raises under the
+    shared subject (BACKLOG #5508)."""
     det, sink, _ = _detector(signin_failures=2)
     for i in range(MAX_SUBJECTS + 10):
         det.observe("auth.login_failed", None, None, f"addr-{i}", None)
     assert len(det._signin._seen) == MAX_SUBJECTS
-    assert sink.signals == []
+    assert [(s, n, c) for s, n, c, _d in sink.signals] == [
+        ("signin_failure_burst", "signin:*", 2)
+    ] * 5
+
+
+def test_the_overflow_expires_and_stays_bounded_between_hits() -> None:
+    """The overflow's expiry and memory bound, checked after every hit on a clock that only moves
+    forward. Subjects of three entries each are evicted, and the window leaves a carried entry about
+    six seconds, so each carry must expire the entries of the subject carried two before it. With
+    that expiry the overflow settles at eight entries and never reaches the threshold of 10; without
+    it the carried entries would pile up and raise. At each carry no entry at or before the cutoff
+    may still be counted, and the running total must match the entries."""
+    window_seconds = 3.0 * MAX_SUBJECTS + 6
+    window = security_signals._Window(10, window_seconds)
+    for i in range(MAX_SUBJECTS + 50):
+        for t in (0.0, 1.0, 2.0):
+            now = 3.0 * i + t
+            assert window.hit(f"s-{i}", now) == (None, None)
+            assert window._overflow_total == sum(w for _t, w in window._overflow) <= 8
+            if window._overflow and t == 0.0:
+                assert min(window._overflow)[0] > now - window_seconds
+    assert len(window._overflow) == 8, "the carries must have reached the overflow"
+
+
+def test_a_signin_burst_spread_past_the_subject_table_still_raises() -> None:
+    """BACKLOG #5508: one refused sign-in from each of MAX_SUBJECTS + 20 addresses. Each address is
+    pushed out of the table before it could reach the threshold, so dropping its count would raise
+    nothing. The 20 evicted counts carry into the overflow and raise once, under the shared subject,
+    naming no address."""
+    det, sink, _ = _detector(signin_failures=20)
+    for i in range(MAX_SUBJECTS + 20):
+        det.observe(
+            "auth.login_failed", None, None, f"10.{i // 65536}.{i // 256 % 256}.{i % 256}", None
+        )
+    ((signal, subject, count, detail),) = sink.signals
+    assert (signal, subject, count) == ("signin_failure_burst", "signin:*", 20)
+    assert "10." not in detail
+    assert detail.startswith("at least 20 refused sign-ins")
+    assert f"the {MAX_SUBJECTS} sources this detector counts one by one" in detail
+
+
+def test_a_spread_burst_cycling_through_more_addresses_than_the_table_raises() -> None:
+    """The shape the eviction gap would have hidden best: the same addresses come round again, each
+    evicted before its next refusal, so no per-address counter ever passes 1."""
+    det, sink, _ = _detector(signin_failures=5)
+    for _ in range(3):
+        for i in range(MAX_SUBJECTS + 1):
+            det.observe("auth.login_failed", None, None, f"addr-{i}", None)
+    assert sink.signals, "a cycling spread past the table must raise"
+    assert {(s, n) for s, n, _c, _d in sink.signals} == {("signin_failure_burst", "signin:*")}
+
+
+@pytest.mark.parametrize(("gap", "expected"), [(61, []), (59, [("signin:*", 5)])])
+def test_a_carried_count_expires_with_the_window(gap: int, expected: list[tuple[str, int]]) -> None:
+    """The control for the two tests above: an evicted subject keeps its entries' own times, so a
+    count older than the window is not carried. The same evictions inside the window do raise."""
+    det, sink, clock = _detector(signin_failures=5, window_seconds=60)
+    for i in range(MAX_SUBJECTS):
+        det.observe("auth.login_failed", None, None, f"old-{i}", None)
+    clock.now += gap
+    for i in range(5):
+        det.observe("auth.login_failed", None, None, f"new-{i}", None)
+    assert [(n, c) for _s, n, c, _d in sink.signals] == expected
+
+
+def test_an_evicted_subject_older_than_the_overflow_merges_in_time_order() -> None:
+    """The carry that interleaves: the evicted subject holds an entry older than the newest already
+    carried. Expiry must still find it first, or a stale entry would stay counted, and the running
+    total must match the entries."""
+    window = security_signals._Window(10**6, 60.0)
+    window.hit("a", 1000.0)
+    for i in range(MAX_SUBJECTS - 1):
+        window.hit(f"b-{i}", 1001.0)
+    window.hit("a", 1002.0)  # "a" now holds 1000 and 1002, and is the most recent subject
+    for i in range(MAX_SUBJECTS):  # evicts every b-*, then "a", whose 1000 is older than 1001
+        window.hit(f"c-{i}", 1003.0)
+    assert min(window._overflow)[0] == 1000.0
+    window.hit("d", 1060.5)  # cutoff 1000.5: the 1000 entry expires, the 1001 entries do not
+    assert min(window._overflow)[0] == 1001.0
+    assert window._overflow_total == sum(w for _t, w in window._overflow) == MAX_SUBJECTS + 1
 
 
 def test_a_failing_sink_never_reaches_the_audit_writer() -> None:
@@ -1498,3 +1579,10 @@ def test_the_logging_sink_logs_posture_restored_at_debug(caplog: pytest.LogCaptu
         LoggingAlertSink().posture_restored("posture:start")
     (record,) = caplog.records
     assert record.levelno == logging.DEBUG and "posture_restored" in record.getMessage()
+
+
+def test_security_md_states_the_live_subject_table_size() -> None:
+    """docs/SECURITY.md gives operators the table size, since the overflow alert starts past it;
+    pinned so the figure moves with the constant (BACKLOG #5508)."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text("utf-8")
+    assert f"at most {MAX_SUBJECTS} subjects one by one (`MAX_SUBJECTS`)" in doc

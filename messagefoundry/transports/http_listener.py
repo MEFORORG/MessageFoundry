@@ -2095,9 +2095,10 @@ class HttpSource(SourceConnector):
     async def _serve_one(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, peer_host: str | None
     ) -> bool:
-        """Read + answer exactly one request. Returns True if a pre-ingress failure occurred (so the
-        outer ``closed`` event is suppressed — the failure already emitted its specific kind). Reading
-        the whole request is bounded by ``receive_timeout`` (the slow-loris guard)."""
+        """Read + answer exactly one request. Returns True if a failure emitted its own kind (so the
+        outer ``closed`` event is suppressed): a pre-ingress failure, or an inbound-handler fault,
+        which may come after the ingress commit (BACKLOG #5680). Reading the whole request is
+        bounded by ``receive_timeout`` (the slow-loris guard)."""
         assert self._handler is not None
 
         async def _read_authenticated() -> HttpRequest:
@@ -2198,7 +2199,37 @@ class HttpSource(SourceConnector):
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
         # persisted before the response is written — as a RECEIVED ingress row, or as an ERROR row when
         # the handler refuses it.
-        receipt = await self._handler(request.body)
+        try:
+            receipt = await self._handler(request.body)
+        except Exception as exc:
+            # BACKLOG #5680, the HTTP twin of the MLLP listener's #1619 arm: a fault inside the
+            # inbound handler, such as a failed ingress commit, is an engine-side failure. Left to
+            # `_on_client`, an OSError (TimeoutError included) read as `peer_reset` with no log line
+            # and no answer, and anything else as `framing_error`. Which status the fault gets is
+            # stated once, in docs/CONNECTIONS.md Table B's HTTP listener row. The fault may come
+            # after the ingress commit, so a re-send can commit a second copy, which at-least-once
+            # allows. Charged to the pacer like any body read, so a sender that re-sends at once is
+            # still paced. Returns True: the failure emitted its own kind, so the outer `closed` is
+            # suppressed.
+            if self._pacer is not None:
+                self._pacer.charge(1, now=time.monotonic())
+            reason = safe_exc(exc)
+            logger.error(
+                "HTTP source %s: a request failed in the inbound handler: %s (peer=%s)",
+                self._log_name,
+                reason,
+                peer_host or "unknown",
+            )
+            await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
+            if isinstance(exc, OSError):
+                status, headers = _refusal_status(RefusalKind.TEMPORARY)
+                answer = build_response(
+                    status, '{"error":"temporarily unavailable"}', extra_headers=headers
+                )
+            else:
+                answer = build_response(500, '{"error":"internal error"}')
+            await self._write_safely(writer, answer)
+            return True
         # Charge one token AFTER the handler has recorded the body, so the debt is settled by the NEXT
         # request's pre-read wait and never by withholding this partner's answer. A GET/HEAD health
         # probe and a pre-ingress refusal charge nothing — they return above — which keeps a peer

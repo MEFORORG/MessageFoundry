@@ -55,6 +55,33 @@ pytestmark = pytest.mark.timeout(
     120
 )  # two engine spawns + a shared-store drain; the 60s default is tight
 
+#: The sign-in read this module's clients take, in seconds (vault BACKLOG #2950 added items 24 and
+#: 31). The shipped read, 150 s, outlasts the 120 s budget above on its own, so a sign-in to a
+#: stalled engine was certain to meet pytest-timeout's thread method, which ends the whole run
+#: rather than this test. Sign-ins here run after the engine spawns and the load hold, so this
+#: makes a stalled sign-in fail its own call more often, and does not guarantee it: a late enough
+#: stall can still run past the budget. It is not shorter because a healthy sign-in on a loaded
+#: runner (password hashing on freshly spawned engines) must still fit inside it.
+_SMOKE_SIGN_IN_READ_S = 30.0
+
+
+@pytest.fixture(autouse=True)
+def _sign_in_read_inside_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import messagefoundry.apiclient.client as client_module
+
+    monkeypatch.setattr(client_module, "SIGN_IN_TIMEOUT_SECONDS", _SMOKE_SIGN_IN_READ_S)
+
+
+def test_the_sign_in_read_fits_inside_this_modules_budget() -> None:
+    """RED when: the fixture above stops bounding the sign-in read, so a client in this module waits
+    the shipped 150 s, past the whole budget. It pins the bound, not that every stall fails inside
+    the budget; ``_SMOKE_SIGN_IN_READ_S`` says why that is not guaranteed."""
+    budget = pytestmark.args[0]  # the timeout(120) above, read rather than restated
+    with EngineClient("http://127.0.0.1:8765") as client:
+        read = client._sign_in_timeout().read
+    assert read == _SMOKE_SIGN_IN_READ_S < budget, (read, budget)
+
+
 _ENGINES = 2
 _COUNT_PER_ENGINE = 2
 _PER_CONN_RATE = 4.0

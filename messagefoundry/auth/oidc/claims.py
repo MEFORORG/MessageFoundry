@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from messagefoundry.auth.oidc.jwks import JwksCache, JwksError
+from messagefoundry.auth.oidc.jwks import JwkAlgMismatch, JwksCache, JwksError
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.domainshape import upn_suffix_key
 from messagefoundry.transports.signing import (
@@ -189,7 +189,10 @@ def _select_key_and_alg(
     if alg not in set(policy.signing_algorithms):
         raise ClaimsError("key_rejected", f"alg {alg.value} is not pinned")
     try:
-        key = jwks.get_key(kid)
+        key = jwks.get_key(kid, alg=alg)
+    except JwkAlgMismatch as exc:
+        # The kid names a key, but its JWK restricts it to another alg (BACKLOG #5517).
+        raise ClaimsError("key_rejected", str(exc)) from exc
     except JwksError as exc:
         raise ClaimsError("unknown_kid", str(exc)) from exc
     try:

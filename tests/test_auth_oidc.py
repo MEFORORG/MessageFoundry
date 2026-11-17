@@ -232,8 +232,8 @@ def test_cache_hit_does_not_refetch(rsa_key: rsa.RSAPrivateKey) -> None:
     fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
     clock = [0.0]
     cache = oidc.JwksCache(fetch, clock=lambda: clock[0])
-    cache.get_key("k1")
-    cache.get_key("k1")
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
     assert fetch.calls == 1
 
 
@@ -242,14 +242,14 @@ def test_unknown_kid_is_throttled_by_the_min_refetch_floor(rsa_key: rsa.RSAPriva
     fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
     clock = [0.0]
     cache = oidc.JwksCache(fetch, min_refetch_seconds=300.0, clock=lambda: clock[0])
-    cache.get_key("k1")  # 1 fetch, warms the cache
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)  # 1 fetch, warms the cache
     for _ in range(50):
         with pytest.raises(oidc.JwksError):
-            cache.get_key("attacker-kid")  # no new fetch: throttled
+            cache.get_key("attacker-kid", alg=SignatureAlgorithm.RS256)  # no new fetch: throttled
     assert fetch.calls == 1
     clock[0] = 400.0  # past the floor -> exactly one more fetch is allowed
     with pytest.raises(oidc.JwksError):
-        cache.get_key("attacker-kid")
+        cache.get_key("attacker-kid", alg=SignatureAlgorithm.RS256)
     assert fetch.calls == 2
 
 
@@ -259,9 +259,9 @@ def test_ttl_expiry_triggers_a_refetch(rsa_key: rsa.RSAPrivateKey) -> None:
     cache = oidc.JwksCache(
         fetch, ttl_seconds=100.0, min_refetch_seconds=10.0, clock=lambda: clock[0]
     )
-    cache.get_key("k1")
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
     clock[0] = 200.0
-    cache.get_key("k1")
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
     assert fetch.calls == 2
 
 
@@ -1151,7 +1151,7 @@ def test_a_concurrent_reader_is_not_refused_while_the_first_fetch_is_in_flight(
 
     def call(tag: str) -> None:
         try:
-            results[tag] = cache.get_key("k1")
+            results[tag] = cache.get_key("k1", alg=SignatureAlgorithm.RS256)
         except BaseException as exc:  # noqa: BLE001 - the failure IS the subject; re-raised below
             results[tag] = exc
 

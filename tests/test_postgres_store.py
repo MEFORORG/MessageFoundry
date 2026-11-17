@@ -5741,11 +5741,13 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
         minted: list[str] = []
         original = keyed._write_session
 
-        async def between_sweep_and_commit(conn: Any, token_hash: str, change: Any) -> Any:
+        async def between_sweep_and_commit(
+            conn: Any, token_hash: str, change: Any, **kwargs: Any
+        ) -> Any:
             if not minted:
                 await _user(keyed, late)
                 minted.append(await _mint(keyed, late))
-            return await original(conn, token_hash, change)
+            return await original(conn, token_hash, change, **kwargs)
 
         monkeypatch.setattr(keyed, "_write_session", between_sweep_and_commit)
         await keyed.revoke_all_sessions(except_token_hash=hash_token(kept))

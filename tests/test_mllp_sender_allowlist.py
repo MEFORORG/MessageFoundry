@@ -204,7 +204,7 @@ async def _wired(
     source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings, ack_mode=ack_mode))
     source.content_type = content_type
     source.refuse_unlisted_sender = runner._make_unlisted_sender_refusal(ic)
-    source.intake_rate_limiter = runner._make_intake_rate_limiter(ic)
+    source.intake_rate_limiter = runner._make_intake_rate_limiter(ic, ic.spec.settings)
     source.on_intake_audit = runner._make_intake_audit_sink(ic)
     if events is not None:
 
@@ -1267,10 +1267,10 @@ def test_the_budget_is_the_http_factory_default_and_only_with_the_allowlist(
     on = _settings(tmp_path / "on", [named[0]], {_issuer(named): [SUBJECT]})
     off = _settings(tmp_path / "off", [named[0]], None)
     runner, ic = _runner(store, on)
-    assert runner._make_intake_rate_limiter(ic) is not None
+    assert runner._make_intake_rate_limiter(ic, ic.spec.settings) is not None
     assert runner._make_intake_audit_sink(ic) is not None
     runner, ic = _runner(store, off)
-    assert runner._make_intake_rate_limiter(ic) is None
+    assert runner._make_intake_rate_limiter(ic, ic.spec.settings) is None
     assert runner._make_intake_audit_sink(ic) is None
 
 
