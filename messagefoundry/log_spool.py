@@ -83,11 +83,22 @@ _DIRECTORY_GONE_ERRNOS = frozenset(
     if code is not None
 )
 
+#: Windows error codes that say the same of a network share: ``ERROR_NETNAME_DELETED`` (64) and
+#: ``ERROR_UNEXP_NET_ERR`` (59). Python maps both to ``EINVAL``, so ``errno`` alone cannot tell
+#: them from one bad argument; ``winerror`` can.
+_DIRECTORY_GONE_WINERRORS = frozenset({64, 59})
+
 
 def _directory_unreachable(exc: OSError) -> bool:
     """Whether a read's ``OSError`` says the spool directory is gone or out of reach, rather than
-    one file failing: a path component that is no longer a directory, or a mount that dropped."""
-    return isinstance(exc, NotADirectoryError) or exc.errno in _DIRECTORY_GONE_ERRNOS
+    one file failing: a path component that is no longer a directory, or a mount or share that
+    dropped. Other network failures, which a platform reports under other codes, read as one
+    file failing."""
+    return (
+        isinstance(exc, NotADirectoryError)
+        or exc.errno in _DIRECTORY_GONE_ERRNOS
+        or getattr(exc, "winerror", None) in _DIRECTORY_GONE_WINERRORS
+    )
 
 
 _SEGMENT_PREFIX = "spool-"
@@ -456,9 +467,8 @@ class LogSpool:
                     self._close_writer()
                     return None
                 self.unreadable += 1
-                if not self._segments:
-                    return None
-                # Each pass retires one segment, so the loop ends with the segments.
+                # Only opening a segment's file raises this, so there is a first segment. Each
+                # pass retires one, so the loop ends with the segments.
                 seq = self._segments[0]
                 if seq == self._write_seq:
                     self._close_writer()

@@ -15,8 +15,12 @@ module is that second half.
   (``<name>.broken-<UTC>-<n>``), a fresh file is opened at the live path, the **rollover event is
   recorded** into it, and the record whose write failed is re-written. A transient condition — a
   momentary lock, an antivirus scan, a rotation race — heals here and stops nothing.
-* **Stage 2 — STOP.** Only when the **replacement** also cannot be written does the guard escalate.
-  A single-stage stop would take feeds down on a hiccup; that is an outage generator, not an invariant.
+* **Stage 2 — STOP.** The guard escalates when the **replacement** also cannot be written, when a
+  sink needs rolling past the flap bound (:meth:`LogWriteGuard.record_rollover`), and when the
+  sink's formatter cannot format even the guard's notice standing in for an unformattable record:
+  that last case is recorded unwritable with no roll, because a roll cannot clear a formatter
+  fault (BACKLOG #5813). A write failure never escalates without a roll attempt first: a single-stage
+  stop would take feeds down on a hiccup; that is an outage generator, not an invariant.
 
 **And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
 operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
@@ -108,7 +112,8 @@ __all__ = [
 #: (bypassing the logging tree, which is what just failed).
 _NOTICE_LOGGER = "messagefoundry.logging_guard"
 
-#: ``rolled`` — Stage 1 healed the sink. ``unwritable`` — Stage 2, the replacement failed too.
+#: ``rolled`` — Stage 1 healed the sink. ``unwritable`` — Stage 2: the replacement failed too, the
+#: sink needed rolling past the flap bound, or its formatter could not format the guard's notice.
 LogSinkStage = Literal["rolled", "unwritable"]
 
 #: Anti-flap bound on stage 1 (see :meth:`LogWriteGuard.record_rollover`). Generous enough that a real
@@ -149,7 +154,8 @@ class LogSinkStatus:
 #: Called (synchronously, from whatever thread was logging) on every stage transition. It MUST be
 #: cheap, non-blocking and never raise — the guard is already handling a failure. It returns False
 #: when it dropped the event, so that the guard can fire an owed stage-2 event again (see
-#: :meth:`LogWriteGuard.record_unwritable`); any other return counts as delivered.
+#: :meth:`LogWriteGuard.record_unwritable`); a raise counts as a drop too, and any other return
+#: counts as delivered.
 EscalationCallback = Callable[[LogSinkEvent], bool | None]
 
 #: One sink's "are you writable again?" self-test. Writes a real record to itself and RAISES if the
@@ -165,7 +171,8 @@ class LogWriteGuard:
     a sink that is already ``unwritable`` does not re-fire on every subsequent record (that would turn
     one broken disk into an unbounded alert storm), and a later successful Stage-1 roll clears that
     page latch so a genuine re-break pages again. A roll past the flap bound does not clear it: the
-    bound calls that roll a failure, so it stays the same break (BACKLOG #5812).
+    bound calls that roll a failure, so the sink stays unwritable, and the roll fires the stage-2
+    event again, as :meth:`record_rollover` states (BACKLOG #5812).
 
     **The FLAP latch is a different thing**, an overlay on what this class reports (BACKLOG #5812,
     ADR 0162 amendment B). A successful roll does not always release it. :meth:`record_rollover`
@@ -283,9 +290,9 @@ class LogWriteGuard:
         :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
         declared unwritable instead: a log you must replace every few seconds is not a working log,
         and stage 2 is the honest verdict on it. Each further roll past the bound in that window
-        finds the sink already unwritable, so it is counted on :meth:`status` and pages nothing,
-        unless the break still owes its stage-2 event: then it fires that event again, as
-        :meth:`record_unwritable` states.
+        finds the sink already unwritable and leaves it so, and fires the stage-2 event and its
+        stderr line again, as origin/main did, so the stop is asked for again whatever the
+        responder answered before.
 
         **The flap latch holds what the bound declared unwritable** (BACKLOG #5812; this paragraph
         is where the rule is stated). The bound's window restarts a minute after its first roll, so a
@@ -317,15 +324,14 @@ class LogWriteGuard:
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
             tripped = streak > _MAX_ROLLS_PER_WINDOW
+            # A roll past the bound on a sink already unwritable keeps it so, so that no other
+            # thread reads it ``rolled`` in between (BACKLOG #5812). The escalation below still
+            # fires stage 2 again for it, as origin/main did, so the stop is asked for again
+            # whatever the responder answered last time.
+            repeat = tripped and previous is not None and previous.state == "unwritable"
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
-                # A roll past the bound on a sink already unwritable keeps it so, and the
-                # escalation below then reads it as already down: one page per break, not one per
-                # roll past the bound (BACKLOG #5812). Writing ``rolled`` first used to hide the
-                # earlier stage 2 from that check.
-                state="unwritable"
-                if tripped and previous is not None and previous.state == "unwritable"
-                else "rolled",
+                state="unwritable" if repeat else "rolled",
                 rollovers=(previous.rollovers if previous else 0) + 1,
                 last_event=reason,
                 last_event_at=_utc_now(),
@@ -343,6 +349,7 @@ class LogWriteGuard:
                     f"{reason}; the sink needed rolling {streak} times in "
                     f"{_ROLL_FLAP_WINDOW_SECONDS:.0f}s, which is a failing log rather than a transient"
                 ),
+                repeat=repeat,
             )
             return
         self._fire(
@@ -350,14 +357,25 @@ class LogWriteGuard:
         )
 
     def record_unwritable(
-        self, sink: str, *, reason: str, cause: str = "after a rollover attempt"
+        self,
+        sink: str,
+        *,
+        reason: str,
+        cause: str = "after a rollover attempt",
+        repeat: bool = False,
     ) -> None:
-        """Stage 2: the replacement could not be written either. Escalates ONCE per break, except
-        that a break whose event was not delivered owes it: no responder was wired, or the responder
-        reported that it dropped the event. An owed event is fired again on the next failure of the
-        break until one is delivered. :meth:`set_escalation` also fires each event already owed
-        when it wires a responder; one a failure records as owed just after that waits for the
-        sink's next failure.
+        """Stage 2: the sink cannot take a record. Called when a roll's replacement could not be
+        written, by :meth:`record_rollover` past the flap bound, and by
+        :meth:`_GuardedSinkMixin.handleError`, with no roll and no replacement, when the sink's
+        formatter cannot format the notice standing in for an unformattable record.
+        Escalates ONCE per break, with two exceptions.
+        A break whose event was not delivered owes it: no responder was wired, or the responder
+        raised or reported that it dropped the event. An owed event is fired again on the next
+        failure of the break until one is delivered. :meth:`set_escalation` also fires each event
+        already owed when it wires a responder; one a failure records as owed just after that
+        waits for the sink's next failure. And ``repeat``, which :meth:`record_rollover` passes
+        for a roll past the flap bound on a sink already unwritable, fires the event and writes
+        the stderr line again, as origin/main did for every roll past the bound.
         ``cause`` is a literal phrase for the stderr line saying how the sink came to be
         unwritable.
 
@@ -402,7 +420,7 @@ class LogWriteGuard:
             reason=reason,
             stop_requested=self.stop_on_unwritable and all_down,
         )
-        if already_down:
+        if already_down and not repeat:
             # Latched: one page per break, not one per dropped record. Without this a broken disk
             # turns every subsequent log line into an alert AND a stderr line, and the storm buries
             # the one message that mattered.
@@ -564,9 +582,8 @@ class LogWriteGuard:
 
     def _fire(self, event: LogSinkEvent) -> bool:
         """Hand ``event`` to the responder, and report whether it was delivered: False when no
-        responder is wired or the responder returned False, which it does when it dropped the
-        event. A responder that raised counts as delivered, so a responder that always raises
-        is not called again for every failure."""
+        responder is wired, the responder returned False, which it does when it dropped the
+        event, or the responder raised."""
         with self._lock:
             callback = self._escalation
         if callback is None:
@@ -580,7 +597,7 @@ class LogWriteGuard:
                 f"log-sink escalation for {_escape_only(event.sink, fallback=_LABEL_DROPPED)} "
                 f"failed: {_safe_reason(exc)}"
             )
-            return True
+            return False
         return delivered is not False
 
 
@@ -787,11 +804,10 @@ def _type_name(exc: BaseException) -> str:
     try:
         return ascii(type(exc).__name__)
     except Exception:
-        with contextlib.suppress(Exception):
-            _last_resort(
-                "an exception's type name could not be rendered for the log write guard; "
-                "a placeholder was substituted"
-            )
+        _last_resort(
+            "an exception's type name could not be rendered for the log write guard; "
+            "a placeholder was substituted"
+        )
         return _RECORD_LABEL_DROPPED
 
 
@@ -863,8 +879,8 @@ class _GuardedSinkMixin(_SinkBase):
         try:
             failure = sys.exception()
             # A record that cannot be formatted is no reason to roll a healthy sink (BACKLOG
-            # #5813). When the stand-in lands, the sink has just taken a write and nothing else
-            # happens; when it does not, the sink is the fault after all and the two stages below
+            # #5813). When the stand-in lands, the sink has just taken a write and neither stage
+            # runs; the fault is only counted for the stderr line. When it does not land, the sink is the fault after all and the two stages below
             # decide. A formatter that cannot format even the stand-in leaves this process unable
             # to log through this sink, so the sink is recorded unwritable without a roll: the
             # file is healthy and a roll cannot clear a formatter fault.

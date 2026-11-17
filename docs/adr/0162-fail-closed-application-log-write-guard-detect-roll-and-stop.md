@@ -386,7 +386,7 @@ restarts a minute after its first roll, so a sink still rolling every few second
 again, and `can_log()` read True with no probe, until the bound tripped again.
 
 **The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).** It is an
-overlay in its own field, `_flap_latch`, holding a `_FlapLatch` per held sink, and never in the
+overlay in its own field, `_flap_latch`, holding a `time.monotonic()` reading per held sink, and never in the
 bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rule; in short:
 
 - The roll that trips the bound latches the sink, in the same hold of the guard's lock that writes the
@@ -409,9 +409,9 @@ bound's `_roll_flap`. `LogWriteGuard.record_rollover`'s docstring states the rul
   read `status()`, so a page that lists the unwritable sinks can name a latched one too.
 
 **What the latch does not change.** The code that computes the bound, its window and streak, the
-state the three `record_*` methods write, the events the guard fires and every stop request is the
-code on `main` before this amendment, line for line, and it does not read the latch. The latch never
-writes to, rolls or probes a sink. The row's *one page per break* clause is not closed by this
+state the `record_*` methods write, the events the guard fires and every stop request does not read
+the latch. Amendment C changes some of that code, for reasons of its own, and makes the wording of
+the stage-2 stderr line read it. The latch never writes to, rolls or probes a sink. The row's *one page per break* clause is not closed by this
 amendment.
 
 **Stricter than section 1 between recovery actions, and stated rather than hidden.** A sink the
@@ -445,26 +445,23 @@ stream, not a proof, and it does not model threads.
 them a revalidate between two flaps that must still stop at the moment `main` stops, and two
 revalidates on real handlers that must neither heal a broken handle nor take a one-shot fault.
 
-## Amendment C (2026-11-17) -- one page per break past the bound, and unformattable records (BACKLOG #5812, #5813)
+## Amendment C (2026-11-17) -- rolls past the bound, owed stage-2 events, and unformattable records (BACKLOG #5812, #5813)
 
-**Amendments A and B are unedited, and where this one disagrees with them it is the newer text.**
-In particular Amendment B's statement that the events and stop requests are `main`'s before it no
-longer holds after this amendment, for the case below.
+**Amendment A is unedited. Amendment B is edited only where the code it describes changed under
+this amendment: the latch's stored value, and what it says the latch leaves alone. Where this
+amendment disagrees with either, it is the newer text.**
 
-**One page per break past the bound.** Before this amendment every roll past section 1's bound
-wrote the sink's state as `rolled` before escalating, so `record_unwritable` never saw the sink as
-already down: each such roll fired another stage-2 event, stop request and stderr line. Now a roll
-past the bound on a sink already unwritable keeps it unwritable, so the first move of a break to
-unwritable pages, by a stage-2 failure or by the roll that trips the bound, and a later roll past
-the bound does not. A roll the bound calls a heal still writes `rolled` and pages stage 1, as
-before, so a sink that keeps flapping across bound windows pages stage 2 once per window it trips
-in. Whether the bound itself should hold across windows is left open with the latch's enforcement
-question. One retry is kept: a stage-2 event that was not delivered, because no responder was
-wired or the engine's responder had no open event loop to hand it to, is fired again on each
-later failure of the break, at most once per failure and without another stderr line, until one
-is delivered. Wiring a responder also fires each event already owed at that moment. A break that
-ends with a heal roll before any such failure is not asked to stop again, as before this
-amendment.
+**Rolls past the bound, and stage-2 events that were not delivered.** Before this amendment
+every roll past section 1's bound wrote the sink's state as `rolled` before escalating, so for
+that interval another thread could read the sink as writable. Now a roll past the bound on a sink
+already unwritable keeps it unwritable. It still fires another stage-2 event and stderr line,
+as `main` does, with the stop request wherever `main`'s would carry one, so the stop is asked for
+again on every such roll whatever the responder answered before. The row's *one page per break* clause is therefore not closed for
+these rolls. A stage-2 event that was not delivered, because no responder was wired, the
+responder raised, or the engine's responder had no open event loop to hand it to, is owed: it is
+fired again on each later failure of the break, at most once per failure and without another
+stage-2 stderr line, until one is delivered. Wiring a responder also fires each event already
+owed at that moment. A break that ends with a heal roll owes nothing.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
 the flap latch, the line now says so, instead of Amendment B's "another sink is still writable".
@@ -494,8 +491,12 @@ it, the sink is the fault and the two stages decide as before. A formatter that 
 that notice leaves the process unable to log through that sink, so the sink is recorded unwritable
 with a reason that names a formatter fault, and the stop is asked for when every sink is
 unwritable, as before this amendment. The log file is not rolled or renamed, by that failure or by
-`revalidate()`'s probe, because it is healthy. A format fault of any kind is counted, and a stderr
-last-resort line names each kind with its count, at most once a minute per sink. Faults counted
+`revalidate()`'s probe, because it is healthy. The format faults `handleError` meets before any
+roll are counted: the record's, the notice's, and a logger or level name that cannot be rendered.
+A stderr last-resort line names each kind with its count, at most once a minute per sink. Two
+format faults are not counted there: one formatting `revalidate()`'s probe notice only fails the
+probe, and one formatting the rollover notice or the re-written record after a roll goes to
+stage 2 as a replacement that could not be written. Faults counted
 inside that minute go on the next such line: at the next fault or flush after the minute, or when
 the sink is closed.
 

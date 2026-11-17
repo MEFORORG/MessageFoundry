@@ -811,12 +811,26 @@ def test_a_spool_directory_out_of_reach_retires_nothing(spool_dir: Path) -> None
         spool.close()
 
 
+def _windows_error(winerror: int | None) -> OSError:
+    """An ``OSError`` as Windows raises it for a network fault: ``EINVAL`` with ``winerror`` set.
+    Built by hand so the case runs on every platform."""
+    exc = OSError(errno.EINVAL, "network fault")
+    if winerror is not None:
+        setattr(exc, "winerror", winerror)  # noqa: B010 - typeshed declares it on win32 only
+    return exc
+
+
 @pytest.mark.parametrize(
     ("error", "closes_writer"),
     [
         (NotADirectoryError(errno.ENOTDIR, "not a directory"), True),
         (OSError(errno.ENOTCONN, "mount dropped"), True),
         (OSError(errno.ESTALE, "stale handle"), True),
+        # BACKLOG #5811: a dropped SMB share, which Python maps to EINVAL. NEGATIVE CONTROL: on
+        # ce55b5324d both read as one file failing and left the writer open.
+        (_windows_error(64), True),
+        (_windows_error(59), True),
+        (_windows_error(None), False),
         (OSError(errno.EMFILE, "too many open files"), False),
     ],
 )

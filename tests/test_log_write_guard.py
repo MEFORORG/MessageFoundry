@@ -209,15 +209,16 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
 # alone would not, and never pages, asks for a stop or trips the bound less than the bound alone.
 
 
-def test_rolls_past_the_bound_page_once_per_break(
+def test_rolls_past_the_bound_ask_for_the_stop_again_as_main_does(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # One page per break (BACKLOG #5812 item 2). The roll that trips the bound pages stage 2 once,
-    # with the stop request; each further roll past the bound in that window finds the sink already
-    # unwritable, is counted on /status, and pages nothing. Driven by real rolls: a sink that heals
-    # on every roll and breaks on every record, well past the bound.
-    # NEGATIVE CONTROL: before the fix each such roll wrote ``rolled`` first, so the escalation never
-    # saw the sink as already down: four stage-2 pages, four stop requests and four stderr lines.
+    # Each roll past the bound fires stage 2 with the stop request and writes the stderr line, as
+    # origin/main does, so the stop is asked for again whatever the responder answered before
+    # (BACKLOG #5812). The sink stays unwritable throughout. Driven by real rolls: a sink that
+    # heals on every roll and breaks on every record, well past the bound.
+    # NEGATIVE CONTROL: on ce55b5324d a roll past the bound on a sink already unwritable fired
+    # nothing, so a stop the responder had taken as delivered and then lost was never asked again:
+    # one stage-2 event, one stop request and one stderr line.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -227,9 +228,9 @@ def test_rolls_past_the_bound_page_once_per_break(
         _break_the_open_handle(handler)
         handler.emit(_record("break"))
 
-    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"]
-    assert sum(e.stop_requested for e in events) == 1
-    assert capsys.readouterr().err.count("IS UNWRITABLE") == 1
+    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 4
+    assert sum(e.stop_requested for e in events) == 4
+    assert capsys.readouterr().err.count("IS UNWRITABLE") == 4
     status = guard.status()[0]
     assert status.state == "unwritable"
     assert status.rollovers == _MAX_ROLLS_PER_WINDOW + 4
@@ -289,11 +290,10 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     # A sink rolling every 10 seconds for five minutes is one break. The bound's window restarts a
     # minute after its first roll, and without the latch the sink then read ``rolled`` (can_log()
     # True with no probe) until the bound tripped again. The latch keeps it ``unwritable``
-    # throughout, while the pages are exactly the bound's: stage 1 for each roll the bound calls a
-    # heal, and stage 2 once for each window the bound trips in (four here); the second roll past
-    # the bound in a window pages nothing.
+    # throughout, while the pages are exactly main's: stage 1 for each roll the bound calls a heal,
+    # and stage 2 for each roll past the bound, two in each of the four windows it trips in.
     # NEGATIVE CONTROL: before the latch the state read ``rolled`` at the first roll of each new
-    # window; before the one-page fix every roll past the bound paged, 30 events with 8 of stage 2.
+    # window.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
@@ -307,8 +307,8 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
         assert guard.status()[0].state == "unwritable"
         assert guard.can_log() is False
 
-    assert len(events) == 26
-    assert [e.stage for e in events].count("unwritable") == 4
+    assert len(events) == 30
+    assert [e.stage for e in events].count("unwritable") == 8
     assert all(e.stop_requested for e in events if e.stage == "unwritable")
 
     # The operator path still releases it, by writing a real record. The sink's own state is the
@@ -329,9 +329,9 @@ def test_the_roll_that_trips_the_bound_reads_unwritable_before_record_unwritable
     seen: list[tuple[str, bool]] = []
     original = guard.record_unwritable
 
-    def spy(sink: str, *, reason: str) -> None:
+    def spy(sink: str, *, reason: str, repeat: bool = False) -> None:
         seen.append((guard.status()[0].state, guard.can_log()))
-        original(sink, reason=reason)
+        original(sink, reason=reason, repeat=repeat)
 
     monkeypatch.setattr(guard, "record_unwritable", spy)
     _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
@@ -902,11 +902,10 @@ def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The roll that trips the bound fires stage 2 while no responder is wired, as in the gap between
-    # a runner's revalidate and its set_escalation. Wiring the responder fires it, so the stop is
-    # still asked for. Once delivered, the later rolls past the bound fire nothing more. The
-    # retry on a later failure is pinned by
-    # test_a_stage2_event_the_responder_dropped_is_fired_again.
-    # NEGATIVE CONTROL: with one page per break and no owed event, nothing fired at all.
+    # a runner's revalidate and its set_escalation. Wiring the responder fires it at once, so the
+    # stop is asked for before the next roll; each later roll past the bound asks again. The retry
+    # on a later failure is pinned by test_a_stage2_event_the_responder_dropped_is_fired_again.
+    # NEGATIVE CONTROL: on 0a71e8b23f set_escalation fired nothing.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     guard = LogWriteGuard()
@@ -914,10 +913,11 @@ def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
     _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
     events: list[LogSinkEvent] = []
     guard.set_escalation(events.append)
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
 
     _roll(guard, clock, 6, 7)
 
-    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)] * 3
 
 
 def test_a_formatter_that_fails_on_every_record_halts_without_renaming_the_log(
@@ -1099,34 +1099,60 @@ def test_an_owed_stage2_event_is_fired_once_per_failure_not_once_per_thread() ->
     assert len(events) == 1
 
 
-def test_a_stage2_event_the_responder_dropped_is_fired_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The roll that trips the bound fires stage 2, and the responder drops it, as the runner's does
-    # with no open loop. The next roll past the bound, on the sink already unwritable, fires it
-    # again, so the stop is still asked for, as on main, where every roll past the bound fired.
-    # NEGATIVE CONTROL: on 0a71e8b23f a wired responder counted as delivered, so the second roll
-    # fired nothing and the only stop request was the dropped one.
-    clock = _FakeClock()
-    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+def test_a_stage2_event_the_responder_dropped_is_fired_again() -> None:
+    # The responder drops the stage-2 event, as the runner's does with no open loop. The break's
+    # next failure fires it again, and once one is delivered the failures after it fire nothing.
+    # NEGATIVE CONTROL: on 0a71e8b23f a wired responder counted as delivered, so the second
+    # failure fired nothing and the only stop request was the dropped one.
     guard = LogWriteGuard()
     guard.register("file")
     delivering: list[bool] = []
     stage2: list[LogSinkEvent] = []
 
     def responder(event: LogSinkEvent) -> bool:
-        if event.stage == "unwritable":
-            stage2.append(event)
+        stage2.append(event)
         return bool(delivering)
 
     guard.set_escalation(responder)
-    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
-    assert [(e.stage, e.stop_requested) for e in stage2] == [("unwritable", True)]
+    guard.record_unwritable("file", reason="disk gone")
     delivering.append(True)
+    guard.record_unwritable("file", reason="disk still gone")
+    guard.record_unwritable("file", reason="answered now, so nothing more")
 
-    _roll(guard, clock, 6, 7)
+    assert [(e.reason, e.stop_requested) for e in stage2] == [
+        ("disk gone", True),
+        ("disk still gone", True),
+    ]
 
-    assert [(e.stage, e.stop_requested) for e in stage2] == [("unwritable", True)] * 2
+
+def test_a_stage2_event_whose_responder_raised_is_fired_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A responder that raised did not take the event, so the break owes it, as for a drop.
+    # NEGATIVE CONTROL: on ce55b5324d a raise counted as delivered, so the second failure fired
+    # nothing and the only stop request was the one the responder raised on.
+    guard = LogWriteGuard()
+    guard.register("file")
+    raising: list[bool] = [True]
+    stage2: list[LogSinkEvent] = []
+
+    def responder(event: LogSinkEvent) -> bool:
+        stage2.append(event)
+        if raising:
+            raise RuntimeError("responder broke")
+        return True
+
+    guard.set_escalation(responder)
+    guard.record_unwritable("file", reason="disk gone")
+    raising.clear()
+    guard.record_unwritable("file", reason="disk still gone")
+    guard.record_unwritable("file", reason="answered now, so nothing more")
+
+    assert [(e.reason, e.stop_requested) for e in stage2] == [
+        ("disk gone", True),
+        ("disk still gone", True),
+    ]
+    assert "log-sink escalation for file failed" in capsys.readouterr().err
 
 
 async def test_the_runners_responder_reports_an_event_it_dropped(store: MessageStore) -> None:
