@@ -459,7 +459,7 @@ def test_a_deny_and_a_clean_run_exit_0(tmp_path, shell):
 # main. The flag is argv, so neither a child nor an inherited environment carries it.
 
 _EXIT_2 = _hooks(_py("import sys; sys.exit(2)"))
-# The environment variable an earlier head of this branch read in place of the flag.
+# A variable an ancestor could set; the block exit must not depend on the environment.
 _OLD_SENTINEL = {"MEFOR_CODEX_BLOCK_SENTINEL": "1"}
 _needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 
@@ -508,15 +508,38 @@ def test_invoke_ignores_an_inherited_environment(tmp_path):
     assert completed.returncode == 2, completed.stderr
 
 
-def test_the_block_exit_flag_never_reaches_the_run_path(tmp_path):
+_ARGV_CHILD = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+
+
+@_needs_pwsh
+def test_invoke_adds_no_flag_to_a_run_childs_argv(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    (root / "scripts/argv.py").write_text(_ARGV_CHILD, encoding="utf-8")
+    completed = _invoke_file(root, "run", "scripts/argv.py", "--b", "1", CODEX_THREAD_ID="x")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == ["--b", "1"]
+
+
+def test_a_run_childs_own_flags_pass_through_as_on_main(tmp_path):
     root = _make_repo(tmp_path, _hooks(), venv=False)
-    marker = root / "ran"
-    (root / "scripts/touch.py").write_text(
-        f"from pathlib import Path\nPath({str(marker)!r}).write_text('x')\n", encoding="utf-8"
-    )
-    completed = _direct(root, "--session-id", "x", "run", "scripts/touch.py", "--block-exit", "10")
-    assert completed.returncode == 2, completed.stderr
-    assert not marker.exists()
+    (root / "scripts/argv.py").write_text(_ARGV_CHILD, encoding="utf-8")
+    flags = ["--block", "1", "--block-exit", "0"]
+    completed = _direct(root, "--session-id", "x", "run", "scripts/argv.py", *flags)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == flags
+
+
+def test_only_the_launchers_block_exit_is_honoured(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    assert _direct(root, "hook", "--block-exit", "0").returncode == 2
+
+
+@_needs_pwsh
+def test_invoke_forwards_a_single_argument_whole(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    completed = _invoke_file(root, "state-dir", CODEX_THREAD_ID="x")
+    assert completed.returncode == 0, completed.stderr
+    assert ".codex" in completed.stdout
 
 
 @_needs_pwsh
