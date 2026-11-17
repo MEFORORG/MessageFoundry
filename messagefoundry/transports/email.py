@@ -233,7 +233,7 @@ def _checked_header(cell: str, field: str, checked: list[str], what: str) -> lis
 
 def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
     """Refuse at least a subject holding a C0 control character, DEL or a Unicode line break, raw
-    or inside an encoded word, and a subject holding a lone surrogate (vault BACKLOG #5360).
+    or inside an encoded word, and a subject holding a lone surrogate.
 
     Raises :class:`ValueError` whose text starts with ``transport``, the outbound's label such as
     ``"Email destination"``, and holds no subject text."""
@@ -248,7 +248,9 @@ def refuse_unsafe_subject(subject: str, *, transport: str) -> None:
     except (UnicodeError, ValueError) as exc:
         failure = type(exc).__name__
     if failure:
+        # Raised outside the handler and type-only: UnicodeEncodeError.object holds the subject.
         raise ValueError(f"{transport} 'subject' cannot be set as a header ({failure})")
+    # Read-back catches encoded words that decode to a control character (#3206).
     if _holds_control_char(str(probe["Subject"])):
         raise ValueError(
             f"{transport} 'subject' holds an encoded word that decodes to a control character"
