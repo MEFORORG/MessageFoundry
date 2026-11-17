@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A corrupt or wrongly typed cell in ``users``, ``user_roles`` or ``sessions`` fails that one row,
-as a failed seal does, rather than raising a bare parse error that breaks every account
-(BACKLOG #5505).
+"""A corrupt or wrongly typed cell in ``users`` or ``sessions`` fails that one row, and one in
+``user_roles`` fails its whole account, as a failed seal does, rather than raising a bare parse
+error that breaks every account (BACKLOG #5505).
 
 The decoders are shared by all three backends, so the decoder tests below hold for each; the store
 tests run the SQLite readers, writing the corrupt cell through a stdlib connection the way an
@@ -309,17 +309,22 @@ async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path:
         for user_id in ("a-good", "a-bad"):
             await _admin(store, user_id, password)
         assert (await service.login("a-bad", password)).ok  # control
+        # Control: the guard counts a-bad while it reads, so a-good may go.
+        await service.delete_user("a-good", actor="test")
+        await _admin(store, "a-good", password)
         _raw(
             path,
             "UPDATE user_roles SET assigned_at=? WHERE user_id=? AND role_id=?",
             ("later", "a-bad", Role.VIEWER.value),
         )
-        assert await service._load_user("a-bad") is None
+        # Sign-in itself refuses and reports it: nothing read the account before this login.
         out = await service.login("a-bad", password)
-        assert not out.ok and out.token is None
-        assert alerts and "a-bad" in alerts[0]
-        assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)
+        assert not out.ok and out.token is None and out.error == "invalid credentials"
+        assert len(alerts) == 1 and "a-bad" in alerts[0]
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        assert await service._load_user("a-bad") is None
         assert await service._load_user("a-good") is not None  # no other account fails
+        # a-bad can no longer sign in, so the guard no longer counts it either.
         with pytest.raises(LastAdministratorRefused):
             await service.delete_user("a-good", actor="test")
         assert await store.get_user("a-good") is not None

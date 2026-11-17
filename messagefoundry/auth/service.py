@@ -13349,7 +13349,8 @@ class AuthService:
         The result's ``user`` is ``None`` for no account, and for an account whose record fails its
         seal, which is handed to :meth:`_user_seal_failed` and marked ``failed`` (BACKLOG #5520). A
         failing account is denied, never written: the store's write helper refuses to re-seal it.
-        On a keyless store there is no seal to check. One statement more than the row read, for
+        On a keyless store there is no seal to check, but a role row whose cells do not parse
+        still fails the pair (BACKLOG #5505). One statement more than the row read, for
         the role rows; the identity build reads them from the result instead of reading them
         again.
 
@@ -13371,13 +13372,15 @@ class AuthService:
             try:
                 grants = await self._store.get_user_role_grants(user.id)
             except RowSealError:
-                # A role row whose cells do not parse (BACKLOG #5505) fails the account as a
-                # forged record does, on a keyless store too, as the write helpers refuse it.
-                # No honest write leaves such a cell, so there is no re-read.
-                break
-            record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
-                return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
+                # A role row whose cells do not parse (BACKLOG #5505) fails the pair as a forged
+                # record does, on a keyless store too, as the write helpers refuse it.
+                grants = None
+            if grants is not None:
+                record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
+                if sealer is None or (
+                    record is not None and await user_seal_ok_async(sealer, record)
+                ):
+                    return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
             if attempt == 0:
                 reread = await read_user_or_unreadable(self._store.get_user(user.id))
                 if reread is None:
@@ -20708,7 +20711,8 @@ class AuthService:
         Takes its set from :meth:`sessions_ended_by_ad_map_save`, which reads
         :meth:`_load_users`: every enabled directory account whose record passes its seal. An
         account that fails its seal is reported by :meth:`_verified` and left out, and so are its
-        sessions. On a keyless store there is no seal to check, so no account is left out. Each
+        sessions. On a keyless store there is no seal to check, so only an account whose stored
+        cells do not parse is left out (BACKLOG #5505). Each
         account's unrevoked rows are then revoked with the store's ``revoke_user_sessions``, so this
         needs no schema change on any backend. The count it returns includes rows already past their
         limits, which the revoke ends too. Unlike the reconciler this is NOT counted against the
