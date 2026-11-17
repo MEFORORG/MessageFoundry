@@ -1079,8 +1079,8 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: ``MARKER``.
 #:
 #: **It runs LAST, after every label pass** -- the PHI passes here and the credential passes of the
-#: log chain -- through :func:`redact_binary_carriage`, never inside :func:`redact`. ``/``, ``+`` and ``=`` are base64 characters, so a run read first took a label
-#: joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
+#: log chain -- through :func:`redact_binary_carriage`, never inside :func:`redact`. ``/``, ``+``
+#: and ``=`` are base64 characters, so a run read first took a label joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
 #: Read last, every labelled value is already hidden as it was before this pass existed, and the
 #: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
 #: piece between two ``/``) is read as part of the run, so the run is not cut there and its tail is

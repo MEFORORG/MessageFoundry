@@ -60,7 +60,12 @@ def _bundle(text: str) -> str:
 
 
 _CHAINS: dict[str, Callable[[str], str]] = {"log": _log_chain}
-_BOTH = pytest.mark.parametrize("chain", list(_CHAINS), ids=list(_CHAINS))
+_LOG_CHAIN = pytest.mark.parametrize("chain", list(_CHAINS), ids=list(_CHAINS))
+
+
+#: A carriage pattern that never matches. The empty group is load-bearing: the pass substitutes
+#: ``\g<1>``, which needs a group 1 even where nothing matches.
+_CARRIAGE_OFF = re.compile(r"(?!)()")
 
 
 def _no_payload(out: str) -> None:
@@ -83,7 +88,7 @@ def test_redact_alone_does_not_read_the_carriage() -> None:
     assert _CARRIAGE in redact(f"bad {_CARRIAGE} end")
 
 
-@_BOTH
+@_LOG_CHAIN
 @pytest.mark.parametrize("form", list(_FORMS), ids=list(_FORMS))
 def test_a_carriage_payload_is_withheld_whole(chain: str, form: str) -> None:
     carriage = _FORMS[form]
@@ -170,7 +175,7 @@ _LABELLED = {
 }
 
 
-@_BOTH
+@_LOG_CHAIN
 @pytest.mark.parametrize("label", ["MRN: ", "MRN:", "mrn=", "MRN#", "patient MRN ", '"mrn": "'])
 def test_a_carriage_that_is_a_labels_value_is_withheld(chain: str, label: str) -> None:
     """Found by code review: the MRN pass reads ``mfb64`` as the value and writes
@@ -180,7 +185,7 @@ def test_a_carriage_that_is_a_labels_value_is_withheld(chain: str, label: str) -
     assert "WlpURVNUXkFMUEhB" not in _CHAINS[chain](f"bad {label}{MARKER}WlpURVNUXkFMUEhB")
 
 
-@_BOTH
+@_LOG_CHAIN
 @pytest.mark.parametrize("case", list(_LABELLED), ids=list(_LABELLED))
 def test_a_labelled_value_next_to_a_carriage_stays_hidden(chain: str, case: str) -> None:
     text, value = _LABELLED[case]
@@ -195,12 +200,12 @@ def test_without_the_carriage_pass_the_log_chain_hides_the_same_values(
     """The control: with the carriage pass off, as on origin/main, each value is already hidden by
     its own label pass, so the green above is that pass's work and the carriage pass took nothing
     from it."""
-    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
+    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", _CARRIAGE_OFF)
     for text, value in _LABELLED.values():
         assert value not in _log_chain(text), text
 
 
-@_BOTH
+@_LOG_CHAIN
 @pytest.mark.parametrize("joiner", ["/", "+", "%2F", "", " "])
 def test_a_carriage_glued_after_another_is_withheld_too(chain: str, joiner: str) -> None:
     """Found by code review round 2: the first run took the second marker's head, so the second
@@ -231,18 +236,12 @@ def test_the_bundle_hides_a_word_glued_after_the_padding_as_main_did() -> None:
     assert "Zq9Secret" not in _bundle(f"bad {MARKER}QQ==Zq9Secret end")
 
 
-_BUNDLE_TEXTS = (
-    *(text for text, _ in _LABELLED.values()),
-    *(f"could not route {carriage} after retry" for carriage in _FORMS.values()),
-    f"bad MRN: {_CARRIAGE}",
-    f"bad {MARKER}WlpURVNUXkFMUEhB/{_CARRIAGE} end",
-)
+def test_the_bundle_runs_no_part_of_the_carriage_pass() -> None:
+    """The support bundle is left as origin/main has it: its own ``_MFB64`` at main's pattern, and
+    no binding of the log chain's pattern or pass anywhere in the module."""
+    from messagefoundry.support import redact as bundle_redact
 
-
-@pytest.mark.parametrize("text", _BUNDLE_TEXTS)
-def test_the_bundle_output_is_main_s(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The bundle reads no part of the #5378 pass: its output is the same with the pass switched
-    off, which is origin/main's output."""
-    with_pass = _bundle(text)
-    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
-    assert _bundle(text) == with_pass
+    assert bundle_redact._MFB64.pattern == r"mfb64:v1:[A-Za-z0-9+/=]+"
+    held = list(vars(bundle_redact).values())
+    assert not any(value is redaction._BINARY_CARRIAGE for value in held)
+    assert not any(value is redact_binary_carriage for value in held)

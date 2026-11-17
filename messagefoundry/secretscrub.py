@@ -1490,9 +1490,8 @@ _MEMBER_KEEP = re.compile(
 #:
 #: The marker is spelled as ``support/redact.py`` ``_MFB64`` spells it, case and all. One more form
 #: is kept whole: a marker whose ``mfb64`` an earlier pass replaced with a placeholder
-#: (``[redacted]:v1:``), which the log chain's carriage pass still reads as a marker (BACKLOG
-#: #5378, ``redaction._BINARY_CARRIAGE``). A word
-#: ends where the marker or the userinfo opener starts, so a word glued on before either
+#: (``[redacted]:v1:``), which the log chain's carriage pass still reads as a marker
+#: (``redaction._BINARY_CARRIAGE``, BACKLOG #5378). A word ends where the marker or the userinfo opener starts, so a word glued on before either
 #: (``amfb64:v1:``, ``xnonnumeric port: ``) cannot take its head: neither reader has a word
 #: boundary. Masking the marker's ``v1`` printed, on a chain line the bundle read back, the body
 #: ``origin/main`` hid (BACKLOG #5030). :func:`_masked_word` keeps where the marker's base64 run
