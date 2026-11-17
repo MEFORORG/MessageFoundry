@@ -87,7 +87,7 @@ pre_commit_can_run() {
     fi
     local empty ok=0
     empty="$(mktemp)"
-    quiet python scripts/security/scan_forbidden.py --require-tokens "$empty" || ok=1
+    quiet python scripts/security/scan_forbidden.py --require-tokens -- "$empty" || ok=1
     rm -f "$empty"
     if [ "$ok" != 0 ]; then
         pre_commit_off "the leak gate's scanner refuses to run here, as its output above says, so the leak gate would refuse any commit that stages a file" \

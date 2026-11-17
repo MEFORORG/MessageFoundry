@@ -3096,19 +3096,25 @@ def main(argv: list[str]) -> int:
             # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,
             # an lstat of the entry itself that fails other than ENOENT fails the run. In
             # staged mode (any path named on the command line, with or without ``--``, outside --path)
-            # a directory or a missing name also fails the run. ENOENT is passed over in the --path
-            # walk (removed since it was listed) and in the tracked scan (deleted in the work tree).
-            # Anything else whose lstat succeeds, such as a dangling link, a link whose target cannot be
-            # stat'ed, or a FIFO, is judged by its path and name only; the walk never lists a link to
-            # a directory, so that is not judged. Every entry that reaches the hits is also judged by
-            # its path and name.
+            # a directory, a link to a directory, a link whose target cannot be stat'ed, or a missing
+            # name also fails the run. ENOENT is passed over in the --path walk (removed since it was
+            # listed) and in the tracked scan (deleted in the work tree). Anything else whose lstat
+            # succeeds, such as a FIFO, or outside staged mode a dangling link, is judged by its path
+            # and name only; the walk never lists a link to a directory, so that is not judged. Every
+            # entry that reaches the hits is also judged by its path and name.
             try:
                 st_mode = abs_path.lstat().st_mode
-                reason = (
-                    "a directory, not a file"
-                    if stat.S_ISDIR(st_mode) and paths and not path_mode
-                    else None
-                )
+                reason = None
+                if paths and not path_mode:
+                    if stat.S_ISDIR(st_mode):
+                        reason = "a directory, not a file"
+                    elif stat.S_ISLNK(st_mode):
+                        try:
+                            if stat.S_ISDIR(abs_path.stat().st_mode):
+                                reason = "a link to a directory, not a file"
+                        except OSError as link_exc:
+                            why = errno.errorcode.get(link_exc.errno or 0, type(link_exc).__name__)
+                            reason = f"a link whose target cannot be stat'ed ({why})"
             except OSError as exc:
                 # Gone since it was listed, or a tracked file deleted in the work tree.
                 if exc.errno == errno.ENOENT and (path_mode or not paths):

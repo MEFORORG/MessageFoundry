@@ -2138,6 +2138,47 @@ def test_a_named_path_that_is_not_a_file_fails_the_run(
     assert sf_main.main(["--", "--path", "dir"]) == 2
 
 
+def _symlink_or_skip(link: Path, target: str, *, is_dir: bool) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=is_dir)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create a symlink here ({type(exc).__name__})")
+
+
+def test_a_named_link_to_a_directory_fails_the_run(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A named link to a directory was judged by its name only and passed, while a named directory
+    fails the run."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    _symlink_or_skip(tmp_path / "link", "dir", is_dir=True)
+    assert sf_main.main(["--", "link"]) == 2
+
+
+def test_a_named_dangling_link_fails_the_run(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A named link whose target cannot be stat'ed has no content to scan, so it fails the run."""
+    monkeypatch.chdir(tmp_path)
+    _symlink_or_skip(tmp_path / "link.md", "absent.md", is_dir=False)
+    assert sf_main.main(["--", "link.md"]) == 2
+
+
+def test_a_named_link_to_a_file_is_scanned_through(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: a named link to a regular file is read through to its target's content."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "leak.txt").write_text("contact ACME\n", encoding="utf-8")
+    (tmp_path / "ok.txt").write_text("fine\n", encoding="utf-8")
+    _symlink_or_skip(tmp_path / "leak.md", "leak.txt", is_dir=False)
+    _symlink_or_skip(tmp_path / "ok.md", "ok.txt", is_dir=False)
+    assert sf_main.main(["--", "leak.md"]) == 1
+    assert sf_main.main(["--", "ok.md"]) == 0
+
+
 def test_a_walked_entry_that_cannot_be_stated_fails_the_run(
     sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2901,6 +2942,20 @@ def test_the_commit_hook_ends_its_options_before_the_staged_names() -> None:
     """BACKLOG #5585 step 2. pre-commit appends the staged names after ``args``."""
     args = [str(a) for a in _forbidden_content_hook().get("args") or []]
     assert args and args[-1] == "--", args
+
+
+def test_the_cloud_setup_probe_asks_the_scanner_as_the_hook_does() -> None:
+    """cloud-setup.sh says it asks the scanner as the hook asks it, so its call carries the hook's
+    entry and args in order, ahead of the one file it names."""
+    hook = _forbidden_content_hook()
+    asked = " ".join([hook["entry"], *(str(a) for a in hook.get("args") or [])])
+    script = (_REPO_ROOT / "scripts" / "hooks" / "cloud-setup.sh").read_text(encoding="utf-8")
+    calls = [
+        line
+        for line in script.splitlines()
+        if "scan_forbidden.py --require-tokens" in line and not line.lstrip().startswith("#")
+    ]
+    assert calls and all(f'{asked} "$empty"' in line for line in calls), calls
 
 
 def test_the_commit_hook_passes_wide_text_and_binary_files() -> None:
