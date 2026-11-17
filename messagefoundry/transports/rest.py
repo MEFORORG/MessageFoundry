@@ -2207,8 +2207,10 @@ def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) ->
     """Whether a token request to ``token_url`` meets an explicit web proxy set up for Digest on a
     ``CONNECT``, where Digest cannot answer the proxy's 407 (vault BACKLOG #2989, ADR 0095 B.1).
 
-    True for an ``https`` token URL the proxy is used for, as :meth:`ProxyConfig.for_host` resolves
-    it with ``no_proxy`` as the bypass list. Such a token hop is refused at build. On a REST or FHIR
+    It reads no proxy and no Digest setting, so the caller checks that a proxy set up for Digest
+    exists. True for an ``https`` token URL that is not loopback and that neither ``no_proxy`` nor
+    urllib's own bypass list names, as :meth:`ProxyConfig.for_host` routes it. Behind a Digest
+    proxy, such a token hop is refused at build. On a REST or FHIR
     outbound that builds exactly one token provider the refusal runs before the proxy credential is
     judged, so it comes before any record of that credential crossing; elsewhere it runs when the
     provider is built. A value that is not a string, or that does not parse, answers ``False``."""

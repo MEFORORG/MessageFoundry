@@ -6,11 +6,10 @@
   at load. The refusal keys on the proxy resolved for the token host, so a token host the proxy
   bypasses still builds. On a REST or FHIR outbound that builds exactly one token provider it runs
   before the proxy credential's hop is judged, so it comes before any record of that credential
-  crossing. The static-credential report no longer lists the proxy hop of at least some Digest
-  proxies the build refuses or never sends through. Where the connection's own `url` is not
-  `https`, it can still list one when an `env()` value decides the token URL or turns a token
-  provider on or off, and one on a DICOMweb connection or a FhirLookup whose token settings are
-  OAuth2's, neither of which builds a provider from those settings. A `CONNECT` 407 on a proxy with no Digest set up, and any other `CONNECT` refusal,
-  still retry.
+  crossing. The static-credential report no longer lists the proxy hop of a Digest proxy on a
+  connection whose own `url` is `https`, or on one that mints a bearer from a literal token URL with
+  no `env()` value turning a token provider on or off; the docstring of `_digest_proxy_refused` says
+  why. Other Digest proxy hops are listed as before. A `CONNECT` 407 on a proxy with no Digest set
+  up, and any other `CONNECT` refusal, still retry.
   [ADR 0095](../docs/adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
   Amendment B.1 has the detail and the remedy.

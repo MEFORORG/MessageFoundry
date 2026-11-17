@@ -946,9 +946,9 @@ _OFF_BOX_PROXY = "http://10.0.0.9:3128"
 _CROSSING = "web-proxy credential over cleartext http"
 
 
-def _build_off_box_proxy(auth: str) -> Any:
+def _build_off_box_proxy(auth: str, ctype: ConnectorType = ConnectorType.REST) -> Any:
     return _build(
-        ConnectorType.REST,
+        ctype,
         "http://127.0.0.1:9/x",
         proxy=_OFF_BOX_PROXY,
         proxy_user="pu",
@@ -959,25 +959,28 @@ def _build_off_box_proxy(auth: str) -> Any:
 
 
 @pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
 def test_a_refused_token_hop_leaves_no_record_of_a_proxy_credential_crossing(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, ctype: ConnectorType
 ) -> None:
     """BACKLOG #2989 item 20. The refusal ran after the proxy credential's hop was judged, so a
     connection refused at build still logged and audited an accepted crossing of a hop that never
-    runs. It now runs first. Fails on the code before that change."""
+    runs. It now runs first. Fails on the code before that change, and, for FHIR, without the
+    ``builds_token_hop=True`` the FHIR outbound passes (review finding 4)."""
     with caplog.at_level("INFO"), pytest.raises(HttpAuthError, match=_DIGEST_PROXY_REFUSED):
-        _build_off_box_proxy("digest")
+        _build_off_box_proxy("digest", ctype)
     assert not [r for r in caplog.records if _CROSSING in r.getMessage()]
 
 
 @pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
 def test_an_accepted_proxy_credential_crossing_is_still_recorded(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, ctype: ConnectorType
 ) -> None:
     """THE CONTROL for the arm above: the same connection with a Basic proxy credential builds, and
     its accepted crossing is recorded, so the empty result above is not a deaf instrument."""
     with caplog.at_level("INFO"):
-        _build_off_box_proxy("basic")
+        _build_off_box_proxy("basic", ctype)
     assert [r for r in caplog.records if _CROSSING in r.getMessage()]
 
 
