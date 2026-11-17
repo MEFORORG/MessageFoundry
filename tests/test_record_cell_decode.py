@@ -20,8 +20,14 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, UserSealRefused
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AuthService,
+    LastAdministratorRefused,
+    UserSealRefused,
+)
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -262,12 +268,88 @@ async def test_a_corrupt_role_row_fails_its_account_seal_and_no_other(tmp_path: 
             await _user(store, user_id)
             await store.set_user_roles(user_id, [Role.VIEWER.value], audits=())
         _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", "u-bad"))
-        assert await store.get_user_role_grants("u-bad") == []
+        with pytest.raises(RowSealError):  # never left out (BACKLOG #5505)
+            await store.get_user_role_grants("u-bad")
+        assert [g.role_id for g in await store.get_user_role_grants("u-good")] == ["viewer"]
         service = AuthService(store, AuthSettings())
         listed = {entry.id: entry.user for entry in await service.list_checked_users()}
         assert set(listed) == {"u-good", "u-bad"}
         assert listed["u-good"] is not None
         assert listed["u-bad"] is None  # listed, and failing its seal
+    finally:
+        await store.close()
+
+
+async def _admin(store: MessageStore, user_id: str, password: str) -> None:
+    await store.create_user(
+        user_id=user_id,
+        username=user_id,
+        auth_provider="local",
+        password_hash=hash_password(password),
+        must_change_password=False,
+        password_generated=False,
+        audits=(),
+    )
+    await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value, Role.VIEWER.value], audits=())
+
+
+async def test_a_corrupt_role_row_fails_its_account_on_a_keyless_store(tmp_path: Path) -> None:
+    """Finding 1 of PR 3007: a keyless store checks no seal, so the role read itself must refuse
+    the account, as the write helpers do, or it signs in without the role while every write to it
+    is refused. Sign-in refuses it and reports it, and the last-administrator guard, which does
+    not count it, agrees with what can sign in."""
+    path = tmp_path / "keyless-roles.db"
+    password = "a-strong-passphrase-here"
+    store = await MessageStore.open(path)
+    try:
+        assert store.row_sealer() is None
+        alerts: list[str] = []
+        service = AuthService(store, AuthSettings(require_mfa=False), integrity_alert=alerts.append)
+        await service.initialize()  # the built-in roles
+        for user_id in ("a-good", "a-bad"):
+            await _admin(store, user_id, password)
+        assert (await service.login("a-bad", password)).ok  # control
+        _raw(
+            path,
+            "UPDATE user_roles SET assigned_at=? WHERE user_id=? AND role_id=?",
+            ("later", "a-bad", Role.VIEWER.value),
+        )
+        assert await service._load_user("a-bad") is None
+        out = await service.login("a-bad", password)
+        assert not out.ok and out.token is None
+        assert alerts and "a-bad" in alerts[0]
+        assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)
+        assert await service._load_user("a-good") is not None  # no other account fails
+        with pytest.raises(LastAdministratorRefused):
+            await service.delete_user("a-good", actor="test")
+        assert await store.get_user("a-good") is not None
+    finally:
+        await store.close()
+
+
+async def test_a_corrupt_role_row_inserted_outside_the_store_fails_the_seal(
+    tmp_path: Path,
+) -> None:
+    """Finding 2 of PR 3007: a corrupt role row INSERTed beside the sealed ones is not left out,
+    which would leave the record matching its seal; the account fails and is reported."""
+    path = tmp_path / "inserted-role.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        alerts: list[str] = []
+        service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
+        await service.initialize()  # the built-in roles
+        await _user(store, "u-ins")
+        await store.set_user_roles("u-ins", [Role.VIEWER.value], audits=())
+        assert await service._load_user("u-ins") is not None  # control
+        assert alerts == []
+        _raw(
+            path,
+            "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES (?,?,?,?)",
+            ("u-ins", Role.ADMINISTRATOR.value, "later", None),
+        )
+        assert await service._load_user("u-ins") is None
+        assert len(alerts) == 1 and "u-ins" in alerts[0]
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
     finally:
         await store.close()
 

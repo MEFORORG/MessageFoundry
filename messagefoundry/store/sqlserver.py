@@ -15002,8 +15002,7 @@ class SqlServerStore:
         rows = await self._fetchall(
             "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
         )
-        # A grant that does not parse is left out, so the account fails its seal alone.
-        return decoded_rows(rows, RoleGrant.from_mapping)
+        return [RoleGrant.from_mapping(r) for r in rows]
 
     @staticmethod
     async def _fetch_dicts(cur: Any) -> list[dict[str, Any]]:

@@ -13368,7 +13368,13 @@ class AuthService:
             return _SealCheck(failed=True)
         sealer = self._store.row_sealer()
         for attempt in range(2):
-            grants = await self._store.get_user_role_grants(user.id)
+            try:
+                grants = await self._store.get_user_role_grants(user.id)
+            except RowSealError:
+                # A role row whose cells do not parse (BACKLOG #5505) fails the account as a
+                # forged record does, on a keyless store too, as the write helpers refuse it.
+                # No honest write leaves such a cell, so there is no re-read.
+                break
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
             if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
                 return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
