@@ -608,7 +608,7 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
 def test_archive_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
     """BACKLOG #5369: a colon, a trailing dot or space, and a reserved device stem or refused
     character are refused on every platform, and the reason does not echo the name. The device
-    arm deliberately over-refuses: of these stems only NUL is rewritten on current Windows."""
+    arm deliberately over-refuses: of these stems only NUL was rewritten on Windows 11 build 26300."""
     reason = archive_member_name_reason(name)
     assert reason is not None and fragment in reason
     assert name not in reason

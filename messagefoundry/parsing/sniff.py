@@ -179,7 +179,7 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 # chokepoint enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
 # metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
 # incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses), or it holds
-# a ZIP record signature anywhere — or (b) not
+# one of the four ZIP record signatures in _ZIP_SIGNATURES anywhere — or (b) not
 # plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
 # the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
 # stripping engine. What it lets through is stated once, in docs/CONNECTIONS.md, under the
@@ -196,11 +196,13 @@ _CONTROL_DENSITY_LIMIT = 0.30
 #: The window the density is judged over: consecutive windows from the start, the last one ending at
 #: the body's end. A dense run that straddles two windows is judged as two halves.
 _TEXT_WINDOW_BYTES = 8192
-#: The ZIP record signatures (local file header, central directory header, end of central directory,
-#: data descriptor), refused anywhere in the body as defence in depth (BACKLOG #5368). An appended ZIP
-#: or DOCX that a reader can extract already carries NUL bytes, which the NUL check refuses; this adds
-#: a NUL-free run carrying a signature. Each carries two C0 control bytes, so a text log does not
-#: contain one by chance.
+#: Four ZIP record signatures, exactly these: ``PK\x03\x04`` local file header, ``PK\x05\x06`` end of
+#: central directory and ``PK\x07\x08`` data descriptor (from ``_MAGIC_PREFIXES``), plus
+#: ``PK\x01\x02`` central directory header. Each is refused anywhere in the body as defence in depth
+#: (BACKLOG #5368). Other ZIP record signatures, at least the ZIP64 ones, are not scanned. An appended
+#: ZIP or DOCX that a reader can extract already carries NUL bytes, which the NUL check refuses; this
+#: adds a NUL-free run carrying one of the four. Each carries two C0 control bytes, so a text log does
+#: not contain one by chance.
 _ZIP_SIGNATURES = (*_MAGIC_PREFIXES["application/zip"], b"PK\x01\x02")
 
 
@@ -210,8 +212,8 @@ def nontext_upload_reason(data: bytes) -> str | None:
 
     * a leading magic-byte signature of a metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX,
       GIF, TIFF) — these carry embedded metadata (EXIF/XMP/docProps) the text-only feature refuses to store;
-    * a ZIP record signature anywhere in the body, as defence in depth behind the NUL check
-      (BACKLOG #5368);
+    * one of the four ZIP record signatures in ``_ZIP_SIGNATURES`` anywhere in the body, as defence
+      in depth behind the NUL check (BACKLOG #5368);
     * a body that is not plausibly plain text — it contains a NUL byte anywhere, or one of its
       consecutive 8 KiB windows has a high density of non-printable control bytes.
 
@@ -352,9 +354,9 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
     would read as ``.`` and skip the content check) are refused. So is a component
     :func:`ntpath.isreserved` names: a reserved device stem (``NUL``, ``con.hl7``, ``COM1``,
     ``CONIN$``) or a character Windows refuses in a name. That arm deliberately over-refuses: of the
-    reserved device stems, only ``NUL`` is rewritten on current Windows (Windows 11 build 26300,
-    measured; see :func:`messagefoundry.pipeline.dr_backup._win_opens_another`), and the others open
-    as ordinary files. The arms run on every platform, since an archive's name is judged for where it
+    reserved device stems, only ``NUL`` was rewritten on Windows 11 build 26300, where it was measured
+    (see :func:`messagefoundry.pipeline.dr_backup._win_opens_another`), and the others opened as
+    ordinary files; other builds were not measured. The arms run on every platform, since an archive's name is judged for where it
     may be written, not where it was read. They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
     a long name beside its 8.3 short form still pass, so a Handler writing members on Windows keeps
     its own collision check. ``windows_names=False`` turns off only these arms; the drive-relative
