@@ -1012,7 +1012,7 @@ def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) ->
 
 
 #: The cleartext (ADR 0153) and revocation (ADR 0173) declaration keys. A connection carries them
-#: as typed fields, and the build mirrors the declared ones into its resolved settings
+#: as typed fields; an outbound's build mirrors the declared ones into its resolved settings
 #: (``wiring_runner._DECLARATION_MIRROR_KEYS`` is built from this).
 CLEARTEXT_REVOCATION_KEYS = (
     "cleartext_accepted",
@@ -1039,20 +1039,23 @@ def refuse_raw_declarations(settings: Mapping[str, Any], where: str) -> None:
     raw = [key for key in CONNECTION_DECLARATION_KEYS if key in settings]
     if raw:
         raise WiringError(
-            f"{where}: {', '.join(raw)} is not a transport setting. Declare it, with its reason, "
-            "as an argument to inbound() or outbound(), whichever takes it, or as a top-level key "
-            "on the connections.toml table, so the declaration is validated and reported"
+            f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested or "
+            "tls_revocation_attested on inbound() or outbound(), and cleartext_accepted on "
+            "outbound() only, each with its _reason, or as top-level keys on the connections.toml "
+            "table, so the declaration is validated and reported"
         )
 
 
 def apply_hop_attestation(
     settings: dict[str, Any], where: str, attested: bool, reason: str | None
 ) -> None:
-    """Mirror a connection's declared attestation pair into its resolved settings, which the caller
-    has already passed through :func:`refuse_raw_declarations`.
+    """Refuse the raw declaration keys in a connection's resolved settings
+    (:func:`refuse_raw_declarations`), then mirror its declared attestation pair there.
 
     The mirror is for the settings-driven seams (the SMART, OAuth2, Digest and FTP guards), which
-    receive only a settings mapping. Written only when declared."""
+    receive only a settings mapping. Written only when declared. Call it before an outbound's
+    cleartext and revocation mirror, which writes keys this refuses."""
+    refuse_raw_declarations(settings, where)
     settings.update(_hop_attestation_entries(where, attested, reason))
 
 
@@ -1737,6 +1740,11 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
         raise WiringError(f"{where}: " + " | ".join(problems))
 
 
+#: The name each carrier's build calls (vault BACKLOG #3234 added step 8): a Registry built in code,
+#: or settings changed after the load, never met :meth:`Registry.bool_literal_problems`.
+refuse_bool_literals = _refuse_bool_literals
+
+
 def _refuse_non_bool_flags(
     where: str, flags: Mapping[str, object], *, none_inherits: tuple[str, ...] = ()
 ) -> None:
@@ -1775,9 +1783,7 @@ def resolve_env_settings(
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. A setting :func:`_bool_settings` names is then read with the
-    strict spelling cast, from either source (vault BACKLOG #3234). A literal on such a setting is
-    not read but judged as :meth:`Registry.bool_literal_problems` judges it, and refused in the
-    same error when that refuses it. Raises a single
+    strict spelling cast, from either source (vault BACKLOG #3234). Raises a single
     :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
     NEVER the value — BACKLOG #1183) — so
@@ -1792,7 +1798,6 @@ def resolve_env_settings(
     blank: list[str] = []
     bool_defaults = _bool_settings().defaults
     bad_defaults: list[str] = []
-    literals: list[str] = []
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1869,12 +1874,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings. It is refused
-            # instead, by the rule the loader applies (Registry.bool_literal_problems), so a
-            # Registry built in code, or settings changed after the load, cannot hand a connector
-            # a non-bool literal for its bool() read either (vault BACKLOG #3234).
-            if (refused := _bool_literal_problem(name, value)) is not None:
-                literals.append(refused)
+            # a literal only in this copy would split one setting into two readings. The loader
+            # refuses one that is not a bool, and so does each carrier's build, before it resolves
+            # (Registry.bool_literal_problems says where).
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -1884,13 +1886,6 @@ def resolve_env_settings(
     if blank:
         problems.append("blank: " + "; ".join(blank))
     parts: list[str] = []
-    if literals:
-        # Written in the config, like a bad default, so it is fixed there and not in the values.
-        owner = f"connection {connection!r}: " if connection else ""
-        parts.append(
-            f"{owner}non-bool literal on a boolean setting, fix it in the config: "
-            + " | ".join(literals)
-        )
     if bad_defaults:
         # Still one error, batched with any environment problems.
         parts.append(
@@ -6954,7 +6949,8 @@ class Registry:
 
         Only a graph that is validated sees this, as the loader's is. A :class:`Registry` built in
         code and handed straight to a runner, or settings changed after the load, meet the same
-        rule where :func:`resolve_env_settings` resolves a carrier's settings for its build."""
+        rule at least where a connection, a database or FHIR lookup, or a reference set is built
+        (:func:`refuse_bool_literals`), before its settings resolve."""
         problems: list[str] = []
         try:
             for kind, name, settings, _deployed in self.settings_carriers():
@@ -7282,7 +7278,8 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         revocation_reason: object = None,
     ) -> bool:
         # What _source_config and _dest_config refuse on a connection's declarations: a raw
-        # declaration key in its transport settings, the cleartext and revocation pairs the Source
+        # declaration key or a non-bool literal in its transport settings, the cleartext and
+        # revocation pairs the Source
         # and Destination validators check, then the typed attestation by the settings carriers'
         # own rule above (the flag type, a missing, blank or control-character reason, and the
         # attested-plus-accepted pair). Such an entry is a hop the engine never builds, however it
@@ -7297,6 +7294,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # string "false" reads unset in both (vault BACKLOG #5286).
         try:
             refuse_raw_declarations(settings, "")
+            refuse_bool_literals(settings, "")
             accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
