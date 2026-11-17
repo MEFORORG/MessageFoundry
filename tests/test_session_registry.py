@@ -734,10 +734,28 @@ def test_a_dead_record_naming_no_session_does_not_veto(config_root: Path) -> Non
 
 
 def test_a_far_future_startedat_is_unverified_not_stale_or_a_throw_under_strict_mode() -> None:
-    """A gap past Int32 minutes is not a start time: UNVERIFIED, which every caller treats as
-    possibly live. The cast this replaced threw there, which stopped them all; STALE would not."""
+    """A startedAt in the future is not a registration that happened: UNVERIFIED, which at least
+    seat.ps1, sessions.ps1 and the remove guards treat as possibly live. The cast this replaced
+    threw on this value; STALE would read as gone. A moderate future value, inside the range the
+    cast handled, reads the same under the default skew."""
     record = {"pid": os.getpid(), "sessionId": "s", "startedAt": 200_000_000_000_000}
     assert _strict_fence(record) == "UNVERIFIED"
+    record["startedAt"] = int((time.time() + 1800) * 1000)
+    assert _strict_fence(record) == "UNVERIFIED"
+
+
+def test_a_live_anonymous_record_with_a_future_startedat_still_vetoes(
+    config_root: Path, tmp_path: Path
+) -> None:
+    """Its fence reads UNVERIFIED, not STALE, so the scan keeps it and its fresh file vetoes."""
+    wt = tmp_path / "wt-future"
+    future = int((time.time() + 3600) * 1000)
+    _anonymous(config_root, "99014.json", {"pid": os.getpid(), "startedAt": future, "cwd": str(wt)})
+    got = _strict(
+        f"(Get-SessionLiveness -SessionId '5491d4d4' -ConfigRoot '{config_root}' "
+        f"-Worktree '{wt}').State"
+    )
+    assert got == "UNREADABLE"
 
 
 def test_a_session_registered_after_its_process_started_is_live_under_a_wide_skew() -> None:

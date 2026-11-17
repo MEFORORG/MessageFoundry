@@ -176,9 +176,8 @@ function Get-RecordField($Record, [string]$Name) {
 # A record's startedAt as a UTC DateTime, or $null when it is missing, not a number, or out of
 # FromUnixTimeMilliseconds's range. Parsed as a double and rounded, as the [int64] cast this replaced
 # did, so a fractional value still counts; NaN fails both bounds. A future value is returned as it
-# is: the fence compares it with the process start, as it always did (a session can register after a
-# long-lived process started, and a caller may widen -StartSkewMinutes for exactly that), and the
-# anonymous-record aging drops future values itself.
+# is: Test-RecordLiveness compares it with the process start and reads one outside the skew as
+# UNVERIFIED, and the anonymous-record aging drops future values itself.
 function Get-RecordStartedUtc($Record) {
     $ms = 0.0
     if (-not [double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
@@ -262,15 +261,17 @@ function Test-RecordLiveness {
     # A process cannot have started after the session it hosts registered (small forward slop for
     # clock jitter). Started much later => this pid was recycled onto a different process.
     $delta = ($procStart - $registered).TotalMinutes
-    # A gap past Int32 minutes (thousands of years) is not a start time. The [int] cast this replaced
-    # threw on it, which stopped every caller, so it stays a possibly-live answer, never STALE.
-    if ([Math]::Abs($delta) -gt [int]::MaxValue) {
-        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record's startedAt is implausibly far from the process start" }
-    }
     if ($delta -gt 1) {
         return @{ State = "STALE"; Detail = "pid $procId reused (process started $([long]$delta)m after the session)" }
     }
     if ($delta -lt (-1 * $StartSkewMinutes)) {
+        # A startedAt still in the future cannot be a registration that happened, so outside the skew
+        # it is an unusable start, not evidence of a recycled pid: UNVERIFIED, never STALE. Inside a
+        # widened skew it falls through to LIVE, as it always did (remove.ps1 widens it). The [long]
+        # casts replaced [int] ones, which threw on a gap past Int32 minutes.
+        if ($startedUtc -gt [DateTime]::UtcNow.AddMinutes(1)) {
+            return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record's startedAt is in the future" }
+        }
         return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([long](-$delta))m" }
     }
     return @{ State = "LIVE"; Detail = "" }
