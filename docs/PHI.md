@@ -2510,8 +2510,11 @@ Properties of the anonymizer:
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. Each component and subcomponent is read in several ways, among them as
-  written, decoded from its escape sequences, and with its invisible characters (Unicode
-  categories Cc and Cf) removed, and some of those readings are also split into pieces. A reading
+  written, decoded from its escape sequences, and with its invisible characters removed, and each
+  reading that is not ASCII is also folded to Unicode compatibility form (NFKC), and some of those
+  readings are also split into pieces. An invisible character, here and wherever this section
+  removes one, is one in Unicode category Cc or Cf or a default-ignorable code point outside
+  them, as `_is_invisible` in `surrogates.py` defines it (BACKLOG #5654). A reading
   or piece that is a site code whole counts. A part that holds no escape character is never split
   at whitespace, so `Call 971234 today`, as a component with no escape character, is not found by
   this check and is left by the scrub. A part that holds one is split at whitespace in its decoded
@@ -2579,7 +2582,11 @@ across fields reads each line as written and with each field decoded a subcompon
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
 decoded a component at a time. Both also take each decoding with `\H\` and `\N\` dropped, and
-every reading with invisible characters removed, the token scan line by line (BACKLOG #5654). The escape
+every reading with invisible characters removed, the token scan line by line (BACKLOG #5654).
+The shape detectors, the cut-shape check and the token scan keep the field, component,
+repetition and subcomponent separators the message declares when they remove invisible
+characters, so two fields or components never join, even under an invisible separator such as a
+TAB field separator. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with

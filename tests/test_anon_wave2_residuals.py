@@ -324,7 +324,7 @@ _DASH_HEAD = "-".join(
 @_LEAKS
 @pytest.mark.parametrize(
     "tail",
-    ["123-45-67­89", "123-45-67\\XAD\\89", "123\\H\\-45-6789", "123-45\\N\\-6789"],
+    ["123-45-67\u00ad89", "123-45-67\\XAD\\89", "123\\H\\-45-6789", "123-45\\N\\-6789"],
     ids=["soft-hyphen", "soft-hyphen-escaped", "highlight", "highlight-off"],
 )
 def test_a_cut_shape_behind_an_invisible_or_highlight_is_a_hit(leak: ModuleType, tail: str) -> None:
@@ -341,8 +341,8 @@ def test_a_cut_shape_behind_an_invisible_or_highlight_is_a_hit(leak: ModuleType,
         "zqsynth\\H\\partner",
         "zqsynth\\N\\partner",
         "zqsynth\\X00\\partner",
-        "zqsynth​partner",
-        "zqsynth͏partner",
+        "zqsynth\u200bpartner",
+        "zqsynth\u034fpartner",
     ],
     ids=["highlight", "highlight-off", "nul-escaped", "zero-width-space", "cgj"],
 )
@@ -440,6 +440,91 @@ def test_a_folded_digit_in_an_escape_body_reads_as_a_site_code(
     with _token_source(monkeypatch, "97\n", guards=False, surrogates=True):
         assert surrogates._reads_as_site_code(part, seps, "|")
         assert surrogates.scrub_site_codes(part, Keyer(_SALT), seps) != part
+
+
+@_SURROGATES
+@pytest.mark.parametrize(
+    "part",
+    [
+        "X\\971234٣\\Y",  # an Arabic-Indic digit after the code
+        "X\\971234５\\Y",  # a fullwidth digit after the code
+        "X\\５971234\\Y",  # a fullwidth digit before it
+        "X\\Z971234٣\\Y",
+    ],
+    ids=["arabic-indic-tail", "fullwidth-tail", "fullwidth-lead", "z-arabic-indic-tail"],
+)
+def test_an_ascii_code_beside_a_non_ascii_digit_in_an_escape_body_is_found(
+    surrogates: ModuleType, part: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A split at every non-digit keeps a non-ASCII digit on the code, so the body is also split
+    at every character that is not an ASCII digit, as it was before (BACKLOG #5654)."""
+    seps = surrogates.Seps()
+    with _token_source(monkeypatch, "97\n", guards=False, surrogates=True):
+        assert surrogates._reads_as_site_code(part, seps, "|")
+        assert surrogates.scrub_site_codes(part, Keyer(_SALT), seps) != part
+
+
+def _header(sep: str, encoding: str = "^~\\&") -> str:
+    return sep.join(
+        ("MSH", encoding, "A", "B", "C", "D", "20260101", "", "ADT^A01", "M1", "P", "2.3")
+    )
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize("sep", ["\t", "\x1f", "­"], ids=["tab", "unit-separator", "soft-hyphen"])
+def test_an_invisible_field_separator_keeps_two_fields_apart(
+    leak: ModuleType, sep: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping invisible characters keeps the declared separators, so two fields never join
+    into a token (BACKLOG #5654). The same token inside one field, behind an invisible character
+    that is no separator, is still found."""
+    head = _header(sep)
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
+        assert leak.leak_report(f"{head}\rZPD{sep}1{sep}zqsynth{sep}partner").hits == []
+        within = leak.leak_report(f"{head}\rZPD{sep}1{sep}zqsynth​partner").hits
+        assert "synthetic partner" in within
+
+
+@_NO_SCANNER
+@_LEAKS
+def test_an_invisible_component_separator_keeps_two_components_apart(
+    leak: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = _header("|", "\x1f~\\&")
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
+        assert leak.leak_report(f"{head}\rZPD|1|zqsynth\x1fpartner").hits == []
+        assert "synthetic partner" in leak.leak_report(f"{head}\rZPD|1|zqsynth\x1epartner").hits
+
+
+@_SURROGATES
+@pytest.mark.parametrize("salt", [_SALT, _SALT + "1", _SALT + "2"])
+def test_an_identifier_surrogate_writes_no_digit_field_separator(
+    surrogates: ModuleType, salt: str
+) -> None:
+    """Under MSH-1 ``5`` a fabricated ``5`` would split the field (BACKLOG #5540)."""
+    seps = surrogates.Seps(field="5")
+    for real in ("1234678", "98764321", "A0049"):
+        out = surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(salt), seps)
+        assert "5" not in out, out
+    for real in ("123-46-7890", "123467890"):
+        out = surrogates.surrogate_ssn(f"{real}^^^H^SS", Keyer(salt), seps)
+        assert "5" not in out, out
+
+
+@_SIDES
+def test_anonymize_under_a_digit_field_separator_keeps_every_field(
+    anon: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many ids, so a fabricated digit drawn from all ten would hit ``5`` in almost every run."""
+    ids = [f"{n:07d}" for n in range(1000000, 1400000, 9973) if "5" not in f"{n:07d}"]
+    assert len(ids) >= 20
+    pid = "5".join(("PID", "1", "", "~".join(f"{i}^^^H^MR" for i in ids), "", "DOE^JOHN"))
+    raw = f"{_header('5')}\r{pid}"
+    with _token_source(monkeypatch, "97\n", guards=False, surrogates=True):
+        out = anon.anonymize(raw, salt=_SALT)
+    line = next(seg for seg in out.split("\r") if seg.startswith("PID"))
+    assert len(line.split("5")) == len(pid.split("5")), "a fabricated id held the field separator"
 
 
 # --- #5532: the decoder's copy of the engine's formatting commands ---------------------------------

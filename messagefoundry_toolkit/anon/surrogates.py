@@ -166,16 +166,18 @@ REDACTED = "[REDACTED]"
 
 @dataclass(frozen=True)
 class Seps:
-    """The component/repetition/subcomponent separators and the escape character of the message
-    being anonymized, read from its own MSH-1/MSH-2 (never hardcoded). The field separator is the
-    adapter's concern. The surrogate kinds never read ``escape``; the leak-check decodes an escaped
-    value with it before its detectors look (BACKLOG #5532), and so does the site-code scrub
-    (BACKLOG #5632)."""
+    """The component/repetition/subcomponent separators, the escape character and the field
+    separator of the message being anonymized, read from its own MSH-1/MSH-2 (never hardcoded).
+    Splitting a line into fields is the adapter's concern; the surrogate kinds read ``field`` only
+    to keep a digit field separator out of a fabricated value (:func:`_free_digits`). The leak-check
+    decodes an escaped value with ``escape`` before its detectors look (BACKLOG #5532), and so does
+    the site-code scrub (BACKLOG #5632)."""
 
     component: str = "^"
     repetition: str = "~"
     subcomponent: str = "&"
     escape: str = "\\"
+    field: str = "|"
 
 
 #: Every ASCII digit, the digits :func:`_fake_digits` draws from by default.
@@ -187,10 +189,11 @@ def _fake_digits(rng: random.Random, length: int, digits: str = _ALL_DIGITS) -> 
     return "".join(rng.choice(digits) for _ in range(max(1, length)))
 
 
-def _free_digits(seps: Seps) -> str:
-    """The ASCII digits the message does not declare as a component, repetition or subcomponent
-    separator or as its escape character: the digits a fabricated id may hold (BACKLOG #5540)."""
-    reserved = seps.component + seps.repetition + seps.subcomponent + seps.escape
+def _free_digits(seps: Seps, field_sep: str) -> str:
+    """The ASCII digits the message does not declare as its field, component, repetition or
+    subcomponent separator or as its escape character: the digits a fabricated value may hold
+    (BACKLOG #5540). ``field_sep`` is the message's field separator."""
+    reserved = field_sep + seps.component + seps.repetition + seps.subcomponent + seps.escape
     return "".join(d for d in _ALL_DIGITS if d not in reserved)
 
 
@@ -209,7 +212,7 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     The subcomponent separator and escape character the message declares are kept
     even when they are not ASCII, so the value keeps its structure, except a declared digit, which
     is fabricated like any other digit; no fabricated digit is one the message declares as a
-    component, repetition or subcomponent separator or escape character (:func:`_free_digits`).
+    separator or escape character (:func:`_free_digits`).
     Each escape sequence a second escape character closes in the same subcomponent becomes
     fabricated letters, one for each character it is written with, its escape characters
     included, so the width holds. Its body is never rewritten character by character, which could
@@ -217,7 +220,7 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     out: list[str] = []
     escape = seps.escape
     kept = (seps.subcomponent, escape)
-    digits = _free_digits(seps)
+    digits = _free_digits(seps, seps.field)
     at = 0
     while at < len(sample):
         ch = sample[at]
@@ -341,10 +344,9 @@ def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
     the CX authority components a CX-shaped national id carries, blanking the rest as
     :func:`_surrogate_identifier` does (BACKLOG #5534). No fabricated digit is one the message
-    declares as a component, repetition or subcomponent separator or escape character
-    (:func:`_free_digits`, BACKLOG #5540); a digit field separator is not avoided."""
+    declares as a separator or escape character (:func:`_free_digits`, BACKLOG #5540)."""
     rng = keyer.rng("ssn", rep)
-    digits = _free_digits(seps)
+    digits = _free_digits(seps, seps.field)
     comps = _components(rep, seps)
     id_part = comps[0]
     if not id_part:
@@ -569,6 +571,10 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
         for at in range(1, len(pieces), 2):
             body = pieces[at]
             if at == len(pieces) - 1 or not _HEX_ARGUMENT_ESCAPE.fullmatch(body):
+                # Split at each run that is not an ASCII digit, which cuts a fullwidth or
+                # Arabic-Indic digit off an ASCII code, and at each run that is not a digit at all,
+                # which keeps a fullwidth code whole (BACKLOG #5654).
+                forms += _NON_ASCII_DIGITS.split(body)
                 forms += _NON_DIGITS.split(body)
                 # Folded first too: ``\D`` splits off a superscript or circled digit, which a
                 # folding consumer shows as an ASCII one (BACKLOG #5654).
@@ -586,9 +592,10 @@ def folded(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
-#: What splits an escape body read as written: any run of characters that are not digits. ``\\D``
-#: as :data:`SITE_CODE_RE`'s ``\\d`` reads a digit, so the two readings agree on a fullwidth
-#: digit (BACKLOG #5654).
+#: One split of an escape body read as written: any run of characters that are not ASCII digits.
+_NON_ASCII_DIGITS: re.Pattern[str] = re.compile(r"[^0-9]+")
+#: The other split: any run of characters that are not digits. ``\\D`` as :data:`SITE_CODE_RE`'s
+#: ``\\d`` reads a digit, so the two readings agree on a fullwidth digit (BACKLOG #5654).
 _NON_DIGITS: re.Pattern[str] = re.compile(r"\D+")
 #: The body of a well-formed escape whose argument is hex: ``\\Xhh..\\``, hex data in whole pairs,
 #: and ``\\Mxxyy\\`` or ``\\Mxxyyzz\\``, the multi-byte character-set escape. The argument codes
@@ -633,9 +640,8 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
 
     # A digit the message declares as a separator is never written: under a digit MSH-1 or MSH-2
     # it would add a field or a component and shift every later one past its rule (BACKLOG #5540).
-    reserved = set(field_sep + seps.component + seps.repetition + seps.subcomponent + seps.escape)
-    digits = [d for d in "0123456789" if d not in reserved]
-    prefixes = [p for p in _NON_SITE_PREFIXES if not reserved.intersection(p)]
+    digits = _free_digits(seps, field_sep)
+    prefixes = [p for p in _NON_SITE_PREFIXES if all(d in digits for d in p)]
 
     def _fake(part: str) -> str:
         if not prefixes:
@@ -645,10 +651,7 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
             )
         rng = keyer.rng("sitecode", part)
         prefix = rng.choice(prefixes)
-        if len(digits) == 10:
-            return f"{prefix}{_fake_digits(rng, len(part) - len(prefix))}"
-        tail = "".join(rng.choice(digits) for _ in range(max(1, len(part) - len(prefix))))
-        return f"{prefix}{tail}"
+        return f"{prefix}{_fake_digits(rng, len(part) - len(prefix), digits)}"
 
     def _one(part: str) -> str:
         return _fake(part) if _reads_as_site_code(part, seps, field_sep) else part
@@ -716,7 +719,13 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
             field = seg[3]
             enc = seg[4:].split(field, 1)[0]
             if len(enc) >= 4:
-                seps = Seps(component=enc[0], repetition=enc[1], escape=enc[2], subcomponent=enc[3])
+                seps = Seps(
+                    component=enc[0],
+                    repetition=enc[1],
+                    escape=enc[2],
+                    subcomponent=enc[3],
+                    field=field,
+                )
                 return seps, field
     return None
 
@@ -889,12 +898,14 @@ def _is_blank(char: str) -> bool:
     return char.isspace() or _is_invisible(char)
 
 
-def dropped(text: str) -> str:
+def dropped(text: str, keep: str = "") -> str:
     """``text`` with every invisible character (:func:`_is_invisible`) removed, as a consumer
-    that drops them reads it."""
+    that drops them reads it. A character in ``keep`` stays, so a caller that passes the
+    message's declared separators keeps its fields and components apart even when a separator is
+    itself invisible, such as a TAB field separator (BACKLOG #5654)."""
     if text.isascii() and text.isprintable():
         return text  # printable ASCII holds no invisible character
-    return "".join(c for c in text if not _is_invisible(c))
+    return "".join(c for c in text if c in keep or not _is_invisible(c))
 
 
 def trim(text: str) -> str:

@@ -12,7 +12,7 @@
 - **The anonymizer's site-code pass writes no separator digit, and an identifier surrogate
   invents no id.** The site-code pass writes no digit the message declares as a separator. An
   identifier or SSN surrogate fabricates every digit of an id and writes no digit the message
-  declares as a component, repetition or subcomponent separator or escape character. An
+  declares as a separator or escape character. An
   identifier surrogate leaves an empty id empty and turns an escape sequence in an id into
   letters of the same width. The
   tee's `anonymize-captures` names a field-separator refusal and its fix instead of advising a

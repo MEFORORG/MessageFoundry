@@ -733,12 +733,21 @@ def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[s
             for source in (fields, shown)
             for by_component in (False, True)
         ]
+    keep = _separators(seps, field_sep)
     readings: list[list[str]] = []
     for source in sources:
-        for reading in (source, [dropped(field) for field in source]):
+        for reading in (source, [dropped(field, keep) for field in source]):
             if reading not in readings:
                 readings.append(reading)
     return readings
+
+
+def _separators(seps: Seps, field_sep: str) -> str:
+    """The field, component, repetition and subcomponent separators the message declares: the
+    characters a reading with invisible characters dropped keeps, so two fields or components
+    never join into one shape or token, even when a separator is itself invisible, such as a TAB
+    field separator (BACKLOG #5654)."""
+    return field_sep + seps.component + seps.repetition + seps.subcomponent
 
 
 def _split_shape_hits(
@@ -813,17 +822,18 @@ def _shape_forms(value: str, seps: Seps, field_sep: str) -> list[str]:
     :func:`_escaped_parts` names read every way :func:`.surrogates.decoded_readings` reads it
     without splitting it again, ``\\H\\`` and ``\\N\\`` dropped and invisible characters
     dropped among them. So ``123-45-67\\XAD\\89`` reads as a dashed SSN (BACKLOG #5654)."""
-    forms = [value, dropped(value)]
+    forms = [value, dropped(value, _separators(seps, field_sep))]
     for part in _escaped_parts(value, seps):
         forms += decoded_readings(part, seps, field_sep, resplit=False)
     return list(dict.fromkeys(forms))
 
 
-def _dropped_lines(text: str) -> str:
+def _dropped_lines(text: str, keep: str) -> str:
     """``text`` with the invisible characters of each line dropped (:func:`.surrogates.dropped`)
-    and its line breaks kept, so two lines never join into one token."""
+    and its line breaks and the characters in ``keep``, the message's declared separators
+    (:func:`_separators`), kept, so two lines or two fields never join into one token."""
     lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
-    return "\r".join(dropped(line) for line in lines)
+    return "\r".join(dropped(line, keep) for line in lines)
 
 
 def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
@@ -837,6 +847,7 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
     not repeated."""
     sources = [text]
     parsed = read_message_seps(text)
+    keep = _separators(*parsed) if parsed is not None else ""
     if parsed is not None and parsed[0].escape and parsed[0].escape in text:
         shown = _without_highlighting(text, parsed[0])
         sources += [
@@ -845,7 +856,9 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
             for by_component in (False, True)
         ]
     hits = scan(text)
-    readings = dict.fromkeys(r for source in sources for r in (source, _dropped_lines(source)))
+    readings = dict.fromkeys(
+        r for source in sources for r in (source, _dropped_lines(source, keep))
+    )
     for reading in list(readings)[1:]:
         hits.extend(hit for hit in scan(reading) if hit not in hits)
     return hits
