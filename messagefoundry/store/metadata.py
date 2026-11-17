@@ -71,8 +71,8 @@ _JSON_VALUE_ERRORS: Final = (
 
 def _unencodable_cause(exc_class: type[BaseException], text: str) -> str:
     """A content-free name for why json refused a reference value (never a value or a key), from
-    the refusal's class and json's own message. It names the value json stopped on, so a value
-    holding two kinds names the first json met. An unknown message stays generic."""
+    the refusal's class and the start of its message, matched against json's own messages. A value
+    holding two kinds names the one that raised first. An unknown message stays generic."""
     if issubclass(exc_class, RecursionError):
         return "a value nested too deep"
     for prefix, kind in _JSON_VALUE_ERRORS:
@@ -101,9 +101,9 @@ def encode_reference_value(value: Any) -> str:
     (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON.
 
     A ``TypeError``, ``ValueError`` or ``RecursionError`` from json is rebuilt as a ``TypeError``
-    that names the kind of value json stopped on, never the value or its key, with none of json's
-    notes, cause or context. The kind is read off the refusal after its handler has exited, and
-    nothing is encoded a second time. Any other exception propagates as raised. One such value
+    that names a kind read off the refusal's class and message, never the value or its key, with
+    none of json's notes, cause or context. The kind is read off the refusal after its handler has
+    exited, and nothing is encoded a second time. Any other exception propagates as raised. One such value
     refuses the whole set, by the rule above."""
     refused: tuple[type[BaseException], str] | None = None
     try:

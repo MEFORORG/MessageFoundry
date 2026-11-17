@@ -44,7 +44,7 @@ class SearchSpec:
     """A parsed, validated content-search request — the metadata pre-filter lives separately (it is the
     SQL ``WHERE``); this is only the in-memory content predicate + caps.
 
-    Exactly one of ``substring`` / ``field_path`` is set (validated by :func:`make_spec`):
+    Exactly one of ``substring`` / ``field_path`` is set (validated in ``__post_init__``):
 
     * ``substring`` — a literal case-insensitive substring tested against the decrypted target column(s).
     * ``field_path`` + ``field_value`` — an HL7 field path (``PID-3``) resolved via ``Peek.field`` against

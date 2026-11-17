@@ -87,8 +87,8 @@ _KEYED_DETAIL = (
 # here. So an expected name held by a virtual table reads as a missing table and is refused rather
 # than skipped. A table is skipped as virtual when its stored SQL starts with the text
 # 'CREATE VIRTUAL TABLE' (LIKE, so the case of ASCII letters does not matter). A virtual table
-# whose stored SQL spells those words any other way, extra spaces included, is not skipped, and its
-# read raises "no such module".
+# whose stored SQL spells those words any other way, extra spaces included, is not skipped: it is
+# read, and where its module is not loaded here that read raises "no such module".
 _ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
