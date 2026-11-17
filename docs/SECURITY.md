@@ -6892,21 +6892,30 @@ while the second-step lock is live. The sign-in lock does not stop it.
 **The per-session count is process-local**, like the per-action step-up grants: a restart
 resets it, and a topology that serves the API from several processes, such as `serve --shard` engine
 shards with their own API ports over one store, gives each process its own count, so a session reachable
-on K ports gets up to K times the budget. The count is held in a map keyed by session, and an entry
-leaves it in these ways and no other: a re-proof finds its session gone, the session is revoked
-for spending its budget (once that revoke commits), a successful re-proof on the step-up re-auth
-route (a successful current-password check on the password-change route keeps it), a rotation
-moves it to the session's new key, a restart forgets every entry, and the two prunes that follow
-(BACKLOG #5336). The bounds are 64 entries per account and 4096 in all, except an entry held past
-them as the next sentences say. When a re-proof
-starts with its account at 64 entries, the counts of that account's sessions the store no longer
-lists, revoked or past their absolute expiry, are dropped first; a session the store still lists,
-idle or not, keeps its count. When a new session's first failure finds its account at 64 entries
-or the map full, entries older than the absolute session lifetime, timed from their first failure,
-go first. If there is still no room, that session is revoked on that first failure, and its entry
-is held at the cap, past both bounds, until its revoke commits. That matters for AD, because since
-the AD sign-in was retired the step-up re-auth route is the **only** place an AD password is still bound: a rejected re-bind counts
-on the engine's own row and against the session. The engine never writes a lock to the directory
+on K ports gets up to K times the budget. The counts are held in a map keyed by session. A count
+leaves the map in at least these ways (BACKLOG #5336):
+
+- the engine ends the session itself, by a sign-out, a revoke of one, some or all sessions, the
+  budget revoke, or the idle or expiry revoke a request meets (the budget revoke drops the count
+  only once its revoke commits);
+- a re-proof finds its session already gone;
+- a successful re-proof on the step-up re-auth route (a successful current-password check on the
+  password-change route keeps the count);
+- a restart, which forgets every count.
+
+A rotation moves the count to the session's new key. Each account holds at most 64 counts, and the
+map at most 4096. When a re-proof starts with its account at 64 counts, the counts of that account's
+sessions the store no longer lists, revoked or past their absolute expiry, are dropped first. A
+session the store still lists, idle or not, keeps its count. When a new session's first failure
+finds its account at 64 counts or the map full, counts older than the absolute session lifetime,
+timed from their first failure, go next. If there is still no room, that session is revoked on that
+first failure. Its count is then held at the cap, past both bounds, until the revoke commits. A
+session the session reaper purges without the engine ending it, at least one that expired with no
+request, keeps its count until one of the drops above, or the age prune, takes it.
+
+The per-session cap matters for AD, because since the AD sign-in was retired the step-up re-auth
+route is the **only** place an AD password is still bound: a rejected re-bind counts on the
+engine's own row and against the session. The engine never writes a lock to the directory
 account. Each rejected re-bind still reaches the DC, though: up to `lockout_threshold` counted ones per
 session, and, with no per-session bound, those uncounted ones below that the DC itself answered, such
 as a busy one or a referral. So a domain lockout policy can still lock the domain account if its
