@@ -87,7 +87,9 @@ function Get-SeatLockReading {
         -ClearHandoff refuses on the same ground. -Unreadable takes that count from a caller that
         already read the registry, so a report over many locks reads it once.
     #>
-    param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
+    # -Worktree is the locked tree, so a fresh registry record that names no session vetoes only the
+    # locks whose tree it overlaps rather than every lock on the box (BACKLOG #5491).
+    param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable, [string]$Worktree)
     # session-registry.ps1's fence reads its record fields without throwing under StrictMode since
     # BACKLOG #5491. This stays off for any read below it that is still bare, under a caller's
     # StrictMode (seat.ps1 runs Latest).
@@ -95,7 +97,7 @@ function Get-SeatLockReading {
     if ($SessionKey.StartsWith('codex-')) {
         return [pscustomobject]@{ State = 'CODEX'; Detail = "Claude's session registry cannot fence a Codex seat"; Gone = $false }
     }
-    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot }
+    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -Worktree $Worktree }
     catch { return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "the liveness lookup failed: $($_.Exception.Message)"; Gone = $false } }
     if ((-not $l.Found) -and $l.State -eq 'UNKNOWN') {
         if ($null -eq $Unreadable) {
@@ -135,7 +137,11 @@ function Get-StaleSeatLocks {
     try { $unreadable = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable | Where-Object { $_.Unreadable }).Count } catch { }
     foreach ($x in $seatLocks) {
         $w = $x.W; $p = $x.P
-        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable
+        # The path comes from a `git worktree list` that Get-RepoWorktrees decodes with the console
+        # code page, so a non-ASCII one may be garbled and would never meet a record's cwd. Only a
+        # plain ASCII path scopes the veto; any other leaves it box-wide (fail closed).
+        $scope = if ([string]$w.Path -match '^[\x20-\x7E]+$') { [string]$w.Path } else { '' }
+        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable -Worktree $scope
         if (-not ($r.Gone -or $r.State -eq 'CODEX')) { continue }
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }

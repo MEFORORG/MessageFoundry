@@ -35,9 +35,9 @@
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
       (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
-                  or UNREADABLE when a LIVE or fresh record that names no session, in the worktree
-                  the caller names, may be this one. The same record turns a matched DEAD or STALE
-                  into UNREADABLE. Get-AnonymousSessionRecords and Get-SessionLiveness say how.
+                  or UNREADABLE when a LIVE or fresh record that names no session, with a cwd
+                  overlapping the worktree the caller names, may be this one. The same record
+                  turns a matched DEAD or STALE into UNREADABLE. Get-AnonymousSessionRecords and Get-SessionLiveness say how.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
@@ -277,11 +277,19 @@ function Test-RecordLiveness {
     return @{ State = "LIVE"; Detail = "" }
 }
 
-# A path in the one form the anonymous-record scoping compares: forward slashes turned back,
-# trailing separators and space dropped, lower-cased. Windows paths compare case-insensitively.
+# A path in the one form the anonymous-record scoping compares: forward slashes turned back, a
+# \\?\ or \\.\ prefix dropped (\\?\UNC\ back to \\), `.` and `..` segments collapsed, trailing
+# separators and space dropped, lower-cased. Windows paths compare case-insensitively. A subst
+# drive, a junction or an 8.3 short name is NOT resolved, so such a spelling still compares unequal.
 function ConvertTo-RegistryNormPath([string]$Path) {
     if (-not $Path) { return '' }
-    return ($Path.Trim() -replace '/', '\').TrimEnd('\').ToLowerInvariant()
+    $p = $Path.Trim() -replace '/', '\'
+    if ($p -match '^\\\\[?.]\\UNC\\') { $p = '\\' + $p.Substring(8) }
+    elseif ($p -match '^\\\\[?.]\\') { $p = $p.Substring(4) }
+    if ([System.IO.Path]::IsPathFullyQualified($p)) {
+        try { $p = [System.IO.Path]::GetFullPath($p) } catch [System.ArgumentException], [System.NotSupportedException], [System.IO.PathTooLongException] { }
+    }
+    return $p.TrimEnd('\').ToLowerInvariant()
 }
 
 # Records that name no session and whose own fence is not DEAD or STALE, each with Fresh and Cwd.
@@ -307,19 +315,25 @@ function Get-AnonymousSessionRecords {
     param(
         [object[]]$Records,
         [double]$FreshHours = 24,
-        [int]$StartSkewMinutes = 15
+        [int]$StartSkewMinutes = 15,
+        # The clock the ages are taken against, so a caller with its own -Now ages these records by
+        # the same instant it ages everything else.
+        # Taken as UTC, as box-activity.ps1 takes its own -Now, and never converted.
+        [datetime]$Now = [DateTime]::UtcNow
     )
-    $now = [DateTime]::UtcNow
     $out = @()
     foreach ($r in @($Records)) {
         if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
         $state = (Test-RecordLiveness -Record $r.Record -StartSkewMinutes $StartSkewMinutes).State
         if ($state -in @('DEAD', 'STALE')) { continue }
         $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
+        # A future value is judged against the wall clock, never -Now: a record written after the
+        # caller took its clock is the freshest kind, and ages 0 rather than dropping out.
+        $wall = [DateTime]::UtcNow.AddMinutes(1)
         $times = @((Get-RecordStartedUtc $r.Record), $(if ($item) { $item.LastWriteTimeUtc })) |
-            Where-Object { $null -ne $_ -and $_ -le $now.AddMinutes(1) }
+            Where-Object { $null -ne $_ -and $_ -le $wall }
         $ageH = if (-not $item) { 0 }
-                elseif ($times) { ($now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours }
+                elseif ($times) { [math]::Max(0, ($Now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours) }
                 else { [double]::PositiveInfinity }
         $cwd = Get-RecordField $r.Record 'cwd'
         $out += [pscustomobject]@{
@@ -334,13 +348,19 @@ function Get-AnonymousSessionRecords {
 }
 
 # Does an anonymous record veto a lookup for -Worktree? Only when the two name one tree: the record's
-# cwd is that worktree or inside it. A record with no readable cwd, or a lookup that names no
-# worktree, cannot be placed, so it vetoes wherever it is asked (fail closed).
+# cwd is that worktree or inside it, or is a git checkout (it holds a .git entry) that the worktree
+# sits under. That last case is a session started in the primary checkout, which can work in a
+# worktree under it (BACKLOG #5491); a plain parent such as a home directory or a drive root does
+# not reach. A record with no readable cwd, or a lookup that names no worktree, cannot be placed, so
+# it vetoes wherever it is asked (fail closed).
 function Test-AnonymousRecordReaches {
     param($Anonymous, [string]$Worktree)
     $w = ConvertTo-RegistryNormPath $Worktree
     if (-not $Anonymous.Cwd -or -not $w) { return $true }
-    return ($Anonymous.Cwd -eq $w) -or $Anonymous.Cwd.StartsWith($w + '\', 'Ordinal')
+    $c = $Anonymous.Cwd
+    if (($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal')) { return $true }
+    # A string, not Join-Path, which throws on a drive this process does not have.
+    return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath "$c\.git")
 }
 
 # Look one session up by id (full or unique prefix) and fence it.
@@ -354,7 +374,9 @@ function Get-SessionLiveness {
         [string[]]$ConfigRoot,
         [int]$StartSkewMinutes = 15,
         [double]$AnonymousFreshHours = 24,
-        [string]$Worktree
+        [string]$Worktree,
+        # Passed to Get-AnonymousSessionRecords, which ages the anonymous records by it.
+        [datetime]$Now = [DateTime]::UtcNow
     )
     $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
     $hit = @($records |
@@ -363,7 +385,7 @@ function Get-SessionLiveness {
     # Fenced only when the answer would be gone, the one case the anonymous records can change.
     # Anonymous lists the vetoing records, so a caller can name the real reason for a refusal.
     $anonymousVeto = {
-        $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes)
+        $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes -Now $Now)
         $veto = @($anon | Where-Object { $_.Fresh -and (Test-AnonymousRecordReaches $_ $Worktree) })
         if ($veto.Count -gt 0) {
             $named = @($veto | ForEach-Object { if ($_.Cwd) { "$($_.File) (cwd $($_.Cwd))" } else { "$($_.File) (no readable cwd)" } })

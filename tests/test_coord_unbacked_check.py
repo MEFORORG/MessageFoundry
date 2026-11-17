@@ -1056,3 +1056,131 @@ def test_a_failed_listing_under_SKIP_REACHABILITY_withholds_counts(
         in (r.stdout)
     )
     assert not re.search(r"^\s+(side|pushed)\s+\d+\s*$", r.stdout, re.MULTILINE), r.stdout
+
+
+@pytest.mark.parametrize("deleted", [True, False], ids=["deleted-on-remote", "still-there"])
+def test_a_tracking_ref_whose_branch_the_remote_DELETED_backs_nothing(
+    repo: Path, origin: Path, deleted: bool
+) -> None:
+    """``deleted-on-remote`` MUST TRIP; ``still-there`` is its must-not-trip twin. origin answers,
+    but ``refs/remotes/origin/side`` is a local copy of a branch origin no longer holds. Trusting
+    every tracking ref of an answering remote cleared work that exists on this disk only."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "pushed, then deleted on the remote", "work")
+    git(repo, "push", "-q", "origin", "side")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "fetch", "-q", "origin")
+    if deleted:
+        git(origin, "branch", "-qD", "side")
+
+    r = check(repo)
+    if deleted:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "no longer advertised by their remote: 1 tracking ref(s)" in r.stdout
+        assert "1 commits on 1 branch exist on no remote" in r.stdout
+    else:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "0 unbacked commits" in r.stdout
+
+
+@pytest.mark.parametrize("orphan", [True, False], ids=["orphan-branch", "branch-off-main"])
+def test_a_squash_verdict_needs_history_shared_with_the_BRANCH_not_head(
+    repo: Path, orphan: bool
+) -> None:
+    """``orphan-branch`` MUST TRIP; ``branch-off-main`` is its must-not-trip twin. Relatedness was
+    judged against HEAD, so an orphan branch whose one commit happens to carry the same diff as a
+    commit on origin/main was compared with it by ``git cherry`` and marked landed."""
+    if orphan:
+        git(repo, "checkout", "-q", "--orphan", "orph")
+        git(repo, "rm", "-rqf", ".")
+        _commit(repo, "g.txt", "same diff", "orphan work")
+        branch = "orph"
+    else:
+        git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "g.txt", "same diff", "work")
+        branch = "side"
+    git(repo, "checkout", "-q", "main")
+    _commit(repo, "g.txt", "same diff", "squashed: work")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+
+    r = check(repo)
+    if orphan:
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "squash/rebase-landed" not in r.stdout
+        assert re.search(rf"^\s+{branch}\s+1\s*$", r.stdout, re.MULTILINE), r.stdout
+    else:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "patch already on origin/main (squash/rebase-landed)" in r.stdout
+
+
+def test_a_tracking_TAG_whose_target_commit_is_missing_does_not_kill_the_scan(
+    repo: Path,
+) -> None:
+    """MUST TRIP, and still measure. Under -SkipReachability every tracking ref excludes, and one
+    naming an annotated tag whose target commit is gone made every rev-list die, so the run read
+    UNVERIFIABLE with nothing measured. The tag backs nothing; ``side`` is named."""
+    git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "g.txt", "this exists on exactly one disk", "work")
+    git(repo, "checkout", "-q", "--detach", "main")
+    _commit(repo, "r.txt", "rescued", "rescued work")
+    target = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "tag", "-a", "-m", "rescue", "rescue-tag", target)
+    tag_oid = git(repo, "rev-parse", "rescue-tag").strip()
+    git(repo, "checkout", "-q", "main")
+    git(repo, "update-ref", "refs/remotes/origin/rescue-tag", tag_oid)
+    git(repo, "tag", "-d", "rescue-tag")
+    obj = repo / ".git" / "objects" / target[:2] / target[2:]
+    os.chmod(obj, stat.S_IWRITE)
+    obj.unlink()
+
+    r = check(repo, extra=["-SkipReachability"])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "git FAILED" not in r.stdout
+    assert "1 commits on 1 branch exist on no remote" in r.stdout
+
+
+def test_a_FAILED_remote_listing_is_unverifiable_never_no_remote(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP. A ``git remote`` that failed listed nothing, and the repository read NO-REMOTE
+    with every commit counted against no exclusion at all."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="remote" exit /b 128\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    env = dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+    r = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(CHECK), "-Path", str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        env=env,
+    )
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "git FAILED for: (remote listing)" in r.stdout
+    assert "NO-REMOTE" not in r.stdout
+    assert "0 of 0 configured" not in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("name", ["wt-é", "wt-e"], ids=["non-ascii", "ascii"])
+def test_a_detached_worktree_at_a_NON_ASCII_path_is_counted(
+    repo: Path, tmp_path: Path, name: str
+) -> None:
+    """``non-ascii`` MUST TRIP; ``ascii`` is its twin. The worktree list was decoded with the
+    console code page, so a path with an accent came back garbled, failed Test-Path and was
+    skipped: its unbacked detached commit was never counted."""
+    git(repo, "checkout", "-q", "--detach", "main")
+    _commit(repo, "d.txt", "detached work", "detached work")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", "main")
+    git(repo, "worktree", "add", "--detach", str(tmp_path / name), sha)
+
+    r = check(repo)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "1 commits on 1 detached worktree exist on no remote" in r.stdout
