@@ -611,9 +611,10 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     helper's name (``getattr(self, '_event')``), and an INSERT statement that is not a call's first
     argument each fail here, because a skipped site is the blind spot this guard exists to close.
 
-    ``shared`` is another module's :func:`_module_strings`: a name this source imports from it by
-    ``from ... import`` reads as its value there (Postgres and SQL Server import ``VIEWED_EVENT``
-    from the SQLite store).
+    ``shared`` is another module's :func:`_module_strings`: a name this source imports by
+    ``from ... import``, unrenamed, reads as its value there (Postgres and SQL Server import
+    ``VIEWED_EVENT`` from the SQLite store). The module the import names is not checked, so a name
+    imported from any other module also reads as ``shared``'s value.
 
     Not read, at least: a helper reached under another name, which the reference check refuses only
     when its name is spelled out whole, as an identifier or a string, an INSERT reached through an

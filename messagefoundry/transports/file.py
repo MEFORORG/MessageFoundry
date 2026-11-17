@@ -1625,8 +1625,10 @@ class FileSource(SourceConnector):
 
     def _remember_stuck(self, key: str, mark: _FileMark, *, lasting: bool) -> bool:
         """Remember the reject at ``key`` as stuck, due its retry after ``STUCK_RETRY_SECONDS`` when
-        ``lasting``, else after ``STUCK_TRANSIENT_RETRY_SECONDS`` (BACKLOG #5717). False when the
-        memory is full, which is logged once until it drains to half (:meth:`_scan_once`)."""
+        ``lasting``, else after ``STUCK_TRANSIENT_RETRY_SECONDS`` (BACKLOG #5717). A key already
+        remembered is remembered anew even when the memory is full. False when the memory is full
+        and does not hold the key, which is logged once until it drains to half
+        (:meth:`_scan_once`)."""
         if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
                 self._stuck_full_logged = True

@@ -5006,10 +5006,12 @@ pass after the scan's other files, a bounded number per scan that the ceiling's 
 count, so a scan can read that many files beyond the ceiling. A due retry settles like a new drop,
 then is read and judged afresh, so one that now passes is ingested. When the move failed for a
 reason that looks lasting, such as access denied, or a copy already sits in the error directory, the
-retry falls due after `STUCK_RETRY_SECONDS`; otherwise after `STUCK_TRANSIENT_RETRY_SECONDS`. A
-retry that reads the file and leaves it in place waits again. At least a failed read, a refused link
+retry falls due after `STUCK_RETRY_SECONDS`; otherwise after `STUCK_TRANSIENT_RETRY_SECONDS`. Some
+retries that read the file and leave it in place wait again: at least a failed read, a refused link
 and a scan hook failure wait the file's back-off again, a reject that stays waits by the rule just
-stated, and a handler failure waits `STUCK_TRANSIENT_RETRY_SECONDS`. A retry that finds the file not
+stated, and a handler failure waits `STUCK_TRANSIENT_RETRY_SECONDS`. Others forget the file, at
+least one that changed during the read and one that passed but could then not be moved or deleted,
+and it is read and charged on later scans like any other file. A retry that finds the file not
 yet settled stays due, and a later scan's retry pass takes it; only when the settle memory is full
 does it wait again. Due retries go
 earliest first, as many per scan as the bound allows.
