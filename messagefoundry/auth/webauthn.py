@@ -167,15 +167,20 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 
 
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
-    """Every exception py_webauthn raises for bad input, which must all reach the audited path.
+    """Exceptions py_webauthn raises for bad input, which must reach the audited path.
+
+    Not every one it raises: at least :func:`_invalid_response_errors` adds ``RecursionError``
+    around both ceremonies' verify calls, and :func:`verify_registration` adds ``AttributeError``
+    around its own (vault BACKLOG #5341).
 
     ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
     out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
     untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
     bare integer a ``TypeError``, and a point that is not on its stated curve a ``ValueError`` from
-    ``cryptography``. Measured at engine ``0076e3cec`` on the pinned ``webauthn==3.0.0`` (BACKLOG
-    #1166). Each is attacker-shaped input, so each must land on the audited invalid-input path ADR
+    ``cryptography``. Measured at engine ``0076e3cec`` on ``webauthn`` 3.0.0 (BACKLOG #1166);
+    ``pyproject.toml`` allows ``webauthn>=3.0.0,<4`` and ``requirements.lock`` pins 3.0.1.
+    Each is attacker-shaped input, so each must land on the audited invalid-input path ADR
     0068 decision 1 requires rather than escape as a 500. Use it only around library calls, never
     around our own logic, where the same exceptions would mean a bug.
 
@@ -605,20 +610,27 @@ def verify_registration(
     _require_webauthn()
     from webauthn import verify_registration_response
 
+    # Resolved before the ``try`` so the AttributeError catch below covers the library call only,
+    # where it is attacker input, and never our own code, where it would be a bug.
+    supported_algs = _supported_pub_key_algs()
     try:
         verified = verify_registration_response(
             credential=response_json,
             expected_challenge=challenge,
             expected_rp_id=rp_id,
             expected_origin=origin,
-            supported_pub_key_algs=_supported_pub_key_algs(),
+            supported_pub_key_algs=supported_algs,
         )
-    except _invalid_response_errors() as exc:
+    except (*_invalid_response_errors(), AttributeError) as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
         # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
-        # #1166): a malformed COSE key raised them straight out of this call.
+        # #1166): a malformed COSE key raised them straight out of this call. AttributeError
+        # joins only here (vault BACKLOG #5341): webauthn 3.0.1's android-safetynet check calls
+        # ``.decode`` on the attestation statement's ``response`` and ``.get`` on the decoded
+        # JWS header and payload with no type check, so a non-bytes ``response``, or a header or
+        # payload decoding to ``null``, a list or a number, raised it straight out of this call.
         raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(

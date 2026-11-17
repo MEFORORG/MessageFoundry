@@ -1870,3 +1870,41 @@ def test_a_deeply_nested_assertion_response_is_the_audited_refusal(
             current_sign_count=0,
         )
     _refused_on_recursion(excinfo, caplog)
+
+
+def _safetynet_jws(header: bytes, payload: bytes) -> bytes:
+    return f"{bytes_to_base64url(header)}.{bytes_to_base64url(payload)}.AA".encode()
+
+
+@pytest.mark.parametrize(
+    "att_stmt",
+    [
+        pytest.param({"ver": "1", "response": "a.b.c"}, id="response-is-text"),
+        pytest.param({"ver": "1", "response": 7}, id="response-is-a-number"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"null", b"{}")}, id="header-null"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"[]", b"{}")}, id="header-list"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"{}", b"null")}, id="payload-null"),
+    ],
+)
+def test_a_malformed_safetynet_statement_is_the_audited_refusal(
+    att_stmt: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #5341. Red: webauthn 3.0.1's android-safetynet check raised AttributeError on
+    these attacker-shaped statements, and it escaped verify_registration as itself."""
+    from webauthn.helpers import encode_cbor, parse_cbor
+
+    challenge = b"c" * 32
+    response = json.loads(SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(challenge))
+    attestation = parse_cbor(base64url_to_bytes(response["response"]["attestationObject"]))
+    attestation["fmt"] = "android-safetynet"
+    attestation["attStmt"] = att_stmt
+    response["response"]["attestationObject"] = bytes_to_base64url(encode_cbor(attestation))
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        wa.verify_registration(
+            response_json=json.dumps(response), challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    assert isinstance(excinfo.value.__cause__, AttributeError), repr(excinfo.value.__cause__)
+    assert any("raw AttributeError" in r.getMessage() for r in caplog.records)
