@@ -510,12 +510,42 @@ async def test_a_reauth_past_the_account_cap_revokes_the_session_on_its_first_fa
     try:
         service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
         await _local_user(store)
+        first_identity, first = await _signed_in(service)
+        assert not (await service.reauth(first_identity, WRONG, token=first)).ok
+        assert service._session_reproof_failures(hash_token(first)) == 1
         identity, token = await _signed_in(service)
-        service._reproof_session_failures["another-session"] = (1, time.monotonic(), "u-bob")
         out = await service.reauth(identity, WRONG, token=token)
         assert out.session_lost, "a session past the cap kept its budget"
-        assert service._session_reproof_failures("another-session") == 1
+        assert service._session_reproof_failures(hash_token(first)) == 1, "a live count went"
         assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
+async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_first_typo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: a session that ends by sign-out never drops its own re-proof count, so at the
+    account's cap the counts of sessions the store no longer lists are dropped before the verify.
+    Otherwise the cap would fill with dead sessions' counts and revoke every new session of the
+    account on its first wrong re-proof."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        ended: list[str] = []
+        for _ in range(2):
+            identity, token = await _signed_in(service)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            await service.logout(token, client=None, proven_at=None)
+            ended.append(hash_token(token))
+        assert all(service._session_reproof_failures(h) == 1 for h in ended)
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert not out.ok and not out.session_lost, "revoked on its first typo"
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        assert all(h not in service._reproof_session_failures for h in ended)
     finally:
         await store.close()
 

@@ -892,9 +892,10 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
 # its entry is younger than the absolute session lifetime, because evicting it would hand that session
 # a fresh budget. One account may hold at most _REPROOF_SESSION_PER_USER entries, so a single account
-# cannot fill the map. When the account is at that cap or the map is full, entries older than that
-# lifetime go first; if there is still no room, a session with no entry yet is revoked on its first
-# failed re-proof instead (fail closed). Before BACKLOG #5336 the per-account cap dropped the
+# cannot fill the map. At that cap a re-proof first drops the counts of the account's sessions the
+# store no longer lists (_drop_ended_reproof_counts). When a new session's first failure finds the
+# account at that cap or the map full, entries older than that lifetime go first; if there is still
+# no room, that session is revoked on that failure instead (fail closed). Before BACKLOG #5336 the per-account cap dropped the
 # account's own oldest LIVE count, so round-robin guesses over more sessions than the cap each got a
 # fresh budget.
 _REPROOF_SESSION_MAX = 4096
@@ -14907,6 +14908,25 @@ class AuthService:
         entry = self._reproof_session_failures.get(token_hash)
         return 0 if entry is None else entry[0]
 
+    async def _drop_ended_reproof_counts(self, user_id: str) -> None:
+        """At the account's cap, drop the re-proof counts of its sessions that have ended (BACKLOG
+        #5336). A session ended by sign-out, revocation, expiry or the per-user session cap never
+        drops its own count, so without this the cap would fill with dead sessions' counts and
+        every new session of a busy account would be revoked on its first failed re-proof.
+
+        Run under the account's re-proof lock (:meth:`_reproof`), which every session rotation of
+        the account also holds, so no entry is re-keyed between the store read and the drop and a
+        live session's count is never dropped. A session the store still lists, idle or not, keeps
+        its count; only one it no longer lists (revoked or past its absolute expiry) loses it. The
+        read is made only at the cap, before the verify, so the charge after the verdict stays
+        synchronous."""
+        failures = self._reproof_session_failures
+        if sum(1 for _, _, uid in failures.values() if uid == user_id) < _REPROOF_SESSION_PER_USER:
+            return
+        live = {s.token_hash for s in await self._store.list_sessions(user_id)}
+        for ended in [h for h, (_, _, uid) in failures.items() if uid == user_id and h not in live]:
+            del failures[ended]
+
     def _charge_reproof_failure(self, token_hash: str, user_id: str) -> int:
         """Charge one failed re-proof to a session; return its total. Synchronous on purpose: it runs
         before any await after the verdict, so a store error later in the attempt cannot leave an
@@ -14983,6 +15003,7 @@ class AuthService:
             # that earlier attempt's, so this one reports the session gone.
             await self._revoke_for_budget(token_hash, time.time())
             return _Reproof(ok=False, session_gone=True, user=user)
+        await self._drop_ended_reproof_counts(user.id)
         verdict: bool | None
         reason: str | None = None
         groups: frozenset[str] = frozenset()
