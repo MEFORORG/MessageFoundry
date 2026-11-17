@@ -375,11 +375,12 @@ have not, the document says nothing about that CVE and your scanner's finding st
   audited by **npm-audit**. **Not in that lock: `@vscode/vsce`, which packages the `.vsix`.** `npm run
   package` fetches it with `npx` at the top-level version its `package` script in `ide/package.json`
   pins; its dependencies are not locked, and the `overrides` in that file do not reach them. So the
-  SBOM does not list vsce or its dependencies, and neither npm-audit nor Dependabot reads them. The
-  reason is [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf): vsce pulls in
-  picomatch, which has no patched release, so vsce in `ide/package-lock.json` would turn npm-audit
-  red. The owner ruled on 2026-11-17 that the change taking vsce out of that lock should merge
-  before the pin. Read 2026-11-17, the tree npx resolves for vsce carries that advisory and
+  SBOM does not list vsce or its dependencies, and neither npm-audit nor Dependabot reads them.
+  [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf) is why vsce is not in
+  `ide/package-lock.json`: vsce pulls in picomatch, which has no patched release, so vsce in that
+  lock would turn npm-audit red. The npx route also runs the fetched packages' install scripts, for
+  example `@vscode/vsce-sign`'s. Read 2026-11-17 with `npm audit` on a lock-only resolve of
+  `@vscode/vsce@4.1.0`, the tree npx resolves for vsce carries that advisory and
   [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) (minimatch); its
   unlocked dependencies can change between runs. The generator itself, and the jscpd clone report
   in `quality-advisory.yml`, install from a separate committed lock,
