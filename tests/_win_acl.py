@@ -19,9 +19,10 @@ _SERVICE_SHORT_NAMES = {"S-1-5-18": "SY", "S-1-5-19": "LS", "S-1-5-20": "NS"}
 
 
 def my_sids(sid: str) -> set[str]:
-    """Every way SDDL may spell the account whose SID is ``sid``: the SID, ``LA`` when it IS the
-    built-in Administrator (RID 500), which the hosted runners run as (CI run 36039014999), or a
-    service account's short name. Each spells that one account and no other."""
+    """The ways SDDL may spell the account whose SID is ``sid``: the SID, ``LA`` for any SID with RID
+    500, which the hosted runners' built-in Administrator has (CI run 36039014999), or a service
+    account's short name. ``LA`` is this machine's built-in Administrator, so for a domain account
+    with RID 500 it names a different account, which a run as that domain account would accept."""
     if sid.endswith("-500"):
         return {sid, "LA"}
     return {sid, _SERVICE_SHORT_NAMES[sid]} if sid in _SERVICE_SHORT_NAMES else {sid}

@@ -616,10 +616,12 @@ def _opens_for_writing(path: Path) -> bool:
     """Whether this process may open ``path`` for writing, asked of ``CreateFileW`` with every
     sharing mode granted, opening only an existing file, so nothing is created or truncated.
 
-    Only an access denial (Win32 error 5) reads as False. Python's own ``open`` reports a sharing
-    violation (error 32, another process holding the file without write sharing) as the same
-    ``PermissionError``, which would read as a denial; any error but 5 is raised instead, since it
-    says nothing about the access list. Windows only."""
+    Only Win32 error 5, access denied, reads as False. That is the access list's refusal for the
+    regular files this fixture hardens, but Windows gives the same error for at least a file with
+    the read-only attribute, one pending deletion and a directory, so error 5 alone does not name
+    the list. Python's own ``open`` reports a sharing violation (error 32, another process holding
+    the file without write sharing) as the same ``PermissionError``, which would read as a denial;
+    any error but 5 is raised instead. Windows only."""
     if sys.platform != "win32":
         raise AssertionError("fixture: _opens_for_writing is Windows only")
     import ctypes

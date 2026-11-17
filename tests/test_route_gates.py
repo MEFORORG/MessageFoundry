@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIWebSocketRoute
 from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
-from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.routing import Host, Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -890,10 +890,6 @@ def _mounts_two_deep(app: FastAPI, directory: str | None) -> None:
     app.mount("/outer", outer)
 
 
-def _frontend_in_a_mount_inside_a_mounted_app(app: FastAPI, directory: str) -> None:
-    _mounts_two_deep(app, directory)
-
-
 def _frontend_under_a_host(app: FastAPI, directory: str | None) -> None:
     inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     inner.add_api_route("/inner", _ok)
@@ -917,7 +913,7 @@ def _frontend_in_an_app_mounted_inside_middleware(app: FastAPI, directory: str |
         _frontend_in_an_include,
         _frontend_in_a_mounted_app,
         # Two mounts deep: a caller that descends into neither must still be refused.
-        _frontend_in_a_mount_inside_a_mounted_app,
+        _mounts_two_deep,
         # A mount whose only content is the group has no routes, so ``_walk`` never descends into
         # it; the refusal must reach it anyway.
         _frontend_alone_in_a_mounted_app,
@@ -960,30 +956,60 @@ def test_a_mount_inside_a_mounted_app_with_no_frontend_group_passes_without_a_de
     app = FastAPI(openapi_url=None)
     _mounts_two_deep(app, None)
     entries = list(route_gates._effective_routes(app))
-    assert [type(served) for _route, served in entries if isinstance(served, Mount)] == [Mount]
+    # The walk yields exactly the app's own entries, whatever FastAPI registers beside them; a walk
+    # that yielded a route from inside a mount would add one.
+    assert [route for route, _served in entries] == list(app.routes)
     assert ("GET", "/outer/inner/deep") in _rows_by_key(app)
+
+
+def _spy_on_the_refusal(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record every app the low-priority refusal reads, as it reads them."""
+    seen: list[Any] = []
+    refuse = route_gates._refuse_low_priority_routes
+
+    def spy(owner: Any, at: str = "") -> None:
+        nested = isinstance(owner, Mount | Host)
+        seen.append(route_gates._app_beneath(owner) if nested else owner)
+        refuse(owner, at)
+
+    monkeypatch.setattr(route_gates, "_refuse_low_priority_routes", spy)
+    return seen
 
 
 @pytest.mark.parametrize(
     "register", [_frontend_under_a_host, _frontend_in_an_app_mounted_inside_middleware]
 )
 def test_a_host_or_a_wrapped_mount_with_no_frontend_group_passes(
-    register: Callable[[FastAPI, str | None], None],
+    register: Callable[[FastAPI, str | None], None], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the Host and middleware shapes: reaching their apps refuses only a
-    low-priority route."""
+    """The control for the Host and middleware shapes: the refusal reaches the app beneath them,
+    and refuses only a low-priority route there."""
     app = FastAPI(openapi_url=None)
     register(app, None)
+    seen = _spy_on_the_refusal(monkeypatch)
     assert list(route_gates._effective_routes(app))
+    reached = [
+        s
+        for s in seen
+        if isinstance(s, FastAPI) and any(getattr(r, "path", None) == "/inner" for r in s.routes)
+    ]
+    assert reached, seen
     route_gates.route_rows(app)
+
+
+def _frontend_in_a_root_mount(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.mount("/", inner)
 
 
 @pytest.mark.parametrize(
     ("register", "where"),
     [
-        (_frontend_in_a_mount_inside_a_mounted_app, "'/outer/inner'"),
+        (_mounts_two_deep, "'/outer/inner'"),
         (_frontend_under_a_host, "'[host api.example.test]'"),
         (_frontend_in_an_app_mounted_inside_middleware, "'/wrapped'"),
+        (_frontend_in_a_root_mount, "'/'"),
     ],
 )
 def test_the_refusal_names_where_the_nested_group_sits(
@@ -994,6 +1020,31 @@ def test_the_refusal_names_where_the_nested_group_sits(
     with pytest.raises(ValueError, match="low-priority route") as caught:
         list(route_gates._effective_routes(app))
     assert f"FastAPI under {where} holds" in str(caught.value)
+
+
+def test_a_mount_walked_on_its_own_is_named_from_its_own_path(tmp_path: Path) -> None:
+    """``_walk`` hands ``_effective_routes`` a Mount; a group beneath it is named from that mount's
+    path, as it is when the walk starts from the app."""
+    app = FastAPI(openapi_url=None)
+    _mounts_two_deep(app, str(tmp_path))
+    (mount,) = [r for r in app.routes if isinstance(r, Mount)]
+    with pytest.raises(ValueError, match="FastAPI under '/outer/inner' holds"):
+        list(route_gates._effective_routes(mount))
+
+
+class _EndlessWrapper:
+    """An object that answers ``.app`` with a new wrapper on every read, as a ``Mock`` does."""
+
+    @property
+    def app(self) -> _EndlessWrapper:
+        return _EndlessWrapper()
+
+
+def test_a_mount_wrapped_without_end_is_refused_rather_than_unwrapped_forever() -> None:
+    app = FastAPI(openapi_url=None)
+    app.mount("/stub", _EndlessWrapper())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="more than 64 middleware layers"):
+        list(route_gates._effective_routes(app))
 
 
 def test_a_mount_cycle_is_refused_rather_than_walked() -> None:

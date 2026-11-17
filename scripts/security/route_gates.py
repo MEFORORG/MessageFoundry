@@ -540,11 +540,19 @@ def _app_beneath(route: Mount | Host) -> Any:
     That is a ``Mount``'s app beneath any middleware the mount wraps around it, or a ``Host``'s app,
     then unwrapped through each ASGI middleware layer that keeps the next app as ``.app``, down to
     the first Starlette app or router (vault BACKLOG #3177). A layer that keeps the next app under
-    any other name ends the unwrapping there, so the refusal does not reach past it."""
+    any other name ends the unwrapping there, so the refusal does not reach past it. More than
+    :data:`_MAX_MIDDLEWARE_LAYERS` layers raise ``ValueError`` rather than unwrap forever, as an
+    object that makes a new ``.app`` on every read would."""
     app: Any = _mounted_app(route) if isinstance(route, Mount) else route.app
-    seen: set[int] = set()
+    # Each layer is held, not only its id, so a freed layer's id cannot come back as a new one's.
+    seen: dict[int, Any] = {}
     while not isinstance(app, Starlette | Router) and id(app) not in seen:
-        seen.add(id(app))
+        if len(seen) >= _MAX_MIDDLEWARE_LAYERS:
+            raise ValueError(
+                f"the app under {_place(route)!r} is wrapped in more than "
+                f"{_MAX_MIDDLEWARE_LAYERS} middleware layers, so the route walk cannot reach it"
+            )
+        seen[id(app)] = app
         inner = getattr(app, "app", None)
         if inner is None:
             break
@@ -552,9 +560,14 @@ def _app_beneath(route: Mount | Host) -> Any:
     return app
 
 
+#: How many ``.app`` middleware layers :func:`_app_beneath` unwraps before it refuses.
+_MAX_MIDDLEWARE_LAYERS = 64
+
+
 def _place(route: Mount | Host) -> str:
-    """How a refusal names where ``route`` sits beneath its parent."""
-    return route.path if isinstance(route, Mount) else f"[host {route.host}]"
+    """How a refusal names where ``route`` sits beneath its parent. Starlette strips a mount at
+    ``/`` to an empty path, so that one is named ``/``."""
+    return (route.path or "/") if isinstance(route, Mount) else f"[host {route.host}]"
 
 
 def _refuse_low_priority_routes(owner: Starlette | Router | Mount | Host, at: str = "") -> None:
@@ -563,8 +576,7 @@ def _refuse_low_priority_routes(owner: Starlette | Router | Mount | Host, at: st
     ``APIRouter.frontend`` registers such a group, and an included router's group comes along with
     it. ``iter_route_contexts`` never yields one, so the walk would serve it unseen (vault BACKLOG
     #3055). None is registered today; teach the walk to read one before registering it. ``at`` is
-    where ``owner`` sits beneath the walked app, for the message; a ``Mount`` or ``Host`` walked on
-    its own is named by its own path or host."""
+    where ``owner`` sits beneath the walked app, for the message."""
     source = _app_beneath(owner) if isinstance(owner, Mount | Host) else owner
     router = source.router if isinstance(source, FastAPI) else source
     if not isinstance(router, APIRouter):
@@ -572,8 +584,7 @@ def _refuse_low_priority_routes(owner: Starlette | Router | Mount | Host, at: st
     hidden = list(fastapi_symbol(router, "_iter_low_priority_routes")())
     if hidden:
         kinds = sorted({type(getattr(r, "original_route", r)).__name__ for r in hidden})
-        where = at or (_place(owner) if isinstance(owner, Mount | Host) else "")
-        named = f"{type(source).__name__} under {where!r}" if where else type(source).__name__
+        named = f"{type(source).__name__} under {at!r}" if at else type(source).__name__
         raise ValueError(
             f"{named} holds {len(hidden)} low-priority route(s) of type {kinds}, "
             "such as a frontend group. The route walk does not visit them, so it would under-report "
@@ -608,7 +619,12 @@ def _effective_routes(
 
     A subtree is walked once for each mount above it, so a caller that descends walks a chain of
     mounts in time that grows with the square of its depth. That is kept: a served app nests a
-    handful of mounts at most, and one walk per level keeps the refusal free of shared state."""
+    handful of mounts at most, and one walk per level keeps the refusal free of shared state.
+
+    ``_at`` is where ``owner`` sits beneath the app the walk started from; a ``Mount`` or ``Host``
+    walked from the top is placed by its own path or host."""
+    if not _at and isinstance(owner, Mount | Host):
+        _at = _place(owner)
     _refuse_low_priority_routes(owner, _at)
     routes: Sequence[BaseRoute] = (
         getattr(_app_beneath(owner), "routes", [])
