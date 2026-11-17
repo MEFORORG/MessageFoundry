@@ -137,6 +137,15 @@ class RowSealError(Exception):
         return f"a stored {self.kind} row failed its integrity check and was refused; nothing was written"
 
 
+class RevokedRowSealError(RowSealError):
+    """A session revoke committed, and the row it ended then did not parse when read back
+    (BACKLOG #5505). The revoke is not rolled back for it: the row is ended either way, and only
+    the read-back is refused. ``args`` are as for :class:`RowSealError`."""
+
+    def __str__(self) -> str:
+        return f"a stored {self.kind} row failed its integrity check after it was revoked"
+
+
 class RowSealUnverifiableError(Exception):
     """A store write helper read a row whose seal Vault transit would not check, and refused the
     write (ADR 0217 (c) step 1).

@@ -37,6 +37,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
+    RevokedRowSealError,
     RowSealer,
     RowSealError,
     TransitSealUnverifiableError,
@@ -577,5 +578,34 @@ async def test_a_recovery_code_cell_that_does_not_parse_is_charged_as_a_wrong_co
             assert not (await service.verify_mfa(out.token, wrong)).ok
         locked = await store.get_user(identity.user_id)
         assert locked is not None and locked.second_step_locked_until is not None
+    finally:
+        await store.close()
+
+
+async def test_a_supersession_that_reads_back_an_unparseable_row_keeps_its_revoke(
+    tmp_path: Path,
+) -> None:
+    """Finding 7 of round 8b6500f2 on PR 3007: the read-back refuses the row, but the revoke it
+    follows commits, and the service reports the ended row."""
+    path = tmp_path / "supersede.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-sup")
+        bad = await _session(store, "u-sup")
+        other = await _session(store, "u-sup")
+        _raw(path, "UPDATE sessions SET user_epoch=? WHERE token_hash=?", ("x", bad))
+        with pytest.raises(RevokedRowSealError) as caught:
+            await store.supersede_session(bad, now=time.time())
+        assert caught.value.args == (SESSION_KIND, bad[:12])
+        assert _revoked(path, bad)
+        assert not _revoked(path, other)
+        alerts: list[str] = []
+        service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
+        _raw(path, "UPDATE sessions SET user_epoch=? WHERE token_hash=?", ("x", other))
+        with pytest.raises(RevokedRowSealError):
+            await service._supersede_session(other, now=time.time())
+        assert _revoked(path, other)
+        assert len(alerts) == 1 and other[:12] in alerts[0]
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
     finally:
         await store.close()

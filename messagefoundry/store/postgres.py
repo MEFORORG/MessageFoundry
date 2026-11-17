@@ -203,6 +203,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealError,
     SealPager,
     classify_unrotated,
@@ -11666,9 +11667,15 @@ class PostgresStore:
                 found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, since)
                 return None if found is None else str(found)
 
-            return await revoke_through_lineage(
-                token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-            )
+            try:
+                return await revoke_through_lineage(
+                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                )
+            except RowSealError as exc:
+                # BACKLOG #5505: only the read-back refused the row, so the block exits cleanly
+                # and its revoke commits before the refusal is raised.
+                refused = exc
+        raise RevokedRowSealError(refused.kind, refused.subject)
 
     async def revoke_user_sessions(
         self,

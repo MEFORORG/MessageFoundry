@@ -3537,6 +3537,10 @@ class AuthStore(Protocol):
         ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
+
+        A row the revoke ended that does not parse when read back raises
+        :class:`~messagefoundry.store.row_seal.RevokedRowSealError` once the revoke has committed
+        (BACKLOG #5505).
         """
         ...
 

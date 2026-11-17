@@ -195,6 +195,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     ResealOutcome,
+    RevokedRowSealError,
     RowSealError,
     SealPager,
     classify_unrotated,
@@ -16992,14 +16993,24 @@ class SqlServerStore:
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 
+            refused: RowSealError | None = None
             try:
-                ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
-                )
+                try:
+                    ended = await revoke_through_lineage(
+                        token_hash,
+                        lineage_since=lineage_since,
+                        revoke=_revoke,
+                        successor=_successor,
+                    )
+                except RowSealError as exc:
+                    # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
+                    refused, ended = exc, None
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        if refused is not None:
+            raise RevokedRowSealError(refused.kind, refused.subject)
         return ended
 
     async def revoke_user_sessions(
