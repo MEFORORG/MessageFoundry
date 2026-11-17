@@ -2348,7 +2348,8 @@ issuer. The engine applies a replaced file only when all three of these hold:
    the marker text out of the comment. The file carries no certificate the hop does not already
    trust. For `[api].tls_client_crl_file`, each CA the hop loaded from `[api].tls_client_ca_file`
    has a CRL of its own in it, as that setting's row says (vault BACKLOG #5627); a file that fails
-   this is refused as `fix_file`.
+   this is refused as `fix_file`. For an inbound connection's `tls_crl_file`, see the
+   [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md.
 2. Each CRL's signature verifies against a CA certificate in the hop's own trust store. OpenSSL checks
    that signature only during a handshake, so without this rule a badly signed CRL would be applied
    and then fail every handshake it judges. The reload cannot see an intermediate CA that the peer
@@ -2473,15 +2474,20 @@ these cases after that WARNING (the paragraph after this list says which). At le
 
 **`[api].tls_client_crl_file` refuses more at start (vault BACKLOG #5627).** That hop checks the
 whole client chain, so each CA loaded from `[api].tls_client_ca_file` needs a CRL of its own in
-the file; that setting's row says what counts. So on that hop at least the second bullet's case
-refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
+the file; that setting's row says what counts. An inbound listener's `tls_crl_file` checks the
+whole chain too, as the [MLLP `tls_crl_file` row](CONNECTIONS.md#mllp--mllp) in CONNECTIONS.md says. So on each of
+those hops at least the second bullet's case refuses the start, and so does the third bullet's where the CRL names no key of that CA, a genuine
 SHA-1 CRL with no key identifier among them. The SHA-1 trade-off above does not arise there for
 such a CRL, since it never loads. A CRL of the first bullet's kind can refuse too, at least where
 its issuer differs from a loaded CA's name only in white space and that CA did not sign it. Every
-other hop loads all three cases with the WARNING.
+other hop, at least each outbound hop, loads all three cases with the WARNING.
 
 If the check itself fails, the engine logs an ERROR that says so. It loads the file unless a CRL
-it judged before the failure is proved badly signed, which refuses the file. Where it loads, the
+it judged before the failure is proved badly signed, which refuses the file. On a hop that checks
+the whole chain, at least `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, the
+rule that each loaded CA has a CRL of its own is applied too. Where that rule refuses the file, the
+start refuses with its reason, unless a CRL already judged is proved badly signed, and the ERROR is
+not logged. Where it loads, the
 CRLs it judged and could not confirm are reported in the WARNING too, which names the first three
 and counts the rest; one it verified is not reported. The CRLs after
 the failure are not judged, so a bad one there loads (vault BACKLOG #3506).
@@ -2540,7 +2546,14 @@ lapse before the new CRL takes effect. Waiting then leaves a gap in which its pe
 the engine says to fix the file with a CRL that is in effect now. A start and a reload both allow
 five minutes of clock skew, so a CRL from a CA whose clock runs a little ahead still counts as in
 effect. At a start, such a CRL refuses every peer it judges until its `thisUpdate` passes, and the
-engine logs a WARNING that says so.
+engine logs a WARNING that says so. A reload applies it too. On a hop that checks CRL time,
+OpenSSL allows no skew, so a revocation only that CRL lists is not enforced until its `thisUpdate`
+passes, and where the hop holds no CRL in effect from that issuer, the hop refuses every peer that
+CRL judges until then, as at a start. The reload's applied line is then a WARNING that says so and
+names the time (vault BACKLOG #5507). It says the same of any CRL in the applied file that is not
+in effect yet, such as a successor kept beside the CRL the hop holds. A hop that sets
+`tls_allow_expired` skips the CRL time check, so there the newer CRL is used at once and the
+reload logs no such WARNING for it.
 
 A reload changes what the next full TLS handshake checks. An established connection is not checked
 again, nor is a session resumed from an earlier handshake. So a newly revoked partner that stays

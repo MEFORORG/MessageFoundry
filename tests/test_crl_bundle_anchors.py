@@ -365,5 +365,5 @@ def test_the_inbound_revocation_refusal_asks_for_a_crl_not_a_ca() -> None:
     with pytest.raises(WiringError) as err:
         check_inbound_revocation(source, "adt-in", posture=HopPosture(enforcing=True))
     text = str(err.value)
-    assert "tls_crl_file (a PEM file holding the CA's CRL)" in text
+    assert "tls_crl_file (a PEM file holding a CRL from each CA in the client chain)" in text
     assert "the CA and its CRL" not in text
