@@ -390,7 +390,16 @@ def test_no_go_when_candidate_drain_times_out_despite_empty_outbound() -> None:
     assert row.delivered_offered_ok  # delivered/offered == 1.0 — would NOT have caught the strand
     assert not row.in_pipeline_ok
     assert row.verdict == FUSE_NO_GO
-    assert "did not fully drain" in row.reason and "await_drain timed out" in row.reason
+    assert "did not fully drain" in row.reason
+    # The record's backlog is the whole pipeline (BACKLOG #5435), so a final read of 0 is no stall
+    # reading, and the reason does not assert one (BACKLOG #5574); a backlog above 0 does.
+    assert "await_drain timed out" not in row.reason
+    stalled = _trials(False, [100.0, 101.0, 99.0], drain_seconds=1.0) + _trials(
+        True, [130.0, 131.0, 129.0], drain_seconds=None, backlog=3
+    )
+    cmp = build_batch_comparison(stalled, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO and "await_drain timed out" in cmp.rows[0].reason
 
 
 def test_no_go_when_delivered_offered_below_floor() -> None:

@@ -234,6 +234,21 @@ def test_go_when_b1_lift_ge_10pct_and_gt_2sigma() -> None:
     assert cmp.ok  # correctness gate (zero-loss held, present)
 
 
+def test_a_b0_trial_that_failed_zero_loss_is_no_reference_for_a_go() -> None:
+    # BACKLOG #5574 item 5: the monotone baseline rule. A B0 trial that failed zero-loss with no
+    # drain time passed B1's drain guard (B0 "never drained") and its rate still fed the lift, so
+    # the same B1 as the GO above read GO. Its B0 is no sound reference, so it cannot be a GO.
+    failed = _rec(fuse=False, read=99.0, no_loss_ok=False, sink_received=900, drain_seconds=None)
+    recs = _trials(False, [100.0, 101.0]) + [failed] + _trials(True, [120.0, 121.0, 119.0])
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.verdict == FUSE_INCONCLUSIVE, row.reason
+    assert "B0 did not hold zero-loss in every trial" in row.reason
+    # The correctness gate reads the candidate alone; B0's loss fails the zero-loss SLO instead.
+    assert row.ok and cmp.overall_verdict == FUSE_INCONCLUSIVE
+
+
 def test_no_go_when_lift_below_threshold() -> None:
     # B1 only ~2% faster ⇒ below the 10% bar ⇒ NO-GO (fusion banked no worthwhile margin).
     recs = _trials(False, [100.0, 101.0, 99.0]) + _trials(True, [102.0, 103.0, 101.0])
@@ -303,13 +318,15 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert "breached" in cmp.rows[0].reason
     # An INCONCLUSIVE arm that also never drained is a definite NO-GO on the drain guard, which
     # the INCONCLUSIVE label must not pre-empt.
-    undrained = [replace(r, drain_seconds=None) for r in unsure]
+    undrained = [
+        replace(r, drain_seconds=None, no_loss=replace(r.no_loss, backlog=5)) for r in unsure
+    ]
     cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + undrained, (False, True))
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO
     assert "did not fully drain" in cmp.rows[0].reason
-    # These trials sent traffic, so a None drain is a real await_drain timeout and keeps its
-    # specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
+    # These trials sent traffic and read rows left, so a None drain is a real await_drain timeout
+    # and keeps its specific reason, which the INCONCLUSIVE reconcile used to make unreachable.
     assert "await_drain timed out" in cmp.rows[0].reason
     assert "rows stranded" in cmp.rows[0].reason and "never ran" not in cmp.rows[0].reason
     # A failed cell (batchbox `_failed_cell_record`: a placeholder sent of 0) carries the same None
@@ -324,7 +341,7 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
     assert "did not fully drain" in cmp.rows[0].reason
-    assert "3 B1 trial(s) recorded no traffic and no drain time" in cmp.rows[0].reason
+    assert "3 B1 trial(s) have no drain time and read no rows left" in cmp.rows[0].reason
     assert "whether rows were stranded is not asserted" in cmp.rows[0].reason
     assert "rows stranded" not in cmp.rows[0].reason
     assert "await_drain timed out" not in cmp.rows[0].reason
@@ -334,7 +351,16 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     )
     assert cmp is not None
     assert "rows stranded" in cmp.rows[0].reason
-    assert "1 B1 trial(s) recorded no traffic" in cmp.rows[0].reason
+    assert "1 B1 trial(s) have no drain time and read no rows left" in cmp.rows[0].reason
+    # A band that could not read /stats times out with traffic and the -1 backlog stand-in, and a
+    # timeout can end on a backlog read at 0: neither is asserted to have stranded rows (#5574).
+    for backlog in (-1, 0):
+        blind = [replace(r, no_loss=replace(r.no_loss, backlog=backlog)) for r in undrained]
+        cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + blind, (False, True))
+        assert cmp is not None
+        assert cmp.rows[0].verdict == FUSE_NO_GO and not cmp.ok
+        assert "3 B1 trial(s) have no drain time and read no rows left" in cmp.rows[0].reason
+        assert "rows stranded" not in cmp.rows[0].reason
     # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
     flat = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))
@@ -402,7 +428,16 @@ def test_no_go_when_candidate_drain_times_out_despite_empty_outbound() -> None:
     )  # delivered/offered == 1.0 — it would NOT have caught the strand
     assert not row.in_pipeline_ok
     assert row.verdict == FUSE_NO_GO
-    assert "did not fully drain" in row.reason and "await_drain timed out" in row.reason
+    assert "did not fully drain" in row.reason
+    # The record's backlog is the whole pipeline (BACKLOG #5435), so a final read of 0 is no stall
+    # reading, and the reason does not assert one (BACKLOG #5574); a backlog above 0 does.
+    assert "await_drain timed out" not in row.reason
+    stalled = _trials(False, [100.0, 101.0, 99.0], drain_seconds=1.0) + _trials(
+        True, [130.0, 131.0, 129.0], drain_seconds=None, backlog=3
+    )
+    cmp = build_fuse_comparison(stalled, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO and "await_drain timed out" in cmp.rows[0].reason
 
 
 def test_single_timed_out_trial_poisons_candidate_drain_worst() -> None:
