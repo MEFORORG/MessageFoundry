@@ -409,13 +409,13 @@ class UnrolledStoreKeyRefused(RuntimeError):
 
 #: The refusal :func:`refuse_unrolled_key_change` raises, and the WARNING it logs under the override.
 _UNROLLED_REFUSAL = (
-    "the store key in use is not confirmed by its stamp, the audit chain has not been rolled to "
-    "it, and the key the chain's current range is under is not configured. This start's "
+    "the store key in use is not confirmed by its stamp, the audit chain's current range is not "
+    "under it, and the key that range is under is not configured. This start's "
     "first audit row would go into that range under another key, and the chain would break there, "
     "so no later `messagefoundry rotate-key` could roll it. Put the key that range is under back in "
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED (it can be older than the last key, where an earlier key "
-    "change was never rolled; the store open's ERROR names the range's first row), keep the new key "
-    "active, and run `messagefoundry rotate-key` until it exits 0, then start. Only where that key "
+    "change was never rolled; the store open's ERROR names the range's first row) and run "
+    "`messagefoundry rotate-key` before you start. Only where that key "
     "is truly lost, set "
     "[secret_rotation].allow_lost_audit_range_key = true to start anyway: that is a security "
     "loosening, and the chain breaks at this start's first audit row."
