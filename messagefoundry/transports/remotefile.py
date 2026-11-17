@@ -3221,8 +3221,8 @@ class RemoteFileSource(SourceConnector):
         0206 rule 5): a batch file, with or without an ``FHS``/``BHS`` envelope, becomes one hand-off
         and one disposition per message, in file order. The listener refuses a body holding a second
         ``MSH``, so a whole batch handed over unsplit would be one ``ERROR``. An undecodable file is
-        handed over as its original bytes, and so is a single-message file, less the bytes of any
-        trailer lines that end it, unless a byte order mark or an ``FHS``/``BHS`` header the parser
+        handed over as its original bytes, and so is a single-message file, less any trailer lines
+        that end it, unless a byte order mark or an ``FHS``/``BHS`` header the parser
         refuses leads it (:func:`split_batch_bytes`). Any
         other content type is handed over verbatim, never decoded.
 

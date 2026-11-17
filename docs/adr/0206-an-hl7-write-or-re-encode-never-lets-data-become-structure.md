@@ -282,8 +282,10 @@ open points settled below.
   bare `FHS`, `BTS^1` under `|`, and a line a space or a byte order mark leads all stay, and an
   empty line ends the run. The first chunk is read as before, so a `BTS` line before the first
   `MSH` is still kept as a message for the parser. A whole-file source that handed a file over as
-  its bytes still does, less the bytes of the trailer lines the split drops from the message it
-  reads there, cut at the line break before them, so its line ends and leading whitespace stay.
+  its bytes still does, less the trailer lines the split drops from the message it reads there.
+  Under a charset that writes ASCII as itself, such as UTF-8 or a single-byte one, they are cut
+  from the bytes at the line break before them, so its line ends and leading whitespace stay.
+  Under any other charset, such as UTF-16, the text before them is re-encoded instead.
   `tests/test_msh_boundary_parity.py` holds `split_batch` to a copy of it as it stood before, and
   `split_batch_bytes` to a copy of its own, each less the trailer lines.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
@@ -482,7 +484,7 @@ into one MLLP frame or one HTTP request is told so, with an `AR` where it can be
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
 sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
-longer an `ERROR`. An `MSH`-led message no longer carries the trailer lines of its batch
+longer an `ERROR`. An `MSH`-led message no longer carries the trailer lines that end it
 to the Handler.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and

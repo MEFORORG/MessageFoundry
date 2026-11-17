@@ -16,9 +16,10 @@ reused by the dry-run / Test Bench:
   order message out into per-order messages.
 
 :func:`split_by_obr` reads the message's **own** separators (MSH-1/MSH-2) and goes through the
-:class:`Message` primitive. :func:`split_batch` cuts the received text into whole lines with no
-parse: at ``MSH`` boundaries, past leading header lines, and before the trailer lines that end a
-message, whose test reads that message's MSH-1.
+:class:`Message` primitive. :func:`split_batch` cuts the received text, its line ends made CR,
+with no parse: at ``MSH`` boundaries and past the byte order marks that lead a later ``MSH``,
+past leading header lines, and before the trailer lines that end a message, whose test reads that
+message's MSH-1.
 """
 
 from __future__ import annotations
@@ -176,8 +177,9 @@ def split_batch(raw: str | bytes) -> list[str]:
     framing has no per-message meaning. So is the run of envelope trailer lines that ends an
     ``MSH``-led message (:func:`_trailer_start`, BACKLOG #5806): each line of it starts with
     ``BTS``, ``FTS``, ``BHS`` or ``FHS`` and then that message's own field separator (MSH-1),
-    when that is ASCII, so a batch's trailer, or the next batch's header, does not reach the pipeline as a segment. Every
-    other line is kept, and every other cut is the one the split made before that change.
+    when that is ASCII. The run must end the message, past one final CR, so a trailer that an
+    empty or whitespace line follows is kept. Every other line is kept, and every other cut is the
+    one the split made before that change.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
     whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
@@ -299,9 +301,9 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
 
     ``raw`` itself, byte for byte, when the parser reads ``text`` as it is: ``text`` starts with
     ``MSH`` after whitespace, or the split found no ``MSH``-led message in it either. From the
-    first of those the trailer lines the split dropped are cut, at the line break before them, and
-    every other byte is kept, line ends and leading whitespace included (BACKLOG #5806,
-    :func:`_less_the_trailer_lines`). Otherwise the split read the message past leading noise the
+    first of those the trailer lines the split dropped are cut (BACKLOG #5806), as
+    :func:`_less_the_trailer_lines` says: under an encoding that writes ASCII as itself, at the
+    line break before them, keeping every other byte. Otherwise the split read the message past leading noise the
     parser refuses, a byte order mark or an ``FHS``/``BHS`` envelope header, so ``message`` is
     handed over re-encoded, as each member of a batch is. Without this, one such message was an
     ``ERROR`` where the same message in a batch of two was recorded."""

@@ -27,9 +27,10 @@ message's own MSH-1) that followed it. The split's copy is left as it stood, so 
 for every other cut: the live split must give the copy's messages less those trailer lines, and
 nothing else (:func:`_less_the_trailer`). The byte scan and its copy are unchanged. The whole-file
 split is held to a copy of origin/main's, on that scan: each message it re-encodes must come back
-less the same lines, and a file it hands over as its bytes must come back as those bytes less the
-bytes of the same trailer lines, its line ends and leading whitespace kept
-(:func:`_old_bytes_less_the_trailer`). The corpus gained trailer tokens and the shapes a review of
+less the same lines, and a file it hands over as its bytes must come back as its decoded text less
+the same trailer lines, line ends and leading whitespace kept, re-encoded
+(:func:`_old_bytes_less_the_trailer`). Every codec the corpus uses writes that text back as the
+file's own bytes, so a codec that does not is not tested here. The corpus gained trailer tokens and the shapes a review of
 that change named.
 """
 
@@ -176,9 +177,9 @@ _AFTER_A_LINE_BREAK = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
 
 
 def _old_bytes_less_the_trailer(raw: bytes, encoding: str) -> bytes:
-    """BACKLOG #5806, over a file the copy hands over as its bytes: those bytes less the file's own
-    last lines, as many as :func:`_less_the_trailer` drops from the copy's one message, so every
-    other byte, line ends and leading whitespace included, stays."""
+    """BACKLOG #5806, over a file the copy hands over as its bytes: its decoded text less its own
+    last lines, as many as :func:`_less_the_trailer` drops from the copy's one message, re-encoded
+    with ``encoding``. Line ends and leading whitespace stay in the text."""
     try:
         text = raw.decode(encoding)
     except (UnicodeError, LookupError):
