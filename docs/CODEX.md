@@ -93,9 +93,9 @@ after it, on new lines:
 if (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }
 ```
 
-The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`. Shapes
-that end on an error, or with a stale exit code, are decided by the tail and are
-not listed here. A hook that opens with `[CmdletBinding()]` does not receive the
+The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`. A hook whose last
+statement fails while `$LASTEXITCODE` is 2, including a 2 left by an earlier
+native command, blocks. A hook that opens with `[CmdletBinding()]` does not receive the
 payload through `$input`.
 
 Which PowerShell hook shapes block is recorded by the tests in tests/test_codex_bridge.py; read them rather than this page.
