@@ -2896,7 +2896,7 @@ def _redacted_copy(
 
 def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
-    with no SQLSTATE is named by its type alone, unless it is a ``DeliveryError`` (a
+    with no SQLSTATE is named by its type alone, unless it is one of :data:`_ENGINE_FIXED_TEXT` (a
     ``NegativeAckError`` included), the missing-extra error, an ``ImportError`` or a
     ``UnicodeError`` (BACKLOG #5348).
 
@@ -2917,7 +2917,7 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
-        if isinstance(exc, (DeliveryError, _DriverMissingError, ImportError, UnicodeError)):
+        if isinstance(exc, (*_ENGINE_FIXED_TEXT, _DriverMissingError, ImportError, UnicodeError)):
             return _safe_db_error(exc)
         if not exc.args:
             return type(exc).__name__
@@ -3023,6 +3023,17 @@ class AutocommitNotConfirmed(RuntimeError):
     on it until a later borrow has set the mode. A setter that raises a driver error raises that
     error instead, and its connection goes back unconfirmed the same way. The text names neither
     the DSN nor the server."""
+
+
+#: Errors the engine raises with fixed text and no driver message, so a credential-free renderer
+#: may print it, remedy included (BACKLOG #5348): every ``DeliveryError`` and ``NegativeAckError``
+#: this module builds (:func:`_credential_free_cause` states the bound), and the two borrow
+#: refusals, whose texts are literals naming neither the DSN nor the server.
+_ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
+    DeliveryError,
+    AutocommitNotConfirmed,
+    UngatedConnectionError,
+)
 
 
 def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
@@ -4092,7 +4103,7 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
             # Type alone, never the text: a connect error can carry DSN attributes (#5348).
-            raise DeliveryError(f"DATABASE connect failed: {_credential_free_detail(exc)}") from exc
+            raise DeliveryError(f"DATABASE connect failed: {_credential_free_cause(exc)}") from exc
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
@@ -4157,7 +4168,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {_credential_free_detail(exc)}")
+            else DeliveryError(f"DATABASE probe failed: {_credential_free_cause(exc)}")
         ) from exc
     finally:
         await _close_and_release(pool, conn, cur, discard=discard)
@@ -5477,13 +5488,14 @@ def _probe_failure_cause(exc: Exception) -> str:
 
 
 def _credential_free_cause(exc: BaseException) -> str:
-    """A ``DeliveryError``'s own text, else :func:`_credential_free_detail` (BACKLOG #5348).
+    """The text of an error in :data:`_ENGINE_FIXED_TEXT`, else :func:`_credential_free_detail`
+    (BACKLOG #5348).
 
     Every ``DeliveryError`` and ``NegativeAckError`` this module builds holds fixed text, a
     SQLSTATE and native number, a type name or a setting, never a driver message: at least
-    :func:`_connect` and :func:`_probe_db` put :func:`_credential_free_detail` in theirs. One
+    :func:`_connect` and :func:`_probe_db` build theirs with this function. One
     another module raises is printed as it stands, a bound and not a guarantee."""
-    return str(exc) if isinstance(exc, DeliveryError) else _credential_free_detail(exc)
+    return str(exc) if isinstance(exc, _ENGINE_FIXED_TEXT) else _credential_free_detail(exc)
 
 
 def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:

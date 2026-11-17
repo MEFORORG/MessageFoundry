@@ -30,6 +30,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
+from messagefoundry.odbc_call_gate import UngatedConnectionError
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
@@ -1829,7 +1830,7 @@ async def test_source_poll_failure_keeps_the_engines_own_text(
 ) -> None:
     """#5348, Manager ruling: the engine's own ``DeliveryError`` and ``NegativeAckError`` hold no
     driver text, so the poll log keeps their remedy. Red mutation: drop ``DeliveryError`` from
-    ``_poll_log_line``'s exemption. Both red."""
+    ``_ENGINE_FIXED_TEXT``. Both red."""
     exc: Exception = (
         DeliveryError(text)
         if "acquire" in text
@@ -1838,6 +1839,51 @@ async def test_source_poll_failure_keeps_the_engines_own_text(
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), exc)
     assert f"RedactedDbError: {type(exc).__name__}: {text}" in caplog.text
+
+
+_BORROW_REFUSALS = [
+    pytest.param(
+        database_module.AutocommitNotConfirmed(
+            "DATABASE: a pooled connection did not keep autocommit mode after it was set; "
+            "refusing to run a statement on it"
+        ),
+        "did not keep autocommit mode",
+        id="autocommit",
+    ),
+    pytest.param(
+        UngatedConnectionError(
+            "odbc: aioodbc Connection cannot be wrapped by the call gate; refusing the connection"
+        ),
+        "cannot be wrapped by the call gate",
+        id="ungated",
+    ),
+]
+
+
+@pytest.mark.parametrize(("exc", "remedy"), _BORROW_REFUSALS)
+async def test_the_engines_borrow_refusals_keep_their_text(
+    caplog: pytest.LogCaptureFixture, exc: Exception, remedy: str
+) -> None:
+    """#5348, Manager ruling: ``AutocommitNotConfirmed`` and ``UngatedConnectionError`` are the
+    engine's fixed text, so the poll log, the mark-failure log and the connect error keep it, as
+    they keep a ``NegativeAckError``'s. Red mutation: drop the class from ``_ENGINE_FIXED_TEXT``.
+    Every stage reds."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=exc,
+        )
+    assert f"RedactedDbError: {type(exc).__name__}: " in caplog.text
+    assert f"a duplicate): {exc}" in caplog.text
+    dest = _dest()
+    dest._pool = _RefusingPool(exc)
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert remedy in str(failed.value)
 
 
 @pytest.mark.parametrize(
