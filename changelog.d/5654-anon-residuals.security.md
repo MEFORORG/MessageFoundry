@@ -5,7 +5,7 @@
   default-ignorable character outside Unicode Cc and Cf no longer hides an `MR` or a site code,
   and the MRN-typed and site-code checks read a fullwidth digit or letter folded. The IPv6 check
   finds more addresses followed by dotted groups, or joined by a dot to an allowed one;
-  docs/PHI.md section 9 says what it still misses. A report no longer calls the denylist live
+  docs/PHI.md section 9 names forms it still misses. A report no longer calls the denylist live
   when the site-code check's prefixes differ from the publish guard's `[site_prefix]` table.
   (`BACKLOG #5654`, `#5541`)
 - **The anonymizer's site-code pass writes no separator digit, and an identifier surrogate

@@ -2599,8 +2599,11 @@ still pass:
   and a code written as the argument of a well-formed hex or multi-byte character-set escape,
   such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
   not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
-- The IPv6 check misses some routable addresses. At least this passes: one written with
-  fullwidth hex digits, which the IPv6 check does not fold (BACKLOG #5654).
+- The IPv6 check misses some routable addresses. At least these pass: one written with
+  fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
+  IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
+  last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
+  (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
