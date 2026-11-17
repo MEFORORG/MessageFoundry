@@ -120,8 +120,6 @@ def test_reset_store_empties_a_seeded_store_on_a_real_server() -> None:
     import time
 
     from harness.load import shardcert
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
     env = {
@@ -132,9 +130,8 @@ def test_reset_store_empties_a_seeded_store_on_a_real_server() -> None:
     }
 
     async def open_store() -> SqlServerStore:
-        with shardcert._env_scope(env):
-            settings = load_settings(environ=os.environ).store
-            return await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+        # The same open the reset itself uses, so the seed and the read-back see its store.
+        return await shardcert._open_rig_store(env)
 
     async def seed() -> None:
         store = await open_store()
