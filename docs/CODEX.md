@@ -29,51 +29,20 @@ claim a failed hook ran.
 
 ### Who decides a block
 
-Only a hook blocks. As in Claude Code, a hook's exit 2 blocks. So does a hook
-that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
-command that cannot start, a defect of its own such as an unsupported handler
-type or shell, or a defect in its group, such as a matcher that is not a valid
-regex, that keeps it from running. Any other hook failure is a
-non-blocking error, which the bridge reports on stderr and as a `systemMessage`.
-A JSON `permissionDecision` deny from a hook is a decision, not a failure.
-
-A bridge fault never blocks, on any event. A fault is anything that keeps the
-bridge from running the hooks: settings that cannot be parsed, a missing session
-id, a payload that cannot be read as UTF-8 JSON, a payload whose
-`hook_event_name` differs from the registered event in more than case, or any
-other exception. The bridge reports it on stderr and as a `systemMessage`, and
-keeps any decision already gathered, such as an earlier hook's deny. A defect is
-judged where it belongs. A hook's own defect is reported and that hook skipped;
-the hooks before it have already run, and the hooks after it still run. A defect
-in a group, such as its matcher, is reported and that group skipped, and the
-groups after it still run.
-
-A launcher that cannot run the bridge never blocks either. In hook mode the
-bridge exits 0 to proceed or 10 to block, and `invoke.ps1` turns 10 into 2. Any
-other outcome is no decision: another bridge exit, including the 2 that Python
-and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. On a
-call that names `hook` as its subcommand, as every registered command does, no
-decision is reported and maps to a non-blocking exit 1 on every event, never to
-2, and never to 0 once `pwsh` has started, except that a help flag prints usage
-and exits 0. `invoke.ps1` ends its process with
-its code.
-
-Codex's documentation does not say which shell runs a hook command. Under a
-PowerShell outer shell, `pwsh -Command` reports the launcher's exit 2 as a
-non-blocking 1, so no exit 2 blocks under it. With `pwsh` missing, the line exits 1 under a
-PowerShell outer shell.
-
-**A future guard that must block when it fails sets
-`"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
-launcher with no decision, or a bridge fault, such as a payload with no session
-id, never blocks.
+Only a hook blocks. A bridge fault, which the bridge reports on stderr and as a
+`systemMessage`, never blocks. In hook mode the bridge exits 0 to proceed or 10
+to block, and `invoke.ps1` turns 10 into 2 and any other non-zero bridge exit
+into a non-blocking 1. Codex's documentation does not say which shell runs a
+hook command. Under a PowerShell outer shell, `pwsh -Command` reports the
+launcher's exit 2 as a non-blocking 1, so no exit 2 blocks under it. With `pwsh`
+missing, the line exits 1 under a PowerShell outer shell. The tests in
+`tests/test_codex_bridge.py` pin the exit codes.
 
 The bridge differs from Claude Code in at least four ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
 the remaining hooks, and the bridge exits 10 on every event, which `invoke.ps1`
 turns into 2, including events where Claude Code only shows the hook's stderr.
-Hook chains have a 90-second outer limit, so the timeouts of a long chain add up
-against it. On Windows, a command-only hook with no `shell` runs under pwsh,
+On Windows, a command-only hook with no `shell` runs under pwsh,
 where Claude Code runs it under Git Bash when Git Bash is installed.
 
 Command-only hooks use the shell they name. With none, they use pwsh on Windows
