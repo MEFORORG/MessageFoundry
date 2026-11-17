@@ -18,6 +18,7 @@ manufactured by the check.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -25,7 +26,7 @@ import logging
 import socket
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -356,24 +357,57 @@ def check_postgres_driver() -> CheckResult:
     )
 
 
-def _bindable(port: int) -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
+def _bindable(port: object) -> str:
+    """Report whether a listener could take ``port``: ``free``, ``in use/bound``, or ``invalid port``.
+
+    The probe binds the IPv4 wildcard and the IPv6 wildcard (BACKLOG #5389). A wildcard bind
+    conflicts with a listener on any address of its family, so a loopback, one-interface or
+    all-interface listener reads as held. The IPv6 probe is dual-stack (``IPV6_V6ONLY`` off)
+    because on Windows a dual-stack listener on ``::`` lets an IPv4 bind and an IPv6-only bind
+    succeed beside it, exclusive or not; only a dual-stack bind sees it.
+
+    On Windows the probe sets ``SO_EXCLUSIVEADDRUSE``, never ``SO_REUSEADDR``: there,
+    ``SO_REUSEADDR`` lets a bind share a port another socket holds, which read a held port as free.
+    On POSIX ``SO_REUSEADDR`` only reuses a TIME_WAIT port, as the engine's own listener does, and a
+    listening socket still refuses it.
+
+    Any bind error reads as ``in use/bound``: a port this process cannot bind is not one the engine
+    can take either. A free result says nothing about an external firewall.
+    """
+    # bool is an int subclass, and True would otherwise probe port 1.
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return "invalid port (must be an integer from 1 to 65535)"
+    # The wildcard is bound and closed, never listened on, so nothing is exposed.
+    for family, wildcard in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):  # nosec B104
+        try:
+            s = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            # The family is not enabled on this host (IPv6 disabled), so no listener can hold it.
+            continue
+        try:
+            if sys.platform == "win32":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                # A host with no dual-stack sockets refuses this; the IPv4 probe covers IPv4 there,
+                # and the IPv6 socket's default still sees every IPv6 listener.
+                with contextlib.suppress(OSError):
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            s.bind((wildcard, port))
+        except OSError:
+            return "in use/bound"
+        finally:
+            s.close()
+    return "free"
 
 
-def check_listener_ports(ports: dict[str, int]) -> CheckResult:
-    """MANUAL: external firewall rules can't be introspected; report local bindability as evidence."""
-    parts = [
-        f"{name} {port}: {'free' if _bindable(port) else 'in use/bound'}"
-        for name, port in ports.items()
-    ]
+def check_listener_ports(ports: Mapping[str, object]) -> CheckResult:
+    """MANUAL: external firewall rules can't be introspected; report local bindability as evidence.
+
+    Bindability is the residual this row can measure: a port that reads free here may still be
+    blocked by a host or network firewall, which is why the row stays MANUAL."""
+    parts = [f"{name} {port}: {_bindable(port)}" for name, port in ports.items()]
     return CheckResult(
         "host.ports",
         "Listener ports / firewall",
