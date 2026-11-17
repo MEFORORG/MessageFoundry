@@ -387,8 +387,8 @@ async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
-    restart: once ``STUCK_RETRY_SECONDS`` pass the reject is read and judged afresh on the first scan
-    that reaches it, and is moved.
+    restart: once ``STUCK_RETRY_SECONDS`` pass and it has settled, the reject is read and judged
+    afresh, and is moved.
 
     Mutation: drop the time test from ``_stuck_step``. Red: the reject is never read again."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
@@ -462,7 +462,8 @@ async def test_due_retries_are_capped_per_scan(
 ) -> None:
     """At most ``STUCK_RETRIES_PER_SCAN_MAX`` retries are examined in one scan; the rest stay due.
 
-    Mutation: drop the slice in ``_scan_once``'s retry pass. Red: all four are read in one scan."""
+    Mutation: pass ``len(due)`` to ``heapq.nsmallest`` in ``_scan_once``'s retry pass. Red: all four
+    are read in the same scan."""
     monkeypatch.setattr(file_mod, "STUCK_RETRIES_PER_SCAN_MAX", 2)
     rig = _Rig(tmp_path, monkeypatch, cap=None)
     for n in range(4):
