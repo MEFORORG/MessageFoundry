@@ -196,6 +196,7 @@ UnattestedReason = Literal[
     "record_has_no_package_rows",
     "install_root_unresolvable",
     "no_attested_file_under_install_root",
+    "no_attested_file_readable",
     "console_attestation_raised",
 ]
 
@@ -669,15 +670,7 @@ def attest_engine() -> AttestationResult:
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
         unmatched_rows=_is_module_row,
-        package_roots=_engine_package_roots,
     )
-
-
-def _engine_package_roots() -> list[Path]:
-    """The resolved directories of the loaded ``messagefoundry`` package (BACKLOG #5376)."""
-    import messagefoundry
-
-    return [Path(root).resolve() for root in messagefoundry.__path__]
 
 
 def attest_console() -> AttestationResult | None:
@@ -832,10 +825,18 @@ def _attest_distribution(
         no_record=False,
         checked=checked,
         drift=drift,
-        # A real baseline was read and still nothing was compared: every loaded file resolved outside
-        # the install root (a shadowed `messagefoundry/` the working directory wins with — #1677 from
-        # this control's side). `attested=True` with `checked == 0` is not clean, it is blind.
-        unattested_reason=None if checked else "no_attested_file_under_install_root",
+        # A real baseline was read and still nothing was compared. `attested=True` with `checked == 0`
+        # is not clean, it is blind. Either every loaded file resolved outside the install root (a
+        # shadowed `messagefoundry/` the working directory wins with — #1677 from this control's
+        # side), or the package sits under the root and no file in it could be read: each was
+        # deleted, special, or failed to open, and is drift (BACKLOG #5376).
+        unattested_reason=(
+            None
+            if checked
+            else "no_attested_file_readable"
+            if under_root
+            else "no_attested_file_under_install_root"
+        ),
     )
 
 

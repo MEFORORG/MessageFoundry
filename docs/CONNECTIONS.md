@@ -4089,7 +4089,9 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 
 **A PKCS#12 bundle for `cert import`** passes in one of two shapes:
 
-- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor;
+- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor whose PBKDF2
+  keyLength is present and equals the HMAC's output size (32 octets for HMAC-SHA-256), as RFC 9579
+  asks and as the `openssl pkcs12 -pbmac1_pbkdf2` export writes;
 - unencrypted bags with no MAC at all (`openssl pkcs12 -export -keypbe NONE -certpbe NONE -nomac
   -in <cert> -inkey <key> -out <new pfx>`). Nothing in it comes from a password, so it needs no
   passphrase. **It also has no integrity check**: nothing detects a change to the file, the same as

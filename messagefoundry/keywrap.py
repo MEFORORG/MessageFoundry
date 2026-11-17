@@ -36,7 +36,7 @@ What is refused, by default and with no setting to turn it off:
 PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
-MAC at the PBKDF2 floor passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
+MAC at the PBKDF2 floor, keyed at its HMAC's output size, passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
 does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. A key bag inside a PKCS#12 part that is itself encrypted is checked by the same bag rules
@@ -410,13 +410,18 @@ def _pbkdf2_fields(buf: bytes, params: _Tlv | None) -> _Pbkdf2:
     iterations = _uint(buf, parts[1])
     key_length: int | None = None
     prf: str | None = None
-    for extra in parts[2:]:
-        if extra.tag == 0x02:
-            key_length = _uint(buf, extra)
-        elif extra.tag == 0x30:
-            prf, _ = _algorithm(buf, extra)
-        else:
-            raise _Malformed
+    # RFC 8018 order, each at most once: keyLength, then prf. A repeated or reordered field is
+    # malformed rather than read by whichever copy comes last, since keyLength now decides the
+    # PBMAC1 check (BACKLOG #5377) and a strict DER reader would not get past it.
+    extras = parts[2:]
+    if extras and extras[0].tag == 0x02:
+        key_length = _uint(buf, extras[0])
+        extras = extras[1:]
+    if extras and extras[0].tag == 0x30:
+        prf, _ = _algorithm(buf, extras[0])
+        extras = extras[1:]
+    if extras:
+        raise _Malformed
     return _Pbkdf2(parts[0], iterations, key_length, prf)
 
 
@@ -820,15 +825,15 @@ def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
     # RFC 9579 section 5: PBKDF2-params under PBMAC1 MUST carry keyLength, an implementation MUST NOT
     # accept them without it, and the key SHOULD be the HMAC's output size. The length is otherwise
     # free, so a keyLength of 1 would key the MAC with one octet and a password check against it
-    # would be near free (BACKLOG #5377). The floor is the HMAC output size, which is also stricter
-    # than section 9's recommended 20-octet minimum. The ceiling is the largest approved output:
-    # a longer key adds nothing to the HMAC, and nothing here needs one.
+    # would be near free (BACKLOG #5377). Only the HMAC's output size passes: it is what the RFC asks
+    # for and what `openssl pkcs12 -pbmac1_pbkdf2` writes, and it is stricter than section 9's
+    # recommended 20-octet minimum. A longer key is refused too, as a shape nothing here writes.
     if fields.key_length is None:
         return (
             "has a PBMAC1 MAC whose PBKDF2 parameters omit keyLength, which RFC 9579 forbids an "
             "implementation to accept"
         )
-    if not mac_length <= fields.key_length <= max(_PBMAC1_SCHEMES.values()):
+    if fields.key_length != mac_length:
         return (
             f"has a PBMAC1 MAC keyed by a {fields.key_length}-octet PBKDF2 key; the HMAC it keys "
             f"takes a {mac_length}-octet key (RFC 9579)"
@@ -978,6 +983,7 @@ def pkcs12_wrap_refusal(
     """The refusal text for a PKCS#12 bundle, or ``None`` when it may be decrypted.
 
     Refused: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than PBMAC1, a PBMAC1
+    MAC whose PBKDF2 keyLength is absent or not its HMAC's output size, a PBMAC1
     or PBES2 derivation under the Appendix C floor, the SHA-1 PKCS#12 PBE and PBES1 bag schemes,
     anything this reader cannot walk, an encrypted bundle with no MAC, and an encrypted bundle with
     no passphrase. The MAC rules apply over clear bags too (BACKLOG #1352), and a bundle that

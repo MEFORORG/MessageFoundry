@@ -1888,42 +1888,58 @@ def _camel_tail(name: str, word: str) -> bool:
     return before.islower() or before.isdigit() or (before.isupper() and rest.islower())
 
 
+def _clean_name(name: str) -> str:
+    """``name`` without tab, CR or LF, which ``urlsplit`` drops, so the detector never sees them."""
+    return name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+
+
+def _strip_digits(name: str) -> str:
+    return name.rstrip("0123456789") or name
+
+
 def _base_name(name: str) -> str:
-    """``name`` without tab, CR or LF (which ``urlsplit`` drops, so the detector never sees them),
-    without a trailing index such as ``[]`` or ``[0]``, and without trailing digits. So
-    ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as ``token``, ``token``, ``key``
-    and ``apiKey``."""
-    base = name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+    """``name`` after :func:`_clean_name`, without a trailing index such as ``[]`` or ``[0]``, and
+    without trailing digits. So ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as
+    ``token``, ``token``, ``key`` and ``apiKey``."""
+    base = _clean_name(name)
     if base.endswith("]") and "[" in base:
         base = base[: base.rfind("[")]
-    return base.rstrip("0123456789") or base
+    return _strip_digits(base)
 
 
 def _base_names(name: str) -> tuple[str, ...]:
     """Every reading of ``name`` the detector judges: :func:`_base_name`'s, and for a bracket-keyed
-    name two more (BACKLOG #5379). Trailing index groups (``[]``, ``[0]``) are dropped
-    first, all of them, so ``token[0][0]`` is judged as ``token``. Then the name before the first
-    ``[`` is one reading, and the name with each ``[`` read as ``.`` is another, so
+    name two more (BACKLOG #5379). The name is cut at every ``[`` and ``]``, each piece stripped of
+    spaces (``parse_qsl`` decodes ``+`` to one) and empty pieces dropped. Trailing pieces that are
+    indexes (all digits) are dropped, all of them, so ``token[0][0]`` is judged as ``token``. Then
+    the first piece is one reading, and the pieces joined by ``.`` are another, so
     ``user[password]`` is judged as ``user.password`` and ends in the credential word, and
     ``sort[key]`` as ``sort.key``, which the non-secret list still reads as a sort key. A name
-    matches when any reading does, so this only widens what :func:`_base_name` alone matched."""
+    matches when any reading does, so this only widens what :func:`_base_name` alone matched.
+    Linear in ``name``: one split, and each piece is looked at a bounded number of times."""
     readings = [_base_name(name)]
-    cleaned = name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+    cleaned = _clean_name(name)
     if "[" in cleaned or "]" in cleaned:
-        while cleaned.endswith("]") and "[" in cleaned:
-            cut = cleaned.rfind("[")
-            index = cleaned[cut + 1 : -1].strip()
-            if index and not index.isdigit():
-                break
-            cleaned = cleaned[:cut]
-        for reading in (cleaned.split("[", 1)[0], cleaned.replace("[", ".").replace("]", "")):
-            if reading:
-                readings.append(reading.rstrip("0123456789") or reading)
+        pieces = [piece.strip() for piece in cleaned.replace("]", "[").split("[")]
+        pieces = [piece for piece in pieces if piece]
+        while pieces and pieces[-1].isdigit():
+            pieces.pop()
+        if pieces:
+            readings.append(_strip_digits(pieces[0]))
+            readings.append(_strip_digits(".".join(pieces)))
     return tuple(dict.fromkeys(readings))
 
 
 def _is_credential_param(name: str) -> bool:
-    return any(_is_credential_base(base) for base in _base_names(name))
+    return _readings_are_credential(_base_names(name))
+
+
+def _readings_are_credential(readings: tuple[str, ...], *, refusal: bool = False) -> bool:
+    """Whether any of ``readings`` (from :func:`_base_names`) names a credential, and with
+    ``refusal`` also whether any is one of :data:`_QUERY_REFUSAL_NAMES`."""
+    if any(_is_credential_base(base) for base in readings):
+        return True
+    return refusal and any(base.casefold() in _QUERY_REFUSAL_NAMES for base in readings)
 
 
 def _is_credential_base(base: str) -> bool:
@@ -1993,11 +2009,7 @@ def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
         {
             _display_name(name)
             for name, _ in pairs
-            if _is_credential_param(name)
-            or (
-                refusal
-                and any(base.casefold() in _QUERY_REFUSAL_NAMES for base in _base_names(name))
-            )
+            if _readings_are_credential(_base_names(name), refusal=refusal)
         }
     )
 

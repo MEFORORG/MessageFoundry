@@ -38,6 +38,7 @@ from tests._approved_key_wrap import (
     AES256_CBC,
     PBES2,
     PBKDF2,
+    PRF,
     SCRYPT,
     _pfx_parts,
     approved_pfx,
@@ -1321,10 +1322,11 @@ def test_a_pbmac1_mac_over_sha1_and_a_truncated_bundle_are_refused(material: Mat
         ("sha256", 1, "1-octet PBKDF2 key"),
         ("sha256", 31, "31-octet PBKDF2 key"),
         ("sha512", 32, "takes a 64-octet key"),
+        ("sha256", 48, "48-octet PBKDF2 key"),
         ("sha256", 65, "65-octet PBKDF2 key"),
         ("sha256", None, "omit keyLength"),
     ],
-    ids=["one-octet", "one-short", "sha512-at-32", "past-the-largest", "omitted"],
+    ids=["one-octet", "one-short", "sha512-at-32", "sha256-at-48", "past-the-largest", "omitted"],
 )
 def test_a_pbmac1_mac_with_a_truncated_or_missing_key_length_is_refused(
     material: Material, prf: str, key_length: int | None, why: str
@@ -1342,6 +1344,23 @@ def test_a_pbmac1_mac_with_a_truncated_or_missing_key_length_is_refused(
     )
     refusal = _p12_refusal(bundle)
     assert refusal is not None and why in refusal and "-pbmac1_pbkdf2" in refusal
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param((integer(1), integer(32)), id="repeated-key-length"),
+        pytest.param(
+            (seq(oid(PRF["sha256"][0]), tlv(0x05, b"")), integer(32)), id="prf-before-key-length"
+        ),
+    ],
+)
+def test_pbkdf2_params_out_of_order_or_repeated_are_malformed(fields: tuple[bytes, ...]) -> None:
+    # BACKLOG #5377: keyLength decides the PBMAC1 check, so it is read only in RFC 8018's place,
+    # once. A last-copy-wins reading would pass [salt, iter, 1, 32] on the 32.
+    block = seq(octets(b"s" * 16), integer(600_000), *fields)
+    with pytest.raises(keywrap._Malformed):
+        keywrap._pbkdf2_fields(block, keywrap._read_tlv(block, 0, len(block)))
 
 
 @pytest.mark.parametrize(("prf", "iterations"), [("sha256", 600_000), ("sha512", 210_000)])

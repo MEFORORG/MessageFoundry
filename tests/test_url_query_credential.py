@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import secretscrub
 from messagefoundry.config.models import (
     ActiveWindow,
     ConnectorType,
@@ -147,6 +148,8 @@ def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
                 "'user[password]'",
             ],
         ),
+        # A space around a bracket key, as ``+`` decodes, is not part of the key.
+        ("https://p.example.invalid/x?user[+password+]=a", ["'user[ password ]'"]),
         # The old reading still holds: a credential word before a non-index bracket key.
         ("https://p.example.invalid/x?token[value]=a", ["'token[value]'"]),
         # Control: a bracket key whose dotted reading is a known non-secret, or no credential word.
@@ -158,6 +161,22 @@ def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
 )
 def test_detector_reads_bracket_keyed_names(url: str, expected: list[str]) -> None:
     assert credential_query_params(url) == expected
+
+
+def test_bracket_readings_stay_linear_in_the_name() -> None:
+    # BACKLOG #5379 review: a name of many ``[]`` groups is read in one split, not one copy per
+    # group. Ratio of two sizes, so a slow runner does not fail it; quadratic would be about 16x.
+    import time
+
+    def cost(n: int) -> float:
+        name = "a" * n + "[]" * n
+        start = time.perf_counter()
+        for _ in range(5):
+            secretscrub._base_names(name)
+        return time.perf_counter() - start
+
+    cost(1000)
+    assert cost(80_000) < 8 * cost(20_000) + 0.05
 
 
 def test_the_refusal_names_drop_every_trailing_index() -> None:
