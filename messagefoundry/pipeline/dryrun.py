@@ -1226,8 +1226,7 @@ def split_messages(raw: bytes) -> list[bytes]:
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     dry-run / commit-check sees every message in a batch file, not just the first. Delegates to the
-    shared :func:`messagefoundry.parsing.split.split_batch` so the live File-source ingress split
-    (transports/file.py) and this dry-run / ``messagefoundry check`` path stay byte-identical.
+    shared :func:`messagefoundry.parsing.split.split_batch`.
 
     **Bytes in, bytes out** (BACKLOG #1689). Returning ``str`` meant this function had already decoded
     the fixture — tolerantly, as UTF-8 — before any inbound was in scope, so the connection's declared

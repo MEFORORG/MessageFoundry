@@ -245,9 +245,7 @@ open points settled below.
   The split goes through a new `split_batch_bytes` in `messagefoundry/parsing/split.py`, which decodes
   with the declared charset, splits with `split_batch`, and re-encodes each message; an
   undecodable file is handed over as its original bytes, and a single-message file as
-  `split_batch_bytes` says. In a charset whose ASCII bytes always mean ASCII (UTF-8, ASCII, ISO
-  8859, Windows-125x), a file with no `MSH` after a line break is one message, so a byte scan
-  decides it with no split. The stop is checked before every hand-off, the first included: a stop part-way leaves the
+  `split_batch_bytes` says. The stop is checked before every hand-off, the first included: a stop part-way leaves the
   whole file for the next start, and a store failure on hand-off K leaves it for the next poll; both
   re-emit the first K messages, the at-least-once behaviour the File source already has. The split
   runs in a worker thread, as the poll's other blocking steps do, so a large batch file does not
@@ -486,8 +484,7 @@ into one MLLP frame or one HTTP request is told so, with an `AR` where it can be
 is processed as the File source processes one, and an enveloped remote batch is no longer one
 `ERROR`. A batch file led by whitespace or a byte order mark keeps its first message on both file
 sources, and a one-message file led by a byte order mark or an `FHS`/`BHS` envelope header is no
-longer an `ERROR`. The split drops the trailer lines that end an `MSH`-led message; where a
-whole-file source still hands them on is said under rule 5.
+longer an `ERROR`. The split drops the trailer lines that end an `MSH`-led message.
 
 **Negative / risks** -- Rule 3 is advisory: a Handler author can still write the unsafe form, and
 the lint sees only literal paths and has the blind spots listed above. A partner that reads a

@@ -92,7 +92,7 @@ def test_split_batch_drops_fhs_bhs_envelope() -> None:
     assert msgs[-1] == ADT_A02
 
 
-BOM = "﻿"
+BOM = "\ufeff"
 
 
 def test_split_batch_drops_the_trailer_of_each_batch_of_a_multi_batch_file() -> None:
