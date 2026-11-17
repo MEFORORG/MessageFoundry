@@ -2610,8 +2610,11 @@ still pass:
   and a code written as the argument of a well-formed hex or multi-byte character-set escape,
   such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
   not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
-  So does a code an invisible character interrupts inside an escape body, such as
-  `\Z97<U+034F>1234\` or `X\97<U+200B>1234\Y`.
+  So does a code that some invisible characters interrupt inside an escape body, such as
+  `\Z97<U+034F>1234\` or `X\97<U+200B>1234\Y`; the miss comes from the escape body, not from
+  the character alone. A code a vertical tab or file separator interrupts there is found, and a
+  carriage return or line feed there ends the line, so the message is refused as holding a line
+  no rule can reach.
 - The IPv6 check misses some routable addresses. At least these pass: one written with
   fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the

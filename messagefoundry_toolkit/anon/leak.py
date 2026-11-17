@@ -1353,9 +1353,10 @@ def refusal_advice(
         if reason.startswith(SITE_PREFIX_SPLIT_LEAD):
             # The source loaded; the site-code table and the guard's differ (BACKLOG #5541).
             steps.append(
-                "Remove each [site_prefix] entry that is not two digits, which the site-code "
-                "check does not read and a new run does not change. Then start a new run so the "
-                "site-code check and the publish guard load the same token source."
+                "The site-code check's prefixes differ from the publish guard's [site_prefix] "
+                "table. A new run loads both from one token source, which clears a split that a "
+                "reload of one table left. An entry that is not two digits keeps them apart in "
+                "every run; docs/PHI.md section 9 describes the check."
             )
         else:
             steps.append("Load the denylist token source.")

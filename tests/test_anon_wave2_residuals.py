@@ -138,10 +138,26 @@ def test_the_opt_in_refuses_on_a_split_table(
         pytest.raises(anon.LeakError, match="denylist not live: the site-code check") as caught,
     ):
         anon.anonymize_checked(f"{_HEAD}\rPV2|1", salt=_SALT, require_live_denylist=True)
-    # The source is loaded, so the advice is to fix the entry, not to load a source.
-    assert "Remove each [site_prefix] entry that is not two digits" in str(caught.value)
-    assert "start a new run so the site-code check and the publish guard" in str(caught.value)
+    # The source is loaded, so the advice names the split, not a source to load.
+    assert "prefixes differ from the publish guard's [site_prefix] table" in str(caught.value)
     assert "Load the denylist token source." not in str(caught.value)
+
+
+@_LEAKS
+def test_the_split_advice_names_no_removal_of_a_site_prefix_entry(leak: ModuleType) -> None:
+    """The publish guard reads every numeric ``[site_prefix]`` entry, so advice to remove or edit
+    one would delete a guard detector (BACKLOG #5541)."""
+    report = leak.LeakReport(
+        hits=[],
+        unmapped_fields=(),
+        structural_hits=[],
+        token_tables_live=False,
+        token_floor_reason=f"{engine_surrogates.SITE_PREFIX_SPLIT_LEAD} 1 two-digit prefix(es)",
+    )
+    advice = leak.refusal_advice(report, denylist_refused=True)
+    assert "[site_prefix]" in advice  # the control: this is the split step
+    for verb in ("remove", "delete", "drop", "edit", "rename", "replace", "change"):
+        assert verb not in advice.lower(), verb
 
 
 # --- #5540: the site-code pass under a digit separator ---------------------------------------------
