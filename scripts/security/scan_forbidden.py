@@ -86,8 +86,10 @@ import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -2113,12 +2115,28 @@ def _ls_files(root: Path) -> list[str]:
     Fixed argv, no shell, ``root`` a separate argument. ``safe.bareRepository=explicit`` keeps git from
     taking a directory of committed files that is shaped like a bare repository as one, and so from
     reading a config a commit wrote."""
+    # A hook or ``rebase --exec`` exports these, and with them git reads another index or keys the list
+    # from another directory, so the paths would not be relative to ``root``.
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_ENV}
     out = subprocess.run(  # nosec B603 B607
         ["git", "-c", "safe.bareRepository=explicit", "-C", str(root), "ls-files", "-z"],
         capture_output=True,
         check=True,
+        env=env,
     ).stdout
     return [p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p]
+
+
+_GIT_LOCATION_ENV = frozenset(
+    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE"}
+)
+
+
+def _path_key(rel: str) -> str:
+    """A root-relative path as the walk compares it with git's list: NFC and case-folded, because a
+    case-insensitive or normalizing filesystem can spell a tracked path differently from the index.
+    Folding only ever counts more paths as tracked, so more is read, never less."""
+    return unicodedata.normalize("NFC", rel).casefold()
 
 
 def _git_tracked() -> list[str]:
@@ -2133,10 +2151,10 @@ def _tracked_under(root: Path) -> set[str] | None:
     under ``root``, which is then an untracked copy of content that cannot be told apart. ``None``
     prunes nothing, the fail-closed side."""
     resolved = root.resolve()
-    if not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
+    if not root.is_dir() or not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
         return None
     try:
-        tracked = set(_ls_files(root))
+        tracked = {_path_key(p) for p in _ls_files(root)}
     except (OSError, subprocess.CalledProcessError) as exc:
         print(
             f"scan_forbidden: git could not list the tracked files under {root} ({type(exc).__name__}),"
@@ -2166,6 +2184,8 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
             name = Path(os.fsdecode(exc.filename)).relative_to(root).as_posix()
         except (TypeError, ValueError):
             name = "."
+        if name != "." and exc.errno == errno.ENOENT:
+            return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
         name = raw if name == "." else name
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
         what = "does not exist" if exc.errno == errno.ENOENT else f"unreadable directory ({why})"
@@ -2182,13 +2202,15 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
             if d != ".git"
             and (
                 tracked is None
-                or prefix + d in tracked_dirs
+                or _path_key(prefix + d) in tracked_dirs
                 or (d not in SKIP_DIRS and not in_skip_dir)
             )
         ]
         for name in files:
             rel = prefix + name
-            if name == ".git" or (in_skip_dir and tracked is not None and rel not in tracked):
+            if name == ".git" or (
+                in_skip_dir and tracked is not None and _path_key(rel) not in tracked
+            ):
                 continue
             out.append((Path(top) / name, rel))
 
@@ -2274,17 +2296,15 @@ def _read_text(path: Path) -> str | None:
     # The head alone decides binary, so a large binary is not read whole only to be set aside.
     with path.open("rb") as f:
         head = f.read(_HEAD_BYTES)
-    if (
-        not head.startswith(tuple(bom for bom, _ in _BOMS))
-        and b"\x00" in head
-        and _bomless_utf16(head) is None
-    ):
-        return None
-    data = path.read_bytes()
-    head = data[:_HEAD_BYTES]
-    for bom, codec in _BOMS:
-        if not data.startswith(bom):
-            continue
+        bom_codec = next(((bom, codec) for bom, codec in _BOMS if head.startswith(bom)), None)
+        wide = None
+        if bom_codec is None and b"\x00" in head:
+            wide = _bomless_utf16(head)
+            if wide is None:
+                return None
+        data = head + f.read()
+    if bom_codec is not None:
+        bom, codec = bom_codec
         wide_text = data.decode(codec, errors="replace")
         if _wide_shape(head[len(bom) :], codec, bom):
             return wide_text
@@ -2297,10 +2317,7 @@ def _read_text(path: Path) -> str | None:
             utf16 = "utf-16-le" if bom == codecs.BOM_UTF32_LE else "utf-16-be"
             readings.append(data.decode(utf16, errors="replace"))
         return "\n".join(readings)
-    if b"\x00" not in head:
-        return data.decode("utf-8", errors="replace")
-    wide = _bomless_utf16(head)
-    return data.decode(wide, errors="replace") if wide is not None else None
+    return data.decode(wide or "utf-8", errors="replace")
 
 
 def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = False) -> list[str]:
@@ -2311,6 +2328,29 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     trimmed line -- for local triage only, never CI.
     """
     return _scan_file(path, rel_posix, show_context=show_context)[0]
+
+
+def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
+    """The hits a file earns by its path and name alone, and whether its content is not to be read.
+    Judged whatever its bytes are, and whether or not it can be opened."""
+    if reason := forbidden_path_reason(posix):
+        return [f"{path}:0: {reason}"], True
+    hits: list[str] = []
+    # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
+    # filename, and a module need not repeat its own name in its text. Placed before the binary
+    # early-return for the same reason the location rule above is -- a DICOM or PDF sample named with
+    # a site code is exactly as much of a leak as the .py beside it, and _read_text drops binaries
+    # unread. Line 0 because the finding is the file, not a location inside it. Unlike a location-rule
+    # hit this does NOT stop the scan: the content still has to be judged.
+    #
+    # This one hit necessarily carries the offending string, because the string is the path and every
+    # hit names its path. That is not a new disclosure -- by the time CI scans it the file is already
+    # in the public tree and in the PR's file list, and at pre-commit time nothing is public yet -- but
+    # it is why the remedy is renaming the file, not an ALLOWLIST line: the allowlist is a per-line
+    # content veto and cannot reach this, exactly as it cannot reach the location rule.
+    if _ESTATE_ID_SHAPE.search(posix):
+        hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
+    return hits, False
 
 
 #: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
@@ -2332,23 +2372,9 @@ def _scan_file(
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
-    if reason := forbidden_path_reason(posix):
-        return [f"{path}:0: {reason}"], "unread"
-    hits: list[str] = []
-    # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
-    # filename, and a module need not repeat its own name in its text. Placed before the binary
-    # early-return for the same reason the location rule above is -- a DICOM or PDF sample named with
-    # a site code is exactly as much of a leak as the .py beside it, and _read_text drops binaries
-    # unread. Line 0 because the finding is the file, not a location inside it. Unlike a location-rule
-    # hit this does NOT stop the scan: the content still has to be judged.
-    #
-    # This one hit necessarily carries the offending string, because the string is the path and every
-    # hit names its path. That is not a new disclosure -- by the time CI scans it the file is already
-    # in the public tree and in the PR's file list, and at pre-commit time nothing is public yet -- but
-    # it is why the remedy is renaming the file, not an ALLOWLIST line: the allowlist is a per-line
-    # content veto and cannot reach this, exactly as it cannot reach the location rule.
-    if _ESTATE_ID_SHAPE.search(posix):
-        hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
+    hits, stop = _name_hits(path, posix)
+    if stop:
+        return hits, "unread"
     try:
         text = _read_text(path)
     except OSError as exc:
@@ -3014,7 +3040,14 @@ def main(argv: list[str]) -> int:
     # and location only, and an unreadable one fails the run with exit 2; counting either as scanned let
     # a run whose files were all unread report coverage it did not have (BACKLOG #5583). A directory the
     # --path walk could not list is unreadable in the same way.
-    candidates, hits = _candidate_files(paths, path_mode=path_mode)
+    try:
+        candidates, hits = _candidate_files(paths, path_mode=path_mode)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # 2, not a traceback's 1: git could not list the tracked files, so nothing was scanned.
+        print(
+            f"scan_forbidden: cannot list the tracked files ({type(exc).__name__})", file=sys.stderr
+        )
+        return 2
     unlisted = len(hits)
     scanned = 0
     unread = 0
@@ -3025,21 +3058,32 @@ def main(argv: list[str]) -> int:
         if _is_skipped(rel):
             continue
         if not abs_path.is_file():
-            # A walked entry that cannot even be stat'ed sits in a directory that lists but does not
-            # open, and a FILE the caller named that is not one (a directory after ``--``, a missing
-            # name) is not scanned. Both are unreadable, not clean. Anything else (a link to a directory,
-            # a tracked path the work tree no longer holds) is passed over as before.
-            if not path_mode and not paths:
-                continue
+            # An entry that cannot be stat'ed (a directory that lists but does not open), and a name
+            # given after ``--`` that is a directory or does not exist, are not clean: each fails the
+            # run. A tracked path the work tree no longer holds is passed over, as before. Any other
+            # entry that is not a regular file, a link or a FIFO, is still judged by its path and name.
             try:
-                abs_path.lstat()
-                reason = None if path_mode else "not a regular file"
+                st_mode = abs_path.lstat().st_mode
+                reason = (
+                    "a directory, not a file"
+                    if stat.S_ISDIR(st_mode) and paths and not path_mode
+                    else None
+                )
             except OSError as exc:
-                reason = f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
-            if reason is not None:
-                hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
-                unreadable += 1
-                unread += 1
+                # Gone since it was listed, or a tracked file deleted in the work tree.
+                if exc.errno == errno.ENOENT and (path_mode or not paths):
+                    continue
+                reason = (
+                    "does not exist"
+                    if exc.errno == errno.ENOENT
+                    else f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
+                )
+            unread += 1
+            if reason is None:
+                hits.extend(_name_hits(abs_path, rel)[0])
+                continue
+            hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
+            unreadable += 1
             continue
         file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
         hits.extend(file_hits)
@@ -3061,13 +3105,14 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
 
-    # A --path scan that examined ZERO files is not a pass: it means the whole tree was skipped (a
-    # SKIP_DIRS component in the path, or an empty/wrong tree). Refuse rather than report a vacuous clean.
+    # A --path scan that examined ZERO files is not a pass: an empty or wrong tree, all-binary content,
+    # or every file untracked under a skipped directory. Refuse rather than report a vacuous clean.
     # A hit outranks the refusal: a run whose only file sits under a forbidden path still reports it.
     if path_mode and scanned == 0 and not hits:
         print(
             "scan_forbidden: --path examined ZERO files (all skipped or unread, or empty tree) — refusing "
-            "(fail closed). Check the scan path for a SKIP_DIRS component (build/venv/dist/…).",
+            "(fail closed). Check that the path names the tree meant: an empty or all-binary tree, or one "
+            "whose every file is untracked under build/venv/dist/…, scans nothing.",
             file=sys.stderr,
         )
         return 2
@@ -3079,7 +3124,8 @@ def main(argv: list[str]) -> int:
         _report_hits(
             "UNREADABLE FILES -- their content was not scanned (fail closed):",
             hits,
-            "Fix the file's permissions or lock, then scan again. Any content hit above still applies.",
+            "Fix the permissions or lock, or name a file that exists, then scan again. Any content "
+            "hit above still applies.",
         )
         return 2
 

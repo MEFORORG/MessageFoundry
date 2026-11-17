@@ -2074,7 +2074,8 @@ def _git_tree(root: Path, tracked: dict[str, str], untracked: dict[str, str]) ->
     root.mkdir(parents=True)
     # A contributor's global ignore list may name these very directories, so it is kept out, and the
     # add is forced.
-    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60, env=env)
     for rel, text in {**tracked, **untracked}.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -2113,6 +2114,9 @@ def test_a_snapshot_shaped_like_a_bare_repository_is_still_walked_whole(
         (root / rel).write_text(text, encoding="utf-8")
     assert sf_main._tracked_under(root) is None
     assert sf_main.main(["--path", str(root)]) == 1
+    # And git, asked directly, refuses to take the directory as a repository at all.
+    with pytest.raises(subprocess.CalledProcessError):
+        sf_main._ls_files(root)
 
 
 def test_an_untracked_copy_inside_a_work_tree_is_walked_whole(sf_main, tmp_path: Path) -> None:
@@ -2243,14 +2247,14 @@ def test_an_unreadable_file_is_a_hit_not_a_clean_file(
     """BACKLOG #5583. An unread file used to read as empty and pass."""
     p = tmp_path / "locked.md"
     p.write_text("contact ACME\n", encoding="utf-8")
-    real = Path.read_bytes
+    real = Path.open
 
-    def refuse(self: Path) -> bytes:
+    def refuse(self: Path, *args: object, **kwargs: object) -> object:
         if self == p:
             raise PermissionError(13, "denied", str(self))
-        return real(self)
+        return real(self, *args, **kwargs)  # type: ignore[call-overload]
 
-    monkeypatch.setattr(Path, "read_bytes", refuse)
+    monkeypatch.setattr(Path, "open", refuse)
     hits = sf.scan_file(p, "locked.md")
     assert hits and "unreadable" in hits[0] and "not scanned" in hits[0], hits
     assert str(tmp_path) not in hits[0], "the hit must not echo the absolute path"
@@ -2314,14 +2318,14 @@ def test_an_unreadable_file_fails_the_run_as_an_instrument(
     locked = root / "locked.md"
     locked.write_text("fine\n", encoding="utf-8")
     (root / "ok.md").write_text("fine\n", encoding="utf-8")
-    real = Path.read_bytes
+    real = Path.open
 
-    def refuse(self: Path) -> bytes:
+    def refuse(self: Path, *args: object, **kwargs: object) -> object:
         if self == locked:
             raise PermissionError(13, "denied", str(self))
-        return real(self)
+        return real(self, *args, **kwargs)  # type: ignore[call-overload]
 
-    monkeypatch.setattr(Path, "read_bytes", refuse)
+    monkeypatch.setattr(Path, "open", refuse)
     assert sf_main.main(["--path", str(root)]) == 2
 
 
@@ -2401,14 +2405,14 @@ def test_a_content_hit_beside_an_unreadable_file_keeps_exit_1(
     locked = root / "locked.md"
     locked.write_text("fine\n", encoding="utf-8")
     (root / "leak.md").write_text("contact ACME\n", encoding="utf-8")
-    real = Path.read_bytes
+    real = Path.open
 
-    def refuse(self: Path) -> bytes:
+    def refuse(self: Path, *args: object, **kwargs: object) -> object:
         if self == locked:
             raise PermissionError(13, "denied", str(self))
-        return real(self)
+        return real(self, *args, **kwargs)  # type: ignore[call-overload]
 
-    monkeypatch.setattr(Path, "read_bytes", refuse)
+    monkeypatch.setattr(Path, "open", refuse)
     assert sf_main.main(["--path", str(root)]) == 1
 
 
@@ -2938,3 +2942,76 @@ def test_utf16_text_whose_first_character_is_nul_is_scanned(sf, tmp_path: Path) 
 )
 def test_a_tag_closing_before_a_record_does_not_hide_it(sf, line: str, kind: str) -> None:
     assert kind in _pr_kinds(sf, line), line
+
+
+def test_an_exported_git_dir_does_not_shift_the_tracked_list(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook exports GIT_DIR, and with it ``git -C sub ls-files`` keys paths from the work tree's top,
+    so a tracked file under ``sub/build/`` was looked up as ``build/...``, missed and pruned."""
+    root = _git_tree(
+        tmp_path / "tree", {"pkg/build/leak.md": "contact ACME\n", "ok.md": "fine\n"}, {}
+    )
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("GIT_DIR", str(root / ".git"))
+    assert sf_main.main(["--path", "pkg"]) == 1
+
+
+def test_a_tracked_directory_spelled_in_another_case_on_disk_is_walked(
+    sf_main, tmp_path: Path
+) -> None:
+    """The walk compares disk names with the index spelling folded, so a case-insensitive filesystem
+    holding ``pkg/build`` for an index ``pkg/Build`` does not prune a tracked file."""
+    root = _git_tree(tmp_path / "tree", {"pkg/Build/leak.md": "contact ACME\n"}, {})
+    (root / "pkg" / "Build").rename(root / "pkg" / "build")
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+def test_a_walked_non_file_is_still_judged_by_its_path(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dangling link or a FIFO under docs/security/ is a hit by its location, whatever it holds."""
+    root = tmp_path / "tree"
+    (root / "docs" / "security").mkdir(parents=True)
+    link = root / "docs" / "security" / "model.md"
+    link.write_text("fine\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def is_file(self: Path, **kwargs: bool) -> bool:
+        return False if self == link else real_is_file(self, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+def test_a_tracked_file_that_cannot_be_stated_fails_the_tracked_scan(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-argument scan passed over a tracked file it could not stat as if it were deleted."""
+    root = _git_tree(tmp_path / "tree", {"ok.md": "fine\n", "sub/leak.md": "contact ACME\n"}, {})
+    monkeypatch.chdir(root)
+    hidden = Path("sub/leak.md")
+    real_is_file, real_lstat = Path.is_file, Path.lstat
+
+    def is_file(self: Path, **kwargs: bool) -> bool:
+        return False if self == hidden else real_is_file(self, **kwargs)
+
+    def lstat(self: Path) -> os.stat_result:
+        if self == hidden:
+            raise PermissionError(13, "denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert sf_main.main([]) == 2
+
+
+def test_a_tracked_scan_git_cannot_list_exits_2(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside a repository the tracked scan raised, and the traceback's 1 read as a content hit."""
+    monkeypatch.chdir(tmp_path)
+    for k in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(k)
+    assert sf_main.main([]) == 2

@@ -78,7 +78,7 @@ pre_commit_off() {
 }
 
 # Can the hooks start here? Every local hook runs `python`. The leak gate runs with --require-tokens,
-# which without a full token source refuses any commit that stages a text file. The scanner answers
+# which without a full token source refuses any commit that stages a file. The scanner answers
 # that itself, asked as the hook asks it but over an empty file, so a hit cannot pass for a refusal.
 pre_commit_can_run() {
     if ! python_ok; then
@@ -90,7 +90,7 @@ pre_commit_can_run() {
     quiet python scripts/security/scan_forbidden.py --require-tokens "$empty" || ok=1
     rm -f "$empty"
     if [ "$ok" != 0 ]; then
-        pre_commit_off "the leak gate's scanner refuses to run here, as its output above says, so the leak gate would refuse any commit that stages a text file" \
+        pre_commit_off "the leak gate's scanner refuses to run here, as its output above says, so the leak gate would refuse any commit that stages a file" \
             "Without a token source, set MEFOR_FORBIDDEN_TOKENS on the cloud environment."
         return 1
     fi
