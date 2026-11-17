@@ -472,9 +472,8 @@ The engine connects with `Encrypt=yes` and **verifies** the server certificate. 
 posture; `MEFOR_ALLOW_INSECURE_TLS` does not lift it (owner ruling 2026-11-14, vault BACKLOG #3533
 item 2). This has three consequences for the AG:
 
-- ODBC Driver 18 validates against the **Windows machine stores** (the root in `LocalMachine\Root`;
-  [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.2 says where each CA goes), and there is no
-  CA-file keyword. Import the DB CA on **every engine VM in both DCs**
+- ODBC Driver 18 validates against the **Windows machine trust store** (`LocalMachine\Root`), and
+  there is no CA-file keyword. Import the DB CA on **every engine VM in both DCs**
   ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5, `scripts/service/import-db-ca.ps1`).
   `[store].ssl_root_cert` is no substitute here: on SQL Server it pins one exact certificate and
   switches the store to `Encrypt=strict`, so after a failover to a replica that presents a different

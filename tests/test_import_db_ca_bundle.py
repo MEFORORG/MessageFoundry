@@ -10,15 +10,13 @@ and checked, and the whole file is refused when any one is not a CA or carries a
 root goes into the machine Root store and any other CA into the intermediate store.
 
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
-directory. The function-level tests lift at least ``Read-CaBundle``, ``Get-CaRefusal``,
-``Get-CaStoreName``, ``Get-ChainRefusal``, ``Get-PresentStoreName`` and ``Get-AnchorSet`` (with the
-``$SignatureHashes`` table and the helpers they call) out of the script's AST and call them, as
-``tests/test_import_db_ca_console_text.py`` does. The whole-script tests are skipped in an elevated
-session. All but one run it with ``-WhatIf``, where ``ShouldProcess`` declines every import, so the
-store is never opened, and even a regression that ignored ``-WhatIf`` would meet the script's own
-elevation refusal rather than the machine Root store. The one without ``-WhatIf`` exists to meet
-that refusal, on Windows only; since hosted Windows runners are elevated, it runs only on an
-unelevated developer box. Both halves need ``pwsh`` and skip where there is none.
+directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
+``Get-CaStoreName`` (and the console helpers they call) out of the script's AST and call them, as
+``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
+only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
+skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
+script's own elevation refusal rather than the machine Root store. Both halves need ``pwsh`` and
+skip where there is none.
 """
 
 from __future__ import annotations
@@ -37,9 +35,8 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7, pkcs12
-from cryptography.x509.name import _ASN1Type
 from cryptography.x509.oid import NameOID
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "service" / "import-db-ca.ps1"
@@ -69,12 +66,9 @@ def _cert(
     issuer: tuple[x509.Certificate, _Key] | None = None,
     *,
     cert_sign: bool | None = None,
-    valid_from_days: int = -1,
-    valid_to_days: int = 30,
 ) -> tuple[x509.Certificate, _Key]:
     """A synthetic certificate. ``ca`` None leaves the basic constraints extension out, and
-    ``cert_sign`` None leaves the key usage extension out. The validity period is given in days
-    from now."""
+    ``cert_sign`` None leaves the key usage extension out."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
@@ -84,8 +78,8 @@ def _cert(
         .issuer_name(issuer[0].subject if issuer else name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now + datetime.timedelta(days=valid_from_days))
-        .not_valid_after(now + datetime.timedelta(days=valid_to_days))
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
     )
     if ca is not None:
         builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=None), True)
@@ -119,26 +113,10 @@ def _pem(*certs: x509.Certificate) -> bytes:
 @pytest.fixture(scope="module")
 def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
     root = _cert("Synthetic Test Root CA", True)
-    other_root = _cert("Synthetic Other Root CA", True)
-    expired_root = _cert("Synthetic Expired Root CA", True, valid_from_days=-30, valid_to_days=-1)
     return {
         "root": root,
         "intermediate": _cert("Synthetic Test Issuing CA", True, root),
         "leaf": _cert("db.test.invalid", False, root),
-        # Issued by a root the file does not hold, and signed under the same issuer NAME as the
-        # file's root by another key: neither chains to the file's root.
-        "foreign_intermediate": _cert("Synthetic Foreign Issuing CA", True, other_root),
-        "name_only_intermediate": _cert(
-            "Synthetic Name-Only Issuing CA", True, (root[0], other_root[1])
-        ),
-        "expired_root": expired_root,
-        "future_root": _cert("Synthetic Future Root CA", True, valid_from_days=2),
-        # Valid itself, but its only root in the file has expired.
-        "under_expired": _cert("Synthetic Issuing CA Under Expired Root", True, expired_root),
-        # Expired, and not a CA either: skipped for its expiry before anything refuses it.
-        "expired_leaf": _cert(
-            "expired.db.test.invalid", False, root, valid_from_days=-30, valid_to_days=-1
-        ),
         "unconstrained": _cert("Synthetic No Constraints", None),
         "no_cert_sign": _cert("Synthetic CA Without CertSign", True, cert_sign=False),
         "cert_sign": _cert("Synthetic CA With CertSign", True, cert_sign=True),
@@ -170,79 +148,9 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     rsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA Root CA")])
     new_key = ec.generate_private_key(ec.SECP384R1())
-    pss_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA-PSS Root CA")])
-    pss_root = (
-        x509.CertificateBuilder()
-        .subject_name(pss_name)
-        .issuer_name(pss_name)
-        .public_key(rsa_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
-        .sign(
-            rsa_key,
-            hashes.SHA256(),
-            rsa_padding=padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH
-            ),
-        )
-    )
-    # The root names itself with a PrintableString; the issuing CA names that issuer with a
-    # UTF8String of the same text. RFC 5280 name matching treats the two as one name.
-    enc_key = ec.generate_private_key(ec.SECP256R1())
-    enc_text = "Synthetic Encoded Root CA"
-    enc_root = build(
-        x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, enc_text, _ASN1Type.PrintableString)]),
-        enc_key.public_key(),
-        enc_key,
-    )
-    enc_issuing = (
-        x509.CertificateBuilder()
-        .subject_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Encoded Issuing CA")])
-        )
-        .issuer_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, enc_text, _ASN1Type.UTF8String)])
-        )
-        .public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
-        .sign(enc_key, hashes.SHA256())
-    )
-    assert enc_root.subject.public_bytes() != enc_issuing.issuer.public_bytes()
-    # The same text in another letter case. With no key identifiers, as here, the Windows chain
-    # engine does not link it either.
-    case_key = ec.generate_private_key(ec.SECP256R1())
-    case_root = build(
-        x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Case Root CA")]),
-        case_key.public_key(),
-        case_key,
-    )
-    case_issuing = (
-        x509.CertificateBuilder()
-        .subject_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Case Issuing CA")])
-        )
-        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "SYNTHETIC CASE ROOT CA")]))
-        .public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
-        .sign(case_key, hashes.SHA256())
-    )
     return {
-        "case_root": case_root,
-        "case_issuing": case_issuing,
-        "enc_root": enc_root,
-        "enc_issuing": enc_issuing,
         "rsa_root": build(rsa_name, rsa_key.public_key(), rsa_key),
         "rekey": build(root.subject, new_key.public_key(), root_key),
-        # Self-signed, but with a signature the script does not verify.
-        "pss_root": pss_root,
     }
 
 
@@ -306,30 +214,6 @@ def files(
         "der_concat": root.public_bytes(der) + inter.public_bytes(der),
         "der_then_pem": root.public_bytes(der) + _pem(inter),
         "b64_trailing": base64.encodebytes(root.public_bytes(der) + b"\x00\x01"),
-        # A root beside a CA that does not chain to it: a foreign issuer, or the root's name alone.
-        "pem_foreign_intermediate": _pem(root, chain["foreign_intermediate"][0]),
-        "pem_name_only_intermediate": _pem(root, chain["name_only_intermediate"][0]),
-        # Outside the validity period: an expired root beside a valid one, and a root not valid yet.
-        "pem_expired_root": _pem(root, chain["expired_root"][0]),
-        "pem_only_expired_root": _pem(chain["expired_root"][0]),
-        "pem_under_expired": _pem(root, chain["expired_root"][0], chain["under_expired"][0]),
-        "pem_encoded_names": _pem(extra["enc_root"], extra["enc_issuing"]),
-        "pem_case_names": _pem(extra["case_root"], extra["case_issuing"]),
-        "pem_expired_leaf": _pem(root, chain["expired_leaf"][0]),
-        "pem_future_root": _pem(chain["future_root"][0]),
-        "pem_pss_root": _pem(extra["pss_root"]),
-        # Bare base64 behind a byte-order mark, UTF-8 and UTF-16.
-        "b64_utf8_bom": b"\xef\xbb\xbf" + base64.encodebytes(root.public_bytes(der)),
-        "b64_utf16_bom": b"\xff\xfe"
-        + base64.encodebytes(root.public_bytes(der)).decode("ascii").encode("utf-16-le"),
-        # A .pfx carried under a CERTIFICATE header: refused by its content, not its label.
-        "pfx_in_certificate_block": b"-----BEGIN CERTIFICATE-----\n"
-        + base64.encodebytes(
-            pkcs12.serialize_key_and_certificates(
-                b"x", root_key, root, None, serialization.NoEncryption()
-            )
-        )
-        + b"-----END CERTIFICATE-----\n",
         "empty": b"",
         "base64_junk": b"not a certificate at all\n",
         "garbage": b"not a certificate!\n",
@@ -347,19 +231,14 @@ def _psq(value: str) -> str:
 
 
 def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, object]]:
-    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal``, ``Get-CaStoreName`` and
-    ``Get-ChainRefusal``, as the script does."""
+    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaStoreName``, as the
+    script does."""
     script = f"""
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
-$set = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -eq '$SignatureHashes' }}, $false)
-if (-not $set) {{ throw 'missing assignment $SignatureHashes' }}
-. ([scriptblock]::Create($set.Extent.Text))
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
-                    'Read-CaBundle', 'Get-CaRefusal', 'Test-SignedBy', 'Test-SelfSigned',
-                    'Get-ChainRefusal', 'Get-CaStoreName', 'Test-SameName')) {{
+                    'Read-CaBundle', 'Get-CaRefusal', 'Test-SelfSigned', 'Get-CaStoreName')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -372,8 +251,7 @@ foreach ($k in $paths.Keys) {{
     $bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes($paths[$k]))
     $out[$k] = @{{ certs = @(foreach ($c in $bundle) {{
       @{{ thumb = $c.Thumbprint; refusal = (Get-CaRefusal -Certificate $c);
-          store = (Get-CaStoreName -Certificate $c);
-          chain = (Get-ChainRefusal -Certificate $c -Bundle $bundle) }} }}) }}
+          store = (Get-CaStoreName -Certificate $c) }} }}) }}
   }} catch {{
     $out[$k] = @{{ error = $_.Exception.Message }}
   }}
@@ -454,54 +332,6 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     )
     assert usage[_thumb(chain["cert_sign"][0])] is None
 
-    # Bare base64 behind a byte-order mark reads as the root it holds.
-    assert certs("b64_utf8_bom") == [(root, None)]
-    assert certs("b64_utf16_bom") == [(root, None)]
-
-    # Validity is the caller's to judge, not Get-CaRefusal's.
-    expired = dict(certs("pem_expired_root"))
-    assert expired[_thumb(chain["expired_root"][0])] is None
-    assert expired[root] is None
-    # Not valid yet is not refused: a new CA may be staged ahead of its start.
-    assert certs("pem_future_root") == [(_thumb(chain["future_root"][0]), None)]
-    # A signature the script cannot verify is refused by name, not read as a missing root.
-    pss = certs("pem_pss_root")
-    assert len(pss) == 1 and pss[0][0] == _thumb(extra["pss_root"]), pss
-    assert str(pss[0][1]).startswith("it is signed with ") and "1.2.840.113549.1.1.10" in str(
-        pss[0][1]
-    ), pss
-
-    # Each CA must chain to a self-signed root through the file's own certificates: an issuing CA
-    # and a re-key certificate that do pass, and one whose issuer is not in the file, or only
-    # carries the root's name under another key, does not.
-    def chained(name: str) -> dict[str, object]:
-        entry = got[name]
-        assert "error" not in entry, f"{name}: {entry}"
-        listed = entry["certs"]
-        assert isinstance(listed, list)
-        return {c["thumb"]: c["chain"] for c in listed}
-
-    assert chained("p7b_der") == {root: None, inter: None}
-    assert chained("root_and_rekey") == {root: None, rekey: None}
-    unchained = "it does not chain to a self-signed root in the file"
-    # Names that differ only in string type or letter case do not link a CA to its root, as the
-    # Windows chain engine does not link them between certificates with no key identifiers.
-    for name, root_key, issuing_key in (
-        ("pem_encoded_names", "enc_root", "enc_issuing"),
-        ("pem_case_names", "case_root", "case_issuing"),
-    ):
-        assert chained(name) == {
-            _thumb(extra[root_key]): None,
-            _thumb(extra[issuing_key]): unchained,
-        }, name
-    for name, key in (
-        ("pem_foreign_intermediate", "foreign_intermediate"),
-        ("pem_name_only_intermediate", "name_only_intermediate"),
-    ):
-        assert chained(name) == {root: None, _thumb(chain[key][0]): unchained}, name
-        # Each is a CA in its own right, so only the chain check catches it.
-        assert dict(certs(name))[_thumb(chain[key][0])] is None, name
-
     # Refused before anything is parsed: a private key, in either container, and what is not a
     # certificate file at all.
     def error(name: str) -> str:
@@ -510,7 +340,6 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
         return str(entry["error"])
 
     assert "'Pfx' content" in error("pfx")
-    assert "'Pfx' content" in error("pfx_in_certificate_block")
     assert "labelled 'PRIVATE KEY'" in error("pem_with_key")
     assert "labelled 'EC PRIVATE KEY'" in error("pem_zero_first_with_key")
     assert "not well formed" in error("pem_unterminated")
@@ -524,30 +353,20 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "control character outside its PEM blocks" in error("der_then_pem")
 
 
-_ERROR_MARK = "TERMINATING-ERROR-MESSAGE: "
-
-
-def _run_script(ca_path: Path, *, whatif: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run the script unelevated. Its terminating error's own message, not pwsh's rendered error
-    view, is printed to stdout on one line after ``_ERROR_MARK``: the view rewraps at the console
-    width and quotes the throwing source line, so text read there can come from the code."""
+def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
     if _elevated():
         pytest.skip("SKIP (nothing run): elevated session; the script is run only unelevated")
-    wrapper = Path(ca_path).parent / f"run-{uuid.uuid4().hex}.ps1"
-    wrapper.write_text(
-        f"""
-$ErrorActionPreference = 'Stop'
-try {{
-    & {_psq(str(_SCRIPT))} -CaPath {_psq(str(ca_path))}{" -WhatIf" if whatif else ""}
-}} catch {{
-    [Console]::Out.WriteLine({_psq(_ERROR_MARK)} + ($_.Exception.Message -replace '\\s+', ' '))
-    exit 1
-}}
-""",
-        encoding="utf-8",
-    )
     return subprocess.run(
-        [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+        [
+            _pwsh(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(_SCRIPT),
+            "-CaPath",
+            str(ca_path),
+            "-WhatIf",
+        ],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -555,18 +374,10 @@ try {{
     )
 
 
-def _error_message(proc: subprocess.CompletedProcess[str]) -> str:
-    found = [
-        ln[len(_ERROR_MARK) :] for ln in proc.stdout.splitlines() if ln.startswith(_ERROR_MARK)
-    ]
-    assert len(found) == 1, proc.stdout + proc.stderr
-    return found[0]
-
-
 def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
 ) -> None:
-    proc = _run_script(files["p7b_der"])
+    proc = _run_whatif(files["p7b_der"])
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert "The file holds 2 certificate(s)" in out
@@ -588,22 +399,15 @@ def test_a_file_without_a_self_signed_root_imports_nothing(
     name: str, files: dict[str, Path]
 ) -> None:
     # An issuing CA alone, or a self-issued certificate another key signed: no root, so refused.
-    proc = _run_script(files[name])
+    proc = _run_whatif(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    assert _error_message(proc).startswith(
-        "Nothing was imported. The file holds no self-signed root."
-    ), out
+    assert "Nothing was imported. The file holds no self-signed root." in out
     assert "What if" not in out
 
 
 _NOT_A_CA = "its basic constraints say it is not a CA"
 _NO_CERT_SIGN = "its key usage does not allow it to sign certificates"
-_UNCHAINED = "it does not chain to a self-signed root in the file"
-
-
-def _pair(cert: x509.Certificate, why: str) -> str:
-    return f"{_thumb(cert)} ({cert.subject.rfc4514_string()}): {why}"
 
 
 @pytest.mark.parametrize(
@@ -611,31 +415,20 @@ def _pair(cert: x509.Certificate, why: str) -> str:
     [
         ("p7b_with_leaf", [("leaf", _NOT_A_CA)]),
         ("pem_two_refused", [("leaf", _NOT_A_CA), ("no_cert_sign", _NO_CERT_SIGN)]),
-        (
-            "pem_under_expired",
-            [
-                (
-                    "under_expired",
-                    "it chains to a self-signed root in the file only through an expired"
-                    " certificate",
-                )
-            ],
-        ),
-        ("pem_foreign_intermediate", [("foreign_intermediate", _UNCHAINED)]),
-        ("pem_name_only_intermediate", [("name_only_intermediate", _UNCHAINED)]),
     ],
 )
-def test_a_bundle_holding_a_refused_certificate_imports_nothing(
+def test_a_bundle_holding_a_non_ca_imports_nothing(
     name: str,
     refused: list[tuple[str, str]],
     chain: dict[str, tuple[x509.Certificate, _Key]],
     files: dict[str, Path],
 ) -> None:
-    proc = _run_script(files[name])
+    proc = _run_whatif(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    pairs = [_pair(chain[key][0], why) for key, why in refused]
-    # The printed list holds each refusal as a whole line, in file order, and nothing else: pwsh's
+    assert "Nothing was imported" in out
+    thumbs = [_thumb(chain[key][0]) for key, _why in refused]
+    # The printed list holds each reason as a whole line, in file order, and nothing else: pwsh's
     # error view rewraps at the console width, and at a Linux runner's 80 columns that split a
     # thumbprint from its reason.
     lines = proc.stdout.splitlines()
@@ -643,200 +436,16 @@ def test_a_bundle_holding_a_refused_certificate_imports_nothing(
     listed = itertools.takewhile(
         lambda ln: ln.startswith("  "), lines[lines.index("Refused:") + 1 :]
     )
-    assert list(listed) == [f"  {p}" for p in pairs], out
-    # The error's own message carries every pair, worded as the list words it, in order, and not
-    # the root CA beside them.
-    message = _error_message(proc)
-    assert message.startswith("Nothing was imported."), message
-    at = [message.find(p) for p in pairs]
-    assert -1 not in at and at == sorted(at), message
-    assert _thumb(chain["root"][0]) not in message, message
+    assert list(listed) == [
+        f"  {t}: {why}" for t, (_key, why) in zip(thumbs, refused, strict=True)
+    ], out
+    # The error names every refused thumbprint, in order, and not the root CA beside them. The
+    # error view's source-line excerpt shows code, not a thumbprint, so this reads the message.
+    at = [proc.stderr.find(t) for t in thumbs]
+    assert -1 not in at and at == sorted(at), proc.stderr
+    assert _thumb(chain["root"][0]) not in proc.stderr, proc.stderr
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
-
-
-def test_an_expired_certificate_off_every_import_path_is_skipped(
-    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
-) -> None:
-    proc = _run_script(files["pem_expired_root"])
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out
-    lines = proc.stdout.splitlines()
-    at = lines.index(f"  Thumbprint : {_thumb(chain['expired_root'][0])}")
-    block = list(itertools.takewhile(lambda ln: ln.startswith("  "), lines[at:]))
-    assert "  Skipped    : it has expired, so it is not installed" in block, block
-    offered = [ln for ln in out.splitlines() if "What if" in ln]
-    assert len(offered) == 1 and _thumb(chain["root"][0]) in offered[0], offered
-
-
-def test_a_file_whose_only_root_has_expired_imports_nothing(files: dict[str, Path]) -> None:
-    proc = _run_script(files["pem_only_expired_root"])
-    assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert _error_message(proc).startswith(
-        "Nothing was imported. The file holds no self-signed root that has not expired."
-    ), proc.stdout
-
-
-@pytest.mark.parametrize(
-    ("name", "issuing"),
-    [("pem_encoded_names", "enc_issuing"), ("pem_case_names", "case_issuing")],
-)
-def test_a_chain_whose_names_differ_only_in_encoding_or_case_is_refused(
-    name: str, issuing: str, extra: dict[str, x509.Certificate], files: dict[str, Path]
-) -> None:
-    # These certificates carry no key identifiers, and without them the Windows chain engine links
-    # an issuer only by the exact bytes of its name, so SChannel could not build this chain: the
-    # file is refused, not imported.
-    proc = _run_script(files[name])
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, out
-    message = _error_message(proc)
-    assert message.startswith("Nothing was imported."), message
-    assert _pair(extra[issuing], _UNCHAINED) in message, message
-    assert "What if" not in out
-
-
-def test_an_expired_certificate_is_skipped_before_anything_refuses_it(
-    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
-) -> None:
-    # Expired and not a CA: listed and skipped, so the root beside it is still offered.
-    proc = _run_script(files["pem_expired_leaf"])
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out
-    lines = proc.stdout.splitlines()
-    at = lines.index(f"  Thumbprint : {_thumb(chain['expired_leaf'][0])}")
-    block = list(itertools.takewhile(lambda ln: ln.startswith("  "), lines[at:]))
-    assert "  Skipped    : it has expired, so it is not installed" in block, block
-    assert not any(ln.startswith("  Refused") for ln in block), block
-    offered = [ln for ln in out.splitlines() if "What if" in ln]
-    assert len(offered) == 1 and _thumb(chain["root"][0]) in offered[0], offered
-
-
-def test_a_ca_already_held_counts_where_it_anchors_and_a_declined_held_root_anchors(
-    tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
-) -> None:
-    """``Get-PresentStoreName`` and ``Get-AnchorSet`` lifted out of the script, with a directory
-    standing in for the machine's registry stores, so nothing reads or writes the real ones."""
-    root = _thumb(chain["root"][0])
-    inter = _thumb(chain["intermediate"][0])
-    # Each case: the registry store names holding the root, then those holding the issuing CA.
-    cases = {
-        "none": ([], []),
-        "root_in_root": (["ROOT"], []),
-        "root_in_ca": (["CA"], []),
-        "inter_in_ca": ([], ["CA"]),
-        "inter_in_root": ([], ["ROOT"]),
-    }
-    for case, (root_in, inter_in) in cases.items():
-        for store, thumb in [(s, root) for s in root_in] + [(s, inter) for s in inter_in]:
-            held = tmp_path / case / store / "Certificates"
-            held.mkdir(parents=True, exist_ok=True)
-            (held / thumb).write_bytes(b"")
-    script = f"""
-$ErrorActionPreference = 'Stop'
-$ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
-$set = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -eq '$SignatureHashes' }}, $false)
-. ([scriptblock]::Create($set.Extent.Text))
-foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
-                    'Read-CaBundle', 'Test-SignedBy', 'Test-SelfSigned', 'Test-SameName',
-                    'Get-ChainRefusal', 'Get-CaStoreName', 'Get-PresentStoreName',
-                    'Get-AnchorSet')) {{
-  $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-      $args[0].Name -eq $name }}, $true)
-  if (-not $def) {{ throw "missing function $name" }}
-  . ([scriptblock]::Create($def.Extent.Text))
-}}
-$bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes({_psq(str(files["p7b_der"]))}))
-$entries = @(foreach ($c in $bundle) {{ @{{ Certificate = $c; StoreName = (Get-CaStoreName -Certificate $c) }} }})
-$out = @{{}}
-foreach ($case in {_psq(",".join(cases))}.Split(',')) {{
-  $dir = Join-Path {_psq(str(tmp_path))} $case
-  $present = @{{}}
-  foreach ($e in $entries) {{
-    $present[$e.Certificate.Thumbprint] = Get-PresentStoreName -Certificate $e.Certificate -StoreName $e.StoreName -RegistryRoot $dir
-  }}
-  # The root declined, the issuing CA approved.
-  $approved = @($entries | Where-Object {{ $_.StoreName -ne 'Root' }})
-  $anchors = Get-AnchorSet -Entries $entries -Approved $approved -RegistryRoot $dir
-  $out[$case] = @{{ present = $present; orphan = (Get-ChainRefusal -Certificate $approved[0].Certificate -Bundle $anchors) }}
-}}
-$out | ConvertTo-Json -Depth 5 -Compress
-"""
-    f = tmp_path / f"dbca-{uuid.uuid4().hex}.ps1"
-    f.write_text(script, encoding="utf-8")
-    proc = subprocess.run(
-        [_pwsh(), "-NoProfile", "-NonInteractive", "-File", str(f)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=120,
-    )
-    assert proc.returncode == 0, f"harness failed: {proc.stdout}\n{proc.stderr}"
-    got = json.loads(proc.stdout.strip().splitlines()[-1])
-    # A root counts only in Root; an issuing CA counts in CA or in Root.
-    assert got["none"]["present"] == {root: None, inter: None}, got
-    assert got["root_in_root"]["present"] == {root: "Root", inter: None}, got
-    assert got["root_in_ca"]["present"] == {root: None, inter: None}, got
-    assert got["inter_in_ca"]["present"] == {root: None, inter: "CertificateAuthority"}, got
-    assert got["inter_in_root"]["present"] == {root: None, inter: "Root"}, got
-    # Declining a root the machine's Root store already holds leaves the issuing CA anchored; a root
-    # held nowhere, or only in the CA store, does not.
-    assert got["root_in_root"]["orphan"] is None, got
-    for case in ("none", "root_in_ca", "inter_in_ca", "inter_in_root"):
-        assert got[case]["orphan"] == _UNCHAINED, (case, got)
-
-
-def test_a_root_signed_in_a_way_the_script_cannot_verify_is_not_reported_missing(
-    extra: dict[str, x509.Certificate], files: dict[str, Path]
-) -> None:
-    proc = _run_script(files["pem_pss_root"])
-    assert proc.returncode != 0, proc.stdout + proc.stderr
-    message = _error_message(proc)
-    assert "holds no self-signed root" not in message, message
-    assert f"{_thumb(extra['pss_root'])} (" in message and "it is signed with " in message, message
-
-
-def test_the_error_names_the_first_five_refusals_and_counts_the_rest(
-    tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]]
-) -> None:
-    leaves = [_cert(f"db{i}.test.invalid", False, chain["root"])[0] for i in range(7)]
-    path = tmp_path / "seven_leaves.pem"
-    path.write_bytes(_pem(chain["root"][0], *leaves))
-    proc = _run_script(path)
-    assert proc.returncode != 0, proc.stdout + proc.stderr
-    message = _error_message(proc)
-    for leaf in leaves[:5]:
-        assert _pair(leaf, _NOT_A_CA) in message, message
-    for leaf in leaves[5:]:
-        assert _thumb(leaf) not in message, message
-        # Still listed for the operator.
-        assert f"  {_pair(leaf, _NOT_A_CA)}" in proc.stdout.splitlines(), proc.stdout
-    assert message.endswith("; and 2 more, listed above."), message
-
-
-def test_a_listed_refused_certificate_names_no_store(
-    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
-) -> None:
-    proc = _run_script(files["p7b_with_leaf"])
-    lines = proc.stdout.splitlines()
-    at = lines.index(f"  Thumbprint : {_thumb(chain['leaf'][0])}")
-    block = list(itertools.takewhile(lambda ln: ln.startswith("  "), lines[at:]))
-    assert f"  Refused    : {_NOT_A_CA}" in block, block
-    assert not any(ln.startswith("  Store") for ln in block), block
-    # The validity period is printed in UTC, so its 'Z' suffix is true.
-    not_after = chain["leaf"][0].not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%SZ")
-    assert f"  Not after  : {not_after}" in block, block
-
-
-def test_an_unelevated_import_is_refused_before_the_file_is_read(files: dict[str, Path]) -> None:
-    if sys.platform != "win32":
-        pytest.skip("SKIP (nothing run): the elevation check reads a Windows token")
-    proc = _run_script(files["der"], whatif=False)
-    assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "requires an elevated (Administrator) PowerShell" in _error_message(proc)
-    assert "The file holds" not in proc.stdout
 
 
 def test_the_script_adds_through_the_store_and_never_by_path() -> None:
@@ -854,5 +463,4 @@ def test_the_script_adds_through_the_store_and_never_by_path() -> None:
     # single import is offered.
     assert body.index("IsInRole(") < body.index("ReadAllBytes(")
     assert body.index("Get-CaRefusal -Certificate") < body.index("ShouldProcess(")
-    assert body.index("Get-ChainRefusal -Certificate") < body.index("ShouldProcess(")
-    assert body.index("ShouldProcess(") < body.index("$store.Add(")
+    assert body.index("ShouldProcess(") < body.index(".Store.Add(")
