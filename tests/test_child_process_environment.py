@@ -1225,13 +1225,6 @@ _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
         "sets the ctypes prototype of the call listed on the line above; it starts nothing"
     ),
     ("service.py", "install_service", "ShellExecuteW"): _SERVICE_CONTROL,
-    # Accepted as an exemption (vault BACKLOG #2716): the service never runs it, and the tools it
-    # runs are the developer's own, configured through the developer's environment.
-    ("checks.py", "_run_tool", "subprocess.run"): (
-        "the developer's own `messagefoundry check` command, run by hand or in CI and never by the "
-        "service; ruff and mypy read their settings from the developer's environment, so it passes "
-        "all of it plus one variable"
-    ),
     ("tray/actions.py", "_run_detached", "subprocess.Popen"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "os.startfile"): _TRAY_OPENS_FOR_ITS_USER,
     ("tray/actions.py", "_open_path", "webbrowser.open"): _TRAY_OPENS_FOR_ITS_USER,
@@ -1270,6 +1263,9 @@ _MUST_CHOOSE = frozenset(
         # The dependency auditor's pip and pip-audit, with auditor_environment: an allowlist, so
         # no MEFOR_* secret and no CI token.
         ("security/audit_all_platforms.py", "_run", "subprocess.run"),
+        # The check gate's advisory ruff and mypy, with worker_environment plus the tools' own
+        # names: once an exemption that passed the whole environment (BACKLOG #5375).
+        ("checks.py", "_run_tool", "subprocess.run"),
     }
 )
 

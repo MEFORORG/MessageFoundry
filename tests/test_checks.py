@@ -8,7 +8,8 @@ import io
 import json
 import logging
 import re
-import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -387,9 +388,7 @@ def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        shutil, "which", lambda _: None
-    )  # the module object the checks module calls
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: False)
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
@@ -404,7 +403,9 @@ def test_run_checks_no_lint_excludes_tools() -> None:
     assert "validate" in names and "dryrun" in names
 
 
-@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff advisory pass is run-if-installed")
+@pytest.mark.skipif(
+    not checks._tool_installed("ruff"), reason="ruff advisory pass is run-if-installed"
+)
 def test_ruff_security_ignores_placeholder_token_fp() -> None:
     # ADR 0144 Increment 3: full `S` over the shipped samples trips S105 on the ADR-0015 body_secrets
     # placeholder token (_TOK_PASSWORD); the curated --ignore S105,S106,S107 suppresses that structural
@@ -414,6 +415,53 @@ def test_ruff_security_ignores_placeholder_token_fp() -> None:
     assert rs.required is False  # still advisory, never blocks
     assert rs.skipped is False and rs.ok is True
     assert "S105" not in rs.detail
+
+
+def test_lint_tool_runs_by_interpreter_path_with_no_engine_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5375: the tool was started by its bare name, which a PATH search resolves (the
+    working directory first, on Windows), and with the engine's whole environment."""
+
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen["cmd"] = cmd
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "Key-Pq4Zt8Wm")
+    monkeypatch.setenv("VAULT_TOKEN", "hvs.Tok-Rx2Lc7")
+    monkeypatch.setenv("PGPASSWORD", "Pw-Hn5Dv1")
+    monkeypatch.setenv("CI_DEPLOY_TOKEN_B614", "Ci-Gs9Kb3")
+    monkeypatch.setenv("MYPYPATH", "stubs")
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = checks._run_tool("ruff", "ruff", ["check", "cfg"])
+
+    assert result.ok is True and result.skipped is False
+    cmd = seen["cmd"]
+    assert cmd[0] == sys.executable and Path(cmd[0]).is_absolute()
+    assert cmd[-4:] == ["-m", "ruff", "check", "cfg"]
+    assert "-P" in cmd and cmd[cmd.index("utf8") - 1] == "-X"
+    env = seen["env"]
+    upper = {name.upper() for name in env}
+    assert not any(name.startswith("MEFOR_") for name in upper)
+    assert {"VAULT_TOKEN", "PGPASSWORD", "CI_DEPLOY_TOKEN_B614"}.isdisjoint(upper)
+    assert env.get("MYPYPATH") == "stubs"  # the tools' own variables still cross
+    assert "PATH" in upper
+
+
+def test_lint_tool_absent_is_skipped_without_starting_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_run(*_a: object, **_k: object) -> None:
+        raise AssertionError("a tool that is not installed must not be started")
+
+    monkeypatch.setattr(subprocess, "run", no_run)
+    result = checks._run_tool("mypy", "mypy_b614_not_a_module", ["cfg"])
+    assert result.skipped is True and result.detail == "not installed"
 
 
 def test_accepts_candidate_flags_leading_guard_filter_and_is_advisory(tmp_path: Path) -> None:

@@ -65,7 +65,7 @@ its acknowledgement. It calls the function ``serve`` calls, so the refusal reads
 ``retention-overrides`` (vault BACKLOG #2368) is its graph half: it FAILS a connection's own
 ``messages_days = 0`` or ``dead_letter_days = 0`` that ``serve``'s registry guard refuses.
 
-``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
+``ruff`` and ``mypy`` are **advisory**: run only when installed for this interpreter, and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
 least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
@@ -102,9 +102,7 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
-import os
 import re
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set
@@ -495,8 +493,8 @@ def run_checks(
         ),
     ]
     if run_lint:
-        results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
-        results.append(_run_tool("mypy", ["mypy", str(config_dir)]))
+        results.append(_run_tool("ruff", "ruff", ["check", str(config_dir)]))
+        results.append(_run_tool("mypy", "mypy", [str(config_dir)]))
         # ADR 0144 part B (Increment 3 curation): flake8-bandit "S" over the config dir — advisory,
         # run-if-installed, the generic SAST net beside the domain-aware _check_handler_security. Keep
         # the FULL S select for breadth (it still catches weak crypto S324, unsafe yaml.load S506,
@@ -509,7 +507,8 @@ def run_checks(
         results.append(
             _run_tool(
                 "ruff-security",
-                ["ruff", "check", "--select", "S", "--ignore", "S105,S106,S107", str(config_dir)],
+                "ruff",
+                ["check", "--select", "S", "--ignore", "S105,S106,S107", str(config_dir)],
             )
         )
     # Appended AFTER the ruff/mypy advisory block. The first four are advisory (required=False, never
@@ -4226,21 +4225,58 @@ def _check_reference_backend(
     )
 
 
-def _run_tool(name: str, cmd: list[str]) -> CheckResult:
-    """Advisory: run ``cmd`` only if its executable resolves; absent → skipped, never blocking."""
-    if shutil.which(cmd[0]) is None:
-        return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
+#: The lint tools' own variables, the only ones beyond a Python child's start-up names that cross
+#: into their environment (BACKLOG #5375): where mypy finds stubs and keeps its cache, where ruff
+#: keeps its cache, the XDG folders both read their user configuration and cache from on POSIX, and
+#: the active virtual environment. Nothing of the engine's namespace, so no ``MEFOR_*`` value and
+#: no ``VAULT_TOKEN`` or ``PGPASSWORD`` reaches either tool.
+_LINT_TOOL_NAMES = frozenset(
+    {
+        "MYPYPATH",
+        "MYPY_CACHE_DIR",
+        "RUFF_CACHE_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "VIRTUAL_ENV",
+    }
+)
+
+
+def _tool_installed(module: str) -> bool:
+    """Whether ``module`` is importable by this interpreter, which is the one that runs it."""
+    import importlib.util
+
     try:
-        # nosec: cmd[0] is a fixed tool name (ruff/mypy), no shell; args are repo paths (low-27).
-        # ruff writes UTF-8. mypy writes its interpreter's stdout encoding, the locale code page on
-        # 3.14 and UTF-8 on 3.15, so PYTHONIOENCODING pins it to match the decode on both.
-        proc = subprocess.run(  # nosec B603 B607
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
+    """Advisory: run ``python -m <module> <args>`` with this interpreter, only when the module is
+    installed for it; absent → skipped, never blocking.
+
+    The tool is named by this interpreter's absolute path and a module, never a bare program name a
+    ``PATH`` search resolves; on Windows that search reads the working directory first, which can be
+    the config repository under check. :func:`~messagefoundry.childenv.python_module_argv` adds
+    ``-P``, so the working directory is off the child's import path too. The child gets
+    :func:`~messagefoundry.childenv.worker_environment` plus :data:`_LINT_TOOL_NAMES`, not the
+    caller's whole environment (BACKLOG #5375). ``-X utf8`` pins the output encoding to the UTF-8
+    the decode below expects, and holds under ``-I``, which ``PYTHONIOENCODING`` would not."""
+    from messagefoundry.childenv import python_module_argv, worker_environment
+
+    if not _tool_installed(module):
+        return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
+    cmd = [*python_module_argv(module, extra_flags=("-X", "utf8")), *args]
+    try:
+        # nosec: an absolute interpreter path and a fixed module, no shell; args are repo paths.
+        proc = subprocess.run(  # nosec B603
             cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env=worker_environment(extra_names=_LINT_TOOL_NAMES),
             check=False,
             timeout=120,
         )
