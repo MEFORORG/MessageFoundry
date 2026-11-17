@@ -2246,25 +2246,61 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
 # words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,
 # and on any dialect a column `receive`, which T-SQL does not reserve.
+#
+# BACKLOG #5346 extended this DENYLIST rather than narrowing the gate to an allowlist of read tokens:
+# a SELECT names arbitrary tables, columns and functions, so an allowlist of words cannot be written,
+# and a grammar-level allow shape is a SQL parser, which this gate says it is not. The extension is
+# every T-SQL statement verb that can follow a SELECT with no `;` and change state on the pooled
+# autocommit connection or beyond it: `SET` (`SET IMPLICIT_TRANSACTIONS ON` would leave every later
+# lookup on that connection in an open transaction), `USE` and `SETUSER` (session database and
+# identity), `COMMIT`/`ROLLBACK`/`SAVE` (transaction control, as `BEGIN` is), `SEND` and `MOVE`
+# (Service Broker), `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `DBCC`, `RECONFIGURE`, `CHECKPOINT`,
+# `ADD` (`ADD SIGNATURE`) and `ENABLE`/`DISABLE` (`... TRIGGER`). `OPENROWSET`, `OPENDATASOURCE`
+# and `OPENQUERY` are refused too, though they sit inside a read's FROM: each sends a pass-through
+# query this scan cannot read to another server or provider, and `OPENROWSET(BULK ...)` reads a
+# server-side file. PostgreSQL and MySQL need a `;` between statements, which rule 3 refuses, so their
+# own statement verbs are not listed. Fail-closed costs at least a MySQL `USE INDEX` hint, a MySQL
+# `CHARACTER SET` cast and any unquoted name spelled like one of these words; quote such a name.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
+        "ADD",
         "ALTER",
+        "BACKUP",
         "BEGIN",
+        "CHECKPOINT",
+        "COMMIT",
         "CREATE",
+        "DBCC",
         "DELETE",
         "DENY",
+        "DISABLE",
         "DROP",
+        "ENABLE",
         "EXEC",
         "EXECUTE",
         "GRANT",
         "INSERT",
         "INTO",
+        "KILL",
         "MERGE",
+        "MOVE",
+        "OPENDATASOURCE",
+        "OPENQUERY",
+        "OPENROWSET",
         "RECEIVE",
+        "RECONFIGURE",
+        "RESTORE",
         "REVOKE",
+        "ROLLBACK",
+        "SAVE",
+        "SEND",
+        "SET",
+        "SETUSER",
+        "SHUTDOWN",
         "TRUNCATE",
         "UPDATE",
         "UPDATETEXT",
+        "USE",
         "WRITETEXT",
     }
 )

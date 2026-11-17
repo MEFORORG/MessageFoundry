@@ -696,6 +696,59 @@ def test_a_crlf_ended_dash_comment_is_still_read(dialect: str) -> None:
         database._require_read_only("SELECT 1 --x\r\nDELETE FROM t", dialect=dialect)
 
 
+# BACKLOG #5346: T-SQL statements a SELECT can carry with no `;` that the keyword set missed, each
+# with the keyword the refusal must name.
+_STATE_CHANGING_TSQL = [
+    ("SELECT 1 SET IMPLICIT_TRANSACTIONS ON", "SET"),
+    ("SELECT 1 USE otherdb", "USE"),
+    ("SELECT 1 SETUSER 'dbo'", "SETUSER"),
+    ("SELECT 1 COMMIT", "COMMIT"),
+    ("SELECT 1 ROLLBACK", "ROLLBACK"),
+    ("SELECT 1 SAVE TRANSACTION s", "SAVE"),
+    ("SELECT 1 SEND ON CONVERSATION @h MESSAGE TYPE m", "SEND"),
+    ("SELECT 1 MOVE CONVERSATION @h TO @g", "MOVE"),
+    ("SELECT 1 BACKUP DATABASE d TO DISK = 'x.bak'", "BACKUP"),
+    ("SELECT 1 RESTORE DATABASE d FROM DISK = 'x.bak'", "RESTORE"),
+    ("SELECT 1 KILL 52", "KILL"),
+    ("SELECT 1 SHUTDOWN WITH NOWAIT", "SHUTDOWN"),
+    ("SELECT 1 DBCC FREEPROCCACHE", "DBCC"),
+    ("SELECT 1 RECONFIGURE", "RECONFIGURE"),
+    ("SELECT 1 CHECKPOINT", "CHECKPOINT"),
+    ("SELECT 1 ADD SIGNATURE TO p BY CERTIFICATE c", "ADD"),
+    ("SELECT 1 DISABLE TRIGGER t ON patients", "DISABLE"),
+    ("SELECT 1 ENABLE TRIGGER t ON patients", "ENABLE"),
+    ("SELECT 1 WRITETEXT t.c @p 'x'", "WRITETEXT"),
+    ("SELECT * FROM OPENROWSET('SQLNCLI', 's', 'DELETE FROM p')", "OPENROWSET"),
+    ("SELECT * FROM OPENQUERY(linked, 'DELETE FROM p')", "OPENQUERY"),
+    ("SELECT * FROM OPENDATASOURCE('SQLNCLI', 's').d.dbo.p", "OPENDATASOURCE"),
+]
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+@pytest.mark.parametrize(("stmt", "keyword"), _STATE_CHANGING_TSQL)
+def test_a_state_changing_tsql_verb_after_a_select_is_refused(
+    stmt: str, keyword: str, dialect: str
+) -> None:
+    """BACKLOG #5346. Each passed onto the autocommit lookup pool before: none was in the set.
+    Red mutation: drop any one keyword from `_SQL_WRITE_KEYWORDS`. Its case reds."""
+    with pytest.raises(DbLookupError, match=f"found a '{keyword}' keyword"):
+        database._require_read_only(stmt, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "stmt", ["SELECT 1 {call dbo.p}", "SELECT 1 {?= call dbo.p(?)}", "SELECT {fn NOW()}, {call p}"]
+)
+def test_an_odbc_call_escape_after_a_select_is_refused(stmt: str) -> None:
+    """BACKLOG #5346's ODBC limb, pinned on the sqlserver preset the lookup path uses."""
+    with pytest.raises(DbLookupError, match="found a 'CALL' keyword"):
+        database._require_read_only(stmt)
+
+
+def test_a_quoted_name_spelled_like_a_new_keyword_is_still_read() -> None:
+    """Control for #5346: the refusal is of the bare word, so a quoted name passes."""
+    database._require_read_only('SELECT [set], "use", [backup] FROM t WHERE [kill] = 1')
+
+
 _MYSQL_COMMENT_MISSES = [
     # MySQL needs whitespace after `--`, so this is `5 - -1`, then INTO.
     "SELECT 5 --1 INTO OUTFILE '/tmp/x'",
