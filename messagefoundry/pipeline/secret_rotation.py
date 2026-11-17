@@ -285,8 +285,9 @@ async def open_rotation_record(
     before it, at least the schema step, the store id pin check and, on SQL Server, the database
     option switch. A ``serve`` start calls it too, after its own open has written under the key,
     through :func:`reconcile_rotation_meta`, which says when: at least for a changed key the keyed
-    audit chain has not rolled to, and for one it has rolled to while a record stands open for
-    another key (BACKLOG #4942). It passes ``keep_another``:
+    audit chain has not rolled to, unless the record already names that key or cannot be read,
+    and for one it has rolled to while a record stands open for another key (BACKLOG #4942). It
+    passes ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
     let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates. A start on
@@ -372,9 +373,10 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
     It holds for a record naming this key. It also holds for a record that cannot be read, because
     this function fails toward NOT stamping: an unstamped key over-reports its age, and a false stamp
     is what would lift an overdue refusal. A record naming another key does not hold here: the key
-    in use was changed by hand. Where the keyed audit chain has not rolled to that key,
-    :func:`reconcile_rotation_meta` holds it anyway and keeps the record (BACKLOG #4942); elsewhere
-    it stamps as any such change does."""
+    in use was changed by hand. On a store with a keyed audit chain,
+    :func:`reconcile_rotation_meta` holds it anyway and keeps the record (BACKLOG #4942), whether or
+    not the chain has rolled to the key in use; on a store with none it stamps as any such change
+    does."""
     if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED:
         return None
     # A key id has one length, so one of any other length is a damaged record, not another key.
