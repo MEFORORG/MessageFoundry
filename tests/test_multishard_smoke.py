@@ -55,6 +55,29 @@ pytestmark = pytest.mark.timeout(
     120
 )  # two engine spawns + a shared-store drain; the 60s default is tight
 
+#: The sign-in read this module's clients take, in seconds: well inside the 120 s budget above
+#: (vault BACKLOG #2950 added items 24 and 31). The shipped read, 150 s, outlasts that budget, so a
+#: sign-in to a stalled engine would meet pytest-timeout's thread method first, which ends the
+#: whole run rather than this test. Bounded here, the same stall fails the one call instead.
+_SMOKE_SIGN_IN_READ_S = 30.0
+
+
+@pytest.fixture(autouse=True)
+def _sign_in_read_inside_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    import messagefoundry.apiclient.client as client_module
+
+    monkeypatch.setattr(client_module, "SIGN_IN_TIMEOUT_SECONDS", _SMOKE_SIGN_IN_READ_S)
+
+
+def test_the_sign_in_read_fits_inside_this_modules_budget() -> None:
+    """RED when: a client in this module would wait longer for a sign-in's reply than the module's
+    pytest-timeout budget allows, the case the fixture above exists to rule out."""
+    budget = pytestmark.args[0]  # the timeout(120) above, read rather than restated
+    with EngineClient("http://127.0.0.1:8765") as client:
+        read = client._sign_in_timeout().read
+    assert read is not None and read < budget, (read, budget)
+
+
 _ENGINES = 2
 _COUNT_PER_ENGINE = 2
 _PER_CONN_RATE = 4.0
