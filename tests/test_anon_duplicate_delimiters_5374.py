@@ -12,8 +12,10 @@ from types import ModuleType
 import pytest
 
 from messagefoundry_toolkit.anon import anonymize as toolkit_anonymize
+from messagefoundry_toolkit.anon import leak as toolkit_leak
 from messagefoundry_toolkit.anon import surrogates as toolkit_surrogates
 from tee.anon import anonymize as tee_anonymize
+from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 
 _BODY = "|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||SYN1^^^H^MR||ZZTEST^ALPHA"
@@ -50,7 +52,8 @@ def test_the_control_four_distinct_characters_are_read(module: ModuleType, enc: 
 def test_the_anonymizer_refuses_a_message_with_repeating_delimiters(
     anonymize: Callable[..., str], enc: str
 ) -> None:
-    with pytest.raises(ValueError, match="no parseable MSH"):  # AnonError subclasses ValueError
+    # AnonError subclasses ValueError; the reason names the repeat, not a missing MSH.
+    with pytest.raises(ValueError, match="repeats an encoding character"):
         anonymize(f"MSH|{enc}{_BODY}", salt=_SALT)
 
 
@@ -59,3 +62,17 @@ def test_the_control_the_anonymizer_rewrites_distinct_delimiters(
     anonymize: Callable[..., str],
 ) -> None:
     assert "ZZTEST" not in anonymize(f"MSH|^~\\&{_BODY}", salt=_SALT)
+
+
+@pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])
+@pytest.mark.parametrize("enc", _REPEATING)
+def test_the_structural_leak_check_reports_repeating_delimiters(leak: ModuleType, enc: str) -> None:
+    """Found by code review round 1: a refused header read as "no parseable MSH" to the leak
+    check, which returns no hit for that, so a direct caller saw a clean structural result."""
+    hits = leak.structural_phi_hits(f"MSH|{enc}{_BODY}", set())
+    assert hits == ["MSH-2 repeats an encoding character, so no field could be read"]
+
+
+@pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])
+def test_the_control_a_message_without_a_header_still_reports_nothing(leak: ModuleType) -> None:
+    assert leak.structural_phi_hits("PID|1||SYN1", set()) == []
