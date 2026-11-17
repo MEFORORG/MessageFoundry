@@ -550,12 +550,11 @@ def verify(
     instead, before any signature processing, and that path does NOT hold to the paragraph above.
     It raises at least these:
 
-    - a document that declares a DOCTYPE: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
-      with a fixed message;
+    - a document that declares a DOCTYPE, whether or not it parses:
+      :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError` with a fixed message;
     - a document that is not well-formed XML: :class:`~messagefoundry.parsing.xml.errors.XmlParseError`,
-      whose message carries lxml's syntax-error text and which is chained from lxml's
-      ``XMLSyntaxError``. That text can quote the document, such as an element or entity name or
-      the bytes at the fault;
+      whose message names only the fault's line, column and libxml2 error code, and which is not
+      chained from lxml's ``XMLSyntaxError`` (BACKLOG #5371);
     - a ``str`` document that UTF-8 cannot encode, such as one holding a lone surrogate:
       :class:`UnicodeEncodeError`, which is NOT an :class:`XmlError`, and whose ``object``
       attribute holds the whole document.

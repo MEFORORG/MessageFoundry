@@ -57,6 +57,53 @@ def test_non_wellformed_raises_parse_error() -> None:
         XmlMessage.parse(b"<root><unclosed></root>")
 
 
+_CANARY = "PHICANARYNAME"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        f"<root><{_CANARY}></root>".encode(),  # tag mismatch quotes the element name
+        f"<root>&{_CANARY};</root>".encode(),  # undefined entity quotes the entity name
+        f"<root>\n<{_CANARY} a='1' a='2'/></root>".encode(),  # duplicate attribute
+    ],
+    ids=["tag-mismatch", "undefined-entity", "duplicate-attribute"],
+)
+def test_parse_error_carries_no_document_text(payload: bytes) -> None:
+    """BACKLOG #5371: lxml's syntax-error text can quote the body, so the XmlParseError names only a
+    position and a code, and lxml's error is on neither exception chain."""
+    with pytest.raises(XmlParseError, match=r"at line \d+, column \d+ \(libxml2 error \d+\)") as ei:
+        parse_bytes(payload)
+    exc = ei.value
+    assert _CANARY not in str(exc) and _CANARY not in repr(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<!DOCTYPE x [<!ENTITY a "b">',  # internal subset never closed
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x',  # body cut short
+        b"<!DOCTYPE x [<!ENTITY bad>]><x/>",  # malformed entity declaration
+        b"<!doctype x><x/>",  # lower case: still refused, as a DTD rather than as a typo
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16"),  # a wide encoding
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>',  # str input
+    ],
+    ids=["open-subset", "truncated", "bad-entity", "lower-case", "utf-16", "str"],
+)
+def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str) -> None:
+    with pytest.raises(XmlSecurityError) as ei:
+        parse_bytes(payload)
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_doctype_text_in_a_wellformed_comment_still_parses() -> None:
+    # The DOCTYPE scan runs only after a parse failure, so a mention in a comment is not refused.
+    root = parse_bytes(b"<x><!-- <!DOCTYPE x> --></x>")
+    assert root.tag == "x"
+
+
 def test_xxe_value_never_resolves_even_if_doctype_slipped_through() -> None:
     # Defense in depth: resolve_entities=False means a custom entity reference is not expanded. Even a
     # doctype-free doc referencing an undefined entity must not pull in external content.

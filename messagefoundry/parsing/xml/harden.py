@@ -83,24 +83,51 @@ def _without_declared_encoding(text: str) -> str:
     return _DECLARED_ENCODING.sub(r"\1", text, count=1)
 
 
+#: Encodings a failed document is read in to look for a DOCTYPE. ``latin-1`` stands for every
+#: ASCII-compatible encoding, UTF-8 included; the rest are the wide encodings libxml2 detects.
+_DOCTYPE_SCAN_CODECS = ("latin-1", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+
+
+def _mentions_doctype(payload: bytes) -> bool:
+    """Whether ``payload`` holds ``<!DOCTYPE`` in any case, in at least the encodings above.
+
+    Only called on a document that already failed to parse, so a match inside a comment or CDATA
+    section cannot turn a well-formed document into a refusal."""
+    return any(
+        "<!DOCTYPE" in payload.decode(codec, "ignore").upper() for codec in _DOCTYPE_SCAN_CODECS
+    )
+
+
 def parse_bytes(data: bytes | str) -> Any:
     """Parse ``data`` into an lxml element tree with the hardened parser, refusing any DOCTYPE.
 
     Returns the root ``_Element``. Raises :class:`XmlSecurityError` if the document declares a DOCTYPE
-    (a DTD/entity-definition carrier), and :class:`XmlParseError` if it is not well-formed XML.
-    Requires the ``[xml]`` extra."""
+    (a DTD/entity-definition carrier), whether or not the rest of it parses, and
+    :class:`XmlParseError` if it is not well-formed XML. Both messages are fixed text plus, for a
+    parse error, the fault's line, column and libxml2 error code; neither carries lxml's message,
+    and neither is chained from lxml's error (BACKLOG #5371). Requires the ``[xml]`` extra."""
     etree = load_lxml()
     if isinstance(data, str):
         payload: bytes = _without_declared_encoding(data).encode("utf-8")
     else:
         payload = bytes(data)
     parser = hardened_parser()
+    fault: str | None = None
     try:
         root = etree.fromstring(payload, parser=parser)
     except etree.XMLSyntaxError as exc:
-        # NOT content-free: lxml's message can quote element and entity names and the bytes at the
-        # fault, and the chain keeps lxml's error. Callers must not log it as body-free.
-        raise XmlParseError(f"not well-formed XML: {exc}") from exc
+        # lxml's message can quote element and entity names and the bytes at the fault, so keep only
+        # the position and libxml2's numeric code (BACKLOG #5371).
+        line, column = exc.position
+        fault = f"line {line}, column {column} (libxml2 error {exc.code})"
+    if fault is not None:
+        # Raised outside the handler so lxml's error is on neither __cause__ nor __context__.
+        if _mentions_doctype(payload):
+            # A DTD that does not even parse is still a DTD: refuse it as one, not as a typo.
+            raise XmlSecurityError(
+                "refusing an XML document that declares a DOCTYPE/DTD (entity-definition carrier)"
+            )
+        raise XmlParseError(f"not well-formed XML at {fault}")
     # Defense in depth: refuse any DOCTYPE so entity *definitions* can't ride along (references are
     # already not resolved). getroottree().docinfo exposes the parsed DOCTYPE, if any.
     docinfo = root.getroottree().docinfo
