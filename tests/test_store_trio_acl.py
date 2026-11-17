@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.store.store as store_mod
+from tests._win_acl import my_sids
 
 _windows_only = pytest.mark.skipif(
     sys.platform != "win32", reason="the store trio's DACL is a Windows mechanism (icacls)"
@@ -626,10 +627,8 @@ def _read_back(path: Path) -> store_mod._SddlDacl:
 
 
 def _my_sids() -> set[str]:
-    """The current user as SDDL may spell it: its SID, or the alias ``LA`` when it IS the built-in
-    Administrator (RID 500), which is what the hosted runners run as (CI run 36039014999)."""
-    me = _my_sid()
-    return {me, "LA"} if me.endswith("-500") else {me}
+    """The current user as SDDL may spell it; :func:`tests._win_acl.my_sids` lists the spellings."""
+    return my_sids(_my_sid())
 
 
 def _build_dir_dacl(directory: Path, *grants: str, owner_ba: bool = False) -> None:

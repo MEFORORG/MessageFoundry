@@ -745,7 +745,8 @@ def test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result() -> No
     # RED when the client's wait drops to or below the engine's request deadline; the comment in
     # EngineClient.cluster_stepdown says why. It compares against the engine constant, not a
     # literal, so raising the engine deadline alone also reds here.
-    assert captured[0].extensions["timeout"]["read"] > DEFAULT_REQUEST_TIMEOUT_SECONDS
+    # The margin itself: 30 s for the 503's hop (vault BACKLOG #2950 added item 28).
+    assert captured[0].extensions["timeout"]["read"] - DEFAULT_REQUEST_TIMEOUT_SECONDS >= 30.0
 
 
 @pytest.mark.parametrize("status", [400, 403, 409, 412, 503])

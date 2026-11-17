@@ -13,7 +13,6 @@ byte-identity test (defect 6). A test with a tee arm kept that arm green, which 
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -31,7 +30,7 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import leak as tee_leak
 from tee.anon.surrogates import normalized_message as tee_normalized
-from tee.store import RelayStore
+from tests._tee_seed import seed_capture
 
 _SALT = "b193-salt-0123456789abcdef"
 _HEADER = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
@@ -126,24 +125,13 @@ def test_one_report_with_a_failed_floor_makes_the_whole_run_not_live(leak: Modul
 # --- defect 3: no log level hides the coverage line -------------------------------------------------
 
 
-def _seed(db: str, raw: bytes) -> None:
-    async def go() -> None:
-        store = await RelayStore.open(db)
-        try:
-            await store.record_capture(direction="corepoint_copy", control_id="C1", raw=raw)
-        finally:
-            await store.close()
-
-    asyncio.run(go())
-
-
 def test_the_cli_prints_the_coverage_line_when_the_level_hides_info(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """In process, with the ``tee.anonymize`` logger above INFO: the line goes to stderr plain. The
     real ``--log-level WARNING`` run is the subprocess test in ``tests/test_anon_integration.py``."""
     db = str(tmp_path / "tee.db")
-    _seed(db, (_BASE + "\rZPD|ZZTEST^SYNTH|19700101").encode("latin-1"))
+    seed_capture(db, (_BASE + "\rZPD|ZZTEST^SYNTH|19700101").encode("latin-1"))
     monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
     logger = logging.getLogger("tee.anonymize")
     monkeypatch.setattr(logger, "level", logging.WARNING)

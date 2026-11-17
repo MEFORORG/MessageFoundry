@@ -107,15 +107,28 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Sequence, Set
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
+
+#: What a settings load raises when the settings are refused or unreadable. ``ValueError`` covers
+#: pydantic's ``ValidationError`` and ``OSError`` covers ``FileNotFoundError`` and
+#: ``IsADirectoryError``, so they are not listed again (vault BACKLOG #2950 added item 11).
+_SETTINGS_LOAD_ERRORS: tuple[type[Exception], ...] = (ValueError, OSError)
+
+#: The settings resolutions and loads of one :func:`run_checks` call, so each runs once per run
+#: rather than once per settings leg (vault BACKLOG #2950 added items 6 and 13). ``None`` outside a
+#: run: a leg called on its own resolves and loads afresh, as it always did.
+_RUN_MEMO: ContextVar[dict[tuple[object, ...], object] | None] = ContextVar(
+    "_RUN_MEMO", default=None
+)
 
 
 def _config_modules(
@@ -218,6 +231,22 @@ class CheckReport:
         return {"ok": self.ok, "checks": [r.to_json() for r in self.results]}
 
 
+def _with_run_memo[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Run ``fn`` with a fresh :data:`_RUN_MEMO`, so its settings legs share one resolution and one
+    load, and drop the memo when it returns: the next run reads the files and environment again."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        token = _RUN_MEMO.set({})
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _RUN_MEMO.reset(token)
+
+    return wrapper
+
+
+@_with_run_memo
 def run_checks(
     config_dir: str | Path,
     *,
@@ -1874,8 +1903,6 @@ def _resolve_snapshot_on_send(
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
     to mirror (ADR 0104 §8.1)."""
-    from pydantic import ValidationError
-
     from messagefoundry.config.settings import PipelineSettings
 
     toml, env_only = _settings_source(
@@ -1887,7 +1914,7 @@ def _resolve_snapshot_on_send(
         # An instance declared in the environment alone previews its own MEFOR_PIPELINE_* value
         # (vault BACKLOG #2355), exactly as the settings legs read it.
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
-    except (FileNotFoundError, ValueError, ValidationError, OSError):
+    except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 
 
@@ -2176,7 +2203,31 @@ def _settings_source(
     Under ``--project-root``, a ``./messagefoundry.toml`` in the working directory also keeps the
     SKIP, named in its text (:func:`_unread_working_dir_toml`).
 
-    ``(None, False)`` is the SKIP the legs have always given a bare dir."""
+    ``(None, False)`` is the SKIP the legs have always given a bare dir.
+
+    Inside :func:`run_checks` it resolves once per distinct argument set (:data:`_RUN_MEMO`)."""
+    memo = _RUN_MEMO.get()
+    if memo is None:
+        return _settings_source_uncached(
+            config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+        )
+    explicit = None if service_config is None else str(service_config)
+    key = ("source", str(config_dir), explicit, suppress_search, env)
+    if key not in memo:
+        memo[key] = _settings_source_uncached(
+            config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+        )
+    return cast("tuple[Path | None, bool]", memo[key])
+
+
+def _settings_source_uncached(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None,
+    suppress_search: bool,
+    env: str | None,
+) -> tuple[Path | None, bool]:
+    """:func:`_settings_source` without the run memo."""
     from messagefoundry.config.settings import environment_named_by_env
 
     toml = _resolve_service_toml(
@@ -2204,7 +2255,35 @@ def _load_check_settings(
     it SKIPs and names the file instead.
 
     ``env`` is ``check --env``, applied as ``serve`` applies its own ``--env``: a CLI override of
-    ``[ai].environment``, above the file and ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355)."""
+    ``[ai].environment``, above the file and ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355).
+
+    Inside :func:`run_checks` the load runs once per distinct argument set, a refusal of
+    :data:`_SETTINGS_LOAD_ERRORS` included, and every later leg gets that answer
+    (:data:`_RUN_MEMO`): its own deep copy, so no leg sees another's change to the model."""
+    memo = _RUN_MEMO.get()
+    if memo is None:
+        return _load_check_settings_uncached(toml, cli=cli, env=env)
+    key = ("load", None if toml is None else str(toml), repr(cli), env)
+    if key not in memo:
+        try:
+            memo[key] = _load_check_settings_uncached(toml, cli=cli, env=env)
+        except _SETTINGS_LOAD_ERRORS as exc:
+            memo[key] = exc
+            raise  # the first leg gets the refusal with its own traceback
+    cached = memo[key]
+    if isinstance(cached, BaseException):
+        # Shed the earlier raise's frames, so the one stored refusal does not pile up every leg's.
+        raise cached.with_traceback(None)
+    return cast("ServiceSettings", cached).model_copy(deep=True)
+
+
+def _load_check_settings_uncached(
+    toml: Path | None,
+    *,
+    cli: Mapping[str, Mapping[str, Any]] | None,
+    env: str | None,
+) -> ServiceSettings:
+    """:func:`_load_check_settings` without the run memo."""
     from messagefoundry.config.settings import load_settings
 
     if env is not None:
@@ -2247,8 +2326,6 @@ def _leg_settings(
 
     ``name`` and ``required`` are the leg's own, on both lines. ``env`` (``check --env``) and
     ``cli`` are passed to :func:`_settings_source` and :func:`_load_check_settings` unchanged."""
-    from pydantic import ValidationError
-
     toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_search, env=env
     )
@@ -2262,13 +2339,17 @@ def _leg_settings(
         )
     try:
         return _load_check_settings(toml, cli=cli, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            name,
-            ok=False,
-            required=required,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    except _SETTINGS_LOAD_ERRORS as exc:
+        return _settings_refused(name, required=required, exc=exc)
+
+
+def _settings_refused(name: str, *, required: bool, exc: Exception) -> CheckResult:
+    """The FAIL line of a leg whose settings were present but refused (BACKLOG #1318), shared by
+    :func:`_leg_settings` and ``static-credentials`` so the two cannot word it differently (vault
+    BACKLOG #2950 added item 12). The refusal goes through :func:`_settings_error`."""
+    return CheckResult(
+        name, ok=False, required=required, detail=f"settings did not load: {_settings_error(exc)}"
+    )
 
 
 def _serve_reads_other_note(
@@ -3419,8 +3500,6 @@ def _check_static_credentials(
     verbatim, environment-only declaration included, vault BACKLOG #2355), the service settings. With
     neither a settings file nor that declaration it reports the graph half and SAYS so. It
     states the clean case out loud, and SKIPs when the graph will not load."""
-    from pydantic import ValidationError
-
     from messagefoundry.config.settings import SecurityEnforcement
     from messagefoundry.config.static_credentials import static_credential_hops
     from messagefoundry.config.wiring import WiringError, load_config
@@ -3449,14 +3528,9 @@ def _check_static_credentials(
     else:
         try:
             settings = _load_check_settings(toml, env=env)
-        except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        except _SETTINGS_LOAD_ERRORS as exc:
             # Present-but-refused is a failure, not a skip (BACKLOG #1318, the alert-smtp-tls rule).
-            return CheckResult(
-                name,
-                ok=False,
-                required=False,
-                detail=f"settings did not load: {_settings_error(exc)}",
-            )
+            return _settings_refused(name, required=False, exc=exc)
     hops = static_credential_hops(registry=registry, settings=settings)
     sec = settings.security if settings is not None else None
     gate_on = sec is not None and sec.require_nonstatic_credentials
