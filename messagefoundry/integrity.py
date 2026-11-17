@@ -184,11 +184,11 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
-#: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other
-#: value is an install whose tripwire is disarmed, which a fail-closed site refuses to start on
-#: (BACKLOG #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a
-#: type error instead of a reason nobody can match on. ``console_attestation_raised`` is the web
-#: console arm's alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
+#: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
+#: is an install whose tripwire is disarmed, which a fail-closed site refuses to start on (BACKLOG
+#: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
+#: instead of a reason nobody can match on. ``console_attestation_raised`` is the web console arm's
+#: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
 UnattestedReason = Literal[
     "declared_editable",
     "not_an_installed_distribution",
@@ -196,7 +196,6 @@ UnattestedReason = Literal[
     "record_has_no_package_rows",
     "install_root_unresolvable",
     "no_attested_file_under_install_root",
-    "no_file_compared_under_install_root",
     "console_attestation_raised",
 ]
 
@@ -835,18 +834,10 @@ def _attest_distribution(
         no_record=False,
         checked=checked,
         drift=drift,
-        # A real baseline was read and still nothing was compared. `attested=True` with `checked == 0`
-        # is not clean, it is blind. Either every loaded file resolved outside the install root (a
-        # shadowed `messagefoundry/` the working directory wins with — #1677 from this control's
-        # side), or the package sits under the root and no file in it was compared: each was
-        # deleted, special, failed to open, or has no RECORD row, and is drift (BACKLOG #5376).
-        unattested_reason=(
-            None
-            if checked
-            else "no_file_compared_under_install_root"
-            if under_root
-            else "no_attested_file_under_install_root"
-        ),
+        # A real baseline was read and still nothing was compared: every loaded file resolved outside
+        # the install root (a shadowed `messagefoundry/` the working directory wins with — #1677 from
+        # this control's side). `attested=True` with `checked == 0` is not clean, it is blind.
+        unattested_reason=None if checked else "no_attested_file_under_install_root",
     )
 
 
@@ -1041,11 +1032,10 @@ async def run_startup_attestation(
       not a tamper;
     - **drift**: an ERROR line, a hash-chained ``startup_integrity`` audit row, and
       :meth:`AlertSink.integrity_drift`;
-    - **attested nothing** (``checked == 0`` and no drift, on an install that declares no editable
-      marker — an absent, empty or stripped ``RECORD``, an unresolvable install root, a shadowed
-      package): a WARNING, the same audit row, and the same alert channel under a distinct subject.
-      A pass with ``checked == 0`` AND drift is handled as drift: an ERROR, under the drift
-      subject;
+    - **attested nothing** (``checked == 0`` on an install that declares no editable marker — an absent,
+      empty or stripped ``RECORD``, an unresolvable install root, a shadowed package): a WARNING, the
+      same audit row, and the same alert channel under a distinct subject. The tripwire is disarmed in
+      this shape; before BACKLOG #1679 it was reported as clean;
     - either of the last two **and** ``fail_closed_on_drift``: after recording + alerting, raise
       :class:`IntegrityError` so the caller refuses to start before any listener binds.
 
