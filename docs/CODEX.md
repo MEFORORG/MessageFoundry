@@ -34,9 +34,9 @@ that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
 command that cannot start, a defect of its own such as an unsupported handler
 type or shell, or a defect in its group, such as a matcher that is not a valid
 regex, that keeps it from running. Any other hook failure is a
-non-blocking error, except a command-only PowerShell hook that ends with a 2 in
-`$LASTEXITCODE`, as described below. The bridge reports it on stderr and as a
-`systemMessage`, naming the hook, ignores that hook's output, and runs the remaining hooks. A JSON
+non-blocking error, except where the PowerShell tail below exits 2. The bridge
+reports it on stderr and as a `systemMessage`, naming the hook, ignores that
+hook's output, and runs the remaining hooks. A JSON
 `permissionDecision` deny from a hook is a decision, not a failure, and is passed
 on as before.
 
@@ -85,17 +85,22 @@ Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
 Structured `command` and `args` avoid shell parsing. A command-only PowerShell
 hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
 PowerShell hook with an explicit `exit 2`. The bridge runs it under
-`pwsh -Command`. That reports as 1 a 2 from a native program, or from a guard
-script the hook calls or dot-sources, when the hook's last statement runs it. So
-the bridge puts a statement after the hook: a hook that ends with `$?` false
-while `$LASTEXITCODE` is 2, including a 2 left by an earlier native command,
-exits 2 and blocks. A last statement that does not reset `$?`, such as
-`if ($false) { ... }`, keeps it false. It does not reach
-a guard called inside a function or script block, or followed by `return` or
-`break`. The bridge
-puts one line before the hook, turning `$PSNativeCommandUseErrorActionPreference`
-off. A hook that opens with an empty `param()` then fails to parse, so it exits
-1 on every call, and under `"onFailure": "block"` it blocks every call.
+`pwsh -Command`. It puts one line before the hook, turning
+`$PSNativeCommandUseErrorActionPreference` off, and appends this fixed tail after
+it, on new lines:
+
+```powershell
+;
+if (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }
+```
+
+The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
+`tests/test_codex_bridge.py` is the record of which shapes block. **A hook that
+must block should end with an explicit `exit 2`.** Shapes that end on an error,
+or with a stale exit code, are decided by the tail and are not listed here.
+
+A hook that opens with an empty `param()` fails to parse after the head line, so
+it exits 1 on every call, and under `"onFailure": "block"` it blocks every call.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

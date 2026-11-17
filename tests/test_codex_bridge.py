@@ -187,13 +187,10 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
         ("trap {{ exit 2 }}; throw 'boom'", "block"),
         ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
-        # A native 2 blocks, passed on by `exit` or left as the last statement, which -Command
-        # alone reports as 1.
+        # The rows from here on record what the bridge's tail decides, shape by shape.
         ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
         ("& '{py}' -c 'import sys; sys.exit(2)'", "block"),
         ("& '{py}' -c 'import sys; sys.exit(3)'", "exit-1"),
-        # A stale 2 does not block after a last statement that succeeds, and does after one
-        # that fails.
         ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
         (
             "& '{py}' -c 'import sys; sys.exit(2)'; Get-Item -LiteralPath 'no-such-item-b4'",
@@ -218,7 +215,6 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("$deny =", "exit-1"),
         ("Write-Output '{{}}' |", "exit-1"),
         ("Write-Output '{{}}' ||", "exit-1"),
-        # A last statement that does not reset $? leaves an earlier native 2 to block.
         ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
         # After the bridge's head line, an empty param() fails to parse. A non-empty one parses
