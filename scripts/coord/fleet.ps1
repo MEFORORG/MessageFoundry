@@ -434,8 +434,7 @@ $lookupFailures = @()
 foreach ($r in $records) {
     $rec = $r.Rec
     # This loop reads seat-record fields through Get-RecordField, which answers `{}` under StrictMode
-    # where `.PSObject.Properties.Name` throws (BACKLOG #5491). The -Chip briefing below still reads
-    # its record's fields bare.
+    # where `.PSObject.Properties.Name` throws (BACKLOG #5491), as the -Chip briefing below does.
     $wt = [string](Get-RecordField $rec 'worktree')
     $sid = [string](Get-RecordField $rec 'sessionId')
 
@@ -660,40 +659,49 @@ if ($Chip) {
     $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1
     if (-not $row) { Write-Error "fleet.ps1: no record for $BoxKey/$SessionKey"; exit 2 }
     $rec = $row.Rec
+    # Every field is read through Get-RecordField: a seat record missing one, `{}` included, has no
+    # such property, and a bare read throws under this script's StrictMode Latest (BACKLOG #5491).
+    $asOf = Get-RecordField $rec 'asOf'
+    $recWt = [string](Get-RecordField $rec 'worktree')
+    $tip = Get-RecordField $rec 'tip'
+    $seatName = Get-RecordField $rec 'seat'
+    $goal = Get-RecordField $rec 'goal'
+    $done = Get-RecordField $rec 'done'
+    $outOfScope = Get-RecordField $rec 'outOfScope'
+    $stashSha = Get-RecordField $rec 'stashSha'
+    $touchedPaths = Get-RecordField $rec 'touchedPaths'
+    $handoff = Get-RecordField $rec 'handoff'
+    $hp = [string](Get-RecordField $handoff 'path')
     $lines = @()
     $lines += "You are a REPLACEMENT SEAT. The session that held this work is gone. You inherit NOTHING"
-    $lines += "from it except what is written below. Everything here was measured at $($rec.asOf) and the"
+    $lines += "from it except what is written below. Everything here was measured at $asOf and the"
     $lines += "world has moved since -- RE-VERIFY BEFORE YOU ACT, do not trust a line because it is specific."
     $lines += ""
-    $lines += "PREDECESSOR CHECKOUT: $($rec.worktree)"
+    $lines += "PREDECESSOR CHECKOUT: $recWt"
     if (-not $row.IsHere) {
         $lines += "RECORDED ON $($row.Host.ToUpperInvariant()), NOT THIS PC ($thisHost). That checkout and any handoff path"
         $lines += "below are on that PC, and nothing here could check them. Run the git steps there."
     }
     $lines += "BRANCH: $($row.Branch)   (identified by NAME, never by a commit id -- a rebase reissues the id)"
-    if ($rec.tip) { $lines += "ITS TIP WAS: $($rec.tip)  AS OF $($rec.asOf). Resolve the branch yourself; do not use this id as an identifier." }
+    if ($tip) { $lines += "ITS TIP WAS: $tip  AS OF $asOf. Resolve the branch yourself; do not use this id as an identifier." }
     $lines += ""
-    if ($rec.seat) { $lines += "SEAT: $($rec.seat)" } else { $lines += "SEAT: NOT DECLARED. The predecessor never declared one; do not invent a role." }
-    if ($rec.goal) { $lines += "GOAL AS DECLARED: $($rec.goal)" } else { $lines += "GOAL: NOT DECLARED." }
-    if ($rec.done) { $lines += "DONE MEANS: $($rec.done)" }
-    if ($rec.outOfScope) { $lines += "OUT OF SCOPE: $($rec.outOfScope)" }
+    if ($seatName) { $lines += "SEAT: $seatName" } else { $lines += "SEAT: NOT DECLARED. The predecessor never declared one; do not invent a role." }
+    if ($goal) { $lines += "GOAL AS DECLARED: $goal" } else { $lines += "GOAL: NOT DECLARED." }
+    if ($done) { $lines += "DONE MEANS: $done" }
+    if ($outOfScope) { $lines += "OUT OF SCOPE: $outOfScope" }
     $lines += ""
     $lines += "FIRST ACTIONS, IN THIS ORDER, BEFORE ANY BUILDING:"
     $lines += "  1. Look at the predecessor checkout. Uncommitted work there is the ONLY thing that truly dies:"
-    $lines += "     git -C `"$($rec.worktree)`" status --porcelain"
-    $lines += "     git -C `"$($rec.worktree)`" log --oneline origin/main..HEAD"
-    if ($rec.stashSha) {
-        $lines += "     A stash commit was captured at record time, covering TRACKED edits only: $($rec.stashSha)"
-        $lines += "     Recover with: git -C `"$($rec.worktree)`" checkout $($rec.stashSha) -- ."
+    $lines += "     git -C `"$recWt`" status --porcelain"
+    $lines += "     git -C `"$recWt`" log --oneline origin/main..HEAD"
+    if ($stashSha) {
+        $lines += "     A stash commit was captured at record time, covering TRACKED edits only: $stashSha"
+        $lines += "     Recover with: git -C `"$recWt`" checkout $stashSha -- ."
     }
     # The loudest thing in the whole briefing, because it is the only category that is GONE if the
     # checkout is removed. `git stash create` has no -u, so an untracked file is held by no git
     # object anywhere -- not in a stash, not in a commit, not on a remote.
-    $untracked = @()
-    if (($rec.PSObject.Properties.Name -contains 'dirty') -and $rec.dirty -and
-        ($rec.dirty.PSObject.Properties.Name -contains 'untracked')) {
-        $untracked = @($rec.dirty.untracked)
-    }
+    $untracked = @(Get-RecordField (Get-RecordField $rec 'dirty') 'untracked' | Where-Object { $null -ne $_ })
     if ($untracked.Count -gt 0) {
         $lines += ""
         $lines += "     *** $($untracked.Count) UNTRACKED FILE(S) EXIST ONLY IN THAT WORKING DIRECTORY. ***"
@@ -704,8 +712,8 @@ if ($Chip) {
     }
     $lines += "  2. git fetch origin FIRST, then decide whether the work already landed. Compare CONTENT, not"
     $lines += "     ancestry -- squash-merge makes 'commits ahead' and 'content ahead' disagree routinely:"
-    if ($rec.touchedPaths -and @($rec.touchedPaths).Count -gt 0) {
-        $lines += "       git diff --name-only origin/main $($row.Branch) -- " + (@($rec.touchedPaths) -join ' ')
+    if ($touchedPaths -and @($touchedPaths).Count -gt 0) {
+        $lines += "       git diff --name-only origin/main $($row.Branch) -- " + (@($touchedPaths) -join ' ')
         $lines += "     Empty output means the content is already on main. DO NOT REBUILD IT."
     } else {
         $lines += "       (no touched paths were recorded, so this check is UNCHECKABLE here -- derive the"
@@ -713,35 +721,36 @@ if ($Chip) {
     }
     $lines += "  3. Re-check claims and allocations BEFORE taking any. This briefing was written at generate"
     $lines += "     time and you are reading it at click time; a hold may have been declared in between."
-    $ownClaims = @($rec.claims | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhClaims = @($rec.claims | Where-Object { $_.attribution -ne 'this-episode' })
-    if ($ownClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: " + (($ownClaims | ForEach-Object { $_.key }) -join ', ') }
+    $claims = @(Get-RecordField $rec 'claims' | Where-Object { $null -ne $_ })
+    $ownClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -eq 'this-episode' })
+    $inhClaims = @($claims | Where-Object { (Get-RecordField $_ 'attribution') -ne 'this-episode' })
+    if ($ownClaims.Count -gt 0) { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: " + (($ownClaims | ForEach-Object { Get-RecordField $_ 'key' }) -join ', ') }
     else { $lines += "     CLAIMS HELD BY THE PREDECESSOR EPISODE: none" }
     if ($inhClaims.Count -gt 0) {
         $lines += "     ALSO PRESENT IN THAT WORKTREE BUT FROM EARLIER OCCUPANTS -- NOT YOURS, DO NOT REHOME:"
-        $lines += "       " + (($inhClaims | ForEach-Object { $_.key }) -join ', ')
+        $lines += "       " + (($inhClaims | ForEach-Object { Get-RecordField $_ 'key' }) -join ', ')
     }
-    $ownAlloc = @($rec.allocations | Where-Object { $_.attribution -eq 'this-episode' })
-    $inhAlloc = @($rec.allocations | Where-Object { $_.attribution -ne 'this-episode' })
-    if ($ownAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: " + (($ownAlloc | ForEach-Object { "$($_.kind) #$($_.number)" }) -join ', ') }
+    $allocs = @(Get-RecordField $rec 'allocations' | Where-Object { $null -ne $_ })
+    $ownAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -eq 'this-episode' })
+    $inhAlloc = @($allocs | Where-Object { (Get-RecordField $_ 'attribution') -ne 'this-episode' })
+    if ($ownAlloc.Count -gt 0) { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: " + (($ownAlloc | ForEach-Object { "$(Get-RecordField $_ 'kind') #$(Get-RecordField $_ 'number')" }) -join ', ') }
     else { $lines += "     LEDGER NUMBERS ALLOCATED BY THIS EPISODE: none" }
     if ($inhAlloc.Count -gt 0) {
         $lines += "     $($inhAlloc.Count) MORE are allocated to that worktree PATH by earlier occupants."
         $lines += "     THEY ARE NOT YOURS. Do not rehome them and do not cite them."
     }
-    if ($rec.handoff -and $rec.handoff.path) {
+    if ($hp) {
         $lines += ""
-        $lines += "  4. READ THE HANDOFF: $($rec.handoff.path)"
+        $lines += "  4. READ THE HANDOFF: $hp"
         # RESOLVED HERE, AT RENDER, NOT READ OUT OF THE RECORD. seat.ps1 re-checks the pointer on
         # every Stop, which covers a LIVE seat -- but the pointer most likely to be wrong belongs to
         # a seat that will never run again, and a dead seat's writer cannot report its own decay.
         # Measured 2026-08-22: the one DANGLING pointer on disk belongs to nice-payne-4dcee0, whose
         # last turn ended 2026-08-19. Only a reader was ever going to catch it.
-        $hp = [string]$rec.handoff.path
         $live = $null
         try { if ($row.IsHere -and (Test-Path -LiteralPath $hp -PathType Leaf)) { $live = (Get-Item -LiteralPath $hp -EA Stop).Length } }
         catch { $live = $null }
-        $wasBytes = $rec.handoff.bytes
+        $wasBytes = Get-RecordField $handoff 'bytes'
         if (-not $row.IsHere) {
             $lines += "     NOT CHECKED: that path is on $($row.Host). Open it there."
         }

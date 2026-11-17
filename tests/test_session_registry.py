@@ -470,7 +470,8 @@ def test_with_no_usable_startedat_the_file_age_decides(
         ("parent", "UNREADABLE"),
         ("plain-parent", "DEAD"),
         ("long-path-prefix", "UNREADABLE"),
-        ("dot-segments", "UNREADABLE"),
+        ("dot-dot-out-of-tree", "UNREADABLE"),
+        ("relative", "UNREADABLE"),
         ("sibling-prefix", "DEAD"),
     ],
     ids=[
@@ -481,18 +482,20 @@ def test_with_no_usable_startedat_the_file_age_decides(
         "checkout-holding-the-worktree",
         "plain-parent-does-not-reach",
         "long-path-prefix",
-        "dot-segments",
+        "dot-dot-out-of-the-tree-still-vetoes",
+        "relative-cwd-fails-closed",
         "sibling-sharing-a-prefix",
     ],
 )
 def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
 ) -> None:
-    """A record naming no session vetoes a lookup for its own tree, case, slashes and a \\\\?\\ or
-    ``..`` spelling aside, and one for a tree under a git checkout it sits in, as a primary
-    checkout holds its worktrees. A plain parent directory does not reach, nor does another tree,
-    even one whose name starts with this one's. One with no readable cwd cannot be placed, so it
-    vetoes everywhere."""
+    """A record naming no session vetoes a lookup for its own tree, case, slashes and a \\\\?\\
+    prefix aside, and one for a tree under a git checkout it sits in, as a primary checkout holds
+    its worktrees. A cwd spelled ``<tree>\\..\\<other>`` is not collapsed, so it still vetoes
+    ``<tree>`` as it did on main. A plain parent directory does not reach, nor does another tree,
+    even one whose name starts with this one's. One with no readable cwd, or a relative one, cannot
+    be placed, so it vetoes everywhere."""
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
     here = checkout / "wt-here"
@@ -503,7 +506,8 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
         "parent": str(checkout),
         "plain-parent": str(tmp_path),
         "long-path-prefix": "\\\\?\\" + str(here),
-        "dot-segments": str(checkout / "x" / ".." / "wt-here"),
+        "dot-dot-out-of-tree": str(here / ".." / "wt-elsewhere"),
+        "relative": "wt-elsewhere",
         "sibling-prefix": str(checkout / "wt-here-too"),
     }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
@@ -556,12 +560,13 @@ def _fleet(
     anon_in_seat_worktree: bool = True,
     raw_records: dict[str, str] | None = None,
     extra_seats: dict[str, str] | None = None,
+    fleet_args: list[str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
     worktree, unless ``anonymous`` sets its own. ``raw_records`` maps more registry file names to
     their exact text, and ``extra_seats`` more seat boxes to the exact text of one seat record in
-    each. Returns the run and the anonymous record's path."""
+    each. ``fleet_args`` replaces ``-Json``. Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
@@ -613,7 +618,7 @@ def _fleet(
     env.update(USERPROFILE=str(home), MEFOR_COORD_ROOT=str(shared))
     fleet = (coord or REGISTRY.parent) / "fleet.ps1"
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), "-Json"],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(fleet), *(fleet_args or ["-Json"])],
         cwd=str(repo),
         capture_output=True,
         text=True,
@@ -915,13 +920,6 @@ def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
 AUDIT = REGISTRY.parents[1] / "worktree" / "worktree-audit.ps1"
 
 
-def _git_repo(path: Path) -> Path:
-    """An empty git repository at ``path``, so git can place a directory inside it."""
-    path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
-    return path
-
-
 def _stale_seat_locks(config_root: Path, locked: Path, sid: str, prelude: str = "") -> str:
     """How many seat locks Get-StaleSeatLocks lists for one lock on ``locked`` held by ``sid``."""
     return _strict(
@@ -934,54 +932,22 @@ def _stale_seat_locks(config_root: Path, locked: Path, sid: str, prelude: str = 
 
 @pytest.mark.parametrize(
     ("anon_cwd", "listed"),
-    [
-        ("other-repo", 1),
-        ("locked", 0),
-        ("junction", 0),
-        ("relative", 0),
-        ("not-a-checkout", 0),
-    ],
-    ids=[
-        "anonymous-in-another-checkout-leaves-the-lock-listed",
-        "anonymous-in-the-tree-vetoes",
-        "a-junction-spelling-of-the-tree-vetoes",
-        "a-relative-cwd-vetoes",
-        "a-cwd-git-cannot-place-vetoes",
-    ],
+    [(None, 1), ("locked", 0), ("elsewhere", 0)],
+    ids=["no-anonymous-record-lists-the-lock", "anonymous-in-the-tree-vetoes", "anywhere-vetoes"],
 )
-def test_stale_seat_locks_scope_the_anonymous_veto_to_each_locked_tree(
-    config_root: Path, tmp_path: Path, anon_cwd: str, listed: int
+def test_stale_seat_locks_keep_the_box_wide_anonymous_veto(
+    config_root: Path, tmp_path: Path, anon_cwd: str | None, listed: int
 ) -> None:
-    """A fresh record naming no session vetoed every lock on the box, because the lookup named no
-    worktree, so one such record hid every stale seat lock. It now leaves alone only a lock on a
-    tree git places its cwd outside of. A cwd whose spelling differs from the tree's but may be an
-    alias of it, a junction or a relative path, or one git cannot place, still vetoes as before.
-    The junction, relative and unplaceable cases listed the lock on 3c19a009b6 (negative control)."""
+    """A fresh record naming no session vetoes every seat lock on the box, wherever its cwd is: a
+    junction, 8.3 or subst spelling of the locked tree cannot be told apart from another tree by
+    its spelling, so the lookup names no worktree (fail closed). With no such record, the gone
+    session's lock is listed."""
     sid = "5491a0a0-0000-4000-8000-000000000000"
     write_session(config_root, pid=never_live_pid(), session_id=sid)
-    locked = _git_repo(tmp_path / "wt-locked")
-    junction = tmp_path / "wt-alias"
-    if anon_cwd == "junction":
-        subprocess.run(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
-            + [f"New-Item -ItemType Junction -Path '{junction}' -Target '{locked}' | Out-Null"],
-            check=True,
-            capture_output=True,
-        )
-    plain = tmp_path / "plain"
-    plain.mkdir()
-    cwds = {
-        "other-repo": str(_git_repo(tmp_path / "wt-other")),
-        "locked": str(locked),
-        "junction": str(junction),
-        "relative": "wt-locked",
-        "not-a-checkout": str(plain),
-    }
-    _anonymous(
-        config_root,
-        "99016.json",
-        {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": cwds[anon_cwd]},
-    )
+    locked = tmp_path / "wt-locked"
+    if anon_cwd is not None:
+        cwd = str(locked) if anon_cwd == "locked" else str(tmp_path / "wt-other")
+        _anonymous(config_root, "99016.json", {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": cwd})
     assert _stale_seat_locks(config_root, locked, sid) == str(listed)
 
 
@@ -1024,3 +990,21 @@ def test_fleet_reads_an_empty_object_seat_record_under_strict_mode(tmp_path: Pat
     j = _fleet_json(proc)
     boxes = {r["Box"] for r in j["rows"]}
     assert {"box-5491", "box-empty"} <= boxes, boxes
+
+
+def test_fleet_chip_renders_a_seat_record_missing_its_fields_under_strict_mode(
+    tmp_path: Path,
+) -> None:
+    """The -Chip briefing read its seat record's fields bare, so a record lacking asOf, worktree,
+    claims or handoff threw under fleet.ps1's StrictMode Latest and wrote no briefing. A missing
+    field now renders as not declared."""
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        extra_seats={"box-chip": json.dumps({"sessionKey": "5491c0de"})},
+        fleet_args=["-Chip", "-BoxKey", "box-chip", "-SessionKey", "5491c0de"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "You are a REPLACEMENT SEAT" in proc.stdout, proc.stdout
+    assert "SEAT: NOT DECLARED" in proc.stdout, proc.stdout
+    assert "CLAIMS HELD BY THE PREDECESSOR EPISODE: none" in proc.stdout, proc.stdout

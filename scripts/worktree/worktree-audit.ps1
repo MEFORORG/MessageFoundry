@@ -87,11 +87,10 @@ function Get-SeatLockReading {
         -ClearHandoff refuses on the same ground. -Unreadable takes that count from a caller that
         already read the registry, so a report over many locks reads it once.
     #>
-    # -Worktree is the locked tree, so a fresh registry record that names no session vetoes only the
-    # locks whose tree it overlaps rather than every lock on the box (BACKLOG #5491). It is placed by
-    # the path git resolves, not its spelling alone, so a cwd that may be an alias of the tree, or that
-    # cannot be placed, still vetoes (Test-AnonymousRecordReachesResolved).
-    param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable, [string]$Worktree)
+    # The lookup names no worktree, so a fresh registry record that names no session vetoes every lock
+    # on the box (fail closed): a cwd spelled by a junction, an 8.3 name or a subst drive cannot be told
+    # apart from the locked tree by its spelling.
+    param([string]$SessionKey, [string[]]$ConfigRoot, [Nullable[int]]$Unreadable)
     # session-registry.ps1's fence reads its record fields without throwing under StrictMode since
     # BACKLOG #5491. This stays off for any read below it that is still bare, under a caller's
     # StrictMode (seat.ps1 runs Latest).
@@ -102,7 +101,7 @@ function Get-SeatLockReading {
     # The removal paths' unbounded start skew (remove.ps1, prune-merged.ps1 and the nightly removal pass
     # [int]::MaxValue to Get-WorktreeOccupancy), so a session the removal fence reads LIVE never reads
     # STALE, and so gone, here.
-    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -Worktree $Worktree -ResolveAnonymousCwd -StartSkewMinutes ([int]::MaxValue) }
+    try { $l = Get-SessionLiveness -SessionId $SessionKey -ConfigRoot $ConfigRoot -StartSkewMinutes ([int]::MaxValue) }
     catch { return [pscustomobject]@{ State = 'UNREADABLE'; Detail = "the liveness lookup failed: $($_.Exception.Message)"; Gone = $false } }
     if ((-not $l.Found) -and $l.State -eq 'UNKNOWN') {
         if ($null -eq $Unreadable) {
@@ -142,11 +141,7 @@ function Get-StaleSeatLocks {
     try { $unreadable = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable | Where-Object { $_.Unreadable }).Count } catch { }
     foreach ($x in $seatLocks) {
         $w = $x.W; $p = $x.P
-        # The path comes from a `git worktree list` that Get-RepoWorktrees decodes with the console
-        # code page, so a non-ASCII one may be garbled and would never meet a record's cwd. Only a
-        # plain ASCII path scopes the veto; any other leaves it box-wide (fail closed).
-        $scope = if ([string]$w.Path -match '^[\x20-\x7E]+$') { [string]$w.Path } else { '' }
-        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable -Worktree $scope
+        $r = Get-SeatLockReading -SessionKey $p.SessionKey -ConfigRoot $ConfigRoot -Unreadable $unreadable
         if (-not ($r.Gone -or $r.State -eq 'CODEX')) { continue }
         $out.Add([pscustomobject]@{ Path = $w.Path; Reason = $w.LockReason; Seat = $p.Seat; SessionKey = $p.SessionKey; State = $r.State; Detail = $r.Detail })
     }

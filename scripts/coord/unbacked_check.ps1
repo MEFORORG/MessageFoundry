@@ -507,6 +507,15 @@ foreach ($p in $Path) {
             if ($hit) { $upstreamCandidates.Add($hit) }
         }
     }
+    # RELATED HISTORY, DECIDED ONCE PER CANDIDATE: against a main that shares no history with this
+    # repository -- another project fetched as a durability remote -- `git cherry` compares the whole
+    # of both, and a diff that happens to be identical there would mark an unbacked commit landed. A
+    # candidate `git merge-base` cannot join to the checkout's HEAD is dropped for the whole run; one
+    # call per candidate, not one per ref. Each ref is checked against the kept candidates again
+    # below, so an orphan branch is not compared with a main that only HEAD shares history with.
+    $upstreamCandidates = @($upstreamCandidates | Where-Object {
+        (Invoke-Git -Repo $p -GitArgs @('merge-base', $_.Oid, 'HEAD')).Ok
+    })
 
     # Branches as a snapshot of object ids: a branch deleted by another session after this listing is
     # still scanned from its id rather than failing, and a non-ASCII name is only ever displayed.
@@ -586,9 +595,10 @@ foreach ($p in $Path) {
             # SHARED HISTORY FIRST: against a main this ref shares no history with -- another project
             # fetched as a durability remote, or an orphan branch -- cherry compares the whole of
             # both, and a diff that happens to be identical there would mark an unbacked commit
-            # landed, so a candidate `git merge-base` cannot join to THIS ref is skipped. EVERY
-            # related candidate is read: a squash that landed on a second answering remote is as
-            # durable as one on origin.
+            # landed. So the candidate list holds only histories related to HEAD (decided once,
+            # above), and of those a candidate `git merge-base` cannot join to THIS ref is skipped
+            # too. EVERY candidate left is read: a squash that landed on a second answering remote
+            # is as durable as one on origin.
             $landed = @{}
             foreach ($u in $upstreamCandidates) {
                 if (-not (Invoke-Git -Repo $p -GitArgs @('merge-base', $u.Oid, $ref.Oid)).Ok) { continue }

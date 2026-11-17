@@ -278,17 +278,15 @@ function Test-RecordLiveness {
 }
 
 # A path in the one form the anonymous-record scoping compares: forward slashes turned back, a
-# \\?\ or \\.\ prefix dropped (\\?\UNC\ back to \\), `.` and `..` segments collapsed, trailing
-# separators and space dropped, lower-cased. Windows paths compare case-insensitively. A subst
-# drive, a junction or an 8.3 short name is NOT resolved, so such a spelling still compares unequal.
+# \\?\ or \\.\ prefix dropped (\\?\UNC\ back to \\), trailing separators and space dropped,
+# lower-cased. Windows paths compare case-insensitively. `.` and `..` segments are NOT collapsed, so a
+# cwd spelled `<tree>\..\<other>` still reads as inside <tree> and vetoes it. A subst drive, a
+# junction or an 8.3 short name is NOT resolved, so such a spelling still compares unequal.
 function ConvertTo-RegistryNormPath([string]$Path) {
     if (-not $Path) { return '' }
     $p = $Path.Trim() -replace '/', '\'
     if ($p -match '^\\\\[?.]\\UNC\\') { $p = '\\' + $p.Substring(8) }
     elseif ($p -match '^\\\\[?.]\\') { $p = $p.Substring(4) }
-    if ([System.IO.Path]::IsPathFullyQualified($p)) {
-        try { $p = [System.IO.Path]::GetFullPath($p) } catch [System.ArgumentException], [System.NotSupportedException], [System.IO.PathTooLongException] { }
-    }
     return $p.TrimEnd('\').ToLowerInvariant()
 }
 
@@ -351,51 +349,18 @@ function Get-AnonymousSessionRecords {
 # cwd is that worktree or inside it, or is a git checkout (it holds a .git entry) that the worktree
 # sits under. That last case is a session started in the primary checkout, which can work in a
 # worktree under it (BACKLOG #5491); a plain parent such as a home directory or a drive root does
-# not reach. A record with no readable cwd, or a lookup that names no worktree, cannot be placed, so
-# it vetoes wherever it is asked (fail closed).
+# not reach. A record with no readable cwd, a cwd that is not fully qualified (it resolves against
+# the session's own directory, which nothing here knows), or a lookup that names no worktree, cannot
+# be placed, so it vetoes wherever it is asked (fail closed).
 function Test-AnonymousRecordReaches {
     param($Anonymous, [string]$Worktree)
     $w = ConvertTo-RegistryNormPath $Worktree
     if (-not $Anonymous.Cwd -or -not $w) { return $true }
     $c = $Anonymous.Cwd
+    if (-not [System.IO.Path]::IsPathFullyQualified($c)) { return $true }
     if (($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal')) { return $true }
     # A string, not Join-Path, which throws on a drive this process does not have.
     return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath "$c\.git")
-}
-
-# The path git resolves for a directory, its toplevel plus its prefix, normalized; '' when git cannot
-# place it. Git for Windows prints the real path through a junction and through an 8.3 name (measured
-# 2026-11-17; see remove.ps1's Get-ResolvedGitDir). A relative path is never placed: it would resolve
-# against this process's cwd, not the session's. Nor is any path while GIT_DIR or GIT_WORK_TREE is set,
-# since either makes git answer for a different checkout.
-function Get-GitResolvedDir([string]$Dir) {
-    if (-not $Dir -or -not [System.IO.Path]::IsPathFullyQualified($Dir)) { return '' }
-    if ($env:GIT_DIR -or $env:GIT_WORK_TREE) { return '' }
-    $top = "$(& git -C $Dir rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $top) { return '' }
-    $prefix = "$(& git -C $Dir rev-parse --show-prefix 2>$null)".Trim()
-    if ($LASTEXITCODE -ne 0) { return '' }
-    return ConvertTo-RegistryNormPath $(if ($prefix) { "$top/$prefix" } else { $top })
-}
-
-# Test-AnonymousRecordReaches, but a record whose spelling places it elsewhere still vetoes unless git
-# resolves both its cwd and the worktree and the resolved paths do not reach either. So a junction or
-# 8.3 spelling of the tree, or a relative cwd, vetoes, and so does a cwd git cannot place, as a lookup
-# naming no worktree vetoes. Whether git resolves a subst drive was not measured, so a resolved path on
-# a drive `subst` lists vetoes too, as does a run where `subst` cannot be read.
-function Test-AnonymousRecordReachesResolved {
-    param($Anonymous, [string]$Worktree)
-    if (Test-AnonymousRecordReaches $Anonymous $Worktree) { return $true }
-    $c = Get-GitResolvedDir $Anonymous.Cwd
-    $w = Get-GitResolvedDir (ConvertTo-RegistryNormPath $Worktree)
-    if (-not $c -or -not $w) { return $true }
-    try { $substOut = @(& subst.exe 2>$null) } catch [System.Management.Automation.CommandNotFoundException] { return $true }
-    if ($LASTEXITCODE -ne 0) { return $true }
-    $substDrives = @($substOut | ForEach-Object { if ("$_" -match '^([A-Za-z]):') { $Matches[1].ToLowerInvariant() } })
-    foreach ($p in @($c, $w)) {
-        if ($p -match '^([a-z]):' -and $substDrives -contains $Matches[1]) { return $true }
-    }
-    return Test-AnonymousRecordReaches ([pscustomobject]@{ Cwd = $c }) $w
 }
 
 # Look one session up by id (full or unique prefix) and fence it.
@@ -407,13 +372,14 @@ function Get-SessionLiveness {
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [string[]]$ConfigRoot,
-        [int]$StartSkewMinutes = 15,
+        # Unbounded by default, as the removal paths pass it (remove.ps1, prune-merged.ps1 and the
+        # nightly removal give [int]::MaxValue to Get-WorktreeOccupancy), so a session those fences
+        # read LIVE never reads STALE, and so gone, here.
+        [int]$StartSkewMinutes = [int]::MaxValue,
         [double]$AnonymousFreshHours = 24,
         [string]$Worktree,
         # Passed to Get-AnonymousSessionRecords, which ages the anonymous records by it.
-        [datetime]$Now = [DateTime]::UtcNow,
-        # Scope the anonymous veto with Test-AnonymousRecordReachesResolved rather than by spelling.
-        [switch]$ResolveAnonymousCwd
+        [datetime]$Now = [DateTime]::UtcNow
     )
     $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
     $hit = @($records |
@@ -423,10 +389,7 @@ function Get-SessionLiveness {
     # Anonymous lists the vetoing records, so a caller can name the real reason for a refusal.
     $anonymousVeto = {
         $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes -Now $Now)
-        $veto = @($anon | Where-Object {
-                $_.Fresh -and $(if ($ResolveAnonymousCwd) { Test-AnonymousRecordReachesResolved $_ $Worktree }
-                                else { Test-AnonymousRecordReaches $_ $Worktree })
-            })
+        $veto = @($anon | Where-Object { $_.Fresh -and (Test-AnonymousRecordReaches $_ $Worktree) })
         if ($veto.Count -gt 0) {
             $named = @($veto | ForEach-Object { if ($_.Cwd) { "$($_.File) (cwd $($_.Cwd))" } else { "$($_.File) (no readable cwd)" } })
             return @{ Veto = $true; Anonymous = $veto; Note = "but $($veto.Count) record(s) that are LIVE or were written in the last ${AnonymousFreshHours}h name no session and may be it: $($named -join '; ')" }
