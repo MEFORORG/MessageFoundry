@@ -104,6 +104,7 @@ __all__ = [
     "prepare_log_record",
     "prints_a_codec_error",
     "redact",
+    "redact_binary_carriage",
     "redact_untrusted",
     "refuse_repeated_keys",
     "safe_error",
@@ -1068,6 +1069,53 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
     # its own guard -- and re-cut it on every pass, which is what the first version of this shipped.
     head, dropped = _clamp(text, max(window - _CLAMP_MARKER_BUDGET, 0))
     return f"{head}\n{_clamp_marker(dropped)}"  # newline, not space: see _clamp_marker
+
+
+#: An ``mfb64:v1:`` binary-carriage value (ADR 0028; ``parsing/binary.py`` ``MARKER``) and the base64
+#: run after it (BACKLOG #5378). The run is a whole message body, PHI by design, and every pass in
+#: :func:`redact` reads it as one opaque token: no HL7 delimiter, no date, no second capitalized word.
+#: So a log record or traceback quoting a carriage reached every sink whole. The marker is written as
+#: a literal because this module is pure stdlib and must not import ``parsing``; a test pins it to
+#: ``MARKER``.
+#:
+#: **It runs LAST, after every label pass** -- the PHI passes here and the credential passes of the
+#: log chain and the support bundle -- through :func:`redact_binary_carriage`, never inside
+#: :func:`redact`. ``/``, ``+`` and ``=`` are base64 characters, so a run read first took a label
+#: joined to it (``QUJD/MRN: 123``, ``QUJD+token=x``) and left its value with nothing to find it by.
+#: Read last, every labelled value is already hidden as it was before this pass existed, and the
+#: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
+#: piece between two ``/``) is read as part of the run, so the run is not cut there and its tail is
+#: taken too.
+#:
+#: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``) or
+#: JSON unicode-escaped (``:``, also with the backslash doubled, as a ``repr`` writes it), and a
+#: run whose ``+``, ``/`` or ``=`` is percent-encoded or unicode-escaped, or whose ``/`` is
+#: JSON-escaped (``\/``), the escapes also with the backslash doubled. The marker and the escapes are
+#: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold takes no non-ASCII letter.
+#: The run ends at its padding. One run unit is required, so prose that merely names the marker, such
+#: as ``missing mfb64:v1: marker``, is kept, and the result re-read changes nothing.
+#:
+#: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
+#: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
+#: first such character; and a marker escaped any other way (``\x3a``) is not read at all.
+_BINARY_CARRIAGE = re.compile(
+    r"(?i)(mfb64(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
+    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>)++"
+    r"(?:=|%3D|\\u003D|\\\\u003D){0,2}",
+    re.ASCII,
+)
+
+
+def redact_binary_carriage(text: str) -> str:
+    """``text`` with every ``mfb64:v1:`` carriage run replaced by the placeholder, the marker kept so a
+    reader can still see a binary body was withheld (BACKLOG #5378).
+
+    **Call it last**, after every label and credential pass over the same text, as
+    :data:`_BINARY_CARRIAGE` says. The ``64`` screen holds for every form of the marker, so most
+    text skips the case-insensitive search."""
+    if "64" not in text:
+        return text
+    return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
 
 
 def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:

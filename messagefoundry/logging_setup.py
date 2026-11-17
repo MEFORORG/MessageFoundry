@@ -76,6 +76,7 @@ from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
     prepare_log_record,
+    redact_binary_carriage,
     redact_untrusted,
     safe_traceback,
 )
@@ -106,6 +107,7 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "BinaryCarriageScrubFilter",
     "redact_log_value",
     "redacted_log_field",
     "UNREADABLE_LOG_VALUE",
@@ -668,6 +670,21 @@ class CredentialScrubFilter(logging.Filter):
         return True
 
 
+class BinaryCarriageScrubFilter(logging.Filter):
+    """Replace an ``mfb64:v1:`` binary-carriage body in every emitted record -- message, exception
+    traceback and ``stack_info`` -- via :func:`~messagefoundry.redaction.redact_binary_carriage`
+    (BACKLOG #5378).
+
+    ORDER. Installed **after** :class:`CredentialScrubFilter`, the last label pass, and **before**
+    :class:`ControlCharScrubFilter`, which must stay last. After, because ``/``, ``+`` and ``=`` are
+    base64 characters: a carriage pass run earlier took a label joined to the run and left its value
+    for no pass to find. :data:`~messagefoundry.redaction._BINARY_CARRIAGE` states the rest."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        _rewrite_record(record, redact_binary_carriage)
+        return True
+
+
 class JsonFormatter(_SafeExcFormatter):
     """Render each record as a single line of JSON — one object per line — for a log shipper / SIEM
     (sec-offbox-log).
@@ -1216,17 +1233,21 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
+    handler.addFilter(BinaryCarriageScrubFilter())  # mfb64 bodies, after every label (#5378)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
 
 
 def scrub_log_text(text: str) -> str:
-    """``text`` through the three text passes :func:`_install_phi_filters` installs, in its order:
-    PHI redaction (bounded), the credential query scrub, then the credential scrub. The control
-    scrub, which runs last on a handler, is left out, so a control character stays as it is.
+    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order: PHI
+    redaction (bounded), the credential query scrub, the credential scrub, then the binary-carriage
+    pass. The control scrub, which runs last on a handler, is left out, so a control character stays
+    as it is.
 
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
     #3045). A handler still runs its chain over the encoded line afterwards."""
-    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+    return redact_binary_carriage(
+        scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+    )
 
 
 def _build_syslog_handler(

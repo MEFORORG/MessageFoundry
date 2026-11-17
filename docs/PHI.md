@@ -1872,7 +1872,7 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
    query parameters (`code`, `state`, `id_token`, `access_token`, `token`, `session_state`). This is the
    only reason a live OIDC authorization code does not land in the access log. Until BACKLOG #1478
    it reached the rendered **message** only, so a `code` inside an exception traceback was
-   scrubbed by nothing; all four filters now share one record walk covering `message`,
+   scrubbed by nothing; every filter in this list now shares one record walk covering `message`,
    `exc_text` and `stack_info`.
 3. **`CredentialScrubFilter`** (BACKLOG #1478) — redacts credential **values** by LABEL, keeping
    the label so the line stays diagnosable: `password`/`secret`/`credential` pairs including the
@@ -1885,7 +1885,12 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
    scrubbed or carry a written reason
    (`tests/test_logging_credential_scrub.py`). **Usernames are deliberately out of scope** — see
    the residual note on stream 4 below.
-4. **`ControlCharScrubFilter`** — escapes CR/LF and the rest of the log alphabet, which includes at
+4. **`BinaryCarriageScrubFilter`** (BACKLOG #5378) — replaces the base64 body of an `mfb64:v1:`
+   binary carriage (ADR 0028), keeping the marker. It runs after every label pass above, so a
+   label joined to the run by a base64 character (`/`, `+`, `=`) has its value hidden first; the
+   forms it reads and its residuals are stated once, on `_BINARY_CARRIAGE` in
+   [`redaction.py`](../messagefoundry/redaction.py).
+5. **`ControlCharScrubFilter`** — escapes CR/LF and the rest of the log alphabet, which includes at
    least the C1 controls, the bidirectional controls and U+2028/U+2029 (log-injection defence, ASVS
    16.4.1). The alphabet is stated once, in `_escapes_in_a_log_line` in
    [`controlchars.py`](../messagefoundry/controlchars.py); read it there.
