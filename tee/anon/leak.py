@@ -274,9 +274,9 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     part is routable, so the IPv4 allow list stays the publish guard's own. Every text
     :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
     hit, so a fail-closed check refuses on any reading. When none parses, the texts of
-    :func:`_label_dropped_runs` are tried the same way. A run in which a dot joins two texts that
-    each hold a colon, as in ``fe80::1.4000:a1::5``, is also judged one joined text at a time, so
-    an allowed address that parses first does not hide a routable one after it (BACKLOG #5654).
+    :func:`_label_dropped_runs` are tried the same way. Each piece :func:`_dot_joined` cuts a run
+    into is also judged on its own, so in ``fe80::1.4000:a1::5`` an allowed address that parses
+    first does not hide a routable one after it (BACKLOG #5654).
     What it misses, and what it refuses though it holds no address, is listed in docs/PHI.md
     section 9."""
     for match in _IPV6_RUN.finditer(text):
@@ -1212,8 +1212,8 @@ def leak_report(
     token hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check)
     rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
-    when ``rules`` is supplied**, over the fields no rule but a ``keep`` rewrites; a bare-string
-    call is token-only. The token scan also reads the text decoded from its HL7 escape sequences
+    when ``rules`` is supplied**, over the same fields and components as the toolkit's; a
+    bare-string call is token-only. The token scan also reads the text decoded from its HL7 escape sequences
     when it has a parseable MSH (BACKLOG #5532), and it reads the guard's tables at each scan
     (BACKLOG #5541).
 

@@ -241,9 +241,9 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     part is routable, so the IPv4 allow list stays the publish guard's own. Every text
     :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
     hit, so a fail-closed check refuses on any reading. When none parses, the texts of
-    :func:`_label_dropped_runs` are tried the same way. A run in which a dot joins two texts that
-    each hold a colon, as in ``fe80::1.4000:a1::5``, is also judged one joined text at a time, so
-    an allowed address that parses first does not hide a routable one after it (BACKLOG #5654).
+    :func:`_label_dropped_runs` are tried the same way. Each piece :func:`_dot_joined` cuts a run
+    into is also judged on its own, so in ``fe80::1.4000:a1::5`` an allowed address that parses
+    first does not hide a routable one after it (BACKLOG #5654).
     What it misses, and what it refuses though it holds no address, is listed in docs/PHI.md
     section 9."""
     for match in _IPV6_RUN.finditer(text):

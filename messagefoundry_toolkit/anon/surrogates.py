@@ -214,10 +214,10 @@ def _free_letters(seps: Seps) -> str:
 
 
 def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
-    """A fabricated value with the **same shape** as ``sample``: each digit becomes an ASCII digit,
-    each letter and each other non-ASCII character becomes an upper-case ASCII letter, and ASCII
-    punctuation and spaces are kept verbatim. Preserves the original width AND the alphanumeric
-    shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used
+    """A fabricated value with the **same width** as ``sample``. Away from an escape character,
+    each digit becomes an ASCII digit, each letter and each other non-ASCII character becomes an
+    upper-case ASCII letter, and ASCII punctuation and spaces are kept verbatim, so ``A0049``
+    becomes ``X7321``, not a shrunk digit-only string. A non-ASCII letter used
     to be kept as it was, so an accented letter of a real id reached the output (BACKLOG #5534).
 
     No fabricated letter or digit is a separator or escape character the message declares
