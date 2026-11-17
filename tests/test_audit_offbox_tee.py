@@ -1191,9 +1191,10 @@ def test_the_old_line_names_the_last_candidates_reasons(monkeypatch, caplog) -> 
     assert _old_line_warnings(caplog, _FLOOR_BEFORE, after) == [_worded(_UNPARSED)]
 
 
-def test_each_old_line_reason_is_logged_once(monkeypatch, caplog) -> None:
+def test_a_second_old_line_reason_is_logged_after_the_first(monkeypatch, caplog) -> None:
     """Review of the PR 2864 repair: one flag for both reasons meant a parse-floor fallback after
-    a shown-word one was never logged. Each reason is logged once. Synthetic values."""
+    a shown-word one was never logged. Each reason is logged, and a warning naming only logged
+    reasons is not logged again. Synthetic values."""
     monkeypatch.setattr(audit_tee, "_OLD_LINE_REASONS_LOGGED", set())
     floor_after = {**_FLOOR_BEFORE, "actor": "[redacted]"}
     assert _old_line_warnings(caplog, _WORD_BEFORE, _WORD_AFTER) == [_worded(_SHOWS)]
@@ -1248,10 +1249,30 @@ def test_a_fault_that_ships_the_old_line_says_so(monkeypatch, caplog) -> None:
         audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
         audit_tee._tee_line(_WORD_BEFORE, _WORD_AFTER)
     (fault,) = [r.getMessage() for r in caplog.records if "scrub failed" in r.getMessage()]
-    assert fault == (
-        "the audit tee's C0 scrub failed (RuntimeError); the record ships without it, as the line "
-        "before the scrub, and further such faults in this process are not logged"
-    )
+    assert fault == _LINE_FAULT
+
+
+_LINE_FAULT = (
+    "the audit tee's C0 scrub failed (RuntimeError); the record ships without it, as the line "
+    "before the scrub, and further such faults in this process are not logged"
+)
+
+
+def test_a_fault_while_bounding_the_detail_says_the_old_line_ships(monkeypatch, caplog) -> None:
+    """Review of the PR 2864 repair: the fault in ``emit_audit_tee`` around ``_bounded_detail``
+    ships the line before #3045, and logs that, not the field fault. Synthetic values."""
+
+    def boom(*_args: object) -> str:
+        raise RuntimeError("synthetic DOE JANE")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit_tee, "_bounded_detail", boom)
+        patch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", True)
+        patch.setattr(audit_tee, "_LINE_SCRUB_FAULT_LOGGED", False)
+        with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
+            _raw_tee_lines([{"detail": f"{chr(0x01)}DOE JANE"}], monkeypatch, scrub=True)
+    faults = [r.getMessage() for r in caplog.records if "scrub failed" in r.getMessage()]
+    assert faults == [_LINE_FAULT]
 
 
 def test_a_long_value_with_no_control_is_not_touched() -> None:

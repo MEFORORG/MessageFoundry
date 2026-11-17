@@ -131,7 +131,7 @@ _FIELD_SCRUB_FAULT_LOGGED = False
 #: :func:`_log_line_fault`.
 _LINE_SCRUB_FAULT_LOGGED = False
 #: The reasons for shipping a record as the line before #3045 that this process has logged, so
-#: each reason is logged once; see :func:`_tee_line`.
+#: a warning naming none but these is not logged again; see :func:`_tee_line`.
 _OLD_LINE_REASONS_LOGGED: set[str] = set()
 _SHOWS_A_WORD = "show a word the line before it hid"
 _UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
@@ -269,10 +269,11 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     :func:`_bounded_detail` after the bound. A whole-field return below ships without the note,
     except for a ``detail``, which gets it there too.
 
-    So, at least, the whole field ships as :data:`_FIELD_REDACTED` where a reading found more,
-    where the plain result shows a word the chain alone hides, and on a fault; a JSON ``detail``
-    ships as the JSON string ``"[redacted]"`` in those cases and where the passes leave it
-    unparseable.
+    So, at least, this returns the whole field as :data:`_FIELD_REDACTED` where a reading found
+    more, where the plain result shows a word the chain alone hides, and on a fault; a JSON
+    ``detail`` as the JSON string ``"[redacted]"`` in those cases and where the passes leave it
+    unparseable. What ships is :func:`_tee_line`'s choice, which can still be the line before
+    #3045, with the field unscrubbed.
 
     With ``detail``, where the value parses as JSON and holds no raw control, which is how most
     writers hand ``detail`` over, each JSON escape that spells a C0 control is decoded to the
@@ -338,15 +339,16 @@ def _log_scrub_fault(exc: Exception) -> None:
     if not _FIELD_SCRUB_FAULT_LOGGED:
         _FIELD_SCRUB_FAULT_LOGGED = True
         log.warning(
-            "the audit tee's field scrub failed (%s); the field ships redacted, and further "
-            "faults in this process are not logged",
+            "the audit tee's field scrub failed (%s); the field is hidden whole, unless the "
+            "record then ships as the line before the scrub, and further faults in this process "
+            "are not logged",
             type(exc).__name__,
         )
 
 
 def _log_line_fault(exc: Exception) -> None:
     """Log a fault that ships a record as the line before #3045, once per process, by type and
-    never with the value. Apart from :func:`_log_scrub_fault`, whose field ships redacted."""
+    never with the value. Apart from :func:`_log_scrub_fault`, a fault in one field's scrub."""
     global _LINE_SCRUB_FAULT_LOGGED
     if not _LINE_SCRUB_FAULT_LOGGED:
         _LINE_SCRUB_FAULT_LOGGED = True
@@ -388,8 +390,9 @@ def _tee_line(
     loses the C0 scrub for that record, and is reached only where hiding the changed fields
     whole still fails the bar on some sink, for either of two reasons: it shows a word the old
     line hid elsewhere in it, or its reading does not parse as JSON where the old line's did. It
-    is logged naming the reasons that fired for that last candidate and no field value, where it
-    names a reason this process has not logged yet, so a logged reason can be named again
+    is logged naming no field value and the reasons the last candidate checked, the line with
+    the changed fields hidden whole, failed for, where it names a reason this process has not
+    logged yet, so a logged reason can be named again
     beside a new one.
     On a fault, the old line ships, which meets the bar by definition."""
     old_line = json.dumps(before, ensure_ascii=False)
@@ -408,14 +411,14 @@ def _tee_line(
             line = json.dumps(candidate, ensure_ascii=False)
             paired = list(zip(sink_readings(line), bars, strict=True))
             shows = not all(_shows_no_more(r, words) for r, (words, _) in paired)
-            # Only the last candidate's reasons are reported, so an earlier one that shows a word
-            # is rejected without its parses.
+            # Only the last checked candidate's reasons are reported, so an earlier one that shows
+            # a word is rejected without its parses.
             if shows and candidate is not candidates[-1]:
                 continue
             unparsed = not all(not parsed or _parses(r) for r, (_, parsed) in paired)
             if not (shows or unparsed):
                 return line
-            # The last candidate's reasons are the ones that ship the old line.
+            # The last checked candidate's reasons are the ones that ship the old line.
             reasons = [_SHOWS_A_WORD] if shows else []
             if unparsed:
                 reasons.append(_UNPARSED)

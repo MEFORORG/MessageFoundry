@@ -2159,7 +2159,8 @@ fields missing, or with one field's text under another key. The `emit_audit_tee`
 docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least two
 residuals that cause these. A text field holding a C0 control, such as a typed sign-in name, is
 scrubbed before it is encoded, and in at least the cases `_scrub_field` in the same file lists,
-the whole field ships as `[redacted]`. That includes a typed sign-in name a client chose to put a
+the whole field ships as `[redacted]`, unless the record ships as it did before that scrub, which
+the `_tee_line` docstring in the same file says when. That includes a typed sign-in name a client chose to put a
 control in, so on a first deployment a client could keep its own typed name out of the off-box
 copy. The `emit_audit_tee` docstring says what that scrub does not cover.
 
