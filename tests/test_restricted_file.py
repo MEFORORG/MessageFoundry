@@ -1506,8 +1506,9 @@ def test_windows_refuses_a_restricted_key_beneath_a_junction(
 
 
 def judge_links_only_under(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
-    """Make the Windows link rule read the real access lists of ``root`` and what is under it, and
-    read every folder above ``root`` as SYSTEM's alone. A test host's own profile folders are not
+    """Make the Windows host readers, which the link rule and the holder read both use, read the
+    real access lists of ``root`` and what is under it, and read every folder above ``root`` as
+    SYSTEM's alone, so a holder outside ``root`` always passes. A test host's own profile folders are not
     the test's to judge: one measured host grants an AppContainer capability full control of
     ``AppData``, which refuses every junction under the temporary directory. A no-op elsewhere."""
     if sys.platform != "win32":

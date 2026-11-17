@@ -807,7 +807,12 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             return None  # a share's root: nothing on this host holds it
     else:
         if not chain or chain[-1][1] == LINK:
-            return "the folders on its path could not be walked (it resolves to a link it passed)"
+            # windows_chain adds an object once, so a path that resolves to a folder it already
+            # passed ends on the link that led back; that folder is not resolved here.
+            return (
+                "the folders on its path could not be walked (a junction or link on it leads back "
+                "to a folder already on the path)"
+            )
         holder_path = ntpath.dirname(chain[-1][0])
         if holder_path == chain[-1][0]:
             return None  # a volume root: nothing holds it
@@ -815,10 +820,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     try:
         problem = _windows_link_problem(chain, host.read_security, trust)
         holder_is_root = ntpath.dirname(holder_path) == holder_path
-        if problem is None and substituted and cause is None and not holder_is_root:
+        if problem is None and substituted and not holder_is_root:
             # A subst letter is spliced in with no link entry, but the folders above its target can
-            # rename what lies below just as they can above a link, so every folder above the holder
-            # is judged by the link rule. The holder itself is judged below, DELETE included.
+            # rename what lies below, as those above a link can. The walk does not say where the
+            # target was, so every folder above the holder is judged by the link rule: stricter
+            # than for a link, whose rule starts at the link. The holder is judged below.
             problem = _windows_judged_problem(
                 _folders_above(holder_path, set()), host.read_security, trust
             )
@@ -1178,7 +1184,7 @@ def broad_access_problem(
             host = windows_host_readers()
         except OSError as exc:
             reason = exc.strerror or type(exc).__name__
-            return f"the folders on its path could not be judged ({reason})"
+            return f"the readers for its owner and the folders on its path could not be built ({reason})"
         if engine_owned:
             problem = _windows_engine_owner_problem(security.owner_sid, host.engine_sid)
             if problem is not None or holder_judged:

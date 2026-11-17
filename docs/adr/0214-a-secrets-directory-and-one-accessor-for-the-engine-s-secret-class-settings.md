@@ -157,12 +157,14 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` now walks
   the directory's own path, so a `subst` drive root such as `S:\` is resolved, and reads the
   owner and access list of the folder that holds the directory where the walk ends, after every
-  junction, link and `subst` drive, not of `full.parent`. Inherit-only entries are skipped. A
-  broad group's `DELETE` on that folder is refused too, except on a volume root. Where a `subst`
-  drive is on the path, the folders above that folder are judged as the folders above a link are.
-  A link or `subst` drive onto a network share, and a share that is this host itself, are
-  refused. So the two gaps the 2026-11-13 list names are closed; the code is the record of the
-  rest, and the check is still not a complete check of the directory's surroundings.
+  junction, link and `subst` drive; a path the walk follows onto a share it names is still read
+  at `full.parent`, through the share. Inherit-only entries are skipped. A broad group's `DELETE`
+  on that folder is refused too, except on a volume root. Where a `subst` drive is on the path,
+  every folder above that folder is judged by the link rule. A link or `subst` drive onto a
+  network share is refused, and so is a share spelled with at least some of this host's own
+  names; `_loopback_share_problem` says which, and a mapped drive is not among them. So the two
+  gaps the 2026-11-13 list names are closed; the code is the record of the rest, and the check is
+  still not a complete check of the directory's surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
   #5657).** On Windows, `_windows_surroundings_problem` in `messagefoundry/restricted_file.py`
   reads the owner and access list of `full.parent`, the folder just above the directory in its
