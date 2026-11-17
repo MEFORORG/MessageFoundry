@@ -24,6 +24,8 @@ import pytest
 
 from tee.__main__ import _build_parser, _confirm_test_only, _parse_age, _parse_endpoint, main
 from tee.store import RelayStore
+from tests._tee_seed import SYNTHETIC_ADT, seed_capture
+from tests._win_acl import my_sids
 
 
 async def _seed(db: str) -> None:
@@ -208,14 +210,7 @@ def _seed_compare(
     corepoint_body = msh + "PID|1||100^^^H^MR||DOE^JANE\r"
     mefor_body = msh + f"PID|1||100^^^H^MR||{mefor_name}\r"
 
-    async def _seed_capture() -> None:
-        store = await RelayStore.open(db)
-        await store.record_capture(
-            direction="corepoint_copy", control_id="C1", raw=corepoint_body.encode()
-        )
-        await store.close()
-
-    asyncio.run(_seed_capture())
+    seed_capture(db, corepoint_body.encode())
     monkeypatch.setattr(
         mefor_api,
         "fetch_mefor_outputs",
@@ -348,21 +343,7 @@ def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | s
     """Seed one synthetic capture and run ``anonymize-captures --out`` on it in process. Logging
     setup is stubbed, since it would reconfigure logging for the whole pytest session."""
     db = str(tmp_path / "tee.db")
-    raw = (
-        "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
-        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
-    )
-
-    async def seed() -> None:
-        store = await RelayStore.open(db)
-        try:
-            await store.record_capture(
-                direction="corepoint_copy", control_id="C1", raw=raw.encode()
-            )
-        finally:
-            await store.close()
-
-    asyncio.run(seed())
+    seed_capture(db, SYNTHETIC_ADT.encode())
     monkeypatch.setenv("MEFOR_ANON_SALT", _ANON_SALT)
     monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
     return main(["anonymize-captures", "--db", db, "--out", str(out)])
@@ -590,31 +571,6 @@ def _sddl_of(path: Path, scratch: Path) -> str:
     return [line for line in text.splitlines() if line.strip()][1]
 
 
-#: SDDL short names icacls prints for an account that may run the tests (a self-hosted runner's
-#: service runs as one of the first three).
-_SDDL_SHORT_NAMES = {"S-1-5-18": "SY", "S-1-5-19": "LS", "S-1-5-20": "NS"}
-
-#: Short names icacls may print for an entry the fixture removes, as the SIDs /remove:g takes. One
-#: not listed here fails the removal, and so the fixture, rather than surviving.
-_SDDL_ALIASES = {
-    "OW": "S-1-3-4",
-    "CO": "S-1-3-0",
-    "AU": "S-1-5-11",
-    "BU": "S-1-5-32-545",
-    "WD": "S-1-1-0",
-}
-
-
-def _my_sids() -> set[str]:
-    """This account as SDDL may spell it: its SID, ``LA`` when it IS the built-in Administrator
-    (RID 500), which the hosted runners run as (see test_store_trio_acl.py), or a service
-    account's short name."""
-    me = _own_sid()
-    if me.endswith("-500"):
-        return {me, "LA"}
-    return {me, _SDDL_SHORT_NAMES[me]} if me in _SDDL_SHORT_NAMES else {me}
-
-
 def _aces(sddl: str) -> tuple[tuple[str, str, str, str], ...]:
     """The DACL entries of ``sddl`` as (type, flags, rights, trustee), through the store's parser."""
     from messagefoundry.store.store import _parse_sddl_dacl
@@ -627,20 +583,21 @@ def _aces(sddl: str) -> tuple[tuple[str, str, str, str], ...]:
 def _harden(path: Path, grant: Literal["F", "R"], scratch: Path) -> str:
     """Leave ``path`` exactly one entry, granting this account ``grant``, check that it took and
     binds this process, and return the list as SDDL."""
-    _win_run("icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{_own_sid()}:{grant}")
-    # /inheritance:r drops only INHERITED entries; explicit ones can survive onto the file (CI run
-    # 36039014999). Measured in CI run 39087669047 (windows-2025): a fixture that removed only
-    # OWNER RIGHTS and CREATOR OWNER left D:PAI(A;;FR;;;LA)(A;;FA;;;SY)(A;;FA;;;BA), and the
-    # runner's elevated token, with Administrators switched on, wrote that R-hardened file. So
-    # every other trustee goes, whoever it is, rather than a list of the ones seen so far.
-    me = _my_sids()
-    others = sorted({sid for *_, sid in _aces(_sddl_of(path, scratch)) if sid not in me})
-    if others:
-        sids = (_SDDL_ALIASES.get(sid, sid) for sid in others)
-        _win_run("icacls.exe", str(path), "/remove:g", *(f"*{sid}" for sid in sids))
-    # A fixture that did not produce its shape is reported as a fixture, not as a product failure.
-    sddl = _sddl_of(path, scratch)
+    from messagefoundry.store.store import _set_security_from_sddl
+
+    # The whole protected list is written in one SetNamedSecurityInfoW call, so every other entry
+    # goes, deny entries included, whoever its trustee is. icacls took two calls here, /grant:r and
+    # then /remove:g, and the second could be refused (exit 5) once the first left this account only
+    # an OWNER RIGHTS entry; store._write_trio_dacl records that measurement. Measured in CI run
+    # 39087669047 (windows-2025): a list that kept SYSTEM and Administrators let the runner's
+    # elevated token write an R-hardened file, so nothing but this account may stay.
     rights = {"F": "FA", "R": "FR"}[grant]
+    written = _set_security_from_sddl(path, f"D:P(A;;{rights};;;{_own_sid()})", protected=True)
+    assert written.failure is None and written.dacl_status == 0, f"fixture: {written}"
+    # A fixture that did not produce its shape is reported as a fixture, not as a product failure.
+    # The list is read back through icacls /save, independently of the call that wrote it.
+    me = my_sids(_own_sid())
+    sddl = _sddl_of(path, scratch)
     entries = _aces(sddl)
     assert len(entries) == 1 and entries[0][:3] == ("A", "", rights), f"fixture: {sddl}"
     assert entries[0][3] in me, f"fixture: {path.name} has {sddl}"
@@ -649,15 +606,46 @@ def _harden(path: Path, grant: Literal["F", "R"], scratch: Path) -> str:
 
 
 def _opens_for_writing(path: Path) -> bool:
-    """Whether this process can open ``path`` for writing. ``r+b`` neither creates nor truncates.
+    """Whether this process may open ``path`` for writing, asked of ``CreateFileW`` with every
+    sharing mode granted, opening only an existing file, so nothing is created or truncated.
 
-    A sharing violation also raises PermissionError on Windows, so a file another process holds
-    without write sharing reads as unwritable here too; nothing in the error tells them apart."""
-    try:
-        with path.open("r+b"):
-            return True
-    except PermissionError:
+    Only Win32 error 5, access denied, reads as False. That is the access list's refusal for the
+    regular files this fixture hardens, but Windows gives the same error for at least a file with
+    the read-only attribute, one pending deletion and a directory, so error 5 alone does not name
+    the list. Python's own ``open`` reports a sharing violation (error 32, another process holding
+    the file without write sharing) as the same ``PermissionError``, which would read as a denial;
+    any error but 5 is raised instead. Windows only."""
+    if sys.platform != "win32":
+        raise AssertionError("fixture: _opens_for_writing is Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateFileW
+    create.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_write, share_all, open_existing = 0x40000000, 0x7, 3
+    handle = create(str(path), generic_write, share_all, None, open_existing, 0, None)
+    if handle != wintypes.HANDLE(-1).value:
+        kernel32.CloseHandle(handle)
+        return True
+    error = ctypes.get_last_error()
+    if error == _ERROR_ACCESS_DENIED:
         return False
+    raise OSError(error, f"fixture: CreateFileW on {path} failed with Win32 error {error}")
+
+
+#: The Win32 error a write open gets when the access list refuses it.
+_ERROR_ACCESS_DENIED = 5
 
 
 @_WINDOWS_ACLS
