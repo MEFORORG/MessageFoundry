@@ -587,8 +587,9 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     ``from ... import`` reads as its value there (Postgres and SQL Server import ``VIEWED_EVENT``
     from the SQLite store).
 
-    Not read: a helper reached under another name, which the reference check refuses only when its
-    name is spelled out, and SQL assembled at run time.
+    Not read, at least: a helper reached under another name, which the reference check refuses only
+    when its name is spelled out, an INSERT reached through an attribute, and SQL assembled at run
+    time.
     """
     tree = parse_source(source)
     imported = {
@@ -661,6 +662,14 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
             assert name in helpers, (
                 f"a call to {name}, which this source does not define; re-aim the scan"
             )
+            through = node.func.value if isinstance(node.func, ast.Attribute) else None
+            if receivers[name] and not (
+                isinstance(through, ast.Name) and through.id in {"self", "cls"}
+            ):
+                # Called through a class or another object, the receiver may be an argument, so
+                # the slot is not known (S._event(self, ...) shifts every argument by one).
+                unplaced.append(ast.unparse(node))
+                continue
             try:
                 value = argument_for(node, helpers[name], "event", receiver=receivers[name])
             except ArgumentUnplaced:
@@ -805,7 +814,7 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
         "        conn.execute('INSERT INTO message_events (message_id, event) VALUES (?, \"k\")',"
         " ('mid',))\n"
         "    lambda self, c: self._event(c, 'mid', 'class_level_kind', None, None, 0.0)\n"
-        "S()._event(c, 'mid', 'module_level_kind', None, None, 0.0)\n"
+        "self._event(c, 'mid', 'module_level_kind', None, None, 0.0)\n"
     )
     assert _event_kinds(source) == (
         {
@@ -1886,6 +1895,19 @@ def test_the_emit_site_scan_places_numbered_parameters_and_unbound_helpers() -> 
         "            _event('mid', VIEWED)\n"
     )
     assert _event_kinds(hidden) == (set(), ["f", "g", "h"])
+
+
+def test_the_emit_site_scan_refuses_a_helper_called_through_another_receiver() -> None:
+    """``S._event(self, ...)`` passes the receiver as an argument, so reading it as a bound call
+    takes ``message_id``'s literal as the kind. Refused rather than read one argument off."""
+    source = (
+        "class S:\n"
+        "    async def _event(self, conn, message_id, event, destination, detail, now): ...\n"
+        "    async def run(self, conn):\n"
+        "        await S._event(self, conn, 'routed', 'undeclared', None, None, 0.0)\n"
+    )
+    with pytest.raises(AssertionError, match="cannot place"):
+        _event_kinds(source)
 
 
 def test_forwarder_walk_refuses_a_namesake_of_a_forwarder() -> None:

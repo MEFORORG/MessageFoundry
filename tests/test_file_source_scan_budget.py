@@ -645,24 +645,25 @@ async def test_a_retry_left_in_place_stays_remembered_and_due(
 async def test_failed_listings_do_not_wipe_the_stuck_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A listing that raises lists nothing, which is no evidence the rejects have gone, so however
-    many fail in a row the memory is not pruned on them.
+    """A watch directory that is gone lists nothing, which is no evidence the rejects have gone, so
+    however many scans meet it the memory is not pruned. Real pathlib, nothing patched:
+    ``Path.glob`` returns nothing for a missing directory rather than raising.
 
-    Mutation: prune on a failed listing. Red: the reject is forgotten after SETTLE_MISS_LIMIT."""
+    Mutation: drop the ``os.scandir`` probe in ``_candidates``. Red: the reject is forgotten after
+    SETTLE_MISS_LIMIT scans and read again once the directory returns."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     rig.drop("a.hl7", _PDF)
     await rig.scan()
     assert await rig.scan() == ["a.hl7"]
 
-    def unlistable(_self: Path, _pattern: str) -> Any:
-        raise PermissionError(errno.EACCES, "denied")
-
-    with monkeypatch.context() as patched:
-        patched.setattr(Path, "glob", unlistable)
-        for _ in range(file_mod.SETTLE_MISS_LIMIT + 1):
-            assert await rig.scan() == []
+    away = tmp_path / "away"
+    rig.inbox.rename(away)
+    for _ in range(file_mod.SETTLE_MISS_LIMIT + 2):
+        assert await rig.scan() == []
+    assert rig.source._listing_failed
+    away.rename(rig.inbox)
     assert len(rig.source._stuck) == 1
-    assert await rig.scan() == [], "still remembered once the listing recovers"
+    assert await rig.scan() == [], "still remembered once the directory returns"
 
 
 async def test_a_full_memory_hovering_at_its_cap_is_not_logged_again(

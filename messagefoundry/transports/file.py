@@ -1963,6 +1963,11 @@ class FileSource(SourceConnector):
         for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
         try:
+            # Opened first because Path.glob and rglob return nothing, rather than raising, for a
+            # watch directory that is missing or unreadable (Python 3.13 and later), which would
+            # read as an empty drop and prune every memory on it (BACKLOG #5717).
+            with os.scandir(self.directory):
+                pass
             matched = list(globber(self.pattern))
         except (OSError, ValueError) as exc:
             # Watch dir vanished/unreadable, or an invalid glob pattern: treat as "nothing this
