@@ -1073,8 +1073,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
-            # BACKLOG #4934: supervise's start refusal reads the audit chain's range keys the open
-            # settled, as serve's lifespan does.
+            # BACKLOG #4934: the start refusal that serve and supervise run before the API pair
+            # mint reads the audit chain's range keys the open settled.
             "hash:via messagefoundry.store.store",
             # BACKLOG #3470: anchor_refusal checks the forwarder's and the SMTP relay's CA before
             # those hops are built, through evaluate_anchor: its SHA-256 fingerprint, and its pin

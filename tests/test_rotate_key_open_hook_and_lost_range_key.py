@@ -296,6 +296,71 @@ def _mint_a_pair_due_for_renewal(state_dir: Path, monkeypatch: pytest.MonkeyPatc
     return (state_dir / "api-generated-cert.pem").read_bytes()
 
 
+def _mint_a_pair_that_falls_due_after_the_first_check(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> bytes:
+    """As :func:`_mint_a_pair_due_for_renewal`, but the pair is reported fresh to the first renewal
+    check after this and due to every later one: a pair crossing the renewal threshold between the
+    start's read-only check and its mint."""
+    from messagefoundry.api import tls
+    from messagefoundry.config.settings import ApiSettings
+
+    tls.ensure_api_tls_material(ApiSettings(), state_dir=state_dir)
+    checks: list[Path] = []
+
+    def due_after_the_first_check(cert_path: Path) -> Any:
+        checks.append(cert_path)
+        return None if len(checks) == 1 else tls._cert_facts(cert_path)
+
+    monkeypatch.setattr(tls, "_renewal_due", due_after_the_first_check)
+    return (state_dir / "api-generated-cert.pem").read_bytes()
+
+
+def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_supervise_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4934: renewal is decided once, by the check the refusal runs on. A pair that falls due after
+    that check is not renewed by the mint, so a start its engine shards will refuse leaves it
+    unchanged. Before, the mint renewed it and the refusal then left the renewal unaudited."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.api.tls import generated_state_dir
+    from messagefoundry.config.settings import ServiceSettings
+
+    db, key_a, key_b = tmp_path / "sup.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    state_dir = generated_state_dir(str(db))
+    minted = _mint_a_pair_that_falls_due_after_the_first_check(state_dir, monkeypatch)
+    settings = ServiceSettings(store=StoreSettings(path=str(db), encryption_key=key_b))
+    before = _audit_rows(db)
+    # Nothing is replaced, so the store is not opened here; each engine shard's lifespan refuses.
+    assert cli._renew_api_tls_before_spawning(settings, str(db)) == state_dir
+    assert (state_dir / "api-generated-cert.pem").read_bytes() == minted
+    assert _audit_rows(db) == before
+
+
+def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_serve_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4934: as the supervise test above, for serve, whose lifespan refuses after the mint."""
+    db, key_a, key_b = tmp_path / "messagefoundry.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    minted = _mint_a_pair_that_falls_due_after_the_first_check(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
+    # The enforce-only start gates (an off-box log collector, ...) are not under test here.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "alerts.security_notifications_required = false\n"
+        "security.local_access_only = true\n",
+        encoding="utf-8",
+    )
+    samples = Path(__file__).resolve().parent.parent / "samples" / "config"
+    main(["serve", "--config", str(samples), "--env", "dev"])
+    assert (tmp_path / "api-generated-cert.pem").read_bytes() == minted
+
+
 @pytest.mark.parametrize("allow_lost", [False, True])
 def test_a_refused_supervise_start_leaves_the_api_pair_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_lost: bool

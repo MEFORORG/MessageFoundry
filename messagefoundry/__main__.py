@@ -4911,8 +4911,12 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #4934: the lifespan's start refusal runs after this mint, so a start that may replace
     # the pair takes it here first. A first-run mint replaces nothing, so it needs no early open.
     # An early open refused on an unmarked value is the exception; _refuse_unrolled_key_before_tls_write
-    # says what that start does instead.
-    if generated_pair_may_be_replaced(settings.api, state_dir=_state_dir, renew=args.shard is None):
+    # says what that start does instead. The answer is also the mint's `renew`, so renewal is decided
+    # once: a pair that falls due after this check is not renewed past the refusal it skipped.
+    _may_replace = generated_pair_may_be_replaced(
+        settings.api, state_dir=_state_dir, renew=args.shard is None
+    )
+    if _may_replace:
         from messagefoundry.pipeline.secret_rotation import UnrolledStoreKeyRefused
         from messagefoundry.store.base import KeylessAuditChainRefused
 
@@ -4932,7 +4936,7 @@ def _serve(args: argparse.Namespace) -> int:
             # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so
             # a lone restarted shard cannot leave its siblings serving a different certificate
             # (#1276).
-            renew=args.shard is None,
+            renew=args.shard is None and _may_replace,
         )
     except RestrictedFileError as exc:
         # The TLS key could not be created restricted, and no usable pair exists to fall back on
@@ -5324,11 +5328,14 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     # BACKLOG #4934: a start that may replace the pair opens the store and takes the engine shards'
     # start refusal before it renews the pair. Any other start, and one whose early open is refused
     # on an unmarked value, mints or reuses first and opens the store only if that replaced a pair.
-    if generated_pair_may_be_replaced(settings.api, state_dir=state_dir) and run_guarded(
-        _audit(renew_after_refusal=True)
-    ):
+    # The check's answer is also the mint's `renew`, so renewal is decided once: a pair that falls
+    # due after the check is not renewed past the refusal it skipped.
+    may_replace = generated_pair_may_be_replaced(settings.api, state_dir=state_dir)
+    if may_replace and run_guarded(_audit(renew_after_refusal=True)):
         return state_dir
-    ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
+    ensure_api_tls_material(
+        settings.api, state_dir=state_dir, replacements=replaced, renew=may_replace
+    )
     if replaced:
         run_guarded(_audit(renew_after_refusal=False))
     return state_dir
