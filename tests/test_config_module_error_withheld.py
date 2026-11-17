@@ -553,16 +553,15 @@ _ENGINE_DIR = Path(messagefoundry.__file__).parent
 def _exec_as(source: str, file: Path, namespace: dict[str, object]) -> None:
     """Run ``source`` compiled under ``file``, which may name no file, in ``namespace``.
 
-    The frame rule reads the compiled file name and ``__name__``, never ``__file__``. Coverage
-    prefers ``__file__`` to the compiled name when the two share a base name, and never records a
-    ``<...>`` name, so a ``<...>`` ``__file__`` keeps a name with no file out of its data. Recorded,
-    such a name stopped ``coverage xml`` with "No source for code", and the diff-coverage job wrote
-    no report. A real file keeps its own ``__file__``, so coverage measures it as before.
+    ``__file__`` is free to set: :func:`messagefoundry.exception_origin._in_the_engine` does not
+    read it. Coverage prefers ``__file__`` to the compiled name when the two share a base name, and
+    never records a ``<...>`` name, so a ``<...>`` ``__file__`` keeps a name with no file out of its
+    data. Recorded, such a name stopped ``coverage xml`` with "No source for code", and the
+    diff-coverage job wrote no report. A real file is its own ``__file__``, as on an import.
 
     The fix stays in this test. A file written into the package would be gone before the report,
     ``purge_files`` keeps the file's entry, and an omit rule would change the coverage config."""
-    if not file.exists():
-        namespace["__file__"] = f"<not on disk>/{file.name}"
+    namespace["__file__"] = str(file) if file.exists() else f"<not on disk>/{file.name}"
     exec(compile(source, str(file), "exec"), namespace)
 
 
