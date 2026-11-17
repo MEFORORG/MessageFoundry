@@ -24,6 +24,7 @@ import pytest
 
 from messagefoundry.store import MessageStore
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -194,10 +195,12 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
 
 
 #: Every table with a flag saying whether it is virtual, so one walk both counts the tables it saw
-#: and finds the virtual ones (a virtual table's ``type`` is ``table`` too).
+#: and finds the virtual ones (a virtual table's ``type`` is ``table`` too). The flag is the module's
+#: own predicate, so the pin and the reads it guards cannot disagree (BACKLOG #6719 item 9).
 _TABLES_FLAGGED_VIRTUAL = (
-    "SELECT name, sql LIKE 'CREATE VIRTUAL TABLE%' FROM sqlite_master WHERE type = 'table'"
+    f"SELECT m.name, NOT ({_ORDINARY_TABLE}) FROM sqlite_master AS m WHERE m.type = 'table'"
 )
+_VIEWS = "SELECT name FROM sqlite_master WHERE type = 'view'"
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -209,11 +212,72 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         await MessageStore._migrate(db)
         async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
             tables = [tuple(r) for r in await cur.fetchall()]
+        async with db.execute(_VIEWS) as cur:
+            views = [r[0] for r in await cur.fetchall()]
     # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
     # absence below cannot pass on an empty walk.
     assert len(tables) >= 30, f"the scratch schema holds only {len(tables)} tables"
     virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
+    # The reads skip views too, so a view this build created would never be verified either
+    # (BACKLOG #6719 item 10).
+    assert views == []
+
+
+async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) -> None:
+    # Negative control for the pin above that needs no fts5 (BACKLOG #6719 item 8): a planted
+    # virtual table is flagged, an ordinary one is not, and the view query sees a view.
+    path = tmp_path / "probe.db"
+    _sql(path, "CREATE TABLE plain (a)", "CREATE VIEW v AS SELECT 1")
+    _plant_unloaded_virtual_table(path, "planted")
+    async with _connected(path) as db:
+        async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
+            rows = {r[0]: bool(r[1]) for r in await cur.fetchall()}
+        async with db.execute(_VIEWS) as cur:
+            views = [r[0] for r in await cur.fetchall()]
+    assert rows == {"plain": False, "planted": True}
+    assert views == ["v"]
+
+
+async def test_a_virtual_table_whose_sql_hides_its_kind_is_still_skipped(tmp_path: Path) -> None:
+    # BACKLOG #6719 item 1: the SQL-text test missed a virtual table whose stored SQL does not spell
+    # its keywords exactly as the LIKE pattern does; rootpage does not depend on the text.
+    path = tmp_path / "hidden.db"
+    _sql(path, "CREATE TABLE plain (a)")
+    _sql(
+        path,
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', 'hidden',"
+        " 'hidden', 0, 'CREATE  VIRTUAL TABLE hidden USING no_such_module(x)')",
+    )
+    async with _connected(path) as db:
+        shape = await read_schema_shape(db)
+    assert set(shape.columns) == {"plain"}
+
+
+@pytest.mark.parametrize(
+    ("cipher_meta", "counted"),
+    [
+        ("CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)", True),  # control
+        ("CREATE VIEW cipher_meta AS SELECT 'k' AS key_id, 1 AS invocations", False),
+    ],
+    ids=["ordinary-table", "view"],
+)
+async def test_a_foreign_count_table_holds_no_count_to_reset(
+    tmp_path: Path, cipher_meta: str, counted: bool
+) -> None:
+    # BACKLOG #6719 item 2: cipher_meta is read only when it is an ordinary table, as store_salt is.
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    path = tmp_path / "count.db"
+    _sql(path, cipher_meta)
+    if counted:
+        _sql(path, "INSERT INTO cipher_meta VALUES ('k', 1)")
+    async with _connected(path) as db:
+        async with db.execute("SELECT count(*) FROM cipher_meta") as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1  # each holds one count row
+        assert await _counts_under_a_dek(db) is counted
 
 
 @_NEEDS_FTS5
