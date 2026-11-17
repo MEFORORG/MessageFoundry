@@ -16,14 +16,15 @@ starts no server. Contents (each a small text/JSON member):
 * ``app-log.txt`` — a **redacted** tail of the configured app log (see
   :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
 
-HARD RULE (do not break): no member this module builds reads a message body or a secret. The config
-summary emits counts/names only; the status snapshot is the metadata-only status models; the log tail is
-run through the redaction pass; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the bundle.
-**That rule is a goal for the code, not a claim about the archive.** The log tail copies what the app
-log holds, and a non-production instance may run at ``DEBUG``, which can log a full message body
-(``docs/PHI.md`` §7, the prod-``DEBUG`` refusal), so the redacted tail can still carry one. What the
-archive does and does not hold is stated once, in the manifest's ``phi_contract`` (BACKLOG #5385), and
-``docs/PHI.md`` stream 14 is the record.
+HARD RULE (do not break): no member this module builds reads a message body from the store, and only
+the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
+emits counts/names only; the status snapshot opens the store read-only, with its credentials, and emits
+only the metadata-only status models; and ``.env`` / ``*.db`` / ``MEFOR_*`` are never read into the
+bundle. **The app-log tail is the exception.** It reads the app log, which can hold a residual secret
+the redaction pass does not read, and, on a non-production instance running at ``DEBUG``, a full
+message body (``docs/PHI.md`` §7, the prod-``DEBUG`` refusal), so the redacted tail can still carry
+either. What the archive does and does not hold is stated once, in the manifest's ``phi_contract``
+(BACKLOG #5385), and ``docs/PHI.md`` stream 14 is the record.
 
 That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
 exception's **message** never enters the bundle: config loading wraps text raised by arbitrary operator

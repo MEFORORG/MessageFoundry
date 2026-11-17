@@ -5,9 +5,10 @@
 ``messagefoundry support-bundle`` writes a single zip for an operator to hand to support: the engine
 ``__version__``, a config summary of registry COUNTS and names only (never a settings value or a
 secret), a ``/status`` snapshot built from the real status models, and a **best-effort redacted**
-app-log tail. The rule for the code is that no member it builds reads a message body or a secret.
-The log tail copies what the app log holds, which on a non-production instance at ``DEBUG`` can be a
-full message body, so that rule is not a claim that the archive is PHI-free or secret-free; what it does and does not
+app-log tail. The rule for the code is that no member it builds reads a message body from the store.
+The app-log tail is the one member that can carry a logged body or a residual secret: it copies what
+the app log holds, which on a non-production instance at ``DEBUG`` can be a full message body, and the
+redaction can leave a secret in it. So the archive is not PHI-free or secret-free; what it does and does not
 hold is stated once, in the manifest's ``phi_contract`` (BACKLOG #5385). See
 :mod:`messagefoundry.support.redact` for the log-line scrubber and
 :func:`messagefoundry.support.bundle.build_bundle` for the assembly.
