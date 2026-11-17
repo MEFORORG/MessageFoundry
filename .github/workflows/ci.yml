@@ -6293,10 +6293,8 @@ jobs:
       # Each arm installs the service under the DEFAULT virtual account (NT SERVICE\MessageFoundry),
       # with sign-in required, on its own fresh data directory, and uninstalls it afterwards. The helper
       # asserts the SCM run-as account and the owner of each sampled service process, so an arm that
-      # silently ran as some other account goes red instead of measuring the wrong thing. Which reds
-      # carry a trio reading and a [STORE ACCESS] tag, and which opens have their confinement checked,
-      # is in the helper's header (WHAT A RED MEANS, CONFINEMENT); not every red, and not every open.
-      # A restriction the engine logged as failed prints GREEN (CONDITIONAL).
+      # silently ran as some other account goes red instead of measuring the wrong thing.
+      # What a red or a GREEN means: the helper's header.
       #
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the service smoke went red.

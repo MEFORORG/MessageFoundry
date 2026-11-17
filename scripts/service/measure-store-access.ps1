@@ -661,7 +661,7 @@ function Wait-ForGateRefusal([string]$Phase) {
     # Read by callers after a $false, so a failure text does not name a lockout when the gate logged
     # a let-start line. Not every gate outcome is recognised. At least the Vault-transit
     # integrity-seal refusal ("refusing to start a PHI instance: the accounts could not be checked
-    # against their integrity seal ...") carries $StartRefused but not $GateRefusal, and opens with no
+    # against their integrity seal ...") carries $StartRefused but not $GateRefusal, and contains no
     # $GateLetStart prefix. On such a path the wait times out, and the caller prints its timeout text and the store-access
     # attribution (Get-Attribution) rather than naming the gate.
     $script:GateLetStartSeen = $false
@@ -1099,7 +1099,8 @@ try {
                     Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity, restarted on the store it created itself, " +
-                        "did not log the expected refusal line in $WaitSeconds s. " +
+                        "did not log the expected refusal line in $WaitSeconds s. The trio reading " +
+                        "that follows was taken after the control reopen. " +
                         (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                     Show-LogTail
                 }
