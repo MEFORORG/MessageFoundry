@@ -936,7 +936,7 @@ async def test_a_cancelled_dr_park_build_whose_cancel_handler_hangs_releases_the
         assert call in done, "the cancelled call is still waiting on the hung build"
         assert call.cancelled()
         # The hung build, and the close waiting on it, are tracked.
-        assert [t for t in runner._lookup_close_tasks if not t.done()]
+        assert len([t for t in runner._lookup_close_tasks if not t.done()]) == 2
     finally:
         await _cancel_tracked(runner, call)
 
@@ -977,7 +977,8 @@ async def test_a_second_cancel_of_dr_park_builds_still_closes_and_tracks_them(
             await asyncio.wait_for(call, timeout=10)  # a timeout is red, not a hung suite
         assert into == {}
         await _wait_until(lambda: closed == ["DONE"], timeout=5)
-        assert len([t for t in runner._lookup_close_tasks if not t.done()]) >= 1
+        # The hung build, and the close waiting on it, are tracked.
+        assert len([t for t in runner._lookup_close_tasks if not t.done()]) == 2
     finally:
         await _cancel_tracked(runner)
 

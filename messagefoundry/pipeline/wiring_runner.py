@@ -5406,14 +5406,15 @@ class RegistryRunner:
             _done, pending = await asyncio.wait(
                 builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS
             )
-        except BaseException:
+        except BaseException as exc:
             # Every build is abandoned before the next await, so a second cancellation below
             # leaves none unclosed or untracked.
             for name in builds:
                 abandon(name)
-            # Bounded, as the timeout below is: a cancel handler or close that hangs must not
-            # hold the reload lock.
-            await asyncio.wait(builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS)
+            if isinstance(exc, asyncio.CancelledError):
+                # Bounded, as the timeout below is: a cancel handler or close that hangs must
+                # not hold the reload lock. Any other raise propagates at once.
+                await asyncio.wait(builds.values(), timeout=_DR_PARK_BUILD_TIMEOUT_SECONDS)
             raise
         raised: BaseException | None = None
         for name, build in builds.items():
@@ -5461,7 +5462,8 @@ class RegistryRunner:
             return
         outcome = build.result().outcome
         if isinstance(outcome, DestinationConnector):
-            await self._aclose_quietly(outcome, name)
+            # Logged through safe_exc, as a reload's retired close is.
+            await self._close_replaced(name, outcome, [])
 
     def _install_lane_destination(self, name: str, built: _LaneBuild) -> Exception | None:
         """Put a :meth:`_build_lane_destination` result in its lane, with no await: the connector,
@@ -9421,9 +9423,9 @@ class RegistryRunner:
         The connectors it takes out of a lane are closed only once the swap commits, after the
         reload lock is released (BACKLOG #5755). Restarting inbounds before
         reconciling outbounds keeps a slow or hung outbound from holding up the engine's intake,
-        with one exception: step 3's builds run in its prepare, before the quiesce, so they delay
-        the inbound binds. The builds for the lanes a DR activation takes out of the park are
-        bounded; :meth:`_build_lane_destinations_bounded` says what that bound holds and what it
+        with at least one exception: step 3's builds run in its prepare, before the quiesce, so
+        they delay the inbound binds. The builds for the lanes a DR activation takes out of the
+        park are bounded; :meth:`_build_lane_destinations_bounded` says what that bound holds and what it
         does not.
         """
         async with self._reload_lock:
