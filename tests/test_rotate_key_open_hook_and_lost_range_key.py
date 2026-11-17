@@ -447,8 +447,11 @@ def _sink_for_the_lifespan(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def _assert_the_store_cipher_alert(sink: Any) -> None:
+    """The alert names the table and column and no planted content, and was sent, not queued."""
     assert sink.events and {e[0] for e in sink.events} == {"store-cipher"}, sink.events
-    assert all("state.value" in reason for _subject, reason, _count in sink.events), sink.events
+    for _subject, reason, _count in sink.events:
+        assert "state.value" in reason and "666" not in reason and "row-key-9" not in reason
+    assert sink.started and sink.drained
 
 
 def test_serve_alerts_on_an_unmarked_state_value_on_a_renewal_due_start(
