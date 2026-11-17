@@ -10,9 +10,12 @@ if (-not (Test-Path -LiteralPath $python)) {
 if (-not (Test-Path -LiteralPath $python)) {
     throw 'Create this worktree''s .venv first; see docs/WORKTREES.md.'
 }
+# The bridge exits 10 (BLOCK_EXIT in bridge.py) for a hook's exit 2 only where this flag is set,
+# and only under the same condition as the mapping below. It pops the flag, so no child sees it.
+$env:MEFOR_CODEX_BLOCK_SENTINEL = if ($args[0] -eq 'hook') { '1' } else { $null }
 & $python (Join-Path $PSScriptRoot 'bridge.py') @args
-# The bridge exits 10 (BLOCK_EXIT in bridge.py) for a hook's exit 2. Ending the process keeps it as
-# 2, which the caller's pwsh -Command would report as 1. Hook mode only, so a caller's window
-# survives `run`.
+$env:MEFOR_CODEX_BLOCK_SENTINEL = $null
+# Ending the process keeps the block as 2, which the caller's pwsh -Command would report as 1.
+# Hook mode only, so a caller's window survives `run`.
 if ($LASTEXITCODE -eq 10 -and $args[0] -eq 'hook') { [Environment]::Exit(2) }
 exit $LASTEXITCODE

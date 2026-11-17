@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -349,6 +350,8 @@ def _outer_argv(shell, command):
         return f"cmd /d /c {command}"
     if shell == "pwsh":
         return ["pwsh", "-NoProfile", "-Command", command]
+    if shell == "none":
+        return shlex.split(command)
     return [shutil.which("sh"), "-c", command]
 
 
@@ -364,9 +367,7 @@ def _link_python(root):
         (root / ".venv/bin/python").symlink_to(sys.executable)
 
 
-def _run_registered(tmp_path, shell, settings_text, payload=_PAYLOAD, venv=True):
-    import tomllib
-
+def _make_repo(tmp_path, settings_text, venv=True):
     root = tmp_path / "repo"
     scripts = root / "scripts/codex"
     scripts.mkdir(parents=True)
@@ -377,18 +378,30 @@ def _run_registered(tmp_path, shell, settings_text, payload=_PAYLOAD, venv=True)
     if venv:
         _link_python(root)
     subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
-    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
-    command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    return root
+
+
+def _launch(argv, cwd, payload=_PAYLOAD, env=None):
     stdin = payload if isinstance(payload, str) else json.dumps(payload)
     return subprocess.run(
-        _outer_argv(shell, command),
-        cwd=scripts,
+        argv,
+        cwd=cwd,
         input=stdin,
         text=True,
         capture_output=True,
         check=False,
         timeout=60,
+        env=env,
     )
+
+
+def _run_registered(tmp_path, shell, settings_text, payload=_PAYLOAD, venv=True):
+    import tomllib
+
+    root = _make_repo(tmp_path, settings_text, venv)
+    config = tomllib.loads((ROOT / ".codex/config.toml").read_text())
+    command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    return _launch(_outer_argv(shell, command), root / "scripts/codex", payload)
 
 
 def _hooks(*handlers):
@@ -439,3 +452,94 @@ def test_a_deny_and_a_clean_run_exit_0(tmp_path, shell):
     assert json.loads(deny.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
     clean = _run_registered(tmp_path / "clean", shell, _hooks(_py("print('{}')")))
     assert clean.returncode == 0, clean.stderr
+
+
+# --- The block sentinel. invoke.ps1 sets MEFOR_CODEX_BLOCK_SENTINEL only for `hook` as its first
+# argument, the condition its 10-to-2 mapping uses; without it a hook's exit 2 exits 2, as on main.
+
+_SENTINEL = "MEFOR_CODEX_BLOCK_SENTINEL"
+_EXIT_2 = _hooks(_py("import sys; sys.exit(2)"))
+# A hook that blocks only where it inherited the sentinel, and otherwise allows.
+_SEES_SENTINEL = _hooks(_py(f"import os, sys; sys.exit(2 if {_SENTINEL!r} in os.environ else 0)"))
+_needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+
+
+def _env(**extra):
+    env = {k: v for k, v in os.environ.items() if k != _SENTINEL}
+    env.update(extra)
+    return env
+
+
+def _direct(root, *args, payload=_PAYLOAD, **extra):
+    bridge_py = root / "scripts/codex/bridge.py"
+    return _launch([sys.executable, str(bridge_py), *args], root, payload, _env(**extra))
+
+
+def _invoke_file(root, *args, payload=_PAYLOAD):
+    invoke = root / "scripts/codex/invoke.ps1"
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(invoke), *args]
+    return _launch(argv, root, payload, _env())
+
+
+@_needs_pwsh
+def test_the_registered_line_gives_2_for_a_hooks_exit_2(tmp_path):
+    completed = _run_registered(tmp_path, "none", _EXIT_2)
+    assert completed.returncode == 2, completed.stderr
+
+
+def test_a_direct_bridge_hook_gives_2_for_a_hooks_exit_2(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2, venv=False)
+    completed = _direct(root, "hook")
+    assert completed.returncode == 2, completed.stderr
+    blocked = _direct(root, "hook", **{_SENTINEL: "1"})
+    assert blocked.returncode == 10, blocked.stderr
+
+
+@_needs_pwsh
+def test_invoke_with_a_flag_before_hook_gives_2(tmp_path):
+    root = _make_repo(tmp_path, _EXIT_2)
+    completed = _invoke_file(root, "--session-id", "x", "hook")
+    assert completed.returncode == 2, completed.stderr
+
+
+@_needs_pwsh
+def test_a_run_child_exiting_10_is_not_remapped(tmp_path):
+    root = _make_repo(tmp_path, _hooks())
+    (root / "scripts/exit10.py").write_text("import sys\nsys.exit(10)\n", encoding="utf-8")
+    assert _invoke_file(root, "--session-id", "x", "run", "scripts/exit10.py").returncode == 10
+    direct = _direct(root, "--session-id", "x", "run", "scripts/exit10.py", **{_SENTINEL: "1"})
+    assert direct.returncode == 10, direct.stderr
+
+
+@_needs_pwsh
+def test_no_hook_child_inherits_the_sentinel(tmp_path):
+    registered = _run_registered(tmp_path / "registered", "none", _SEES_SENTINEL)
+    assert registered.returncode == 0, registered.stderr
+    root = _make_repo(tmp_path / "direct", _SEES_SENTINEL, venv=False)
+    direct = _direct(root, "hook", **{_SENTINEL: "1"})
+    assert direct.returncode == 0, direct.stderr
+
+
+# The exit code each fault gave on origin/main, through each launch path. "registered" runs the
+# .codex/config.toml line with no outer shell; its pwsh -Command reports the script's exit 2 as 1.
+# With no .venv, invoke.ps1 throws before the bridge runs, which exits 1.
+_MAIN_FAULT_EXIT = {"registered": 1, "direct": 2, "invoke": 2}
+
+
+@_needs_pwsh
+@pytest.mark.parametrize("path", list(_MAIN_FAULT_EXIT))
+@pytest.mark.parametrize("fault", list(_FAULTS))
+def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
+    settings_text, payload, venv = _FAULTS[fault]
+    if path == "registered":
+        completed = _run_registered(tmp_path, "none", settings_text, payload, venv)
+    elif not venv and path == "direct":
+        pytest.skip("the direct path never reads a .venv")
+    else:
+        root = _make_repo(tmp_path, settings_text, venv)
+        if path == "direct":
+            completed = _direct(root, "hook", payload=payload, **{_SENTINEL: "1"})
+        else:
+            completed = _invoke_file(root, "hook", payload=payload)
+    expected = 1 if not venv else _MAIN_FAULT_EXIT[path]
+    assert completed.returncode == expected, (completed.stdout, completed.stderr)

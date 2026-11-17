@@ -18,9 +18,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# Hook mode's exit code for a hook's deliberate exit 2. invoke.ps1 ends its process with 2 for it,
-# since pwsh -Command reports a script's exit 2 as 1. Every other outcome exits as before.
+# Hook mode's exit code for a hook's deliberate exit 2, used only where invoke.ps1 set
+# BLOCK_SENTINEL. invoke.ps1 ends its process with 2 for it, since pwsh -Command reports a script's
+# exit 2 as 1. Without the sentinel a hook's exit 2 exits 2, and every other outcome exits as before.
 BLOCK_EXIT = 10
+BLOCK_SENTINEL = "MEFOR_CODEX_BLOCK_SENTINEL"
 EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -336,11 +338,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Popped before any child starts, so no hook or run child inherits it.
+    block_exit = BLOCK_EXIT if os.environ.pop(BLOCK_SENTINEL, None) == "1" else 2
     try:
         sys.exit(main())
     except HookBlocked as exc:
         print(f"Codex bridge: {exc}", file=sys.stderr)
-        sys.exit(BLOCK_EXIT)
+        sys.exit(block_exit)
     except (
         OSError,
         ValueError,
