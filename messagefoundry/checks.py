@@ -65,7 +65,7 @@ its acknowledgement. It calls the function ``serve`` calls, so the refusal reads
 ``retention-overrides`` (vault BACKLOG #2368) is its graph half: it FAILS a connection's own
 ``messages_days = 0`` or ``dead_letter_days = 0`` that ``serve``'s registry guard refuses.
 
-``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
+``ruff`` and ``mypy`` are **advisory**: run only when installed for this interpreter, and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags a ``raise`` whose message interpolates a variable — at
 least the f-string, ``+`` concatenation, ``%`` formatting and ``.format(...)`` spellings — the
@@ -104,7 +104,6 @@ import functools
 import importlib.metadata
 import os
 import re
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set
@@ -495,8 +494,11 @@ def run_checks(
         ),
     ]
     if run_lint:
-        results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
-        results.append(_run_tool("mypy", ["mypy", str(config_dir)]))
+        results.append(_run_tool("ruff", "ruff", ["check", str(config_dir)]))
+        # --config-file= (empty) reads no mypy configuration file: with none named, mypy looks
+        # in the working directory and every parent up to a repository root, and a file there
+        # can name a plugin that mypy imports and runs (BACKLOG #5375).
+        results.append(_run_tool("mypy", "mypy", ["--config-file=", str(config_dir)]))
         # ADR 0144 part B (Increment 3 curation): flake8-bandit "S" over the config dir — advisory,
         # run-if-installed, the generic SAST net beside the domain-aware _check_handler_security. Keep
         # the FULL S select for breadth (it still catches weak crypto S324, unsafe yaml.load S506,
@@ -509,7 +511,8 @@ def run_checks(
         results.append(
             _run_tool(
                 "ruff-security",
-                ["ruff", "check", "--select", "S", "--ignore", "S105,S106,S107", str(config_dir)],
+                "ruff",
+                ["check", "--select", "S", "--ignore", "S105,S106,S107", str(config_dir)],
             )
         )
     # Appended AFTER the ruff/mypy advisory block. The first four are advisory (required=False, never
@@ -4226,21 +4229,122 @@ def _check_reference_backend(
     )
 
 
-def _run_tool(name: str, cmd: list[str]) -> CheckResult:
-    """Advisory: run ``cmd`` only if its executable resolves; absent → skipped, never blocking."""
-    if shutil.which(cmd[0]) is None:
+#: The lint tools' own variables, the only ones beyond a Python child's start-up names that cross
+#: into their environment (BACKLOG #5375): where mypy finds stubs and keeps its cache, where ruff
+#: keeps its cache, ``XDG_CONFIG_HOME``, where ruff looks for a user configuration file on POSIX,
+#: and the active virtual environment. Nothing of the engine's namespace, so no ``MEFOR_*`` value
+#: and no ``VAULT_TOKEN`` or ``PGPASSWORD`` reaches either tool.
+_LINT_TOOL_NAMES = frozenset(
+    {
+        "MYPYPATH",
+        "MYPY_CACHE_DIR",
+        "RUFF_CACHE_DIR",
+        "XDG_CONFIG_HOME",
+        "VIRTUAL_ENV",
+    }
+)
+
+
+def _tool_installed(module: str) -> bool:
+    """Whether ``module`` is importable by the child :func:`_run_tool` starts. Searched on this
+    interpreter's absolute import-path entries less the working directory, since the child starts
+    with ``-P`` and :func:`~messagefoundry.childenv.worker_environment` drops a relative
+    ``PYTHONPATH`` entry. Locates only; imports nothing."""
+    import importlib.machinery
+
+    try:
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+    except OSError:
+        cwd = ""
+    path = [e for e in sys.path if e and os.path.isabs(e) and os.path.normcase(e) != cwd]
+    try:
+        return importlib.machinery.PathFinder.find_spec(module, path) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _ruff_binary() -> str | None:
+    """The ``ruff`` program installed beside this interpreter, by absolute path: the scripts folder
+    of its environment, then of its base installation, then of the user scheme, three of the places
+    ruff's own ``find_ruff_bin`` looks; a ruff installed with ``pip install --target`` or
+    ``--prefix`` is not found here. ``None`` when none holds it. Run directly rather than
+    as ``python -m ruff``, which on Windows starts the program as a grandchild that the timeout in
+    :func:`_run_tool` cannot kill."""
+    import sysconfig
+
+    program = "ruff" + (sysconfig.get_config_var("EXE") or "")
+    folders = (
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+        sysconfig.get_path("scripts", scheme=sysconfig.get_preferred_scheme("user")),
+    )
+    for folder in folders:
+        if folder and os.path.isabs(folder):
+            candidate = os.path.join(folder, program)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _module_absent_in_child(module: str, stderr: str) -> bool:
+    """Whether a ``python -m <module>`` child failed because it could not run the module at all,
+    as the interpreter reports it on its last line, rather than because the tool found a fault."""
+    lines = stderr.strip().splitlines()
+    last = lines[-1] if lines else ""
+    return last.endswith(
+        (
+            f"No module named {module}",
+            f"No module named {module}.__main__; '{module}' is a package and cannot be directly "
+            "executed",
+            f"No module named {module}.__main__",
+        )
+    )
+
+
+def _tool_command(module: str) -> list[str] | None:
+    """The command line that starts lint tool ``module``, or ``None`` when it is not installed for
+    this interpreter. Never a bare program name a ``PATH`` search resolves: on Windows that search
+    reads the working directory first, which can be the config repository under check (BACKLOG
+    #5375). ``ruff`` is its program by absolute path (:func:`_ruff_binary`). Any other tool is
+    ``python -m <module>`` by this interpreter's absolute path, through
+    :func:`~messagefoundry.childenv.python_module_argv`, whose ``-P`` keeps the working directory
+    off the child's import path; ``-X utf8`` sets UTF-8 output where ``-I`` would make the child
+    ignore ``PYTHONIOENCODING``."""
+    from messagefoundry.childenv import python_module_argv
+
+    if module == "ruff":
+        binary = _ruff_binary()
+        return [binary] if binary else None
+    if not _tool_installed(module):
+        return None
+    return python_module_argv(module, extra_flags=("-X", "utf8"))
+
+
+def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
+    """Advisory: run lint tool ``module`` with ``args``, only when it is installed for this
+    interpreter (:func:`_tool_command`); an absent tool is skipped and never blocks. A ``ruff`` or ``mypy``
+    installed only elsewhere on ``PATH`` is not run.
+
+    The child gets :func:`~messagefoundry.childenv.worker_environment` plus
+    :data:`_LINT_TOOL_NAMES`, not the caller's whole environment (BACKLOG #5375), with
+    ``PYTHONIOENCODING`` set to the UTF-8 the decode below expects: mypy writes its interpreter's
+    stdout encoding, the locale code page on 3.14."""
+    from messagefoundry.childenv import worker_environment
+
+    cmd = _tool_command(module)
+    if cmd is None:
         return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     try:
-        # nosec: cmd[0] is a fixed tool name (ruff/mypy), no shell; args are repo paths (low-27).
-        # ruff writes UTF-8. mypy writes its interpreter's stdout encoding, the locale code page on
-        # 3.14 and UTF-8 on 3.15, so PYTHONIOENCODING pins it to match the decode on both.
-        proc = subprocess.run(  # nosec B603 B607
-            cmd,
+        # nosec: an absolute program or interpreter path, no shell; args are repo paths.
+        proc = subprocess.run(  # nosec B603
+            [*cmd, *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env=worker_environment(
+                {**os.environ, "PYTHONIOENCODING": "utf-8"}, extra_names=_LINT_TOOL_NAMES
+            ),
             check=False,
             timeout=120,
         )
@@ -4253,5 +4357,9 @@ def _run_tool(name: str, cmd: list[str]) -> CheckResult:
         )
     if proc.returncode == 0:
         return CheckResult(name, ok=True, required=False, detail="passed")
+    if module != "ruff" and _module_absent_in_child(module, proc.stderr or ""):
+        # The probe searched the parent's import path; the -P child's can differ, and a module it
+        # cannot run is not installed for it.
+        return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     detail = (proc.stdout or proc.stderr).strip().replace("\n", " ")[:300] or "failed"
     return CheckResult(name, ok=False, required=False, detail=detail)
