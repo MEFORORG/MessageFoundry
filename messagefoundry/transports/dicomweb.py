@@ -215,8 +215,9 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
     ``bearer_token`` beside a Basic pair, or either beside an ``Authorization`` entry in the static
     ``headers``, would have one silently replace the other or go out as a second header. A Basic
     user-id may not hold a colon (RFC 7617 section 2: the first colon ends it, so the server would
-    split the pair somewhere else). No credential may hold a control character, which would reach
-    the request as a malformed or injected header. A Basic half may not hold a lone surrogate, which
+    split the pair somewhere else). No credential may hold a control character: RFC 7617 section 2
+    excludes control characters from the Basic user-id and password, and RFC 6750 section 2.1
+    admits none in a bearer token. A Basic half may not hold a lone surrogate, which
     its UTF-8 encode cannot write, and the bearer token, which goes on the wire as written, may not
     hold a character ``http.client``'s latin-1 header encode cannot write; either would otherwise
     surface as an encoder error quoting part of the secret. A colon in the password is legal and
@@ -539,13 +540,14 @@ class DicomWebDestination(DestinationConnector):
                 _reject_url_control_chars(str(k), "header name")
                 _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
-        # _refuse_ambiguous_credentials screened these at the top of __init__: one credential at
-        # most, a Basic pair complete, and no control character or surrogate in any of them.
+        # _refuse_ambiguous_credentials screens these at the top of __init__. The Basic guard still
+        # asks for both halves, so a caller that reaches this without that screen sends nothing for
+        # a lone half rather than a wrong credential.
         token = s.get("bearer_token")
         user, password = s.get("basic_user"), s.get("basic_password")
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        elif user:
+        elif user and password:
             raw = f"{user}:{password}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         return headers

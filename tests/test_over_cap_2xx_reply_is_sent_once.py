@@ -414,8 +414,10 @@ def _dest(ctype: ConnectorType, url: str, over: dict[str, Any]) -> Any:
     ``capture_response`` on in ``build_outbound_connection``, a step ``_build`` skips, so the
     re-ingress row takes its capture setting from that step.
 
-    A DICOMweb base url refuses a query (vault BACKLOG #5358), so its marker query is dropped: the
-    url cannot carry one to a record."""
+    A DICOMweb base url refuses a query (vault BACKLOG #5358), so its marker query is dropped, and
+    the url-marker assertions hold trivially for those rows. Their positive control is
+    ``test_digest_refusal_classification.test_a_dicomweb_url_cannot_carry_the_marker_query``: the
+    build refuses this file's marker url, so the marker cannot reach a record."""
     if ctype is ConnectorType.DICOMWEB:
         url = url.split("?", 1)[0]
     if "reingress_to" not in over:

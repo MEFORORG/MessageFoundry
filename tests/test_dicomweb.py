@@ -1038,6 +1038,14 @@ def test_dicomweb_credential_refusal_names_the_connection(
         _dest(**over)
 
 
+@pytest.mark.parametrize("over", [{"basic_user": "svc"}, {"basic_password": "pw"}])
+def test_dicomweb_header_builder_sends_no_lone_basic_half(over: dict[str, str]) -> None:
+    """Past the constructor's screen, a lone half still sends nothing rather than ``svc:None``
+    (vault BACKLOG #5359)."""
+    headers = _dest()._build_headers(dict(over))
+    assert "Authorization" not in headers
+
+
 def test_dicomweb_single_credentials_still_construct() -> None:  # vault BACKLOG #5359
     """Positive controls: each credential alone, and a colon in the password (RFC 7617 allows it)."""
     assert _dest(bearer_token="t")._headers["Authorization"] == "Bearer t"
@@ -1073,3 +1081,62 @@ def test_dicomweb_base_url_query_or_fragment_refused(url: str) -> None:  # vault
 def test_dicomweb_plain_base_url_still_derives_studies() -> None:  # vault BACKLOG #5358
     assert _dest_at(BASE)._target_url == f"{BASE}/studies"
     assert _dest_at(f"{BASE}/")._target_url == f"{BASE}/studies"
+
+
+_QUERY_CREDENTIAL_URL = f"{BASE}?api_key=QQ7SECRET"
+
+
+def test_dicomweb_query_credential_is_not_reported_as_a_hop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # vault BACKLOG #5358
+    """The build refuses any url query, so the query-credential readers do not list a DICOMweb hop
+    that cannot exist: the census, ``query_credential_hops`` and the pre-build WARNING. REST with
+    the same url is the positive control for each reader."""
+    from messagefoundry.config.static_credentials import _http_literal_static
+    from messagefoundry.config.wiring import (
+        Registry,
+        Rest,
+        build_outbound_connection,
+        query_credential_hops,
+    )
+    from messagefoundry.transports.egress import (
+        URL_QUERY_REFUSED_DESTINATIONS,
+        warn_url_query_credentials,
+        warn_url_query_credentials_before_build,
+    )
+
+    assert ConnectorType.DICOMWEB in URL_QUERY_REFUSED_DESTINATIONS
+    with pytest.raises(ValueError, match="no query string or fragment"):
+        _dest_at(_QUERY_CREDENTIAL_URL)
+
+    dicomweb = DICOMweb(url=_QUERY_CREDENTIAL_URL)
+    rest = Rest(url=_QUERY_CREDENTIAL_URL)
+    census = "a credential in the url query"
+    assert census not in _http_literal_static(
+        ConnectorType.DICOMWEB, dicomweb.settings, displaced=False, env_values=None
+    )
+    assert census in _http_literal_static(
+        ConnectorType.REST, rest.settings, displaced=False, env_values=None
+    )
+
+    registry = Registry()
+    registry.outbound["OB_DW"] = build_outbound_connection("OB_DW", dicomweb)
+    registry.outbound["OB_REST"] = build_outbound_connection("OB_REST", rest)
+    assert [name for name, _ in query_credential_hops(registry)] == ["OB_REST"]
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.egress"):
+        warn_url_query_credentials(
+            "outbound 'OB_DW'", dicomweb.settings, connector_type=ConnectorType.DICOMWEB
+        )
+        warn_url_query_credentials_before_build(
+            "outbound 'OB_DW'",
+            dicomweb.settings,
+            {},
+            connection="OB_DW",
+            connector_type=ConnectorType.DICOMWEB,
+        )
+        assert not caplog.records
+        warn_url_query_credentials(
+            "outbound 'OB_REST'", rest.settings, connector_type=ConnectorType.REST
+        )
+    assert [r for r in caplog.records if "OB_REST" in r.getMessage()]

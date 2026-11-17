@@ -7554,13 +7554,18 @@ def query_credential_hops(
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
     0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
-    ``env()`` URL's operator ``cast``, as the build does."""
+    ``env()`` URL's operator ``cast``, as the build does. An outbound whose type is in
+    ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS`` is left off: its build refuses any url
+    query (vault BACKLOG #5358), so the hop never exists."""
+    from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
+
     out: list[tuple[str, str]] = []
     for name, settings in (
         *(
             (oc.name, oc.spec.settings)
             for oc in registry.outbound.values()
-            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+            if (oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef))
+            and oc.spec.type not in URL_QUERY_REFUSED_DESTINATIONS
         ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):

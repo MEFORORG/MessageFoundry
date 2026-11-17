@@ -5331,7 +5331,11 @@ class RegistryRunner:
             # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
             # A raise here fails the lane, isolated as the build's own would be.
             warn_url_query_credentials_before_build(
-                f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                f"outbound {name!r}",
+                oc.spec.settings,
+                self._env_values,
+                connection=oc.name,
+                connector_type=oc.spec.type,
             )
         except Exception as exc:
             return self._install_lane_destination(name, _LaneBuild(exc, _AnchorVerdict()))
@@ -6789,7 +6793,11 @@ class RegistryRunner:
                 # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
                 # record. Inside this try, so a step that raises fails this lane only.
                 warn_url_query_credentials_before_build(
-                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                    f"outbound {name!r}",
+                    oc.spec.settings,
+                    self._env_values,
+                    connection=oc.name,
+                    connector_type=oc.spec.type,
                 )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.

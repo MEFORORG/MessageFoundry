@@ -107,9 +107,11 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate.
     ``oauth2_enabled`` counts as on only when absent, a real ``True``, or an unresolved ``env()``
     reference; a truthiness read used to take the string ``"false"`` or ``"0"`` as on and an
-    explicit ``None`` as off. Any other value, and a blank, whitespace-only or unset token URL beside
-    a written flag, reads as OFF here, and :func:`refuse_oauth2_settings` refuses the same settings
-    when the connector builds, so neither reading reaches the wire. The loader refuses a non-bool
+    explicit ``None`` as off. Any other flag value reads as OFF here. So does a blank,
+    whitespace-only or unset token URL while the flag is on (absent or ``True``), when either the
+    flag or the URL key was written; a mapping with neither is simply a connection without OAuth2.
+    :func:`refuse_oauth2_settings` refuses the same settings when a REST, SOAP or FHIR destination
+    builds (through :func:`bearer_provider_from_settings`). The loader refuses a non-bool
     literal too (``Registry.bool_literal_problems``), and :func:`with_oauth2_client_credentials` a
     literal blank token URL."""
     if _oauth2_setting_problem(s) is not None:
@@ -120,8 +122,9 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
 
 def refuse_oauth2_settings(s: Mapping[str, Any]) -> None:
     """Raise :class:`HttpAuthError` for OAuth2 settings :func:`oauth2_auth_configured` reads as off
-    only because they are wrong (vault BACKLOG #5362): a non-bool ``oauth2_enabled``, or a blank or
-    unset token URL beside the flag. Called first by :func:`bearer_provider_from_settings`, the
+    only because they are wrong (vault BACKLOG #5362): a non-bool ``oauth2_enabled``, or a blank,
+    whitespace-only or unset token URL while the flag is on (absent or ``True``) and either the flag
+    or the URL key was written. Called first by :func:`bearer_provider_from_settings`, the
     construction seam of every HTTP destination that offers OAuth2. Names the connection, the keys
     and the type, never a value."""
     problem = _oauth2_setting_problem(s)
@@ -404,7 +407,9 @@ def bearer_provider_from_settings(
     token hop stops leaking the authorization server's SNI while its payload hop is routed.
     ``trust_anchor_policy`` (#1660) likewise reaches whichever provider is built, so the token hop
     verifies against the same instance ``[tls]`` anchor the delivery hop has used since #1180."""
-    # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
+    # A wrong OAuth2 flag or token URL is refused first (vault BACKLOG #5362): the presence test below
+    # reads such settings as OAuth2 off, so it could not report a conflict for them anyway. Then the
+    # conflict is detected from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
     refuse_oauth2_settings(s)

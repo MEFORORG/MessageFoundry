@@ -268,8 +268,10 @@ def _http_literal_static(
     the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
     added). So a REST or FHIR ``"Authorization "``, with a trailing space, still counts: it goes
     on the wire beside the connector's own. DICOMweb refuses to build with any spelling of it beside
-    its own credential (vault BACKLOG #5359), and sets no ``Authorization`` of its own without one. A query parameter counts when
-    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
+    its own credential (vault BACKLOG #5359), and sets no ``Authorization`` of its own without
+    one. A query parameter counts when ``secretscrub.credential_query_params`` names it, the reader
+    ``query_credential_hops`` uses, except on a type in
+    ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS``, whose build refuses any query.
 
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 
@@ -304,8 +306,15 @@ def _http_literal_static(
         for key, value in headers.items()
     ):
         out.append("a credential in the headers table")
+    from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
+
     url = _db_setting(settings, "url", None, values)
-    if isinstance(url, str) and credential_query_params(url):
+    # A type whose build refuses any url query never runs such a hop, so it is not listed.
+    if (
+        ctype not in URL_QUERY_REFUSED_DESTINATIONS
+        and isinstance(url, str)
+        and credential_query_params(url)
+    ):
         out.append("a credential in the url query")
     return out
 
