@@ -34,14 +34,18 @@ contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import re
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
+
+import annotationlib
 
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
@@ -588,26 +592,33 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     ``routed_id`` must be keyword-only with no default, so every call that reaches the handoff
     carries it in ``kwargs``; a handoff that takes it any other way is refused here, at decoration
     (BACKLOG #6698). Every layer of a ``functools.wraps`` chain that has a code object is read, the
-    one this wrapper calls included: the innermost such layer must take ``routed_id`` keyword-only,
-    and none may take it positionally or give it a default. A layer without a code object, such as
-    an ``lru_cache`` wrapper or a callable object, is not read, and a chain in which no layer has a
-    code object is refused. What a layer does with ``*args`` or ``**kwargs`` is not read."""
-    # Read off the code objects rather than inspect.signature, which would evaluate annotations (a
-    # TYPE_CHECKING-only one raises NameError at decoration) unless asked not to.
+    one this wrapper calls included, and none may take ``routed_id`` positionally or give it a
+    default. A layer without a code object, such as an ``lru_cache`` wrapper or a callable object,
+    is skipped by that read. Where the chain's innermost layer has a code object and no layer carries a
+    ``__signature__``, that layer must take ``routed_id`` keyword-only. Otherwise
+    ``inspect.signature`` decides it, as before this walk: ``routed_id`` must be keyword-only with
+    no default in the signature it reports. What a layer does with ``*args`` or ``**kwargs`` is not
+    read."""
     name = getattr(fn, "__qualname__", repr(fn))
     layers: list[object] = [fn]
     while hasattr(layers[-1], "__wrapped__"):
+        if len(layers) >= sys.getrecursionlimit():  # the bound inspect.unwrap applies
+            raise TypeError(f"{name} has a __wrapped__ chain too long to read")
         layer = layers[-1].__wrapped__
         if any(layer is seen for seen in layers):
             raise TypeError(f"{name} has a cycle in its __wrapped__ chain")
         layers.append(layer)
     # A layer with no code object (an lru_cache wrapper, a callable object) is skipped, and the
-    # layers that have one are judged; with none at all there is nothing to read, so it is refused.
+    # layers that have one are judged.
     coded = [(layer, code) for layer in layers if (code := getattr(layer, "__code__", None))]
-    if not coded:
-        raise TypeError(
-            f"{name}: its {type(fn).__qualname__} layer must be a plain function or method"
-        )
+    # The code objects give the signature the call reaches only when the chain's innermost layer has
+    # one and no layer declares a __signature__ (mock.create_autospec does). Otherwise the signature
+    # read below decides whether routed_id is keyword-only with no default.
+    walk_decides = (
+        bool(coded)
+        and coded[-1][0] is layers[-1]
+        and not any(hasattr(layer, "__signature__") for layer in layers)
+    )
     for depth, (layer, code) in enumerate(coded):
         # Each refusal names the layer that failed: functools.wraps copies the innermost's
         # __qualname__ onto every layer, so the code object's own name is read.
@@ -617,10 +628,23 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
         keyword_only = code.co_varnames[
             code.co_argcount : code.co_argcount + code.co_kwonlyargcount
         ]
-        if depth == len(coded) - 1 and "routed_id" not in keyword_only:
+        if walk_decides and depth == len(coded) - 1 and "routed_id" not in keyword_only:
             raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
         if "routed_id" in (getattr(layer, "__kwdefaults__", None) or {}):
             raise TypeError(f"{label} must give its keyword-only routed_id no default")
+    if not walk_decides:
+        # STRING: only the kind is read, so no annotation is evaluated (a TYPE_CHECKING-only one
+        # would raise NameError at decoration).
+        sig = inspect.signature(fn, annotation_format=annotationlib.Format.STRING)
+        param = sig.parameters.get("routed_id")
+        if (
+            param is None
+            or param.kind is not inspect.Parameter.KEYWORD_ONLY
+            or param.default is not inspect.Parameter.empty
+        ):
+            raise TypeError(
+                f"{name} must take routed_id as a keyword-only parameter with no default"
+            )
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:

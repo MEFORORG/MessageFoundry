@@ -426,7 +426,8 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
 
     import functools
 
-    with pytest.raises(TypeError, match="must be a plain function or method$"):
+    # No code object to read: the signature read refuses it, as before the walk.
+    with pytest.raises(TypeError, match="keyword-only parameter with no default$"):
         dead_letters_on_cell_tag(functools.partial(absent, other="x"))
     # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
     # evaluated at decoration.
@@ -478,8 +479,8 @@ async def test_the_handoff_wrapper_reads_every_layer_of_a_wraps_chain() -> None:
 
 @pytest.mark.usefixtures("fresh_audit_memo")
 async def test_a_wraps_layer_without_code_is_skipped_not_refused() -> None:
-    """A layer with no code object (an lru_cache wrapper, a callable object) is skipped and the
-    layers that have code are judged, as the signature read before it did."""
+    """A layer with no code object (an lru_cache wrapper, a callable object) is skipped, and the
+    layers that have code are judged."""
     import functools
 
     async def inner(self: _DeadLetterSink, *, routed_id: str) -> bool:
@@ -506,6 +507,49 @@ async def test_a_wraps_layer_without_code_is_skipped_not_refused() -> None:
     # The layers with code are still judged through a layer without it.
     with pytest.raises(TypeError, match=r"\.positional must take routed_id as a keyword-only"):
         dead_letters_on_cell_tag(functools.lru_cache(positional))  # type: ignore[type-var]
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_signature_read_decides_where_the_code_objects_cannot() -> None:
+    """Shapes the signature read accepted before the walk are still accepted: a wraps chain whose
+    innermost layer is a callable object with no code, and a ``mock.create_autospec`` function,
+    whose code takes ``*args, **kwargs`` while its declared signature names ``routed_id``."""
+    import functools
+    from unittest import mock
+
+    class Impl:
+        async def __call__(self, sink: _DeadLetterSink, *, routed_id: str) -> bool:
+            raise CellTagError("messages", "raw", "kw-4", "A")
+
+    impl = Impl()
+
+    @functools.wraps(impl)
+    async def outer(*args: Any, **kwargs: Any) -> bool:
+        return await impl(*args, **kwargs)
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(outer)(sink, routed_id="r-4") is False
+    assert sink.dead == ["r-4"]
+
+    async def spec(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        return True
+
+    dead_letters_on_cell_tag(mock.create_autospec(spec))
+
+    # The signature read still refuses what it refused before: a callable object whose call takes
+    # routed_id positionally.
+    class Positional:
+        async def __call__(self, sink: _DeadLetterSink, routed_id: str) -> bool:
+            return True
+
+    positional = Positional()
+
+    @functools.wraps(positional)
+    async def outer_positional(*args: Any, **kwargs: Any) -> bool:
+        return await positional(*args, **kwargs)
+
+    with pytest.raises(TypeError, match="keyword-only parameter with no default$"):
+        dead_letters_on_cell_tag(outer_positional)
 
 
 class _NoKeyringView:

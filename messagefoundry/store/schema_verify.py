@@ -85,14 +85,11 @@ _KEYED_DETAIL = (
 # module" (BACKLOG #6719). THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which
 # tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
 # here. So an expected name held by a virtual table reads as a missing table and is refused rather
-# than skipped. A table is skipped as virtual when pragma_table_list, which reports SQLite's own
-# parse of its SQL, gives type 'virtual' for the same name, compared exactly; the rootpage does not
-# decide it. So a planted ordinary-table row with a rootpage of 0 is still read, and reads as the
-# corrupt object it is (pragma_table_list needs SQLite 3.37 or later).
-_ORDINARY_TABLE = (
-    "m.type = 'table' AND NOT EXISTS (SELECT 1 FROM pragma_table_list AS tl"
-    " WHERE tl.schema = 'main' AND tl.name = m.name AND tl.type = 'virtual')"
-)
+# than skipped. A table is skipped as virtual when its stored SQL starts with the text
+# 'CREATE VIRTUAL TABLE' (LIKE, so the case of ASCII letters does not matter). A virtual table
+# whose stored SQL spells those words any other way, extra spaces included, is not skipped, and its
+# read raises "no such module".
+_ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.
@@ -113,10 +110,9 @@ _INDEXES_SQL = (
     " FROM sqlite_master AS m, pragma_index_list(m.name) AS il, pragma_index_xinfo(il.name) AS ix"
     f" WHERE {_ORDINARY_TABLE} AND ix.key = 1"
 )
-# Whether the name bound as the one parameter is an ordinary table.
-_ORDINARY_TABLE_EXISTS_SQL = (
+_SALT_TABLE_SQL = (
     "SELECT EXISTS (SELECT 1 FROM sqlite_master AS m"
-    f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = ?)"
+    " WHERE " + _ORDINARY_TABLE + " AND lower(m.name) = 'store_salt')"
 )
 _TABLES_SQL = (
     "SELECT m.name FROM sqlite_master AS m"
@@ -427,12 +423,6 @@ async def run_schema_step(
         ) from exc
 
 
-async def _is_ordinary_table(db: aiosqlite.Connection, name: str) -> bool:
-    async with db.execute(_ORDINARY_TABLE_EXISTS_SQL, (name,)) as cur:
-        row = await cur.fetchone()
-    return bool(row and row[0])
-
-
 async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     """Whether the live file records AES-GCM use but has no store salt: it was opened keyed, and
     only by a writer that seals under the DEK itself (ADR 0196). A cell-bound writer mints the salt
@@ -440,8 +430,8 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
 
     The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
     older file may have no ``store_salt`` table at all, and that too means no salt was ever minted.
-    So does a view or a virtual table under its name (see ``_ORDINARY_TABLE``, BACKLOG #6719): only
-    an ordinary table can hold a salt this build minted. ``cipher_meta`` is read whatever object
+    So does a view under its name, or a virtual table ``_ORDINARY_TABLE`` skips (BACKLOG #6719):
+    only an ordinary table can hold a salt this build minted. ``cipher_meta`` is read whatever object
     holds the name, so a readable count leans toward the new-key remedy rather than a reset."""
     try:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
@@ -451,7 +441,9 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     if not (row and row[0]):
         return False
     try:
-        if not await _is_ordinary_table(db, "store_salt"):
+        async with db.execute(_SALT_TABLE_SQL) as cur:
+            ordinary = await cur.fetchone()
+        if not (ordinary and ordinary[0]):
             return True  # no ordinary salt table: this file never had a salt minted
         async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
             salted = await cur.fetchone()

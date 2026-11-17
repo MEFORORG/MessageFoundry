@@ -7,9 +7,9 @@
   message and counts the lines held back since the last one, a non-text cell is logged by its type, and a
   failed cell-tag audit write names its cell and row reference, with a programming error's frames.
   (`BACKLOG #6697`, `#6712`)
-- The dead-letter wrapper reads `routed_id` off the code of every layer of a `functools.wraps`
-  chain that has code, and skips a layer without it. See its docstring for the rule.
+- The dead-letter wrapper refuses a handoff when a layer of its `functools.wraps` chain that has
+  a code object takes `routed_id` positionally or with a default. Where the layers' code cannot
+  show the signature the call reaches, `inspect.signature` decides, as before. See its docstring
+  for the rule.
   (`BACKLOG #6698`)
 - A `SearchSpec` built directly is held to the same needle rules as `make_spec`. (`BACKLOG #6700`)
-- The SQLite schema check skips a table that `pragma_table_list` names as virtual.
-  (`BACKLOG #6719`)

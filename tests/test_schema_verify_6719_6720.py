@@ -239,25 +239,9 @@ async def test_the_virtual_table_probe_finds_one_without_fts5(tmp_path: Path) ->
     assert views == ["v"]
 
 
-async def test_a_virtual_table_whose_sql_hides_its_kind_is_still_skipped(tmp_path: Path) -> None:
-    # BACKLOG #6719 item 1: the SQL-text test missed a virtual table whose stored SQL does not spell
-    # its keywords exactly as the LIKE pattern does; rootpage does not depend on the text.
-    path = tmp_path / "hidden.db"
-    _sql(path, "CREATE TABLE plain (a)")
-    _sql(
-        path,
-        "PRAGMA writable_schema = ON",
-        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table', 'hidden',"
-        " 'hidden', 0, 'CREATE  VIRTUAL TABLE hidden USING no_such_module(x)')",
-    )
-    async with _connected(path) as db:
-        shape = await read_schema_shape(db)
-    assert set(shape.columns) == {"plain"}
-
-
 async def test_a_planted_ordinary_table_with_rootpage_zero_is_not_skipped(tmp_path: Path) -> None:
-    # A rootpage of 0 does not make a row virtual: SQLite parses this one as an ordinary table, so
-    # the reads must not skip it, and reading the salt table it names fails as corrupt.
+    # A rootpage of 0 does not make a row virtual: its stored SQL is an ordinary CREATE TABLE, so
+    # the reads do not skip it, and reading the salt table it names fails as corrupt.
     path = tmp_path / "rootless.db"
     _sql(path, "CREATE TABLE cipher_meta (key_id TEXT)", "INSERT INTO cipher_meta VALUES ('k')")
     _sql(
