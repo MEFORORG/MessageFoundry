@@ -1073,9 +1073,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
             "compare:via messagefoundry.pipeline.secret_rotation",
-            # BACKLOG #4934: the start refusal serve and supervise run here reads the audit
-            # chain's range keys the open settled.
-            "hash:via messagefoundry.store.store",
             # BACKLOG #3470: anchor_refusal checks the forwarder's and the SMTP relay's CA before
             # those hops are built, through evaluate_anchor: its SHA-256 fingerprint, and its pin
             # compare, which these specs never reach since they carry no pin.
@@ -1141,10 +1138,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
-            # BACKLOG #4934: the start refusal compares the DEK key id with its stamp
-            # (dek_changed), and reads the audit chain's range keys the open settled.
-            "compare:via messagefoundry.pipeline.secret_rotation",
-            "hash:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/api/security.py": frozenset(

@@ -1358,9 +1358,6 @@ _CLI_OPENERS = {
     "_provision_admin.page_granted.reopen",
     # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
     "_renew_api_tls_before_spawning._audit",
-    # BACKLOG #4934: serve's open for the unrolled-key refusal before it writes the API pair, on
-    # the verdict its lifespan passes
-    "_refuse_unrolled_key_before_tls_write._check",
     "_audit_verify.run",
     "_audit_anchor.run",
     # BACKLOG #1719: cipher-audit's read-only open of a PostgreSQL or SQL Server store

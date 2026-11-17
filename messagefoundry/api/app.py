@@ -12652,26 +12652,6 @@ def create_managed_app(
         # store; left open, aiosqlite's non-daemon worker holds the process at exit (#1257). The
         # engine has not started anywhere in this span, so the unwind never calls engine.stop().
         try:
-            # BACKLOG #4934 (owner ruling 2026-11-04): first, before anything below writes an audit
-            # row, refuse a changed store key the keyed audit chain cannot follow. The open settled
-            # the chain; the only I/O is the stamp read.
-            from messagefoundry.pipeline.secret_rotation import refuse_unrolled_key_change
-            from messagefoundry.store.store import (
-                SecretRotationMetaStore,
-                audit_chain_rolled,
-                audit_range_key_missing,
-            )
-
-            if isinstance(store, SecretRotationMetaStore):
-                await refuse_unrolled_key_change(
-                    store,
-                    dek_key_id=store.cipher_info().active_key_id,
-                    audit_rolled=audit_chain_rolled(store),
-                    range_key_missing=audit_range_key_missing(store),
-                    allow_lost=(
-                        secret_rotation_settings or SecretRotationSettings()
-                    ).allow_lost_audit_range_key,
-                )
             # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
             # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
             # operator opts in; every uploaded-logs route 503s when None.

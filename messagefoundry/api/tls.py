@@ -60,7 +60,6 @@ __all__ = [
     "api_tls_source",
     "build_api_ssl_context",
     "ensure_api_tls_material",
-    "generated_pair_may_be_replaced",
     "generated_state_dir",
     "off_loopback_certificate_remedy",
     "plan_api_tls_material",
@@ -629,25 +628,6 @@ def _let_local_users_read_cert(cert_path: Path) -> None:
     _grant_read(cert_path, _LOCAL_USERS_SID)
 
 
-def generated_pair_may_be_replaced(
-    api: ApiSettings, *, state_dir: Path, renew: bool = True
-) -> bool:
-    """True when :func:`ensure_api_tls_material`, given the same arguments, may replace a generated
-    pair already on disk: a renewal, or the recovery of an unusable or half-written pair, each of
-    which it reports as a :class:`GeneratedPairReplaced`. A first-run mint replaces nothing and
-    answers ``False``. Read-only: it writes nothing and takes no lock, so a start can run a
-    refusal first and leave the pair as it found it on a refused start (BACKLOG #4934). The mint
-    decides again what it finds on disk; a caller that passes a ``False`` answer on as the mint's
-    ``renew=False`` keeps a pair that falls due after this call from being renewed there, but not a
-    pair that stops loading from being recovered."""
-    if plan_api_tls_material(api, state_dir=state_dir).source != "generated":
-        return False
-    cert_path, key_path = _generated_pair(state_dir)
-    if not (cert_path.exists() or key_path.exists()):
-        return False
-    return not _reusable_without_the_lock(cert_path, key_path, renew=renew)
-
-
 def ensure_api_tls_material(
     api: ApiSettings,
     *,
@@ -683,12 +663,11 @@ def ensure_api_tls_material(
     Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
     hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
 
-    **``renew=False`` reuses a pair that loads, due or not.** An engine shard (``serve --shard``)
-    always passes it: every process that serves the pair must start together when it is renewed,
-    or a lone restarted shard would serve a new certificate while its siblings keep the old one in
-    memory. So ``supervise`` renews before it spawns any shard. A caller may also pass it to keep a
-    ``False`` answer from :func:`generated_pair_may_be_replaced` (BACKLOG #4934). It still mints on
-    a first run and still recovers a pair that does not load, because it has nothing else to serve.
+    **``renew=False`` is for an engine shard (``serve --shard``).** Every process that serves the
+    pair must start together when it is renewed, or a lone restarted shard would serve a new
+    certificate while its siblings keep the old one in memory. So ``supervise`` renews before it
+    spawns any shard, and a shard only reuses a pair that loads, due or not. It still mints on a
+    first run and still recovers a pair that does not load, because it has nothing else to serve.
     **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
     the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
     and only a pair that does not load or has expired lets the error propagate. Other errors, such

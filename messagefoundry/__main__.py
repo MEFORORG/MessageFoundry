@@ -4899,7 +4899,6 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.api.tls import (
         GeneratedPairReplaced,
         ensure_api_tls_material,
-        generated_pair_may_be_replaced,
         generated_state_dir,
     )
     from messagefoundry.restricted_file import RestrictedFileError
@@ -4908,26 +4907,6 @@ def _serve(args: argparse.Namespace) -> int:
     # the store is open, which is after this point (ADR 0172 decision 6: never silent).
     _replaced: list[GeneratedPairReplaced] = []
     _state_dir = generated_state_dir(settings.store.path)
-    # BACKLOG #4934: the lifespan's start refusal runs after this mint, so a start that may replace
-    # the pair takes it here first. A first-run mint replaces nothing, so it needs no early open.
-    # An early open refused on an unmarked value is the exception; _refuse_unrolled_key_before_tls_write
-    # says what that start does instead. A False answer also makes the mint's `renew` False, so a
-    # pair that falls due after this check is not renewed past the refusal it skipped.
-    _may_replace = generated_pair_may_be_replaced(
-        settings.api, state_dir=_state_dir, renew=args.shard is None
-    )
-    if _may_replace:
-        from messagefoundry.pipeline.secret_rotation import UnrolledStoreKeyRefused
-        from messagefoundry.store.base import KeylessAuditChainRefused
-
-        try:
-            _refuse_unrolled_key_before_tls_write(settings)
-        except (UnrolledStoreKeyRefused, KeylessAuditChainRefused) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        except _StoreOpenRefused as exc:  # its text already went through codec_safe_str
-            print(f"error: cannot open the store: {exc}; refusing to start.", file=sys.stderr)
-            return 2
     try:
         _material = ensure_api_tls_material(
             settings.api,
@@ -4936,7 +4915,7 @@ def _serve(args: argparse.Namespace) -> int:
             # An engine shard never renews: `supervise` renews before it spawns the whole fleet, so
             # a lone restarted shard cannot leave its siblings serving a different certificate
             # (#1276).
-            renew=args.shard is None and _may_replace,
+            renew=args.shard is None,
         )
     except RestrictedFileError as exc:
         # The TLS key could not be created restricted, and no usable pair exists to fall back on
@@ -5247,25 +5226,12 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     here, so a base_dir set in the file is applied too, or the two would name different pairs.
 
     A re-mint is audited like serve's, in the store the shards are about to open, over the same
-    derived store-hop posture serve's lifespan opens it with. On a start that may replace the pair,
-    that store is opened first and takes serve's start refusal before the renewal runs (BACKLOG
-    #4934), and a failure to open propagates before any renewal, except one: an open refused on an
-    unmarked value (``UnmarkedCipherError``). That open passes no refusal hook, so the start falls
-    back to the order main ran: it logs a WARNING, mints, and returns if nothing was replaced, and
-    an engine shard that then starts sends the store-cipher alert from its hooked open. If the mint
-    replaced the pair, it opens the store again to audit the replacement, with no hook, as main
-    did, and that open raises ``UnmarkedCipherError`` again, which ``supervise`` does not catch: it
-    ends the start at the dispatch floor, the replaced pair is left unaudited, and no alert is
-    sent. Any other start mints first and opens the store only if that
-    replaced a pair, which then takes the start refusal before the audit row; a refusal there also
-    leaves the replaced pair unaudited.
+    derived store-hop posture serve's lifespan opens it with. A failure to open propagates, as it
+    would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
-    import asyncio
-
     from messagefoundry.api.tls import (
         GeneratedPairReplaced,
         ensure_api_tls_material,
-        generated_pair_may_be_replaced,
         generated_state_dir,
         record_generated_pair_replacements,
     )
@@ -5273,7 +5239,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store
-    from messagefoundry.store.crypto import UnmarkedCipherError
 
     cwd = Path.cwd()
     root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
@@ -5281,6 +5246,9 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
 
     state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(settings.api, state_dir=state_dir, replacements=replaced)
+    if not replaced:
+        return state_dir
     posture = (
         hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
         if settings.ai is not None
@@ -5291,127 +5259,20 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     # as it does there, and a store with no key and no opt-out is refused here as serve would refuse.
     shard_store = settings.store.model_copy(update={"path": store_path})
 
-    async def _audit(*, renew_after_refusal: bool) -> bool:
-        """``False`` only when the open ahead of a renewal is refused on an unmarked value."""
+    async def _audit() -> None:
+        store = await open_store(
+            shard_store,
+            create=True,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(shard_store, settings.security),
+        )
         try:
-            store = await open_store(
-                shard_store,
-                create=True,
-                posture=posture,
-                keyless_chain_refusal=keyless_opt_out_refusal(shard_store, settings.security),
-            )
-        except UnmarkedCipherError:
-            if not renew_after_refusal:
-                raise
-            logging.getLogger(__name__).warning(
-                "the store open before the API pair renewal was refused on an unmarked value; the "
-                "start refusal was not checked, and the fleet start goes on to the mint"
-            )
-            return False
-        try:
-            # BACKLOG #4934: before the renewal and before the audit row below, which is this
-            # store's first since the open.
-            await _refuse_unrolled_key_on(store, settings)
-            if renew_after_refusal:
-                # Off the loop: key generation, file writes and the pair lock's wait block.
-                await asyncio.to_thread(
-                    ensure_api_tls_material,
-                    settings.api,
-                    state_dir=state_dir,
-                    replacements=replaced,
-                )
             await record_generated_pair_replacements(store, replaced)
         finally:
             await store.close()
-        return True
 
-    # BACKLOG #4934: a start that may replace the pair opens the store and takes the engine shards'
-    # start refusal before it renews the pair. Any other start, and one whose early open is refused
-    # on an unmarked value, mints or reuses first and opens the store only if that replaced a pair.
-    # The check's answer is also the mint's `renew`, so renewal is decided once: a pair that falls
-    # due after the check is not renewed past the refusal it skipped.
-    may_replace = generated_pair_may_be_replaced(settings.api, state_dir=state_dir)
-    if may_replace and run_guarded(_audit(renew_after_refusal=True)):
-        return state_dir
-    ensure_api_tls_material(
-        settings.api, state_dir=state_dir, replacements=replaced, renew=may_replace
-    )
-    if replaced:
-        run_guarded(_audit(renew_after_refusal=False))
+    run_guarded(_audit())
     return state_dir
-
-
-async def _refuse_unrolled_key_on(store: Store, settings: ServiceSettings) -> None:
-    """``serve``'s start refusal of a changed store key the keyed audit chain cannot follow
-    (BACKLOG #4934), on an open store; see
-    :func:`~messagefoundry.pipeline.secret_rotation.refuse_unrolled_key_change`."""
-    from messagefoundry.pipeline.secret_rotation import refuse_unrolled_key_change
-    from messagefoundry.store.store import (
-        SecretRotationMetaStore,
-        audit_chain_rolled,
-        audit_range_key_missing,
-    )
-
-    if isinstance(store, SecretRotationMetaStore):
-        await refuse_unrolled_key_change(
-            store,
-            dek_key_id=store.cipher_info().active_key_id,
-            audit_rolled=audit_chain_rolled(store),
-            range_key_missing=audit_range_key_missing(store),
-            allow_lost=settings.secret_rotation.allow_lost_audit_range_key,
-        )
-
-
-def _refuse_unrolled_key_before_tls_write(settings: ServiceSettings) -> None:
-    """Open ``serve``'s store and run :func:`_refuse_unrolled_key_on` before the start may replace
-    the generated API pair (BACKLOG #4934). The lifespan
-    refuses again after its own open; this one exists only because the mint comes first. Raises
-    :class:`~messagefoundry.pipeline.secret_rotation.UnrolledStoreKeyRefused`, the keyless-chain
-    refusal, :class:`_StoreOpenRefused` for an open refusal :func:`_open_store_or_refuse` maps, and
-    anything else the open raises, except one. This open passes no ``refusal_hook``, so an open
-    refused on an unmarked value (``UnmarkedCipherError``) logs a WARNING and returns without the
-    check instead. The start goes on to the mint, which may replace the pair, and, unless a gate
-    between the two refuses first, to the lifespan, whose open passes the hook, is refused on the
-    same value and sends the store-cipher alert. A pair the mint replaced is then left unaudited,
-    as on main. A planted row the open's at-open sweep finds and leaves in place, without raising,
-    is reported to no hook, so it reaches only the log; if the check then refuses, the start ends
-    here and no hooked open runs to alert on it."""
-    from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
-    from messagefoundry.last_resort import run_guarded
-    from messagefoundry.store import open_store
-    from messagefoundry.store.crypto import UnmarkedCipherError
-
-    posture = (
-        hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-        if settings.ai is not None
-        else None
-    )
-
-    async def _check() -> None:
-        try:
-            store = await _open_store_or_refuse(
-                open_store(
-                    settings.store,
-                    create=True,
-                    posture=posture,
-                    keyless_chain_refusal=keyless_opt_out_refusal(
-                        settings.store, settings.security
-                    ),
-                )
-            )
-        except UnmarkedCipherError:
-            # The lifespan's hooked open refuses it again and alerts, as before #4934.
-            logging.getLogger(__name__).warning(
-                "the store open before the API pair mint was refused on an unmarked value; the "
-                "start refusal was not checked, and the start goes on to the mint and the store open"
-            )
-            return
-        try:
-            await _refuse_unrolled_key_on(store, settings)
-        finally:
-            await store.close()
-
-    run_guarded(_check())
 
 
 def _supervise(args: argparse.Namespace) -> int:
@@ -5628,7 +5489,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
     # as the gates above: every shard would refuse, and the supervisor would only restart them. The
     # store key file is checked before the renewal below can open the store and read it.
-    from messagefoundry.pipeline.secret_rotation import UnrolledStoreKeyRefused
     from messagefoundry.restricted_file import RestrictedFileError
     from messagefoundry.store.base import KeylessAuditChainRefused
 
@@ -5695,9 +5555,6 @@ def _supervise(args: argparse.Namespace) -> int:
     try:
         state_dir = _renew_api_tls_before_spawning(settings, db_base)
     except KeylessAuditChainRefused as exc:  # #1916: a named key the provider did not resolve
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except UnrolledStoreKeyRefused as exc:  # BACKLOG #4934: in full, since it carries the remedy
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except RestrictedFileError as exc:  # the TLS key could not be created restricted
