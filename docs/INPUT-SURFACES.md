@@ -523,7 +523,7 @@ help. Each rule is in the script's `param()` block or its body.
 | `uninstall-net-helper.ps1` | `-ServiceName` | The `-ServiceName` rule above |
 | `measure-store-access.ps1` | `-Order` | Required. One of `ProvisionFirst`, `StartFirst`, `StartFirstEndToEnd` |
 | | `-DataDir` | Required |
-| `import-db-ca.ps1` | `-CaPath` | Required. A certificate file holding a self-signed root. The help block at the top of the script, which `Get-Help` does not print, as the paragraph above says, lists the shapes it reads and what it refuses |
+| `import-db-ca.ps1` | `-CaPath` | Required. A certificate file holding a self-signed root. The help block at the top of the script, which `Get-Help` does not print, as the paragraph above says, lists the shapes it reads and, with "at least", what it refuses |
 
 `install-service.ps1` also relates parameters to each other. `-EngineWheel` refuses `-AppExe` and
 `-PythonExe`. `-EngineWheelSha256`, `-RequirementsLock`, `-RequirementsLockSha256` and

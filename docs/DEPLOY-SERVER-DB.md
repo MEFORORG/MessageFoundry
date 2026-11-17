@@ -552,8 +552,8 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-The helper shows every certificate in the file, and refuses the whole file, importing nothing, on
-any of the refusals its own help lists.
+The helper shows every certificate in the file, and refuses the whole file, importing nothing, on at
+least the refusals its own help lists.
 
 **Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
 documents point here. A self-signed root, whose signature verifies under its own key, goes into
@@ -565,9 +565,9 @@ engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which 
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
 there without its root. The helper refuses a file unless it holds a self-signed root and every
-other CA in it chains to a self-signed root through the file's own certificates. With `-Confirm` you
-may still decline the root and accept another CA, so give it the root of the CA you mean to trust,
-alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+other CA in it chains to a self-signed root through the file's own certificates. With `-Confirm`,
+declining a root that an accepted CA chains through imports nothing, so give it the root of the CA
+you mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root
 CA you have checked yourself:
@@ -600,10 +600,11 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete every certificate the old CA's file added, the root from
-     `LocalMachine\Root` and any issuing CA from `LocalMachine\CA`, by the thumbprints the helper
-     listed when it imported that file. An issuing CA left in `LocalMachine\CA` stays a trust anchor
-     for the engine's Python TLS (§5.2). For example
+   - **SQL Server:** delete the old CA's certificates, the root from `LocalMachine\Root` and any
+     issuing CA from `LocalMachine\CA`, by the thumbprints the helper listed when it imported that
+     file. An issuing CA left in `LocalMachine\CA` stays a trust anchor for the engine's Python TLS
+     (§5.2). The helper lists a certificate the store already held too, so keep any that something
+     else installed or still needs (Group Policy, say). For example
      `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -in @('<old root>', '<old issuing CA>') | Remove-Item`.
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 

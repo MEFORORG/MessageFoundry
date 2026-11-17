@@ -2928,9 +2928,10 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
     # Parses the operator's CA certificate file into a collection (so a malformed file fails before
-    # anything is touched and the operator sees every certificate they are about to trust), checks
-    # whether each one's signature verifies under its own key (to tell a self-signed root from an
-    # issuing CA), then INSTALLS each one through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md
+    # anything is touched and the operator sees every certificate they are about to trust), verifies
+    # each one's signature under its own key (to tell a self-signed root from an issuing CA) and
+    # under the keys of the file's other certificates (to check that each CA chains to a root in the
+    # file; RSA PKCS#1 v1.5 and ECDSA with SHA-1, SHA-256, SHA-384 or SHA-512), then INSTALLS each one through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md
     # section 5.2 says which). A trust-anchor decision for the whole host, not only the engine.
     "scripts/service/import-db-ca.ps1": frozenset(
         {"key_cert:X509", "key_cert:X509Store", "sign_verify:SignData"}

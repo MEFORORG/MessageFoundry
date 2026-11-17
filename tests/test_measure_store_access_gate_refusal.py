@@ -11,7 +11,8 @@ engine that served. Now a line must also carry the refusal's own words, through
 NOTHING HERE RUNS THE SCRIPT: it installs a service and must run elevated, which only the hosted
 windows-service-smoke leg does. The test lifts the two phrase assignments and
 ``Test-GateRefusalLine`` out of the script's AST and calls the function on lines worded as the
-engine words them, and pins that the engine still words them so. It needs ``pwsh`` and skips where
+engine words them. It pins that ``app.py`` still holds each line's prefix and the clause text after
+it, as literals; it does not render the lines from ``app.py``. It needs ``pwsh`` and skips where
 there is none.
 """
 
@@ -60,7 +61,7 @@ $ErrorActionPreference = 'Stop'
 $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(_SCRIPT))}, [ref]$null, [ref]$errs)
 if (@($errs).Count) {{ throw "the script does not parse: $($errs[0])" }}
-foreach ($var in @('GateRefusal', 'StartRefused')) {{
+foreach ($var in @('GateRefusal', 'NoAdminRefusal', 'StartRefused')) {{
   $set = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
       $args[0].Left.Extent.Text -eq ('$' + $var) }}, $false)
   if (-not $set) {{ throw "missing assignment `${{var}}" }}
@@ -73,6 +74,7 @@ if (-not $def) {{ throw 'missing function Test-GateRefusalLine' }}
 $lines = {_psq(json.dumps(lines))} | ConvertFrom-Json
 ConvertTo-Json -Compress -InputObject @{{
   refusal = @($lines | ForEach-Object {{ [bool](Test-GateRefusalLine $_) }})
+  no_admin = @($lines | ForEach-Object {{ [bool](Test-GateRefusalLine $_ $NoAdminRefusal) }})
   clause = @($lines | ForEach-Object {{ $_ -match [regex]::Escape($GateRefusal) }}) }}
 """
     f = tmp_path / f"gate-{uuid.uuid4().hex}.ps1"
@@ -97,12 +99,22 @@ def test_the_engine_still_words_the_three_gate_lines_so() -> None:
     for prefix, line in (_REFUSAL, _SKIPPED, _WARN_MODE):
         assert prefix in app, prefix
         assert prefix in line
+    # The clauses the script matches on, as app.py spells the detail text after each prefix. The
+    # no-Administrator detail is split across an f-string, so its two halves are pinned apart.
+    assert '"no enabled Administrator{' in app
+    assert '"exists in this store, so no enabled account holds the role "' in app
+    assert (
+        '"no enabled Administrator has a notification address, so every out-of-band security "'
+        in app
+    )
 
 
 @pytest.mark.parametrize("host", ["pwsh", "powershell"])
 def test_only_the_refusal_counts_as_a_refused_start(tmp_path: Path, host: str) -> None:
     got = _judge(host, tmp_path, [_REFUSAL[1], _SKIPPED[1], _WARN_MODE[1], "unrelated line"])
     assert got["refusal"] == [True, False, False, False], got
+    # The narrower clause the StartFirstEndToEnd arm passes: the no-Administrator refusal only.
+    assert got["no_admin"] == [True, False, False, False], got
     # The control: the clause the wait used to match alone is in both warning lines, so the old
     # criterion took an engine that went on to serve for a refused one.
     assert got["clause"] == [True, True, True, False], got

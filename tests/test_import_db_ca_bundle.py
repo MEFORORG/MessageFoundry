@@ -12,11 +12,12 @@ root goes into the machine Root store and any other CA into the intermediate sto
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
 directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
 ``Get-CaStoreName`` (and the console helpers they call) out of the script's AST and call them, as
-``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
-only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
-skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
-script's own elevation refusal rather than the machine Root store. Both halves need ``pwsh`` and
-skip where there is none.
+``tests/test_import_db_ca_console_text.py`` does. The whole-script tests are skipped in an elevated
+session. All but one run it with ``-WhatIf``, where ``ShouldProcess`` declines every import, so the
+store is never opened, and even a regression that ignored ``-WhatIf`` would meet the script's own
+elevation refusal rather than the machine Root store. The one without ``-WhatIf`` exists to meet
+that refusal, on Windows only; since hosted Windows runners are elevated, it runs only on an
+unelevated developer box. Both halves need ``pwsh`` and skip where there is none.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7, pkcs12
 from cryptography.x509.oid import NameOID
 
@@ -162,9 +163,29 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
     rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     rsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA Root CA")])
     new_key = ec.generate_private_key(ec.SECP384R1())
+    pss_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA-PSS Root CA")])
+    pss_root = (
+        x509.CertificateBuilder()
+        .subject_name(pss_name)
+        .issuer_name(pss_name)
+        .public_key(rsa_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        .sign(
+            rsa_key,
+            hashes.SHA256(),
+            rsa_padding=padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH
+            ),
+        )
+    )
     return {
         "rsa_root": build(rsa_name, rsa_key.public_key(), rsa_key),
         "rekey": build(root.subject, new_key.public_key(), root_key),
+        # Self-signed, but with a signature the script does not verify.
+        "pss_root": pss_root,
     }
 
 
@@ -234,6 +255,7 @@ def files(
         # Outside the validity period: an expired root beside a valid one, and a root not valid yet.
         "pem_expired_root": _pem(root, chain["expired_root"][0]),
         "pem_future_root": _pem(chain["future_root"][0]),
+        "pem_pss_root": _pem(extra["pss_root"]),
         # Bare base64 behind a byte-order mark, UTF-8 and UTF-16.
         "b64_utf8_bom": b"\xef\xbb\xbf" + base64.encodebytes(root.public_bytes(der)),
         "b64_utf16_bom": b"\xff\xfe"
@@ -269,6 +291,10 @@ def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, obj
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
+$set = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Left.Extent.Text -eq '$SignatureHashes' }}, $false)
+if (-not $set) {{ throw 'missing assignment $SignatureHashes' }}
+. ([scriptblock]::Create($set.Extent.Text))
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
                     'Read-CaBundle', 'Get-CaRefusal', 'Test-SignedBy', 'Test-SelfSigned',
                     'Get-ChainRefusal', 'Get-CaStoreName')) {{
@@ -374,7 +400,14 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     expired = dict(certs("pem_expired_root"))
     assert expired[_thumb(chain["expired_root"][0])] == "it has expired"
     assert expired[root] is None
-    assert certs("pem_future_root") == [(_thumb(chain["future_root"][0]), "it is not valid yet")]
+    # Not valid yet is not refused: a new CA may be staged ahead of its start.
+    assert certs("pem_future_root") == [(_thumb(chain["future_root"][0]), None)]
+    # A signature the script cannot verify is refused by name, not read as a missing root.
+    pss = certs("pem_pss_root")
+    assert len(pss) == 1 and pss[0][0] == _thumb(extra["pss_root"]), pss
+    assert str(pss[0][1]).startswith("it is signed with ") and "1.2.840.113549.1.1.10" in str(
+        pss[0][1]
+    ), pss
 
     # Each CA must chain to a self-signed root through the file's own certificates: an issuing CA
     # and a re-key certificate that do pass, and one whose issuer is not in the file, or only

@@ -31,8 +31,8 @@
     reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
     unless it holds a self-signed root and every other CA in it chains to a self-signed root
     through the file's own certificates, each link's signature verified. No revocation, name
-    constraint or path length is checked, and with -Confirm the operator may still decline the
-    root and accept another CA.
+    constraint or path length is checked. With -Confirm the operator may decline a root, but then
+    nothing is imported if an approved CA chains only through it.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -41,14 +41,15 @@
     nothing reaches a store that the operator was not shown. Roots are added first. The whole
     file is refused, and nothing is imported, when any certificate in it is not marked as a CA by
     its basic constraints, has a key usage that cannot sign certificates, carries a private key,
-    or is outside its validity period, when it holds no self-signed root, when a CA in it does not
-    chain to a self-signed root in the file, when a DER value in it (the whole file, a PEM block,
-    or decoded base64) does not end where its bytes end, or when a control character other than
-    tab, CR or LF sits outside its PEM blocks. A BER value with an indefinite length, which some
-    tools write for a .p7b, is refused by that DER rule; re-encode it as DER first. Only RSA
-    PKCS#1 v1.5 and ECDSA signatures with SHA-1 or SHA-2 are verified, so a root or a chain link
-    signed any other way (RSA-PSS, for one) is refused. Other text outside PEM blocks, bare base64
-    among them, is ignored, not refused. At least a .pfx, and
+    is signed in a way this script does not verify, or has expired, when it holds no self-signed
+    root, when a CA in it does not chain to a self-signed root in the file, when a DER value in it
+    (the whole file, a PEM block, or decoded base64) does not end where its bytes end, or when a
+    control character other than tab, CR or LF sits outside its PEM blocks. Only RSA PKCS#1 v1.5
+    and ECDSA signatures with SHA-1, SHA-256, SHA-384 or SHA-512 are verified; RSA-PSS and
+    SHA-224, for two, are not. A BER value with an indefinite length, which some tools write for a
+    .p7b, is refused by the DER rule; re-encode it as DER first. A certificate not valid yet is
+    listed with a note, not refused, so a new CA can be staged ahead of its start. Other text
+    outside PEM blocks, bare base64 among them, is ignored, not refused. At least a .pfx, and
     a well-formed PEM block with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a
     PRIVATE KEY block), are refused before anything is parsed. Key material outside well-formed
     PEM armour is not looked for; no private key is ever loaded either way.
@@ -307,25 +308,28 @@ function Read-CaBundle {
     return , $unique
 }
 
+# The hash of each signature algorithm this script can verify, by OID: RSA PKCS#1 v1.5 and ECDSA,
+# each with SHA-1, SHA-256, SHA-384 or SHA-512. Any other (RSA-PSS, SHA-224, Ed25519 and DSA among
+# them) is not verified, and Get-CaRefusal refuses a certificate signed with one.
+$SignatureHashes = @{
+    '1.2.840.113549.1.1.5' = 'SHA1'; '1.2.840.113549.1.1.11' = 'SHA256'
+    '1.2.840.113549.1.1.12' = 'SHA384'; '1.2.840.113549.1.1.13' = 'SHA512'
+    '1.2.840.10045.4.1' = 'SHA1'; '1.2.840.10045.4.3.2' = 'SHA256'
+    '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
+}
+
 # Whether $Signer issued the certificate: the certificate's issuer is $Signer's subject, byte for
-# byte, AND its signature verifies under $Signer's public key. RSA PKCS#1 v1.5 and ECDSA with SHA-1
-# or SHA-2 are checked; any other signature algorithm (RSA-PSS, SHA-224, Ed25519 and DSA among them)
-# reads as not signed, which fails closed: such a certificate is never a root, and never a link.
+# byte, AND its signature verifies under $Signer's public key. A signature algorithm outside
+# $SignatureHashes reads as not signed, which fails closed.
 function Test-SignedBy {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Signer)
     if ([Convert]::ToBase64String($Signer.SubjectName.RawData) -cne
         [Convert]::ToBase64String($Certificate.IssuerName.RawData)) { return $false }
-    $hashes = @{
-        '1.2.840.113549.1.1.5' = 'SHA1'; '1.2.840.113549.1.1.11' = 'SHA256'
-        '1.2.840.113549.1.1.12' = 'SHA384'; '1.2.840.113549.1.1.13' = 'SHA512'
-        '1.2.840.10045.4.1' = 'SHA1'; '1.2.840.10045.4.3.2' = 'SHA256'
-        '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
-    }
     $oid = $Certificate.SignatureAlgorithm.Value
-    if (-not $hashes.ContainsKey($oid)) { return $false }
-    $hash = [System.Security.Cryptography.HashAlgorithmName]::new($hashes[$oid])
+    if (-not $SignatureHashes.ContainsKey($oid)) { return $false }
+    $hash = [System.Security.Cryptography.HashAlgorithmName]::new($SignatureHashes[$oid])
     # Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }.
     $raw = $Certificate.RawData
     $outer = Read-DerHeader -Bytes $raw
@@ -421,17 +425,18 @@ function Get-CaStoreName {
 # extension counts as not a CA here. RFC 5280 (the Basic Constraints section) requires the extension
 # of a version 3 CA certificate; a version 1 root, which cannot carry it, is refused too, by this
 # script's choice rather than the RFC's. A key usage extension that leaves out certificate signing
-# also counts as not a CA (RFC 5280, the Key Usage section). A certificate outside its validity
-# period at $NowUtc is refused as well: nothing that chains through it validates, so importing it
-# is only ever a mistake, and an expired root must not stand in for the one a CA chains to.
+# also counts as not a CA (RFC 5280, the Key Usage section). A signature this script cannot verify
+# is refused by name, so a root signed that way is not reported as missing. A certificate that has
+# expired at $NowUtc is refused as well: nothing that chains through it validates, so importing it
+# is only ever a mistake, and an expired root must not stand in for the one a CA chains to. A
+# certificate not valid yet is not refused here; the listing warns of it, since a new CA may be
+# staged ahead of its start for a make-before-break rotation.
 function Get-CaRefusal {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
         [datetime]$NowUtc = [datetime]::UtcNow)
     # Read-CaBundle already refuses every container that can carry a key; this holds if it ever stops.
     if ($Certificate.HasPrivateKey) { return 'it carries a private key' }
-    if ($Certificate.NotAfter.ToUniversalTime() -lt $NowUtc) { return 'it has expired' }
-    if ($Certificate.NotBefore.ToUniversalTime() -gt $NowUtc) { return 'it is not valid yet' }
     $constraints = @($Certificate.Extensions |
         Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] })
     if ($constraints.Count -eq 0) { return 'it has no basic constraints extension, so it is not marked as a CA' }
@@ -445,6 +450,11 @@ function Get-CaRefusal {
             return 'its key usage does not allow it to sign certificates'
         }
     }
+    $algorithm = $Certificate.SignatureAlgorithm
+    if (-not $SignatureHashes.ContainsKey($algorithm.Value)) {
+        return "it is signed with $($algorithm.FriendlyName) ($($algorithm.Value)), which this script does not verify"
+    }
+    if ($Certificate.NotAfter.ToUniversalTime() -lt $NowUtc) { return 'it has expired' }
     return $null
 }
 
@@ -484,6 +494,9 @@ $entries = @(foreach ($cert in $bundle) {
     Write-Host "  Thumbprint : $($cert.Thumbprint)"
     Write-Host "  Not before : $($cert.NotBefore.ToUniversalTime().ToString('u'))"
     Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
+    if ($cert.NotBefore.ToUniversalTime() -gt $nowUtc) {
+        Write-Host "  Not valid yet: nothing that chains through it validates before its start."
+    }
     if ($why) {
         Write-Host "  Refused    : $why"
         $refusals.Add("$($cert.Thumbprint) ($(ConvertTo-PrintableText $cert.Subject)): $why")
@@ -492,28 +505,33 @@ $entries = @(foreach ($cert in $bundle) {
     }
     @{ Certificate = $cert; Target = $target }
 })
-if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
-    # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
-    # it would be trusted with no root's revocation or constraints over it (the help's "Where each
-    # CA goes"), so a rootless file is refused rather than imported. Checked first, since every CA
-    # in such a file is also refused for reaching no root, and this message says why in one line.
-    throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
-        "the CA chains to, alone or in the same .p7b chain.")
-}
-if ($refusals.Count -gt 0) {
+# Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
+# it would be trusted with no root's revocation or constraints over it (the help's "Where each CA
+# goes"), so a rootless file is refused rather than imported. Every CA in such a file is also refused
+# for reaching no root, so the error leads with the one cause that explains them.
+$rootless = -not ($entries | Where-Object { $_.Target -eq $stores['Root'] })
+if ($rootless -or $refusals.Count -gt 0) {
     # Printed one per line for the operator: pwsh 7's default error view rewraps a message at the
     # console width, which can split a line. The error carries the same lines, joined into its one
     # message, for a caller that catches it or keeps only the error stream; past the first few it
     # gives the count instead.
-    Write-Host ""
-    Write-Host "Refused:"
-    foreach ($line in $refusals) { Write-Host "  $line" }
-    $shown = 5
-    $named = ($refusals | Select-Object -First $shown) -join '; '
-    if ($refusals.Count -gt $shown) { $named += "; and $($refusals.Count - $shown) more, listed above" }
-    throw ("Nothing was imported. Every certificate in the file must be a CA, within its validity " +
-        "period, that may sign certificates, carries no private key, and chains to a self-signed " +
-        "root in the file. Refused: $named.")
+    $named = ''
+    if ($refusals.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Refused:"
+        foreach ($line in $refusals) { Write-Host "  $line" }
+        $shown = 5
+        $named = " Refused: " + (($refusals | Select-Object -First $shown) -join '; ')
+        if ($refusals.Count -gt $shown) { $named += "; and $($refusals.Count - $shown) more, listed above" }
+        $named += "."
+    }
+    if ($rootless) {
+        throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
+            "the CA chains to, alone or in the same .p7b chain.$named")
+    }
+    throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
+        "certificates, carries no private key, is signed in a way this script verifies, has not " +
+        "expired, and chains to a self-signed root in the file.$named")
 }
 
 # --- import ------------------------------------------------------------------
@@ -524,6 +542,19 @@ $approved = @(foreach ($entry in $entries) {
         $entry
     }
 })
+# Under -Confirm the operator may decline a root. An approved CA must still reach a root through the
+# approved certificates alone, or it would land in LocalMachine\CA with no root over it.
+$approvedSet = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+foreach ($entry in $approved) { [void]$approvedSet.Add($entry.Certificate) }
+$orphans = @(foreach ($entry in $approved) {
+    if (Get-ChainRefusal -Certificate $entry.Certificate -Bundle $approvedSet) {
+        "$($entry.Certificate.Thumbprint) ($(ConvertTo-PrintableText $entry.Certificate.Subject))"
+    }
+})
+if ($orphans.Count -gt 0) {
+    throw ("Nothing was imported. A root was declined that these approved CAs chain to, and a CA " +
+        "is not imported without its root: $($orphans -join '; ').")
+}
 
 if ($approved.Count -gt 0) {
     # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent). Roots go
@@ -551,16 +582,11 @@ if ($approved.Count -gt 0) {
     }
     Write-Host ""
     Write-Host "Imported $added CA certificate(s)."
-    if ($approved | Where-Object { $_.Target -eq $stores['Root'] }) {
-        Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
-        Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
-    } else {
-        Write-Warning ("No root was imported. Over SChannel and ODBC a DB server cert validates only if " +
-            "its root is already in $StoreLocation; the engine's Python TLS treats LocalMachine\CA " +
-            "differently (see this script's help, 'Where each CA goes').")
-    }
+    # Every approved CA reached an approved root above, so a root is among what was imported.
+    Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
+    Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
-    Write-Host "roll the server cert, then remove every certificate the OLD file added, by the"
-    Write-Host "thumbprints this script listed for it -- see docs/DEPLOY-SERVER-DB.md."
+    Write-Host "roll the server cert, then remove the OLD file's certificates by the thumbprints listed"
+    Write-Host "above, keeping any that was in the store before -- see docs/DEPLOY-SERVER-DB.md."
 }

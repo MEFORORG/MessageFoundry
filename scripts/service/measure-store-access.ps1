@@ -646,14 +646,19 @@ function Wait-ForGateRefusal([string]$Phase) {
       Wait until the service logs the ADR 0167 refusal (Test-GateRefusalLine), which it reaches only
       after opening the store and reading its users. Samples process owners throughout, since NSSM
       restarts the refused engine and each restart is a new process. Returns $true on the refusal,
-      $false on timeout.
+      $false on timeout, and $false at once, with a reading quoting it, when the gate's clause is
+      logged without the refusal: the engine read its users and the gate let the start go on.
     #>
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         Update-OwnerSample "during $Phase"
-        $refused = @(Get-LogMatches ([regex]::Escape($GateRefusal)) |
-            Where-Object { Test-GateRefusalLine $_.Line })
-        if ($refused.Count -gt 0) { return $true }
+        $gate = @(Get-LogMatches ([regex]::Escape($GateRefusal)))
+        if (@($gate | Where-Object { Test-GateRefusalLine $_.Line }).Count -gt 0) { return $true }
+        if ($gate.Count -gt 0) {
+            Add-Reading ("during $Phase the service reached the ADR 0167 gate, which did not refuse " +
+                "the start: $(Get-Excerpt $gate[0].Line 300)")
+            return $false
+        }
         Start-Sleep -Seconds 1
     }
     return $false
@@ -979,18 +984,19 @@ try {
         $noAdmin = @(Get-LogMatches ([regex]::Escape($NoAdminRefusal)) |
             Where-Object { Test-GateRefusalLine $_.Line $NoAdminRefusal })
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but never reached the account gate, so its open is unproven" }
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but logged no ADR 0167 refusal (a reading above says if the gate let it start)" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
             Show-LogTail
         } elseif ($noAdmin.Count -eq 0) {
-            $line = @(Get-LogMatches ([regex]::Escape($GateRefusal)) | Select-Object -First 1 |
+            $line = @(Get-LogMatches ([regex]::Escape($GateRefusal)) |
+                Where-Object { Test-GateRefusalLine $_.Line } | Select-Object -First 1 |
                 ForEach-Object { Get-Excerpt $_.Line 300 })
-            Add-Failure ("$ServiceIdentity reached the ADR 0167 gate on a fresh store, but no line said " +
-                "both '$StartRefused' and '$NoAdminRefusal'. Either the start was not refused, or it " +
-                "was refused for a missing address, which means the first start created an account no " +
-                "operator named. Gate line: $($line -join ' ')")
+            Add-Failure ("$ServiceIdentity was refused by the ADR 0167 gate on a fresh store, but not " +
+                "in the words '$NoAdminRefusal'. A refusal for a missing address would mean the first " +
+                "start created an account no operator named; the refusal line says which. " +
+                "Refusal line: $($line -join ' ')")
             Show-LogTail
         } elseif (@($noAdmin | Where-Object { $_.Line -match [regex]::Escape($ProvisionHint) }).Count -eq 0) {
             Add-Failure ("$ServiceIdentity was refused for want of an Administrator, but the refusal " +
@@ -1032,7 +1038,7 @@ try {
         Stop-TheService
         Show-Trio "service first start"
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but never reached the account gate, so its open is unproven" }
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but logged no ADR 0167 refusal (a reading above says if the gate let it start)" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
@@ -1084,7 +1090,7 @@ try {
                     Stop-TheService
                     if (-not $reopened) {
                         Add-Failure ("$ServiceIdentity could not open $DbPath after $Operator's open " +
-                            "re-secured it: the restart never reached the account gate in $WaitSeconds s. " +
+                            "re-secured it: the restart logged no ADR 0167 refusal in $WaitSeconds s. " +
                             (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                         Show-LogTail
                     } else {
