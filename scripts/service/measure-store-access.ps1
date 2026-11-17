@@ -32,10 +32,10 @@
            provisions. Either outcome is reached only after the store opened, so it is the proof
            that the operator opened it.
         3. The service is started again and must reach the same refusal, which proves it can still
-           open the store that the operator's open re-secured. If step 2 instead PROVISIONED (no
-           bootstrap account existed), the gate would pass, so the proof is /health and sign-in. If
-           step 2 FAILED, the service is restarted anyway as a control: reopening the store it
-           created itself tells "restricted to the service" apart from "restricted to nobody usable".
+           open the store after the operator's open. If step 2 instead PROVISIONED (no bootstrap
+           account existed), the gate would pass, so the proof is /health and sign-in. If step 2
+           FAILED, the service is restarted anyway as a control, and the run reports whether that
+           restart logged the refusal.
 
     -Order StartFirstEndToEnd (ADR 0183 Amendment A, Wave 2: AC-11 and AC-13 across two identities)
         The start-first flow an operator now meets, with no outcome left open.
@@ -53,25 +53,19 @@
     NT SERVICE\<ServiceName>, and every process sampled under the service must run as it. Where the
     engine is up (provision first), the sample must include the engine process itself.
 
-    WHAT A RED MEANS. At least every red that says an identity did not open, provision or serve
-    within the wait, apart from the three let-start reds below, names that identity and lists for
-    each file of the trio the entries it carries and whether any grants that identity read and
-    write. That list is a READING of the DACL, not an access check: it names the file, and the
-    behaviour above says the open failed. Such a red is tagged [STORE ACCESS] only when the
-    service log or the probe output shows an open failure; otherwise it is tagged
-    [NOT SHOWN TO BE STORE ACCESS], because a refused start gate or a held port also stops the
-    engine from serving.
-    The three let-start reds are for a start the ADR 0167 gate let go on where a refusal was
-    expected (the first start, the StartFirst control and the StartFirst restart). They say so,
-    point at the READING that quotes the gate's line, and say the service's access is not in
-    question, with no trio list and no tag. Other reds say what they checked.
+    WHAT A RED MEANS. A red that carries the store-access attribution (Get-Attribution) names an
+    identity and lists, for each file of the trio, its entries and whether any grants that identity
+    read and write. That list is a READING of the DACL, not an access check. It is tagged
+    [STORE ACCESS] when the service log or the probe output has a line matching $OpenErrorPattern,
+    and [NOT SHOWN TO BE STORE ACCESS] otherwise. Which reds carry it is in the script; at least a
+    red for a start the ADR 0167 gate let go on, where a refusal was expected, does not.
 
-    CONFINEMENT IS CHECKED AFTER EACH OPEN A STEP PROVES. Opening is half of the question; the other
-    half is the property ADR 0163's restriction exists for. After each such open, every trio file
-    may grant only SYSTEM, BUILTIN\Administrators, the service account and the operator, block
-    inheritance, and be owned by one of them, or the arm goes RED. The control reopen is not
-    checked, and neither is an open whose proof (the expected refusal, the operator's provision or
-    decline, or /health and sign-in) did not arrive, the three let-start reds included.
+    CONFINEMENT. Opening is half of the question; the other half is the property ADR 0163's
+    restriction exists for. Test-Resecured reads each trio file present and goes RED on one that
+    inherits, is owned outside SYSTEM, BUILTIN\Administrators, the service account and the
+    operator, or grants anyone outside them. It runs only where the script calls it, which is not
+    after every open: at least the control reopen, and an open whose step logged no proof, are not
+    checked.
     A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when it cannot restrict a file, so a
     restriction warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning.
 
@@ -126,17 +120,15 @@ $Email = "w0-admin@example.invalid"
 # either is reworded, the arm goes RED on a missing proof rather than passing on a stale one.
 # $GateRefusal is the clause the gate's no-Administrator and no-address branches both open with, so
 # the file-access arms prove the service read the user table whichever of the two fired. The gate's
-# Vault-transit refusal carries none of these three (see Wait-ForGateRefusal). $NoAdminRefusal and
-# $ProvisionHint are the no-Administrator branch alone, which StartFirstEndToEnd requires (ADR 0183
-# Wave 2, AC-11); $NoAdminRefusal is in it only when no account record failed its integrity seal.
+# Vault-transit refusal carries none of $GateRefusal, $NoAdminRefusal and $ProvisionHint (see
+# Wait-ForGateRefusal). $NoAdminRefusal and $ProvisionHint are the no-Administrator branch alone,
+# which StartFirstEndToEnd requires (ADR 0183 Wave 2, AC-11); $NoAdminRefusal is in it only when no account record failed its integrity seal.
 $GateRefusal = "no enabled Administrator"
 $NoAdminRefusal = "no enabled Administrator exists"
 $ProvisionHint = "provision-admin --username"
 # The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry
-# $GateRefusal too, and may carry the other two phrases above, so without this an engine that
-# started and served would pass every step that expects a refusal (each Wait-ForGateRefusal call
-# below; ProvisionFirst has none); Test-GateRefusalLine requires $StartRefused and the clause on one
-# line.
+# $GateRefusal too, and the engine goes on to start after either. Test-GateRefusalLine requires
+# $StartRefused and the clause on one line.
 $StartRefused = "refusing to start"
 # The openings of the gate's lines that let a start go on, at least these three in app.py: the
 # skipped-gate warning, the warn-mode line, and the warning that the gate could not run (a Vault
@@ -331,9 +323,8 @@ function Get-LogMatches {
 
 function Get-Attribution {
     <#
-      One sentence for a red: which trio files carry no read+write grant for $Identity, whether the
-      log shows an open failure, and the trio itself. Stated as readings so a red caused by something
-      other than file access (a start gate, a port) is not dressed up as one.
+      The attribution text a red appends: which trio files carry no read+write grant for $Identity,
+      whether the log or $Output has an open-failure line, and the trio itself.
     #>
     param([string]$Identity, [string[]]$IdentitySids, [string]$Output)
     $trio = Get-TrioReport -Identity $Identity -IdentitySids $IdentitySids
@@ -341,8 +332,8 @@ function Get-Attribution {
              else { "Every present trio file grants $Identity read+write, so the cause is probably NOT file access; read the output below." }
     $hits = @(Get-LogMatches $OpenErrorPattern | Select-Object -First 3 | ForEach-Object { Get-Excerpt $_.Line 240 })
     if ($Output -and $Output -match $OpenErrorPattern) { $hits += "probe output: " + (Get-Excerpt $Output 240) }
-    # The KIND leads the message, so a red that is not shown to be file access cannot be read as the
-    # lockout Wave 0 is looking for: a refused start gate or a held port also fails to serve.
+    # The KIND opens this attribution text, which the caller may put after its own words. Without
+    # an open-failure line the tag says so: a refused start gate or a held port also fails to serve.
     $kind = if ($hits.Count -gt 0) { "[STORE ACCESS]" } else { "[NOT SHOWN TO BE STORE ACCESS]" }
     $log = if ($hits.Count -gt 0) { "Open-failure evidence: $($hits -join ' || ')." }
            else { "No open-failure line was found in the service log or the probe output." }
@@ -361,10 +352,11 @@ function Show-Trio([string]$Label) {
 function Test-Resecured {
     <#
       After an identity's open, is the store still CONFINED -- the property ADR 0163's restriction
-      exists for? Every present trio file must block inheritance, be OWNED by, and grant only, SYSTEM,
-      BUILTIN\Administrators, the service account or the operator. Anything else is a RED: an
-      outside entry makes the store readable by that principal; an outside owner keeps WRITE_DAC and
-      can grant itself access; an inheriting file takes whatever the directory is later given.
+      exists for? A present trio file whose DACL it reads is a RED if it inherits, is OWNED outside,
+      or grants an Allow entry outside, SYSTEM, BUILTIN\Administrators, the service account and the
+      operator: an outside entry makes the store readable by that principal; an outside owner keeps
+      WRITE_DAC and can grant itself access; an inheriting file takes whatever the directory is later
+      given. A DACL it cannot read is a CONDITION.
 
       This replaced a check on the MECHANISM ("the .db still inherits", "the DACL did not change"),
       which encoded the pre-0b rewrite-to-the-opener design and would have flagged Wave 0b's
@@ -699,10 +691,10 @@ function Add-FirstStartFailure {
       As in the control and restart branches, it gives the store-access attribution unless the wait
       saw one of the gate's let-start lines ($GateLetStart).
     #>
-    $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
+    $what = if ($script:GateLetStartSeen) { "logged a line of the ADR 0167 gate letting the start go on (the READING line quotes it), where a refusal was expected," }
             elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
             else { "never created $DbPath" }
-    $cause = if ($script:GateLetStartSeen) { "The service's access is not in question." }
+    $cause = if ($script:GateLetStartSeen) { "No store-access attribution is given for a start the gate let go on." }
              else { Get-Attribution $ServiceIdentity (Get-ServiceSids) "" }
     Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " + $cause)
     Show-LogTail
@@ -1089,28 +1081,26 @@ try {
             $provisioned = ($r.Code -eq 0)
             $declined = ($r.Text -match [regex]::Escape($ProvisionDecline))
             if (-not ($provisioned -or $declined)) {
-                Add-Failure ("$Operator could not open $DbPath, which $ServiceIdentity created and " +
-                    "secured, through provision-admin's open path (exit $($r.Code)). " +
+                Add-Failure ("$Operator ran provision-admin on $DbPath, which $ServiceIdentity created, " +
+                    "and it exited $($r.Code) without provisioning or declining, so the operator's " +
+                    "open is unproven. " +
                     (Get-Attribution $Operator (Get-OperatorSids) $r.Text))
-                # CONTROL: if the operator's failed run did not open and re-secure the store, a service
-                # that cannot reopen even its own store means the first open locked out EVERY identity,
-                # not only the operator. That separates "restricted to the service" from "restricted
-                # to nobody usable".
+                # CONTROL: restart the service on the store it created and report whether it logs the
+                # refusal again. The trio listing above shows what the operator's failed run left.
                 Start-TheService "reopen of its own store (control)"
                 $own = Wait-ForGateRefusal "the control reopen"
                 Stop-TheService
                 if ($own) {
-                    Add-Reading "control: $ServiceIdentity reopened the store it created, so the store is restricted to the service and not to nobody"
+                    Add-Reading "control: $ServiceIdentity, restarted on the store it created, logged the expected refusal, so it reopened that store"
                 } elseif ($script:GateLetStartSeen) {
-                    Add-Failure ("control: $ServiceIdentity reopened the store it created and reached " +
-                        "the ADR 0167 gate, which let the start go on (the reading above), so this " +
-                        "control expected a refusal it did not get; the service's access is not in question.")
+                    Add-Failure ("control: $ServiceIdentity, restarted on the store it created, logged a " +
+                        "line of the ADR 0167 gate letting the start go on (the reading above), where " +
+                        "this control expected a refusal. No store-access attribution is given for it.")
                     Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity, restarted on the store it created itself, " +
-                        "did not log the expected refusal line in $WaitSeconds s. If the cause is store " +
-                        "access, and the operator's failed run did not open and re-secure the store, " +
-                        "its own first open locked out every identity. " +
+                        "did not log the expected refusal line in $WaitSeconds s. This run cannot tell " +
+                        "whether the service's first open or the operator's failed run left the store so. " +
                         (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                     Show-LogTail
                 }
@@ -1119,12 +1109,12 @@ try {
                        else { "and provision-admin declined on an existing Administrator (the pre-Wave 2 bootstrap shape)" }
                 Add-Reading "$Operator opened $DbPath $how"
                 Test-Resecured -Identity $Operator -Output $r.Text
-                # 3. The service starts again on the store the operator's open re-secured.
+                # 3. The service starts again on the store after the operator's open.
                 Start-TheService "restart"
                 if ($provisioned) {
                     # An addressed Administrator now exists, so the gate passes: prove the open by serving.
                     $failed = $Failures.Count
-                    Test-ServiceServes "the restart" "$Operator's open re-secured"
+                    Test-ServiceServes "the restart" "$Operator provisioned"
                     Stop-TheService
                     if ($Failures.Count -eq $failed) {
                         Test-Resecured -Identity $ServiceIdentity -FromServiceLog
@@ -1133,13 +1123,14 @@ try {
                     $reopened = Wait-ForGateRefusal "the restart"
                     Stop-TheService
                     if (-not $reopened -and $script:GateLetStartSeen) {
-                        Add-Failure ("$ServiceIdentity opened $DbPath after $Operator's open and reached " +
-                            "the ADR 0167 gate, which let the start go on (the reading above), so the " +
-                            "restart expected a refusal it did not get; the service's access is not in question.")
+                        Add-Failure ("$ServiceIdentity, restarted on $DbPath after $Operator's open, " +
+                            "logged a line of the ADR 0167 gate letting the start go on (the reading " +
+                            "above), where the restart expected a refusal. No store-access attribution " +
+                            "is given for it.")
                         Show-LogTail
                     } elseif (-not $reopened) {
-                        Add-Failure ("$ServiceIdentity, restarted on $DbPath after $Operator's open " +
-                            "re-secured it, did not log the expected refusal line in $WaitSeconds s. " +
+                        Add-Failure ("$ServiceIdentity, restarted on $DbPath after $Operator's open, " +
+                            "did not log the expected refusal line in $WaitSeconds s. " +
                             (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                         Show-LogTail
                     } else {
@@ -1183,7 +1174,7 @@ if ($Conditions.Count -gt 0) {
     Write-Host "::warning title=ADR 0183 Wave 0 ($Order) GREEN (CONDITIONAL)::$(Format-Annotation $why)"
     Write-Host "GREEN (CONDITIONAL) [$Order]: $why"
 } else {
-    Write-Host "GREEN [$Order]: both identities opened the store in this order, and it stayed confined after each open."
+    Write-Host "GREEN [$Order]: both identities opened the store in this order, and no confinement check went red."
 }
 # The Actions wrapper exits with $LASTEXITCODE, which the last native command (nssm, icacls) set.
 exit 0
