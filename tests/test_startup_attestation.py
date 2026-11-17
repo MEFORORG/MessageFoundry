@@ -2313,7 +2313,7 @@ def test_a_package_directory_swapped_for_a_link_to_a_sibling_in_the_install_root
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``<install root>/<package>`` moved to ``<install root>/<package>_real`` with a link left in its
-    place: the files are compared where the link resolves, as origin/main compared them, so they have
+    place: the files are compared where the link resolves, as they were before BACKLOG #5376, so they have
     no rows and the package's own rows are read back as gone."""
     console_root = _install_engine_and_console(tmp_path, monkeypatch)
     package_dir = console_root / _CONSOLE_PKG

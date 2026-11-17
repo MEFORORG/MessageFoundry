@@ -396,11 +396,11 @@ def _record_place(path: str | Path) -> Path:
 
     A file or a package directory swapped for a link keeps that place, so it is still compared
     against its row, and reading it reads through the link, which is what an import would run.
-    Resolving the name too would move a linked package directory out of the install root, where every
-    row reads as ``missing`` although each file is there (BACKLOG #5376).
+    Resolving the name too would move a package directory linked out of the install root out of it,
+    where none of its files is compared (BACKLOG #5376).
 
-    A path whose last component is ``..`` (or that has no name) is resolved whole, as origin/main
-    resolved every root, because ``..`` is not a name ``RECORD`` can hold. So a package directory
+    A path whose last component is ``..`` (or that has no name) is resolved whole, as every root was
+    before BACKLOG #5376, because ``..`` is not a name ``RECORD`` can hold. So a package directory
     linked out of the install root and named through ``..`` reads as loaded from outside the install
     root, not through the link."""
     path = Path(path)
@@ -459,10 +459,11 @@ def _import_capable_files(roots: Iterable[str]) -> list[Path]:
     **Not every file**, which is the scope BACKLOG #1432 declined; ADR 0041's 2026-10-06 amendment
     says why that ruling does not reach these shapes, and records what this walk still does not see.
 
-    **Each root is walked at its** :func:`_record_place`, and nothing under it is resolved. A file, or
-    the package directory itself, swapped for a link keeps its place under the install root, and
-    hashing it reads the bytes the link points at, which is what an import would run. The console arm
-    does the same (:func:`_console_loaded_files`).
+    **Each root is walked at its** :func:`_record_place`, and nothing under it is resolved. A file
+    swapped for a link keeps its place under the install root, and hashing it reads the bytes the link
+    points at, which is what an import would run. Where a walked file is compared, a package directory
+    that is itself a link included, :func:`_attest_distribution` says. The console arm does the same
+    (:func:`_console_loaded_files`).
     """
     files: set[Path] = set()
 
@@ -824,7 +825,7 @@ def _attest_distribution(
         return rel is not None and (rel == package or rel.startswith(prefix))
 
     # Where each loaded root's files sit in `RECORD`. A root that resolves under the install root is
-    # anchored where it resolves, as origin/main walked every root, so a link into the package from
+    # anchored where it resolves, as every root was before BACKLOG #5376, so a link into the package from
     # anywhere is compared as if loaded there, and a package directory swapped for a link to another
     # directory in the install root is compared as that directory. A root that resolves outside the
     # install root is read through the link at its record place when that place is in the package (a

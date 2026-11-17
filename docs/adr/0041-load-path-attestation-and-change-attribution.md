@@ -479,16 +479,16 @@ fingerprint+git-HEAD covers more cheaply for now.
 >   the root. A walked file is still compared where its root resolves when that is under the install
 >   root, as before, so a link into the package is compared as the package.
 > - **A package directory swapped for a link out of the install root is read through the link and
->   compared** at its `RECORD` place, so a changed file there is `hash_mismatch` drift and a deleted
->   one is `missing` drift. Before, the resolved root put every file outside the install root and
+>   compared** at its `RECORD` place, so a changed file the arm attests there is `hash_mismatch`
+>   drift and a deleted one whose row the arm reads back is `missing` drift (AC-15, AC-16 say which). Before, the resolved root put every file outside the install root and
 >   none was compared. An intact one is still attested-nothing
 >   (`package_directory_links_out_of_install_root`, AC-13): a package directory linked out of the
 >   install root does not make the pass clean, however its files compare. A single file swapped for a
 >   link out of the install root is hashed in place, as the 2026-10-06 amendment says, and an intact
 >   one reads clean.
-> - **The read-back of unmatched `RECORD` rows has a second trigger**, a loaded package root that is,
->   or resolves to, the package directory `RECORD` describes, so an emptied package is `missing` drift
->   for each row. The 2026-09-25 amendment's FIFO sentence held only while the walk listed some
+> - **The read-back of unmatched `RECORD` rows has a second trigger**, a loaded package root; the
+>   `_attest_distribution` docstring states both triggers. So an emptied package is `missing` drift
+>   for each row the arm reads back. The 2026-09-25 amendment's FIFO sentence held only while the walk listed some
 >   console file under the install root; it now holds for an emptied console too.
 > - **The console arm's walk names a directory it cannot list**, as `missing` drift, as the engine
 >   arm's does; the 2026-10-06 amendment's residual *"The console arm's walk still skips a directory it
