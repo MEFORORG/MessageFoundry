@@ -38,9 +38,18 @@ _SMALL_STACK = 2 * 1024 * 1024
 _TOO_DEEP = "[" * _DEPTH + "]" * _DEPTH
 
 
+#: Each route's too-deep body, and the refusal it answers. The re-auth route hands the body to the
+#: service, whose audited refusal answers; the enrolment route cannot read the label, so it answers
+#: its own malformed-body refusal.
 _DEEP_BODIES = {
-    "/ui/reauth/webauthn": '{"response": ' + _TOO_DEEP + "}",
-    "/ui/account/webauthn/verify": '{"label": "k", "response": ' + _TOO_DEEP + "}",
+    "/ui/reauth/webauthn": (
+        '{"response": ' + _TOO_DEEP + "}",
+        {"ok": False, "error": "passkey verification failed"},
+    ),
+    "/ui/account/webauthn/verify": (
+        '{"label": "k", "response": ' + _TOO_DEEP + "}",
+        {"ok": False, "error": "malformed request"},
+    ),
 }
 
 
@@ -70,12 +79,10 @@ def _on_a_small_stack[T](call: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 @pytest.mark.parametrize("route", sorted(_DEEP_BODIES))
-def test_a_body_nested_too_deep_is_a_malformed_request_not_a_500(
-    tmp_path: Path, route: str
-) -> None:
+def test_a_body_nested_too_deep_is_a_refusal_not_a_500(tmp_path: Path, route: str) -> None:
     """vault BACKLOG #5341. Red: the route's own ``request.json()`` raised ``RecursionError``,
     which its catch did not list, so it escaped the route (a 500 on a served engine)."""
-    body = _DEEP_BODIES[route]
+    body, refusal = _DEEP_BODIES[route]
 
     async def _parse() -> object:
         return json.loads(body)
@@ -106,7 +113,7 @@ def test_a_body_nested_too_deep_is_a_malformed_request_not_a_500(
             await engine.stop()
 
     r = _on_a_small_stack(_post)
-    assert (r.status_code, r.json()) == (400, {"ok": False, "error": "malformed request"})
+    assert (r.status_code, r.json()) == (400, refusal)
 
 
 def _spy_login(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
