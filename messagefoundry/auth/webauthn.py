@@ -188,10 +188,21 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
 
 def _invalid_response_errors() -> tuple[type[Exception], ...]:
     """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
-    call of each ceremony (vault BACKLOG #5341). The library's own ``json.loads`` raises it,
-    unwrapped, for JSON nested too deep for the stack: at least its credential parsers and its
-    ``clientDataJSON`` parser catch only ``JSONDecodeError``. Its message names stack use, not the
-    input. So the catch stays around the whole call, not one parse.
+    call of each ceremony (vault BACKLOG #5341). Read and run on the installed webauthn 3.0.1:
+
+    * Its credential-JSON parsers (``parse_registration_credential_json``,
+      ``parse_authentication_credential_json``) catch only ``JSONDecodeError`` around their
+      ``json.loads``, so a credential handed to the library as text and nested too deep for the
+      stack raises ``RecursionError`` unwrapped. A caller that hands it an already-parsed dict
+      does not reach that parse.
+    * At least the ``android-safetynet`` attestation check also ``json.loads`` the JWS header and
+      payload with no guard, and ``verify_registration_response`` calls it outside any ``try``.
+    * The library's ``clientDataJSON`` parse is not a source: both verify functions call it inside
+      ``except Exception`` and re-raise ``InvalidRegistrationResponse`` or
+      ``InvalidAuthenticationResponse``, which :func:`_invalid_input_errors` already holds.
+
+    A ``RecursionError`` message names stack use, not the input. Because a source sits inside the
+    call as well as at its entry, the catch stays around the whole call, not one parse.
 
     The stored key is not such a source: the library's CBOR decodes, the stored key's included, go
     through its ``parse_cbor``, which wraps every ``Exception`` as ``InvalidCBORData`` (read on

@@ -768,7 +768,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # whatever the provider, before the engine sees it.
 
         def _refused() -> Response:
-            # The challenge is already popped, so every refusal also ends its handle cookie.
+            # The challenge is already popped, so each refusal this helper builds also ends its
+            # handle cookie. Not every refusal after the pop comes here: the login-budget 429 above
+            # raises with the cookie left set.
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
             if handle:
                 clear_passkey_sign_in_cookie(refused, request)

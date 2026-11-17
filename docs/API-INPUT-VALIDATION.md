@@ -5,12 +5,21 @@ It covers the control plane: the ids, connection names, time bounds and search t
 client sends to the engine. It does not cover message payloads. Those are the data plane, and they
 have their own documents: [HL7-VALIDATION.md](HL7-VALIDATION.md) and [CODESETS.md](CODESETS.md).
 
-The rules live in one module, [`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py).
-The rules table below is quoted from it. `tests/test_api_input_validation.py` checks that six
-phrases on this page still match the code, and fails if the page drops one. It does not check every
-number on this page. The connection-name pattern is the one exception to where it is written:
-it is defined in [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and
-imported by that module, because the config loader enforces the same rule.
+Most of the rules live in one module,
+[`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py), and most of the rules
+table below is quoted from it. `tests/test_api_input_validation.py` checks that six phrases on this
+page still match the code, and fails if the page drops one. It does not check every number on this
+page. At least four rules in the table are written, in whole or in part, elsewhere. The
+connection-name pattern is defined in
+[`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
+module, because the config loader enforces the same rule. The sign-in name's NUL rule is in
+`validation.py`, but its length bounds, 256 characters and the minimum of 1 on
+`POST /users/directory`, are set on the request models in
+[`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py).
+The HL7 field-path grammar is `parse_path` in
+[`messagefoundry/parsing/peek.py`](../messagefoundry/parsing/peek.py). The layered preset ids'
+pattern is in `validation.py`, but their 1024-character bound is set on the route in
+[`messagefoundry/api/app.py`](../messagefoundry/api/app.py).
 
 Two later sections quote rules held in other files: the items checked behind a route, and the rules
 over two or more items. Each entry there names the code that holds its rule. No test compares those
@@ -344,7 +353,7 @@ replace it.** The first two are below. The third is the DR archive path, under
 2. A log `level` is checked against the engine's own level names, which is why a wrong one gets a
    400. The shape rule only keeps an arbitrary-length string out of that error message.
 
-**One rule is documented here but enforced elsewhere.** The HL7 field path grammar belongs to
+**The field path is documented here but enforced elsewhere.** The HL7 field path grammar belongs to
 `messagefoundry.parsing.peek.parse_path`, and `messagefoundry.store.content_search.make_spec` applies
 it at every point the API accepts a `field_path`. A malformed path is already a 400. Copying that
 pattern into the API models would create a second definition of a rule that has one.

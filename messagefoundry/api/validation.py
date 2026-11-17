@@ -207,8 +207,11 @@ PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 #: store's lookup, and PostgreSQL text cannot hold one, so its driver raises rather than finding no
 #: row. Only the NUL: no account on that store can hold one, while other control characters can
 #: reach a stored name through paths ``auth.usernames.username_refusal`` does not govern, such as
-#: provision-admin, so refusing them here could lock a holder out. The web console's form sign-in
-#: applies the same rule by hand (``"\x00" in``), since it parses its form without pydantic.
+#: provision-admin, so refusing them here could lock a holder out. That holds on PostgreSQL alone,
+#: and there only on its documentation, not run here. The SQLite store can hold a NUL name:
+#: ``create_user`` stores one and ``get_user_by_username`` finds it. The SQL Server store is not
+#: measured. The web console's form sign-in applies the same rule by hand (``"\x00" in``), since
+#: it parses its form without pydantic.
 SIGN_IN_NAME_PATTERN = r"^[^\x00]*$"
 
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,
