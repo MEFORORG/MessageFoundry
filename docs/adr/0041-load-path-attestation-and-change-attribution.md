@@ -384,9 +384,10 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    serves is one that is attested.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
 >    distribution metadata or a stripped `RECORD` is attested-nothing. One loaded from a directory
->    other than the one its `RECORD` describes compares no file against it, and its `RECORD` rows are
->    not reported. Since BACKLOG #5376, one loaded from that directory, through a link included,
->    reports each `RECORD` row no listed file matched as `missing` drift.
+>    that neither is nor resolves to the one its `RECORD` describes compares no file against it, and
+>    its `RECORD` rows are not reported. Since BACKLOG #5376, one loaded from that directory, or
+>    through a link to or from it, reports each `RECORD` row no listed file matched as `missing`
+>    drift.
 >    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
 >    distribution beside an engine that declares itself editable: that is a checkout that installed
 >    only the engine, and the engine's exemption already concedes everything this one would.
@@ -468,8 +469,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `__pycache__` file is still unread by either arm, for the reason the 2026-09-25 amendment gives.
 > Bytecode planted under the config tree is vault BACKLOG #2596, and `.pth` files and other start-up
 > code in `site-packages` are vault BACKLOG #2701. A FIFO, device or socket planted under an import
-> name is not listed by the engine walk unless it sits at a `RECORD` path. The console arm's walk still
-> skips a directory it cannot list; this amendment changed only the engine arm. The D3 trust-domain
+> name is not listed by the engine walk unless it sits at a `RECORD` path. Since BACKLOG #5376 the
+> console arm's walk also names a directory it cannot list, as `missing` drift. The D3 trust-domain
 > residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
 
 ## Options considered

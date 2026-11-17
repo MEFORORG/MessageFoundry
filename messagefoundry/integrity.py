@@ -739,7 +739,7 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies only when one of ``package_roots`` (the loaded package's directories) is
+    applies only when one of ``package_roots`` (the loaded package's directories) is, or resolves to,
     ``<install root>/<package>``. So a package loaded from elsewhere is not reported as every file it
     did not load, while one whose every file is gone still is (BACKLOG #5376).
 
@@ -810,10 +810,15 @@ def _attest_distribution(
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
     prefix = f"{package}/"
-    # The parent is resolved and the directory itself is not, so a package directory swapped for a
-    # link still names the place `RECORD` describes.
+    # Matched twice: with only the parent resolved, so a package directory swapped for a link still
+    # names the place `RECORD` describes, and fully resolved, so a link from elsewhere into that place
+    # does too.
     in_package = any(
-        _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root) == package
+        package
+        in (
+            _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root),
+            _record_relpath(Path(root).resolve(), install_root),
+        )
         for root in package_roots
     )
     if unmatched_rows is not None and in_package:

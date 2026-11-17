@@ -1928,6 +1928,25 @@ def test_a_console_loaded_from_a_directory_nested_in_the_package_blames_no_intac
     assert console.unattested_reason == _NOTHING_UNDER_ROOT
 
 
+def test_a_console_imported_through_a_link_into_the_package_still_reads_back_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link placed outside the install root that points into the real package: the walk resolves
+    back under the root, and the deleted file must still be ``missing`` drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    (package_dir / "static" / "app.js").unlink()
+    alias = tmp_path / "ahead_on_sys_path" / _CONSOLE_PKG
+    alias.parent.mkdir()
+    _symlink(alias, package_dir, directory=True)
+    _load_fake_console(monkeypatch, alias)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(f"{_CONSOLE_PKG}/static/app.js", "missing")]
+    assert console.checked == len(_CONSOLE_FILES) - 1
+
+
 def test_an_engine_package_directory_swapped_for_a_link_is_missing_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
