@@ -2072,13 +2072,90 @@ def test_a_tracked_or_staged_file_under_a_build_directory_is_scanned(
 def _git_tree(root: Path, tracked: dict[str, str], untracked: dict[str, str]) -> Path:
     """A git work tree at ``root`` with ``tracked`` files added to the index and ``untracked`` beside."""
     root.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60)
+    # A contributor's global ignore list may name these very directories, so it is kept out, and the
+    # add is forced.
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60, env=env)
     for rel, text in {**tracked, **untracked}.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(text, encoding="utf-8")
     if tracked:
-        subprocess.run(["git", "-C", str(root), "add", "--", *tracked], check=True, timeout=60)
+        subprocess.run(
+            ["git", "-C", str(root), "add", "-f", "--", *tracked], check=True, timeout=60, env=env
+        )
     return root
+
+
+def test_the_tracked_scan_reads_a_name_git_would_quote(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``git ls-files`` without ``-z`` C-quotes a non-ASCII name, which is then no file, so the
+    no-argument tracked scan skipped it unread."""
+    root = _git_tree(tmp_path / "tree", {"café.md": "contact ACME\n"}, {})
+    monkeypatch.chdir(root)
+    assert sf_main.main([]) == 1
+
+
+def test_a_snapshot_shaped_like_a_bare_repository_is_still_walked_whole(
+    sf_main, tmp_path: Path
+) -> None:
+    """A pushed commit can carry HEAD, config, objects and refs at its root. Git must not read that
+    directory as a repository (and its config), and its build directories are still committed content."""
+    root = tmp_path / "snapshot"
+    for rel, text in {
+        "HEAD": "ref: refs/heads/main\n",
+        "config": "[core]\n\tbare = false\n\tworktree = .\n",
+        "objects/x": "x\n",
+        "refs/x": "x\n",
+        "build/leak.md": "contact ACME\n",
+    }.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+    assert sf_main._tracked_under(root) is None
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+def test_an_untracked_copy_inside_a_work_tree_is_walked_whole(sf_main, tmp_path: Path) -> None:
+    """A directory git tracks nothing under, inside some work tree, is a copy of content git cannot
+    describe, so its build directories are read."""
+    root = _git_tree(
+        tmp_path / "tree", {"ok.md": "fine\n"}, {"copy/build/leak.md": "contact ACME\n"}
+    )
+    assert sf_main.main(["--path", str(root / "copy")]) == 1
+
+
+def test_a_named_path_that_is_not_a_file_fails_the_run(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory after ``--`` was skipped in silence, so ``-- --path dir`` scanned nothing and passed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "dir" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main(["--", "--path", "dir"]) == 2
+
+
+def test_a_walked_entry_that_cannot_be_stated_fails_the_run(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that lists but does not open (mode 0444 on POSIX) hid its files behind is_file()."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    hidden = root / "leak.md"
+    hidden.write_text("contact ACME\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    real_is_file, real_lstat = Path.is_file, Path.lstat
+
+    def is_file(self: Path, **kwargs: bool) -> bool:
+        return False if self == hidden else real_is_file(self, **kwargs)
+
+    def lstat(self: Path) -> os.stat_result:
+        if self == hidden:
+            raise PermissionError(13, "denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert sf_main.main(["--path", str(root)]) == 2
 
 
 def test_the_path_walk_still_skips_an_untracked_environment(sf_main, tmp_path: Path) -> None:
@@ -2827,8 +2904,11 @@ def test_the_commit_hook_passes_wide_text_and_binary_files() -> None:
     passed a UTF-16 file to the scanner, which decodes it, and never passed a binary file, which the
     scanner still judges by its name and path."""
     hook = _forbidden_content_hook()
-    assert "text" not in (hook.get("types") or []), hook
-    assert "binary" not in (hook.get("exclude_types") or []), hook
+    # Exact, so a narrower filter cannot pass in its place.
+    assert hook.get("types") == ["file"], hook
+    for key in ("types_or", "exclude_types", "files"):
+        assert not hook.get(key), (key, hook)
+    assert hook.get("exclude") == r"^scripts/security/scan-tokens\.local\.txt$", hook
 
 
 def test_utf16_text_whose_first_character_is_nul_is_scanned(sf, tmp_path: Path) -> None:

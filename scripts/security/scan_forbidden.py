@@ -2106,56 +2106,86 @@ reload_tokens()
 # --------------------------------------------------------------------------------------------------
 
 
+def _ls_files(root: Path) -> list[str]:
+    """``git ls-files`` in ``root``, NUL-separated so a name git would C-quote (non-ASCII, a quote, a
+    control byte) comes back as itself rather than as a path that does not exist. Raises on failure.
+
+    Fixed argv, no shell, ``root`` a separate argument. ``safe.bareRepository=explicit`` keeps git from
+    taking a directory of committed files that is shaped like a bare repository as one, and so from
+    reading a config a commit wrote."""
+    out = subprocess.run(  # nosec B603 B607
+        ["git", "-c", "safe.bareRepository=explicit", "-C", str(root), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    return [p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p]
+
+
 def _git_tracked() -> list[str]:
-    # Fixed literal argv ["git", "ls-files"]: no shell, no user input.
-    return subprocess.run(  # nosec B603 B607
-        ["git", "ls-files"], capture_output=True, text=True, check=True
-    ).stdout.splitlines()
+    return _ls_files(Path("."))
 
 
 def _tracked_under(root: Path) -> set[str] | None:
-    """The files git tracks under ``root``, relative to it, or ``None`` when git cannot say (no work
-    tree there, no git, a refused repository). Fixed argv, no shell; ``root`` is a separate argument."""
-    try:
-        out = subprocess.run(  # nosec B603 B607
-            ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
+    """The files git tracks under ``root``, relative to it, or ``None`` when nothing can say.
+
+    ``None`` when no directory from ``root`` up holds a ``.git`` entry, so git is never run in a
+    pushed commit's snapshot, whose files the commit chose; when git fails; and when git tracks no file
+    under ``root``, which is then an untracked copy of content that cannot be told apart. ``None``
+    prunes nothing, the fail-closed side."""
+    resolved = root.resolve()
+    if not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
         return None
-    return {p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p}
+    try:
+        tracked = set(_ls_files(root))
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(
+            f"scan_forbidden: git could not list the tracked files under {root} ({type(exc).__name__}),"
+            " so the walk skips no build or environment directory there.",
+            file=sys.stderr,
+        )
+        return None
+    return tracked or None
 
 
-def _walk(root: Path, out: list[tuple[Path, str]], errors: list[str]) -> None:
-    """Every file under ``root``, keyed by its root-relative posix path, with SKIP_DIRS pruned only where
-    git says the files are untracked (BACKLOG #5585). Outside a work tree nothing tells tracked from
-    untracked, so nothing but ``.git`` is pruned: a pushed commit's snapshot is committed content
-    wherever it sits. A directory the walk cannot list is reported in ``errors``, where ``rglob`` used to
-    drop it without a word."""
+def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
+    """Every file under the directory ``raw``, keyed by its root-relative posix path, with SKIP_DIRS
+    pruned only where git says the files are untracked (BACKLOG #5585). Outside a work tree nothing
+    tells tracked from untracked, so nothing but ``.git`` is pruned: a pushed commit's snapshot is
+    committed content wherever it sits. A directory the walk cannot list is reported in ``errors``,
+    where ``rglob`` used to drop it without a word."""
+    root = Path(raw)
     tracked = _tracked_under(root)
     tracked_dirs = {
         "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
     }
 
     def refused(exc: OSError) -> None:
-        # Root-relative, as every hit is: the absolute form can carry a user-home path.
+        # Root-relative, as every hit is: the absolute form can carry a user-home path. The root itself
+        # is named as the caller wrote it.
         try:
             name = Path(os.fsdecode(exc.filename)).relative_to(root).as_posix()
         except (TypeError, ValueError):
             name = "."
+        name = raw if name == "." else name
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-        errors.append(
-            f"{name}/:0: unreadable directory ({why}), so its files were not scanned (fail closed)"
-        )
+        what = "does not exist" if exc.errno == errno.ENOENT else f"unreadable directory ({why})"
+        errors.append(f"{name}/:0: {what}, so its files were not scanned (fail closed)")
 
     for top, dirs, files in os.walk(root, onerror=refused):
         rel_top = Path(top).relative_to(root).as_posix()
         prefix = "" if rel_top == "." else rel_top + "/"
+        in_skip_dir = bool(set(Path(prefix).parts) & SKIP_DIRS)
+        # Under a skipped directory only the paths leading to tracked files are walked at all.
         dirs[:] = [
             d
             for d in dirs
-            if d != ".git" and (d not in SKIP_DIRS or tracked is None or prefix + d in tracked_dirs)
+            if d != ".git"
+            and (
+                tracked is None
+                or prefix + d in tracked_dirs
+                or (d not in SKIP_DIRS and not in_skip_dir)
+            )
         ]
-        in_skip_dir = bool(set(Path(prefix).parts) & SKIP_DIRS)
         for name in files:
             rel = prefix + name
             if name == ".git" or (in_skip_dir and tracked is not None and rel not in tracked):
@@ -2190,7 +2220,7 @@ def _candidate_files(
                 if root.name != ".git":
                     out.append((root, root.name))
                 continue
-            _walk(root, out, errors)
+            _walk(raw, out, errors)
         return out, errors
     if paths:
         return [(Path(a), Path(a).as_posix()) for a in paths], []
@@ -2241,6 +2271,15 @@ def _read_text(path: Path) -> str | None:
 
     A NUL near the start used to mean binary outright, so UTF-16 and UTF-32 text, which a Windows tool
     writes routinely, went unscanned. A byte-order mark or the UTF-16 shape now decodes it first."""
+    # The head alone decides binary, so a large binary is not read whole only to be set aside.
+    with path.open("rb") as f:
+        head = f.read(_HEAD_BYTES)
+    if (
+        not head.startswith(tuple(bom for bom, _ in _BOMS))
+        and b"\x00" in head
+        and _bomless_utf16(head) is None
+    ):
+        return None
     data = path.read_bytes()
     head = data[:_HEAD_BYTES]
     for bom, codec in _BOMS:
@@ -2976,13 +3015,31 @@ def main(argv: list[str]) -> int:
     # a run whose files were all unread report coverage it did not have (BACKLOG #5583). A directory the
     # --path walk could not list is unreadable in the same way.
     candidates, hits = _candidate_files(paths, path_mode=path_mode)
+    unlisted = len(hits)
     scanned = 0
     unread = 0
     unreadable = len(hits)
     for abs_path, rel in candidates:
         # SKIP_DIRS is applied by the --path walk alone, and only to files git does not track there
         # (_walk); the tracked and staged scans read every file they name.
-        if not abs_path.is_file() or _is_skipped(rel):
+        if _is_skipped(rel):
+            continue
+        if not abs_path.is_file():
+            # A walked entry that cannot even be stat'ed sits in a directory that lists but does not
+            # open, and a FILE the caller named that is not one (a directory after ``--``, a missing
+            # name) is not scanned. Both are unreadable, not clean. Anything else (a link to a directory,
+            # a tracked path the work tree no longer holds) is passed over as before.
+            if not path_mode and not paths:
+                continue
+            try:
+                abs_path.lstat()
+                reason = None if path_mode else "not a regular file"
+            except OSError as exc:
+                reason = f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
+            if reason is not None:
+                hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
+                unreadable += 1
+                unread += 1
             continue
         file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
         hits.extend(file_hits)
@@ -3000,7 +3057,7 @@ def main(argv: list[str]) -> int:
         print(
             f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
             f"{unread} more were binary, unreadable or under a forbidden path, so their content "
-            "was not scanned.",
+            f"was not scanned, and {unlisted} director(ies) could not be listed.",
             file=sys.stderr,
         )
 
