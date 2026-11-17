@@ -137,6 +137,10 @@ def site_prefixes_loaded() -> bool:
     return bool(_SITE_PREFIXES)
 
 
+#: How the :func:`site_prefix_split` reason starts, so a caller can tell it from a floor failure.
+SITE_PREFIX_SPLIT_LEAD = "the site-code check uses"
+
+
 def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
     """Why the site-code check does not use the publish guard's ``[site_prefix]`` table, or
     ``None`` when it uses the same prefixes. ``guard_prefixes`` is the guard's own table, whose
@@ -147,7 +151,7 @@ def site_prefix_split(guard_prefixes: tuple[str, ...]) -> str | None:
     if set(guard_prefixes) == set(_SITE_PREFIXES):
         return None
     return (
-        f"the site-code check uses {len(_SITE_PREFIXES)} two-digit prefix(es) but the publish "
+        f"{SITE_PREFIX_SPLIT_LEAD} {len(_SITE_PREFIXES)} two-digit prefix(es) but the publish "
         f"guard's [site_prefix] table holds {len(set(guard_prefixes))} entr(ies) — an entry that "
         "is not two digits, or a reload of one table without the other "
         "(surrogates.reload_site_prefixes); the site-code check does not match what the guard counts"
@@ -825,8 +829,8 @@ _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
 #: combining grapheme joiner
 #: U+034F and the variation selectors, category Mn, and the Hangul fillers U+115F, U+1160, U+3164
 #: and U+FFA0, category Lo. A consumer shows none of them, so a site code or ``MR`` they
-#: interleave reads as the value without them (BACKLOG #5654). The ranges that lie inside Cc or
-#: Cf are left to :data:`_INVISIBLE_CATEGORIES`.
+#: interleave reads as the value without them (BACKLOG #5654). Most ranges inside Cc or Cf are
+#: left to :data:`_INVISIBLE_CATEGORIES`; a few listed here hold Cf code points as well.
 _DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
     (0x034F, 0x034F),
     (0x115F, 0x1160),

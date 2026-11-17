@@ -51,6 +51,7 @@ from pathlib import Path
 from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retargeted_defaults
 from .surrogates import (
     COMPONENT_KEEPING_KINDS,
+    SITE_PREFIX_SPLIT_LEAD,
     Seps,
     decoded_readings,
     dropped,
@@ -1332,7 +1333,15 @@ def refusal_advice(
     if MALFORMED_LINE_HIT in report.structural_hits:
         steps.append(MALFORMED_LINE_ADVICE)
     if denylist_refused:
-        steps.append("Load the denylist token source.")
+        reason = report.token_floor_reason or ""
+        if reason.startswith(SITE_PREFIX_SPLIT_LEAD):
+            # The source loaded; the site-code table and the guard's differ (BACKLOG #5541).
+            steps.append(
+                "Make every [site_prefix] entry in the token source two digits, then run again "
+                "so both tables load from it."
+            )
+        else:
+            steps.append("Load the denylist token source.")
     return " ".join(steps)
 
 

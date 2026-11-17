@@ -2548,7 +2548,7 @@ both are described below:
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
-| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or CX.5, the identifier type code, in any of its subcomponents too, such as `ID^^^AUTH^MR&local`. Component 5 of any field the check reads is read as CX.5 whatever the field's type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
+| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or components 5, 7 and 13, where CX.5, XON.7 and XCN.13 carry an id type, in any of their subcomponents too, such as `ID^^^AUTH^MR&local`. Those components are read so in every field whatever its type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
@@ -2569,8 +2569,9 @@ component read and one subcomponent on a subcomponent read, and `Peek` decodes a
 reading the first one where a component has several. An escape can pair across the subcomponent
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
-of its subcomponents decoded on its own. The MRN-typed check reads every component, its first
-subcomponent and each subcomponent of CX.5, as written, decoded, and with invisible characters
+of its subcomponents decoded on its own, also with `\H\` and `\N\` dropped and with invisible
+characters removed. The MRN-typed check reads every component, its first subcomponent and each
+subcomponent of components 5, 7 and 13, as written, decoded, and with invisible characters
 removed, each trimmed and never split; `tests/test_anon_b224_5654.py` is the specification
 of which forms count (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
@@ -2597,9 +2598,8 @@ still pass:
   and a code written as the argument of a well-formed hex or multi-byte character-set escape,
   such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
   not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
-- The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
-  address, such as `fe80::1.4000:a1::5`, and one split by a highlighting or control escape, such
-  as `4000:a1:\H\:5` or `4000:a1\X00\::5` (BACKLOG #5654).
+- The IPv6 check can miss a routable address written in a form none of its candidate texts
+  parses (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 

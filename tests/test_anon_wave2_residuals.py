@@ -134,9 +134,12 @@ def test_the_opt_in_refuses_on_a_split_table(
 ) -> None:
     with (
         _token_source(monkeypatch, "975\n", guards=True, surrogates=True),
-        pytest.raises(anon.LeakError, match="denylist not live: the site-code check"),
+        pytest.raises(anon.LeakError, match="denylist not live: the site-code check") as caught,
     ):
         anon.anonymize_checked(f"{_HEAD}\rPV2|1", salt=_SALT, require_live_denylist=True)
+    # The source is loaded, so the advice is to fix the entry, not to load a source.
+    assert "two digits" in str(caught.value)
+    assert "Load the denylist token source." not in str(caught.value)
 
 
 # --- #5540: the site-code pass under a digit separator ---------------------------------------------
