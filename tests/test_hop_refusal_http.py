@@ -688,6 +688,15 @@ def test_url_segment_and_conditional_query_readings() -> None:
     assert http_credentials_sent(ConnectorType.REST, secret) == []
 
 
+def test_a_fhir_search_code_parameter_in_conditional_query_is_not_a_credential() -> None:
+    """``code`` is FHIR's own search parameter in a conditional_query, so the ``url`` refusal's
+    function-key reading of it does not apply there (BACKLOG #5350)."""
+    from messagefoundry.transports.rest import http_credentials_sent
+
+    query = {"conditional_query": "code=http://loinc.org|1234-5"}
+    assert http_credentials_sent(ConnectorType.FHIR, query) == []
+
+
 @pytest.mark.parametrize("cell", _CELLS)
 def test_an_explicit_none_verify_tls_verifies(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Vault BACKLOG #3230: ``verify_tls = None`` takes the default (on). It used to read as off, so

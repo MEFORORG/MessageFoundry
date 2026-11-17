@@ -114,6 +114,7 @@ from messagefoundry.transports.rest import (
     _is_shared_no_redirect_opener,
     _latin1_refusal_position,
     _no_redirect_opener,
+    _query_credentials_sent,
     _redact_url,
     _shared_no_redirect_opener,
     assert_probe_hop,
@@ -862,7 +863,9 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
     are refused. So is a ``#``: urllib splits it off client-side as a fragment, so the server
     would run a shorter search than the one configured. A backslash stays, since FHIR's search
     escapes use it. ``if-none-exist`` puts it in the ``If-None-Exist`` header, which http.client
-    encodes as Latin-1 and where a space is legal, so only non-Latin-1 is refused. Control
+    encodes as Latin-1 and where a space is legal, so non-Latin-1 is refused there. So is a ``#``
+    (BACKLOG #5350): the header carries a query string, and a server that reads it as a URL's query
+    stops at the ``#``, so it would match on a shorter search than the one configured. Control
     characters were already refused by :func:`_reject_config_control_chars`.
 
     The URL length is checked as a LOWER bound: the shortest resourceType is one letter, so a query
@@ -891,6 +894,11 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
             raise ValueError(
                 f"{setting} is not encodable as Latin-1 for conditional='if-none-exist' (it is "
                 "sent as the If-None-Exist header value); percent-encode the search parameters"
+            )
+        if "#" in query:
+            raise ValueError(
+                f"{setting} must hold no '#' for conditional='if-none-exist' (a server reading the "
+                "If-None-Exist value as a query would stop at it); percent-encode it as %23"
             )
         if len(query) > MAX_OUTBOUND_HEADER_VALUE_LEN:
             raise ValueError(
@@ -1124,6 +1132,20 @@ class FhirDestination(DestinationConnector):
             _refuse_unsendable_conditional_query(
                 self.conditional_query, self.conditional, url.rstrip("/")
             )
+            # BACKLOG #5350: the query rides the request line or the If-None-Exist header, so a
+            # credential in it lands in the server's and any proxy's log. Warned on every hop, as a
+            # url query credential is; a verify-off or off-box cleartext hop refuses it below, by
+            # the same reader (http_credentials_sent).
+            for found in _query_credentials_sent(
+                "conditional_query", self.conditional_query, query_only=True
+            ):
+                logger.warning(
+                    "FHIR destination %s carries a credential in its conditional_query (%s). It is "
+                    "sent in the request URL or the If-None-Exist header, so the server's and any "
+                    "proxy's log will hold it; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
+                    config.name,
+                    found,
+                )
         # BACKLOG #5911: the If-None-Exist value is this connection's setting, bounded above, so _post
         # leaves it out of the message-derived set. Belt and braces: the check above already keeps an
         # over-length value from reaching the send-time gate.

@@ -1394,10 +1394,16 @@ def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> li
     the refusals. A name the ``&``-split query does not reach is counted too, unnamed: a ``;``-split
     segment (``;jsessionid=``), a fragment or a second ``?``, by
     :func:`~messagefoundry.secretscrub.has_credential_like_segment` (BACKLOG #5353). That reader
-    knows no ``code`` parameter, so a ``;code=`` segment is not counted."""
+    knows no ``code`` parameter, so a ``;code=`` segment is not counted. Nor is ``code`` in a
+    bare query: there it is FHIR's own search parameter (``Observation?code=...``), not the
+    function key the refusals count it as in a ``url``."""
     if not isinstance(value, str) or not value:
         return []
-    names = credential_query_params(f"?{value}" if query_only else value, refusal=True)
+    names = (
+        credential_query_params(f"?{value}")
+        if query_only
+        else credential_query_params(value, refusal=True)
+    )
     if names:
         noun = "parameter" if query_only else "query parameter"
         return [f"{setting} {noun} {', '.join(names)}"]
