@@ -207,15 +207,17 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         ]
     # A command-only source runs in the shell it names; with none, pwsh on Windows and bash
     # elsewhere. Environment expansion belongs to that shell; structured args above need no shell
-    # parsing.
+    # parsing. With no bash found, it runs where main ran it: pwsh on Windows, sh elsewhere.
     shell = hook.get("shell")
     if shell is None:
         shell = "powershell" if os.name == "nt" else "bash"
     if shell == "bash":
-        bash = git_bash() if os.name == "nt" else "bash"
-        if not bash:
-            raise FileNotFoundError("Git Bash not found; a shell: bash hook cannot run")
-        return [bash, "-c", command]
+        bash = git_bash() if os.name == "nt" else shutil.which("bash")
+        if bash:
+            return [bash, "-c", command]
+        if os.name != "nt":
+            return ["sh", "-c", command]
+        shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
         return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -271,7 +273,7 @@ def group_selected(group: dict, discriminator: set[str] | None) -> bool:
 
 
 def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> int:
-    """Decide one Codex hook event: 0 to proceed, 2 to block, or 1 for a reported SessionEnd failure.
+    """Decide one Codex hook event: 0 to proceed, 2 to block, or 1 for a failure main exited on.
 
     With no stdin given, the payload is read from this process's stdin as UTF-8 bytes; the text
     stream would decode it with the console code page. `event` is the event Codex registered.
@@ -301,9 +303,11 @@ def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> i
         merge_output(result, {"systemMessage": message})
     if result:
         print(json.dumps(result))
-    # Codex reads no SessionEnd output, so a reported failure there exits non-zero, as on main.
+    # On these events a reported failure exits non-zero, as on main: Codex reads no SessionEnd
+    # output, and a PermissionRequest failure must not read as a clean pass.
     reported = str(result.get("systemMessage", "")).splitlines()
-    if event.lower() == "sessionend" and any(m.endswith("(not blocking)") for m in reported):
+    failing_events = ("sessionend", "permissionrequest")
+    if event.lower() in failing_events and any(m.endswith("(not blocking)") for m in reported):
         return 1
     return 0
 
@@ -355,9 +359,9 @@ def run_one_hook(root: Path, payload: dict, env: dict[str, str], hook: dict, res
     except json.JSONDecodeError:
         update = unparsed
     if not isinstance(update, dict):
+        if update is not unparsed:  # JSON that is not an object is a hook defect, as on main.
+            raise ValueError("Hook JSON output must be an object")
         if event not in PLAIN_CONTEXT_EVENTS:
-            if update is not unparsed:  # JSON that is not an object is a hook defect, as on main.
-                raise ValueError("Hook JSON output must be an object")
             print(output, file=sys.stderr)
             return
         output = output.replace(

@@ -272,11 +272,23 @@ def test_a_matcher_on_an_event_without_one_is_ignored(bridge, tmp_path):
     assert result["hookSpecificOutput"]["additionalContext"] == "remember the brief"
 
 
-@pytest.mark.parametrize("stdout", ["remember the brief", "3", "true", '["a list"]'])
-def test_plain_or_non_object_prompt_hook_output_becomes_context(bridge, tmp_path, stdout):
-    settings(tmp_path, [handler(stdout)], event="UserPromptSubmit", matcher="")
+def test_plain_prompt_hook_output_becomes_context(bridge, tmp_path):
+    settings(tmp_path, [handler("remember the brief")], event="UserPromptSubmit", matcher="")
     result = bridge.dispatch(tmp_path, {"session_id": "x", "hook_event_name": "UserPromptSubmit"})
-    assert result["hookSpecificOutput"]["additionalContext"] == stdout
+    assert result["hookSpecificOutput"]["additionalContext"] == "remember the brief"
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "UserPromptSubmit"])
+@pytest.mark.parametrize("stdout", ["3", "true", '["a list"]', "null"])
+def test_non_object_json_on_a_context_event_is_a_reported_hook_defect(
+    bridge, tmp_path, event, stdout
+):
+    """As on main, where these events raised too: non-object JSON is not context."""
+    settings(tmp_path, [handler(stdout)], event=event, matcher="")
+    payload = {"session_id": "x", "hook_event_name": event, "source": "startup"}
+    result = bridge.dispatch(tmp_path, payload)
+    assert "Hook JSON output must be an object" in result["systemMessage"], result
+    assert stdout not in result.get("hookSpecificOutput", {}).get("additionalContext", "")
 
 
 @pytest.mark.parametrize("stdout", ["3", "[1]", '"s"', "true", "null"])
@@ -298,10 +310,27 @@ def test_a_command_only_hook_defaults_to_pwsh_on_windows_else_bash(bridge, tmp_p
         assert bridge.hook_argv(tmp_path, hook)[0] == "pwsh"
         assert Path(bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})[0]).stem == "bash"
         monkeypatch.setattr(bridge, "git_bash", lambda: None)
-        with pytest.raises(FileNotFoundError):
-            bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})
+        assert bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})[0] == "pwsh"
     else:
         assert Path(bridge.hook_argv(tmp_path, hook)[0]).stem == "bash"
+
+
+@pytest.mark.parametrize("shell", ["bash", None])
+def test_a_bash_hook_with_no_bash_runs_where_main_ran_it(bridge, tmp_path, monkeypatch, shell):
+    """With no bash found, main's shell runs it (pwsh on Windows, sh elsewhere), so a deny lands."""
+    real_which = shutil.which
+    monkeypatch.setattr(bridge, "git_bash", lambda: None)
+    monkeypatch.setattr(
+        bridge.shutil, "which", lambda name, *a, **k: None if name == "bash" else real_which(name)
+    )
+    if shutil.which("pwsh" if os.name == "nt" else "sh") is None:
+        pytest.skip("needs main's shell")
+    hook = {"type": "command", "command": "echo '" + json.dumps(DENIAL) + "'"}
+    if shell:
+        hook["shell"] = shell
+    settings(tmp_path, [hook])
+    result = bridge.dispatch(tmp_path, BASH_CALL)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
 
 
 @pytest.mark.skipif(
@@ -905,6 +934,31 @@ def test_a_session_end_failure_exits_non_zero(bridge, tmp_path, monkeypatch, hoo
     (tmp_path / ".claude/settings.json").write_text(text)
     payload = json.dumps({"session_id": "x", "hook_event_name": "SessionEnd", "reason": "exit"})
     argv = ["hook", "--event", "SessionEnd"]
+    assert _main(bridge, monkeypatch, tmp_path, argv, payload.encode()) == expected
+
+
+@pytest.mark.parametrize(
+    ("hooks", "expected"),
+    [
+        ([exits(1)], 1),
+        ([python("import time; time.sleep(5)", timeout=1)], 1),
+        (None, 1),
+        ([handler("{}")], 0),
+    ],
+    ids=["failing-hook", "timeout", "fault", "clean"],
+)
+def test_a_permission_request_failure_exits_non_zero(
+    bridge, tmp_path, monkeypatch, hooks, expected
+):
+    """As on main: a PermissionRequest failure must not read as a clean pass."""
+    (tmp_path / ".claude").mkdir()
+    group = [{"matcher": "Bash", "hooks": hooks}]
+    text = "{not json" if hooks is None else json.dumps({"hooks": {"PermissionRequest": group}})
+    (tmp_path / ".claude/settings.json").write_text(text)
+    payload = json.dumps(
+        {"session_id": "x", "hook_event_name": "PermissionRequest", "tool_name": "Bash"}
+    )
+    argv = ["hook", "--event", "PermissionRequest"]
     assert _main(bridge, monkeypatch, tmp_path, argv, payload.encode()) == expected
 
 
