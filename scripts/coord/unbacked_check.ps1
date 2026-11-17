@@ -77,6 +77,11 @@
     check that cannot tell must not print the word that means it can. Use -SkipReachability to
     suppress the probe; the output then says reachability was not checked.
 
+    The same holds for ONE dead remote among live ones, and for tracking refs left behind by a remote
+    no longer configured. The repository is then not UNVERIFIABLE, so only the remotes that answered
+    may exclude a commit; a branch held by the dead remote alone is counted as unbacked, and the
+    remotes that did not answer are named (BACKLOG #5502).
+
     A RELATED PRACTICE, because this check is how the need surfaces. Prose that CITES a commit which
     will deliberately never land -- a trial branch, a refuted experiment, a rejected approach -- makes
     a merged file depend on a sha this check would otherwise be the only thing protecting. Measured
@@ -107,8 +112,12 @@
 
     WHAT THIS DOES NOT MEASURE. Whether an uncommitted change is worth keeping, and whether a
     remote-tracking ref is up to date with what the server has now (run `git fetch --prune` first if
-    that matters). Reachability from ANY remote-tracking ref counts as backed, including a rescue
-    tag -- durable is not the same as landed, and this measures durability only.
+    that matters). Reachability from a TRUSTED remote's tracking refs counts as backed, including a
+    rescue tag fetched there -- durable is not the same as landed, and this measures durability only.
+    A remote is trusted when it answered the probe with at least one ref, branch or tag; with
+    -SkipReachability, or when none answered
+    (UNVERIFIABLE), every remote-tracking ref still excludes; in the UNVERIFIABLE case no patch-id
+    match is read from them, so a squash-landed branch counts in that floor.
 
 .PARAMETER Path
     One or more repository roots. Defaults to the repository containing this script.
@@ -130,9 +139,15 @@
     pwsh -NoProfile -File scripts\coord\unbacked_check.ps1 -Path C:\a\repo,C:\another\repo -Json
 
 .OUTPUTS
-    Exit code 0 when every ref is backed by at least one remote-tracking ref; 1 when any is not.
-    Exit code 2 means the check could not run and therefore reports nothing -- never success.
+    Exit code 0 when every ref is backed by at least one trusted remote-tracking ref; 1 when any is not.
+    Exit code 2 means the check could not run, or could not run completely -- never success. That
+    includes a git listing or rev-list that failed partway (reported as UNVERIFIABLE). Such a run
+    still lists the unbacked items it did measure, in text and in the JSON, except that whenever a
+    trusted remote's tracking-ref listing or the object check on those refs failed, in any mode,
+    the text prints "a git listing failed for <labels>; per-branch counts are not shown" instead of
+    the per-branch list. The JSON lists the items either way.
 #>
+#Requires -Version 7
 [CmdletBinding()]
 param(
     [string[]]$Path,
@@ -143,9 +158,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Invoke-Git starts this exact file. Resolved once through PowerShell command discovery, which never
+# runs a binary from the current directory; a bare 'git' handed to ProcessStartInfo would let Windows
+# search pwsh's own folder and the current directory before PATH.
+$gitExe = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0].Source
+# Could-not-run messages go to stderr directly: Write-Error under Stop would end the script with
+# exit 1, "unbacked found", before the exit 2 that means "could not run" (see .OUTPUTS).
+if (-not $gitExe) { [Console]::Error.WriteLine("git is not on PATH."); exit 2 }
+
 if (-not $Path -or $Path.Count -eq 0) {
     $root = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null)
-    if (-not $root) { Write-Error "Not inside a git repository, and no -Path given."; exit 2 }
+    if (-not $root) { [Console]::Error.WriteLine("Not inside a git repository, and no -Path given."); exit 2 }
     $Path = @($root)
 }
 
@@ -177,19 +200,83 @@ $Path = @($Path | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().
 #
 # The classification only ever moves a commit from AT-RISK to DURABLE. A commit that fails both arms
 # is reported exactly as before, so this cannot mask the case the script exists for.
+#
+# At least these git calls go through here: the remote and ref listings, symbolic-ref, cat-file,
+# merge-base, cherry, and every rev-list that asks "what is unbacked". Others still use `& git`. It
+# starts git directly rather than through a PowerShell pipeline, for three measured reasons:
+#   - stdin is written as ONE pre-joined string. Piping a few thousand lines object by object cost
+#     710 ms a call on a synthetic 3000-ref repository, against 222 ms for the old `--not --remotes`
+#     glob and 45 ms for this.
+#   - output is decoded as UTF-8. PowerShell decodes native output with the console code page, so a
+#     non-ASCII branch name came back garbled and every rev-list fed that name failed.
+#   - the exit code travels with the output. Ok is false when git failed, and a caller must never
+#     read a failed run's empty output as "nothing unbacked" (BACKLOG #5502).
+function Invoke-Git {
+    param([string]$Repo, [string[]]$GitArgs, [string]$StdinText)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
+    $psi.ArgumentList.Add('-C')
+    $psi.ArgumentList.Add($Repo)
+    foreach ($a in $GitArgs) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $null = $proc.StandardError.ReadToEndAsync()
+    # git can exit before reading its stdin -- a repository or worktree removed mid-run -- and the
+    # write then fails on a closed pipe. That is this call failing, never the whole run crashing.
+    $writeFailed = $false
+    try {
+        if ($StdinText) { $proc.StandardInput.Write($StdinText) }
+        $proc.StandardInput.Close()
+    } catch [System.IO.IOException] {
+        $writeFailed = $true
+    }
+    $proc.WaitForExit()
+    $lines = @($outTask.Result -split "`r?`n" | Where-Object { $_ })
+    return [pscustomobject]@{ Ok = ((-not $writeFailed) -and $proc.ExitCode -eq 0); Lines = $lines }
+}
+
+# The trusted exclusion set arrives as '^<object id>' lines on stdin ($ExcludeText, joined once per
+# repository): object ids rather than refnames, so a ref pruned by a concurrent fetch, or one whose
+# name does not survive a round trip, cannot make rev-list die mid-run.
+function Invoke-RevList {
+    param([string]$Repo, [string[]]$RevArgs, [string[]]$NotArgs, [string]$ExcludeText)
+    return Invoke-Git -Repo $Repo -GitArgs (@('rev-list', '--stdin') + @($RevArgs) + @($NotArgs)) -StdinText $ExcludeText
+}
+
+# A remote's own tracking refs, as Name and Oid: full refnames under refs/remotes/<name>/, with
+# symrefs dropped (a symref's target, if it is trusted, is listed in its own right; a symref pointing
+# outside would smuggle that ref in) and a nested remote's namespace (<name>/<other>) left to that
+# remote. Ok is false when the listing failed, which the caller reports rather than reading as "no
+# refs".
+function Get-RemoteOwnRefs {
+    param([string]$Repo, [string]$Remote, [string[]]$AllRemotes)
+    $nested = @($AllRemotes | Where-Object { $_.StartsWith("$Remote/", [StringComparison]::Ordinal) })
+    $res = Invoke-Git -Repo $Repo -GitArgs @('for-each-ref', '--format=%(objectname) %(refname) %(symref)', "refs/remotes/$Remote")
+    $own = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in $res.Lines) {
+        $oid, $name, $sym = $line -split ' ', 3
+        if ($sym) { continue }
+        if (-not $name.StartsWith("refs/remotes/$Remote/", [StringComparison]::Ordinal)) { continue }
+        if ($nested | Where-Object { $name.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) }) { continue }
+        $own.Add([pscustomobject]@{ Name = $name; Oid = $oid })
+    }
+    return [pscustomobject]@{ Ok = $res.Ok; Refs = $own }
+}
+
+# $Landed maps each commit the caller's `git cherry` runs marked '-' to the upstream that marked it.
+# $NotArgs and $ExcludeText are the caller's exclusion set, so a parent counts as backed only by a
+# remote this run trusts (see $excludeText and $upstreamCandidates below, BACKLOG #5502).
 function Test-CommitContentDurable {
-    param([string]$Repo, [string]$Commit)
+    param([string]$Repo, [string]$Commit, [hashtable]$Landed, [string[]]$NotArgs, [string]$ExcludeText)
 
     # Arm 1: patch-id already upstream. `git cherry` marks '-' when an equivalent patch exists on the
     # upstream ref, which is precisely the squash/rebase-landed case a sha comparison cannot see.
-    foreach ($up in @('origin/main', 'origin/master')) {
-        if ((& git -C $Repo rev-parse --verify --quiet "$up") ) {
-            $mark = (& git -C $Repo cherry $up $Commit 2>$null | Select-Object -First 1)
-            if ($mark -and $mark.StartsWith('-')) {
-                return [pscustomobject]@{ Durable = $true; Why = "patch already on $up (squash/rebase-landed)" }
-            }
-            break
-        }
+    if ($Landed.ContainsKey($Commit)) {
+        return [pscustomobject]@{ Durable = $true; Why = "patch already on $($Landed[$Commit] -replace '^refs/remotes/', '') (squash/rebase-landed)" }
     }
 
     # Arm 2: a re-derivable merge over backed parents.
@@ -199,9 +286,9 @@ function Test-CommitContentDurable {
     if ($parents.Count -lt 2) { return [pscustomobject]@{ Durable = $false; Why = $null } }
 
     foreach ($par in $parents) {
-        $n = (& git -C $Repo rev-list --count $par --not --remotes 2>$null)
-        if (-not $n -or [int]$n -gt 0) {
-            return [pscustomobject]@{ Durable = $false; Why = $null }   # a parent is itself unbacked
+        $res = Invoke-RevList -Repo $Repo -RevArgs @('--count', $par) -NotArgs $NotArgs -ExcludeText $ExcludeText
+        if (-not $res.Ok -or -not $res.Lines -or [int]$res.Lines[0] -gt 0) {
+            return [pscustomobject]@{ Durable = $false; Why = $null }   # a parent is unbacked, or unknown
         }
     }
     $actual = (& git -C $Repo rev-parse "$Commit^{tree}" 2>$null)
@@ -224,30 +311,130 @@ $durableFindings = @()
 
 foreach ($p in $Path) {
     if (-not (Test-Path -LiteralPath $p)) {
-        Write-Error "Path does not exist: $p"
+        [Console]::Error.WriteLine("Path does not exist: $p")
         exit 2
     }
+    # ABSOLUTE, ONCE, BEFORE ANY GIT CALL. `& git -C .` resolves against PowerShell's location, and
+    # Invoke-Git's process resolves against the process directory, which a Set-Location does not
+    # move; with a relative path the two halves of a run would read different repositories.
+    $p = (Resolve-Path -LiteralPath $p).ProviderPath
     $inside = (& git -C $p rev-parse --is-inside-work-tree 2>$null)
     if ($inside -ne "true") {
-        Write-Error "Not a git repository: $p"
+        [Console]::Error.WriteLine("Not a git repository: $p")
         exit 2
     }
 
-    $remotes = @(& git -C $p remote 2>$null)
+    # Read through Invoke-Git, UTF-8, so remote names compare equal to the refnames listed the same way.
+    $remotes = @((Invoke-Git -Repo $p -GitArgs @('remote')).Lines)
 
     # Probe each remote ONCE. `ls-remote --exit-code` contacts the server and changes nothing locally,
     # which is what makes it safe to run from an audit. This is the axis that distinguishes "backed
     # up" from "excluded by a local copy of a store that no longer answers".
     $reachable = @()
     $unreachable = @()
+    $emptyRemotes = @()
     if (-not $SkipReachability) {
         foreach ($rem in $remotes) {
-            & git -C $p ls-remote --exit-code --quiet $rem HEAD 2>$null | Out-Null
+            # A remote answers when it advertises a branch or tag. Branches first, then tags, so a large
+            # remote's pull refs are never listed: a bare repository whose HEAD names a branch nobody
+            # pushed still holds branches, and a durability store may hold only rescue tags. Exit 2
+            # from both means it answered with no refs -- an empty or recreated store, which backs
+            # nothing, so it is untrusted and reported apart from one that did not answer.
+            & git -C $p ls-remote --exit-code --quiet --heads $rem 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 2) { & git -C $p ls-remote --exit-code --quiet --tags $rem 2>$null | Out-Null }
             if ($LASTEXITCODE -eq 0) { $reachable += $rem } else { $unreachable += $rem }
+            if ($LASTEXITCODE -eq 2) { $emptyRemotes += $rem }
         }
     }
 
-    $refs = @(& git -C $p for-each-ref --format='%(refname)' refs/heads 2>$null)
+    # TRUST ONLY WHAT ANSWERED (BACKLOG #5502). A bare `--not --remotes` lets every tracking ref
+    # exclude commits -- a remote that did not answer, or a namespace left by a remote no longer
+    # configured -- so with one live remote the repository is not UNVERIFIABLE and a branch held only
+    # by a dead store read as backed. So once any remote answered, only the answering remotes' OWN
+    # tracking refs exclude, passed as explicit object ids (Get-RemoteOwnRefs, Invoke-RevList): no
+    # glob, so neither a symref pointing outside the namespace nor a nested remote's namespace rides
+    # along. The bare form stays when reachability was skipped (documented as weaker) or when none
+    # answered: that repository is reported UNVERIFIABLE, whose count is stated as a floor. With no
+    # remote configured nothing excludes, orphan tracking refs included. Names are compared
+    # case-sensitively, as git compares them.
+    #
+    # Every place a listing or a rev-list failed. A failed scan prints nothing, and nothing must not
+    # read as zero: one such failure makes the repository UNVERIFIABLE and the run exit 2.
+    $scanFailed = @()
+    # Each remote's own refs are listed once and reused for the exclusion set and the candidates.
+    $ownRefs = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($r in $remotes) {
+        if (-not $SkipReachability -and $reachable -cnotcontains $r) { continue }
+        $listing = Get-RemoteOwnRefs -Repo $p -Remote $r -AllRemotes $remotes
+        if (-not $listing.Ok) { $scanFailed += "(tracking refs of $r)" }
+        $ownRefs[$r] = $listing.Refs
+    }
+    $notArgs = @('--not', '--remotes')
+    $excludeText = ''
+    if ($remotes.Count -eq 0) {
+        $notArgs = @()
+    } elseif ($reachable.Count -gt 0) {
+        $notArgs = @()
+        $oids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($r in $reachable) { foreach ($x in $ownRefs[$r]) { [void]$oids.Add($x.Oid) } }
+        # A tracking ref naming a missing object backs nothing, and handing its id to rev-list would
+        # kill every scan. One cat-file call drops such ids; a missing BRANCH tip or a hole in history
+        # still fails its own rev-list and reads UNVERIFIABLE.
+        if ($oids.Count -gt 0) {
+            $check = Invoke-Git -Repo $p -GitArgs @('cat-file', '--batch-check=%(objectname) %(objecttype)') -StdinText ((@($oids) -join "`n") + "`n")
+            if (-not $check.Ok) { $scanFailed += '(tracking ref object check)' }
+            $present = @($check.Lines | Where-Object { $_ -notmatch ' missing$' } | ForEach-Object { ($_ -split ' ', 2)[0] })
+            $excludeText = (($present | ForEach-Object { "^$_" }) -join "`n") + "`n"
+        }
+    }
+    # Tracking refs under no configured remote: no longer trusted once any remote answered, and
+    # counted so the output can say they were ignored.
+    $orphanRefs = 0
+    if ($reachable.Count -gt 0) {
+        $listing = Invoke-Git -Repo $p -GitArgs @('for-each-ref', '--format=%(refname)', 'refs/remotes')
+        if (-not $listing.Ok) { $scanFailed += '(tracking ref listing)' }
+        $orphanRefs = @($listing.Lines | Where-Object {
+            $rn = $_
+            -not ($remotes | Where-Object { $rn.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) })
+        }).Count
+    }
+    # The patch-id arm reads the default branches of the TRUSTED remotes: for each, every one of its
+    # refs/remotes/<r>/HEAD target, main and master that is one of that remote's own refs. Membership
+    # in Get-RemoteOwnRefs is the existence test, so a dangling HEAD falls back, a HEAD target outside
+    # the namespace or in a nested remote's is refused, and a local branch or tag NAMED like a
+    # tracking ref never stands in (rev-parse would resolve one). Without -SkipReachability a trusted
+    # remote is one that answered, so with none answering (UNVERIFIABLE) the arm is off. Origin is
+    # listed first only so it names the upstream in the reclassification line; the ref loop reads
+    # every candidate. Each candidate carries its object id, which is what git is handed.
+    $trustedNames = if ($SkipReachability) { $remotes } else { $reachable }
+    $ordered = @($trustedNames | Where-Object { $_ -ceq 'origin' }) + @($trustedNames | Where-Object { $_ -cne 'origin' })
+    $upstreamCandidates = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $ordered) {
+        $own = $ownRefs[$r]
+        $head = (Invoke-Git -Repo $p -GitArgs @('symbolic-ref', '--quiet', "refs/remotes/$r/HEAD")).Lines | Select-Object -First 1
+        foreach ($n in @($head, "refs/remotes/$r/main", "refs/remotes/$r/master")) {
+            if (-not $n -or ($upstreamCandidates | Where-Object { $_.Name -ceq $n })) { continue }
+            $hit = $own | Where-Object { $_.Name -ceq $n } | Select-Object -First 1
+            if ($hit) { $upstreamCandidates.Add($hit) }
+        }
+    }
+    # RELATED HISTORY, DECIDED ONCE PER CANDIDATE: against a main that shares no history with this
+    # repository -- another project fetched as a durability remote -- `git cherry` compares the whole
+    # of both, and a diff that happens to be identical there would mark an unbacked commit landed. A
+    # candidate `git merge-base` cannot join to the checkout's HEAD is dropped for the whole run; one
+    # call per candidate, not one per ref.
+    $upstreamCandidates = @($upstreamCandidates | Where-Object {
+        (Invoke-Git -Repo $p -GitArgs @('merge-base', $_.Oid, 'HEAD')).Ok
+    })
+
+    # Branches as a snapshot of object ids: a branch deleted by another session after this listing is
+    # still scanned from its id rather than failing, and a non-ASCII name is only ever displayed.
+    $heads = Invoke-Git -Repo $p -GitArgs @('for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads')
+    if (-not $heads.Ok) { $scanFailed += '(branch listing)' }
+    $refs = @($heads.Lines | ForEach-Object {
+        $oid, $name = $_ -split ' ', 2
+        [pscustomobject]@{ Oid = $oid; Name = $name }
+    })
     $findings = @()
 
     # DETACHED WORKTREE HEADS. A worktree checked out on a branch is already covered by the ref scan
@@ -277,7 +464,13 @@ foreach ($p in $Path) {
         # symbolic-ref fails on a detached HEAD; that failure IS the test.
         & git -C $native symbolic-ref --quiet HEAD 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) { continue }
-        $dn = (& git -C $native rev-list --count HEAD --not --remotes 2>$null)
+        $res = Invoke-RevList -Repo $native -RevArgs @('--count', 'HEAD') -NotArgs $notArgs -ExcludeText $excludeText
+        if (-not $res.Ok) {
+            # A worktree removed by another session mid-run holds nothing at risk here; skip it.
+            if (Test-Path -LiteralPath $native) { $scanFailed += "(detached) $native" }
+            continue
+        }
+        $dn = $res.Lines | Select-Object -First 1
         if ($dn -and [int]$dn -gt 0) {
             $detached += [pscustomobject]@{
                 Worktree = $native
@@ -288,27 +481,45 @@ foreach ($p in $Path) {
     }
 
     foreach ($ref in $refs) {
-        # --not --remotes excludes everything reachable from any remote-tracking ref. With no remotes
-        # configured it excludes nothing, so the count is the branch's entire history -- correct, and
-        # the reason the NO-REMOTE case is reported separately below rather than silently inflating a
-        # total that would then read as ordinary unpushed work.
-        $n = (& git -C $p rev-list --count $ref --not --remotes 2>$null)
-        if ($n -and [int]$n -gt 0) {
+        # The exclusion set excludes everything reachable from a trusted remote-tracking ref. With no
+        # remotes configured it excludes nothing, so the count is the branch's entire history --
+        # correct, and the reason the NO-REMOTE case is reported separately below rather than silently
+        # inflating a total that would then read as ordinary unpushed work.
+        $refName = $ref.Name -replace '^refs/heads/', ''
+        $res = Invoke-RevList -Repo $p -RevArgs @($ref.Oid) -NotArgs $notArgs -ExcludeText $excludeText
+        if (-not $res.Ok) { $scanFailed += $refName; continue }
+        $unbacked = $res.Lines
+        $n = $unbacked.Count
+        if ($n -gt 0) {
             # CLASSIFY BEFORE ALARMING (BACKLOG #1299). Only when EVERY unbacked commit on this ref is
             # content-durable does the ref stop being a finding -- one commit that fails both arms
             # keeps the whole ref in the at-risk report, because the point is not to lose that one.
-            $unbacked = @(& git -C $p rev-list $ref --not --remotes 2>$null)
+            # ONE `git cherry` PER REF, read line by line (BACKLOG #5493). It lists every commit in
+            # upstream..ref, so a per-commit call whose FIRST line was taken as that commit's verdict
+            # read the OLDEST commit's mark, and one landed commit at the base of a branch cleared
+            # every unpushed commit on top of it.
+            # SHARED HISTORY FIRST: against a main the ref shares no history with -- another project
+            # fetched as a durability remote -- cherry compares the whole of both, and a diff that
+            # happens to be identical there would mark an unbacked commit landed, so the candidate
+            # list holds only related histories (decided once, above). EVERY candidate is read: a
+            # squash that landed on a second answering remote is as durable as one on origin.
+            $landed = @{}
+            foreach ($u in $upstreamCandidates) {
+                foreach ($cl in (Invoke-Git -Repo $p -GitArgs @('cherry', $u.Oid, $ref.Oid)).Lines) {
+                    if ($cl -match '^- ([0-9a-f]+)$' -and -not $landed.ContainsKey($Matches[1])) { $landed[$Matches[1]] = $u.Name }
+                }
+            }
             $why = $null
-            $allDurable = $unbacked.Count -gt 0
+            $allDurable = $true
             foreach ($c in $unbacked) {
-                $v = Test-CommitContentDurable -Repo $p -Commit $c
+                $v = Test-CommitContentDurable -Repo $p -Commit $c -Landed $landed -NotArgs $notArgs -ExcludeText $excludeText
                 if (-not $v.Durable) { $allDurable = $false; break }
                 if (-not $why) { $why = $v.Why }
             }
             if ($allDurable) {
                 $durableFindings += [pscustomobject]@{
                     Repo    = $p
-                    Ref     = ($ref -replace '^refs/heads/', '')
+                    Ref     = $refName
                     Commits = [int]$n
                     Why     = $why
                 }
@@ -316,7 +527,7 @@ foreach ($p in $Path) {
                 continue
             }
             $findings += [pscustomobject]@{
-                Ref     = ($ref -replace '^refs/heads/', '')
+                Ref     = $refName
                 Commits = [int]$n
             }
         }
@@ -331,11 +542,15 @@ foreach ($p in $Path) {
         RemotesConfigured   = $remotes.Count
         RemotesReachable    = $reachable.Count
         RemotesUnreachable  = $unreachable
+        RemotesEmpty        = $emptyRemotes
+        OrphanTrackingRefs  = $orphanRefs
         ReachabilityChecked = (-not $SkipReachability)
         # UNVERIFIABLE: remotes exist, none answered. Every "backed" verdict in this repo then rests
         # on local copies of a store that is not there, so the commit count below understates by an
-        # unknown amount and must not be read as clean.
-        Unverifiable        = (($remotes.Count -gt 0) -and (-not $SkipReachability) -and ($reachable.Count -eq 0))
+        # unknown amount and must not be read as clean. A failed rev-list is the same verdict for a
+        # different reason: the scan itself could not run, so its silence is not a zero.
+        ScanFailed          = $scanFailed
+        Unverifiable        = ((($remotes.Count -gt 0) -and (-not $SkipReachability) -and ($reachable.Count -eq 0)) -or ($scanFailed.Count -gt 0))
         RefsScanned         = $refs.Count
         WorktreesScanned    = $wtHeads.Count
         Unbacked            = $findings.Count
@@ -368,13 +583,41 @@ if ($Json) {
     } | ConvertTo-Json -Depth 6
     # Unverifiable and detached must both fail too. A consumer keying only on CommitsUnbacked would
     # read a dead remote as clean; one keying only on BranchesUnbacked would miss every detached
-    # checkout, which is how 30 commits went unreported.
+    # checkout, which is how 30 commits went unreported. A failed scan exits 2, "could not run", so a
+    # consumer can tell a broken measurement from work that needs a rescue push.
+    if (@($repos | Where-Object { $_.ScanFailed.Count -gt 0 }).Count -gt 0) { exit 2 }
     exit ([int](($totalUnbacked -gt 0) -or ($unverifiableCount -gt 0) -or ($totalDetached -gt 0)))
 }
 
 $unverifiableRepos = @($repos | Where-Object { $_.Unverifiable })
+$scanFailedRepos = @($repos | Where-Object { $_.ScanFailed.Count -gt 0 })
 
 foreach ($r in $repos) {
+    if ($r.ScanFailed.Count -gt 0) {
+        Write-Host "UNVERIFIABLE  $($r.Repo)" -ForegroundColor Red
+        Write-Host "              git FAILED for: $($r.ScanFailed -join ', ')" -ForegroundColor Red
+        Write-Host "              A failed scan prints nothing, and nothing is not zero: this repository" -ForegroundColor Red
+        Write-Host "              could not be fully measured. Run git fsck there; a missing object is the usual cause." -ForegroundColor Red
+        # What DID scan is still shown: a failure on one ref must not hide the at-risk work found
+        # on the others. The JSON carries the same items under Findings and DetachedUnbacked. When
+        # a trusted-refs listing or the object check failed, in any mode, the per-branch list is
+        # withheld.
+        $listingFailed = @($r.ScanFailed | Where-Object { $_ -like '(tracking refs of *' -or $_ -eq '(tracking ref object check)' })
+        if ($listingFailed.Count -gt 0) {
+            Write-Host "              a git listing failed for $($listingFailed -join ', '); per-branch counts are not shown" -ForegroundColor Red
+        } elseif ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0) {
+            Write-Host "              measured before or beside the failure, on no remote:" -ForegroundColor Yellow
+            if (-not $Quiet) {
+                foreach ($f in ($r.Findings | Sort-Object Commits -Descending)) {
+                    Write-Host ("              {0,-55} {1}" -f $f.Ref, $f.Commits)
+                }
+                foreach ($f in ($r.DetachedUnbacked | Sort-Object Commits -Descending)) {
+                    Write-Host ("              {0,-55} {1}" -f "(detached) $($f.Worktree) @ $($f.Head)", $f.Commits) -ForegroundColor Yellow
+                }
+            }
+        }
+        continue
+    }
     if (-not $r.HasRemote) {
         Write-Host "NO-REMOTE     $($r.Repo)" -ForegroundColor Red
         Write-Host "              $($r.Commits) commits across $($r.RefsScanned) refs exist on this disk only." -ForegroundColor Red
@@ -385,6 +628,9 @@ foreach ($r in $repos) {
     if ($r.Unverifiable) {
         Write-Host "UNVERIFIABLE  $($r.Repo)" -ForegroundColor Red
         Write-Host "              $($r.RemotesConfigured) remote(s) configured, NONE reachable: $($r.RemotesUnreachable -join ', ')" -ForegroundColor Red
+        if ($r.RemotesEmpty.Count -gt 0) {
+            Write-Host "              of those, answered with no refs (an empty store): $($r.RemotesEmpty -join ', ')" -ForegroundColor Red
+        }
         Write-Host "              This check reports $($r.Commits) unbacked across $($r.RefsScanned) refs, and that number" -ForegroundColor Red
         Write-Host "              is a FLOOR, not an answer. Everything it counted as backed was excluded by" -ForegroundColor Red
         Write-Host "              refs/remotes/* -- local copies of a store that did not answer. Restore the" -ForegroundColor Red
@@ -416,10 +662,26 @@ if ($SkipReachability) {
 } else {
     $reach = ($repos | Measure-Object -Property RemotesReachable -Sum).Sum
     $conf = ($repos | Measure-Object -Property RemotesConfigured -Sum).Sum
-    Write-Host "           $reach of $conf configured remote(s) answered"
+    Write-Host "           $reach of $conf configured remote(s) answered$(if ($repos | Where-Object { $_.RemotesEmpty.Count -gt 0 }) { ' (a remote that answered with no refs is not counted)' })"
+    # Named, because a branch held only by one of these reads as "exist on no remote" above, and
+    # the remedy for that is restoring the remote, not a rescue push.
+    foreach ($r in ($repos | Where-Object { $_.RemotesReachable -gt 0 -and $_.RemotesUnreachable.Count -gt 0 })) {
+        $silent = @($r.RemotesUnreachable | Where-Object { $r.RemotesEmpty -cnotcontains $_ })
+        if ($silent.Count -gt 0) {
+            Write-Host "           not trusted, did not answer: $($silent -join ', ') in $($r.Repo) -- a branch held only there counts as unbacked; restore or re-point it" -ForegroundColor Yellow
+        }
+        if ($r.RemotesEmpty.Count -gt 0) {
+            Write-Host "           not trusted, answered with no refs: $($r.RemotesEmpty -join ', ') in $($r.Repo) -- an empty store backs nothing" -ForegroundColor Yellow
+        }
+    }
+    foreach ($r in ($repos | Where-Object { $_.OrphanTrackingRefs -gt 0 })) {
+        Write-Host "           not trusted, no configured remote: $($r.OrphanTrackingRefs) tracking ref(s) in $($r.Repo) -- a branch held only there counts as unbacked" -ForegroundColor Yellow
+    }
 }
 if ($unverifiableRepos.Count -gt 0) {
     Write-Host "result   : UNVERIFIABLE in $($unverifiableRepos.Count) repositor$(if ($unverifiableRepos.Count -eq 1) { 'y' } else { 'ies' }) -- see above. Not reporting clean." -ForegroundColor Red
+    # Exit 2 when a scan could not run (see .OUTPUTS); 1 when it ran against remotes that did not answer.
+    if ($scanFailedRepos.Count -gt 0) { exit 2 }
     exit 1
 }
 # Printed BEFORE the result line, and on every run, so "0 unbacked commits" can never be read alone.
