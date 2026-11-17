@@ -1212,8 +1212,7 @@ def test_census_resolves_env_credentials_before_judging() -> None:  # vault BACK
 
 def test_census_with_no_values_leaves_an_env_credential_unjudged() -> None:  # vault BACKLOG #5359
     """With no values, as ``messagefoundry check`` passes, an ``env()`` credential is not judged by
-    its ``default=``: the instance may override it, and check must never list fewer hops than
-    serve. So the hop stays listed."""
+    its ``default=``: the instance may override it. So the hop stays listed."""
     from messagefoundry.config.static_credentials import static_credential_hops
     from messagefoundry.config.wiring import Registry, build_outbound_connection, env
 
