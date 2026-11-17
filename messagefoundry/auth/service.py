@@ -3048,11 +3048,42 @@ def _log_totp_refused(username: str) -> None:
     )
 
 
+#: The longest escaped actor :func:`_storable_actor` writes, in UTF-16 code units: the narrowest
+#: shipped ``audit_log.actor`` column, SQL Server's NVARCHAR(256), which counts them. SQLite and
+#: PostgreSQL keep it as TEXT, with no length bound.
+_AUDIT_ACTOR_MAX = 256
+
+
+def _utf16_units(text: str) -> int:
+    """How many UTF-16 code units ``text`` takes, as an NVARCHAR column counts its length."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
 def _storable_actor(username: str) -> str:
     """A typed sign-in username as an audit row's actor (BACKLOG #5342): as typed, unless it holds a
     NUL, which at least a PostgreSQL store refuses in a text column. Then every control character
-    is escaped, as a log argument's are, so the row is still written and names what was sent."""
-    return scrub_log_argument(username) if "\x00" in username else username
+    is escaped, as a log argument's are, so the row is still written and names what was sent.
+
+    An escape takes six characters for each NUL, so an escaped name can outgrow
+    :data:`_AUDIT_ACTOR_MAX` and the write would fail on SQL Server. Such a name keeps the longest
+    prefix that fits beside a marker, ``...sha256:`` and the SHA-256 of the name as typed, so the
+    cut is deterministic and two long names that share the prefix stay distinct."""
+    if "\x00" not in username:
+        return username
+    escaped = scrub_log_argument(username)
+    if _utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
+        return escaped
+    # surrogatepass, so a lone surrogate cannot make the digest raise. The escape already wrote
+    # any lone surrogate out as text, so a cut between code points leaves the prefix storable.
+    marker = "...sha256:" + hashlib.sha256(username.encode("utf-8", "surrogatepass")).hexdigest()
+    room = _AUDIT_ACTOR_MAX - len(marker)
+    prefix: list[str] = []
+    for char in escaped:
+        room -= _utf16_units(char)
+        if room < 0:
+            break
+        prefix.append(char)
+    return "".join(prefix) + marker
 
 
 def _log_combined_totp_defect(user_id: str, exc: Exception) -> None:

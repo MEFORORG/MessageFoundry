@@ -665,6 +665,35 @@ async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces
     assert actors == ["bo\\u0000b", "bo\\u0000b"], actors
 
 
+async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
+    engine: Engine,
+) -> None:
+    """BACKLOG #5342: the escape writes each NUL as six characters, so 200 of them made a
+    1200-character actor, which SQL Server's ``audit_log.actor NVARCHAR(256)`` refuses, and the
+    sign-in would raise instead of writing its row. The actor is cut to 256 UTF-16 units with a
+    marker naming the SHA-256 of the name as typed, the same cut every time."""
+    from messagefoundry.auth.service import _AUDIT_ACTOR_MAX, _storable_actor, _utf16_units
+
+    service = await _service(engine)
+    name = "\x00" * 200
+    out = await service.login(name, PW, client="10.0.0.9")
+    assert not out.ok
+    actors = [
+        str(row["actor"])
+        for row in await engine.store.list_audit()
+        if row["action"] == "auth.login_failed" and "sha256:" in str(row["actor"])
+    ]
+    assert len(actors) == 1, actors
+    assert _AUDIT_ACTOR_MAX == 256
+    assert _utf16_units(actors[0]) <= _AUDIT_ACTOR_MAX, len(actors[0])
+    assert actors[0] == _storable_actor(name), "the cut is not deterministic"
+    assert actors[0].startswith("\\u0000") and "\x00" not in actors[0]
+    assert _storable_actor("\x00" * 201) != actors[0], "two long names share one actor"
+    # Past the BMP each character is two units, so the bound counts units, not characters.
+    wide = _storable_actor("\x00" + "\U0001f600" * 200)
+    assert len(wide) < _utf16_units(wide) <= _AUDIT_ACTOR_MAX
+
+
 # --- #1167 (ASVS 11.2.4): the recovery-code walk must cost the same whatever is presented --------
 
 
