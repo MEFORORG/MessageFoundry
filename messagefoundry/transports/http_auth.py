@@ -98,24 +98,20 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
 
     ON means ``oauth2_token_url`` holds a non-blank value and ``oauth2_enabled`` is absent, a real
     ``True``, or an unresolved ``env()`` reference; every other reading is OFF (the strict read
-    below). The SINGLE
-    definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the provider),
-    the mutual-exclusion screen in :func:`bearer_provider_from_settings`, the static-credential hop
-    reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`.
-    Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the screen treated
-    only a literal ``False`` as off.
+    below). The SINGLE definition, shared by at least :func:`oauth2_cc_provider_from_settings`
+    (which builds the provider), the mutual-exclusion screen in
+    :func:`bearer_provider_from_settings`, the static-credential hop reader (BACKLOG #1182) and
+    :func:`~messagefoundry.config.wiring.oauth_request_advisories`. Before it existed the builder
+    treated any falsy ``oauth2_enabled`` as off while the screen treated only a literal ``False``
+    as off.
 
     Read strictly (vault BACKLOG #5362), and total: it never raises, because readers of the loaded
-    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate.
-    ``oauth2_enabled`` counts as on only when absent, a real ``True``, or an unresolved ``env()``
-    reference; a truthiness read used to take the string ``"false"`` or ``"0"`` as on and an
-    explicit ``None`` as off. Any other flag value reads as OFF here. So does a blank,
-    whitespace-only or unset token URL while the flag is on (absent or ``True``), when either the
-    flag or the URL key was written; a mapping with neither is simply a connection without OAuth2.
-    :func:`refuse_oauth2_settings` refuses the same settings when a REST, SOAP or FHIR destination
-    builds (through :func:`bearer_provider_from_settings`). The loader refuses a non-bool
-    literal too (``Registry.bool_literal_problems``), and :func:`with_oauth2_client_credentials` a
-    literal blank token URL."""
+    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate. A
+    truthiness read used to take the string ``"false"`` or ``"0"`` as on and an explicit ``None``
+    as off. :func:`refuse_oauth2_settings` refuses the same settings when a REST, SOAP or FHIR
+    destination builds (through :func:`bearer_provider_from_settings`). The loader refuses a
+    non-bool literal too (``Registry.bool_literal_problems``), and
+    :func:`with_oauth2_client_credentials` a literal blank token URL."""
     if _oauth2_setting_problem(s) is not None:
         return False
     enabled = s.get("oauth2_enabled", True)
@@ -346,9 +342,9 @@ def oauth2_cc_provider_from_settings(
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
     when :func:`oauth2_auth_configured` reads symmetric OAuth2-CC auth as off — so any connection that
     didn't configure it is byte-identical. That includes the settings :func:`refuse_oauth2_settings`
-    refuses (a non-bool ``oauth2_enabled``, a blank or unset token URL beside the flag): this function
-    does not call it and returns ``None`` for them; :func:`bearer_provider_from_settings` refuses
-    them before it gets here. ``proxy`` (ADR 0126) routes the
+    refuses: this function does not call it and returns ``None`` for them;
+    :func:`bearer_provider_from_settings` refuses them before it gets here. ``proxy`` (ADR 0126)
+    routes the
     token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
     re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
     construction.
@@ -652,9 +648,7 @@ def with_oauth2_client_credentials(
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     if enabled is True and isinstance(token_url, str) and not token_url.strip():
-        # A literal blank or whitespace-only string is refused here, where `messagefoundry check`
-        # sees it without building the connector. A literal None, and an env() that resolves blank
-        # or None, are refused only at the build (vault BACKLOG #5362).
+        # A literal blank or whitespace-only string is refused here (vault BACKLOG #5362).
         raise HttpAuthError(
             "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
         )

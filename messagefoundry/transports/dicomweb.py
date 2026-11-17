@@ -223,7 +223,7 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
     surface as an encoder error quoting part of the secret. A colon in the password is legal and
     admitted.
 
-    Called first in the constructor, before any proxy or hop guard records a crossing for a
+    Called in the constructor, before any proxy or hop guard records a crossing for a
     connection that will not build. Raises :class:`HttpAuthError`, as SOAP's half-pair refusal does,
     naming the connection and the settings, never a value."""
     # Lazy, as rest.py imports it: http_auth imports this package's siblings at its top.
@@ -540,8 +540,6 @@ class DicomWebDestination(DestinationConnector):
                 _reject_url_control_chars(str(k), "header name")
                 _reject_url_control_chars(str(v), f"header {str(k)!r} value")
             headers.update({str(k): str(v) for k, v in extra.items()})
-        # _refuse_ambiguous_credentials screens these at the top of __init__. The Basic branch below
-        # also asks for both halves.
         token = s.get("bearer_token")
         user, password = s.get("basic_user"), s.get("basic_password")
         if token:
