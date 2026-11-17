@@ -14,7 +14,7 @@ of the script's AST: they call ``Test-GateRefusalLine`` on lines worded as the e
 and run ``Wait-ForGateRefusal`` against a stand-in log reader. A substring check finds each line's
 prefix, and source fragments of the no-Administrator and no-address detail texts, somewhere in
 ``app.py``; it does not render the lines, so it does not prove the refusal still puts the clause and
-"refusing to start" on one line. Nothing here pins ``$ProvisionHint`` or ``$ProvisionDecline``. Each
+"refusing to start" on one line. Nothing here pins at least ``$ProvisionHint`` or ``$ProvisionDecline``. Each
 case that runs PowerShell needs its own host, ``pwsh`` or ``powershell``, and skips where that host
 is missing; the ``app.py`` pin and the source-text test need neither.
 """

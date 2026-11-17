@@ -1099,8 +1099,7 @@ try {
                     Show-LogTail
                 } else {
                     Add-Failure ("control: $ServiceIdentity, restarted on the store it created itself, " +
-                        "did not log the expected refusal line in $WaitSeconds s. The trio reading " +
-                        "that follows was taken after the control reopen. " +
+                        "did not log the expected refusal line in $WaitSeconds s. " +
                         (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                     Show-LogTail
                 }
