@@ -63,6 +63,11 @@ open points settled below.
    writes it, so it lands as the first component and reads back unchanged. At a component or
    subcomponent path it is exactly `set`. `copy_field` and `split_field` use `set_data` when the
    source path is a component or subcomponent, and `set` when it is a whole field.
+   *(Note 2026-11-17, vault BACKLOG #5821: a whole-field source copied or split into a component
+   or subcomponent no longer goes through a component `set`, which escaped its escape sequences a
+   second time. Its raw text is written into that part as one leaf, its escapes kept as sent and
+   its separators escaped as data, by a whole-field `set` of the rebuilt field. A whole-field
+   source into a whole-field destination still uses `set`.)*
 2. **A whole-field `set` with author-supplied text keeps today's meaning.** `msg.set("PV1-19", "A^B")`
    still writes two components. A whole-field copy of a whole field still copies raw text, structure
    and all.

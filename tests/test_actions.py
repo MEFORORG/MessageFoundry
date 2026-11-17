@@ -231,6 +231,39 @@ def test_copy_field_decodes_a_whole_field_into_a_component() -> None:
     assert m["NK1-3"] == "O\\S\\Brien"
 
 
+def test_copy_field_keeps_a_whole_fields_escapes_in_a_component() -> None:
+    # BACKLOG #5821. The whole field's escapes are kept as sent rather than decoded and written
+    # back, so a line break is carried rather than refused and a highlight is not lost.
+    m = Message.parse(MSH_ONLY + "PID|1||1||a\\.br\\b\\H\\c\\N\\^d\\\rNK1|1|X^Y\r")
+    copy_field(m, "PID-5", "NK1-2.1")
+    assert m["NK1-2"] == "a\\.br\\b\\H\\c\\N\\\\S\\d\\E\\^Y"
+    assert m["NK1-2.1"] == "a\rb_c_^d\\"
+
+
+def test_copy_field_refuses_a_component_of_a_delimiter_field() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\r")
+    with pytest.raises(ValueError, match="delimiters"):
+        copy_field(m, "PID-5", "MSH-2.1")
+    with pytest.raises(ValueError, match="delimiters"):
+        append_to_field(m, "MSH-2.1", "X")
+    assert m.encode().startswith("MSH|^~\\&|")
+
+
+def test_copy_field_into_a_component_of_an_absent_segment_raises_key_error() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\r")
+    with pytest.raises(KeyError):
+        copy_field(m, "PID-5", "NK1-2.1")
+
+
+def test_trim_field_keeps_an_escape_the_strip_would_cut() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||\\X2041\\x  \r")
+    trim_field(m, "PID-5")
+    assert m["PID-5"] == "\\X2041\\x"
+    m = Message.parse(MSH_ONLY + "PID|1||1||\\X0D410D42\\x|F\r")
+    trim_field(m, "PID-5")  # the escape's CR is not cut out, so nothing raises
+    assert m["PID-5"] == "\\X0D410D42\\x"
+
+
 def test_split_field_decodes_each_whole_field_piece_into_a_component() -> None:
     # BACKLOG #5821. NEGATIVE CONTROL: on the unfixed code NK1-2.1 read back "O\S\Brien".
     m = Message.parse(MSH_ONLY + "PID|1||1||O\\S\\Brien^John\rNK1|1|X^Y\r")
@@ -778,23 +811,25 @@ def test_date_diff_field_a_whole_field_holding_more_than_one_timestamp_raises(
     assert m["ZTS-3"] is None
 
 
-def test_date_diff_field_a_component_path_with_an_empty_first_repetition_is_a_no_op() -> None:
-    # Main read a component path from the first repetition, so an empty one is a no-op.
-    m = _two_stamps("~20270101", "20260104")
-    date_diff_field(m, "ZTS-1.1", "ZTS-2", "ZTS-3", unit="days")
-    assert m["ZTS-3"] is None
-
-
-@pytest.mark.parametrize("start", ["20260101~~20270101", "20260101~"])
+@pytest.mark.parametrize("start", ["20260101~~20270101", "~20270101"])
 @pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
 def test_date_diff_field_any_second_repetition_raises_on_either_path(start: str, path: str) -> None:
     # BACKLOG #5822 added item 2. A component path refused "a~b" but read "a~~b" as "a", since its
-    # second repetition is empty. NEGATIVE CONTROL: on the unfixed code the component path wrote 3
-    # for both values.
+    # second repetition is empty, and "~b" as nothing. NEGATIVE CONTROL: on the unfixed code the
+    # component path wrote 3 for the first value and nothing for the second, raising neither time.
     m = _two_stamps(start, "20260104")
     with pytest.raises(ValueError, match="repeats"):
         date_diff_field(m, path, "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] is None
+
+
+@pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
+def test_date_diff_field_ignores_a_trailing_empty_repetition(path: str) -> None:
+    # A trailing empty repetition holds nothing, as a trailing empty component does. NEGATIVE
+    # CONTROL: on the unfixed code the whole-field path raised ValueError.
+    m = _two_stamps("20260101~", "20260104")
+    date_diff_field(m, path, "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "3"
 
 
 @pytest.mark.parametrize(
