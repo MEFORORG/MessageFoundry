@@ -4830,12 +4830,18 @@ class DatabaseSource(SourceConnector):
                         "DATABASE source poll task failed: %s", _credential_free_cause(fault)
                     )
                 except Exception as failure:  # noqa: BLE001 - a fixed line in its place
-                    logger.warning(
-                        "DATABASE source poll task failed: %s [message withheld: %s while "
-                        "rendering it]",
-                        type(fault).__name__,
-                        type(failure).__name__,
-                    )
+                    try:
+                        logger.warning(
+                            "DATABASE source poll task failed: %s [message withheld: %s while "
+                            "rendering it]",
+                            type(fault).__name__,
+                            type(failure).__name__,
+                        )
+                    except Exception:
+                        # Logging itself is failing. Under a cancel it must not replace the
+                        # CancelledError stop() re-raises, as a close failure does not.
+                        if not interrupted:
+                            raise
         finally:
             # The pool closes whatever the log line did: stop() runs during reload quiesce.
             if owns_pool:
@@ -5520,7 +5526,8 @@ def _credential_free_cause(exc: BaseException) -> str:
     :func:`_connect` and :func:`_probe_db` build theirs with this function. One another module
     raises is printed too, so that is a bound and not a guarantee. Either way the text is
     redacted and cut at :data:`_ENGINE_TEXT_LIMIT` by ``safe_text``, with no type prefix; one
-    whose ``str()`` would print a codec error takes :func:`_credential_free_detail` instead.
+    whose ``str()`` would print a codec error takes :func:`_credential_free_detail` instead,
+    and one with no text is named by its type.
 
     It never raises, as the ``_safe_db_error`` it replaced at the mark-failure log and in
     ``_finish_stop`` never did: an error whose rendering raises is named by its type and a
@@ -5528,7 +5535,7 @@ def _credential_free_cause(exc: BaseException) -> str:
     try:
         if not isinstance(exc, _ENGINE_FIXED_TEXT) or prints_a_codec_error(exc):
             return _credential_free_detail(exc)
-        return safe_text(str(exc), limit=_ENGINE_TEXT_LIMIT)
+        return safe_text(str(exc), limit=_ENGINE_TEXT_LIMIT) or type(exc).__name__
     except Exception as failure:  # noqa: BLE001 - see docstring: its callers are error arms
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"

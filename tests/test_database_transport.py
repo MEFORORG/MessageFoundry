@@ -1959,7 +1959,8 @@ async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
     it, since either guard prints the same note (``test_credential_free_cause_never_raises`` pins
     the helper's alone). ``render``: the renderer itself raises; red
     when ``_finish_stop`` does not guard its log line. ``logger``: every warning raises, so the
-    raise reaches ``stop()``; red when the close is not in a ``finally``."""
+    raise reaches an ordinary ``stop()``; red when the close is not in a ``finally``. Under a
+    cancel it must not replace the ``CancelledError``; red when the fallback's raise is kept."""
     src = _src(body_column="payload")
     fault_exc: Exception = _UnclassifiableError("x") if broken == "fault" else RuntimeError("y")
     if broken == "render":
@@ -1992,6 +1993,11 @@ async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
         if broken == "logger":
             with pytest.raises(OSError, match="log sink gone"):
                 await src._finish_stop(task, interrupted=False)
+            src._task = task
+            closed.clear()
+            await src._finish_stop(task, interrupted=True)  # under a cancel it never raises
+            assert closed == [database_module._POOL_CLOSE_TIMEOUT_S]
+            closed[:] = [None]
         else:
             await src._finish_stop(task, interrupted=False)
     assert closed == [None], "the pool was not closed"
@@ -2022,11 +2028,12 @@ def _real_ungated_refusal(monkeypatch: pytest.MonkeyPatch) -> UngatedConnectionE
 def test_credential_free_cause_bounds_the_engines_text() -> None:
     """#5348, batch 613 review: an engine error's text is printed, so it takes a bound, as the
     ``safe_exc`` rendering it replaced did. Red mutation: print ``str(exc)`` unbounded, or cut
-    it well past ``_ENGINE_TEXT_LIMIT``."""
+    it at a limit outside 300 to 440, or return no text for an error that has none."""
     long = DeliveryError("DATABASE connect failed: " + "word " * 4000)
     out = database_module._credential_free_cause(long)
     assert out.startswith("DATABASE connect failed: word")
-    assert len(out) <= database_module._ENGINE_TEXT_LIMIT + 40  # the cut note's length
+    assert 300 <= len(out) <= 440  # 400 and the cut note: the remedy fits, little else does
+    assert database_module._credential_free_cause(DeliveryError()) == "DeliveryError"
 
 
 #: The real statement_timeout refusal ``_apply_statement_timeout`` builds, SQLSTATE form.
