@@ -46,9 +46,9 @@ Posture (ADR 0017 amendment, 2026-06-27):
   unresolvable install root, and a package imported from *outside* the install root give one. Unless
   the install declares itself editable, such a pass with no drift logs at WARNING, records the
   ``startup_integrity`` audit row, fires the AlertSink, and refuses to start under
-  ``fail_closed_on_drift``. One that also found drift is reported as drift (:func:`_act_on`). Before #1679 those
-  shapes returned a silent clean no-op, so a site that opted into hard enforcement would start anyway
-  with its tripwire disarmed, and the INFO line would say clean.
+  ``fail_closed_on_drift``. One that also found drift is reported as drift (:func:`_act_on`). Before
+  #1679 the four shapes named above returned a silent clean no-op, so a site that opted into hard
+  enforcement would start anyway with its tripwire disarmed, and the INFO line would say clean.
 
 **What it detects is an INCONSISTENT edit, not a consistent one.** The baseline ships beside the code it
 attests, inside the same install the stated adversary can write, so an edit that also re-seals ``RECORD``
@@ -189,10 +189,9 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 #: reports a pass carrying any other value as drift when it also found drift, and otherwise as
 #: attested-nothing, which a fail-closed site refuses to start on (BACKLOG #1679). A ``Literal``
 #: rather than a bare ``str`` so a typo at a construction site is a type error instead of a reason
-#: nobody can match on. ``no_file_read_under_install_root``: an attested file sat under the install
-#: root, or the loaded package's directory is the one ``RECORD`` describes, and no file's bytes were
-#: read, as when every file was deleted or fails to open (BACKLOG #5376).
-#: ``no_attested_file_under_install_root``: neither held.
+#: nobody can match on. ``no_file_read_under_install_root``: the loaded package is the directory
+#: ``RECORD`` describes, and no file's bytes were read, as when every file was deleted or fails to
+#: open (BACKLOG #5376). ``no_attested_file_under_install_root``: it was loaded from anywhere else.
 #: ``console_attestation_raised`` is the web console arm's alone (BACKLOG #1802): its pass raised, so
 #: it compared nothing that can be trusted.
 UnattestedReason = Literal[
@@ -541,8 +540,15 @@ def _console_loaded_files() -> list[Path] | None:
             path = Path(origin)
             files.add(path.parent.resolve() / path.name)
         return sorted(files)
+
+    def unlistable(error: OSError) -> None:
+        # Named as a file, as the engine walk does: it has no `RECORD` row, so it is drift.
+        if error.filename is not None:
+            path = Path(error.filename)
+            files.add(path.parent.resolve() / path.name)
+
     for root in search:
-        for dirpath, dirnames, filenames in Path(root).walk():
+        for dirpath, dirnames, filenames in Path(root).walk(on_error=unlistable):
             dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
             directory = dirpath.resolve()
             files.update(
@@ -675,8 +681,8 @@ def attest_engine() -> AttestationResult:
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
         # No `package_roots`: the declared asset paths are listed whether or not they exist, so an
-        # attested file sits under the install root whenever the loaded package does, every module
-        # gone or not.
+        # attested file sits in the loaded package whenever that is the directory `RECORD` describes,
+        # every module gone or not.
         unmatched_rows=_is_module_row,
     )
 
@@ -728,10 +734,10 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies only when an attested file sits under the install root or one of ``package_roots`` (the
-    loaded package's directories) is ``<install root>/<package>``, so a package loaded from elsewhere
-    is not reported as every file it did not load, while one whose every file is gone still is
-    (BACKLOG #5376).
+    applies only when the loaded package is ``<install root>/<package>``: an attested file sits in it,
+    or one of ``package_roots`` (the loaded package's directories) is it. So a package loaded from
+    elsewhere is not reported as every file it did not load, while one whose every file is gone still
+    is (BACKLOG #5376).
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -799,11 +805,14 @@ def _attest_distribution(
         checked += 1
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    under_root = bool(seen) or any(
-        _record_relpath(Path(root).resolve(), install_root) == package for root in package_roots
+    prefix = f"{package}/"
+    # Like the walks, resolve the directory's parent and not the directory itself, so a package
+    # directory swapped for a link still names the place `RECORD` describes.
+    in_package = any(rel.startswith(prefix) for rel in seen) or any(
+        _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root) == package
+        for root in package_roots
     )
-    if unmatched_rows is not None and under_root:
-        prefix = f"{package}/"
+    if unmatched_rows is not None and in_package:
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
             DriftEntry(path=rel, reason="missing")
@@ -819,7 +828,7 @@ def _attest_distribution(
     if not checked:
         reason = (
             "no_file_read_under_install_root"
-            if under_root
+            if in_package
             else "no_attested_file_under_install_root"
         )
     return AttestationResult(

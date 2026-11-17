@@ -401,8 +401,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 >
 > A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
 > never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift. Until BACKLOG
-#5376 that held only while the walk listed some console file under the install root, so a console
-whose every file was deleted or special read as attested-nothing.
+> #5376 that held only while the walk listed some console file under the install root, so a console
+> whose every file was deleted or special read as attested-nothing.
 >
 > **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
 > console code that has already run can remove itself from it and be skipped; that is the D3

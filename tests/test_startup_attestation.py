@@ -33,9 +33,10 @@ import logging
 import os
 import sys
 import types
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from importlib.metadata import PackageNotFoundError, PathDistribution
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1811,7 +1812,10 @@ def test_a_console_whose_package_directory_was_deleted_is_missing_drift(
 
     console = integ.attest_console()
     assert console is not None
-    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    # The walk names the directory it could not list, and the read-back names every row.
+    assert _drift(console) == [(_CONSOLE_PKG, "missing")] + [
+        (rel, "missing") for rel in sorted(_CONSOLE_FILES)
+    ]
     assert console.unattested_reason == _NOTHING_READ
 
 
@@ -1863,6 +1867,67 @@ def test_a_console_loaded_from_another_directory_under_the_root_blames_no_intact
     assert console is not None
     assert console.drift == [] and console.checked == 0
     assert console.unattested_reason == _NOTHING_UNDER_ROOT
+
+
+def test_a_console_loaded_from_another_directory_with_a_file_blames_no_intact_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same, with a file in the other directory: only that file, which has no row, is drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    elsewhere = console_root / "elsewhere" / _CONSOLE_PKG
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "__init__.py").write_bytes(b"")
+    _load_fake_console(monkeypatch, elsewhere)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(f"elsewhere/{_CONSOLE_PKG}/__init__.py", "missing")]
+    assert console.unattested_reason == _NOTHING_UNDER_ROOT
+
+
+def test_a_console_package_directory_swapped_for_a_link_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The package directory itself replaced by a link to an empty directory outside the root: the
+    link still names the place ``RECORD`` describes, so every row is ``missing`` drift."""
+    import shutil
+
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    shutil.rmtree(package_dir)
+    empty = tmp_path / "outside" / _CONSOLE_PKG
+    empty.mkdir(parents=True)
+    _symlink(package_dir, empty, directory=True)
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
+
+
+def test_an_unlistable_console_directory_is_named_as_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory the walk cannot list is named itself, as the engine walk names one, so the drift
+    points at it and not only at the rows it hides. Simulated, since a list-deny ACL is not portable."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    _load_fake_console(monkeypatch, package_dir)
+    real_walk = Path.walk
+
+    def walk(self: Path, **kwargs: Any) -> Iterator[tuple[Path, list[str], list[str]]]:
+        on_error = kwargs.get("on_error")
+        if self == package_dir and on_error is not None:
+            on_error(PermissionError(13, "denied", str(package_dir)))
+            return iter(())
+        return real_walk(self, **kwargs)
+
+    monkeypatch.setattr(Path, "walk", walk)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert (_CONSOLE_PKG, "missing") in _drift(console)
 
 
 def test_an_asset_that_fails_to_open_is_drift_and_not_counted(
