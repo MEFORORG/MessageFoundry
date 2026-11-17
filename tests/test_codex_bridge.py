@@ -279,7 +279,7 @@ def test_plain_or_non_object_prompt_hook_output_becomes_context(bridge, tmp_path
     assert result["hookSpecificOutput"]["additionalContext"] == stdout
 
 
-@pytest.mark.parametrize("stdout", ["3", "[1]", '"s"', "true"])
+@pytest.mark.parametrize("stdout", ["3", "[1]", '"s"', "true", "null"])
 def test_non_object_json_on_a_tool_event_is_a_reported_hook_defect(bridge, tmp_path, stdout):
     """As on main: JSON that is not an object is an error, and blocks only under onFailure."""
     settings(tmp_path, [handler(stdout)])

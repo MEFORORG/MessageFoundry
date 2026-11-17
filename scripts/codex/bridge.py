@@ -350,13 +350,14 @@ def run_one_hook(root: Path, payload: dict, env: dict[str, str], hook: dict, res
     output = completed.stdout.strip()
     if not output:
         return
+    unparsed = object()  # json.loads returns None for "null", so None cannot mean "not JSON".
     try:
-        update = json.loads(output)
+        update: object = json.loads(output)
     except json.JSONDecodeError:
-        update = None
+        update = unparsed
     if not isinstance(update, dict):
         if event not in PLAIN_CONTEXT_EVENTS:
-            if update is not None:  # JSON that is not an object is a hook defect, as on main.
+            if update is not unparsed:  # JSON that is not an object is a hook defect, as on main.
                 raise ValueError("Hook JSON output must be an object")
             print(output, file=sys.stderr)
             return

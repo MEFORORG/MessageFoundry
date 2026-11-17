@@ -30,8 +30,7 @@ claim a failed hook ran.
 ### Who decides a block
 
 Only a hook blocks. A bridge fault, which the bridge reports on stderr and as a
-`systemMessage`, never blocks. In hook mode the bridge exits 0 to proceed or 10
-to block, and `invoke.ps1` turns 10 into 2 and any other non-zero bridge exit
+`systemMessage`, never blocks. In hook mode `invoke.ps1` turns 10 into 2 and any other non-zero bridge exit
 into a non-blocking 1. Codex's documentation does not say which shell runs a
 hook command. Under a PowerShell outer shell, `pwsh -Command` reports the
 launcher's exit 2 as a non-blocking 1, so no exit 2 blocks under it. With `pwsh`
