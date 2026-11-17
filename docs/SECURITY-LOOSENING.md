@@ -95,9 +95,10 @@ message under `dynamic_headers` meets the same rule as the hop's static headers,
 message is sent, after the hop's own send-time check. That refusal dead-letters the one
 message and names neither the header nor its
 value. The HTTP family reads its
-auth-setting credentials from the same reader as the static-credential inventory. That inventory
-does not yet count a static header or a `url` query credential, so for those two kinds this rule is
-the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
+auth-setting credentials from the same reader as the static-credential inventory. The inventory
+does not count every kind this rule refuses: at least a credential in a `url` `;` segment, after
+an earlier `#` or a second `?`, and one in a FHIR `conditional_query` are refused here and not
+counted there, so for those kinds this rule is the wider of the two. A hop with no credential and no such header is not refused by this rule. Its own loosening entry
 decides it.
 
 An AD bind always carries a credential, because the service account must bind first. So

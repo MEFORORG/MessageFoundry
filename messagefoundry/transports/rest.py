@@ -1366,8 +1366,9 @@ def http_credentials_sent(
     hop that already turned verification off that is the cheaper error. A credential-looking query
     parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
     ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). So does a
-    credential-looking name in a ``;``-split segment or after a second ``?`` of
-    ``url`` (:func:`_query_credentials_sent`, BACKLOG #5353). The FHIR destination adds its
+    credential-looking name in any ``name=value`` segment of what urllib sends of ``url``, read
+    from its first ``;``, ``?`` or ``#`` up to the last ``#`` (:func:`_url_segments_sent`,
+    :func:`_query_credentials_sent`, BACKLOG #5353); a ``code`` name there is not counted. The FHIR destination adds its
     ``conditional_query``, which crosses the hop too, by the same reader at its own call sites. A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
@@ -1391,8 +1392,9 @@ def http_credentials_sent(
 
     It reads settings only, so a header a Handler stamps per message under ``dynamic_headers`` is
     not seen here; :func:`refuse_held_dynamic_headers` judges those at send. Nor is a secret in
-    the path of ``url`` before its first ``;``; docs/SECURITY-LOOSENING.md lists it among the
-    hops the rule does not reach."""
+    the path of ``url`` before its first ``;``, ``?`` or ``#``, nor in the fragment after its last
+    ``#``, which urllib never sends; docs/SECURITY-LOOSENING.md lists the path among the hops the
+    rule does not reach."""
     # Lazy: it imports config.wiring, which this module does not otherwise load.
     from messagefoundry.config.static_credentials import http_hop_credentials
 
