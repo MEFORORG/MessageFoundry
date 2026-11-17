@@ -391,9 +391,9 @@ def _seg(value: str | int) -> str:
 def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     """Refuse an unsafe base URL, then refuse plaintext ``http`` to a non-loopback host.
 
-    A base URL is refused in at least these cases: httpx cannot parse it, its scheme is not
-    ``http`` or ``https``, it has no host, it carries userinfo, or it is plaintext ``http`` to a
-    non-loopback host without ``allow_insecure``. Each refusal is an :class:`ApiError` that
+    A base URL is refused in at least these cases: httpx cannot parse it or IDNA-decode its host,
+    its scheme is not ``http`` or ``https``, it has no host, it carries userinfo, or it is
+    plaintext ``http`` to a non-loopback host without ``allow_insecure``. Each refusal is an :class:`ApiError` that
     chains nothing.
 
     Returns ``True`` when the caller has opted into a **cleartext non-loopback hop** -- the one
@@ -431,7 +431,8 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     **One parser decides (BACKLOG #5343).** The URL is parsed with ``httpx.URL``, the parser the
     transport dials with, not ``urllib.parse``. Two parsers that disagree on a URL are how a check
     passes one host while the request goes to another; a URL httpx cannot parse raises
-    :class:`ApiError` here rather than ``httpx.InvalidURL`` later.
+    :class:`ApiError` here rather than ``httpx.InvalidURL`` later. So does a host whose IDNA
+    decode fails, which httpx would otherwise raise as ``idna.IDNAError`` on every request.
 
     **Plaintext http to a remote host (CONSOLE-3, ASVS 12.3.3, BACKLOG #1179).** A remote
     ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a remote engine
@@ -456,6 +457,9 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     """
     try:
         url: httpx.URL | None = httpx.URL(base_url)
+        # httpx builds every request through ``host``, which IDNA-decodes: a malformed ``xn--``
+        # label raises idna.IDNAError (a UnicodeError) there, so it is read here, at construction.
+        _ = url.host
     except (httpx.InvalidURL, UnicodeError):  # a bad port, a control character, a lone surrogate
         url = None
     if url is None:  # raised outside the handler, so it chains no error quoting the URL
@@ -467,7 +471,7 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
             f"refusing a base URL with {found}: this client permits only the "
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
-    # raw_host, not host: it is what the transport dials, and host IDNA-decodes and can raise.
+    # raw_host, not host: it is what the transport dials, undecoded.
     host = url.raw_host.decode("ascii").lower()
     if not host:
         raise ApiError(

@@ -724,12 +724,28 @@ def test_transport_guard_refuses_a_base_url_carrying_userinfo() -> None:
         assert "s3cret" not in str(excinfo.value)
 
 
-def test_transport_guard_raises_no_raw_idna_error() -> None:
-    """A malformed IDNA A-label raises ApiError or constructs, never a raw ``idna`` error: the gate
-    reads ``raw_host``, which does not decode (BACKLOG #5343).
+@pytest.mark.parametrize("base_url", ["https://xn--ab-.example:8765", "http://xn--ab-.example"])
+def test_transport_guard_refuses_a_malformed_idna_host(base_url: str) -> None:
+    """A host with a malformed ``xn--`` label is refused at construction with the chain-free
+    :class:`ApiError` (BACKLOG #5343). httpx builds the request URL through ``url.host``, which
+    IDNA-decodes, so such a client used to construct and then raise a raw ``idna.IDNAError`` on
+    every request, out of the ApiError-only client.
 
-    Mutation: read ``url.host``. Red: ``idna.core.IDNAError`` escapes the constructor."""
-    EngineClient("https://xn--ab-.example:8765").close()
+    Mutation: read only ``raw_host`` and drop the ``url.host`` read. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="does not parse") as excinfo:
+        EngineClient(base_url, allow_insecure=True)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+@pytest.mark.parametrize("base_url", ["http://localhost", "http://[::1]", "http://127.0.0.1"])
+def test_transport_guard_permits_every_loopback_host_name(base_url: str) -> None:
+    """NEGATIVE CONTROL for the IDNA refusal: each loopback spelling still constructs as loopback
+    http, with no cleartext-hop posture."""
+    client = EngineClient(base_url)
+    try:
+        assert client._cleartext_hop is False
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize(
