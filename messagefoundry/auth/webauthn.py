@@ -169,7 +169,7 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
     """Every exception py_webauthn raises for bad input, which must all reach the audited path.
 
-    ``WebAuthnException`` is the library's own base class. The other three entries catch four raw
+    ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
     out when a COSE key is malformed rather than merely wrong: its key decoder indexes an
     untyped CBOR value, so a missing label is a ``KeyError``, a short array an ``IndexError``, a
@@ -184,6 +184,20 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     from webauthn.helpers.exceptions import WebAuthnException
 
     return (WebAuthnException, LookupError, TypeError, ValueError)
+
+
+def _invalid_response_errors() -> tuple[type[Exception], ...]:
+    """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
+    call of each ceremony (vault BACKLOG #5341). The library's own ``json.loads`` raises it,
+    unwrapped, for a response nested too deep for the stack. Its message names stack use, not the
+    input.
+
+    In :func:`verify_assertion` that call also decodes the stored key, so a ``RecursionError``
+    from that decode, for example on a low stack, is refused as invalid input too. Our own
+    stored-key check, :func:`_require_usable_public_key`, runs before that call and does not catch
+    it. Nor does this reach a caller that parses the body itself before calling in: at least the
+    web console's passkey routes do, and their own parse raises it first."""
+    return (*_invalid_input_errors(), RecursionError)
 
 
 def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
@@ -587,7 +601,7 @@ def verify_registration(
             expected_origin=origin,
             supported_pub_key_algs=_supported_pub_key_algs(),
         )
-    except _invalid_input_errors() as exc:
+    except _invalid_response_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
@@ -685,7 +699,7 @@ def verify_assertion(
             credential_public_key=public_key,
             credential_current_sign_count=current_sign_count,
         )
-    except _invalid_input_errors() as exc:
+    except _invalid_response_errors() as exc:
         # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
         # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
         # sign-count regression message ("...sign count...") still rides through for the
@@ -780,11 +794,13 @@ def resident_key_from_response(response_json: str) -> bool | None:
 
 def _transports_from_response(response_json: str) -> list[str] | None:
     """Best-effort ``response.transports`` extraction (browser hint — absence is fine)."""
-    try:
-        parsed = json.loads(response_json)
-        transports = parsed.get("response", {}).get("transports")
-    except (ValueError, AttributeError):  # pragma: no cover - verify_registration already parsed
+    # The same refusal-safe parse as resident_key_from_response, so a RecursionError here cannot
+    # escape after the library's own parse succeeded (vault BACKLOG #5341).
+    parsed, refused = json_loads_or_refusal(response_json)
+    if refused is not None or not isinstance(parsed, dict):
         return None
+    response = parsed.get("response")
+    transports = response.get("transports") if isinstance(response, dict) else None
     if isinstance(transports, list) and all(isinstance(t, str) for t in transports):
         return list(transports) or None
     return None

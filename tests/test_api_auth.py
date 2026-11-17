@@ -3672,3 +3672,54 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
             "/auth/login", json={"username": "sup", "password": PW, "supersedes": "x" * 257}
         )
         assert too_long.status_code == 422
+
+
+# --- vault BACKLOG #5342: a sign-in naming a NUL is refused at the body --------------------------
+
+
+@pytest.mark.parametrize("username", ["sup\x00", "\x00", "s\x00up"])
+async def test_login_refuses_a_nul_username_before_the_store(
+    engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red: each reached ``AuthService.login``, where on a PostgreSQL store the NUL would raise an
+    error the route does not catch, a 500 outside the failure-timing pad. Now each is a 422 before
+    the service runs."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    async with _client(engine, service) as c:
+        reached: list[str] = []
+
+        async def _spy(*args: object, **kwargs: object) -> object:
+            reached.append("login")
+            raise AssertionError("the service ran")
+
+        monkeypatch.setattr(service, "login", _spy)
+        r = await c.post("/auth/login", json={"username": username, "password": PW})
+        assert r.status_code == 422
+        assert reached == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"username": "s\x01up"}, {"username": ""}, {"supersedes": "tok\x00en"}, {"supersedes": ""}],
+)
+async def test_login_still_reaches_the_service_for_other_unusual_values(
+    engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The controls: another control character, an empty name, and a ``supersedes`` holding a NUL
+    (only ever hashed, never sent to the store) are not refused by the body. They reach
+    ``AuthService.login`` as before, and answer as it decides."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    reached: list[str] = []
+    real_login = service.login
+
+    async def _spy(username: str, *args: Any, **kwargs: Any) -> Any:
+        reached.append(username)
+        return await real_login(username, *args, **kwargs)
+
+    monkeypatch.setattr(service, "login", _spy)
+    async with _client(engine, service) as c:
+        body = {"username": "sup", "password": PW, **fields}
+        r = await c.post("/auth/login", json=body)
+        assert reached == [body["username"]]
+        assert r.status_code == (200 if "supersedes" in fields else 401)
