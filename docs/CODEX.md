@@ -104,9 +104,7 @@ payload through `$input`.
 A command-only PowerShell hook written as named blocks, at least `begin`,
 `process`, `end`, `clean` and `dynamicparam`, cannot block by its own `exit 2`
 under the bridge: it fails to parse with the tail after it, so it exits 1 on
-every call, and under `"onFailure": "block"` it blocks every call. Such a hook
-must use the `-File` exec form instead, a `command` of `pwsh` with `args` that
-name the script after `-File`.
+every call, and under `"onFailure": "block"` it blocks every call.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

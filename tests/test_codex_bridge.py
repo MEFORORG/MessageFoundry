@@ -182,7 +182,7 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
 @pytest.mark.parametrize(
     ("command", "outcome"),
     [
-        # A command-only PowerShell hook blocks by `exit 2`, as under Claude Code.
+        # A command-only PowerShell hook blocks by `exit 2`.
         ("Write-Output 'x' | Out-Null; exit 2", "block"),
         ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
         ("trap {{ exit 2 }}; throw 'boom'", "block"),
