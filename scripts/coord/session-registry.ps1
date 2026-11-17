@@ -34,7 +34,10 @@
                   that just launched is the last thing that should read as absent.
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
-      (Found=$false) no record at all -- it exited cleanly, or was never registered.
+      (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
+                  or UNREADABLE when a LIVE or fresh record that names no session, in the worktree
+                  the caller names, may be this one. The same record turns a matched DEAD or STALE
+                  into UNREADABLE. Get-AnonymousSessionRecords and Get-SessionLiveness say how.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
@@ -149,10 +152,38 @@ function Get-LoginForSession {
     # for -- but it REPORTS the count, so the caller can say which of the two silences it is in.
     $hits = @(
         Get-SessionRecords -ConfigRoot $ConfigRoot |
-            Where-Object { $_.Record -and $_.Record.sessionId -and ($_.Record.sessionId -ieq $SessionId) }
+            Where-Object { [string](Get-RecordField $_.Record 'sessionId') -ieq $SessionId }
     )
     $login = if ($hits.Count -eq 1) { Get-LoginLabel $hits[0].Root } else { '' }
     return [pscustomobject]@{ Login = $login; Matched = $hits.Count }
+}
+
+# One field of a registry record, or $null when the record lacks it. A bare `$rec.pid` throws under
+# Set-StrictMode for a missing property, and these functions run in their caller's strict scope
+# (at least seat.ps1 and fleet.ps1 set it). A record missing a field is what a file caught mid-write looks like,
+# so the read must answer rather than throw (BACKLOG #5491).
+function Get-RecordField($Record, [string]$Name) {
+    if ($null -eq $Record) { return $null }
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains($Name)) { return $Record[$Name] }
+        return $null
+    }
+    $p = $Record.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+# A record's startedAt as a UTC DateTime, or $null when it is missing, not a number, or out of
+# FromUnixTimeMilliseconds's range. Parsed as a double and rounded, as the [int64] cast this replaced
+# did, so a fractional value still counts; NaN fails both bounds. A future value is returned as it
+# is: Test-RecordLiveness compares it with the process start and reads one outside the skew as
+# UNVERIFIED, and the anonymous-record aging drops future values itself.
+function Get-RecordStartedUtc($Record) {
+    $ms = 0.0
+    if (-not [double]::TryParse([string](Get-RecordField $Record 'startedAt'), [System.Globalization.NumberStyles]::Float,
+            [cultureinfo]::InvariantCulture, [ref]$ms) -or
+        -not ($ms -ge -62135596800000 -and $ms -le 253402300799999)) { return $null }
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ms).UtcDateTime
 }
 
 # Every registry record, with the root it came from attached.
@@ -204,8 +235,12 @@ function Test-RecordLiveness {
     # A record with NO pid cannot be fenced, so it is UNREADABLE, not DEAD. It used to report DEAD --
     # which is not a veto anywhere -- and a registry file caught mid-write has exactly this shape, so a
     # session that had just launched read as "nobody is there" to a caller about to delete its worktree.
-    $procId = [int]$Record.pid
-    if (-not $procId) { return @{ State = "UNREADABLE"; Detail = "no pid in record; it cannot be fenced" } }
+    # Fields are read through Get-RecordField and parsed with TryParse, because a cast throws on a value
+    # that is not a number (BACKLOG #5491).
+    $procId = 0
+    if (-not [int]::TryParse([string](Get-RecordField $Record 'pid'), [ref]$procId) -or $procId -eq 0) {
+        return @{ State = "UNREADABLE"; Detail = "no usable pid in record; it cannot be fenced" }
+    }
 
     $proc = Get-Process -Id $procId -EA SilentlyContinue
     if (-not $proc) { return @{ State = "DEAD"; Detail = "pid $procId not running" } }
@@ -217,38 +252,138 @@ function Test-RecordLiveness {
         # upgrading it to LIVE: an unverifiable fence is not a passed fence.
         return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; start time unreadable" }
     }
-    if ($null -eq $Record.startedAt) {
-        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no startedAt" }
+    $startedUtc = Get-RecordStartedUtc $Record
+    if ($null -eq $startedUtc) {
+        return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record has no usable startedAt" }
     }
+    $registered = $startedUtc.ToLocalTime()
 
-    $registered = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$Record.startedAt).LocalDateTime
     # A process cannot have started after the session it hosts registered (small forward slop for
     # clock jitter). Started much later => this pid was recycled onto a different process.
     $delta = ($procStart - $registered).TotalMinutes
     if ($delta -gt 1) {
-        return @{ State = "STALE"; Detail = "pid $procId reused (process started $([int]$delta)m after the session)" }
+        return @{ State = "STALE"; Detail = "pid $procId reused (process started $([long]$delta)m after the session)" }
     }
     if ($delta -lt (-1 * $StartSkewMinutes)) {
-        return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([int](-$delta))m" }
+        # A startedAt still in the future cannot be a registration that happened, so outside the skew
+        # it is an unusable start, not evidence of a recycled pid: UNVERIFIED, never STALE. Inside a
+        # widened skew it falls through to LIVE, as it always did (remove.ps1 widens it). The [long]
+        # casts replaced [int] ones, which threw on a gap past Int32 minutes.
+        if ($startedUtc -gt [DateTime]::UtcNow.AddMinutes(1)) {
+            return @{ State = "UNVERIFIED"; Detail = "pid $procId alive; record's startedAt is in the future" }
+        }
+        return @{ State = "STALE"; Detail = "pid $procId start precedes the session by $([long](-$delta))m" }
     }
     return @{ State = "LIVE"; Detail = "" }
 }
 
+# A path in the one form the anonymous-record scoping compares: forward slashes turned back,
+# trailing separators and space dropped, lower-cased. Windows paths compare case-insensitively.
+function ConvertTo-RegistryNormPath([string]$Path) {
+    if (-not $Path) { return '' }
+    return ($Path.Trim() -replace '/', '\').TrimEnd('\').ToLowerInvariant()
+}
+
+# Records that name no session and whose own fence is not DEAD or STALE, each with Fresh and Cwd.
+#
+# WHY THEY MATTER (BACKLOG #5491). Such a record may be the session a caller asks about, caught
+# mid-write, so a gone answer beside one is not a gone answer. Under StrictMode the lookup used to
+# throw on it, which seat.ps1 refused on; skipping it silently would turn that refusal into a clear.
+#
+# WHICH ONES VETO (Fresh = $true). A LIVE one always does: its pid and start time say it is running,
+# and it stops vetoing on its own when that process exits. A non-LIVE one (UNVERIFIED or UNREADABLE)
+# vetoes only while fresh, or a record that never gains its session id would block every clear
+# until someone deleted it. Its age is taken from the newer of its startedAt and its file's last
+# write, a future value of either being ignored. A file that vanished between the listing and this
+# read is the shape of one being replaced right now, so it ages 0 whatever its startedAt. The
+# default of 24 hours is box-activity.ps1's FreshHours, which bounds its own veto over unparsed
+# registry files: the same "may be this session mid-launch" shape. An older one is returned with
+# Fresh = $false, for the caller to report.
+#
+# WHERE THEY VETO is Get-SessionLiveness's -Worktree: Cwd is the record's own cwd, normalized, or ''
+# when it has none it can read.
+function Get-AnonymousSessionRecords {
+    [CmdletBinding()]
+    param(
+        [object[]]$Records,
+        [double]$FreshHours = 24,
+        [int]$StartSkewMinutes = 15
+    )
+    $now = [DateTime]::UtcNow
+    $out = @()
+    foreach ($r in @($Records)) {
+        if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
+        $state = (Test-RecordLiveness -Record $r.Record -StartSkewMinutes $StartSkewMinutes).State
+        if ($state -in @('DEAD', 'STALE')) { continue }
+        $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
+        $times = @((Get-RecordStartedUtc $r.Record), $(if ($item) { $item.LastWriteTimeUtc })) |
+            Where-Object { $null -ne $_ -and $_ -le $now.AddMinutes(1) }
+        $ageH = if (-not $item) { 0 }
+                elseif ($times) { ($now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours }
+                else { [double]::PositiveInfinity }
+        $cwd = Get-RecordField $r.Record 'cwd'
+        $out += [pscustomobject]@{
+            File     = $r.File
+            Cwd      = if ($cwd -is [string]) { ConvertTo-RegistryNormPath $cwd } else { '' }
+            State    = $state
+            AgeHours = $ageH
+            Fresh    = ($state -eq 'LIVE') -or ($ageH -lt $FreshHours)
+        }
+    }
+    return $out
+}
+
+# Does an anonymous record veto a lookup for -Worktree? Only when the two name one tree: the record's
+# cwd is that worktree or inside it. A record with no readable cwd, or a lookup that names no
+# worktree, cannot be placed, so it vetoes wherever it is asked (fail closed).
+function Test-AnonymousRecordReaches {
+    param($Anonymous, [string]$Worktree)
+    $w = ConvertTo-RegistryNormPath $Worktree
+    if (-not $Anonymous.Cwd -or -not $w) { return $true }
+    return ($Anonymous.Cwd -eq $w) -or $Anonymous.Cwd.StartsWith($w + '\', 'Ordinal')
+}
+
 # Look one session up by id (full or unique prefix) and fence it.
+#
+# -Worktree names the tree the caller is about to act on (a seat's worktree, a transcript's birth
+# cwd). Pass it whenever it is known: without it every fresh anonymous record on the box vetoes.
 function Get-SessionLiveness {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [string[]]$ConfigRoot,
-        [int]$StartSkewMinutes = 15
+        [int]$StartSkewMinutes = 15,
+        [double]$AnonymousFreshHours = 24,
+        [string]$Worktree
     )
-    $hit = @(Get-SessionRecords -ConfigRoot $ConfigRoot |
-        Where-Object { $_.Record.sessionId -and ([string]$_.Record.sessionId).StartsWith($SessionId, 'OrdinalIgnoreCase') })
+    $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
+    $hit = @($records |
+        Where-Object { $sid = [string](Get-RecordField $_.Record 'sessionId'); $sid -and $sid.StartsWith($SessionId, 'OrdinalIgnoreCase') })
+
+    # Fenced only when the answer would be gone, the one case the anonymous records can change.
+    # Anonymous lists the vetoing records, so a caller can name the real reason for a refusal.
+    $anonymousVeto = {
+        $anon = @(Get-AnonymousSessionRecords -Records $records -FreshHours $AnonymousFreshHours -StartSkewMinutes $StartSkewMinutes)
+        $veto = @($anon | Where-Object { $_.Fresh -and (Test-AnonymousRecordReaches $_ $Worktree) })
+        if ($veto.Count -gt 0) {
+            $named = @($veto | ForEach-Object { if ($_.Cwd) { "$($_.File) (cwd $($_.Cwd))" } else { "$($_.File) (no readable cwd)" } })
+            return @{ Veto = $true; Anonymous = $veto; Note = "but $($veto.Count) record(s) that are LIVE or were written in the last ${AnonymousFreshHours}h name no session and may be it: $($named -join '; ')" }
+        }
+        $old = @($anon | Where-Object { -not $_.Fresh } | ForEach-Object { $_.File })
+        if ($old.Count -gt 0) {
+            return @{ Veto = $false; Anonymous = @(); Note = "; $($old.Count) older record(s) name no session and do not veto: $($old -join '; ')" }
+        }
+        return @{ Veto = $false; Anonymous = @(); Note = '' }
+    }
 
     if ($hit.Count -eq 0) {
+        $a = & $anonymousVeto
+        if ($a.Veto) {
+            return @{ Found = $false; State = "UNREADABLE"; Detail = "no record names this session, $($a.Note)"; Record = $null; Anonymous = $a.Anonymous }
+        }
         # Not registered. NOT proof it is gone -- a session that never registered looks identical to
         # one that exited cleanly, so callers must fall back to an independent signal.
-        return @{ Found = $false; State = "UNKNOWN"; Detail = "no registry record"; Record = $null }
+        return @{ Found = $false; State = "UNKNOWN"; Detail = "no registry record$($a.Note)"; Record = $null; Anonymous = @() }
     }
     # More than one match on a prefix: fence them all and report the most-alive, because the caller is
     # about to decide whether it is safe to disturb something.
@@ -259,7 +394,17 @@ function Get-SessionLiveness {
     foreach ($h in $hit) {
         $l = Test-RecordLiveness -Record $h.Record -StartSkewMinutes $StartSkewMinutes
         if (-not $best -or $rank[$l.State] -lt $rank[$best.State]) {
-            $best = @{ Found = $true; State = $l.State; Detail = $l.Detail; Record = $h.Record }
+            $best = @{ Found = $true; State = $l.State; Detail = $l.Detail; Record = $h.Record; Anonymous = @() }
+        }
+    }
+    if ($best.State -in @('DEAD', 'STALE')) {
+        $a = & $anonymousVeto
+        if ($a.Veto) {
+            $best.Detail = "its record reads $($best.State) ($($best.Detail)), $($a.Note)"
+            $best.State = "UNREADABLE"
+            $best.Anonymous = $a.Anonymous
+        } elseif ($a.Note) {
+            $best.Detail = "$($best.Detail)$($a.Note)"
         }
     }
     return $best

@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Write the retirement tombstone into this clone's shared BACKLOG allocation registry, so a stale
+    Write the retirement tombstone into this clone's local BACKLOG allocation registry, so a stale
     pre-retirement copy of alloc.ps1 issues an absurd number instead of one the vault already uses.
 
 .DESCRIPTION
@@ -96,24 +96,25 @@ $resolved = (& git --git-dir=$($GitCommonDir.Trim()) rev-parse --path-format=abs
 if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "-GitCommonDir '$GitCommonDir' is not a git directory." }
 $GitCommonDir = $resolved.Trim()
 
-# coord-root.ps1 is required; without it this refuses rather than guess (docs/COORD-SHARED-ROOT.md).
+# coord-root.ps1 supplies only the record's host stamp now (Get-CoordHost, the name every reader
+# of a host field compares). Without it this refuses rather than stamp a host some other way.
 $coordRootScript = Join-Path $PSScriptRoot 'coord-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
-    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the coordination root cannot be resolved and nothing was read or written.")
+    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- $coordRootScript is missing, so the record's host cannot be stamped and nothing was read or written.")
     exit 4
 }
 . $coordRootScript
 $thisHost = Get-CoordHost
 
-# The allocation registry may live on the shared root, and a tombstone written beside a local copy
-# would lift no allocator that reads the shared one. It refuses rather than fall back, -Check
-# included, with an exit code of its own so a caller cannot read the refusal as ABSENT.
-$allocDir = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
-if ($allocDir.Error) {
-    [Console]::Error.WriteLine("tombstone-retired-backlog-allocator.ps1: REFUSED -- the allocation registry could not be resolved, so nothing was read or written: $($allocDir.Error)")
-    exit 4
-}
-$registry = Join-Path $allocDir.Path "backlog"
+# THE LOCAL REGISTRY, ALWAYS, AND NEVER THE SHARED ROOT (BACKLOG #5492). Every pre-retirement
+# alloc.ps1 predates the shared root (docs/COORD-SHARED-ROOT.md, approved 2026-10-21) and reads only
+# <common>/mefor-coord/alloc/backlog, which that document's migration keeps in place for this record.
+# This script used to resolve alloc through coord-root.ps1, so with a root configured it would have
+# written and checked the tombstone only on the share, which no stale copy reads, while -Check said
+# PRESENT. The share helps no stale copy, and it can hurt: at least a share another repository also
+# names could carry the record to a LIVE allocator. So it stays off the share. (A vault worktree of
+# THIS clone shares the local registry instead; the header's ONE SHARED-REGISTRY CASE covers it.)
+$registry = Join-Path (Join-Path (Join-Path $GitCommonDir 'mefor-coord') 'alloc') 'backlog'
 $file = Join-Path $registry "$TombstoneNumber.json"
 
 function Test-IsTombstone([string]$Path) {
@@ -124,6 +125,19 @@ function Test-IsTombstone([string]$Path) {
 }
 
 if ($Check) {
+    # A tombstone on a configured share was never this script's to write there (an older revision
+    # did), and it could lift a live allocator that reads that share. Warn; never write or remove it,
+    # and leave the exit code to the local registry. An unresolvable share is skipped silently.
+    $shared = Resolve-CoordDir -From $GitCommonDir -Kind 'alloc' -LocalRoot (Join-Path $GitCommonDir 'mefor-coord')
+    if (-not $shared.Error -and $shared.Source -ne 'local') {
+        $sharedFile = Join-Path (Join-Path $shared.Path 'backlog') "$TombstoneNumber.json"
+        # A root that names this clone's own mefor-coord, by any spelling, is the local registry:
+        # warning about it would send an operator to delete the one tombstone stale copies read.
+        $isLocal = [System.IO.Path]::GetFullPath($sharedFile).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($file).TrimEnd('\')
+        if (-not $isLocal -and (Test-Path -LiteralPath $sharedFile)) {
+            Write-Host "WARNING: a record sits at $sharedFile on the shared root. This script never writes there, and a live allocator reading that share would be lifted by it; check it and remove it by hand."
+        }
+    }
     if (-not (Test-Path -LiteralPath $file)) {
         Write-Host "ABSENT: $file"
         exit 1
