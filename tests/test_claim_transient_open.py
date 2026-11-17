@@ -631,41 +631,15 @@ def test_the_postgres_unopened_item_carries_the_fault() -> None:
 # --- the fault T17 logs holds no claimed row's plaintext (BACKLOG #6706) --------------------------
 
 
-def _frames(exc: BaseException) -> list[Any]:
-    """Every frame ``exc`` reaches: each traceback entry's frame and its ``f_back`` callers, for
-    ``exc`` and for every exception on its ``__cause__``/``__context__`` chain."""
-    frames: list[Any] = []
-    seen_exc: set[int] = set()
-    seen_frames: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    while pending:
-        cur = pending.pop()
-        if cur is None or id(cur) in seen_exc:
-            continue
-        seen_exc.add(id(cur))
-        pending += [cur.__cause__, cur.__context__]
-        tb = cur.__traceback__
-        while tb is not None:
-            frame: Any = tb.tb_frame
-            while frame is not None and id(frame) not in seen_frames:
-                seen_frames.add(id(frame))
-                frames.append(frame)
-                frame = frame.f_back
-            tb = tb.tb_next
-    return frames
-
-
-def _payloads_in(value: Any) -> set[str]:
-    values = value if isinstance(value, (list, tuple)) else [value]
-    return {v.payload for v in values if isinstance(v, OutboxItem) and v.payload}
-
-
 async def test_the_fault_t17_logs_holds_no_claimed_payload(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Row one opens and its body runs; the outage hits row two. The exception T17 logs is a fresh
-    fault with no chain, and no frame it reaches, through its traceback, a caller's ``f_back`` or
-    its cause and context, holds row one's plaintext."""
+    fault that was never raised: it has no traceback, cause or context, so logging it reaches no
+    frame at all, and none of the dispatcher's frames, whose ``items`` hold row one's plaintext.
+
+    The property is asserted directly. A walk of the frames the fault reaches, checked for row
+    one's plaintext, would walk nothing here and pass on nothing."""
     from messagefoundry.pipeline.stage_dispatcher import _LanePhase  # noqa: PLC0415
     from tests.test_stage_dispatcher import (  # noqa: PLC0415
         ManualClock,
@@ -695,9 +669,9 @@ async def test_the_fault_t17_logs_holds_no_claimed_payload(
         assert len(seen) == 1
         fault = seen[0]
         assert isinstance(fault, QueueOpenFault)
-        assert (fault.__cause__, fault.__context__) == (None, None)
-        leaked = {p for f in _frames(fault) for v in f.f_locals.values() for p in _payloads_in(v)}
-        assert leaked == set(), "a frame the logged fault reaches holds claimed plaintext"
+        assert (fault.__traceback__, fault.__cause__, fault.__context__) == (None, None, None), (
+            "the logged fault was raised or chained, so it reaches a frame that may hold plaintext"
+        )
     finally:
         await d.stop()
         await store.close()
