@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports import file as file_mod
 from messagefoundry.transports.file import FileSource, ScanRejected, set_scan_hook
+from tests._share_fault import unlistable_dir
 
 _HL7 = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL5717|P|2.5.1\rPID|1||12345\r"
 _PDF = b"%PDF-1.7 not an HL7 message"
@@ -799,3 +800,48 @@ async def test_a_copy_left_in_error_waits_like_a_lasting_failure(
     stays = [r for r in caplog.records if "stays in place" in r.message]
     assert stays, "the line was logged at all"
     assert sum(r.levelno >= logging.WARNING for r in stays) == 1
+
+
+async def test_a_failed_listing_is_logged_once_per_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A watch directory gone for many polls writes one WARNING when the listing starts failing and
+    one line when it recovers, not one per poll; a second outage is logged again.
+
+    Mutation: always log the failure at WARNING. Red: one WARNING per scan."""
+    caplog.set_level(logging.INFO, logger=file_mod.logger.name)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    away = tmp_path / "away"
+
+    def lines(text: str, level: int) -> int:
+        return sum(text in r.getMessage() and r.levelno == level for r in caplog.records)
+
+    for outage in (1, 2):
+        rig.inbox.rename(away)
+        for _ in range(4):
+            await rig.scan()
+        assert lines("could not list", logging.WARNING) == outage
+        away.rename(rig.inbox)
+        await rig.scan()
+        assert lines("can list its watch directory again", logging.INFO) == outage
+        assert not rig.source._listing_failed
+
+
+async def test_an_unlistable_watch_directory_is_a_failed_listing(tmp_path: Path) -> None:
+    """A watch directory that exists but cannot be listed (the unreachable share on Windows, a
+    mode-000 directory on POSIX) is a failed listing, though ``Path.glob`` answers ``[]`` for it."""
+    with unlistable_dir(tmp_path) as folder:
+        source = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(folder)}))
+        assert source._candidates() == []
+        assert source._listing_failed
+
+
+async def test_an_empty_watch_directory_is_not_a_failed_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty drop lists as empty, so the memories are pruned as usual. (An empty Windows drive
+    root, where ``os.scandir`` would fail, is why the check uses ``os.listdir``; no test host here
+    has one to point at.)"""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    assert await rig.scan() == []
+    assert not rig.source._listing_failed

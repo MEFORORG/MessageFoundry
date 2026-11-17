@@ -978,6 +978,8 @@ class FileSource(SourceConnector):
         self._stuck_full_logged = False
         # Set by _candidates when this scan's listing failed, so the scan prunes no memory on it.
         self._listing_failed = False
+        # Whether the listing failed last time, so its WARNING is written once per outage.
+        self._listing_down = False
         # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188).
         self._label = config.name or str(self.directory)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
@@ -1963,23 +1965,32 @@ class FileSource(SourceConnector):
         for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
         try:
-            # Opened first because Path.glob and rglob return nothing, rather than raising, for a
-            # watch directory that is missing or unreadable (Python 3.13 and later), which would
-            # read as an empty drop and prune every memory on it (BACKLOG #5717).
-            with os.scandir(self.directory):
-                pass
             matched = list(globber(self.pattern))
+            if not matched:
+                # Path.glob and rglob return nothing, rather than raising, for a watch directory
+                # that is missing or unreadable, which would read as an empty drop and prune every
+                # memory on it (BACKLOG #5717). So an empty result is checked by a listing that
+                # raises. os.listdir, not os.scandir: on Windows scandir fails on an empty drive
+                # root, which has no entries at all, and listdir returns [] there.
+                os.listdir(self.directory)
         except (OSError, ValueError) as exc:
             # Watch dir vanished/unreadable, or an invalid glob pattern: treat as "nothing this
             # scan" (logged) rather than letting it propagate and kill the poller (review H-4).
-            logger.warning(
+            # WARNING when it starts failing and DEBUG while it stays failed, so a directory gone
+            # for a weekend does not write a WARNING per poll.
+            logger.log(
+                logging.DEBUG if self._listing_down else logging.WARNING,
                 "file source could not list %s (pattern %r): %s",
                 self.directory,
                 self.pattern,
                 _describe_os_error(exc),
             )
+            self._listing_down = True
             self._listing_failed = True
             return []
+        if self._listing_down:
+            self._listing_down = False
+            logger.info("file source %s can list its watch directory again", self.directory)
         files = [
             p
             for p in matched
