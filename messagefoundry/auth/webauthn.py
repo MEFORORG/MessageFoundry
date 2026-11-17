@@ -167,11 +167,9 @@ def _supported_pub_key_algs() -> list[COSEAlgorithmIdentifier]:
 
 
 def _invalid_input_errors() -> tuple[type[Exception], ...]:
-    """Exceptions py_webauthn raises for bad input, which must reach the audited path.
-
-    Not every one it raises: at least :func:`_invalid_response_errors` adds ``RecursionError``
-    around both ceremonies' verify calls, and :func:`verify_registration` adds ``AttributeError``
-    around its own (vault BACKLOG #5341).
+    """Exceptions py_webauthn raises for bad input, caught around its key-decoding calls in
+    :func:`_require_usable_public_key`. Both ceremonies' verify calls catch every ``Exception``
+    instead (vault BACKLOG #5341).
 
     ``WebAuthnException`` is the library's own base class. The next three entries catch four raw
     exception types (``LookupError`` covers both ``KeyError`` and ``IndexError``) that it lets
@@ -189,54 +187,6 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
     from webauthn.helpers.exceptions import WebAuthnException
 
     return (WebAuthnException, LookupError, TypeError, ValueError)
-
-
-def _invalid_response_errors() -> tuple[type[Exception], ...]:
-    """:func:`_invalid_input_errors` plus ``RecursionError``, caught around the whole library verify
-    call of each ceremony (vault BACKLOG #5341). Read and run on the installed webauthn 3.0.1:
-
-    * Its credential-JSON parsers (``parse_registration_credential_json``,
-      ``parse_authentication_credential_json``) catch only ``JSONDecodeError`` around their
-      ``json.loads``, so a credential handed to the library as text and nested too deep for the
-      stack raises ``RecursionError`` unwrapped. A caller that hands it an already-parsed dict
-      does not reach that parse.
-    * At least the ``android-safetynet`` attestation check also ``json.loads`` the JWS header and
-      payload with no guard, and ``verify_registration_response`` calls it outside any ``try``.
-    * The library's ``clientDataJSON`` parse is not a source: both verify functions call it inside
-      ``except Exception`` and re-raise ``InvalidRegistrationResponse`` or
-      ``InvalidAuthenticationResponse``, which :func:`_invalid_input_errors` already holds.
-
-    A ``RecursionError`` message names stack use, not the input. Because a source sits inside the
-    call as well as at its entry, the catch stays around the whole call, not one parse.
-
-    The stored key is not such a source: the library's CBOR decodes, the stored key's included, go
-    through its ``parse_cbor``, which wraps every ``Exception`` as ``InvalidCBORData`` (read on
-    webauthn 3.0.1). A caller that parses the body itself is not reached by this catch, so it
-    must catch its own parse's ``RecursionError``, as at least the web console's passkey routes
-    do."""
-    return (*_invalid_input_errors(), RecursionError)
-
-
-def _attestation_certificate_errors() -> tuple[type[Exception], ...]:
-    """Raw ``cryptography`` exceptions an attacker-supplied attestation certificate raised straight
-    out of ``verify_registration_response`` (BACKLOG #5341). Each derives from ``Exception`` alone,
-    so :func:`_invalid_input_errors` does not hold it. Reproduced on webauthn 3.0.1 and
-    cryptography 50.0.2. :func:`verify_registration` passes the library no root certificates, so
-    its chain check passes and the certificate is parsed as sent:
-
-    * ``UnsupportedAlgorithm``: a ``packed`` statement whose ``x5c`` leaf names a key algorithm
-      cryptography does not know. The library calls ``public_key()`` on it.
-    * ``InvalidVersion``: a ``packed`` or ``tpm`` leaf whose version field is not one X.509
-      defines. ``load_der_x509_certificate`` raises it.
-    * ``DuplicateExtension``: a ``tpm`` leaf carrying one extension twice, once its signature over
-      ``certInfo`` verifies. The library reads ``extensions`` on it.
-
-    Registration only: the assertion ceremony parses no certificate. A function, so this module
-    keeps its third-party imports inside the functions that use them."""
-    from cryptography.exceptions import UnsupportedAlgorithm
-    from cryptography.x509 import DuplicateExtension, InvalidVersion
-
-    return (UnsupportedAlgorithm, InvalidVersion, DuplicateExtension)
 
 
 def _refusal(exc: Exception, *, ceremony: _Ceremony) -> WebAuthnVerificationError:
@@ -632,16 +582,9 @@ def verify_registration(
     _require_webauthn()
     from webauthn import verify_registration_response
 
-    # Resolved before the ``try`` so the AttributeError catch below covers the library call alone
-    # and not our code before it. Inside the call it would also catch a bad argument of ours
-    # reaching the library (a non-str ``rp_id`` or ``origin``); the arguments are typed ``str``,
-    # and :func:`_refusal` logs the type at WARNING, so such a bug is not silent.
+    # Resolved before the ``try`` so the catch below covers the library call alone and not our
+    # code before it.
     supported_algs = _supported_pub_key_algs()
-    refused: tuple[type[Exception], ...] = (
-        *_invalid_response_errors(),
-        AttributeError,
-        *_attestation_certificate_errors(),
-    )
     try:
         verified = verify_registration_response(
             credential=response_json,
@@ -650,19 +593,9 @@ def verify_registration(
             expected_origin=origin,
             supported_pub_key_algs=supported_algs,
         )
-    except refused as exc:
-        # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
-        # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
-        # ...) — every library-side rejection must land on the audited return-False/400 path,
-        # never an unhandled 500. That is the aim, not a proof: a raw type outside this tuple
-        # still escapes. The raw decode errors join it for the same reason (BACKLOG #1166): a
-        # malformed COSE key raised them straight out of this call. More join only here, at
-        # registration (vault BACKLOG #5341). The attestation-certificate errors, and what raised
-        # each, are in :func:`_attestation_certificate_errors`. AttributeError: webauthn 3.0.1's
-        # android-safetynet check calls ``.decode`` on the attestation statement's ``response``
-        # and ``.get`` on the decoded JWS header and payload with no type check, so a non-bytes
-        # ``response``, or a header or payload decoding to ``null``, a list or a number, raised it
-        # straight out of this call.
+    except Exception as exc:
+        # Every exception from the library call is the audited refusal (vault BACKLOG #5341), and
+        # :func:`_refusal` logs the type of any raw one at WARNING.
         raise _refusal(exc, ceremony="registration") from exc
     _require_usable_public_key(verified.credential_public_key, ceremony="registration")
     return RegistrationResult(
@@ -755,12 +688,11 @@ def verify_assertion(
             credential_public_key=public_key,
             credential_current_sign_count=current_sign_count,
         )
-    except _invalid_response_errors() as exc:
-        # The BASE class, deliberately (PR-A review HIGH): malformed input raises siblings of
-        # InvalidAuthenticationResponse — every rejection lands audited, never a 500. The
-        # sign-count regression message ("...sign count...") still rides through for the
-        # service's clone-signal classification. The raw types stay caught although the stored
-        # key was screened above: the response itself is attacker input too.
+    except Exception as exc:
+        # Every exception from the library call is the audited refusal (vault BACKLOG #5341), and
+        # :func:`_refusal` logs the type of any raw one at WARNING. The sign-count regression
+        # message ("...sign count...") still rides through for the service's clone-signal
+        # classification.
         raise _refusal(exc, ceremony="assertion") from exc
     return AssertionResult(verified.new_sign_count, bool(verified.user_verified))
 

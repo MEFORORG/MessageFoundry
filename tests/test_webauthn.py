@@ -1955,11 +1955,15 @@ _EC_PUBLIC_KEY_OID, _UNKNOWN_KEY_OID = "06072a8648ce3d0201", "06072a8648ce3d0209
 _VERSION_3, _VERSION_5 = "a003020102", "a003020105"
 #: The id-ce-keyUsage OID and the id-ce-basicConstraints OID (id-ce arcs 15 and 19), one length.
 _KEY_USAGE_OID, _BASIC_CONSTRAINTS_OID = "0603551d0f", "0603551d13"
+#: A subjectAltName GeneralName: a directoryName holding an empty Name, and the same bytes tagged
+#: x400Address and ediPartyName, two forms cryptography does not support.
+_DIRECTORY_NAME, _X400_ADDRESS, _EDI_PARTY_NAME = "a4023000", "a3023000", "a5023000"
 
 
-def _attestation_cert() -> tuple[bytes, Any]:
+def _attestation_cert(*, san: bool = False) -> tuple[bytes, Any]:
     """A self-signed P-256 leaf in DER, and its private key. Its subject is empty and it carries
-    BasicConstraints then KeyUsage, so the library's tpm check reads it as far as its extensions."""
+    BasicConstraints then KeyUsage, so the library's tpm check reads it as far as its extensions.
+    With ``san`` it also carries a subjectAltName holding one empty directoryName."""
     import datetime
 
     from cryptography import x509
@@ -1970,7 +1974,7 @@ def _attestation_cert() -> tuple[bytes, Any]:
 
     key = ec.generate_private_key(ec.SECP256R1())
     start = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([]))
         .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "t")]))
@@ -1983,8 +1987,12 @@ def _attestation_cert() -> tuple[bytes, Any]:
             x509.KeyUsage(True, False, False, False, False, False, False, False, False),
             critical=False,
         )
-        .sign(key, hashes.SHA256())
     )
+    if san:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DirectoryName(x509.Name([]))]), critical=True
+        )
+    cert = builder.sign(key, hashes.SHA256())
     return cert.public_bytes(Encoding.DER), key
 
 
@@ -1994,9 +2002,12 @@ def _patched(der: bytes, old: str, new: str) -> bytes:
     return der.replace(bytes.fromhex(old), bytes.fromhex(new))
 
 
-def _attested_registration(fmt: str, patch: tuple[str, str] | None) -> tuple[str, bytes]:
+def _attested_registration(
+    fmt: str, patch: tuple[str, str] | None, *, san: bool = False
+) -> tuple[str, bytes]:
     """A registration response re-labelled ``fmt``, its statement carrying a leaf certificate
-    patched by ``patch`` (``None`` leaves it intact), and its challenge.
+    patched by ``patch`` (``None`` leaves it intact), and its challenge. ``san`` is passed to
+    :func:`_attestation_cert`.
 
     The ``tpm`` statement is built to pass every check the library runs before it parses the
     leaf: ``pubArea`` names the credential's own P-256 point, ``certInfo`` carries the hashes the
@@ -2013,7 +2024,7 @@ def _attested_registration(fmt: str, patch: tuple[str, str] | None) -> tuple[str
     soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
     response = json.loads(soft.create_response(challenge))
     attestation = parse_cbor(base64url_to_bytes(response["response"]["attestationObject"]))
-    der, key = _attestation_cert()
+    der, key = _attestation_cert(san=san)
     leaf = der if patch is None else _patched(der, *patch)
     if fmt == "packed":
         statement: dict[str, Any] = {"alg": -7, "sig": b"\x30\x00", "x5c": [leaf]}
@@ -2067,6 +2078,18 @@ def _attested_registration(fmt: str, patch: tuple[str, str] | None) -> tuple[str
             "DuplicateExtension",
             id="tpm-duplicate-extension",
         ),
+        pytest.param(
+            "tpm",
+            (_DIRECTORY_NAME, _X400_ADDRESS),
+            "UnsupportedGeneralNameType",
+            id="tpm-san-x400-address",
+        ),
+        pytest.param(
+            "tpm",
+            (_DIRECTORY_NAME, _EDI_PARTY_NAME),
+            "UnsupportedGeneralNameType",
+            id="tpm-san-edi-party-name",
+        ),
     ],
 )
 def test_a_malformed_attestation_certificate_is_the_audited_refusal(
@@ -2075,7 +2098,8 @@ def test_a_malformed_attestation_certificate_is_the_audited_refusal(
     """vault BACKLOG #5341, at this module's seam only: the refusal the service audits. Red:
     cryptography raised each of these on an attacker-supplied leaf, and it escaped
     verify_registration as itself, which the route would have served as a 500."""
-    response_json, challenge = _attested_registration(fmt, patch)
+    san = patch[0] == _DIRECTORY_NAME
+    response_json, challenge = _attested_registration(fmt, patch, san=san)
     with (
         caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
         pytest.raises(wa.WebAuthnVerificationError) as excinfo,
@@ -2088,18 +2112,21 @@ def test_a_malformed_attestation_certificate_is_the_audited_refusal(
 
 
 @pytest.mark.parametrize(
-    ("fmt", "refusal"),
+    ("fmt", "san", "refusal"),
     [
-        pytest.param("packed", "Could not verify attestation statement signature", id="packed"),
-        pytest.param("tpm", "subjectAltName", id="tpm"),
+        pytest.param(
+            "packed", False, "Could not verify attestation statement signature", id="packed"
+        ),
+        pytest.param("tpm", False, "subjectAltName", id="tpm"),
+        pytest.param("tpm", True, "Subject Alt Name was invalid", id="tpm-san"),
     ],
 )
 def test_an_intact_attestation_certificate_is_parsed_past_where_the_patched_ones_fail(
-    fmt: str, refusal: str
+    fmt: str, san: bool, refusal: str
 ) -> None:
     """Positive control for the test above: with the leaf intact, the library parses it and
     refuses later, on purpose. So each patched leaf, not the statement around it, raised there."""
-    response_json, challenge = _attested_registration(fmt, None)
+    response_json, challenge = _attested_registration(fmt, None, san=san)
     with pytest.raises(wa.WebAuthnVerificationError, match=refusal) as excinfo:
         wa.verify_registration(
             response_json=response_json, challenge=challenge, rp_id=RP, origin=ORIGIN
