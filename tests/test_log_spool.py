@@ -774,11 +774,41 @@ def test_a_segment_that_is_gone_is_retired_and_the_rest_still_replays(spool_dir:
         first = _segments(spool_dir)[0]
         lost = [json.loads(line)["line"] for line in first.read_bytes().splitlines()]
         first.unlink()
-        assert spool.peek() is None  # the pass that finds it gone
+        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+        # The pass that finds it gone moves on to the next segment rather than reading as drained
+        # (BACKLOG #5811). NEGATIVE CONTROL: before the fix this peek answered None and `pending`
+        # read False with five records still spooled.
+        entry = spool.peek()
+        assert entry is not None and entry.line == expected[0]
+        assert spool.pending
         assert spool.unreadable == 1
         assert spool.read_errors == 0
-        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
         assert lost and _drain(spool) == expected
+    finally:
+        spool.close()
+
+
+def test_two_segments_gone_in_a_row_are_both_passed_over(spool_dir: Path) -> None:
+    """One peek walks past every missing segment at the head, however many, to the oldest one left."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    try:
+        for n in range(8):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 3
+        gone = [
+            json.loads(line)["line"]
+            for path in segments[:2]
+            for line in path.read_bytes().splitlines()
+        ]
+        for path in segments[:2]:
+            path.unlink()
+        expected = [f"record {n:04d}" for n in range(8) if f"record {n:04d}" not in gone]
+        entry = spool.peek()
+        assert entry is not None and entry.line == expected[0]
+        assert spool.unreadable == 2
+        assert _drain(spool) == expected
     finally:
         spool.close()
 

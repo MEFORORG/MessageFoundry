@@ -412,26 +412,30 @@ class LogSpool:
         now. Idempotent until :meth:`advance`.
 
         A read error never escapes: ``QueueListener`` catches only ``queue.Empty``, so an exception
-        here would end the listener thread for good. Only a segment that is GONE is retired; any
-        other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
+        here would end the listener thread for good. Only a segment that is GONE is retired, and the
+        read then moves on to the next segment: answering ``None`` there would read as drained, and
+        the forwarder would send live records ahead of the older ones still spooled (BACKLOG #5811).
+        Any other ``OSError`` (out of descriptors, a sharing violation) keeps every file and returns
         ``None``, so the caller tries again later instead of deleting undelivered records."""
-        try:
-            entry = self._peek()
-            self.read_faulted = False
-            return entry
-        except FileNotFoundError:
-            self.unreadable += 1
-            seq = self._segments[0] if self._segments else None
-            if seq is not None:
+        while True:
+            try:
+                entry = self._peek()
+                self.read_faulted = False
+                return entry
+            except FileNotFoundError:
+                self.unreadable += 1
+                if not self._segments:
+                    return None
+                # Each pass retires one segment, so the loop ends with the segments.
+                seq = self._segments[0]
                 if seq == self._write_seq:
                     self._close_writer()
                 self._retire(seq)
-            return None
-        except OSError:
-            self.read_errors += 1
-            self.read_faulted = True
-            self._close_reader()
-            return None
+            except OSError:
+                self.read_errors += 1
+                self.read_faulted = True
+                self._close_reader()
+                return None
 
     def _close_reader(self) -> None:
         if self._reader is not None:
