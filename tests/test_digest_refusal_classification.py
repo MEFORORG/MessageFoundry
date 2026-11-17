@@ -984,8 +984,8 @@ def test_an_accepted_proxy_credential_crossing_is_still_recorded(
 # --- the early refusal is for a caller that builds the provider the settings name -----------------
 #
 # Vault BACKLOG #2989, review round 3. ``rest.proxy_auth_handler_from_settings`` runs the token
-# hop's Digest refusal early only for the REST and FHIR outbounds, which build their bearer with
-# ``bearer_provider_from_settings``. A DICOMweb outbound builds no token provider, and a FhirLookup
+# hop's Digest refusal early only for the REST and FHIR outbounds, which pass
+# ``builds_token_hop``. A DICOMweb outbound builds no token provider, and a FhirLookup
 # builds SMART only, so OAuth2 settings on either name a provider that is never built. Each fails
 # on 19540d5bb7, where the early refusal read the settings for every caller.
 
@@ -1072,8 +1072,8 @@ def test_a_dicomweb_outbound_with_token_settings_behind_a_digest_proxy_builds(
 
 
 def test_the_early_refusal_checks_the_token_url_before_it_reads_it() -> None:
-    """Review round 3, F4: the early refusal runs the provider's own token URL check first, so the
-    Digest rule never reads a URL the provider would refuse. A token URL holding a credential is
+    """Review round 3, F4: the early refusal runs the provider's own ``_check_token_url`` first, so
+    a URL that check refuses is refused for itself. A token URL holding a credential is
     refused for the credential, as the provider refuses it. On 19540d5bb7 it was refused as a
     Digest token hop instead."""
     from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop

@@ -2324,11 +2324,11 @@ def proxy_auth_handler_from_settings(
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
     ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007).
 
-    ``builds_token_hop`` is set by a caller that builds its bearer provider with
-    ``http_auth.bearer_provider_from_settings`` (the REST and FHIR outbounds). For it a Digest
-    credential also meets ``http_auth.refuse_a_digest_proxy_on_the_token_hop`` here, before the
-    guard below. Every other caller leaves it unset: its token hop, if any, keeps the later refusal
-    in ``smart._TokenEndpointProvider._open_token_hop``."""
+    ``builds_token_hop`` is set by the REST and FHIR outbounds only. For them a Digest credential
+    also meets ``http_auth.refuse_a_digest_proxy_on_the_token_hop`` here, before the guard below.
+    Every other caller leaves it unset, the SOAP outbound included, although it builds its bearer
+    the same way: its token hop, if any, keeps the later refusal in
+    ``smart._TokenEndpointProvider._open_token_hop``, after the guard."""
     user = s.get("proxy_user")
     password = s.get("proxy_password")
     auth_type = s.get("proxy_auth_type")
