@@ -636,8 +636,10 @@ def generated_pair_may_be_replaced(
     pair already on disk: a renewal, or the recovery of an unusable or half-written pair, each of
     which it reports as a :class:`GeneratedPairReplaced`. A first-run mint replaces nothing and
     answers ``False``. Read-only: it writes nothing and takes no lock, so a start can run a
-    refusal first and leave the pair as it found it on a refused start (BACKLOG #4934). A pair that
-    changes on disk between this call and the mint is decided again there."""
+    refusal first and leave the pair as it found it on a refused start (BACKLOG #4934). ``serve``
+    and ``supervise`` pass a ``False`` answer to the mint as ``renew=False``, so a pair that falls
+    due after this call is not renewed there; whether a pair that stops loading after this call is
+    recovered is still decided again at the mint."""
     if plan_api_tls_material(api, state_dir=state_dir).source != "generated":
         return False
     cert_path, key_path = _generated_pair(state_dir)
@@ -686,7 +688,9 @@ def ensure_api_tls_material(
     certificate while its siblings keep the old one in memory. So ``supervise`` renews before it
     spawns any shard, and a shard only reuses a pair that loads, due or not. It still mints on a
     first run and still recovers a pair that does not load, because it has nothing else to serve.
-    **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
+    A plain ``serve`` and ``supervise`` also pass ``renew=False`` when
+    :func:`generated_pair_may_be_replaced` found nothing to replace, so they renew only a pair that
+    check found due (BACKLOG #4934). **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
     the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
     and only a pair that does not load or has expired lets the error propagate. Other errors, such
     as a ``[api].host`` the certificate builder refuses, still stop the start.

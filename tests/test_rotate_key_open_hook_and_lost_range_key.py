@@ -338,10 +338,12 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_supervise_star
     assert _audit_rows(db) == before
 
 
-def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_serve_start(
+def test_a_pair_falling_due_mid_start_is_not_renewed_by_serve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#4934: as the supervise test above, for serve, whose lifespan refuses after the mint."""
+    """#4934: as the supervise test above, for serve. The read-only check finds the pair fresh, so
+    no early refusal runs, and the mint must not renew it either: this store's lifespan would
+    refuse before auditing a renewal. The lifespan itself is not run here."""
     db, key_a, key_b = tmp_path / "messagefoundry.db", generate_key(), generate_key()
     asyncio.run(_seed(db, tmp_path / "uploads", key_a))
     minted = _mint_a_pair_that_falls_due_after_the_first_check(tmp_path, monkeypatch)
@@ -349,7 +351,8 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_serve_start(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)
     # The enforce-only start gates (an off-box log collector, ...) are not under test here.
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    started: list[object] = []
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: started.append(a))
     (tmp_path / "messagefoundry.toml").write_text(
         "security.block_unlisted_outbound = true\n"
         "alerts.security_notifications_required = false\n"
@@ -357,7 +360,9 @@ def test_a_pair_falling_due_mid_start_is_not_renewed_by_a_refused_serve_start(
         encoding="utf-8",
     )
     samples = Path(__file__).resolve().parent.parent / "samples" / "config"
-    main(["serve", "--config", str(samples), "--env", "dev"])
+    # Positive control: the start ran past the mint and reached the server.
+    assert main(["serve", "--config", str(samples), "--env", "dev"]) == 0
+    assert len(started) == 1
     assert (tmp_path / "api-generated-cert.pem").read_bytes() == minted
 
 

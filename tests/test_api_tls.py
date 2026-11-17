@@ -5452,7 +5452,8 @@ def test_plain_serve_renews_and_an_engine_shard_never_does(
     reuses it untouched: `supervise` renews for the whole fleet before spawning, so one restarted
     shard can never serve a certificate its siblings do not.
 
-    Mutation: drop ``renew=args.shard is None``. Red: the shard row renews."""
+    Mutation: drop ``args.shard is None`` from both the read-only check's ``renew`` and the mint's.
+    Red: the shard row renews. Dropping it from either one alone stays green."""
     cert = tmp_path / _GENERATED_CERT_NAME
     _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
     old = cert.read_bytes()
