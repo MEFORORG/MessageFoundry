@@ -474,6 +474,49 @@ async def test_one_account_cannot_evict_another_sessions_count(
         await store.close()
 
 
+async def test_an_account_at_its_cap_keeps_every_live_count_and_a_new_session_meets_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: at the per-account cap the account's oldest LIVE count was dropped, so round-
+    robin guesses over more sessions than the cap each got a fresh budget. Now no live count goes:
+    a new session is answered at the cap, so its caller revokes it."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        assert service._charge_reproof_failure("s-0", "u-bob") == 1
+        assert service._charge_reproof_failure("s-0", "u-bob") == 2
+        assert service._charge_reproof_failure("s-1", "u-bob") == 1
+        assert service._charge_reproof_failure("s-2", "u-bob") == 5, "a new session was tracked"
+        assert service._session_reproof_failures("s-0") == 2, "a live count was evicted"
+        assert service._session_reproof_failures("s-1") == 1
+        assert "s-2" not in service._reproof_session_failures
+        # Another account is not touched by bob's cap.
+        assert service._charge_reproof_failure("s-other", "u-other") == 1
+    finally:
+        await store.close()
+
+
+async def test_an_account_at_its_cap_prunes_its_expired_counts_before_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: an entry older than the absolute session lifetime belongs to no live session,
+    so it goes first when the account is at its cap, even with the map itself far from full."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        lifetime = service._settings.session_absolute_hours * 3600
+        long_ago = time.monotonic() - lifetime - 60
+        service._reproof_session_failures["old"] = (3, long_ago, "u-bob")
+        assert service._charge_reproof_failure("live", "u-bob") == 1
+        assert service._charge_reproof_failure("new", "u-bob") == 1, "the expired entry stayed"
+        assert "old" not in service._reproof_session_failures
+        assert service._session_reproof_failures("live") == 1
+    finally:
+        await store.close()
+
+
 async def test_a_lock_set_by_another_leg_during_the_verify_does_not_block_or_get_cleared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

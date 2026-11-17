@@ -891,10 +891,12 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
 # its entry is younger than the absolute session lifetime, because evicting it would hand that session
-# a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
-# full, a session with no entry yet is revoked on its first failed re-proof instead (fail closed). One
-# account may hold at most _REPROOF_SESSION_PER_USER entries, dropping its own oldest, so a single
-# account cannot fill the map.
+# a fresh budget. One account may hold at most _REPROOF_SESSION_PER_USER entries, so a single account
+# cannot fill the map. When the account is at that cap or the map is full, entries older than that
+# lifetime go first; if there is still no room, a session with no entry yet is revoked on its first
+# failed re-proof instead (fail closed). Before BACKLOG #5336 the per-account cap dropped the
+# account's own oldest LIVE count, so round-robin guesses over more sessions than the cap each got a
+# fresh budget.
 _REPROOF_SESSION_MAX = 4096
 _REPROOF_SESSION_PER_USER = 64
 
@@ -4244,7 +4246,7 @@ class AuthService:
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
-        # oldest evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
+        # never a live count evicted) and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the
         # same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
         # that serves the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
@@ -14900,15 +14902,17 @@ class AuthService:
             count, first, _ = existing
             failures[token_hash] = (count + 1, first, user_id)
             return count + 1
-        mine = [h for h, (_, _, uid) in failures.items() if uid == user_id]
-        if len(mine) >= _REPROOF_SESSION_PER_USER:
-            # This account's own oldest entry goes; no other account's count is touched.
-            del failures[mine[0]]
-        if len(failures) >= _REPROOF_SESSION_MAX:
+
+        def no_room() -> bool:
+            mine = sum(1 for _, _, uid in failures.values() if uid == user_id)
+            return mine >= _REPROOF_SESSION_PER_USER or len(failures) >= _REPROOF_SESSION_MAX
+
+        if no_room():
             lifetime = self._settings.session_absolute_hours * 3600
             for stale in [h for h, (_, seen, _) in failures.items() if now - seen > lifetime]:
                 del failures[stale]
-        if len(failures) >= _REPROOF_SESSION_MAX:
+        if no_room():
+            # No live count is dropped for this one, its account's own included (BACKLOG #5336).
             return max(self._policy.lockout_threshold, 1)
         failures[token_hash] = (1, now, user_id)
         return 1

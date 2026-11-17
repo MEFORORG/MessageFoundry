@@ -6893,9 +6893,9 @@ while the second-step lock is live. The sign-in lock does not stop it.
 resets it, and a topology that serves the API from several processes, such as `serve --shard` engine
 shards with their own API ports over one store, gives each process its own count, so a session reachable
 on K ports gets up to K times the budget. The count is also held in a bounded map, and a live count is never
-evicted: one account holds at most 64 entries and drops only its own oldest, entries older than the
-absolute session lifetime go when the map fills, and if it is still full a session with no entry yet
-is revoked on its first failed re-proof. That matters for AD, because since the AD sign-in was retired
+evicted: one account holds at most 64 entries, entries older than the absolute session lifetime go
+when the account is at that cap or the map fills, and if there is still no room a session with no
+entry yet is revoked on its first failed re-proof (BACKLOG #5336). That matters for AD, because since the AD sign-in was retired
 the step-up re-auth route is the **only** place an AD password is still bound: a rejected re-bind counts
 on the engine's own row and against the session. The engine never writes a lock to the directory
 account. Each rejected re-bind still reaches the DC, though: up to `lockout_threshold` counted ones per
