@@ -272,6 +272,48 @@ def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_unusable(token
         assert client.token == "before"
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"recovery_codes": ["code-one", "code-two"]},
+        {"recovery_codes": ["code-one", "code-two"], "token": None},
+        {"recovery_codes": ["code-one", "code-two"], "token": 7},
+    ],
+    ids=["no_token", "null_token", "non_string_token"],
+)
+def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_missing(
+    reply: dict[str, object],
+) -> None:
+    """A missing, null or non-string token loses the codes no less than a malformed string one
+    does, so the codes are read without requiring the token (BACKLOG #5344, review round one).
+
+    Mutation: decode the codes with ``MfaConfirmResponse``, whose ``token`` is a required str.
+    Red: ApiError ``token: Field required``."""
+    with _client_answering(json.dumps(reply).encode()) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one", "code-two")
+        assert confirmed.other_sessions is None
+        assert confirmed.token_adopted is False
+        assert client.token == "before"
+
+
+def test_confirm_mfa_adopts_a_sendable_token_even_when_the_codes_do_not_decode() -> None:
+    """The engine has rotated the session by the time it replies, so a sendable token is adopted
+    before the rest of the reply is read: a skewed ``other_sessions`` then raises ApiError, but
+    the client stays signed in on the new token (BACKLOG #5344, review round one).
+
+    Mutation: adopt the token only after the codes decode. Red: the token is still ``before``."""
+    reply = {"recovery_codes": ["code-one"], "token": "rotatedOK", "other_sessions": "many"}
+    with _client_answering(json.dumps(reply).encode()) as client:
+        client._token = "before"
+        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
+            client.confirm_mfa("123456")
+        assert client.token == "rotatedOK"
+    assert "code-one" not in str(excinfo.value) and "rotatedOK" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
 def test_confirm_mfa_adopts_a_sendable_token() -> None:
     """NEGATIVE CONTROL: a confirm reply with a sendable token is adopted and says so."""
     reply = json.dumps({"recovery_codes": ["code-one"], "token": "after"}).encode()

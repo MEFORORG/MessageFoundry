@@ -38,7 +38,6 @@ from messagefoundry.api.auth_models import (
     CurrentUser,
     CustomRoleInfo,
     LoginResponse,
-    MfaConfirmResponse,
     MfaDisableResponse,
     MfaEnrollResponse,
     MfaResetResponse,
@@ -168,8 +167,8 @@ class MfaConfirmed:
     or None when the engine could not count them. The rotated session token is not here: the
     client has already adopted it, unless ``token_adopted`` is False.
 
-    ``token_adopted`` is False when the reply carried codes but a rotated token this client cannot
-    send (BACKLOG #5344). The codes are still good and are returned, because the engine committed
+    ``token_adopted`` is False when the reply carried codes but no rotated token this client can
+    send: missing, null, or not sendable (BACKLOG #5344). The codes are still good and are returned, because the engine committed
     them before replying and will not show them again. The held token was left in place and may
     already be dead, since the engine rotated the session, so the caller should save the codes
     first and then sign in again."""
@@ -300,7 +299,8 @@ class _RotatedToken(BaseModel):
 
     Local rather than the engine's ``ElevatedResponse`` so that one token rule serves all three
     elevation routes, whose replies differ in their other fields. ``confirm_mfa`` checks its token
-    against this model after reading the recovery codes, rather than decoding the reply with it.
+    against this model on its own, apart from the recovery codes it reads with
+    :class:`_MfaConfirmCodes`.
 
     The token must be one this client can send: RFC 6750 token68 characters only, so no space,
     CR/LF or non-ASCII character that would break the header build, and short enough that
@@ -312,6 +312,17 @@ class _RotatedToken(BaseModel):
         max_length=MAX_REQUEST_HEADER_VALUE_LEN - len(_BEARER_PREFIX),
         pattern=r"^[A-Za-z0-9._~+/-]+=*$",
     )
+
+
+class _MfaConfirmCodes(BaseModel):
+    """The ``POST /me/mfa/confirm`` reply's codes and count, without its token (BACKLOG #5344).
+
+    Local rather than the engine's ``MfaConfirmResponse``, whose ``token`` is a required str, so
+    that a reply with a missing or unusable token still yields the one-time recovery codes.
+    :meth:`EngineClient.confirm_mfa` reads the token through :class:`_RotatedToken` instead."""
+
+    recovery_codes: list[str]
+    other_sessions: int | None = None
 
 
 class _UserListRow(RootModel[UserListEntry]):
@@ -1312,13 +1323,14 @@ class EngineClient:
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
         token is adopted here — the caller gets the codes and the count, never the token.
 
-        The reply is decoded once and the codes are read before the token is checked against the
-        same sendable-token rule :meth:`_adopt_rotated` applies (BACKLOG #5344). A reply that does
-        not decode raises :class:`ApiError` as before. A reply whose codes decode but whose token
-        this client cannot send does NOT raise: the codes are returned with ``token_adopted``
-        False, the held token is left in place and may be dead, and a value-free warning is
-        logged. Raising there would lose codes the engine has already committed and will not
-        show again; see :class:`MfaConfirmed`.
+        The token and the codes are read independently (BACKLOG #5344). A token that passes the
+        sendable-token rule :meth:`_adopt_rotated` applies is adopted first, whatever the rest of
+        the reply holds, since the engine has already rotated the session. A reply whose codes do
+        not decode then raises :class:`ApiError`. A reply whose codes decode but whose token is
+        missing, null or not sendable does NOT raise: the codes are returned with
+        ``token_adopted`` False, the held token is left in place and may be dead, and a value-free
+        warning is logged. Raising there would lose codes the engine has already committed and
+        will not show again; see :class:`MfaConfirmed`.
 
         ``enrolment_code`` is the single-use issued enrolment code (ADR 0207), which a
         directory account's first factor needs on a session its identity provider did not stamp.
@@ -1336,24 +1348,24 @@ class EngineClient:
         response = self._request(
             "POST", "/me/mfa/confirm", json=body, timeout=self._sign_in_timeout()
         )
-        # Decoded once, and the codes read before the token is checked: the engine has already
-        # committed them, so a token this client cannot send must not take them down with it.
-        confirmed = _decode(response, MfaConfirmResponse)
+        # The token and the codes are read independently. The engine has rotated the session and
+        # committed the codes before it replies, so neither half's failure may take the other down.
         try:
-            rotated: _RotatedToken | None = _RotatedToken(token=confirmed.token)
-        except ValidationError:  # its text quotes the token, so it is neither logged nor chained
-            rotated = None
-        if rotated is None:
+            token: str | None = _decode(response, _RotatedToken).token
+        except ApiError:  # nothing is raised from here, so nothing chains a value
+            token = None
+        if token is None:
             _log.warning(
-                "MFA enrolment confirmed, but the rotated session token in the reply cannot be "
-                "sent by this client; the recovery codes are returned, the token is not adopted."
+                "MFA enrolment confirmed, but the reply carries no session token this client can "
+                "send; the token is not adopted."
             )
         else:
-            self._hold_issued(rotated.token)
+            self._hold_issued(token)
+        confirmed = _decode(response, _MfaConfirmCodes)
         return MfaConfirmed(
             recovery_codes=tuple(confirmed.recovery_codes),
             other_sessions=confirmed.other_sessions,
-            token_adopted=rotated is not None,
+            token_adopted=token is not None,
         )
 
     def verify_mfa(self, code: str) -> None:
