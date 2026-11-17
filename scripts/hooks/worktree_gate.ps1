@@ -797,9 +797,9 @@ function Get-ScanRawIndexMap($Seg) {
 # THE READER IS THE SCAN, which is the gate's existing tokenizer: Remove-QuotedSpans unquotes a quoted
 # span holding one bare word, single or double and under either host's escape, joins quoted pieces
 # (`'a'/'b'` reads `a/b`), and blanks a span with whitespace in it, so a quoted commit message or echo
-# cannot supply a token. It does not unquote every form the shell accepts; Get-JoinedReading adds a
-# second reading for an empty pair joined to a word and a POSIX `$'<word>'`. Each invocation is read
-# from its OWN window -- from the
+# cannot supply a token. It does not unquote every form the shell accepts: at least `-C ''<p>`,
+# `-C <p>''` and `-C $'<p>'` are not read as the shell reads them, as on origin/main. Each invocation is read from its OWN
+# window -- from the
 # separator before its owning git token up to its verb -- through the resolver's -OwnWindow branch,
 # which folds that invocation's own `-C` tokens over a chdir it can follow and answers NOTHING where it
 # cannot. The window is also handed in as the resolver's $Line, so --work-tree, GIT_WORK_TREE,
@@ -834,14 +834,9 @@ function Get-ScanRawIndexMap($Seg) {
 # open, at least: a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 # an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff --quiet) {
 # git reset --hard }` from outside); rule 3c's later-disarm filter counts `.git` as a git word; and a
-# chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one;
-# and a `bash -c` payload joined with `'\''` or `'"'"'` is one more segment, so its re-quoted `-C`
-# reaches the first reading too, which roots that quote-tainted token at a governed cwd.
-#
-# THE JOINED READING COVERS A `-C` OR PATH VALUE IN THE INVOCATION'S OWN WINDOW, AND NOT, AT LEAST:
-# a joined verb or disarm key, a joined chdir target, a carried `$'...'` GIT_DIR, other `bash -c` and
-# PowerShell payload joins, a joined `-C` after an earlier chdir it cannot follow, and a `-c` disarm
-# after an earlier `config` word. Reviews measured these as allowed; BACKLOG #5655 holds the list.
+# chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one.
+# Also not read: a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`, because the
+# payload's extraction stops at the first joint, as on origin/main.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -877,7 +872,7 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     $win = $Scan.Substring($start, $At - $start)
     $chdirAt = Get-ChdirAtCommandPattern
     $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
-    $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win; Start = $start }
+    $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
     if ($priorChdirs.Count -eq 0) { return $plain }
     # A `-C` FOLD THAT ENDS ABSOLUTE DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3),
     # so where the directory is unknown the plain reading is still returned for it. Without this, an
@@ -898,83 +893,7 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
         if ($absC) { return $plain }
         return
     }
-    [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win; Start = $start }
-}
-
-# The segment's raw index map for the joined readings, built at most once per segment object and kept
-# on it (review round 84a1c1fd70): built per reading, a line of a few hundred invocations re-ran the
-# span scanner for each one. That removed one square-of-the-line cost, not all of them: Get-JoinedReading
-# still walks every reading's window, and the windows overlap, so a long line can still pass the hook's
-# timeout (review round c49803c0c3). Rule 3's branch-switch text and rule 3d still build their own map.
-# $false stands for "no map".
-function Get-JoinMap($Seg) {
-    if ($null -eq $Seg) { return $null }
-    $have = $Seg.PSObject.Properties['JoinMap']
-    if ($null -eq $have) {
-        $built = Get-ScanRawIndexMap $Seg
-        $Seg | Add-Member -NotePropertyName JoinMap -NotePropertyValue $(if ($null -eq $built) { $false } else { $built })
-        $have = $Seg.PSObject.Properties['JoinMap']
-    }
-    if ($have.Value -is [bool]) { return $null }
-    , $have.Value
-}
-
-# THE SAME READING WITH JOINED QUOTE PIECES READ AS THE SHELL READS THEM (BACKLOG #5655 step 7), or
-# nothing where the window is unchanged. The scan keeps an empty pair joined to a word, and the `$` of a
-# POSIX `$'<word>'`, so `-C ''<p>`, `-C <p>''` and `-C $'<p>'` named nothing. Only the added readings
-# use this, so the shared scan and every reading made before are untouched, and a second reading can
-# only add a deny. A trailing pair joins under POSIX. Under PowerShell it joins too, except right
-# after the same quote character, where it is an escaped quote; the PowerShell model is not complete,
-# since a pair after a quoted word of the other quote (`"<p>"''`) is joined although PowerShell passes
-# it as an empty argument of its own. A leading pair joins under POSIX only:
-# PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
-# The `$` is dropped only before a `-C`, `--work-tree`, `--git-dir`, GIT_WORK_TREE or GIT_DIR value,
-# POSIX only, and the word is then read literally: bash decodes backslash escapes inside `$'...'`, so a
-# word holding one is misread, in either direction. The window cannot tell a `$'<word>'` from a variable
-# there either, so a variable's name is read as a relative path too.
-#
-# The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
-# where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
-# through the segment's raw index map at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
-# glued pair elsewhere on the line used to arm the join). No map, no join. Only POSIX and PowerShell
-# segments are read: in cmd a quote is a literal.
-function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
-    if ($Conv -ne 'posix' -and $Conv -ne 'pwsh') { return }
-    $w = [string]$Reading.Window
-    $w2 = $w
-    $map = $(if ($w -match "''|`"`"" -and $null -ne $Reading.Start) { Get-JoinMap $Seg })
-    if ($null -ne $map) {
-        $edge = "[\s;&|(){}<>'`"]"
-        $sb = [System.Text.StringBuilder]::new()
-        $k = 0
-        while ($k -lt $w.Length) {
-            $two = $(if ($k + 1 -lt $w.Length) { $w.Substring($k, 2) } else { '' })
-            if ($two -eq "''" -or $two -eq '""') {
-                $at = [int]$Reading.Start + $k
-                $real = $map[$at + 1] -eq $map[$at] + 1
-                # PowerShell reads a doubled quote right after the same quote as an escaped quote inside
-                # that string, not as an empty pair: `'<p>'''` passes `<p>'` (review round 84a1c1fd70).
-                if ($real -and $Conv -eq 'pwsh' -and $map[$at] -gt 0 -and
-                    [string]$Seg.Raw[$map[$at] - 1] -eq [string]$two[0]) { $real = $false }
-                $n = $k + 2
-                while ($n + 1 -lt $w.Length -and ($w.Substring($n, 2) -eq "''" -or $w.Substring($n, 2) -eq '""')) { $n += 2 }
-                $nextCh = $(if ($n -lt $w.Length) { [string]$w[$n] } else { ' ' })
-                $prevCh = $(if ($sb.Length -gt 0) { [string]$sb[$sb.Length - 1] } else { ' ' })
-                $trailing = $prevCh -notmatch $edge
-                $leading = $Conv -eq 'posix' -and $prevCh -match '\s' -and $nextCh -notmatch $edge
-                if ($real -and ($trailing -or $leading)) { $k += 2; continue }
-            }
-            [void]$sb.Append($w[$k])
-            $k++
-        }
-        $w2 = $sb.ToString()
-    }
-    if ($Conv -eq 'posix') {
-        $w2 = $w2 -creplace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)(?:=|\s+)|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
-    }
-    if ($w2 -ceq $w) { return }
-    # No Start: the joined window is shorter, so an offset into it no longer maps to the scan.
-    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2 }
+    [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
 }
 
 # The index of the LAST `git` or `git.exe` word before $At, in any case on Windows, or -1. No
@@ -2527,7 +2446,6 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
     }
 
     $inner = @()
-    $joinedInner = @()
     # THE PRIOR ACCUMULATOR. `Prior` is the BLANKED text of everything that RAN BEFORE this segment, in
     # textual order -- the state rule 3c reads a carried environment variable out of. It is blanked
     # rather than raw for exactly the reason $ownGitDir is read off the scan: an assignment inside a
@@ -2538,20 +2456,10 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
         # WHICH ARM MATCHED IS RECORDED, because only the double-quoted one can carry an outer escape.
         # A single-quoted word is fully literal on BOTH hosts, so its payload already IS what the
         # interpreter receives and re-decoding it would corrupt a legitimate backslash or backtick.
-        # A THIRD ARM, POSIX OUTER HOST ONLY (BACKLOG #5655 step 7): a single-quoted argument the shell
-        # joins with an embedded quote, `'..'"'"'..'` or `'..'\''..'`, is one word, so `bash -c 'git -C
-        # '"'"'<p>'"'"' reset --hard'` runs `git -C '<p>' reset --hard`. The second arm stops at the
-        # first joint and saw `git -C ` alone. This arm is added, never substituted: its payload is one
-        # more segment, emitted after every other segment of the command (see THE JOINED PAYLOADS at
-        # the end of this function), so rule 3's first-verb bookkeeping sees what it saw before.
-        $specs = @(
+        foreach ($spec in @(
             @{ Pat = "(?i)(?:^|\s)$flagThenSep`"$dqCode`""; Escaped = $true }
             @{ Pat = "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*)'"; Escaped = $false }
-        )
-        if ($Convention -eq 'posix') {
-            $specs += @{ Pat = "(?i)(?:^|\s)$flagThenSep'(?<code>[^']*(?:'(?:`"'`"|\\')'[^']*)+)'"; Escaped = $false; Joined = $true }
-        }
-        foreach ($spec in $specs) {
+        )) {
             foreach ($m in [regex]::Matches($ln, $spec.Pat)) {
                 # WHO OWNS THIS FLAG DECIDES BOTH QUESTIONS -- whether to recurse at all, and under
                 # WHICH ESCAPE CONVENTION (BACKLOG #1229 residual, fourth round). `(?:^|\s)` consumes
@@ -2591,15 +2499,12 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
                 # before it: every earlier line, plus this line up to the flag. Blanked here for the
                 # same reason the lines are, and `$m.Index` is an index into `$ln` -- both RAW -- so no
                 # index crosses between a raw string and a blanked one.
-                $code = $m.Groups['code'].Value
-                if ($spec.Joined) { $code = $code.Replace("'`"'`"'", "'").Replace("'\''", "'") }
-                $payload = [pscustomobject]@{
-                    Text    = $code
+                $inner += [pscustomobject]@{
+                    Text    = $m.Groups['code'].Value
                     Conv    = $owner
                     Escaped = [bool]$spec.Escaped
                     Prior   = $priorForLine + (Remove-QuotedSpans $ln.Substring(0, $m.Index) $Convention)
                 }
-                if ($spec.Joined) { $joinedInner += $payload } else { $inner += $payload }
             }
         }
         # APPENDED AFTER the line is processed, so `Prior` never includes the line it belongs to.
@@ -2619,11 +2524,10 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
 
     # Each extracted payload carries ITS OWN convention, taken from the interpreter that was matched
     # rather than from the tool name at the call site. See the note at the extraction above.
-    # A PAYLOAD HOLDING A NEWLINE comes only from the second view: a physical line has none. It is
-    # split into logical lines under the INTERPRETER's convention, so `bash -c '<code>'` spanning
-    # lines is scanned statement by statement, with its own comments and heredocs modelled.
-    $emitPayload = {
-        param($item)
+    foreach ($item in $inner) {
+        # A PAYLOAD HOLDING A NEWLINE comes only from the second view: a physical line has none. It is
+        # split into logical lines under the INTERPRETER's convention, so `bash -c '<code>'` spanning
+        # lines is scanned statement by statement, with its own comments and heredocs modelled.
         if ($item.Text.Contains("`n")) {
             $pp = $item.Prior
             foreach ($piece in @(Split-LogicalLines $item.Text $item.Conv)) {
@@ -2632,12 +2536,11 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
                 [pscustomobject]@{ Raw = $piece; Scan = $ps; Prior = $pp; Conv = $item.Conv }
                 $pp += $ps + "`n"
             }
-            return
+            continue
         }
         $s = Remove-QuotedSpans $item.Text $item.Conv
         [pscustomobject]@{ Raw = $item.Text; Scan = $s; Prior = $item.Prior; Conv = $item.Conv }
     }
-    foreach ($item in $inner) { & $emitPayload $item }
 
     # =================================================================================================
     # THE SAME PAYLOAD AGAIN, IN THE ENCODING ITS INTERPRETER ACTUALLY RECEIVES
@@ -2720,12 +2623,6 @@ function Get-SegmentView([string]$Cmd, [string]$Convention = 'none', [string[]]$
             Get-SegmentView $Cmd $Convention -LogicalLines $logical
         }
     }
-
-    # THE JOINED PAYLOADS COME LAST (BACKLOG #5655; review round 462e4285). Emitted in line order beside
-    # the other payloads, a joined payload on an earlier line became rule 3's first verb-bearing segment,
-    # so rule 3b judged it and never reached a later line's payload: two `bash -c` lines, the second
-    # `git -C <linked-wt> -C "" checkout <b>`, were allowed where origin/main denied them.
-    foreach ($item in $joinedInner) { & $emitPayload $item }
 }
 
 # A PARSE FAILURE IS RECORDED, NOT ALLOWED. It used to exit 0, which let through any payload
@@ -4288,10 +4185,7 @@ What to do instead:
                 foreach ($gw in $gws) {
                     if ($seen.ContainsKey("$to/$gw")) { continue }
                     $seen["$to/$gw"] = $true
-                    foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) {
-                        $readings.Add($r)
-                        foreach ($j in @(Get-JoinedReading $r $seg.Conv $seg)) { $readings.Add($j) }
-                    }
+                    foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) { $readings.Add($r) }
                 }
             }
             foreach ($reading in $readings) {
@@ -5183,7 +5077,6 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $ownGit = Get-GitWordBefore $seg.Scan $vIdx
                 if ($ownGit -gt $vm.Index) { $gitAts += $ownGit }
                 $readings = @(foreach ($gitAt in $gitAts) { Get-InvocationReading $seg.Scan $vIdx -GitAt $gitAt -Prior $seg.Prior })
-                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv $seg })
                 foreach ($reading in $readings) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -416,7 +417,7 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
     assert "SHARED git" in reason, reason
 
 
-# ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6, 7
+# ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6
 #
 # Each DENY row was measured ALLOW on origin/main f0e49f45c5c, run from an ungoverned repository.
 
@@ -430,12 +431,6 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
         ("git -C '{p}' -c user.name=$(git config user.name) config {k}", "SHARED git configur"),
         # Step 3: an earlier line's subshell chdir switched the added reading off.
         ("(cd {tmp} && ls)\ngit -C '{p}' reset --hard", "SHARED PRIMARY"),
-        # Step 7: four quoted forms the scan did not unquote.
-        ("git -C $'{p}' reset --hard", "SHARED PRIMARY"),
-        ("git -C ''{p} reset --hard", "SHARED PRIMARY"),
-        ("git -C {p}'' reset --hard", "SHARED PRIMARY"),
-        ("bash -c 'git -C '\"'\"'{p}'\"'\"' reset --hard'", "SHARED PRIMARY"),
-        (r"bash -c 'git -C '\''{p}'\'' reset --hard'", "SHARED PRIMARY"),
     ],
 )
 def test_closing_step_shapes_are_denied(rig: SimpleNamespace, template: str, text: str) -> None:
@@ -449,12 +444,6 @@ def test_closing_step_shapes_are_denied(rig: SimpleNamespace, template: str, tex
         ("git -C '{o}' -c user.name=$(git log -1 --format=%an) config {k}", "Bash"),
         ("git -C '{o}' -c user.name=$(git config user.name) config {k}", "Bash"),
         ("(cd {tmp} && ls)\ngit -C '{o}' reset --hard", "Bash"),
-        ("git -C $'{o}' reset --hard", "Bash"),
-        ("git -C ''{o} reset --hard", "Bash"),
-        ("git -C {o}'' reset --hard", "Bash"),
-        ("git -C {o}'' reset --hard", "PowerShell"),
-        ("bash -c 'git -C '\"'\"'{o}'\"'\"' reset --hard'", "Bash"),
-        (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "Bash"),
         ("git commit -m '' ; git -C {o} status", "Bash"),
     ],
 )
@@ -473,15 +462,43 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         ("if (git -C '{p}' diff --quiet) {{ git reset --hard }}", "outside", "PowerShell"),
         # The later-disarm filter counts `.git` as a git word, so the grep's `-c alias.lg` is judged.
         ("git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f", "primary", "Bash"),
-        # A joined `bash -c` payload's re-quoted `-C` reaches the first reading, which roots the
-        # quote-tainted token at the governed cwd.
-        (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "primary", "Bash"),
     ],
 )
 def test_known_false_denies_of_the_added_readings_still_deny(
     rig: SimpleNamespace, template: str, where: str, tool: str
 ) -> None:
     assert not _allowed(rig, _fmt(rig, template), _cwd(rig, where), tool)
+
+
+# Quoted forms the gate's unquoting does not read as the shell does (closing step 7), left ALLOW as on
+# origin/main f0e49f45c5c. Each names the primary, so each should be DENY; a fix flips its row.
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git -C $'{p}' reset --hard",
+        "git -C ''{p} reset --hard",
+        "git -C {p}'' reset --hard",
+        "bash -c 'git -C '\"'\"'{p}'\"'\"' reset --hard'",
+        r"bash -c 'git -C '\''{p}'\'' reset --hard'",
+    ],
+)
+def test_known_gap_joined_quote_forms_stay_allowed(rig: SimpleNamespace, template: str) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # Review round c49803c0c3, finding 4: the git runs in the ungoverned repository. Allowed on
+        # origin/main; refused by this branch's former joined `bash -c` reading.
+        r"bash -c 'git -C '\''{o}'\'' stash list'",
+        r"bash -c 'git -C '\''{o}'\'' reset --hard'",
+    ],
+)
+def test_a_joined_bash_payload_naming_an_ungoverned_repo_is_allowed_from_the_primary(
+    rig: SimpleNamespace, template: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.primary)
 
 
 # Review round 34781a2201: shapes the first build of this change got wrong.
@@ -517,46 +534,18 @@ def test_review_round_shapes_are_denied(
     assert text in reason, reason
 
 
-# Review round e9fa08d529.
-@pytest.mark.parametrize(
-    ("template", "text"),
-    [
-        ("git -C {p}'''' reset --hard", "SHARED PRIMARY"),
-        ("git --git-dir $'{p}/.git' config {k}", "SHARED git configur"),
-        ("git --work-tree $'{p}' reset --hard", "SHARED PRIMARY"),
-    ],
-)
-def test_review_round_two_joined_shapes_are_denied(
-    rig: SimpleNamespace, template: str, text: str
-) -> None:
-    reason = _reason(rig, _fmt(rig, template), rig.outside)
-    assert text in reason, reason
-
-
 def test_a_disarm_inside_a_substitution_is_not_the_outer_commands(rig: SimpleNamespace) -> None:
     # The substitution's git runs in the cwd; the outer `-C` must not decide it.
     assert _allowed(rig, _fmt(rig, "git -C '{p}' log $(/usr/bin/git config {k})"), rig.outside)
 
 
-def test_a_blanked_spacey_suffix_is_not_joined(rig: SimpleNamespace) -> None:
-    # `<p>' copy'` names `<p> copy`; the scan blanks `' copy'` to an empty pair, which is not joined.
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_a_spacey_quoted_suffix_names_its_own_repository(rig: SimpleNamespace, tool: str) -> None:
+    # `<p>' copy'` names `<p> copy`, an ungoverned repository; origin/main allows this.
     copy = rig.tmp / "Primary copy"
     subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
-    assert _allowed(rig, _fmt(rig, "git -C {p}' copy' reset --hard"), rig.outside)
-
-
-def test_a_glued_pair_elsewhere_on_the_line_does_not_arm_the_join(rig: SimpleNamespace) -> None:
-    # Review round 4d1a3ae7fd: the echo's `a''` armed the join for the blanked `' copy'`, which then
-    # named the primary. `<p> copy` is an ungoverned repository; origin/main allows this.
-    copy = rig.tmp / "Primary copy"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
-    assert _allowed(rig, _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard"), rig.outside)
-
-
-def test_a_real_glued_pair_on_the_invocation_still_joins(rig: SimpleNamespace) -> None:
-    # The control for the row above: the same line with the glued pair on the -C value denies.
-    reason = _reason(rig, _fmt(rig, "echo a'' ; git -C {p}'' reset --hard"), rig.outside)
-    assert "SHARED PRIMARY" in reason, reason
+    assert _allowed(rig, _fmt(rig, "git -C {p}' copy' reset --hard"), rig.outside, tool)
+    assert _allowed(rig, _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard"), rig.outside, tool)
 
 
 def test_origin_mains_bare_read_with_a_glued_pair_still_denies(rig: SimpleNamespace) -> None:
@@ -566,45 +555,23 @@ def test_origin_mains_bare_read_with_a_glued_pair_still_denies(rig: SimpleNamesp
     assert "SHARED git configur" in reason, reason
 
 
-# Review round 84a1c1fd70. PowerShell passes `'<p>'''` as `<p>'` (a doubled quote inside a
-# single-quoted string is an escaped quote), and `''"<p>"` as two arguments, `` and `<p>`;
-# bash passes `<p>` for both. Measured with an argv printer under pwsh 7.
 @pytest.mark.parametrize(
     "template",
     ["git -C '{p}''' reset --hard", "git -C '{p}''' config {k}", "git -C ''\"{p}\" reset --hard"],
 )
-def test_powershell_escaped_or_leading_pairs_are_not_joined(
+def test_powershell_escaped_or_leading_pairs_stay_allowed(
     rig: SimpleNamespace, template: str
 ) -> None:
+    # PowerShell passes `'<p>'''` as `<p>'` and `''"<p>"` as two arguments, so none names the primary.
     assert _allowed(rig, _fmt(rig, template), rig.outside, "PowerShell")
 
 
-@pytest.mark.parametrize(
-    ("template", "text"),
-    [
-        ("git -C '{p}''' reset --hard", "SHARED PRIMARY"),
-        ("git -C '{p}''' config {k}", "SHARED git configur"),
-        ("git -C ''\"{p}\" reset --hard", "SHARED PRIMARY"),
-    ],
-)
-def test_the_same_pairs_join_under_bash(rig: SimpleNamespace, template: str, text: str) -> None:
-    reason = _reason(rig, _fmt(rig, template), rig.outside)
-    assert text in reason, reason
-
-
-def test_a_glued_pair_elsewhere_does_not_arm_the_join_under_powershell(
+def test_a_bash_payload_on_an_earlier_line_does_not_hide_a_later_lines_payload(
     rig: SimpleNamespace,
 ) -> None:
-    copy = rig.tmp / "Primary copy"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
-    command = _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard")
-    assert _allowed(rig, command, rig.outside, "PowerShell")
-
-
-def test_a_joined_payload_does_not_hide_a_later_lines_payload(rig: SimpleNamespace) -> None:
-    # Review round 462e4285: the joined payload of line 1 was emitted ahead of line 2's payload, so
-    # rule 3b judged line 1's checkout (in an ungoverned repository) and never reached line 2's.
-    # Measured ALLOW at a6da3c77526 and DENY on origin/main f0e49f45c5c.
+    # Review round 462e4285: an intermediate head emitted line 1's payload ahead of line 2's, so rule
+    # 3b judged line 1's checkout (in an ungoverned repository) and never reached line 2's. Measured
+    # ALLOW at a6da3c77526 and DENY on origin/main f0e49f45c5c.
     who = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"]
     for args in (["commit", "-q", "--allow-empty", "-m", "x"], ["branch", rig.other]):
         subprocess.run(
@@ -621,3 +588,19 @@ def test_known_gap_a_separator_inside_a_closed_substitution(rig: SimpleNamespace
     # owning-word reading, so the outer quoted `-C` is not read. A fix flips this row.
     command = _fmt(rig, "git -C '{p}' -c user.name=$(git log -1 | head -1) config {k}")
     assert _allowed(rig, command, rig.outside)
+
+
+def test_a_long_run_of_glued_pairs_costs_about_what_a_short_line_does(rig: SimpleNamespace) -> None:
+    # Review round c49803c0c3, finding 3: an intermediate head's joined reading grew with the square
+    # of the line, and a 12 KB run of glued `''` after one `-C` outran the gate's 45 s test budget
+    # (27.7 s in that review; origin/main about 2 s). The ceiling is generous on purpose, so a slow
+    # pwsh launch does not flake it: the regression it guards costs tens of seconds.
+    short = _fmt(rig, "git -C {o}'' reset --hard")
+    long = _fmt(rig, "git -C {o}" + "''" * 5900 + " reset --hard")
+    started = time.monotonic()
+    assert _allowed(rig, short, rig.outside)
+    short_s = time.monotonic() - started
+    started = time.monotonic()
+    assert _allowed(rig, long, rig.outside)
+    long_s = time.monotonic() - started
+    assert long_s < 3 * short_s + 10, (short_s, long_s)
