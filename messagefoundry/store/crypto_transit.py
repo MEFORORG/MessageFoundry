@@ -342,7 +342,8 @@ def _report_unlogged(fault: BaseException) -> None:
 
 
 def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2) -> bool:
-    """``log.warning(*build())`` that never raises, and whether it was emitted (BACKLOG #6707).
+    """``log.warning(*build())`` that never raises, and whether that call returned without raising
+    (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
     ``build`` is called inside the guard, so a fault rendering the message, such as a lazy import
     in :func:`vault_failure_text`, is caught too. The audit verify path logs beside a verdict; a
     raise there would otherwise turn a row's break into a walk that could not run. A failure is
@@ -357,9 +358,10 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2) -> bool:
 
 def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
     """:func:`_warn_quietly`, unless the warning ``kind()`` was logged in the last
-    :data:`_WARNING_LOG_INTERVAL_S`. Only an emitted warning counts as logged, so one that failed
-    is tried again next time. The slot is taken before the warning, so concurrent callers emit it
-    once. Never raises: the key, the slot and the warning are all built inside one guard."""
+    :data:`_WARNING_LOG_INTERVAL_S`. A warning whose log call raised does not count as logged, so
+    a later call tries it again. The slot is taken before the warning, so concurrent callers emit
+    it at most once. Never raises: the key, the slot and the warning are all built inside one
+    guard."""
     try:
         key = kind()
         with _logged_at_lock:
@@ -828,7 +830,7 @@ class TransitCipher(_UnmarkedPolicy):
             try:
                 self.audit_hmac(data)
             except CipherError as exc:
-                failure = exc  # an except name is unbound once the block ends
+                failure = exc  # a closure may not name the except variable (ruff F821)
                 _warn_quietly(
                     lambda: (
                         "the cost-only audit HMAC beside a malformed stored MAC failed: %s",
@@ -1004,7 +1006,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            failure = probe_exc  # an except name is unbound once the block ends
+            failure = probe_exc  # a closure may not name the except variable (ruff F821)
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
@@ -1024,7 +1026,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             return is_vault_unavailable(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
-            failure = fault  # an except name is unbound once the block ends
+            failure = fault  # a closure may not name the except variable (ruff F821)
             _warn_quietly(
                 lambda: (
                     "Transit failure classifier raised %s; read as an outage",
@@ -1052,7 +1054,7 @@ class TransitCipher(_UnmarkedPolicy):
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
-            failure = probe_exc  # an except name is unbound once the block ends
+            failure = probe_exc  # a closure may not name the except variable (ruff F821)
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify failed, and a verify over fixed input failed too "
