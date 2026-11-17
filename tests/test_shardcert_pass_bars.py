@@ -8,7 +8,9 @@ Unit tests over synthetic counters and a fake store: no load run, no database.
 from __future__ import annotations
 
 import dataclasses
+import textwrap
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -187,6 +189,31 @@ async def test_reset_store_clears_every_table(monkeypatch: pytest.MonkeyPatch) -
     deletes = [s for s in cur.executed if "DELETE" in s]
     assert len(deletes) == len(shardcert._RESET_TABLES)
     assert store.closed
+
+
+def test_reset_store_covers_every_table_a_certification_reads() -> None:
+    """BACKLOG #5576: a table a verdict reads that the reset does not empty would carry an earlier
+    run's rows into this one. The verdicts read the store through this module's own SQL and the
+    engine's ``/stats`` (``SqlServerStore.stats``); every table either names must be reset."""
+    import ast
+    import inspect
+    import re
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    def tables(source: str) -> set[str]:
+        found: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                found.update(re.findall(r"\bFROM\s+([A-Za-z_][\w.]*)", node.value))
+        # The reset's own f-strings splice `{table}`/`{t}`, which leave no literal name here, and
+        # SQL Server's catalog views are no store table.
+        return {t for t in found if not t.startswith("sys.")}
+
+    read = tables(Path(inspect.getfile(shardcert)).read_text(encoding="utf-8"))
+    read |= tables(textwrap.dedent(inspect.getsource(SqlServerStore.stats)))
+    assert "queue" in read, read  # the instrument finds the store-truth scan it is meant to see
+    assert read <= set(shardcert._RESET_TABLES), read - set(shardcert._RESET_TABLES)
 
 
 async def test_reset_store_raises_on_a_delete_failure(monkeypatch: pytest.MonkeyPatch) -> None:
