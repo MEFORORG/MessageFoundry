@@ -136,8 +136,9 @@ class ServiceEnvPosture:
     #: The service whose lists were read, when one was found.
     service_name: str | None = None
     #: Every variable name the service's environment lists set, upper-cased: each string's
-    #: first name, and a secret-class or ``MEFOR_VALUE_*`` name a later line of it starts. Empty
-    #: unless ``status`` is ``OBSERVED``.
+    #: first name, and a secret-class or ``MEFOR_VALUE_*`` name a later line of it starts. A first
+    #: name that may be key material is left out, as ``_Variable.continued`` says. Empty unless
+    #: ``status`` is ``OBSERVED``.
     listed: tuple[str, ...] = ()
     #: ``(name, registry value)`` for each name in ``listed``, so a refusal can say which value
     #: to change.
@@ -305,13 +306,9 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: sign, and nor does a single padded base64 key, whose only equals signs end it. ``OTHER=``
 #: with an empty value does not match either, and is read as part of the value above it.
 #:
-#: Key material CAN match. ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` takes a comma-separated list
-#: of padded base64 keys, so a line ``<key>=,<key>=`` reads as an ordinary name, the first key,
-#: set to the rest. The heuristic alone would then end the retired-keys value above it and leave
-#: that name empty, so nothing would refuse (vault BACKLOG #5394). What makes it safe is
-#: :func:`_names`: a secret-class name with any non-blank line after it on its string is kept
-#: whatever its own value reads as, so this heuristic decides only where an ordinary or
-#: ``MEFOR_VALUE_*`` value ends, never whether a secret-class name refuses.
+#: Key material CAN match: a line ``<key>=,<key>=`` of retired keys reads as an ordinary name set
+#: to the rest. So this heuristic never decides alone whether an empty secret-class name refuses;
+#: :attr:`_Variable.continued` states the rule that does.
 _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?!=*\s*\Z)")
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
@@ -341,8 +338,18 @@ class _Variable:
     value: str
     #: Whether NSSM may read the name with a line break in it.
     broken: bool = False
-    #: Whether a non-blank line follows the variable's own line on its string, so a later line
-    #: the reader took for another variable may be its value.
+    #: THE RULE for an empty secret-class name (vault BACKLOG #5394). True when the variable's
+    #: own line sets it empty or blank AND a non-blank line follows it in its registry value:
+    #: later in its own string, or in any later item of the same ``REG_MULTI_SZ`` value. Then
+    #: whatever follows may be its value, because key material such as ``<key>=,<key>=`` reads
+    #: as another variable's line, and NSSM's GUI and ``nssm set`` put each variable in its own
+    #: item. :func:`_names` keeps a secret-class name that is ``continued`` whatever its value
+    #: reads as. A name whose own line sets it to something keeps the value rule
+    #: :func:`_names` applies to every name, wherever it sits, so a path-form OIDC key above
+    #: another line is not a secret. An empty name on the last non-blank line of the last item
+    #: is not ``continued``, so it stays unlisted. Once an empty secret-class name is
+    #: ``continued``, :func:`_variables` keeps no ordinary name from a later item's first line
+    #: of that registry value, since that "name" may be key material.
     continued: bool = False
 
 
@@ -359,8 +366,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     under the whole-string reading it sets nothing, so the secrets directory's name is never taken
     as set by a later line. Any other line, such as one of key material, belongs to the value
     above it, so a key whose value starts on the next line is not empty. A line of key material
-    can still read as an ordinary variable, so each variable records whether a non-blank line
-    follows it, and :func:`_names` keeps a secret-class name that has one whatever its value.
+    can still read as an ordinary variable; :attr:`_Variable.continued` states the rule that
+    covers it, across the items of a ``REG_MULTI_SZ`` value as well as within one string.
 
     Each string is also read whole, as ``main`` read it: the name before its first equals sign,
     stripped, and everything after it as the value. That variable is kept when its name is one
@@ -371,7 +378,18 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     It is kept unless a later line sets a name :func:`_names` keeps, since both readings then
     describe the same variable and it is counted once."""
     read: list[_Variable] = []
-    for where, entry in entries:
+    # ``item_follows[i]``: a later item of the same registry value holds a non-blank line.
+    item_follows = [False] * len(entries)
+    nonblank_later: set[str] = set()
+    for index in range(len(entries) - 1, -1, -1):
+        where, entry = entries[index]
+        item_follows[index] = where in nonblank_later
+        if entry.strip():
+            nonblank_later.add(where)
+    # The registry values in which an empty secret-class name is ``continued`` so far.
+    after_empty: set[str] = set()
+    for index, (where, entry) in enumerate(entries):
+        start = len(read)  # where this string's variables begin in ``read``
         lines = _LINE_BREAK.split(entry)
         # ``skip`` keeps the later lines' numbers counted from the string's real first line.
         skip = next((i for i, line in enumerate(lines) if line.strip()), len(lines) - 1)
@@ -397,18 +415,29 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                 parts = [rest]  # ends the value above, and is not kept
             else:
                 parts.append(line)
+
+        # :attr:`_Variable.continued`: the own line's value is blank, and a non-blank line
+        # follows it on this string (``last`` is below it) or in a later item.
+        more_items = item_follows[index]
         later_variables = [
             _Variable(
                 f"{where}, line {number} of a string whose first line is another entry",
                 written,
                 "\n".join(value_parts),
-                continued=last > number - 1,
+                continued=not value_parts[0].strip() and (last > number - 1 or more_items),
             )
             for number, written, value_parts in later
         ]
-        if first_equals:
+        # A first name that follows a ``continued`` empty secret-class name may be key material,
+        # so only a name the refusal is about is kept from it.
+        if first_equals and (where not in after_empty or _refused_name(first_written.upper())):
             read.append(
-                _Variable(where, first_written, "\n".join(first_parts), continued=last > skip)
+                _Variable(
+                    where,
+                    first_written,
+                    "\n".join(first_parts),
+                    continued=not first_rest.strip() and (last > skip or more_items),
+                )
             )
         # The whole-string reading, exactly as ``main`` read every entry: the name is everything
         # before the first equals sign, stripped, and the value everything after it. Kept when that
@@ -428,6 +457,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
             read.append(_Variable(where, name, whole_value, broken=broken))
         read.extend(later_variables)
+        if any(v.continued and v.written.upper() in _REFUSED_CLASS_NAMES for v in read[start:]):
+            after_empty.add(where)
     return read
 
 
@@ -436,10 +467,9 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str], ...]:
     never kept. An empty value carries no secret, so its name is not kept, except a
     ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and whose empty
     value the engine still overlays on the value file. A path in a name that takes either a key or
-    its path is not a secret, so that name is not kept either. Neither exception holds for a
-    secret-class name with a non-blank line after it on its string: that line may be its value,
-    as a line of retired keys can read as another variable, so the name is kept whatever its own
-    value reads as (vault BACKLOG #5394). Windows compares environment names without case, so
+    its path is not a secret, so that name is not kept either. A secret-class name that is
+    :attr:`_Variable.continued` is kept whatever its value reads as; that attribute states the
+    rule. Windows compares environment names without case, so
     this does too. Each name is returned with the first registry value, and the
     line, that sets it."""
     names: dict[str, str] = {}

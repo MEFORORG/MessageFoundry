@@ -236,10 +236,26 @@ def test_no_identifier_in_the_module_reads_as_a_secret_to_codeql() -> None:
     assert not sorted(name for name in identifiers if _SENSITIVE_IDENTIFIER.search(name))
 
 
-def test_a_name_set_to_nothing_is_not_listed() -> None:
-    posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "=orphan"])
+@pytest.mark.parametrize(
+    "entries",
+    [["MEFOR_STORE_ENCRYPTION_KEY="], ["MEFOR_STORE_PASSWORD=   "], ["=orphan"]],
+)
+def test_a_name_set_to_nothing_is_not_listed(entries: list[str]) -> None:
+    """Each shape is the value's last item. With a non-blank item after an empty secret-class
+    name, that item may be its value, so the name refuses (vault BACKLOG #5394); the next test
+    pins that the three together now refuse."""
+    posture = _service(entries)
     assert posture.listed == ()
     assert service_env_refusal(posture) is None
+
+
+def test_empty_secret_class_names_with_items_after_them_now_refuse() -> None:
+    """``main`` listed nothing here. Under :attr:`serviceenv._Variable.continued` the empty key
+    and the blank password each have a non-blank item after them, and either item may be the
+    value NSSM's GUI split off, so both refuse. The nameless ``=orphan`` is still not listed."""
+    posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "=orphan"])
+    assert posture.listed == ("MEFOR_STORE_ENCRYPTION_KEY", "MEFOR_STORE_PASSWORD")
+    assert service_env_refusal(posture) is not None
 
 
 def test_a_service_that_cannot_be_found_is_named_and_not_refused() -> None:
@@ -457,6 +473,20 @@ _PADDED = "c3ludGhldGljLXJldGlyZWQta2V5LXZhbHVl="
 _LINE_BREAKS = pytest.mark.parametrize("br", ["\r\n", "\n", "\r"], ids=["crlf", "lf", "cr"])
 
 
+def _holds_padded(text: str) -> bool:
+    """Whether ``text`` holds :data:`_PADDED` in any case, with or without its padding. A name
+    the reader keeps is upper-cased, so a plain ``_PADDED in text`` can never fire."""
+    return _PADDED.rstrip("=").upper() in text.upper()
+
+
+def test_the_key_material_check_fires_on_an_upper_cased_name() -> None:
+    """The positive control for :func:`_holds_padded`: the shape a leak would take, the key
+    upper-cased as a listed name, is caught, and the plain check it replaced misses it."""
+    leaked = repr(ServiceEnvPosture(ServiceEnvStatus.OBSERVED, listed=(_PADDED.upper(),)))
+    assert _holds_padded(leaked)
+    assert _PADDED not in leaked
+
+
 @_LINE_BREAKS
 @pytest.mark.parametrize(
     ("name", "entry"),
@@ -467,22 +497,90 @@ _LINE_BREAKS = pytest.mark.parametrize("br", ["\r\n", "\n", "\r"], ids=["crlf", 
         ),
         ("MEFOR_STORE_PASSWORD", "MEFOR_AI_ENVIRONMENT=prod{br}{name}={br}abc=def"),
         ("MEFOR_STORE_PASSWORD", "{name}={br}abc=def"),
+        (
+            "MEFOR_STORE_PASSWORD",
+            "MEFOR_LOG_LEVEL=INFO{br}{name}={br}MEFOR_AI_ENVIRONMENT=prod",
+        ),
     ],
-    ids=["retired-keys-later", "password-later", "password-first"],
+    ids=["retired-keys-later", "password-later", "password-first", "password-middle"],
 )
 def test_a_secret_class_name_with_a_line_after_it_refuses_whatever_it_reads(
     br: str, name: str, entry: str
 ) -> None:
     """Vault BACKLOG #5394: a comma-separated list of padded keys, ``<key>=,<key>=``, reads as an
     ordinary variable's line, so the retired-keys name above it read as empty and nothing refused.
-    A secret-class name with any non-blank line after it now refuses whatever its own value reads
-    as, under each line break a registry string may hold."""
+    An empty secret-class name with a non-blank line after it now refuses, under each line break
+    a registry string may hold. The last case refuses an empty password above an ordinary line,
+    which ``main`` let through; that is accepted."""
     posture = _service([entry.format(br=br, name=name)])
     assert name in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert name in refusal
-    assert _PADDED not in repr(posture)
+    assert not _holds_padded(repr(posture))
+    assert not _holds_padded(refusal)
+
+
+#: NSSM's ``AppEnvironmentExtra`` is ``REG_MULTI_SZ``, and its GUI and ``nssm set`` put each
+#: variable in its own item, so the value an empty name above it may hold is the next item.
+_SPLIT_ACROSS_ITEMS = pytest.mark.parametrize(
+    ("name", "items"),
+    [
+        ("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", ["{name}=", f"{_PADDED},{_PADDED}"]),
+        ("MEFOR_STORE_PASSWORD", ["{name}=", "abc=def"]),
+        ("MEFOR_STORE_PASSWORD", ["MEFOR_LOG_LEVEL=INFO", "{name}=", "", "abc=def"]),
+    ],
+    ids=["retired-keys", "password", "password-middle"],
+)
+
+
+@_SPLIT_ACROSS_ITEMS
+def test_an_empty_secret_class_name_with_a_later_item_refuses(name: str, items: list[str]) -> None:
+    """Vault BACKLOG #5394: ``main`` let both through, and listed the first key upper-cased as a
+    name, which ``GET /security/posture`` serves. The secret-class name now refuses and is
+    named, and no form of the key material reaches the reading or the refusal."""
+    posture = _service([item.format(name=name) for item in items])
+    assert name in posture.listed
+    assert "ABC" not in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert name in refusal
+    assert not _holds_padded(repr(posture))
+    assert not _holds_padded(refusal)
+
+
+@_SPLIT_ACROSS_ITEMS
+def test_the_same_items_with_an_ordinary_name_do_not_refuse(name: str, items: list[str]) -> None:
+    """The control: an ordinary ``MEFOR_`` name in place of the secret-class one refuses
+    nothing, so it is the secret-class name, not the item shape, that refuses."""
+    posture = _service([item.format(name="MEFOR_LOG_FILE") for item in items])
+    assert service_env_refusal(posture) is None
+
+
+def test_an_empty_secret_class_name_in_its_values_last_item_is_not_listed() -> None:
+    """Only a non-blank line or item after it can be the value, so an empty name at the end of
+    the value, or with only blank items after it, stays unlisted."""
+    posture = _service(["MEFOR_LOG_LEVEL=INFO", "MEFOR_STORE_PASSWORD=", "", "  "])
+    assert posture.listed == ("MEFOR_LOG_LEVEL",)
+    assert service_env_refusal(posture) is None
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\keys\\oidc.pem\r\nMEFOR_LOG_LEVEL=INFO"],
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\keys\\oidc.pem\nMEFOR_LOG_LEVEL=INFO"],
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\keys\\oidc.pem\rMEFOR_LOG_LEVEL=INFO"],
+        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\keys\\oidc.pem", "MEFOR_LOG_LEVEL=INFO"],
+    ],
+    ids=["crlf", "lf", "cr", "two-items"],
+)
+def test_a_path_form_oidc_key_above_another_line_is_not_a_secret(items: list[str]) -> None:
+    """A path-form OIDC key is not a secret wherever it sits, as on ``main``: a name whose own
+    line sets it to something keeps its value rule, whatever follows it."""
+    posture = _service(items)
+    assert "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY" not in posture.listed
+    assert service_env_refusal(posture) is None
 
 
 @_LINE_BREAKS
