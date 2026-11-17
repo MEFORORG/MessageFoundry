@@ -36,8 +36,8 @@ What is refused, by default and with no setting to turn it off:
 PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
-MAC at the PBKDF2 floor, keyed at its HMAC's output size, passes, because any other MAC is keyed by the PKCS#12 KDF, which Appendix C
-does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
+MAC at the PBKDF2 floor, with a keyLength of its HMAC's output size, passes, because any other MAC
+is keyed by the PKCS#12 KDF, which Appendix C does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. A key bag inside a PKCS#12 part that is itself encrypted is checked by the same bag rules
 in a SECOND step: the caller decrypts that part with the passphrase and hands it back
@@ -748,7 +748,7 @@ _MD5: Final = "1.2.840.113549.2.5"
 _SHA1: Final = "1.3.14.3.2.26"
 
 #: HMAC schemes a PBMAC1 MAC may use, SHA-2 at 256 bits and up, each with its output length in
-#: octets. The length is the floor for the PBKDF2 keyLength that keys it (BACKLOG #5377).
+#: octets. The PBKDF2 keyLength that keys it must equal that length (BACKLOG #5377).
 _PBMAC1_SCHEMES: Final = {
     "1.2.840.113549.2.9": 32,  # HMAC-SHA-256
     "1.2.840.113549.2.10": 48,  # HMAC-SHA-384
@@ -835,8 +835,8 @@ def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
         )
     if fields.key_length != mac_length:
         return (
-            f"has a PBMAC1 MAC keyed by a {fields.key_length}-octet PBKDF2 key; the HMAC it keys "
-            f"takes a {mac_length}-octet key (RFC 9579)"
+            f"has a PBMAC1 MAC keyed by a {fields.key_length}-octet PBKDF2 key; RFC 9579 asks for "
+            f"the HMAC's output size, {mac_length} octets, and only that is accepted"
         )
     return None
 

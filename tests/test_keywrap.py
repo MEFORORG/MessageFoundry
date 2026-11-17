@@ -1321,7 +1321,7 @@ def test_a_pbmac1_mac_over_sha1_and_a_truncated_bundle_are_refused(material: Mat
     [
         ("sha256", 1, "1-octet PBKDF2 key"),
         ("sha256", 31, "31-octet PBKDF2 key"),
-        ("sha512", 32, "takes a 64-octet key"),
+        ("sha512", 32, "the HMAC's output size, 64 octets"),
         ("sha256", 48, "48-octet PBKDF2 key"),
         ("sha256", 65, "65-octet PBKDF2 key"),
         ("sha256", None, "omit keyLength"),

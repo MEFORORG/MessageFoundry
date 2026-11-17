@@ -1782,7 +1782,7 @@ def test_a_console_whose_every_file_was_deleted_is_missing_drift(
     assert console.checked == 0 and console.ok is False
     # The audit row names what happened: the package is under the root and nothing in it was read.
     detail = console.audit_detail()
-    assert detail["unattested_reason"] == "no_attested_file_readable"
+    assert detail["unattested_reason"] == "no_file_compared_under_install_root"
     assert detail["drift_count"] == len(_CONSOLE_FILES)
 
 
@@ -1885,5 +1885,23 @@ def test_a_pass_where_no_file_opens_is_attested_nothing_and_drift(
     assert sorted(_drift(result)) == sorted(
         [(_ASSET, "missing"), ("mfengine/__init__.py", "missing")]
     )
-    assert result.unattested_reason == "no_attested_file_readable"
-    assert result.audit_detail()["unattested_reason"] == "no_attested_file_readable"
+    assert result.unattested_reason == "no_file_compared_under_install_root"
+    assert result.audit_detail()["unattested_reason"] == "no_file_compared_under_install_root"
+
+
+def test_an_emptied_engine_package_with_no_declared_asset_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine arm by construction: with no declared asset to place its root under the install
+    root, the loaded package's own directory does, so every module row is ``missing`` drift."""
+    import messagefoundry
+
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(messagefoundry, "__path__", [str(package_dir)])
+    for rel in _ENGINE_FILES:
+        (tmp_path / rel).unlink()
+
+    result = attest_engine()
+    assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
+    assert result.checked == 0
+    assert result.unattested_reason == "no_file_compared_under_install_root"

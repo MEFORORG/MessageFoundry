@@ -1865,8 +1865,8 @@ _QUERY_NOT_CREDENTIAL_TAILS = (
 )
 
 #: Names the HTTP family's no-escape credential refusals count beside the heuristic, as the whole
-#: name after any reading :func:`_base_names` gives, ignoring case (``refusal=True``). ``code`` carries an Azure
-#: Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
+#: of any reading :func:`_base_names` gives, ignoring case (``refusal=True``). ``code`` carries an
+#: Azure Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
 #: also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
 #: warns and reports. A refusal of a hop that already relaxed verification, or that crosses plain
 #: ``http`` off this machine, takes that over-refusal (vault BACKLOG #3533 item 7).
@@ -1901,7 +1901,11 @@ def _base_name(name: str) -> str:
     """``name`` after :func:`_clean_name`, without a trailing index such as ``[]`` or ``[0]``, and
     without trailing digits. So ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as
     ``token``, ``token``, ``key`` and ``apiKey``."""
-    base = _clean_name(name)
+    return _cut_last_bracket(_clean_name(name))
+
+
+def _cut_last_bracket(base: str) -> str:
+    """:func:`_base_name` over a name :func:`_clean_name` already cleaned."""
     if base.endswith("]") and "[" in base:
         base = base[: base.rfind("[")]
     return _strip_digits(base)
@@ -1912,13 +1916,14 @@ def _base_names(name: str) -> tuple[str, ...]:
     name two more (BACKLOG #5379). The name is cut at every ``[`` and ``]``, each piece stripped of
     spaces (``parse_qsl`` decodes ``+`` to one) and empty pieces dropped. Trailing pieces that are
     indexes (all digits) are dropped, all of them, so ``token[0][0]`` is judged as ``token``. Then
-    the first piece is one reading, and the pieces joined by ``.`` are another, so
-    ``user[password]`` is judged as ``user.password`` and ends in the credential word, and
-    ``sort[key]`` as ``sort.key``, which the non-secret list still reads as a sort key. A name
-    matches when any reading does, so this only widens what :func:`_base_name` alone matched.
-    Linear in ``name``: one split, and each piece is looked at a bounded number of times."""
-    readings = [_base_name(name)]
+    the first piece is one reading, and each piece joined by ``.`` to the piece before it is
+    another. So ``user[password]`` and ``user[password][x]`` are both judged as ``user.password``,
+    which ends in the credential word, and ``sort[key]`` as ``sort.key``, which the non-secret
+    list still reads as a sort key. A name matches when any reading does, so this only widens what
+    :func:`_base_name` alone matched. Linear in ``name``: one split, and each piece is in at most
+    two readings."""
     cleaned = _clean_name(name)
+    readings = [_cut_last_bracket(cleaned)]
     if "[" in cleaned or "]" in cleaned:
         pieces = [piece.strip() for piece in cleaned.replace("]", "[").split("[")]
         pieces = [piece for piece in pieces if piece]
@@ -1926,7 +1931,10 @@ def _base_names(name: str) -> tuple[str, ...]:
             pieces.pop()
         if pieces:
             readings.append(_strip_digits(pieces[0]))
-            readings.append(_strip_digits(".".join(pieces)))
+            readings.extend(
+                _strip_digits(f"{before}.{piece}")
+                for before, piece in zip(pieces, pieces[1:], strict=False)
+            )
     return tuple(dict.fromkeys(readings))
 
 

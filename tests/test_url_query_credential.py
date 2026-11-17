@@ -148,6 +148,16 @@ def test_detector_reads_camel_case_tails(url: str, expected: list[str]) -> None:
                 "'user[password]'",
             ],
         ),
+        # A credential key with a non-index key after it.
+        (
+            "https://p.example.invalid/x?user[password][x]=a&data[secret][0][name]=b"
+            "&oauth[access_token][value]=c",
+            [
+                "'data[secret][0][name]'",
+                "'oauth[access_token][value]'",
+                "'user[password][x]'",
+            ],
+        ),
         # A space around a bracket key, as ``+`` decodes, is not part of the key.
         ("https://p.example.invalid/x?user[+password+]=a", ["'user[ password ]'"]),
         # The old reading still holds: a credential word before a non-index bracket key.
@@ -165,18 +175,21 @@ def test_detector_reads_bracket_keyed_names(url: str, expected: list[str]) -> No
 
 def test_bracket_readings_stay_linear_in_the_name() -> None:
     # BACKLOG #5379 review: a name of many ``[]`` groups is read in one split, not one copy per
-    # group. Ratio of two sizes, so a slow runner does not fail it; quadratic would be about 16x.
+    # group. The best of three runs at each of two sizes, compared as a ratio with wide margin:
+    # linear is about 4x, quadratic about 16x.
     import time
 
     def cost(n: int) -> float:
         name = "a" * n + "[]" * n
-        start = time.perf_counter()
-        for _ in range(5):
+        runs = []
+        for _ in range(3):
+            start = time.perf_counter()
             secretscrub._base_names(name)
-        return time.perf_counter() - start
+            runs.append(time.perf_counter() - start)
+        return min(runs)
 
     cost(1000)
-    assert cost(80_000) < 8 * cost(20_000) + 0.05
+    assert cost(80_000) < 10 * cost(20_000) + 0.05
 
 
 def test_the_refusal_names_drop_every_trailing_index() -> None:
