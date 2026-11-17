@@ -260,9 +260,9 @@ open points settled below.
   chunk is read past whitespace, a byte order mark (U+FEFF) and its `FHS`/`BHS` envelope header
   lines. What remains is a message when it starts with `MSH`, and is otherwise kept so the parser
   records its `ERROR`. The File source calls `split_batch` too, so it is fixed by the same change.
-  The dry-run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8 byte order mark is
-  three characters, so it strips that mark first and splits as the live sources do under a UTF-8
-  charset. It is not told the connection's charset, so under a single-byte charset, where the live
+  The dry-run's `split_messages` splits a latin-1 view of the bytes, in which it spells each UTF-8
+  byte order mark's three bytes as the mark itself, so it reads the marks as the live sources do
+  under a UTF-8 charset. It is not told the connection's charset, so under a single-byte charset, where the live
   sources keep those three bytes and the parser refuses the file, the dry run still reads past them;
   that gap stays open. *Changed in the
   final repair round:* a file holding one message led by a UTF-8 byte order mark, or by an
@@ -274,12 +274,15 @@ open points settled below.
   disposition each member of a batch gets. The mark is read in the decoded text, so under a
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
-  with `MSH` after whitespace is still handed over as its own bytes. The split drops an envelope's
-  header lines. *(Changed by BACKLOG #5806: it also drops the run of `FHS`, `BHS`, `BTS` and `FTS`
-  lines that ends an `MSH`-led message, so neither the last message of an enveloped file nor its
-  only message carries the trailer to the Handler. A one-message file led by `MSH` that ends with
-  such lines is handed over as the split read it, as a batch member is, rather than as its own
-  bytes.)*
+  with `MSH` after whitespace, and that ends with no envelope line, is still handed over as its own
+  bytes. The split drops the `FHS`, `BHS`, `BTS` and `FTS` envelope lines before the first message,
+  and the run of them that ends an `MSH`-led message (BACKLOG #5806), so neither the last message
+  of an enveloped file nor its only message carries the trailer to the Handler. A one-message file
+  led by `MSH` that ends with such lines is handed over as the split read it, as a batch member is.
+  An envelope line here opens, past spaces, tabs and the other ASCII whitespace and byte order
+  marks, with one of those ids, followed by the field separator (MSH-1) of the message it goes
+  with (the one it ends, or for lines before the first message, that message), or by nothing but
+  that noise. So a data line such as `FHS: 140 bpm` stays in its message.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -576,10 +579,11 @@ segment, is still not a boundary. Each `_Boundary` is now one pattern that opens
 break, which no mark holds, so `_next_boundary` stays linear in the text however its boundaries
 are spelled, after one scan for `MSH` settles a text holding none.
 
-**Not changed.** The dry run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8
-mark is three characters, so it does not cut at a marked later `MSH`. It hands the file over whole,
-and the ingress guard it then runs refuses it as two messages, where the live sources under UTF-8
-record two messages. That is a further case of the gap vault #2853 names, and it stays open.
+**The dry run.** The dry run's `split_messages` splits a latin-1 view of the bytes in which each
+UTF-8 mark's three bytes are spelled as the mark itself, so it cuts at a marked later `MSH` as the
+live sources do under UTF-8. Under a single-byte charset the live sources keep the three bytes and
+do not cut there, while the dry run still does. That is a further case of the gap vault #2853
+names, and it stays open.
 
 The tests: `tests/test_one_frame_one_message.py::test_the_ingress_guard_refuses_a_second_msh_that_marks_lead`,
 `::test_the_file_split_cuts_past_the_marks_before_a_later_msh` and

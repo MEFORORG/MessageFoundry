@@ -468,6 +468,23 @@ def test_split_messages_reads_a_leading_run_of_marks_as_the_live_split(
     assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
 
 
+@pytest.mark.parametrize(
+    "noise",
+    [b"\xc2\xa0", b"\xc2\x85", b"\xe2\x80\x83", b"\x1c", b"\x0b", b"\xef\xbb\xbf"],
+    ids=["nbsp", "nel", "em-space", "fs", "vt", "mark"],
+)
+@pytest.mark.parametrize("count", [1, 2], ids=["one-message", "two-messages"])
+def test_split_messages_reads_envelope_noise_as_the_live_split(noise: bytes, count: int) -> None:
+    """Round-three review of BACKLOG #5806, finding 2: the trailer walk read every Unicode space as
+    noise, so the live UTF-8 decode read a non-breaking space after a trailer as noise and dropped
+    the trailer, where the dry run's latin-1 view read the same bytes as two other characters and
+    kept it. Noise is now an explicit ASCII set plus the mark. Mutation: read ``str.isspace`` as
+    noise again. Red: the nbsp, nel and em-space cases differ."""
+    body = ADT_A01 + ADT_A01.replace("MSG1", "MSG2") if count == 2 else ADT_A01
+    raw = body.encode("utf-8") + b"BTS|1\r" + noise + b"\rFTS|1\r"
+    assert split_messages(raw) == split_batch_bytes(raw, "utf-8")
+
+
 def test_split_messages_keeps_a_mark_that_leads_no_msh() -> None:
     """Control: marks after a line break that no MSH follows are data, kept byte for byte."""
     raw = ADT_A01.encode("utf-8") + b"NTE|1||\xef\xbb\xbfnote\r\xef\xbb\xbfNTE|2\r"

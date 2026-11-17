@@ -24,7 +24,10 @@ Each edited line says what it read at a0a5e4f5a4.
 BACKLOG #5806 changed the split and the byte scan on purpose too, and their copies with them: an
 ``MSH``-led message no longer ends with the batch envelope lines that followed it in the file, the
 first chunk is read past trailer lines as well as header lines, and an envelope segment id
-anywhere in a file needs a decode. The corpus gained a ``BTS|`` token for it.
+anywhere in a file needs a decode. The corpus gained a ``BTS|`` token for it. Its third review
+round narrowed both: an envelope line takes the field separator of the message it goes with, the
+noise around it is an explicit ASCII set and the mark, and the byte scan reads an envelope id
+only at a line start. The corpus gained a ``BTS^`` token, a file separator and a no-break space.
 """
 
 from __future__ import annotations
@@ -88,9 +91,10 @@ def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if b"\rMSH" in raw or b"\nMSH" in raw:
         return True
-    # BACKLOG #5806: an envelope segment id anywhere now needs a decode too.
-    if any(segment in raw for segment in (b"FHS", b"BHS", b"BTS", b"FTS")):
-        return True
+    # BACKLOG #5806: an envelope segment id at a line start, past in-line noise, needs a decode too.
+    for line in re.split(rb"[\r\n]", raw):
+        if line.lstrip(_OLD_IN_LINE_NOISE_BYTES).startswith((b"FHS", b"BHS", b"BTS", b"FTS")):
+            return True
     # BACKLOG #5918: a later MSH that UTF-8 byte order marks lead now needs a decode too.
     return _OLD_LATER_MSH_BYTES_PAST_BOM.search(raw) is not None
 
@@ -100,9 +104,10 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     first, *rest = _OLD_MSH_BOUNDARY.split(text)
     messages = [chunk[1:].lstrip(BOM) for chunk in rest]  # BACKLOG #5918: was chunk[1:]
     head = first.lstrip(_LEADING_WS_STR)
-    # BACKLOG #5806: was head.startswith(("FHS", "BHS")).
-    while _old_envelope(head.partition("\r")[0]):
-        head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
+    # BACKLOG #5806: was head.startswith(("FHS", "BHS")), and lstrip(_LEADING_WS_STR) after it.
+    separator = _old_separator(messages[0]) if messages else None
+    while _old_envelope(head.partition("\r")[0], separator):
+        head = head.partition("\r")[2].lstrip(_OLD_NOISE)
     if head.strip():
         messages.insert(0, head)
     messages = [_old_drop_trailer(m) for m in messages]  # BACKLOG #5806: was not there
@@ -111,17 +116,26 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
 
 #: BACKLOG #5806: the envelope segment ids, dropped before the first message and at a message's end.
 _OLD_ENVELOPE_LINES = ("FHS", "BHS", "BTS", "FTS")
-#: BACKLOG #5806: the noise around a message's closing envelope lines, whitespace and the mark.
-_OLD_TRAILING_NOISE = "".join(chr(c) for c in range(0x3001) if chr(c).isspace()) + BOM
+#: BACKLOG #5806: the noise around envelope lines, the ASCII whitespace and the mark.
+_OLD_NOISE = "".join(chr(c) for c in range(128) if chr(c).isspace()) + BOM
+_OLD_IN_LINE_NOISE = _OLD_NOISE.replace("\r", "").replace("\n", "")
+_OLD_IN_LINE_NOISE_BYTES = _OLD_IN_LINE_NOISE.replace(BOM, "").encode("ascii") + b"\xef\xbb\xbf"
 
 
-def _old_envelope(line: str) -> bool:
-    """BACKLOG #5806: noise, an envelope id, then the line's end or a character that is neither a
-    word character nor whitespace."""
-    rest = line.lstrip(_OLD_TRAILING_NOISE)
+def _old_separator(message: str) -> str | None:
+    """BACKLOG #5806: MSH-1 of an MSH-led message, unless it is a line break or missing."""
+    if not message.startswith("MSH") or len(message) < 4 or message[3] in "\r\n":
+        return None
+    return message[3]
+
+
+def _old_envelope(line: str, separator: str | None) -> bool:
+    """BACKLOG #5806: in-line noise, an envelope id, then the message's field separator, or
+    in-line noise alone to the line's end."""
+    rest = line.lstrip(_OLD_IN_LINE_NOISE)
     if not rest.startswith(_OLD_ENVELOPE_LINES):
         return False
-    return len(rest) == 3 or not (rest[3].isalnum() or rest[3] == "_" or rest[3].isspace())
+    return rest[3:4] == separator or rest[3:].strip(_OLD_IN_LINE_NOISE) == ""
 
 
 def _old_drop_trailer(message: str) -> str:
@@ -133,9 +147,13 @@ def _old_drop_trailer(message: str) -> str:
         return message
 
     def noise(line: str) -> bool:
-        return line.strip(_OLD_TRAILING_NOISE) == ""
+        return line.strip(_OLD_NOISE) == ""
 
-    envelope = _old_envelope
+    separator = _old_separator(message)
+
+    def envelope(line: str) -> bool:
+        return _old_envelope(line, separator)
+
     lines = message.split("\r")
     run = len(lines)
     while run > 1 and (noise(lines[run - 1]) or envelope(lines[run - 1])):
@@ -152,7 +170,25 @@ def _old_drop_trailer(message: str) -> str:
 #: the byte order mark, other leading whitespace and a vertical tab, a field separator, the batch
 #: envelope headers and a trailer (BACKLOG #5806), another segment, and a non-Latin-1 character (a
 #: wider string kind).
-TOKENS = ("\r", "\n", "MSH", "MS", "H", BOM, " ", "\x0b", "|", "FHS|", "BHS|", "BTS|", "PID|", "王")
+TOKENS = (
+    "\r",
+    "\n",
+    "MSH",
+    "MS",
+    "H",
+    BOM,
+    " ",
+    "\x0b",
+    "\x1c",
+    "\xa0",
+    "|",
+    "FHS|",
+    "BHS|",
+    "BTS|",
+    "BTS^",
+    "PID|",
+    "王",
+)
 #: Every string of up to this many tokens, then a seeded sample of longer ones, which is where a
 #: marked second boundary or two boundaries behind an envelope header first fit.
 EXHAUSTIVE_TOKENS = 4

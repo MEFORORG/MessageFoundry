@@ -16,8 +16,19 @@ reused by the dry-run / Test Bench:
   order message out into per-order messages.
 
 :func:`split_by_obr` reads the message's **own** separators (MSH-1/MSH-2) and goes through the
-:class:`Message` primitive. :func:`split_batch` cuts the text only between whole lines, at a
-message boundary or before the envelope lines it drops, and never inside a segment.
+:class:`Message` primitive. :func:`split_batch` normalizes line ends to CR and then cuts the text
+at these places, and nowhere else:
+
+* past the spaces, tabs, line breaks, vertical tabs, form feeds and byte order marks that lead it,
+  then past each envelope line before the first ``MSH`` and the noise (:data:`_NOISE`) after it;
+* at the CR before each later ``MSH`` line, and past the byte order marks between that CR and the
+  ``MSH``, so the CR goes with neither message;
+* at the start of the run of envelope lines, with the noise among and after them, that ends an
+  ``MSH``-led message.
+
+So what it drops is at least line-end characters, leading noise, byte order marks before an
+``MSH`` and whole envelope lines with the noise around them; it never cuts a line that holds a
+segment's id and fields.
 """
 
 from __future__ import annotations
@@ -143,24 +154,37 @@ def _sends_more_than_one_message(payload: str) -> bool:
 #: pattern ``\s`` is exactly the bytes of ``sniff._LEADING_WS``; a test pins the two.
 _LEADING_BOM = re.compile(rb"\s*" + _BOM_BYTES)
 
-#: A batch-envelope line, a file's or batch's header or trailer, matched within one line's bounds:
-#: whitespace or byte order marks, then ``FHS``, ``BHS``, ``BTS`` or ``FTS``, then the line's end or
-#: a character that can be a field separator, so a data line such as ``FHS 140 bpm`` is not one.
-#: None is a message's segment, so the split drops them before the first message and at the end of
-#: each (BACKLOG #5806).
-_ENVELOPE_LINE = re.compile(r"[\s" + _BOM + r"]*(?:FHS|BHS|BTS|FTS)(?:[^\w\s]|$)")
+#: The noise the split reads past around envelope lines: the ASCII characters ``str.isspace`` reads
+#: as whitespace, and the byte order mark. An explicit ASCII set, so the dry run's latin-1 view of
+#: a file and a UTF-8 decode of it read the same characters as noise; a non-ASCII space is data.
+_NOISE = " \t\r\n\x0b\x0c\x1c\x1d\x1e\x1f" + _BOM
 
-#: The noise a message may end with around its envelope lines: whitespace, as ``str.isspace`` reads
-#: it, and byte order marks. A test holds it to the class ``_ENVELOPE_LINE`` opens with.
-_TRAILING_NOISE = "".join(chr(c) for c in range(0x3001) if chr(c).isspace()) + _BOM
+#: :data:`_NOISE` within one line, a regex class run, spelled out for the ReDoS scanner.
+_IN_LINE_NOISE = r"[ \t\x0b\x0c\x1c\x1d\x1e\x1f" + _BOM + r"]*"
 
-#: The leading noise :func:`split_batch` reads the first chunk past, ``sniff._LEADING_WS_STR``
-#: spelled out for the ReDoS scanner, as a test pins.
+#: The opening of a batch-envelope line, a file's or batch's header or trailer: in-line noise,
+#: then ``FHS``, ``BHS``, ``BTS`` or ``FTS``. :func:`_is_envelope_line` says what must follow. None
+#: is a message's segment, so the split drops them before the first message and at the end of each
+#: (BACKLOG #5806).
+_ENVELOPE_ID = re.compile(_IN_LINE_NOISE + "(?:FHS|BHS|BTS|FTS)")
+
+#: In-line noise alone, to the end of the line it is matched in.
+_IN_LINE_NOISE_ONLY = re.compile(_IN_LINE_NOISE)
+
+#: :data:`_NOISE` across lines, which the first chunk is read past after each envelope line.
+_NOISE_RUN = re.compile(r"[ \t\r\n\x0b\x0c\x1c\x1d\x1e\x1f" + _BOM + r"]*")
+
+#: The leading noise :func:`split_batch` reads the first chunk past before anything else,
+#: ``sniff._LEADING_WS_STR`` spelled out for the ReDoS scanner, as a test pins.
 _LEADING_NOISE = re.compile(r"[ \t\r\n\x0b\x0c" + _BOM + r"]*")
 
-#: An envelope segment id in a file's bytes, for :func:`_needs_a_decode`. Any hit only costs a
-#: decode.
-_ENVELOPE_ID_BYTES = re.compile(rb"[BF][HT]S")
+#: An envelope segment id at the start of a line of a file's bytes, past in-line noise, for
+#: :func:`_needs_a_decode`: the bytes of :data:`_ENVELOPE_ID` after a line break or at the start.
+#: The mark is UTF-8's, read as any run of its three bytes, as :data:`_RAW_BYTES` reads it; a wider
+#: match only costs a decode. The class holds no line break, so each break starts one run: linear.
+_ENVELOPE_ID_BYTES = re.compile(
+    rb"(?:\A|[\r\n])[ \t\x0b\x0c\x1c\x1d\x1e\x1f" + _BOM_BYTES + rb"]*[BF][HT]S"
+)
 
 #: Codecs (by ``codecs.lookup`` name) that write every ASCII character as that one byte and use no
 #: ASCII byte for anything else, so a byte scan for a later ``MSH`` answers what a decode would.
@@ -177,18 +201,23 @@ def split_batch(raw: str | bytes) -> list[str]:
     too, and the cut is past those marks, so the message starts with ``MSH`` (BACKLOG #5918). Each
     returned message is ``\r``-delimited. The ``FHS``/``BHS``/``BTS``/``FTS`` envelope lines before
     the first ``MSH`` are dropped, since each split message is routed on its own and the batch
-    framing has no per-message meaning. So are those that end an ``MSH``-led message, such as a
-    batch's trailer or the next batch's header (:func:`_trailer_start`, BACKLOG #5806), so the
+    framing has no per-message meaning. So are the envelope lines that end an ``MSH``-led message,
+    such as a batch's trailer or the next batch's header (:func:`_trailer_start`, BACKLOG #5806).
+    An envelope line opens, past in-line :data:`_NOISE`, with one of those ids, followed by the
+    field separator of the message it goes with (the first ``MSH``-led one after it, or the one it
+    ends) or by nothing but that noise (:func:`_is_envelope_line`). So the
     members of a batch :func:`encode_batch` framed come back with their segments and no envelope
     line. A member cut at the next ``MSH`` loses the CR before it.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
-    whitespace, a byte order mark (U+FEFF) and those envelope lines. What remains is a message when
+    the leading noise the content sniff tolerates (spaces, tabs, line breaks, vertical tabs, form
+    feeds and byte order marks), then those envelope lines and the noise after each. A chunk of
+    envelope lines and noise alone is not a message. What remains is a message when
     it starts with ``MSH``, and is otherwise kept as one too, so the parser records its ``ERROR``
     rather than the split discarding what the sender sent.
 
     A payload holding a single message and no envelope line comes back as one element: its
-    normalized text, past any leading whitespace and byte order marks. An empty/whitespace payload
+    normalized text, past that leading noise. An empty/whitespace payload
     yields the normalized text as the sole element (the caller — e.g. the parser — then reports it
     as malformed rather than silently dropping it).
     """
@@ -202,16 +231,42 @@ def split_batch(raw: str | bytes) -> list[str]:
     # Each later message runs from past its boundary's own CR, and any marks after it, so it starts
     # with MSH, up to the next boundary.
     messages = [text[cut + 1 : end].lstrip(_BOM) for cut, end in itertools.pairwise(bounds)]
-    # The leading noise the content sniff tolerates, then each envelope line and the noise after it.
-    # Walked by index, so a first chunk of many envelope lines is not copied once per line.
+    # The leading noise the content sniff tolerates, then each envelope line and the noise after it,
+    # the same noise the end of a message is read back past. An envelope line here takes the field
+    # separator of the first MSH-led message after it. Walked by index, so a first chunk of many
+    # envelope lines is not copied once per line.
     first = bounds[0]
-    pos = _past_leading_noise(text, 0, first)
-    while _ENVELOPE_LINE.match(text, pos, line_end := _line_end(text, pos, first)):
-        pos = _past_leading_noise(text, line_end, first)
+    separator = _field_separator(messages[0]) if messages else None
+    pos = _past(_LEADING_NOISE, text, 0, first)
+    while _is_envelope_line(text, pos, line_end := _line_end(text, pos, first), separator):
+        pos = _past(_NOISE_RUN, text, line_end, first)
     head = text[pos:first]
     if head.strip():  # a chunk of other whitespace alone is not a message either
         messages.insert(0, head)
     return [_without_trailer(m) for m in messages] or [text]
+
+
+def _field_separator(message: str) -> str | None:
+    """MSH-1 of an ``MSH``-led ``message``, or None when it has none: it is not ``MSH``-led, or
+    a line break or nothing follows its ``MSH``."""
+    if not message.startswith(_MSH) or len(message) <= len(_MSH):
+        return None
+    separator = message[len(_MSH)]
+    return None if separator in "\r\n" else separator
+
+
+def _is_envelope_line(text: str, start: int, end: int, separator: str | None) -> bool:
+    """Whether the line ``text[start:end]`` is a batch-envelope line of the message whose field
+    separator is ``separator``: :data:`_ENVELOPE_ID`, then that separator, or in-line noise alone
+    to the line's end. So a data line such as ``FHS: 140 bpm`` or ``FHS 140 bpm`` is not one when
+    the message's separator is ``|``."""
+    found = _ENVELOPE_ID.match(text, start, end)
+    if found is None:
+        return False
+    after = found.end()
+    if after < end and text[after] == separator:
+        return True
+    return _IN_LINE_NOISE_ONLY.fullmatch(text, after, end) is not None
 
 
 def _line_end(text: str, pos: int, end: int) -> int:
@@ -220,9 +275,9 @@ def _line_end(text: str, pos: int, end: int) -> int:
     return end if found < 0 else found
 
 
-def _past_leading_noise(text: str, pos: int, end: int) -> int:
-    """The index past the run of :data:`_LEADING_NOISE` at ``pos`` in ``text[:end]``."""
-    found = _LEADING_NOISE.match(text, pos, end)
+def _past(noise: re.Pattern[str], text: str, pos: int, end: int) -> int:
+    """The index past the run ``noise`` matches at ``pos`` in ``text[:end]``."""
+    found = noise.match(text, pos, end)
     return pos if found is None else found.end()
 
 
@@ -231,34 +286,34 @@ def _without_trailer(message: str) -> str:
     with no envelope line, ``message`` itself, uncopied."""
     if not message.startswith(_MSH):
         return message
-    cut = _trailer_start(message)
+    cut = _trailer_start(message, _field_separator(message))
     return message if cut == len(message) else message[:cut]
 
 
-def _trailer_start(text: str) -> int:
-    """Where the run of envelope lines (:data:`_ENVELOPE_LINE`) that ends ``text`` starts (BACKLOG
-    #5806), or ``len(text)`` when it ends with none. The run is read from the end: envelope lines,
-    and :data:`_TRAILING_NOISE` between and after them. It starts at its first envelope line, so
-    the line break before that line stays with the text. The first line is never in it. A line
-    break is a CR or an LF, so a file's decoded text reads as its normalized text does. Each step
-    back searches windows that double, so the work grows with the run and the line before it, not
-    with the text."""
+def _trailer_start(text: str, separator: str | None) -> int:
+    """Where the run of envelope lines (:func:`_is_envelope_line`, for a message whose field
+    separator is ``separator``) that ends ``text`` starts (BACKLOG #5806), or ``len(text)`` when it
+    ends with none. The run is read from the end: envelope lines, and :data:`_NOISE` between and
+    after them. It starts at its first envelope line, so the line break before that line stays with
+    the text. The first line is never in it. A line break is a CR or an LF, so a file's decoded
+    text reads as its normalized text does. Each step back searches windows that double, so the
+    work grows with the run and the line before it, not with the text."""
     cut = len(text)
     end = _noise_start(text, cut)
     while True:
         start = _line_start(text, end)
-        if start == 0 or not _ENVELOPE_LINE.match(text, start, end):
+        if start == 0 or not _is_envelope_line(text, start, end, separator):
             return cut
         cut = start
         end = _noise_start(text, start)
 
 
 def _noise_start(text: str, end: int) -> int:
-    """Where the run of :data:`_TRAILING_NOISE` that ends ``text[:end]`` starts."""
+    """Where the run of :data:`_NOISE` that ends ``text[:end]`` starts."""
     width = 256
     while end:
         low = max(0, end - width)
-        kept = len(text[low:end].rstrip(_TRAILING_NOISE))
+        kept = len(text[low:end].rstrip(_NOISE))
         if kept:
             return low + kept
         end = low
@@ -292,8 +347,8 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     :func:`split_batch` finds is handed back.
 
     A file holding no ``MSH`` after a line break, with or without byte order marks between them,
-    and holding no envelope segment id (``FHS``, ``BHS``, ``BTS``, ``FTS``) anywhere, is one
-    message the parser reads as it is. Under UTF-8 only, it must also not open with a byte order
+    and holding no line that opens with an envelope segment id (``FHS``, ``BHS``, ``BTS``,
+    ``FTS``) past in-line noise, is one message the parser reads as it is. Under UTF-8 only, it must also not open with a byte order
     mark, which the split reads past. Under a single-byte charset the mark's bytes are three
     characters the split keeps. Where a byte scan can tell (:func:`_needs_a_decode`), such a file
     is returned without a decode or a split, so the common single-message file pays a few scans."""
@@ -326,14 +381,14 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     message in a batch of two did not."""
     if not message.startswith(_MSH):
         return raw
-    if starts_with_msh(text) and _trailer_start(text) == len(text):
+    if starts_with_msh(text) and _trailer_start(text, _field_separator(message)) == len(text):
         return raw
     return message.encode(encoding)
 
 
 def _needs_a_decode(raw: bytes, encoding: str) -> bool:
     """Whether ``raw`` may hold an ``MSH`` after a line break, with or without UTF-8 byte order
-    marks between them, may hold an envelope line, or, under UTF-8, may open with a byte order mark
+    marks between them, may hold a line that opens with an envelope segment id, or, under UTF-8, may open with a byte order mark
     the split reads past. It answers False only for an encoding that writes each ASCII character as
     that one byte and uses no ASCII byte for anything else, with none of those shapes present. Any
     other encoding answers True, so the caller decodes. Under a single-byte charset the mark's bytes
@@ -347,8 +402,9 @@ def _needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if name == "utf-8" and _LEADING_BOM.match(raw):
         return True
-    # An envelope segment id anywhere, which may begin a line the split drops (BACKLOG #5806). A
-    # wide test: a hit in data only costs a decode, after which the file is handed over as before.
+    # An envelope segment id at the start of a line, which may be a line the split drops (BACKLOG
+    # #5806). Only at a line start, so base64 data inside a field does not cost a decode; a hit
+    # that is a data line only costs a decode, after which the file is handed over as before.
     if _ENVELOPE_ID_BYTES.search(raw):
         return True
     return _next_boundary(raw, 0, _RAW_BYTES) >= 0

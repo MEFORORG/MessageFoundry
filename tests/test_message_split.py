@@ -141,32 +141,90 @@ def test_split_batch_reads_an_envelope_run_past_tolerated_noise(tail: str) -> No
 
 def test_the_split_noise_classes_are_the_ones_they_name() -> None:
     """The leading class is spelled out for the ReDoS scanner and must stay the content sniff's one
-    definition of tolerated noise; the class an envelope line opens with must be the trailing noise
-    the end of a message is read back past."""
+    definition of tolerated noise. Every other class is :data:`split._NOISE`: the run the leading
+    walk reads past after an envelope line, the class an envelope line opens with (line breaks
+    aside), and, as bytes, the class the fast path reads before an envelope id. Round two of
+    BACKLOG #5806's review: the walk read the sniff's class where the end of a message read every
+    space, so a first chunk of envelope lines could become a message."""
     chars = [chr(c) for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF]
     leading = {ch for ch in chars if split_module._LEADING_NOISE.fullmatch(ch)}
     assert leading == set(_LEADING_WS_STR)
-    opener = {ch for ch in chars if split_module._ENVELOPE_LINE.match(ch + "BTS")}
-    assert opener == set(split_module._TRAILING_NOISE)
+    noise = set(split_module._NOISE)
+    assert {ch for ch in chars if split_module._NOISE_RUN.fullmatch(ch)} == noise
+    in_line = {ch for ch in chars if split_module._ENVELOPE_ID.match(ch + "BTS")}
+    assert in_line == noise - {"\r", "\n"}
+    assert {ch for ch in chars if split_module._IN_LINE_NOISE_ONLY.fullmatch(ch)} == in_line
+    # The byte class: each ASCII noise byte, and the mark's three bytes.
+    pattern = split_module._ENVELOPE_ID_BYTES
+    in_bytes = {b for b in range(256) if pattern.fullmatch(b"\r" + bytes([b]) + b"BTS")}
+    assert in_bytes == {ord(ch) for ch in in_line if ch.isascii()} | set(b"\xef\xbb\xbf")
+    # Every noise character reads the same in a latin-1 view and a UTF-8 decode (BACKLOG #5806
+    # round two, finding 2): ASCII, and the mark, which the dry run spells as itself.
+    assert all(ch.isascii() for ch in noise - {BOM})
 
 
 @pytest.mark.parametrize(
-    "data", ["FHS 140 bpm regular", "BTSX|1", "FTS_LIKE"], ids=["space", "letter", "underscore"]
+    "data",
+    ["FHS 140 bpm regular", "BTSX|1", "FTS_LIKE", "FHS: 140 bpm", "BTS-1", "FHS^1"],
+    ids=["space", "letter", "underscore", "colon", "hyphen", "other-separator"],
 )
 def test_a_data_line_that_only_begins_with_an_envelope_id_is_kept(data: str) -> None:
-    """Round-two review of BACKLOG #5806: any line beginning with the letters was dropped, so a
-    wrapped text line such as a fetal heart rate note was cut from the stored message. Mutation:
-    drop the separator lookahead from ``_ENVELOPE_LINE``. Red: the line is gone."""
+    """Round-two and round-three review of BACKLOG #5806: any line beginning with the letters, and
+    then any one beginning with them and a punctuation mark, was dropped, so a wrapped text line
+    such as a fetal heart rate note was cut from the stored message. An envelope line takes the
+    message's own field separator (MSH-1). Mutation: accept any non-word character after the id.
+    Red: the colon, hyphen and caret lines are gone."""
     body = ADT_A01 + data + "\r"
     assert split_batch(body) == [body]
     assert split_batch_bytes(body.encode("utf-8"), "utf-8") == [body.encode("utf-8")]
 
 
+def test_an_envelope_line_reads_the_members_own_separator() -> None:
+    """Control: a member whose MSH-1 is ``^`` loses a ``BTS^`` trailer and keeps a ``BTS|`` line,
+    and the header run before it is read with the same separator."""
+    member = "MSH^~|\\&^A^B\rPID^1\r"
+    assert split_batch("FHS^x\rBHS^x\r" + member + "BTS|1\rBTS^1\rFTS^1\r") == [member + "BTS|1\r"]
+
+
 def test_a_trailer_followed_by_a_frame_end_byte_is_still_dropped() -> None:
-    """Round-two review of BACKLOG #5806: an MLLP capture can end with ``\\x1c``, whitespace to
-    ``str.isspace``, and the narrower noise class kept the trailer before it. Red with the
-    sniff's class: the member ends with ``BTS|1``."""
+    """Round-two review of BACKLOG #5806: an MLLP capture can end with ``\\x1c``, which
+    ``str.isspace`` reads as whitespace, and the sniff's noise class kept the trailer before it.
+    Red with the sniff's class: the member ends with ``BTS|1``."""
     assert split_batch(ADT_A01 + "BTS|1\rFTS|1\r\x1c\r" + ADT_A02)[0] == ADT_A01
+
+
+def test_base64_data_holding_an_envelope_id_stays_on_the_fast_path() -> None:
+    """Round-three review of BACKLOG #5806, finding 5: the byte scan took an envelope id anywhere,
+    so a one-message file carrying an embedded document whose base64 text holds ``BHS`` paid a
+    decode and a split. Mutation: search ``[BF][HT]S`` anywhere. Red: the file needs a decode."""
+    document = "JVBERi0xLjQKBHSx" + "QUJD" * 64  # synthetic base64 text, "BHS" inside it
+    raw = (ADT_A01 + "OBX|1|ED|DOC^Doc||^AP^PDF^Base64^" + document + "\r").encode("utf-8")
+    assert b"BHS" in raw
+    assert split_module._needs_a_decode(raw, "utf-8") is False
+    assert split_batch_bytes(raw, "utf-8") == [raw]
+
+
+@pytest.mark.parametrize(
+    "line", [b"BTS|1", b"  BTS|1", b"\xef\xbb\xbfFHS|", b"\x0b\x1cBHS|"], ids=str
+)
+@pytest.mark.parametrize("brk", [b"\r", b"\n"], ids=["cr", "lf"])
+def test_an_envelope_id_at_a_line_start_still_needs_a_decode(line: bytes, brk: bytes) -> None:
+    """Control: an envelope id at a line start, past the noise and marks the split reads past,
+    still sends the file to the decode, at the start of the file too."""
+    body = ADT_A01.encode("utf-8")
+    assert split_module._needs_a_decode(body + brk + line + brk, "utf-8") is True
+    assert split_module._needs_a_decode(line + brk + body, "latin-1") is True
+
+
+@pytest.mark.parametrize("noise", ["\x1c", "\x0b ", BOM, "\t"])
+def test_a_first_chunk_of_envelope_lines_and_noise_lines_is_no_message(noise: str) -> None:
+    """Round-three review of BACKLOG #5806, finding 3: the leading walk read past the sniff's noise
+    class after an envelope line, where the end of a message reads past every noise character, so
+    a line of other noise between two header lines made the rest of the first chunk a spurious
+    non-``MSH`` message, recorded as an ERROR. Mutation: read past ``_LEADING_NOISE`` after each
+    envelope line. Red: a first element of ``\\x1c\\rBHS|...``."""
+    filed = "FHS|^~\\&\r" + noise + "\rBHS|^~\\&\r" + ADT_A01 + "BTS|1\rFTS|1\r"
+    assert split_batch(filed) == [ADT_A01]
 
 
 @pytest.mark.parametrize("where", ["head", "tail"])
