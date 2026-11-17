@@ -611,6 +611,71 @@ def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:
     assert outbound_headers_from_metadata({}) == {}
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "HOST",
+        "Content-Length",
+        "transfer-encoding",
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "TE",
+        "Trailer",
+        "Upgrade",
+        "Cookie",
+        "cookie",
+    ],
+)
+def test_a_message_cannot_set_routing_framing_hop_by_hop_or_cookie_headers(name: str) -> None:
+    """BACKLOG #5352: these are dropped in any letter case, as Authorization is; the rest of the
+    bag still projects."""
+    bag = {f"http.header.{name}": "v", "http.header.X-Trace-Id": "t-1"}
+    assert outbound_headers_from_metadata(bag) == {"X-Trace-Id": "t-1"}
+
+
+def test_the_per_message_denied_headers_are_pinned() -> None:
+    """Narrowing the set lets a message set one of these again, so it is a reviewed change."""
+    from messagefoundry.transports.rest import PER_MESSAGE_DENIED_HEADERS
+
+    assert (
+        frozenset(
+            {
+                "host",
+                "content-length",
+                "transfer-encoding",
+                "connection",
+                "keep-alive",
+                "proxy-connection",
+                "te",
+                "trailer",
+                "upgrade",
+                "cookie",
+            }
+        )
+        == PER_MESSAGE_DENIED_HEADERS
+    )
+
+
+@pytest.mark.parametrize("spelling", ["host", "HOST", "Host"])
+def test_ech_readdressing_pins_the_upstream_host_over_any_spelling(spelling: str) -> None:
+    """BACKLOG #5352: urllib folds header names with capitalize(), so a lowercase ``host`` after the
+    pinned ``Host`` used to replace it, and the sidecar would route to the wrong upstream."""
+    from messagefoundry.transports.rest import ech_readdressed_request
+
+    req = ech_readdressed_request(
+        "http://127.0.0.1:9000",
+        "https://partner.example.com:8443/api?x=1",
+        data=b"{}",
+        headers={"Host": "attacker.example", spelling: "attacker.example", "X-A": "1"},
+        method="POST",
+    )
+    assert req.get_header("Host") == "partner.example.com:8443"
+    assert req.full_url == "http://127.0.0.1:9000/api?x=1"
+    assert req.get_header("X-a") == "1"
+
+
 # --- BACKLOG #1663: an illegal request value is a permanent NAK, not an escaping internal error ----
 #
 # `_post` carried arms for HTTPError, URLError and (TimeoutError, OSError) but not the

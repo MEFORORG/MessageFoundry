@@ -162,6 +162,27 @@ DYNAMIC_HEADER_PREFIX = "http.header."
 # string. Measured on the pre-fix literal: ``match("X-Foo\n")`` was truthy; with ``\Z`` it is None.
 _HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
+#: Lowercased header names a message may never set under ``dynamic_headers`` (BACKLOG #5352), beside
+#: ``Authorization`` and the proxy-credential spellings. ``Host`` names the upstream, and on an ECH
+#: connection the sidecar routes by it. ``Content-Length`` and ``Transfer-Encoding`` frame the body,
+#: which ``http.client`` already frames, so a second value would send conflicting framing. The RFC
+#: 9110 section 7.6.1 hop-by-hop fields belong to the connection, not to one message. ``Cookie`` is a
+#: session credential the redaction screen does not read by name.
+PER_MESSAGE_DENIED_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "upgrade",
+        "cookie",
+    }
+)
+
 
 def _latin1_refusal_position(value: str) -> int | None:
     """Index of the first character ``http.client.putheader``'s latin-1 encode would reject, or
@@ -247,7 +268,9 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     :func:`_strip_header_control_chars`, so a message-derived value cannot split the request or inject an
     extra header. **``Authorization`` and ``Proxy-Authorization`` are never settable per-message** —
     auth is connection config only, so a message-derived value can neither weaken nor replace the
-    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). **Pure:** the
+    connection's credential, nor ride a proxy handler's admission (vault BACKLOG #3416). Nor is any
+    name in :data:`PER_MESSAGE_DENIED_HEADERS`, in any letter case: ``Host``, the framing and
+    hop-by-hop fields and ``Cookie`` are dropped like ``Authorization`` (BACKLOG #5352). **Pure:** the
     result is a deterministic function of ``metadata`` (itself pure from the transform), so an
     at-least-once re-run yields byte-identical headers. ``None``/empty → ``{}`` (the default,
     byte-identical) — no per-message headers.
@@ -283,11 +306,14 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        if name.lower() == "authorization" or is_proxy_credential_header_name(name):
+        lowered = name.lower()
+        if lowered == "authorization" or is_proxy_credential_header_name(name):
             # Auth is connection-configured only: a message never sets or overrides it. A proxy
             # handler's admission covers the connection's own proxy_user header, so a message must
             # not be able to supply one (vault BACKLOG #3416).
             continue
+        if lowered in PER_MESSAGE_DENIED_HEADERS:
+            continue  # routing, framing, hop-by-hop or Cookie: never per-message (BACKLOG #5352)
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
         safe = _strip_header_control_chars(value)
@@ -2733,7 +2759,9 @@ def ech_readdressed_request(
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
-    h = dict(headers)
+    # Any spelling of Host goes first (BACKLOG #5352): urllib folds header names with capitalize(),
+    # so a ``host`` entry after ``Host`` in this dict would replace the pinned upstream.
+    h = {name: value for name, value in headers.items() if name.lower() != "host"}
     h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
     return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
         sidecar + path, data=data, headers=h, method=method
