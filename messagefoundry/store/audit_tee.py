@@ -48,13 +48,7 @@ from messagefoundry.logging_setup import (
     scrub_log_text,
     sink_readings,
 )
-from messagefoundry.redaction import (
-    _REDACTED,
-    _clamp_marker,
-    clamp_untrusted,
-    safe_text,
-    safe_text_bound,
-)
+from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
 
 __all__ = [
     "AuditObserver",
@@ -139,9 +133,6 @@ _LINE_SCRUB_FAULT_LOGGED = False
 #: a warning naming none but these is not logged again; see :func:`_tee_line`.
 _OLD_LINE_REASONS_LOGGED: set[str] = set()
 _SHOWS_A_WORD = "show a word the line before it hid"
-_SHOWS_A_CUT_WORD = (
-    "show a word the line before it hid, or cut off past the handler chain's redaction window"
-)
 _UNPARSED = "leave a sink's reading unparseable where the line before it parsed"
 
 
@@ -177,28 +168,6 @@ def _line_words(line: str) -> tuple[Counter[str], Counter[str]]:
         Counter(_WORD.findall(_LINE_ESCAPE.sub(" ", text))),
         Counter(_WORD.findall(_JSON_ESCAPE.sub(" ", text))),
     )
-
-
-#: The note the handler chain's bound ends a reading with
-#: (:func:`~messagefoundry.redaction.clamp_untrusted`), after its newline, raw or as the control
-#: scrub escapes it. Derived from the note's writer, so a re-worded note is still matched.
-_BOUND_NOTE = re.compile(
-    r"(?:\\+n|\n)" + re.escape(_clamp_marker(0)).replace("0", "[0-9_]+") + r"\Z"
-)
-
-
-def _reading_words(reading: str) -> tuple[Counter[str], Counter[str]]:
-    """:func:`_line_words` of a sink's reading without the bound note that ends it, if one does.
-    The note is the chain's text, not the record's, and its count moves with the line's length.
-    Only the bound writes one last: an uncut line ends with its closing brace, or with the
-    placeholder of a pass that took the brace."""
-    return _line_words(_BOUND_NOTE.sub("", reading, count=1))
-
-
-def _plus(
-    words: tuple[Counter[str], Counter[str]], more: tuple[Counter[str], Counter[str]]
-) -> tuple[Counter[str], Counter[str]]:
-    return words[0] + more[0], words[1] + more[1]
 
 
 def _shows_no_more(line: str, bar: tuple[Counter[str], Counter[str]]) -> bool:
@@ -386,27 +355,13 @@ def _tee_line(
             k: v if after[k] == v else whole_detail() if k == "detail" else _FIELD_REDACTED
             for k, v in before.items()
         }
-        bars = [(_reading_words(r), _parses(r)) for r in sink_readings(old_line)]
-        # A line over the handler chain's redaction window is read only up to its bound, so what
-        # lies past the cut was not hidden, only left unread. Each sink's bar takes the words that
-        # sink shows of the first window's worth of it, read alone.
-        head = clamp_untrusted(old_line)
-        cut = head is not old_line
-        if cut:
-            rest = sink_readings(old_line[head.rfind("\n") :])
-            bars = [
-                (_plus(words, _reading_words(r)), parsed)
-                for (words, parsed), r in zip(bars, rest, strict=True)
-            ]
+        bars = [(_line_words(r), _parses(r)) for r in sink_readings(old_line)]
         candidates = (after,) if whole == after else (after, whole)
         reasons: list[str] = []
         for candidate in candidates:
             line = json.dumps(candidate, ensure_ascii=False)
             paired = list(zip(sink_readings(line), bars, strict=True))
-            shows = not all(
-                all(n <= bar for n, bar in zip(_reading_words(r), words, strict=True))
-                for r, (words, _) in paired
-            )
+            shows = not all(_shows_no_more(r, words) for r, (words, _) in paired)
             # Only the last checked candidate's reasons are reported, so an earlier one that shows
             # a word is rejected without its parses.
             if shows and candidate is not candidates[-1]:
@@ -415,7 +370,7 @@ def _tee_line(
             if not (shows or unparsed):
                 return line
             # The last checked candidate's reasons are the ones that ship the old line.
-            reasons = [_SHOWS_A_CUT_WORD if cut else _SHOWS_A_WORD] if shows else []
+            reasons = [_SHOWS_A_WORD] if shows else []
             if unparsed:
                 reasons.append(_UNPARSED)
     except Exception as exc:  # noqa: BLE001 - the tee must still ship the record
@@ -538,11 +493,9 @@ def emit_audit_tee(
       typed sign-in name ship that way. A record can ship as the line before #3045, losing the
       scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
       so a client can turn the scrub off for its own record.
-    * A record whose line is longer than the handler chain's redaction window,
-      :data:`~messagefoundry.redaction._REDACT_WINDOW` characters, is held to what that window
-      kept of the line before #3045, plus each sink's reading, alone, of the next window past the
-      cut. So a scrubbed line can show text the old line cut off unread, and one that shows a word
-      beyond both ships the line from before #3045.
+    * A record whose line is longer than the handler chain's redaction window can ship the line
+      from before #3045, losing the C0 field scrub. At least a large ``action``, ``actor``,
+      ``channel_id`` or ``client`` can make one.
     * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
       and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
       as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.
