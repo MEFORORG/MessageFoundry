@@ -167,6 +167,35 @@ async def test_a_passkey_only_owner_signs_in_past_a_live_sign_in_lock(engine: En
     assert user is not None and user.locked_until is None and user.failed_attempts == 0
 
 
+async def test_a_passkey_sign_in_with_a_stray_code_still_signs_in(engine: Engine) -> None:
+    """BACKLOG #5397. RED when: ui_login refuses the combined passkey sign-in for a non-digit
+    authenticator code within the bound, which the assertion takes precedence over. The control is
+    the same sign-in with an oversized code, which the form still refuses before auth.login."""
+    from webauthn.helpers import base64url_to_bytes
+
+    from messagefoundry.auth.totp import MAX_DIGITS
+
+    service = await _service(engine)
+    _user_id, key = await _passkey_only_operator(service)
+    for code, signs_in in (("1 x", True), ("1" * (MAX_DIGITS + 1), False)):
+        async with _client(engine, service) as c:
+            begun = await c.post("/ui/login/passkey", headers=SAME_ORIGIN)
+            assert begun.status_code == 200
+            challenge = base64url_to_bytes(begun.json()["options"]["challenge"])
+            assertion = key.get_response(challenge)  # type: ignore[attr-defined]
+            r = await c.post(
+                "/ui/login",
+                data={
+                    "username": "op",
+                    "password": PW,
+                    "passkey_assertion": assertion,
+                    "totp_code": code,
+                },
+            )
+        assert r.status_code == 303
+        assert (r.headers["location"] != "/ui/login?e=bad") is signs_in, (code, r.headers)
+
+
 async def test_a_must_change_account_may_register_a_passkey_as_its_first_factor(
     engine: Engine,
 ) -> None:

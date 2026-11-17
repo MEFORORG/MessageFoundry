@@ -110,6 +110,11 @@ from messagefoundry.domainshape import (
     upn_suffix_key,
 )
 from messagefoundry.logging_setup import LOG_LEVELS
+from messagefoundry.password_bounds import (
+    PASSWORD_MAX,
+    PASSWORD_MIN_LENGTH_MAX,
+    TEMPORARY_PASSWORD_CLASS_SUFFIX,
+)
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import (
     REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
@@ -4128,6 +4133,26 @@ class AuthSettings(_Section):
                 "so no site term would be screened; turn the check on or remove the terms"
             )
         return self
+
+    @field_validator("password_min_length")
+    @classmethod
+    def _check_password_min_length(cls, value: int) -> int:
+        # BACKLOG #5397: at least the JSON sign-in, step-up and password-change requests and the
+        # console's sign-in, step-up and password forms refuse a password longer than PASSWORD_MAX.
+        # A temporary password is minted at least this long, plus a class suffix when a class rule
+        # is on and the random part misses a class, so a higher floor could mint a credential those
+        # surfaces refuse. The cap assumes the suffix whether or not a class rule is on. Refused at
+        # load rather than lowered.
+        if value > PASSWORD_MIN_LENGTH_MAX:
+            raise ValueError(
+                f"password_min_length must be at most {PASSWORD_MIN_LENGTH_MAX}: an engine-issued "
+                "temporary password is at least that long, plus a "
+                f"{len(TEMPORARY_PASSWORD_CLASS_SUFFIX)}-character suffix when a character-class "
+                "rule is on and the random part misses a class, and the sign-in and "
+                f"password-change requests accept no password over {PASSWORD_MAX} characters; "
+                "the cap holds whether or not a class rule is on"
+            )
+        return value
 
     @field_validator("mfa_recovery_code_count")
     @classmethod

@@ -16,9 +16,10 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
+from messagefoundry.api.auth_models import LoginRequest, MfaVerifyRequest, ReauthRequest
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     EditResendRequest,
@@ -177,6 +178,68 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
     if refusal is DirectoryRefusal.DEMOTED:
         return _DIRECTORY_DEMOTED_ERROR
     return _DIRECTORY_UNCONFIRMED_ERROR
+
+
+#: The pydantic error types that say a value is too long: on a ``length_only`` field of
+#: :func:`_form_fits`, the only refusals that count.
+_TOO_LONG_ERRORS = frozenset({"string_too_long", "bytes_too_long", "too_long"})
+#: The ``length_only`` set of a form whose second-factor field is named ``code``.
+_CODE_FIELD = frozenset({"code"})
+
+
+def _form_fits(
+    request: Request,
+    model: type[BaseModel],
+    /,
+    *,
+    length_only: frozenset[str] = frozenset(),
+    **fields: str,
+) -> bool:
+    """Whether the JSON route's own request ``model`` accepts these hand-parsed form values.
+
+    The /ui credential forms parse their bodies by hand, so nothing bounds a field the way the JSON
+    route's model does. Asking the model keeps one definition of each bound (BACKLOG #5397, #5398,
+    #5399). Only the fields a caller passes are checked: at least the sign-in username, password
+    and authenticator code, the MFA and step-up codes, the step-up password, and the
+    enrolment-confirm code. A field a caller does not pass, such as the sign-in passkey assertion,
+    is not. Nor is the enrolment code at either binding step, which the engine bounds at the point
+    it reads the code, so every refusal the service gave before that read still comes first. Any
+    refusal by the model counts, except on a field named in ``length_only``, where only a too-long
+    one does.
+    Every caller names its second-factor code there, and the sign-in authenticator code must be,
+    because ``LoginRequest``'s digit pattern would refuse what the form has always passed on. The
+    check only refuses and never normalises: each caller strips its code of surrounding space
+    once, and passes that stripped value both here and to the service, so a correct code padded
+    with space is not refused for the padding.
+
+    Each caller runs this after its rate limiter, so a refused value has already been charged
+    whatever that limiter charges for the request, which the JSON route's 422 is not. On a paid
+    passkey sign-in that charge was taken at the begin leg. A refusal is logged in the JSON 422
+    handler's own words, with the method, the path and the count of the errors that counted, which
+    can be fewer than that handler counts, and never a value: the fields are credentials."""
+    try:
+        model(**fields)
+    except ValidationError as exc:
+        counted = [
+            error
+            for error in exc.errors(include_url=False, include_input=False)
+            if error["type"] in _TOO_LONG_ERRORS
+            or not (error["loc"] and error["loc"][0] in length_only)
+        ]
+        if counted:
+            _log_form_refusal(request, len(counted))
+            return False
+    return True
+
+
+def _log_form_refusal(request: Request, errors: int) -> None:
+    """The JSON 422 handler's own words, with no value: the refused fields are credentials."""
+    _log.info(
+        "request validation failed on %s %s: %d field error(s)",
+        request.method,
+        request.url.path,
+        errors,
+    )
 
 
 def _refusal_error(elevation: Elevation, fallback: str) -> str:
@@ -761,13 +824,44 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # L5b (ADR 0068 §8): the form rides the SAME auth.login seam as the JSON surface, with
         # allow-listed provider values only; absent stays LOCAL (regression-pinned). The browser
         # AD-password sign-in is RETIRED (BACKLOG #1137): the login page renders no provider
-        # selector, and "ad" stays in the allow-list only so the ENGINE (_dispatch_login) is the
-        # single point that refuses and audits it. Directory accounts sign in by Windows SSO or
-        # OIDC, and the AD bind as the user survives only as the step-up re-bind at /ui/reauth
-        # (and the JSON /me/reauth).
+        # selector, and "ad" stays in the allow-list so the ENGINE (_dispatch_login) refuses and
+        # audits it, for every "ad" sign-in within the bounds below. An oversized one is refused
+        # here first, as for "local", and so is not audited. Directory accounts sign in by Windows
+        # SSO or OIDC, and the AD bind as the user survives only as the step-up re-bind at
+        # /ui/reauth (and the JSON /me/reauth).
+        #
+        # BACKLOG #5397: an oversized username, password or authenticator code is refused here,
+        # before auth.login hashes or audits it, as the JSON route's 422 refuses it before the
+        # engine sees it. That holds for provider "ad" too. Refused, never clamped: a truncated
+        # credential is a different one. The authenticator code is bounded by length only, and is
+        # measured and passed on with surrounding space stripped, as the engine strips it: a blank
+        # or space-only one is still the two-step flow, a padded code still counts, and a non-digit
+        # one is still passed on, as before. The passkey challenge was already popped, and the
+        # budget charged as _form_fits says.
+
+        def _refused() -> Response:
+            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
+            if handle:
+                clear_passkey_sign_in_cookie(refused, request)
+            return refused
+
         provider_value = form.get("provider", "local")
-        if provider_value not in ("local", "ad"):
-            return RedirectResponse("/ui/login?e=bad", status_code=303)
+        username = form.get("username", "")
+        password = form.get("password", "")
+        # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
+        # one is today's two-step flow.
+        # Stripped once, and that value is both the one measured and the one sent, so a code padded
+        # past the form's body is never carried to the service. The engine strips it anyway.
+        totp_code = form.get("totp_code", "").strip()
+        if provider_value not in ("local", "ad") or not _form_fits(
+            request,
+            LoginRequest,
+            length_only=frozenset({"totp_code"}),
+            username=username,
+            password=password,
+            totp_code=totp_code,
+        ):
+            return _refused()
         # ADR 0197 Amendment A, wave 2: the combined passkey sign-in. The assertion rides the form,
         # the handle of its challenge the cookie the begin leg set; both or neither. Clamped, so an
         # oversized assertion is simply an invalid one.
@@ -779,14 +873,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             else None
         )
         outcome = await auth.login(
-            form.get("username", ""),
-            form.get("password", ""),
+            username,
+            password,
             provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
             client=client,
-            # ADR 0197 (BACKLOG #1131): the authenticator-code field, shown on every sign-in. A blank
-            # one is today's two-step flow. Clamped as the JSON route bounds it; a longer value is
-            # simply a wrong code.
-            totp_code=form.get("totp_code", "")[:16] or None,
+            totp_code=totp_code or None,
             # ASVS 7.2.4: the Set-Cookie below REPLACES whatever session cookie this browser sent,
             # so the engine ends that one session as part of a SUCCESSFUL mint, rather than leave
             # it valid and unreachable until it expires. A failed sign-in ends nothing.
@@ -795,10 +886,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             passkey_challenge=staged.challenge if staged is not None else None,
         )
         if not outcome.ok or outcome.token is None:
-            refused = RedirectResponse("/ui/login?e=bad", status_code=303)
-            if handle:
-                clear_passkey_sign_in_cookie(refused, request)
-            return refused
+            return _refused()
         # A must-change account goes straight to the browser rotation page (L4b) — every other
         # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
         # second-factor page for the same reason (ASVS 6.3.3). must_change comes first for an
@@ -1867,7 +1955,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 429, "too many attempts", headers={"Retry-After": _CEREMONY_RETRY_AFTER}
             )
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-        elevation = await auth.verify_mfa(token, form.get("code", ""), client=client)
+        # Stripped once, and that value is both the one measured and the one sent, as at
+        # /ui/login: a correct code with surrounding space still counts. The engine strips it too.
+        code = form.get("code", "").strip()
+        # BACKLOG #5398: the JSON MfaVerifyRequest's own bound, by length only. An oversized code
+        # never reaches verify_mfa, whose recovery-code leg hashes it once per slot, so it is not
+        # audited and it reads as a wrong code.
+        elevation = (
+            await auth.verify_mfa(token, code, client=client)
+            if _form_fits(request, MfaVerifyRequest, length_only=_CODE_FIELD, code=code)
+            else Elevation()
+        )
         if elevation.token is not None:
             # The session was re-keyed (ASVS 7.2.4), so the cookie this browser holds is now dead.
             # Re-set it on the redirect or the operator is signed out by their own correct code. A
@@ -1889,14 +1987,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if await auth.mfa_satisfied(token):
             # A session that already met its factor owes this page nothing, as the GET says, so
             # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
-            # has already audited and charged the code. The re-render below is pending-only.
+            # has already audited and charged any code within the bound. The re-render below is
+            # pending-only.
             return RedirectResponse("/ui", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
-        # already audited the failure. Generic copy: the form cannot say whether the code was
-        # wrong or expired without narrowing a guess. A directory refusal narrows nothing, because
-        # the code was never checked (BACKLOG #2023), so it says what did happen.
+        # already audited the failure of any code within the bound. Generic copy: the form cannot
+        # say whether the code was wrong or expired without narrowing a guess. A directory refusal
+        # narrows nothing, because the code was never checked (BACKLOG #2023), so it says what did
+        # happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
@@ -2066,9 +2166,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         mfa_enrolled = mfa.enabled
         if mfa_enrolled and not satisfied:
+            # Stripped once, measured and sent stripped, as at /ui/login; a blank one is no code.
             code = form.get("code", "").strip()
+            # BACKLOG #5399: the JSON MfaVerifyRequest's bound, by length only. An oversized code
+            # is not checked or audited, and reads as a wrong one.
             code_elevation = (
-                await auth.verify_mfa(token, code, client=client) if code else Elevation()
+                await auth.verify_mfa(token, code, client=client)
+                if code
+                and _form_fits(request, MfaVerifyRequest, length_only=_CODE_FIELD, code=code)
+                else Elevation()
             )
             if code_elevation.session_lost:
                 # The session ended during the ceremony, whether or not the code was checked yet
@@ -2107,13 +2213,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         claim = claim_continuation(action, token, next_)
         continues = claim.continues
         pre_rotation = token
+        password = form.get("password", "")
         try:
-            pw_elevation = await auth.reauth(
-                identity,
-                form.get("password", ""),
-                token=token,
-                client=client,
-                purpose=action.action if continues else None,
+            # BACKLOG #5399: the JSON ReauthRequest's bound. An oversized password is neither
+            # hashed nor sent to the directory, is not audited, and takes the wrong-password exit
+            # below.
+            pw_elevation = (
+                await auth.reauth(
+                    identity,
+                    password,
+                    token=token,
+                    client=client,
+                    purpose=action.action if continues else None,
+                )
+                if _form_fits(request, ReauthRequest, password=password)
+                else Elevation()
             )
         except BaseException:
             claim.restore()
