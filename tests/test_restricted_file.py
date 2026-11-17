@@ -891,8 +891,8 @@ def test_a_file_only_the_engine_writes_owned_by_another_account_is_refused() -> 
     ],
 )
 def test_a_share_that_is_this_host_itself_is_refused(path: str) -> None:
-    """Vault BACKLOG #5657: a loopback spelling stops the walk at the share, so a junction on the
-    local path would go unjudged."""
+    """Vault BACKLOG #5657: a share spelled with one of this host's own names or addresses
+    is refused."""
     problem = str(restricted_file._loopback_share_problem(path, "myhost", _routes_to_itself))
     assert "a network share that may be on this host itself" in problem
     assert "keys" not in problem  # names no path
@@ -1688,7 +1688,7 @@ def test_windows_a_junction_holding_a_key_on_a_share_is_refused(
     surroundings = restricted_file._windows_surroundings_problem
     assert surroundings(via_share / "real" / "store.key", host) is None  # the control
     problem = str(surroundings(via_share / "j" / "store.key", host))
-    assert "the folder that holds it on the share is a reparse point" in problem
+    assert "the folder that holds it is a reparse point" in problem
 
 
 @windows_only
@@ -1806,7 +1806,7 @@ def test_windows_a_mapped_network_drive_is_read_as_a_share(
     # The control: the local folder the server's junction names passes when named directly.
     assert surroundings(secure / "client.key", host) is None
     problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
-    assert "the folder that holds it on the share is a reparse point" in problem
+    assert "the folder that holds it is a reparse point" in problem
 
 
 @windows_only

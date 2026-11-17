@@ -709,17 +709,16 @@ def _loopback_share_problem(
     host_name: str,
     source_of: Callable[[Any], Any],
 ) -> str | None:
-    """Why a key file reached through a share may be on this host's own disk, or ``None``. Such a
-    spelling stops the walk at the share, so a junction on the local path would go unjudged
-    (vault BACKLOG #5657); the share is refused, and the refusal asks for the local path instead.
+    """Why a key file reached through a share may be on this host's own disk, or ``None`` (vault
+    BACKLOG #5657). Such a share is refused, and the refusal asks for the local path instead; ADR
+    0214's 2026-11-17 amendment states when this test runs.
 
     The server counts as this host when ``config.settings._names_this_host`` reads it as loopback
     or unspecified (shorthand and decimal forms included); when it is ``host_name``, the whole
     name; or when it is an address that ``source_of`` (the route to it) answers with itself. An
     address whose route cannot be read is refused too, failing closed. Any other name is not
-    recognized, at least a part of ``host_name``, a longer name that starts with it, its NetBIOS
-    form, and a name that resolves to this host by DNS alone. Kept free of I/O, ``source_of``
-    aside."""
+    recognized, at least a part of ``host_name``, a longer name that starts with it, and a name
+    that resolves to this host by DNS alone. Kept free of I/O, ``source_of`` aside."""
     from messagefoundry.config.settings import _bare_host, _host_ip_literal, _names_this_host
 
     # A trailing dot (the fully qualified spelling) goes before the suffix test.
@@ -778,19 +777,12 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     link and ``subst`` drive on the way, or for a drive root the folder holding where it leads
     (none for a volume root), and its owner and entries are read there. Where the walk ends on a
     link back to a folder already on the path, the holder is read by its path as written instead
-    (:func:`_windows_holder_as_written_problem`), and a drive root's is not read. Each volume's drive type is read,
-    not its file system: a volume whose drive type cannot be read ends the walk and is refused. A
-    mapped network drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at
-    it, as at a UNC share, and the path is then walked again as a local volume, so the junctions
-    and links on it are judged by the link rule. A walk that reached a share the path names, by a
-    UNC path or a mapped drive letter, reads the holder through the share by its path as written,
-    and refuses it when it is a reparse point, a junction or link among others; one that reached a
-    share, a mapped drive included, through a junction, link or ``subst`` drive met before the walk
-    stopped is refused. A junction or link the second walk of a mapped drive meets is judged by the
-    link rule alone, wherever it leads. A mapped drive letter is
-    judged by the loopback test through the share ``WNetGetConnectionW`` names for it, and refused
-    when that cannot be read. The caller has read ``path`` itself and refused it if it is a link.
-    ``host`` holds the readers."""
+    (:func:`_windows_holder_as_written_problem`), and a drive root's is not read. On that walk each
+    volume's drive type is read, not its file system, and a volume whose drive type cannot be read
+    ends it and is refused. A UNC share or a mapped network drive (``GetDriveTypeW`` answers
+    ``DRIVE_REMOTE``) stops it; what is then refused, and where the holder is read, is stated once
+    in ADR 0214's 2026-11-17 amendment. The caller has read ``path`` itself and refused it if it is
+    a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
     try:
@@ -841,8 +833,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             )
         if remote:
             # Before drive types were read, a mapped drive was walked as a local volume and the
-            # junctions and links met on it were judged by the link rule. That walk is kept, so
-            # stopping at the share leaves none of those unjudged.
+            # junctions and links met on it were judged by the link rule. That walk is kept.
             local_chain, local_cause = windows_chain(
                 str(walked), os.getcwd, _win_probe, drive_target=host.drive_target
             )
@@ -883,7 +874,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     if cause is not None:  # a share: the walk stops there, and the holder is read through it
         holder_path = str(full.parent)
         if holder_path == str(full):
-            holder_path = None  # a share's root: nothing on this host holds it
+            holder_path = None  # a share's root: no holder is read
     elif chain[-1][1] == LINK:  # a walk with no cause has added at least the volume root
         # windows_chain adds an object once, so a path that resolves to a folder it already
         # passed ends on the link that led there, and does not record which folder that is.
@@ -903,10 +894,10 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             return _windows_holder_as_written_problem(Path(holder_path))
         if cause is not None and _is_reparse_point(holder_path):
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
-            # folder it points at, which this check does not read through a share.
+            # folder it points at, which is not read.
             return (
-                "the folder that holds it on the share is a reparse point, such as a junction or "
-                "link, which this check does not read through; name a folder that is not one"
+                "the folder that holds it is a reparse point, such as a junction or link; set it "
+                "to a path whose folder is not a link, junction or other reparse point"
             )
         holder = host.read_security(holder_path, DIRECTORY)
     except OSError as exc:  # a reader that could not be run

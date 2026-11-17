@@ -158,35 +158,39 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   walks `full.parent`, except for a drive root such as `S:\`, whose own path it walks, so a
   `subst` drive root is resolved. It reads the owner and access list of the folder where that
   walk ends, after every junction, link and `subst` drive, or for a drive root the folder that
-  holds where it leads.
+  holds where it leads, except where the list below says otherwise.
 
-  - A mapped network drive is read as a share: the walk stops at it. The path is then walked
-    again as a local volume, as before this amendment, and the junctions and links on it are
-    judged by the link rule.
-  - Only each volume's drive type is read on the walk. A volume whose drive type cannot be read
-    ends the walk and is refused. The walk does not read its file system, so it does not refuse
-    a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before this
-    amendment.
-  - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
-    through the share at `full.parent`. It is refused when it is a reparse point there, a
-    junction or link among others.
+  - On that walk only each volume's drive type is read. A volume whose drive type cannot be read
+    ends the walk and is refused. The walk does not read a volume's file system, so it does not
+    refuse a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before
+    this amendment.
   - Where the walk ends on a link back to a folder already on the path, that folder is read at
     `full.parent` by its path as written, as before this amendment.
   - The holder's entries are judged as before: an inherit-only entry is counted, and any
     conditional, object or callback allow entry is refused.
   - A `subst` drive on the path gives no folder the link rule; as before, only a junction or
     link on the path does.
-  - A junction, link or `subst` drive met before the walk stops, leading onto a network share or
-    a mapped network drive, is refused. One the second walk of a mapped drive meets is judged by
-    the link rule alone, wherever it leads.
-  - A share spelled with at least some of this host's own names or addresses is refused.
-    `_loopback_share_problem` says which. A mapped drive letter is judged through the share
-    `WNetGetConnectionW` names for it, and refused when that cannot be read.
+  - **The share rule.** A UNC path, or a drive `GetDriveTypeW` answers as `DRIVE_REMOTE` (a
+    mapped network drive), stops the walk. The path is then refused at least when one of these
+    holds:
+    - the walk met any junction, link or `subst` drive before it stopped;
+    - the path is on a mapped drive, and walked again as a local volume, as before this
+      amendment, that walk stops for a reason other than reaching a share, or meets a junction
+      or link the link rule refuses. That second walk reads no drive type;
+    - the share's server is spelled with at least some of this host's own names or addresses,
+      this host's name cannot be read, or, for a mapped drive, `WNetGetConnectionW` cannot name
+      its share;
+    - the folder at `full.parent`, read through the share, is a reparse point, a junction or link
+      among others.
+
+    Otherwise that folder's owner and access list are read there by the holder rule. At a
+    share's root no holder is read.
 
   So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root, by the holder
-  rule on the folder that holds where it leads, unless it leads to a volume root. A mapped network drive root is read as a share root, so nothing on this
-  host holds it. By the holder rule, a broad group's `DELETE` on the holder is still not counted;
-  the link rule, where it judges the holder, counts it, except on a volume root. The code is the record of the rest. The check is
+  rule on the folder that holds where it leads, unless it leads to a volume root. A mapped
+  network drive root is read as a share root, so no holder is read for it. By the holder rule, a
+  broad group's `DELETE` on the holder is still not counted; the link rule, where it judges the
+  holder, counts it, except on a volume root. The code is the record of the rest. The check is
   still not a complete check of the directory's surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
   #5657).** On Windows, `_windows_surroundings_problem` in `messagefoundry/restricted_file.py`

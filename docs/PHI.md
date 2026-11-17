@@ -452,20 +452,19 @@ than a path is not checked
   handoff file.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
   the owner and access list of the folder that holds the key file, in most cases where its path
-  resolves to (the ADR 0214 amendment linked below names the exception), after any junction, link or `subst`
-  drive (on a network share or mapped network drive the path
-  names, by its path as written, and refused when that folder is a reparse point, such as a
-  junction or link; a volume
-  on the way whose drive type cannot be read is refused, and the walk to that folder does not read
-  a volume's file system), and
-  refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
-  folder's owner is such a group or cannot be read
+  resolves to, after any junction, link or `subst` drive, and refuses the key file when one of
+  the groups above or an application package may delete a file in that folder, change its access
+  list or take it over, or when that folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
   permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
   account, SYSTEM or Administrators; an engine running as LOCAL SERVICE or NETWORK SERVICE shares
-  that account with other services, so that owner does not show the engine made it. It is not a complete check of the file's surroundings; see
-  [ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments). Do not rely on this check alone. Restrict the
+  that account with other services, so that owner does not show the engine made it. Where that
+  folder is read, and what is refused on a network share or a mapped network drive, is in the
+  2026-11-17 entry of the
+  [ADR 0214 amendments](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
+  under *The share rule*. It is not a complete check of the file's surroundings. Do not rely on
+  this check alone. Restrict the
   secrets directory and every folder above it yourself, and the folder that holds each key file
   and every folder above it.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other

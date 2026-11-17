@@ -552,9 +552,9 @@ pure-Python equivalent:
   and again before View Log opens the file, so it can refuse one before touching it. And
   `transports/database.py`, which calls `GetDriveTypeW` and `QueryDosDeviceW` as inputs to the
   best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705). And
-  `restricted_file.py`, which on Windows asks `kernel32`'s `GetDriveTypeW` whether each drive on
-  a key file's path is a mapped network drive, and for one that is, loads `mpr` to ask
-  `WNetGetConnectionW` which share it is mapped to (vault BACKLOG #5657)
+  `restricted_file.py`, which on Windows asks `kernel32`'s `GetDriveTypeW` whether a volume the
+  walk of a key file's path reaches is a mapped network drive, and may load `mpr` to ask
+  `WNetGetConnectionW` which share such a drive is mapped to (vault BACKLOG #5657)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
   only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
