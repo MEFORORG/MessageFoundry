@@ -1058,10 +1058,10 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
-A record the sink cannot format is replaced by a notice naming its logger where the formatter can
-format that notice, and when the sink takes it neither stage runs. Where the formatter cannot,
-nothing is written for the record and neither stage runs. Either way, stderr says so when that
-sink has not said so in the last minute.
+A record the sink cannot format is not by itself a write failure. What happens to it, including
+the case where the formatter cannot format even the guard's own notice and the sink counts as
+unwritable, is stated in [ADR 0162](adr/0162-fail-closed-application-log-write-guard-detect-roll-and-stop.md)
+amendment C, *A record that cannot be formatted is not a sink failure*.
 
 **Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
 `stopped`. The difference is the one that decides what you do next: `stopped` means the lane is

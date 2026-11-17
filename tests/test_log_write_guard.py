@@ -918,13 +918,14 @@ def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
     assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
 
 
-def test_a_formatter_that_fails_on_every_record_is_a_formatter_fault_not_a_sink_failure(
+def test_a_formatter_that_fails_on_every_record_halts_without_renaming_the_log(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # When the sink cannot format even the guard's own notice, the sink was never written to, so
-    # it is neither rolled nor called unwritable. The fault is said on stderr instead.
-    # NEGATIVE CONTROL: on fd09ca1394 the notice's format failure was taken for a sink failure: the
-    # file was renamed aside and stage 2 fired with a stop request.
+    # When the sink cannot format even the guard's own notice, this process cannot log through it,
+    # so the sink is recorded unwritable and, as the only sink, asks for the stop, as on main. The
+    # file itself is healthy, so it is not renamed, not by the failure and not by revalidate().
+    # NEGATIVE CONTROL: on c6ee866c0c the fault was only said on stderr: no event, the sink read
+    # healthy and can_log() answered True, so the halt never fired.
     class Broken(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
             raise RuntimeError("formatter is broken")
@@ -935,16 +936,21 @@ def test_a_formatter_that_fails_on_every_record_is_a_formatter_fault_not_a_sink_
     log_path = tmp_path / "app.log"
     handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
     handler.setFormatter(Broken())
+    capsys.readouterr()
 
     handler.emit(_record("anything"))
-    handler.close()
 
-    assert events == []
-    assert [s.state for s in guard.status()] == ["healthy"]
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+    assert "formatter fault, not a disk fault" in events[0].reason
+    assert [s.state for s in guard.status()] == ["unwritable"]
+    assert guard.can_log() is False
+    assert guard.revalidate() is False
+    handler.close()
     assert list(tmp_path.iterdir()) == [log_path]  # nothing rolled aside
     err = capsys.readouterr().err
     assert "nor the notice standing in for it ('RuntimeError')" in err
-    assert "IS UNWRITABLE" not in err
+    assert "IS UNWRITABLE because its formatter fails" in err
+    assert "after a rollover attempt" not in err
     assert "formatter is broken" not in err  # the exception's type only, never its message
 
 
@@ -972,12 +978,67 @@ def test_an_absorbed_format_fault_is_said_on_stderr_once_per_interval(
     handler.close()
 
     assert first.count("could not format a record ('TypeError')") == 1
-    assert "covers" not in first
+    assert "(x1)" in first
     assert quiet == ""
-    assert "this line covers 2 format faults" in later
+    assert "could not format a record ('TypeError')" in later and "(x2)" in later
     for line in (first, later):
         assert "first" not in line and "third" not in line  # nothing from the record
     assert [s.state for s in guard.status()] == ["healthy"]
+
+
+def test_the_last_faults_of_a_burst_are_said_at_the_next_flush_and_at_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A burst's faults after its first line are counted. They are said once the interval has
+    # passed, by the next record's flush even when that record formats, and at close in any case.
+    # Each kind of fault is named with its own count.
+    # NEGATIVE CONTROL: on c6ee866c0c a burst's last faults were said only if a later FAULT came
+    # after the interval; a quiet sink never said them, and the line gave one total for all kinds.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    handler = _file_handler(tmp_path / "app.log", guard)
+    capsys.readouterr()
+
+    handler.emit(_record("count %d", "a"))  # said at once
+    capsys.readouterr()
+    clock.now += 1
+    handler.emit(_record("count %d", "b"))  # TypeError, counted
+    handler.emit(_record("%z", "c"))  # a ValueError, another kind, counted
+    handler.emit(_record("count %d", "d"))
+    handler.emit(_record("formats fine"))
+    assert capsys.readouterr().err == ""  # still inside the interval
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("formats fine too"))
+    flushed = capsys.readouterr().err
+    clock.now += 1
+    handler.emit(_record("count %d", "e"))  # inside the new interval: counted
+    assert capsys.readouterr().err == ""
+    handler.close()
+    closed = capsys.readouterr().err
+
+    assert "could not format a record ('TypeError'); " in flushed
+    assert "(x2)" in flushed and "(x1)" in flushed
+    assert flushed.count("could not format a record (") == 2  # two kinds, each with its count
+    assert "could not format a record ('TypeError')" in closed and "(x1)" in closed
+
+
+def test_the_stand_in_escapes_the_logger_name_once(tmp_path: Path) -> None:
+    # The logger name is escaped for the notice and then quoted. ``repr`` on the escaped value
+    # doubled every backslash the escape wrote.
+    # NEGATIVE CONTROL: on c6ee866c0c the notice read ``'a\\\\nb'`` for a name holding a newline.
+    guard = LogWriteGuard()
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+    record = _record("count %d", "x")
+    record.name = "a\nb"
+
+    handler.handle(record)
+    handler.close()
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "from logger 'a\\nb' at level INFO" in text
+    assert "a\\\\nb" not in text
 
 
 def test_a_record_with_no_name_or_level_name_does_not_raise(tmp_path: Path) -> None:

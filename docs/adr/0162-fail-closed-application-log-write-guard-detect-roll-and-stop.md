@@ -474,17 +474,20 @@ longer probed, and is not marked healthy after a probe that landed, so a latch, 
 bound's streak recorded meanwhile is kept. A change between that check and the probe's own write
 still meets the probe: the lock is never held across a sink's I/O.
 
-**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). `handleError` used
-to roll the sink on any failure, then fail to re-write the same record and call the sink
-unwritable. On the handlers `configure_logging` builds, the redaction filter already replaces a
-record whose message cannot be rendered, so this path needs a formatter that fails where the filter
-did not. Now such a record's place is taken by a fixed notice naming its logger and level. When the
-sink takes the notice, neither stage runs. When it refuses it, the sink is the fault and the two
-stages decide as before. A formatter that cannot format even that notice is a formatter fault, not
-a sink failure: neither stage runs, and nothing is written for the record. A format fault of either
-kind writes a stderr last-resort line when that sink has written none in the last minute. A fault
-inside that minute is only counted, and the count goes on the next such line, if a later fault
-writes one.
+**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). This paragraph is
+where the rule is stated. `handleError` used to roll the sink on any failure, then fail to re-write
+the same record and call the sink unwritable. On the handlers `configure_logging` builds, the
+redaction filter already replaces a record whose message cannot be rendered, so this path needs a
+formatter that fails where the filter did not. Now such a record's place is taken by a fixed notice
+naming its logger and level. When the sink takes the notice, neither stage runs. When it refuses
+it, the sink is the fault and the two stages decide as before. A formatter that cannot format even
+that notice leaves the process unable to log through that sink, so the sink is recorded unwritable
+with a reason that names a formatter fault, and the stop is asked for when every sink is
+unwritable, as before this amendment. The log file is not rolled or renamed, by that failure or by
+`revalidate()`'s probe, because it is healthy. A format fault of any kind is counted, and a stderr
+last-resort line names each kind with its count, at most once a minute per sink. Faults counted
+inside that minute go on the next such line: at the next fault or flush after the minute, or when
+the sink is closed.
 
 **Part of the side-by-side check is now committed.**
 `test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on
