@@ -827,7 +827,7 @@ function Get-ScanRawIndexMap($Seg) {
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; git options after the verb; and a line
 # whose ONLY git word is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on
-# Windows), which rule 3's first reading exits on before these readings run. That last one is
+# Windows), which these readings never reach. That last one is
 # origin/main's too. Also, at least: any line after an earlier line whose chdir sits in parentheses,
 # which makes the earlier-line reading answer nothing, unless the invocation's `-C` fold ends absolute
 # and its window names no work tree or git dir. Under Bash `(cd x && ls)` is a subshell and the shell
@@ -853,8 +853,9 @@ function Get-ScanRawIndexMap($Seg) {
 #   * a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 #   * an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff
 #     --quiet) { git reset --hard }` from outside);
-#   * rule 3c's later-disarm filter counts `.git` as a git word (`git config core.hooksPath ; grep
-#     --exclude-dir=.git -c alias.lg f` from the primary);
+#   * rule 3c's later-disarm filter counts `.git` as a git word, so the grep fix above misses a grep
+#     naming `.git` (`git config core.hooksPath ; grep --exclude-dir=.git -c alias.lg f` from the
+#     primary);
 #   * a chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a
 #     real one;
 #   * a `config` pathspec after a closed `$( )` reads as a config disarm (`git -C '<p>' log $(git
