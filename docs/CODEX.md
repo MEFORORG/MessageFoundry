@@ -34,8 +34,7 @@ Only a hook blocks. A bridge fault, which the bridge reports on stderr and as a
 into a non-blocking 1. Codex's documentation does not say which shell runs a
 hook command. Under a PowerShell outer shell, `pwsh -Command` reports the
 launcher's exit 2 as a non-blocking 1, so no exit 2 blocks under it. With `pwsh`
-missing, the line exits 1 under a PowerShell outer shell. The tests in
-`tests/test_codex_bridge.py` pin the exit codes.
+missing, the line exits 1 under a PowerShell outer shell.
 
 The bridge differs from Claude Code in at least four ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops

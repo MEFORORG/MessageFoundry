@@ -25,10 +25,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     if ($word -notlike '*=*' -and $word.Length -ge 3 -and '--session-id'.StartsWith($word, [StringComparison]::Ordinal)) { $i++ }
 }
 if ($mode -eq 'hook') {
-    # The bridge decides with exit 0, or with 10 (BLOCK_EXIT in bridge.py) for a block, which
-    # becomes 2 here. Anything else, a missing .venv, a crash, or the 2 that Python and argparse
-    # exit with, is no decision: reported, and a non-blocking 1 on every event.
-    # tests/test_codex_bridge.py pins the exit codes.
+    # 10 (BLOCK_EXIT in bridge.py) becomes 2 here.
     # With this preference on, the bridge's block exit 10 would throw and read as no decision.
     $PSNativeCommandUseErrorActionPreference = $false
     $code = 1

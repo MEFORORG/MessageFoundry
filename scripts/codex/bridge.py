@@ -175,8 +175,7 @@ MATCHER_FIELDS = {
 # Claude Code adds a hook's plain exit-0 stdout as context for these events only.
 PLAIN_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
 # Hook mode's exit code for run_hook's block. invoke.ps1 turns it into 2 and every other non-zero,
-# the interpreter's and argparse's 2 included, into a non-blocking 1. See docs/CODEX.md, "Who
-# decides a block".
+# the interpreter's and argparse's 2 included, into a non-blocking 1.
 BLOCK_EXIT = 10
 
 
