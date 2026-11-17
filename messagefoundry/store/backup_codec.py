@@ -188,8 +188,9 @@ def _validate_key(key: bytes) -> None:
 
 def _aad(header_digest: bytes, frame_index: int, *, final: bool) -> bytes:
     """The per-frame AAD: ``header_sha256 ‖ frame_index(uint64) ‖ final_flag(uint8)``. Binds the header
-    (so a tampered key_id/chunk_size fails the tag), the frame order (so a reorder/drop fails), and the
-    terminator (so a tail-truncation fails as a missing final frame)."""
+    bytes (a changed header is refused before decrypt or fails the tag; see :func:`decrypt_stream`),
+    the frame order (so a reorder/drop fails), and the terminator (so a tail-truncation fails as a
+    missing final frame)."""
     return header_digest + _U64.pack(frame_index) + (b"\x01" if final else b"\x00")
 
 
@@ -398,6 +399,11 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
     """Parse + validate the magic/version/header at the front of ``src``, returning the
     :class:`ArchiveHeader`. Does NOT decrypt — used by the key-fingerprint precheck (AC-5) to read the
     ``key_id`` before attempting any decryption."""
+    return _read_header(src)[0]
+
+
+def _read_header(src: BinaryIO) -> tuple[ArchiveHeader, bytes]:
+    """:func:`read_header`, also returning the header bytes as read, which the frames' AAD hashes."""
     magic = _read_exact(src, len(MAGIC), "magic")
     if magic != MAGIC:
         raise BackupCodecError("not a .mfbak archive (bad magic)")
@@ -454,12 +460,12 @@ def read_header(src: BinaryIO) -> ArchiveHeader:
             f"malformed .mfbak header (chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes, got "
             f"{header.chunk_size})"
         )
-    # The frames' AAD hashes header.to_json_bytes(), not the bytes read, so the header is bound only
-    # if the two are the same bytes. The writer emits exactly that form; any other spelling of the
-    # same fields (spacing, key order, an extra or repeated key, a coerced value) is refused here.
+    # The writer emits exactly header.to_json_bytes(); any other spelling of the same fields is
+    # refused here, so a re-spelled header is a header refusal rather than a tag failure, and a
+    # caller of read_header alone (the key precheck) sees only the writer's own form.
     if header_bytes != header.to_json_bytes():
         raise BackupCodecError("malformed .mfbak header (not in the form this format writes)")
-    return header
+    return header, header_bytes
 
 
 def archive_key_id(path: str | Path) -> str:
@@ -475,8 +481,10 @@ def decrypt_stream(
 ) -> ArchiveHeader:
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
-    ``final`` terminator, so a reordered/dropped/truncated/appended chunk or a tampered header **fails
-    the GCM tag** (``BackupCodecError``). Fail-closed: nothing decrypts unless every frame authenticates.
+    ``final`` terminator, so a reordered/dropped/truncated/appended chunk **fails the GCM tag**
+    (``BackupCodecError``). A changed header is refused or fails closed: a re-spelled one by
+    :func:`read_header`, a changed ``key_id`` as a key mismatch, any other changed value at the tag.
+    Fail-closed: nothing decrypts unless every frame authenticates.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
     so a wrong key is a clean early error, not an opaque tag failure.
@@ -490,7 +498,7 @@ def decrypt_stream(
     from cryptography.exceptions import InvalidTag
 
     _validate_key(key)
-    header = read_header(src)
+    header, header_bytes = _read_header(src)
     expected_kid = key_fingerprint(key)
     # Constant-time (ASVS 11.2.4, BACKLOG #1167). `expected_kid` is a one-way fingerprint of the key
     # and is public (the header carries it, and the refusal below prints it), so this hides no
@@ -500,7 +508,8 @@ def decrypt_stream(
             f"the resolved store key (key_id={expected_kid}) does not match the archive's key "
             f"(key_id={header.key_id}); the DR site must hold the same DEK to restore (ADR 0049)"
         )
-    header_digest = hashlib.sha256(header.to_json_bytes()).digest()
+    # The bytes as read, so the binding does not rest on the canonical-form check alone.
+    header_digest = hashlib.sha256(header_bytes).digest()
     aes = _frame_aes(header, key)
     # AESGCM appends EXACTLY _TAG_BYTES to a chunk of at most chunk_size, so this bound is exact and
     # holds no slack. The min() is redundant WHILE read_header caps chunk_size, and it is kept anyway:
