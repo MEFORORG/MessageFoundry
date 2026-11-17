@@ -669,17 +669,7 @@ def attest_engine() -> AttestationResult:
         _DIST_NAME,
         lambda: [*_loaded_module_files(), *_attested_asset_files()],
         unmatched_rows=_is_module_row,
-        package_roots=_engine_package_roots,
     )
-
-
-def _engine_package_roots() -> list[Path]:
-    """The resolved directories of the loaded ``messagefoundry`` package (BACKLOG #5376). Today the
-    declared asset paths, listed whether or not they exist, already place the engine root under the
-    install root; this makes an emptied engine package read as drift without relying on that."""
-    import messagefoundry
-
-    return [Path(root).resolve() for root in messagefoundry.__path__]
 
 
 def attest_console() -> AttestationResult | None:
@@ -705,21 +695,8 @@ def attest_console() -> AttestationResult | None:
         )
         return None
     return _attest_distribution(
-        _CONSOLE_DIST_NAME,
-        _CONSOLE_PACKAGE,
-        lambda: files,
-        unmatched_rows=_any_row,
-        package_roots=_console_package_roots,
+        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, unmatched_rows=_any_row
     )
-
-
-def _console_package_roots() -> list[Path]:
-    """The resolved ``__path__`` directories of the loaded web console, or none when it is not loaded
-    or has no ``__path__`` (BACKLOG #5376). Read from ``sys.modules`` like
-    :func:`_console_loaded_files`, so it never imports the console."""
-    module = sys.modules.get(_CONSOLE_PACKAGE)
-    search = getattr(module, "__path__", None) if module is not None else None
-    return [Path(root).resolve() for root in search] if search is not None else []
 
 
 def _attest_distribution(
@@ -728,7 +705,6 @@ def _attest_distribution(
     attested_files: Callable[[], list[Path]],
     *,
     unmatched_rows: Callable[[str], bool] | None = None,
-    package_roots: Callable[[], list[Path]] | None = None,
 ) -> AttestationResult:
     """Compare ``attested_files()`` against the ``RECORD`` of installed distribution ``dist_name``,
     whose source sits under the top-level ``package`` directory. The one classifier both arms share,
@@ -737,16 +713,8 @@ def _attest_distribution(
     ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
-    applies when at least one attested file sat under the install root, or when one of
-    ``package_roots()`` (the loaded package's own directories) does, so a package loaded from outside
-    it stays attested-nothing rather than turning into a list of every file it did not load. The
-    second condition is BACKLOG #5376: a loaded package whose every file was deleted, or swapped for
-    a FIFO or socket the walk leaves out, lists no file, and without it read as attested-nothing
-    rather than as ``missing`` drift for each row.
-
-    ``checked`` counts only files whose bytes were read and compared. A file that fails to open is
-    ``missing`` drift and is not counted, so a pass in which no file could be read is
-    attested-nothing as well as drift (BACKLOG #5376).
+    applies only when at least one attested file sat under the install root, so a package loaded from
+    outside it stays attested-nothing rather than turning into a list of every file it did not load.
     """
     try:
         dist = metadata.distribution(dist_name)
@@ -802,22 +770,17 @@ def _attest_distribution(
             # A FIFO, device or socket at a RECORD path: reading it can block startup forever.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
+        checked += 1
         try:
             # Streamed: a module swapped for a link to a very large file must not be read into memory.
             with file.open("rb") as handle:
                 actual = hashlib.file_digest(handle, "sha256").digest()
         except OSError:
-            # Not compared, so not counted: a pass whose every file fails to open compared nothing.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
-        checked += 1
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    under_root = bool(seen) or any(
-        _record_relpath(root, install_root) is not None
-        for root in (package_roots() if package_roots is not None else [])
-    )
-    if unmatched_rows is not None and under_root:
+    if unmatched_rows is not None and seen:
         prefix = f"{package}/"
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
