@@ -103,6 +103,7 @@ from typing import Any, Literal
 
 import requests
 import requests.adapters
+import requests.auth
 import requests.utils
 import urllib3.connection
 import urllib3.connectionpool
@@ -1602,6 +1603,25 @@ def _refuse_an_insecure_vault_hop(
     return sent, proxy
 
 
+class _NoAmbientAuth(requests.auth.AuthBase):
+    """A session auth that adds nothing, so requests never reads a netrc file (vault BACKLOG #5355).
+
+    ``Session.prepare_request`` reads the netrc file (``NETRC``, else ``~/.netrc`` or ``~/_netrc``)
+    whenever ``trust_env`` is on and neither the request nor the session carries auth, and would
+    attach a matching entry as an ``Authorization: Basic`` header. No Vault client authenticates
+    that way: the token rides in ``X-Vault-Token``. A truthy session auth skips that read and
+    leaves the request as hvac built it.
+
+    ``trust_env`` itself stays on, because it also carries the proxy variables and the system
+    proxy, and ``REQUESTS_CA_BUNDLE`` and ``CURL_CA_BUNDLE``, which docs/CONFIGURATION.md and
+    ``store/keyprovider_vault.py`` name as supported for both Vault clients. Its only other netrc
+    read is ``Session.rebuild_auth``, which runs on a followed redirect, and every Vault client
+    refuses redirects (BACKLOG #1042)."""
+
+    def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        return r
+
+
 def mount_strict_reply_adapter(
     client: Any,
     *,
@@ -1646,6 +1666,9 @@ def mount_strict_reply_adapter(
     credentials and is not ``https://``, which would send those credentials in cleartext (BACKLOG
     #2547), and when requests would send it through a proxy whose URL requests cannot read or
     send, since requests' own error would carry that URL or its credentials (vault BACKLOG #3454).
+
+    On a hop it mounts, it also sets :class:`_NoAmbientAuth` as the session auth where none is
+    set, so requests reads no netrc file for a Vault request (vault BACKLOG #5355).
     At least the three Vault clients the engine builds today call this; a new one must too.
     """
     session = getattr(getattr(client, "adapter", None), "session", None)
@@ -1678,5 +1701,9 @@ def mount_strict_reply_adapter(
     # Before the adapter is mounted, so a refused hop leaves the session as hvac built it. The
     # adapter runs the check, so this one and each send's share its one read of the CRL flag.
     adapter.refuse_an_unrevoked_hop(sent, proxy)
+    # Vault BACKLOG #5355: no netrc read and no netrc Basic credentials on any Vault request. A
+    # session auth the caller already set skips the read too, so it is left as it is.
+    if session.auth is None:
+        session.auth = _NoAmbientAuth()
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

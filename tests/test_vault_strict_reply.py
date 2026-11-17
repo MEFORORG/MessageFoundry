@@ -560,3 +560,98 @@ def test_the_kv_secret_provider_fails_closed_on_a_misframed_reply(
         monkeypatch.delenv("MEFOR_SECRETS_VAULT_CA_FILE", raising=False)
         with pytest.raises(SecretProviderError, match="framed its response body ambiguously"):
             VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
+
+
+# --- no netrc file is read, and none of its credentials ride on a Vault request (#5355) ----------
+
+
+def _plant_netrc(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A netrc file whose entry matches the scripted Vault's host. Synthetic credentials only."""
+    netrc_file = tmp_path / "netrc"
+    netrc_file.write_text(
+        "machine 127.0.0.1 login synthetic-user password synthetic-pass\n", encoding="ascii"
+    )
+    monkeypatch.setenv("NETRC", str(netrc_file))
+
+
+def _authorization_sent(server: _ScriptedVault) -> list[bytes]:
+    return [
+        line
+        for request in server.requests
+        for line in request.split(b"\r\n")
+        if line.lower().startswith(b"authorization:")
+    ]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["messagefoundry.config.secretprovider_vault", "messagefoundry.store.keyprovider_vault"],
+)
+def test_a_vault_client_reads_no_netrc_file_and_sends_none_of_its_credentials(
+    module: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5355. Mutation: drop the session auth the mount sets. Red: a netrc read on
+    the request, and an Authorization header from the planted entry."""
+    import importlib
+
+    import requests.sessions
+
+    _plant_netrc(tmp_path, monkeypatch)
+    reads: list[object] = []
+    real = requests.sessions.get_netrc_auth
+
+    def _recording_netrc_auth(*args: Any, **kwargs: Any) -> Any:
+        reads.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", _recording_netrc_auth)
+    mod = importlib.import_module(module)
+    with _ScriptedVault([(_ok(), True)]) as server:
+        client = mod._build_client(
+            f"http://127.0.0.1:{server.port}", _TOKEN, revocation_attested=False
+        )
+        assert _get(client) == {"data": {"data": {"value": "synthetic"}}}
+        # trust_env stays on: the proxy variables and CA bundle variables the docs name still apply.
+        assert client.adapter.session.trust_env is True
+    assert reads == []
+    assert _authorization_sent(server) == []
+    assert any(b"x-vault-token: " + _TOKEN.encode() in r.lower() for r in server.requests)
+
+
+def test_control_a_plain_requests_session_sends_the_planted_netrc_credentials(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control: a stock session with the same netrc file sends its entry as Basic auth,
+    so the empty reading above is the mount's doing and not a netrc file requests cannot read."""
+    import requests
+
+    _plant_netrc(tmp_path, monkeypatch)
+    with _ScriptedVault([(_ok(), True)]) as server, requests.Session() as session:
+        assert session.get(f"http://127.0.0.1:{server.port}/{_KV_PATH}", timeout=10).ok
+    assert [line.split(b" ")[1] for line in _authorization_sent(server)] == [b"Basic"]
+
+
+def test_the_mount_leaves_a_session_auth_the_caller_set() -> None:
+    """A session that already carries auth skips the netrc read on its own, so the mount keeps it."""
+    import requests
+
+    from messagefoundry.transports.strict_requests import _NoAmbientAuth, mount_strict_reply_adapter
+
+    class _Adapter:
+        base_uri = "https://vault.example.test:8200"
+        session = requests.Session()
+
+    class _Client:
+        adapter = _Adapter()
+
+    preset = requests.auth.HTTPBasicAuth("synthetic-user", "synthetic-pass")
+    _Client.adapter.session.auth = preset
+    mount_strict_reply_adapter(
+        _Client(),
+        connector="Vault test hop",
+        ssl_context_factory=ssl.create_default_context,
+        revocation_attested=True,
+        attestation_section="secrets",
+    )
+    assert _Client.adapter.session.auth is preset
+    assert not isinstance(preset, _NoAmbientAuth)
