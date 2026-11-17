@@ -568,7 +568,7 @@ _NAME_DIGEST_CHARS = 12
 #: derived from engine code rather than from a list of plausible extensions:
 #:
 #: * ``parsing/sniff.py`` ``_EXTENSION_CONTENT_TYPE`` — the engine's own extension-to-``ContentType``
-#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .json .fhir .xml .dcm .edi .x12``.
+#:   map for archive-member admission (ASVS 5.2.2): ``.hl7 .hl7v2 .json .fhir .xml .dcm .edi .x12``.
 #: * ``parsing/sniff.py`` ``_EXTENSION_MAGIC`` — the container/attachment formats it admits by leading
 #:   magic bytes: ``.pdf .png .jpg .jpeg .gif .tif .tiff .zip .gz``.
 #: * ``uploads.py`` ``_ALLOWED_UPLOAD_EXTENSIONS`` / ``content_type_for`` — ``.hl7v2`` and ``.txt``.
