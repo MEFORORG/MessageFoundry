@@ -6852,11 +6852,9 @@ class SecretRotationSettings(_Section):
     # build would buy the setting without the posture. Setting it false is a LOOSENING and
     # security_loosenings() names it, so the opt-out is never silent.
     enforce_store_key_expiry: bool = True
-    # BACKLOG #4934 — serve refuses to start when the store key changed, the keyed audit chain has
-    # not rolled to it, and the key the chain's current range is under is not configured: the first
-    # audit row that start wrote would break the chain, and no later rotate-key could roll it. True
-    # starts anyway, for a prior key that is truly lost; it is a LOOSENING, named by
-    # security_loosenings(), and the chain breaks at that start's first audit row.
+    # BACKLOG #4934 — True starts serve over its refusal of a store key change the keyed audit
+    # chain cannot follow; a LOOSENING, named by security_loosenings(). The refusal's condition and
+    # way out are stated once, in this setting's entry in docs/SECURITY-LOOSENING.md.
     allow_lost_audit_range_key: bool = False
     # ASVS 13.3.4 / BACKLOG #1932 — the calendar refusal for the NON-DEK classes, OPT-IN per class.
     # Each entry names one class from ENFORCEABLE_SECRET_EXPIRY_CLASSES. Under
@@ -10679,10 +10677,9 @@ def security_loosenings(
         out.append(
             (
                 "allow_lost_audit_range_key",
-                "the engine starts even when the store key changed, the audit chain has not been "
-                "rolled to it and the key its current range is under is not configured, so the "
-                "audit chain breaks at that start's first audit row and no rotate-key run can roll "
-                "it afterwards",
+                "the engine starts even where its refusal of a store key change the keyed audit "
+                "chain cannot follow would stop it, and the audit chain breaks at that start's "
+                "first audit row; docs/SECURITY-LOOSENING.md states that refusal",
             )
         )
     # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4). Owner answer to

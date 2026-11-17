@@ -242,7 +242,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
-| | `[secret_rotation].allow_lost_audit_range_key` | `false` (`true` starts the engine on a changed store key the keyed audit chain has not rolled to while the key of the chain's current range is not configured; the chain breaks at that start's first audit row) |
+| | `[secret_rotation].allow_lost_audit_range_key` | `false` (`true` starts the engine over the store key refusal its entry below states) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
@@ -838,29 +838,27 @@ This section is kept rather than deleted, because the claim it used to make is t
 Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
 the next start may do.
 - **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
-  change. With it off, `serve` (and each `supervise` shard) refuses to start when the store key in
-  use is not confirmed by its stamp, the chain's current range is not under it, and the key that
-  range is under is not configured. The refusal never fires on at least two
-  kinds of store, so this setting changes nothing there: a store under
-  `[store].cipher_provider = "vault_transit"`, because Transit holds its key and the engine has no
-  local store key to compare with the stamp; and a store whose audit ranges the open could not
-  authenticate, because the open then cannot say which key the current range is under, though
-  that start's first audit row may still break the chain. With it on, that start goes ahead: its first audit row goes into that range under the
-  new key, never verifies there, and the chain breaks at that row. `audit-verify` reports the break,
-  and `rotate-key` cannot roll the chain afterwards.
+  change. This entry is the statement of when that refusal fires and of the way out. With it off,
+  `serve` (and each `supervise` shard) refuses to start when all of these hold: the engine holds a
+  local store key, so not under `[store].cipher_provider = "vault_transit"`; the stamp does not
+  name that key, which covers a different key, no stamp, and a stamp under a scheme this release
+  does not know; the store has a keyed audit chain whose ranges the open authenticated; and the
+  key the chain's newest range is under is not configured. It refuses whether or not the key in
+  use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
+  that range under the key in use, never verifies there, and the chain breaks at that row. Once it
+  has broken, `audit-verify` reports the break, and no `rotate-key` run can roll the chain.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
   and every other start check. Rows before the break still verify. The setting changes nothing on a
-  start whose key is unchanged, whose chain has rolled, or whose range key is configured.
-- **When acceptable:** only when the key the chain's current range is under is truly lost, so no
-  `rotate-key` run can roll the chain anyway. If the key exists anywhere, put it back in
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key` instead.
+  start the refusal would not stop.
+- **When acceptable:** only when the key the chain's newest range is under is truly lost. If the
+  key exists anywhere, put it back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key`
+  instead. Its audit chain step says whether it rolled the chain and, where it refuses, why. Where
+  the key in use already keyed an earlier range, that step refuses and asks for a new key.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
-- **Reversible:** no, once a start has used it. The chain stays broken at that row, and the store
-  needs the setting on for every later start: turned back off, the next start refuses again,
-  because the chain's range is still under the lost key, and no `rotate-key` run can move it. Set
-  only and never used, it changes nothing and can be removed.
+- **Reversible:** no, once a start has used it: the chain stays broken at that row. Set only and
+  never used, it changes nothing and can be removed.
 
 ### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
 Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A

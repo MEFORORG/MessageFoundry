@@ -346,23 +346,22 @@ async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -
 
 #: The WARNING a start logs when it opened the rotation record itself (BACKLOG #4942).
 _OPENED_AT_START = (
-    "secret rotation: the store key in use differs from its stamp, or has none, and the audit "
+    "secret rotation: the store key in use is not confirmed by its stamp, and the audit "
     "chain has not been rolled to it, so no `messagefoundry rotate-key` run has completed on it. A "
     "rotation record was opened for it, its rotation date was not stamped and its age was not "
     "reset. Stop the engine and run `messagefoundry rotate-key`, with the prior key in "
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, until it exits 0. If it refuses at its audit chain step, "
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED. If it refuses at its audit chain step, "
     "its error says whether a re-run can clear that, and the way out where none can."
 )
 
 #: The WARNING a start logs when it held a key and kept a record open for another key (BACKLOG
 #: #4942): see :func:`open_rotation_record`'s ``keep_another``.
 _HELD_FOR_ANOTHER_RECORD = (
-    "secret rotation: the store key in use differs from its stamp, or has none, while the "
+    "secret rotation: the store key in use is not confirmed by its stamp, while the "
     "rotation record stands open for another store key that no `messagefoundry rotate-key` run has "
     "completed on. That record was kept, this key's "
     "rotation date was not stamped and its age was not reset. Stop the engine and run "
-    "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, "
-    "until it exits 0."
+    "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED."
 )
 
 
@@ -430,9 +429,8 @@ async def refuse_unrolled_key_change(
     range_key_missing: bool,
     allow_lost: bool,
 ) -> None:
-    """Raise :class:`UnrolledStoreKeyRefused` when the store key changed, the keyed audit chain has
-    not rolled to it, and the key the chain's current range is under is not configured (BACKLOG
-    #4934, owner ruling 2026-11-04). ``serve`` calls it right after the store open, before it writes
+    """Raise :class:`UnrolledStoreKeyRefused` on the condition the ``allow_lost_audit_range_key``
+    entry in docs/SECURITY-LOOSENING.md states (BACKLOG #4934, owner ruling 2026-11-04). ``serve`` calls it right after the store open, before it writes
     any audit row. ``audit_rolled`` is :func:`~messagefoundry.store.store.audit_chain_rolled` and
     ``range_key_missing`` is :func:`~messagefoundry.store.store.audit_range_key_missing`, both for
     the open store.
