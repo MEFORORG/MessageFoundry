@@ -493,9 +493,9 @@ def emit_audit_tee(
       typed sign-in name ship that way. A record can ship as the line before #3045, losing the
       scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
       so a client can turn the scrub off for its own record.
-    * A record whose line is longer than the handler chain's 64 KiB window ships the line from
-      before #3045, unscrubbed. At least a large ``action``, ``actor``, ``channel_id`` or
-      ``client`` can make one.
+    * A record whose line is longer than the handler chain's redaction window can ship the line
+      from before #3045, losing the C0 field scrub. At least a large ``action``, ``actor``,
+      ``channel_id`` or ``client`` can make one.
     * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
       and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
       as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.
