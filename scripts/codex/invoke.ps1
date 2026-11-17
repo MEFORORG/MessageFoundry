@@ -22,7 +22,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     $word = [string]$args[$i]
     if ($word -notlike '-*') { $mode = $word; break }
     # argparse takes any unambiguous prefix of --session-id, and it consumes the next argument.
-    if ($word -notlike '*=*' -and $word.Length -ge 3 -and '--session-id'.StartsWith($word)) { $i++ }
+    if ($word -notlike '*=*' -and $word.Length -ge 3 -and '--session-id'.StartsWith($word, [StringComparison]::Ordinal)) { $i++ }
 }
 if ($mode -eq 'hook') {
     # The bridge decides with exit 0, or with 10 (BLOCK_EXIT in bridge.py) for a block, which

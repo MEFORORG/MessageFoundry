@@ -200,24 +200,28 @@ def git_bash() -> str | None:
 
 
 # -Command reports a native program's exit 2 as 1, which would turn a block into a non-blocking
-# error. This wrapper passes on the hook's own final exit 2: it runs every statement but the last,
-# resets $LASTEXITCODE, then runs the last one. A failed last statement that set exit code 2 exits
-# 2; any other failed last statement, a failed cmdlet or a native non-zero, exits 1. So a stale 2
-# from an earlier native command never blocks, and no recorded error hides a real final 2. The
-# hook text travels base64-encoded, so no quoting in it can reach the wrapper.
-POWERSHELL_WRAPPER = """$PSNativeCommandUseErrorActionPreference = $false
-$__mfText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))
-$__mfParseErrors = $null
-$__mfAst = [System.Management.Automation.Language.Parser]::ParseInput($__mfText, [ref]$null, [ref]$__mfParseErrors)
-$__mfStatements = @(if ($__mfAst.EndBlock) {{ $__mfAst.EndBlock.Statements }})
-if ($__mfParseErrors.Count -or $__mfAst.BeginBlock -or $__mfAst.ProcessBlock -or $__mfStatements.Count -eq 0) {{
-    . ([scriptblock]::Create($__mfText))
-}} else {{
-    $__mfSplit = $__mfStatements[-1].Extent.StartOffset
-    . ([scriptblock]::Create($__mfText.Substring(0, $__mfSplit)))
-    $global:LASTEXITCODE = 0
-    . ([scriptblock]::Create($__mfText.Substring($__mfSplit) + "`n" + 'if (-not $?) {{ if ($LASTEXITCODE -eq 2) {{ exit 2 }}; exit 1 }}'))
-}}
+# error. This tail runs after the hook text, in the hook's own scope, so the hook keeps its $input,
+# $LASTEXITCODE, $?, trap and return. Only when the last statement failed does it look further: it
+# passes on exit code 2 unless that statement is a pipeline ending in a cmdlet or in a command that
+# does not exist, which cannot have set the code, so a stale 2 from an earlier native command
+# never blocks and no recorded error hides a real final 2. Any other failure exits 1. The tail
+# reparses the hook text, carried base64-encoded so no quoting in it can reach the tail.
+POWERSHELL_TAIL = """
+if (-not $?) {
+    $__mfCmdletLast = $false
+    $__mfAst = [System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('B64')), [ref]$null, [ref]$null)
+    $__mfLast = if ($__mfAst.EndBlock) { $__mfAst.EndBlock.Statements | Select-Object -Last 1 }
+    if ($__mfLast -is [System.Management.Automation.Language.PipelineAst]) {
+        $__mfCall = $__mfLast.PipelineElements | Select-Object -Last 1
+        if ($__mfCall -is [System.Management.Automation.Language.CommandAst] -and $__mfCall.GetCommandName()) {
+            $__mfFound = Get-Command -Name $__mfCall.GetCommandName() -ErrorAction Ignore | Select-Object -First 1
+            if ($__mfFound -is [System.Management.Automation.AliasInfo]) { $__mfFound = $__mfFound.ResolvedCommand }
+            $__mfCmdletLast = $null -eq $__mfFound -or $__mfFound.CommandType -eq 'Cmdlet'
+        }
+    }
+    if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2 -and -not $__mfCmdletLast) { exit 2 }
+    exit 1
+}
 """
 
 
@@ -241,7 +245,8 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        script = POWERSHELL_WRAPPER.format(b64=base64.b64encode(command.encode()).decode())
+        encoded = base64.b64encode(command.encode()).decode()
+        script = command + POWERSHELL_TAIL.replace("B64", encoded)
         return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 

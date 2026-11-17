@@ -214,6 +214,14 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
             "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction Ignore",
             "notice",
         ),
+        # The hook keeps its own $input, $LASTEXITCODE, $?, trap, param() and return.
+        ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
+        ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
+        ("& '{py}' -c 'import sys; sys.exit(3)'; if (-not $?) {{ exit 2 }}", "block"),
+        ("trap {{ exit 2 }}; Write-Output 'x' | Out-Null; throw 'boom'", "block"),
+        ("param($x = 1)\n& '{py}' -c 'import sys; sys.exit(2)'", "block"),
+        ("if ($true) {{ & '{py}' -c 'import sys; sys.exit(2)' }}", "block"),
+        ("if ($true) {{ return }}; exit 2", "allow"),
     ],
     ids=[
         "native-exit-2",
@@ -224,6 +232,13 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "handled-error-then-final-2",
         "silenced-error-then-final-2",
         "stale-2-then-ignored-cmdlet",
+        "reads-input",
+        "exit-lastexitcode",
+        "checks-status",
+        "trap",
+        "param-block",
+        "compound-statement",
+        "early-return",
     ],
 )
 def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, command, outcome):
@@ -938,18 +953,30 @@ def test_a_defective_group_whose_hook_sets_on_failure_block_blocks(bridge, tmp_p
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    ("args", "stub", "expected"),
     [
-        (["hook", "--event", "Stop"], 2),
-        (["--session-id", "S", "hook", "--event", "Stop"], 2),
-        (["--session-id=S", "hook", "--event", "Stop"], 2),
-        (["--sess", "S", "hook", "--event", "Stop"], 2),
+        (["hook", "--event", "Stop"], "10", 2),
+        (["--session-id", "S", "hook", "--event", "Stop"], "10", 2),
+        (["--session-id=S", "hook", "--event", "Stop"], "10", 2),
+        (["--sess", "S", "hook", "--event", "Stop"], "10", 2),
+        # No decision after options stays a non-blocking 1, never a raw 2.
+        (["--session-id", "S", "hook", "--event", "Stop"], "2", 1),
+        # The value of --session-id is not the subcommand, even when it reads hook.
+        (["--session-id", "hook", "run", "scripts/codex/bridge.py"], "10", 10),
         # The twin: a run whose target merely takes the word hook is not hook mode.
-        (["run", "scripts/codex/bridge.py", "hook"], 10),
+        (["run", "scripts/codex/bridge.py", "hook"], "10", 10),
     ],
-    ids=["first", "after-session-id", "session-id-equals", "abbreviated-option", "run-mode"],
+    ids=[
+        "first",
+        "after-session-id",
+        "session-id-equals",
+        "abbreviated-option",
+        "no-decision-after-options",
+        "session-id-named-hook",
+        "run-mode",
+    ],
 )
-def test_the_launcher_finds_hook_mode_after_options(tmp_path, args, expected):
+def test_the_launcher_finds_hook_mode_after_options(tmp_path, args, stub, expected):
     """A block reaches Codex as 2 wherever hook is the subcommand, never as the raw 10."""
     root = tmp_path / "repo"
     scripts = root / "scripts/codex"
@@ -960,7 +987,7 @@ def test_the_launcher_finds_hook_mode_after_options(tmp_path, args, expected):
     completed = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(scripts / "invoke.ps1"), *args],
         cwd=scripts,
-        env={**os.environ, "STUB_BRIDGE_EXIT": "10"},
+        env={**os.environ, "STUB_BRIDGE_EXIT": stub},
         input="{}",
         text=True,
         capture_output=True,

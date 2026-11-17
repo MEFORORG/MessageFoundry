@@ -53,7 +53,8 @@ groups after it still run.
 A launcher that cannot run the bridge never blocks either. In hook mode the
 bridge exits 0 to proceed or 10 to block, and `invoke.ps1` turns 10 into 2. Any
 other outcome is no decision: another bridge exit, including the 2 that Python
-and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. No
+and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. On a
+call that names `hook` as its subcommand, as every registered command does, no
 decision is reported and maps to a non-blocking exit 1 on every event, never to
 2, and never to 0 once `pwsh` has started. `invoke.ps1` ends its process with
 its code, and the command line passes it on, because `pwsh -Command` would
