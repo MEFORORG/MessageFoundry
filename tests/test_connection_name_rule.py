@@ -9,6 +9,7 @@ pin the refusal on both authoring surfaces, and pin the two layers to ONE patter
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 import typing
 from collections.abc import Callable
@@ -247,3 +248,76 @@ def test_a_corepoint_xml_package_with_a_long_name_still_loads(tmp_path: Path) ->
     assert channels
     for ch in channels:
         assert connection_names.is_connection_name(ch.module_name)
+
+
+def _two_inbounds(tmp_path: Path, first: str, second: str, outbound_name: str = "OB") -> Path:
+    body = LOGIC_PY + textwrap.dedent(
+        f"""
+        from messagefoundry import File, MLLP, inbound, outbound
+        inbound({first!r}, MLLP(port=2600), router="r")
+        inbound({second!r}, MLLP(port=2601), router="r")
+        outbound({outbound_name!r}, File(directory="./out"))
+        """
+    )
+    (tmp_path / "logic.py").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def test_names_differing_only_in_case_are_refused_at_load(tmp_path: Path) -> None:
+    # BACKLOG #5392: a case-insensitive SQL Server collation would give the two one set of rows.
+    with pytest.raises(WiringError, match="differs only in case") as info:
+        load_config(_two_inbounds(tmp_path, "IB_ACME_ADT", "ib_acme_adt"))
+    assert "'ib_acme_adt'" in str(info.value)
+    assert "'IB_ACME_ADT'" in str(info.value)
+
+
+def test_distinct_names_and_a_case_twin_in_another_table_still_load(tmp_path: Path) -> None:
+    # The control: two names that differ by more than case load, and the check is per table, as the
+    # exact-duplicate check is, so an outbound may share an inbound's name up to case.
+    registry = load_config(_two_inbounds(tmp_path, "IB_ACME_ADT", "IB_ACME_ORU", "ib_acme_adt"))
+    assert set(registry.inbound) == {"IB_ACME_ADT", "IB_ACME_ORU"}
+    assert set(registry.outbound) == {"ib_acme_adt"}
+
+
+def test_every_record_namespace_has_one_helper() -> None:
+    assert connection_names.db_lookup_record_name("L") == "db_lookup:L"
+    assert connection_names.reference_record_name("R") == "reference:R"
+    # No engine module hand-spells a namespace prefix the helpers own (BACKLOG #5392).
+    root = Path(connection_names.__file__).parent
+    # A string literal, either quote, f-string or not, that opens with a prefix and goes on to a
+    # placeholder or ends there to be concatenated. An error message such as "db_lookup: no ..." is
+    # prose, not a record name.
+    spelled_re = re.compile(
+        r"""(?<!\w)[rRbBuU]?[fF]?[rR]?(["'])(?:db_lookup|reference|inbound|fhir_lookup):(?:\{|\1)"""
+    )
+    spelled = [
+        f"{path.relative_to(root)}: {match.group(0)}"
+        for path in root.rglob("*.py")
+        if path.name != "connection_names.py"
+        for match in spelled_re.finditer(path.read_text(encoding="utf-8"))
+    ]
+    assert spelled == []
+
+
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+def test_a_case_twin_across_toml_and_code_is_refused(tmp_path: Path, direction: str) -> None:
+    config = _toml(tmp_path, "IB_ACME", "OB_ACME")
+    call = (
+        'inbound("ib_acme", MLLP(port=2700), router="r")'
+        if direction == "inbound"
+        else 'outbound("ob_acme", File(directory="./out2"))'
+    )
+    (config / "twin.py").write_text(
+        f"from messagefoundry import File, MLLP, inbound, outbound\n{call}\n", encoding="utf-8"
+    )
+    with pytest.raises(WiringError, match=f"duplicate {direction} connection name.*differs only"):
+        load_config(config)
+
+
+def test_a_rename_onto_a_case_twin_is_refused_at_plan_time(tmp_path: Path) -> None:
+    config = _two_inbounds(tmp_path, "IB_ACME_ADT", "IB_ACME_ORU")
+    registry = load_config(config)
+    with pytest.raises(WiringError, match="differs only in case"):
+        plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_adt")
+    # The control: a rename to its own case variant is not a twin of another connection.
+    plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_oru")

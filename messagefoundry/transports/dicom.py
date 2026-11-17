@@ -1996,9 +1996,11 @@ class DicomScpSource(SourceConnector):
             )
             too_wide = (
                 " You set source_ip_allowlist, but an entry in it is wider than"
-                f" /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6), or does"
-                " not parse, so it restricts nobody it can be shown to and does not count (vault"
-                " BACKLOG #2622). Narrow every entry."
+                f" /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6), is an"
+                " IPv6 entry inside a prefix carrying IPv4 addresses (such as ::ffff:0:0/96) that"
+                f" is wider than /{96 + ALLOWLIST_MIN_PREFIX_V4}, or does not parse, so it"
+                " restricts nobody it can be shown to and does not count (vault"
+                " BACKLOG #2622, #5393). Narrow every entry."
                 if self._source_ip_allowlist
                 else ""
             )

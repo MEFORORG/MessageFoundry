@@ -15520,7 +15520,9 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
         "control: anyone who can reach the socket can submit a message. Set intake_auth "
         "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
         "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
-        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
+        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6), "
+        "and an IPv6 entry inside a prefix that carries IPv4 addresses (such as ::ffff:0:0/96 "
+        f"or 64:ff9b::/96) is at least a /{96 + _INTAKE_ALLOWLIST_MIN_PREFIX_V4}. "
         "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
         "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
     )

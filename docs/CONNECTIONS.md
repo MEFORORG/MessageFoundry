@@ -15,6 +15,10 @@ Mirth/NextGen Connect parity reference for what's planned.
 - **MESSAGE TYPE** — the HL7 message code carried (`ADT`, `ORM`, `ORU`, `SIU`, `DFT`, `MDM`, `VXU`, …),
   or `MIXED` / `ALL` when a connection isn't message‑type‑specific.
 
+Two inbound, or two outbound, connections may not have names that differ only in case
+(`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, because a SQL Server store column
+that compares without case would read the two as one (BACKLOG #5392).
+
 Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sample uses partner
 `Test`: **`IB_Test_ADT`** (inbound MLLP) → **`FILE-OUT_Test_ADT`** (outbound file).
 

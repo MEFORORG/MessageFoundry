@@ -443,7 +443,9 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   this gate judges only that mode, and the allow-list is not consulted here. The listener still
   refuses a peer outside `source_ip_allowlist` on every connection. With `intake_auth = none`, the
   default, a `source_ip_allowlist` counts when every entry is /8 or narrower for IPv4, or /32 or
-  narrower for IPv6. `tls_ca_file` alone does not count, because it accepts any certificate that CA
+  narrower for IPv6. An IPv6 entry inside a prefix that carries IPv4 addresses, at least the
+  IPv4-mapped `::ffff:0:0/96`, NAT64 and Teredo prefixes, must also be /104 or narrower, which
+  fixes /8 of the IPv4 address, so `::ffff:0:0/96` does not count. `tls_ca_file` alone does not count, because it accepts any certificate that CA
   ever signed.
   `--allow-insecure-bind` does not waive this gate.
 
