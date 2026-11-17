@@ -42,13 +42,10 @@ Posture (ADR 0017 amendment, 2026-06-27):
   hard enforcement that this install cannot give, and the branch used to return silently, so a
   first deployment in that shape would start with its tripwire disarmed and nothing to read.
 - **Attested-nothing is not clean** (BACKLOG #1679). A pass that compared no file (``checked == 0``)
-  names why in :data:`UnattestedReason`. At least an absent, empty or package-row-less ``RECORD``, an
-  unresolvable install root, and a package imported from *outside* the install root give one. Unless
-  the install declares itself editable, such a pass with no drift logs at WARNING, records the
-  ``startup_integrity`` audit row, fires the AlertSink, and refuses to start under
-  ``fail_closed_on_drift``. One that also found drift is reported as drift (:func:`_act_on`). Before
-  #1679 the four shapes named above returned a silent clean no-op, so a site that opted into hard
-  enforcement would start anyway with its tripwire disarmed, and the INFO line would say clean.
+  is never reported clean. :data:`UnattestedReason` names why it compared nothing, and
+  :func:`run_startup_attestation` says what each outcome costs. Before #1679 such a pass returned a
+  silent clean no-op, so a site that opted into hard enforcement would start anyway with its tripwire
+  disarmed, and the INFO line would say clean.
 
 **What it detects is an INCONSISTENT edit, not a consistent one.** The baseline ships beside the code it
 attests, inside the same install the stated adversary can write, so an edit that also re-seals ``RECORD``
@@ -385,6 +382,17 @@ def _record_has_package_rows(record: dict[str, bytes], package: str) -> bool:
     return any(rel.startswith(f"{package}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record)
 
 
+def _record_place(path: str | Path) -> Path:
+    """``path`` with its parent resolved and its own name kept: the place a ``RECORD`` row names it.
+
+    A file or a package directory swapped for a link keeps that place, so it is still compared
+    against its row, and reading it reads through the link, which is what an import would run.
+    Resolving the name too would move a linked package directory out of the install root, where every
+    row reads as ``missing`` although each file is there (BACKLOG #5376)."""
+    path = Path(path)
+    return path.parent.resolve() / path.name
+
+
 def _loaded_package_roots() -> list[str]:
     """The directories of the loaded first-party ``messagefoundry`` package (BACKLOG #5376)."""
     import messagefoundry
@@ -435,10 +443,10 @@ def _import_capable_files(roots: Iterable[str]) -> list[Path]:
     **Not every file**, which is the scope BACKLOG #1432 declined; ADR 0041's 2026-10-06 amendment
     says why that ruling does not reach these shapes, and records what this walk still does not see.
 
-    **The root is resolved, the files under it are not.** A file swapped for a symlink keeps its place
-    under the install root, and hashing it reads the bytes the symlink points at, which is what an
-    import would run. Resolving the file itself would move it outside the root, where the comparison
-    skips it. The console arm does the same (:func:`_console_loaded_files`).
+    **Each root is walked at its** :func:`_record_place`, and nothing under it is resolved. A file, or
+    the package directory itself, swapped for a link keeps its place under the install root, and
+    hashing it reads the bytes the link points at, which is what an import would run. The console arm
+    does the same (:func:`_console_loaded_files`).
     """
     files: set[Path] = set()
 
@@ -447,7 +455,7 @@ def _import_capable_files(roots: Iterable[str]) -> list[Path]:
             files.add(Path(error.filename))
 
     for root in roots:
-        for dirpath, _dirnames, filenames in Path(root).resolve().walk(on_error=unlistable):
+        for dirpath, _dirnames, filenames in _record_place(root).walk(on_error=unlistable):
             for name in filenames:
                 path = dirpath / name
                 if path.is_file():
@@ -494,10 +502,10 @@ def _any_row(rel: str) -> bool:
 def _attested_asset_files() -> list[Path]:
     """The on-disk paths of the shipped security **data** assets in :data:`_ATTESTED_ASSETS`.
 
-    Resolved under ``messagefoundry.__path__``, the same anchor the module walk uses, so both halves
-    attest the install this process actually imported from. Like that walk it resolves the root and
-    not the asset, so an asset swapped for a symlink is hashed in its own place rather than skipped as
-    outside the install root (vault BACKLOG #2763).
+    Placed under each ``messagefoundry.__path__`` root's :func:`_record_place`, the same anchor the
+    module walk uses, so both halves attest the install this process actually imported from. Like that
+    walk it resolves neither the root nor the asset, so an asset swapped for a symlink is hashed in its
+    own place rather than skipped as outside the install root (vault BACKLOG #2763).
 
     **A path is returned whether or not it exists.** Deleting a declared asset is tampering too, and a
     caller that filtered on existence would report clean for it; the attestation loop turns the
@@ -507,7 +515,7 @@ def _attested_asset_files() -> list[Path]:
 
     return list(
         dict.fromkeys(
-            Path(root).resolve() / rel
+            _record_place(root) / rel
             for root in messagefoundry.__path__
             for rel in _ATTESTED_ASSETS
         )
@@ -530,11 +538,9 @@ def _console_loaded_files() -> list[Path] | None:
     file shadowing the package name) contributes its own ``__file__``; one with neither contributes
     nothing, which leaves the pass comparing nothing -- attested-nothing, not clean.
 
-    **Directories are resolved, the file name is not.** A file swapped for a symlink therefore keeps its
-    place under the install root, and hashing it reads the bytes the symlink points at, which is what
-    an import would run. Resolving the file itself would move it outside the root, where the comparison
-    skips it. ``Path.walk`` does not follow a symlinked directory; it reports it as a file, which has no
-    ``RECORD`` row and so is drift. A directory the walk cannot list is returned too, as the engine
+    **Each root is walked at its** :func:`_record_place`, and nothing under it is resolved, as in the
+    engine walk (:func:`_import_capable_files`). ``Path.walk`` does not follow a symlinked directory
+    under the root; it reports it as a file, which has no ``RECORD`` row and so is drift. A directory the walk cannot list is returned too, as the engine
     walk returns one, so it is drift as well (BACKLOG #5376).
     """
     module = sys.modules.get(_CONSOLE_PACKAGE)
@@ -544,22 +550,19 @@ def _console_loaded_files() -> list[Path] | None:
 
     def unlistable(error: OSError) -> None:
         if error.filename is not None:
-            path = Path(error.filename)
-            files.add(path.parent.resolve() / path.name)
+            files.add(_record_place(error.filename))
 
     search = getattr(module, "__path__", None)
     if search is None:
         origin = getattr(module, "__file__", None)
         if origin:
-            path = Path(origin)
-            files.add(path.parent.resolve() / path.name)
+            files.add(_record_place(origin))
         return sorted(files)
     for root in search:
-        for dirpath, dirnames, filenames in Path(root).walk(on_error=unlistable):
+        for dirpath, dirnames, filenames in _record_place(root).walk(on_error=unlistable):
             dirnames[:] = [name for name in dirnames if name != _BYTECODE_CACHE_DIR]
-            directory = dirpath.resolve()
             files.update(
-                directory / name for name in filenames if not _is_special_file(directory / name)
+                dirpath / name for name in filenames if not _is_special_file(dirpath / name)
             )
     return sorted(files)
 
@@ -742,11 +745,13 @@ def _attest_distribution(
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
     runs when at least one attested file sat under the install root, or when one of ``package_roots``
     (the loaded package's directories) is, or resolves to, ``<install root>/<package>`` or a directory
-    in it. The second
-    trigger is BACKLOG #5376: a package whose every file is gone, or whose directory is a link out of
-    the install root, lists no file under it. A package loaded from outside the install root by
-    neither trigger stays attested-nothing rather than turning into a list of every file it did not
-    load.
+    in it. The second trigger is BACKLOG #5376: a package whose every file is gone lists no file under
+    the install root. A package loaded from outside the install root by neither trigger stays
+    attested-nothing rather than turning into a list of every file it did not load. This paragraph is
+    where the trigger is stated; ADR 0041 AC-13 and ``docs/CONFIGURATION.md`` point here.
+
+    A file sits under the install root at its own path or at its :func:`_record_place`, so a package
+    reached through a link from outside the install root into it is compared as if loaded there.
 
     ``checked`` counts a file only once its bytes were read.
     """
@@ -789,7 +794,9 @@ def _attest_distribution(
     checked = 0
     seen: set[str] = set()
     for file in attested_files():
-        rel = _record_relpath(file, install_root)
+        rel = _record_relpath(file, install_root) or _record_relpath(
+            _record_place(file), install_root
+        )
         if rel is None:
             continue  # loaded from outside the install root — not attestable against this RECORD
         seen.add(rel)
@@ -819,13 +826,13 @@ def _attest_distribution(
     def in_package(rel: str | None) -> bool:
         return rel is not None and (rel == package or rel.startswith(prefix))
 
-    # The package-root trigger matches a root twice: with only its parent resolved, so a package
-    # directory swapped for a link still names the place `RECORD` describes, and fully resolved, so a
-    # link from elsewhere into that place does too.
+    # The package-root trigger matches a root twice: at its record place, so a package directory
+    # swapped for a link still names the place `RECORD` describes, and fully resolved, so a link from
+    # elsewhere into that place does too.
     read_back = unmatched_rows is not None and (
         bool(seen)
         or any(
-            in_package(_record_relpath(Path(root).parent.resolve() / Path(root).name, install_root))
+            in_package(_record_relpath(_record_place(root), install_root))
             or in_package(_record_relpath(Path(root).resolve(), install_root))
             for root in package_roots
         )
