@@ -6358,10 +6358,12 @@ class AuthService:
         # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
         # exception: this decrypt is reachable WITHOUT the password here, so an unpadded 500 would
         # name the account as enrolled to anyone who knows the username. The secret comes from the
-        # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
-        # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
-        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, and is
-        # reached only once a code matched.
+        # checked record, so no driver runs here since BACKLOG #3510, and the open runs off the
+        # loop (:meth:`_open_totp_cell`, BACKLOG #3929). Every cipher refuses a cell as
+        # ``CipherError``, the Transit one included, and a value that opens but is not base32 raises
+        # ``ValueError``; both fail CLOSED (the code is wrong) and are logged by the census's own
+        # one-line loggers, with no traceback (BACKLOG #5335). Anything else is a defect and is
+        # raised. ``consume_totp_step`` below is outside the catch, reached only once a code matched.
         try:
             secret = await self._totp_secret(user)
             step = (
@@ -6374,12 +6376,11 @@ class AuthService:
                 if secret
                 else None
             )
-        except Exception:
-            _log.exception(
-                "combined sign-in: the stored TOTP secret for %s could not be read; treating the "
-                "code as wrong",
-                user.username,
-            )
+        except CipherError:
+            _log_totp_undecryptable(user.username)
+            step = None
+        except ValueError:  # binascii.Error is a ValueError: opened, but not base32
+            _log_totp_malformed(user.username)
             step = None
         # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
         # purpose). Asked on every combined sign-in, it would be a store call only an account with

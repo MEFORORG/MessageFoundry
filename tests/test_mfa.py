@@ -2389,6 +2389,69 @@ async def test_a_corrupt_stored_secret_is_a_padded_wrong_code(
         await store.close()
 
 
+async def test_an_unreadable_secret_on_the_combined_sign_in_logs_one_line_and_no_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5335: the combined sign-in reaches the TOTP cell with a username alone, so a cell
+    that will not open, or opens to a value that is not base32, is a wrong code logged by the
+    census's one-line WARNING loggers, never an ERROR with a traceback."""
+    import logging
+
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.store.crypto import CipherError
+
+    def undecryptable(_user_id: str, _cell: str | None) -> str:
+        raise CipherError("synthetic: the stored secret will not decrypt")
+
+    def not_base32(_user_id: str, _cell: str | None) -> str:
+        return "not base32 at all!"
+
+    for opener, text in (
+        (undecryptable, "does not decrypt under this store key"),
+        (not_base32, "is not a key codes can be computed with"),
+    ):
+        store = await _store()
+        try:
+            service = AuthService(store, _lock_settings(50))
+            _identity, password, steps = await _totp_admin(service, monkeypatch)
+
+            async def no_pad(_deadline: float) -> None:
+                return None
+
+            monkeypatch.setattr(service_module, "_sleep_until", no_pad)
+            monkeypatch.setattr(store, "open_totp_secret", opener)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger=service_module.__name__):
+                out = await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())
+            assert not out.ok
+            mine = [r for r in caplog.records if r.name == service_module.__name__]
+            assert any(text in r.getMessage() for r in mine), [r.getMessage() for r in mine]
+            assert all(r.exc_info is None for r in mine), "a traceback was logged"
+            assert all(r.levelno < logging.ERROR for r in mine), "logged at ERROR"
+        finally:
+            await store.close()
+
+
+async def test_a_defect_opening_the_secret_on_the_combined_sign_in_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5335: the catch takes the cipher's refusal and a value that is not base32 only. A
+    defect is not read as a wrong code, which would hide it behind a refused sign-in."""
+    store = await _store()
+    try:
+        service = AuthService(store, _lock_settings(50))
+        _identity, password, steps = await _totp_admin(service, monkeypatch)
+
+        def defect(_user_id: str, _cell: str | None) -> str:
+            raise RuntimeError("synthetic defect")
+
+        monkeypatch.setattr(store, "open_totp_secret", defect)
+        with pytest.raises(RuntimeError, match="synthetic defect"):
+            await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())
+    finally:
+        await store.close()
+
+
 async def test_a_reauth_after_a_run_of_wrong_codes_still_flags_login_after_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
