@@ -913,14 +913,29 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 #
 # The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
 # where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
-# through Get-ScanRawIndexMap at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
+# through the segment's raw index map at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
 # glued pair elsewhere on the line used to arm the join). No map, no join. Only POSIX and PowerShell
 # segments are read: in cmd a quote is a literal.
+# The segment's raw index map, built ONCE per segment and kept on it (review round 84a1c1fd70): built
+# per reading, a line of a few hundred invocations re-ran the span scanner for each one, which grows as
+# the square of the line and can pass the hook's timeout. $false stands for "no map".
+function Get-JoinMap($Seg) {
+    if ($null -eq $Seg) { return $null }
+    $have = $Seg.PSObject.Properties['JoinMap']
+    if ($null -eq $have) {
+        $built = Get-ScanRawIndexMap $Seg
+        $Seg | Add-Member -NotePropertyName JoinMap -NotePropertyValue $(if ($null -eq $built) { $false } else { $built })
+        $have = $Seg.PSObject.Properties['JoinMap']
+    }
+    if ($have.Value -is [bool]) { return $null }
+    , $have.Value
+}
+
 function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
     if ($Conv -ne 'posix' -and $Conv -ne 'pwsh') { return }
     $w = [string]$Reading.Window
     $w2 = $w
-    $map = $(if ($w -match "''|`"`"" -and $null -ne $Reading.Start) { Get-ScanRawIndexMap $Seg })
+    $map = $(if ($w -match "''|`"`"" -and $null -ne $Reading.Start) { Get-JoinMap $Seg })
     if ($null -ne $map) {
         $edge = "[\s;&|(){}<>'`"]"
         $sb = [System.Text.StringBuilder]::new()
@@ -930,6 +945,10 @@ function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
             if ($two -eq "''" -or $two -eq '""') {
                 $at = [int]$Reading.Start + $k
                 $real = $map[$at + 1] -eq $map[$at] + 1
+                # PowerShell reads a doubled quote right after the same quote as an escaped quote inside
+                # that string, not as an empty pair: `'<p>'''` passes `<p>'` (review round 84a1c1fd70).
+                if ($real -and $Conv -eq 'pwsh' -and $map[$at] -gt 0 -and
+                    [string]$Seg.Raw[$map[$at] - 1] -eq [string]$two[0]) { $real = $false }
                 $n = $k + 2
                 while ($n + 1 -lt $w.Length -and ($w.Substring($n, 2) -eq "''" -or $w.Substring($n, 2) -eq '""')) { $n += 2 }
                 $nextCh = $(if ($n -lt $w.Length) { [string]$w[$n] } else { ' ' })
@@ -947,7 +966,8 @@ function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
         $w2 = $w2 -replace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)(?:=|\s+)|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
     }
     if ($w2 -ceq $w) { return }
-    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2; Start = $Reading.Start }
+    # No Start: the joined window is shorter, so an offset into it no longer maps to the scan.
+    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2 }
 }
 
 # The index of the LAST `git` or `git.exe` word before $At, in any case on Windows, or -1. No

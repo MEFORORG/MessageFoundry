@@ -476,8 +476,6 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         # A joined `bash -c` payload's re-quoted `-C` reaches the first reading, which roots the
         # quote-tainted token at the governed cwd.
         (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "primary", "Bash"),
-        # bash runs this as the bare read `git config core.hooksPath`; the gate reads a disarm.
-        ("git config core.hooksPath''", "primary", "Bash"),
     ],
 )
 def test_known_false_denies_of_the_added_readings_still_deny(
@@ -559,3 +557,45 @@ def test_a_real_glued_pair_on_the_invocation_still_joins(rig: SimpleNamespace) -
     # The control for the row above: the same line with the glued pair on the -C value denies.
     reason = _reason(rig, _fmt(rig, "echo a'' ; git -C {p}'' reset --hard"), rig.outside)
     assert "SHARED PRIMARY" in reason, reason
+
+
+def test_origin_mains_bare_read_with_a_glued_pair_still_denies(rig: SimpleNamespace) -> None:
+    # A false deny origin/main already makes, not one of the added readings': bash runs this as the
+    # bare read `git config core.hooksPath`. Pinned as known, with its refusal text.
+    reason = _reason(rig, "git config core.hooksPath''", rig.primary)
+    assert "SHARED git configur" in reason, reason
+
+
+# Review round 84a1c1fd70. PowerShell passes `'<p>'''` as `<p>'` (a doubled quote inside a
+# single-quoted string is an escaped quote), and `''"<p>"` as two arguments, `` and `<p>`;
+# bash passes `<p>` for both. Measured with an argv printer under pwsh 7.
+@pytest.mark.parametrize(
+    "template",
+    ["git -C '{p}''' reset --hard", "git -C '{p}''' config {k}", "git -C ''\"{p}\" reset --hard"],
+)
+def test_powershell_escaped_or_leading_pairs_are_not_joined(
+    rig: SimpleNamespace, template: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside, "PowerShell")
+
+
+@pytest.mark.parametrize(
+    ("template", "text"),
+    [
+        ("git -C '{p}''' reset --hard", "SHARED PRIMARY"),
+        ("git -C '{p}''' config {k}", "SHARED git configur"),
+        ("git -C ''\"{p}\" reset --hard", "SHARED PRIMARY"),
+    ],
+)
+def test_the_same_pairs_join_under_bash(rig: SimpleNamespace, template: str, text: str) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert text in reason, reason
+
+
+def test_a_glued_pair_elsewhere_does_not_arm_the_join_under_powershell(
+    rig: SimpleNamespace,
+) -> None:
+    copy = rig.tmp / "Primary copy"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
+    command = _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard")
+    assert _allowed(rig, command, rig.outside, "PowerShell")
