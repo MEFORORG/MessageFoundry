@@ -70,6 +70,7 @@ import hashlib
 import io
 import itertools
 import logging
+import os
 import posixpath
 import re
 import socket
@@ -79,6 +80,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import PurePath
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from messagefoundry.config.models import (
@@ -144,7 +146,7 @@ from messagefoundry.transports.file import (
     SETTLE_SEEN_MAX,
     ScanRejected,
     _check_template_fits,
-    _content_matches_declared,
+    _content_matches_encoded,
     render_filename,
     scan_inbound_file,
 )
@@ -2728,6 +2730,38 @@ class RemoteFileDestination(DestinationConnector):
         return None  # connect-per-operation — nothing held open
 
 
+def _remote_processed_dir(remote_dir: str, value: object) -> str:
+    """The ``processed_subdir`` directory ``value`` names under ``remote_dir``, or ValueError for one
+    that names the poll directory itself or a directory above it, as the File source refuses
+    (``file._archive_subdir``). A file "moved" to the poll directory itself stays where the next
+    poll lists it, so it would be handed over again on every poll: at least ``""``, ``"."`` and
+    ``"a/.."``. A directory above it (``".."``) is refused too, to keep the rule the same as the
+    local source's, where an ancestor hides every drop. Purely lexical on POSIX paths, with no server call. An absolute value under a
+    relative ``remote_dir`` cannot be placed against it without the server, so it is let through.
+    An ``os.PathLike`` value is read as a POSIX path (``as_posix`` for a ``pathlib`` path, so a
+    Windows ``Path`` keeps its separators, else ``os.fspath``) and checked the same way. The value is
+    withheld from the error, as the other setting refusals here do."""
+    if isinstance(value, PurePath):
+        value = value.as_posix()
+    elif isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("REMOTEFILE processed_subdir must name a directory (value withheld)")
+    target = posixpath.normpath(posixpath.join(remote_dir, value))
+    base = posixpath.normpath(remote_dir)
+    if posixpath.isabs(target) == posixpath.isabs(base):
+        t_parts = [p for p in target.split("/") if p not in ("", ".")]
+        b_parts = [p for p in base.split("/") if p not in ("", ".")]
+        t_up = t_parts.count("..")  # normpath leaves ".." only at the front
+        b_up = b_parts.count("..")
+        if t_up > b_up or (len(t_parts) <= len(b_parts) and b_parts[: len(t_parts)] == t_parts):
+            raise ValueError(
+                "REMOTEFILE processed_subdir must not be the poll directory or a directory above "
+                "it (value withheld)"
+            )
+    return posixpath.join(remote_dir, value)
+
+
 class RemoteFileSource(SourceConnector):
     """Poll ``remote_dir`` for ``pattern`` files and feed each to the pipeline handler."""
 
@@ -2787,7 +2821,7 @@ class RemoteFileSource(SourceConnector):
             knob="poll_max_files",
             transport="REMOTEFILE source",
         )
-        self._processed_dir = posixpath.join(
+        self._processed_dir = _remote_processed_dir(
             self._remote_dir, s.get("processed_subdir", ".processed")
         )
         self._error_dir = posixpath.join(self._remote_dir, s.get("error_subdir", ".error"))
@@ -3092,15 +3126,17 @@ class RemoteFileSource(SourceConnector):
                     safe_exc(exc, file_name=name),
                 )
                 continue
-            # Content-vs-type magic-byte check (ASVS 5.2.2), mirroring the local File source's
-            # _content_matches_declared dispatch (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
+            # Content-vs-type magic-byte check (ASVS 5.2.2), the local File source's own helper: the raw
+            # bytes, then for a text type on a non-ASCII encoding the head decoded with `encoding`, so a
+            # UTF-16 or UTF-32 drop is not quarantined for its BOM (BACKLOG #5684). The dispatch is
+            # _content_matches_declared's (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
             # json/fhir→{/[, xml→<; binary/text unchecked). The remote dir is a less-trusted source, so a
             # drop whose leading bytes contradict its declared content_type is quarantined before its bytes
             # reach the pipeline. The former None-skips-sniff carve-out was REMOVED (ASVS 5.2.2): the check
             # now ALWAYS runs, converging onto the local source's semantics — the helper's None arm already
             # means hl7v2, so a content_type=None drop is sniffed as HL7 (a binary drop is quarantined to
             # .error, not delivered raw).
-            if not _content_matches_declared(self.content_type, raw):
+            if not _content_matches_encoded(self.content_type, raw, self._encoding):
                 # Like the oversize / scan-reject cases it never became a "received message", so there
                 # is no store disposition; preserve it in .error and log it (never a silent drop).
                 declared = (self.content_type or ContentType.HL7V2).value
@@ -3169,8 +3205,8 @@ class RemoteFileSource(SourceConnector):
             disposed += 1
             if file_key is not None:
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
-                await self._leave_record(file_key)
-                newly_recorded += 1
+                # Only a durable write counts, so a broken ledger does not draw a prune.
+                newly_recorded += await self._leave_record(file_key)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
@@ -3438,12 +3474,34 @@ class RemoteFileSource(SourceConnector):
             return True
         return False
 
-    async def _leave_record(self, file_key: str) -> None:
-        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key) + the bounded cache."""
-        self._seen_add(file_key)
-        if self.processed_ledger is not None:
+    async def _leave_record(self, file_key: str) -> bool:
+        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key), then the bounded
+        cache. Returns whether the durable row was written. The ledger goes first, so a write that
+        is cancelled leaves nothing cached (BACKLOG #5685). A ledger write that fails is logged,
+        without the key or the file name, and the key is still cached, so a cached key does not
+        always have a durable row behind it: the file is then handed over at most once in this
+        process, and the rest of the poll goes on, rather than the file being handed over again on
+        every poll while the ledger stays broken. With no durable row, a restart or a cache eviction
+        hands it over once more, which at-least-once allows. A key the ledger refuses
+        (``FileKeyError``) is handled the same way, so the file is not handed over again on every
+        poll, as it was not when the cache went first."""
+        if self.processed_ledger is None:
+            self._seen_add(file_key)
+            return False
+        try:
             with self._stop_guard.store_call():
                 await self.processed_ledger.mark_processed(file_key)
+        except Exception as exc:  # noqa: BLE001 -- any store fault; the poll must go on
+            logger.warning(
+                "REMOTEFILE %s: processed-ledger write failed (%s); the file is remembered for "
+                "this process only",
+                self._connection or _where(self._host, self._remote_dir),
+                _fault_detail(exc),
+            )
+            self._seen_add(file_key)
+            return False
+        self._seen_add(file_key)
+        return True
 
     async def _after_processing(self, path: str, name: str, read_size: int) -> None:
         if self._after_read == "leave":
