@@ -81,9 +81,11 @@ def h_file(msg):
     return Send("OB", msg)  # noqa: F821
 
 
-# (5) BACKLOG #5380: the source is the first positional parameter of every function, as in the AST
-# lint, so a module-qualified or import-aliased decorator, an async def, an undecorated helper and a
-# public helper in a `_<feed>_transforms.py` module are all scanned.
+# (5) BACKLOG #5380: the source is the first positional parameter of every function, so a
+# module-qualified or import-aliased decorator, an async def, an undecorated helper and a public
+# helper in a `_<feed>_transforms.py` module are all scanned. This differs from the AST lint's
+# phi-to-log in two ways: that lint skips async def, and on a method it keys on `self`, where these
+# rules take the parameter after a self/cls/mcs/klass/metacls/_self receiver.
 @mf.handler("h_qualified")
 def h_qualified(msg):
     body = msg.raw

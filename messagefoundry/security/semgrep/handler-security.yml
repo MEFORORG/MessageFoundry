@@ -206,7 +206,7 @@ rules:
       # payload assembly. `.write()`/`.writelines()` count on a handle this rule saw opened as a file,
       # whatever the mode expression says: chained, assigned or bound by `with`. `builtins.open` and
       # `$P.open` resolve an import alias (`from builtins import open as o`, codecs.open, io.open), and
-      # symbolic propagation (options, below) resolves an opener bound to a name (`o = open`).
+      # symbolic propagation (this rule's options, above) resolves an opener bound to a name (`o = open`).
       - patterns:
           - pattern-either:
               - pattern: $OPEN(...).write(...)
