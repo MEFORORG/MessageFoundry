@@ -2333,7 +2333,8 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
 
 def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
-    Judged whatever its bytes are, and whether or not it can be opened."""
+    Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read; the
+    non-file branch of ``main`` uses them only for an entry it can lstat."""
     if reason := forbidden_path_reason(posix):
         return [f"{posix}:0: {reason}"], True
     hits: list[str] = []
@@ -3080,12 +3081,14 @@ def main(argv: list[str]) -> int:
         if _is_skipped(rel):
             continue
         if not abs_path.is_file():
-            # Not a regular file. In every mode, a stat that fails other than ENOENT fails the run. In
+            # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,
+            # an lstat of the entry itself that fails other than ENOENT fails the run. In
             # staged mode (any path named on the command line, with or without ``--``, outside --path)
             # a directory or a missing name also fails the run. ENOENT is passed over in the --path
             # walk (removed since it was listed) and in the tracked scan (deleted in the work tree).
-            # Anything else that stats, such as a dangling link or a FIFO, is judged by its path and
-            # name only; the walk never lists a link to a directory, so that is not judged.
+            # Anything else whose lstat succeeds, such as a dangling link, a link whose target cannot be
+            # stat'ed, or a FIFO, is judged by its path and name only; the walk never lists a link to
+            # a directory, so that is not judged.
             try:
                 st_mode = abs_path.lstat().st_mode
                 reason = (
