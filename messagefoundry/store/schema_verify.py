@@ -85,9 +85,9 @@ _KEYED_DETAIL = (
 # module" (BACKLOG #6719). THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which
 # tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
 # here. So an expected name held by a virtual table reads as a missing table and is refused rather
-# than skipped. A table is virtual when SQLite's own parse of its SQL says so, read as
-# pragma_table_list's type 'virtual'; neither the spelling of the stored text nor the rootpage
-# decides it. So a planted ordinary-table row with a rootpage of 0 is still read, and reads as the
+# than skipped. A table is skipped as virtual when pragma_table_list, which reports SQLite's own
+# parse of its SQL, gives type 'virtual' for the same name, compared exactly; the rootpage does not
+# decide it. So a planted ordinary-table row with a rootpage of 0 is still read, and reads as the
 # corrupt object it is (pragma_table_list needs SQLite 3.37 or later).
 _ORDINARY_TABLE = (
     "m.type = 'table' AND NOT EXISTS (SELECT 1 FROM pragma_table_list AS tl"
