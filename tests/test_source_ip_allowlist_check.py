@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.wiring import MLLP, File, WiringError, build_inbound_connection
+from messagefoundry.config.wiring import MLLP, File, WiringError, build_inbound_connection, env
 
 
 def _inbound(transport: Any, allowlist: Any) -> Any:
@@ -26,10 +26,15 @@ def test_generator_allowlist_entries_are_still_validated() -> None:
         _inbound(MLLP(port=2575), (entry for entry in ["127.0.0.1", "999.1.1.1"]))
 
 
-@pytest.mark.parametrize("value", ["127.0.0.1", b"127.0.0.1", 5])
-def test_single_value_allowlist_refused(value: object) -> None:
-    with pytest.raises(WiringError, match="not a single value"):
+@pytest.mark.parametrize("value", ["127.0.0.1", b"127.0.0.1", 5, {"10.0.0.1": "lab"}])
+def test_a_value_that_is_not_a_list_is_refused(value: object) -> None:
+    with pytest.raises(WiringError, match="must be a list of IP addresses"):
         _inbound(MLLP(port=2575), value)
+
+
+def test_an_env_allowlist_is_refused_by_name() -> None:
+    with pytest.raises(WiringError, match="does not take an env"):
+        _inbound(MLLP(port=2575), env("ips"))
 
 
 @pytest.mark.parametrize("value", [[], ()])

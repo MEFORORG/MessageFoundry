@@ -660,7 +660,7 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
                 f"{type(default).__name__} (value withheld). The default is sent as the headers "
                 "wherever the key is unset, so give it a table of header name to value, or none."
             )
-        _reject_envref_headers(factory, default)
+        _reject_envref_headers(f"{factory} (the env() default= of its headers)", default)
         return
     if not isinstance(headers, Mapping):
         raise WiringError(
@@ -881,6 +881,25 @@ def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool
     return settings_hop_attestation(settings, where)
 
 
+#: The connection types whose ``tls`` off builds no TLS context in either direction, so a
+#: ``tls_ca_file`` beside it is never read, by the factory name a refusal gives.
+_UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
+    {ConnectorType.MLLP: "MLLP", ConnectorType.HTTP: "Http", ConnectorType.DIMSE: "DICOM"}
+)
+
+
+def _unread_ca_on_tls_off(factory: str, tls: object, tls_ca_file: object) -> str | None:
+    """The unread reason for a factory's literal ``tls``, after refusing a non-bool one beside a CA,
+    since the reason reads it by truthiness. An ``env()`` ``tls`` is truthy here, and
+    :func:`refuse_resolved_verify_off` reads it once resolved."""
+    if tls_ca_file is None:
+        return None
+    _refuse_bool_literals({"tls": tls}, factory)
+    from messagefoundry.auth.trust_anchors import unread_ca_reason
+
+    return unread_ca_reason({"tls": tls})
+
+
 def refuse_resolved_verify_off(
     type_: ConnectorType, settings: Mapping[str, Any], where: str
 ) -> None:
@@ -892,9 +911,19 @@ def refuse_resolved_verify_off(
     the same test runs here, on the value the connector will read. SOAP needs no copy: its
     connector refuses a client cert with verification off when it is built.
 
-    ``Ftp()`` is the other factory with such a refusal: a CA beside a literal ``tls=False``. An
-    ``env()`` ``tls`` resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp``
-    with a CA is refused here, in either direction, with or without a pin."""
+    ``Ftp()`` has such a refusal too: a CA beside a literal ``tls=False``. An ``env()`` ``tls``
+    resolves into ``protocol`` (vault BACKLOG #3234), so a resolved plain ``ftp`` with a CA is
+    refused here, in either direction, with or without a pin. So do ``MLLP()``, ``Http()`` and
+    ``DICOM()`` (BACKLOG #5329, #5331): with ``tls`` off they build no TLS context, so a CA beside
+    a ``tls`` that resolved off is refused here."""
+    label = _UNREAD_CA_ON_TLS_OFF.get(type_)
+    if label is not None:
+        if settings.get("tls_ca_file") and not bool_setting(settings, "tls", default=False):
+            raise WiringError(
+                f"{where}: {label} tls_ca_file would never be read: tls resolved off, which "
+                "builds no TLS context."
+            )
+        return
     if type_ is ConnectorType.REMOTEFILE:
         if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
             raise WiringError(
@@ -2864,13 +2893,15 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
-    _check_tls_ca_file("MLLP", tls_ca_file)  # BACKLOG #5329
-    _check_tls_ca_pin("MLLP", tls_ca_pin, tls_ca_file)
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
         # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
         _refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
+    _check_tls_ca_file(  # BACKLOG #5329
+        "MLLP", tls_ca_file, unread=_unread_ca_on_tls_off("MLLP", tls, tls_ca_file)
+    )
+    _check_tls_ca_pin("MLLP", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -3347,7 +3378,9 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
-    _check_tls_ca_file("Http", tls_ca_file)  # BACKLOG #5329
+    _check_tls_ca_file(  # BACKLOG #5329
+        "Http", tls_ca_file, unread=_unread_ca_on_tls_off("Http", tls, tls_ca_file)
+    )
     _check_tls_ca_pin("Http", tls_ca_pin, tls_ca_file)
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
@@ -4554,16 +4587,8 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
-    # BACKLOG #5331.
-    if tls_ca_file is not None:
-        # The unread reason below reads tls by truthiness, so 0 would be refused as TLS off. Only
-        # here: elsewhere inbound()/outbound() refuse it, naming the connection.
-        _refuse_bool_literals({"tls": tls}, "DICOM")
-    _check_tls_ca_file(
-        "DICOM",
-        tls_ca_file,
-        # An env() tls is truthy here; resolved, the build reads it.
-        unread=None if tls else "tls=False builds no TLS context for the SCP or the SCU",
+    _check_tls_ca_file(  # BACKLOG #5331
+        "DICOM", tls_ca_file, unread=_unread_ca_on_tls_off("DICOM", tls, tls_ca_file)
     )
     _check_tls_ca_pin("DICOM", tls_ca_pin, tls_ca_file)
     settings: dict[str, Any] = {
@@ -6448,9 +6473,9 @@ class Registry:
     # not the startup dir (vault BACKLOG #3094). Carried with the graph, so it swaps atomically.
     source_dir: Path | None = None
     # A digest of the config modules' bytes as this load read them
-    # (:func:`config_code_digest`), or
-    # None for a graph built in code or a module that could not be read. The engine refuses a
-    # sandbox worker whose digest differs (vault BACKLOG #2724).
+    # (:func:`config_code_digest`), or None for a graph built in code: a load refuses when it has
+    # no digest (BACKLOG #5334). The engine refuses a sandbox worker whose digest differs (vault
+    # BACKLOG #2724).
     code_digest: str | None = None
     # The one read of the directory this graph was loaded from, whose bytes it ran (vault BACKLOG
     # #2596), or None for a graph built in code. Its fingerprint is the reload's audit digest, and a
@@ -8315,26 +8340,32 @@ def _check_metadata(name: str, metadata: Mapping[str, Any] | None) -> None:
 
 
 def _check_source_ip_allowlist(
-    name: str, listens: bool, allowlist: list[str] | None
+    name: str, listens: bool, allowlist: Iterable[str] | None
 ) -> tuple[str, ...] | None:
     """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
-    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE **listen**
-    source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention).
+    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE/HTTP
+    **listen** source, which ``None`` or an empty one leaves unrestricted (the ``[egress]``
+    allowlist convention). Any allowlist on another source is refused, an empty one included.
 
     It is read once, so a generator is not consumed by validation and frozen empty, which a
     listener would read as no restriction (BACKLOG #5333)."""
     if allowlist is None:
         return None
-    if isinstance(allowlist, (str, bytes)) or not isinstance(allowlist, Iterable):
+    if isinstance(allowlist, EnvRef):
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist does not take an env() reference; "
+            "write the list of IP addresses or CIDR networks"
+        )
+    if isinstance(allowlist, (str, bytes, Mapping)) or not isinstance(allowlist, Iterable):
         raise WiringError(
             f"inbound connection {name!r}: source_ip_allowlist must be a list of IP addresses or "
-            "CIDR networks, not a single value"
+            f"CIDR networks, not {type(allowlist).__name__}"
         )
     entries = tuple(allowlist)
     if not listens:
         raise WiringError(
             f"inbound connection {name!r}: source_ip_allowlist is only valid for an "
-            "MLLP/TCP/X12/DIMSE listen source"
+            "MLLP/TCP/X12/DIMSE/HTTP listen source"
         )
     if not entries:
         return None
@@ -8401,7 +8432,7 @@ def build_inbound_connection(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: list[str] | None = None,
+    source_ip_allowlist: Iterable[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
@@ -8682,7 +8713,7 @@ def inbound(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: list[str] | None = None,
+    source_ip_allowlist: Iterable[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
@@ -9198,7 +9229,8 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     The loader records it on the graph, and a sandbox worker's load records its own; the engine
     refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
     graph's names, which are compared anyway, and the worker serves the code sets the engine hands
-    it. None when a module cannot be read, which is logged.
+    it. None when a module cannot be read, which is logged; a load refuses before it gets here
+    (:func:`_require_loadable`), and :func:`load_snapshot` refuses a None digest too.
 
     Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
     would give every importer of the loader its comparison and hash operations in the crypto
@@ -9214,8 +9246,7 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     if unread:
         # A module it could not read is not described by the rest.
         _logger.warning(
-            "config module digest unavailable for %s, so a sandbox worker's config code is not "
-            "compared with this load's: could not read %s",
+            "config module digest unavailable for %s: could not read %s",
             scrub_log_argument(str(snapshot.directory)),
             scrub_log_argument(", ".join(unread)),
         )
@@ -9911,7 +9942,7 @@ def load_snapshot(
         # The sandbox compares a worker's digest only when the engine has one (BACKLOG #5334).
         raise WiringError(
             f"{_CONFIG_SOURCE_LEAD} {directory}: the config modules' digest could not be "
-            "computed; see the engine log"
+            "computed, so a sandbox worker's config code could not be compared with it"
         )
     registry = Registry(
         source_dir=source_dir if source_dir is not None else directory,

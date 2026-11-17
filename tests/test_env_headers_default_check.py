@@ -63,9 +63,12 @@ def test_a_none_default_or_no_default_still_builds(factory: str, with_none: bool
     assert HEADERS_FACTORIES[factory](ref).settings["headers"] == ref
 
 
-def test_a_table_default_with_a_reference_name_is_refused() -> None:
-    """The default is checked as a literal table is, so a reference in the key position is refused
-    here as well as by :class:`~messagefoundry.config.wiring.EnvRef` when it is made."""
-    inner = messagefoundry.env("hdr_name")
-    with pytest.raises(WiringError):
-        HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers", default={inner: "v"}))
+def test_a_reference_deeper_than_envrefs_own_scan_is_refused_in_the_default() -> None:
+    """The default is checked as a literal table is. EnvRef's own scan of a default stops one
+    level sooner, so a reference six lists under a header value is seen only here."""
+    deep: Any = messagefoundry.env("x")
+    for _ in range(6):
+        deep = [deep]
+    ref = messagefoundry.env("all_headers", default={"X-A": deep})  # the control: EnvRef passes it
+    with pytest.raises(WiringError, match=r"default= of its headers\) headers may not use env"):
+        HEADERS_FACTORIES["Rest"](ref)
