@@ -694,14 +694,15 @@ def _resolved_headers_problem(value: object) -> str | None:
     The text names only the kind of problem. It does not reuse :func:`_reject_envref_headers`'
     message, because that one lists the offending header names and env keys, and here every one of
     them comes from the environment value, which :func:`resolve_env_settings` never shows any part
-    of (BACKLOG #1183). The scan is the same one, :func:`_contains_envref` over both axes."""
+    of (BACKLOG #1183). The scan is the same one, entry by entry over both axes, so a table whose
+    header names happen to be ``env`` is not read as a marker, and each value is scanned to the
+    same depth."""
     if not isinstance(value, dict):
         return f"value is not a table but {type(value).__name__} (value withheld)"
-    if _contains_envref(value):
+    if any(_is_nested_envref(name) or _contains_envref(item) for name, item in value.items()):
         return (
             "the table holds an env() reference, which is never resolved inside a table and would "
-            "reach the partner as its repr; headers may not use env() there (names and value "
-            "withheld)"
+            "reach the partner as its repr (names and value withheld)"
         )
     return None
 
@@ -1843,6 +1844,7 @@ def resolve_env_settings(
     blank: list[str] = []
     bool_defaults = _bool_settings().defaults
     bad_defaults: list[str] = []
+    owner = f" of connection {connection!r}" if connection else ""
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1906,7 +1908,6 @@ def resolve_env_settings(
                 # A default is written in the config, so it is reported apart from the
                 # environment values, whose advice would send the author to the wrong place.
                 if source == "default":
-                    owner = f" of connection {connection!r}" if connection else ""
                     bad_defaults.append(problem.replace(" (env ", f"{owner} (env ", 1))
                 else:
                     bad.append(problem)
@@ -1921,12 +1922,10 @@ def resolve_env_settings(
                 and got is not None
                 and (problem_text := _resolved_headers_problem(got))
             ):
-                owner = f" of connection {connection!r}" if connection else ""
                 bad.append(f"setting {name!r}{owner} (env {value.key!r}): {problem_text}")
                 continue
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
-                owner = f" of connection {connection!r}" if connection else ""
                 blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the

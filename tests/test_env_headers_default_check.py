@@ -91,7 +91,7 @@ def test_an_environment_value_that_is_not_a_table_is_refused_once_resolved(value
 def test_an_environment_table_holding_a_reference_is_refused_once_resolved() -> None:
     spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
     table = {"X-Partner-Key": {"env": "partner_key", "default": SENTINEL}}
-    with pytest.raises(WiringError, match="may not use env") as excinfo:
+    with pytest.raises(WiringError, match=r"holds an env\(\) reference") as excinfo:
         resolve_env_settings(spec.settings, {"all_headers": table})
     assert SENTINEL not in str(excinfo.value)
 
@@ -131,3 +131,21 @@ def test_a_refused_environment_table_names_nothing_taken_from_the_environment(
     assert "partner_key" not in text
     assert "'headers'" in text
     assert "OB_ACME_REST" in text
+
+
+def test_an_environment_table_is_scanned_as_a_literal_table_is() -> None:
+    """The resolved value is scanned entry by entry, as a literal table is: a header named ``env``
+    is a header, not a marker, and a reference as deep as the literal rule sees is refused."""
+    spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
+    named_env = {"env": "prod", "default": "x"}
+    HEADERS_FACTORIES["Rest"](named_env)  # the control: the literal rule accepts it
+    assert resolve_env_settings(spec.settings, {"all_headers": named_env})["headers"] == named_env
+
+    deep: Any = {"env": "partner_key", "default": SENTINEL}
+    for _ in range(6):
+        deep = [deep]
+    with pytest.raises(WiringError, match="may not use env"):
+        HEADERS_FACTORIES["Rest"]({"X-A": deep})  # the control: the literal rule refuses it
+    with pytest.raises(WiringError, match=r"holds an env\(\) reference") as excinfo:
+        resolve_env_settings(spec.settings, {"all_headers": {"X-A": deep}})
+    assert SENTINEL not in str(excinfo.value)
