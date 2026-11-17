@@ -610,8 +610,10 @@ def verify_registration(
     _require_webauthn()
     from webauthn import verify_registration_response
 
-    # Resolved before the ``try`` so the AttributeError catch below covers the library call only,
-    # where it is attacker input, and never our own code, where it would be a bug.
+    # Resolved before the ``try`` so the AttributeError catch below covers the library call alone
+    # and not our code before it. Inside the call it would also catch a bad argument of ours
+    # reaching the library (a non-str ``rp_id`` or ``origin``); the arguments are typed ``str``,
+    # and :func:`_refusal` logs the type at WARNING, so such a bug is not silent.
     supported_algs = _supported_pub_key_algs()
     refused: tuple[type[Exception], ...] = (*_invalid_response_errors(), AttributeError)
     try:
@@ -626,7 +628,11 @@ def verify_registration(
         # The BASE class, deliberately (PR-A review HIGH): structurally-malformed browser input
         # raises siblings of InvalidRegistrationResponse (InvalidJSONStructure, InvalidCBORData,
         # ...) — every library-side rejection must land on the audited return-False/400 path,
-        # never an unhandled 500. The raw decode errors join it for the same reason (BACKLOG
+        # never an unhandled 500. That is the aim, not a proof: a raw type outside this tuple
+        # still escapes. cryptography's UnsupportedAlgorithm derives from Exception alone, so it is
+        # not caught here; code review reported it raised by an attestation certificate whose key
+        # algorithm cryptography does not know, which this branch did not reproduce. The raw
+        # decode errors join it for the same reason (BACKLOG
         # #1166): a malformed COSE key raised them straight out of this call. AttributeError
         # joins only here (vault BACKLOG #5341): webauthn 3.0.1's android-safetynet check calls
         # ``.decode`` on the attestation statement's ``response`` and ``.get`` on the decoded

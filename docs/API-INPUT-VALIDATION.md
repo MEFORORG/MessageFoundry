@@ -28,8 +28,8 @@ sections with the code, so read the named code when a number matters.
 A value that breaks one of these rules gets an HTTP 422 with the field named, except a malformed HL7
 field path, which gets a 400: its rule is enforced outside the API models, as the note on the field
 path below says. The web console's sign-in form is another exception, described under the table.
-The engine refuses such a value
-before it reaches a database query, a filesystem path, a log line or a CSV export.
+Whatever the status, the value that breaks a rule is refused before it reaches a database query, a
+filesystem path, a log line or a CSV export.
 
 ---
 

@@ -1884,13 +1884,15 @@ def _safetynet_jws(header: bytes, payload: bytes) -> bytes:
         pytest.param({"ver": "1", "response": _safetynet_jws(b"null", b"{}")}, id="header-null"),
         pytest.param({"ver": "1", "response": _safetynet_jws(b"[]", b"{}")}, id="header-list"),
         pytest.param({"ver": "1", "response": _safetynet_jws(b"{}", b"null")}, id="payload-null"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"1", b"{}")}, id="header-number"),
     ],
 )
 def test_a_malformed_safetynet_statement_is_the_audited_refusal(
     att_stmt: dict[str, object], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """vault BACKLOG #5341. Red: webauthn 3.0.1's android-safetynet check raised AttributeError on
-    these attacker-shaped statements, and it escaped verify_registration as itself."""
+    """vault BACKLOG #5341, at this module's seam only: the refusal the service audits. Red:
+    webauthn 3.0.1's android-safetynet check raised AttributeError on these attacker-shaped
+    statements, and it escaped verify_registration as itself."""
     from webauthn.helpers import encode_cbor, parse_cbor
 
     challenge = b"c" * 32
