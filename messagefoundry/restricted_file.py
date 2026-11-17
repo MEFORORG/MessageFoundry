@@ -701,6 +701,9 @@ def _windows_judged_problem(
     return None
 
 
+#: What a folder judged because a ``subst`` drive is on the path is, for the refusal text.
+_SUBST_FOLDER_SUBJECT = "a folder above the one holding it, where a subst drive on its path leads,"
+
 #: The suffix Windows uses to spell an IPv6 address as a UNC server name.
 _IPV6_LITERAL_SUFFIX = ".ipv6-literal.net"
 
@@ -872,7 +875,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
                 _folders_above(holder_path, set()), host.read_security, trust
             )
             if problem is not None:
-                return problem
+                # The finding text speaks of a junction or link; this folder is above a subst drive.
+                return problem.replace(_LINK_FINDING_SUBJECT[DIRECTORY], _SUBST_FOLDER_SUBJECT, 1)
         if cause is not None and _is_reparse_point(holder_path):
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
             # folder it points at, which this check does not read through a share.

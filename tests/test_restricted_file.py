@@ -1694,7 +1694,8 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
     assert surroundings(Path("Q:\\"), host) is None
     _icacls(top, "/grant", f"*{_USERS}:(DC)")  # Users may rename mid away, from above the holder
     problem = str(surroundings(Path("Q:\\store.key"), host))
-    assert "a folder holding or above a junction or link on its path can be changed" in problem
+    assert "where a subst drive on its path leads, can be changed" in problem
+    assert "junction" not in problem  # there is none on this path
     assert str(tmp_path) not in problem
     _icacls(top, "/remove:g", f"*{_USERS}")
     _icacls(mid, "/grant", f"*{_USERS}:(DC)")  # Users may delete the drive root's own folder
