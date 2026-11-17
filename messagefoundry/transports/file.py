@@ -1316,13 +1316,14 @@ class FileSource(SourceConnector):
         elif reached < len(candidates) and self._stuck:
             # A remembered reject past the ceiling's break is due too, or under a sustained backlog
             # the retry pass would never reach it. Read from the memory, which is bounded and
-            # usually small, rather than from the listing past the break.
+            # usually small, rather than from the listing past the break: an entry this scan's
+            # listing held has a miss count of 0 after pruning.
             now = time.monotonic()
-            unreached = {str(p) for p in candidates} - {str(p) for p in candidates[:reached]}
+            examined = {str(p) for p in candidates[:reached]}
             due.extend(
                 (seen.due, Path(key))
-                for key, (seen, _missed) in self._stuck.items()
-                if seen.due <= now and key in unreached
+                for key, (seen, missed) in self._stuck.items()
+                if seen.due <= now and not missed and key not in examined
             )
         # Earliest due first, so a retried reject cannot keep the slots from those behind it.
         for _due, path in heapq.nsmallest(self._retry_allowance(disposed), due, key=itemgetter(0)):
@@ -1570,28 +1571,36 @@ class FileSource(SourceConnector):
         scan compares it with, so a file that changed or was replaced since is examined again. Only
         ``move`` and ``delete`` remember. ``leave`` keeps examining such a file as it always has:
         there a read-only share is expected, and nothing here changes it."""
-        done = await self._run_fs(self._archive_to, path, self.error_dir, read_id)
+        done = await self._run_fs(self._archive_to, path, self.error_dir, read_id, track=True)
         if done.archived:
             await self._emit_event(kind, reason=reason)
+        key = str(path)
         if self.after_read == "leave":
             return
         if not done.stays:
-            self._stuck.pop(str(path), None)  # gone, or another file in its place: forget it
+            self._stuck.pop(key, None)  # gone, or another file in its place: forget it
             return
-        if self._remember_stuck(str(path), mark, lasting=done.lasting):
-            logger.warning(
+        # A copy already in .error waits as a lasting failure would, so a transient failure to
+        # remove the original does not write another copy and event on every scan.
+        lasting = done.lasting or done.archived
+        first = key not in self._stuck
+        if self._remember_stuck(key, mark, lasting=lasting):
+            # WARNING when first remembered, DEBUG on each retry after, so a file that stays stuck
+            # does not write a WARNING per scan.
+            logger.log(
+                logging.WARNING if first else logging.DEBUG,
                 "file source %s: rejected file %s stays in place; it is tried again %s",
                 self.directory,
                 safe_name(path.name),
                 f"once it changes or {STUCK_RETRY_SECONDS:.0f} seconds pass"
-                if done.lasting
+                if lasting
                 else "on the next scan, after the other files",
             )
 
     def _remember_stuck(self, key: str, mark: _FileMark, *, lasting: bool) -> bool:
         """Remember the reject at ``key`` as stuck, due its retry after ``STUCK_RETRY_SECONDS`` when
         ``lasting``, else on the next scan (BACKLOG #5717). False, logged, when the memory is full."""
-        if len(self._stuck) >= SETTLE_SEEN_MAX:  # an examined file's own entry is already gone
+        if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
                 self._stuck_full_logged = True
                 logger.warning(
@@ -2179,14 +2188,26 @@ class FileSource(SourceConnector):
         return self._archive_to(path, dest_dir, read_id, stamp=stamp).archived
 
     def _archive_to(
-        self, path: Path, dest_dir: Path, read_id: _FileId | None = None, *, stamp: bool = False
+        self,
+        path: Path,
+        dest_dir: Path,
+        read_id: _FileId | None = None,
+        *,
+        stamp: bool = False,
+        track: bool = False,
     ) -> _Archived:
         """:meth:`_move`, saying also whether the original stays at ``path`` and whether
         :func:`_lasting` judges the reason will not clear by itself, which is what a quarantine
-        remembers a stuck reject by (BACKLOG #5717). Each failure is logged here."""
+        remembers a stuck reject by (BACKLOG #5717). Each failure is logged here. Without ``track``
+        a transient failure is not checked further and reads as the file gone, which saves a stat
+        for a caller that reads only ``archived``."""
+
+        def stays(lasting: bool) -> bool:
+            return lasting or (track and _holds(path, read_id))
+
         pin, lasting = self._try_pin(path, read_id)
         if pin is None:
-            return _Archived(False, lasting or _holds(path, read_id), lasting)
+            return _Archived(False, stays(lasting), lasting)
         with pin:
             if stamp:
                 self._stamp_archive_time(pin, path)
@@ -2206,7 +2227,7 @@ class FileSource(SourceConnector):
                     _describe_os_error(exc, file_name=path.name),
                 )
                 lasting = _lasting(exc, stage="archive" if opened else "archive_dir")
-                return _Archived(False, lasting or _holds(path, read_id), lasting)
+                return _Archived(False, stays(lasting), lasting)
             if not gone:
                 try:
                     _remove_pinned(pin)
@@ -2219,7 +2240,7 @@ class FileSource(SourceConnector):
                         safe_exc(exc, file_name=path.name),
                     )
                     lasting = _lasting(exc)
-                    return _Archived(True, lasting or _holds(path, read_id), lasting)
+                    return _Archived(True, stays(lasting), lasting)
         return _Archived(archived=True, stays=False, lasting=False)
 
     def _stamp_archive_time(self, pin: _Pin, path: Path) -> None:

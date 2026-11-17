@@ -403,8 +403,23 @@ def _local_values(scope: ast.AST, name: str) -> list[ast.expr] | None:
     augmented assignment, a walrus, a ``with`` target, or a tuple unpacking with a starred part).
     Plain tuple unpacking is read position by position. An import binds no ``Name`` node and is not
     seen."""
-    if any(isinstance(node, ast.arg) and node.arg == name for node in ast.walk(scope)):
-        return None  # a parameter of the scope or of a def or lambda nested in it
+    for node in ast.walk(scope):
+        if (
+            (isinstance(node, ast.arg) and node.arg == name)
+            or (
+                isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar)
+                and node.name == name
+            )
+            or (
+                isinstance(node, ast.Import | ast.ImportFrom)
+                and node is not scope
+                and any((alias.asname or alias.name) == name for alias in node.names)
+                and not isinstance(scope, ast.Module)
+            )
+        ):
+            # A parameter (of the scope or of a def or lambda in it), an ``except ... as``, a
+            # ``match`` capture or a local import: bindings with no Name node to read.
+            return None
     values: list[ast.expr] = []
     read: set[int] = set()
     for node in ast.walk(scope):
@@ -512,6 +527,13 @@ def _raw_insert_event(call: ast.Call, sql: str) -> ast.expr | None:
     ):
         return None
     slot = columns.index("event")
+    placeholders = [v.strip() for v in values.group(1).split(",")]
+    numbered = [int(p[1:]) - 1 for p in placeholders if p.startswith("$")]
+    if numbered:
+        # asyncpg numbers its parameters, so ``$n`` names the argument, not the column position.
+        if len(numbered) != len(placeholders):
+            return None
+        slot = numbered[columns.index("event")]
     rest = call.args[1:]
     if len(rest) == 1 and isinstance(rest[0], ast.Tuple | ast.List):
         params: list[ast.expr] = list(rest[0].elts)
@@ -585,10 +607,21 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _EVENT_HELPERS:
             assert node.name not in helpers, f"two {node.name} definitions; name the one meant"
             helpers[node.name] = node
+    methods = {
+        id(node)
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    receivers: dict[str, bool] = {}
     for helper in helpers.values():
         assert "event" in {a.arg for a in (*helper.args.posonlyargs, *helper.args.args)}, (
             f"{helper.name} has no `event` parameter; re-aim this guard"
         )
+        bound = _binds_receiver(helper, methods)
+        assert bound is not None, f"{helper.name} is decorated in a way this scan cannot place"
+        receivers[helper.name] = bound
     prose = {
         id(stmt.value)
         for stmt in ast.walk(tree)
@@ -629,7 +662,7 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
                 f"a call to {name}, which this source does not define; re-aim the scan"
             )
             try:
-                value = argument_for(node, helpers[name], "event", receiver=True)
+                value = argument_for(node, helpers[name], "event", receiver=receivers[name])
             except ArgumentUnplaced:
                 unplaced.append(ast.unparse(node))
                 continue
@@ -948,6 +981,16 @@ def _forwarded_kinds(tree: ast.Module) -> tuple[set[str], list[int], set[str]]:
         assert not rebound, f"{func.name} rebinds its kind `{param}` at lines {rebound}"
         assert func.name not in forwarders, f"two forwarders named {func.name}; name the one meant"
         forwarders[func.name] = (func, param)
+    namesakes = sorted(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name in forwarders
+        and node is not forwarders[node.name][0]
+    )
+    # A call is matched to its forwarder by name, so another def of that name would be read through
+    # the forwarder's signature.
+    assert not namesakes, f"defs sharing a forwarder's name: {namesakes}; name the one meant"
     kinds: set[str] = set()
     unread: list[int] = []
     called: set[int] = set()
@@ -1804,3 +1847,54 @@ def test_the_sink_probe_reads_a_basic_config_mention_as_no_sink() -> None:
     assert "logging.basicConfig" in planted
     assert not _is_log_sink(planted)
     assert not source_calls(planted, "basicConfig")
+
+
+def test_the_emit_site_scan_places_numbered_parameters_and_unbound_helpers() -> None:
+    """asyncpg's ``$n`` names its argument, so the column position does not; a helper outside a
+    class, or a staticmethod, binds no receiver; and a binding with no Name node is unreadable."""
+    numbered = (
+        "def f(c):\n"
+        "    c.execute('INSERT INTO message_events (message_id, ts, event) VALUES ($1, $3, $2)',"
+        " 'mid', 'numbered_kind', 0.0)\n"
+    )
+    assert _event_kinds(numbered) == ({"numbered_kind"}, [])
+    unbound = (
+        "def _event_sync(cur, message_id, event): ...\n"
+        "class S:\n"
+        "    @staticmethod\n"
+        "    def _event(message_id, event): ...\n"
+        "    def run(self, cur):\n"
+        "        _event_sync(cur, 'mid', 'module_helper_kind')\n"
+        "        self._event('mid', 'static_kind')\n"
+    )
+    assert _event_kinds(unbound) == ({"module_helper_kind", "static_kind"}, [])
+    hidden = (
+        "VIEWED = 'module_kind'\n"
+        "def _event(message_id, event): ...\n"
+        "def f(flag):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except Exception as VIEWED:\n"
+        "        pass\n"
+        "    _event('mid', VIEWED)\n"
+        "def g(flag):\n"
+        "    from elsewhere import VIEWED\n"
+        "    _event('mid', VIEWED)\n"
+        "def h(flag):\n"
+        "    match flag:\n"
+        "        case 'x' as VIEWED:\n"
+        "            _event('mid', VIEWED)\n"
+    )
+    assert _event_kinds(hidden) == (set(), ["f", "g", "h"])
+
+
+def test_forwarder_walk_refuses_a_namesake_of_a_forwarder() -> None:
+    namesake = ast.parse(
+        "class S:\n"
+        "    async def _quarantine(self, kind):\n"
+        "        await self._emit_event(kind)\n"
+        "class Other:\n"
+        "    async def _quarantine(self, path, reason, kind): ...\n"
+    )
+    with pytest.raises(AssertionError, match="sharing a forwarder's name"):
+        _forwarded_kinds(namesake)

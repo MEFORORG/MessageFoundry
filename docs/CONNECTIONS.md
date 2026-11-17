@@ -5005,7 +5005,8 @@ size, modification time or file identity changes, or its retry falls due. A retr
 pass after the scan's other files, a bounded number per scan that the ceiling's log line does not
 count, so a scan can read that many files beyond the ceiling. A retry reads and judges the file
 afresh, so one that now passes is ingested. When the move failed for a reason that looks lasting,
-such as access denied, the retry falls due after `STUCK_RETRY_SECONDS`; otherwise on the next scan.
+such as access denied, or a copy already sits in the error directory, the retry falls due after
+`STUCK_RETRY_SECONDS`; otherwise on the next scan.
 A file copied into the error directory whose original could not be removed is retried the same way,
 so each retry may write another copy and record another event. At least a restart of the connection
 and a full memory leave a file charged again; the full memory is logged when it fills, and again

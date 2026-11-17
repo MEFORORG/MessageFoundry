@@ -201,7 +201,7 @@ async def test_a_quarantine_whose_move_failed_records_nothing(
     source._handler = handler
     moves: list[Path] = []
 
-    def failed_move(path: Path, _dest: Path, *_rest: object) -> file_mod._Archived:
+    def failed_move(path: Path, _dest: Path, *_rest: object, **_kw: object) -> file_mod._Archived:
         moves.append(path)
         # Nothing archived; the file stays for a lasting reason, so it is remembered (#5717).
         return file_mod._Archived(archived=False, stays=True, lasting=True)

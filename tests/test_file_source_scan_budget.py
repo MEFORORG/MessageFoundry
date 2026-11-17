@@ -16,6 +16,7 @@ Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Win
 from __future__ import annotations
 
 import errno
+import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -617,7 +618,8 @@ async def test_a_retry_left_in_place_stays_remembered_and_due(
     """A retry whose read fails transiently is not forgotten: it stays due, so the next scan tries
     it again in the retry pass rather than reading and charging it in the fresh pass.
 
-    Mutation: drop the re-remember after a FREE retry in ``_scan_once``. Red: it is forgotten."""
+    Mutation: delete the entry in ``_examine``'s retry branch instead of making it due. Red: it is
+    forgotten."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     rig.drop("a.hl7", _PDF)
     await rig.scan()
@@ -743,3 +745,56 @@ async def test_a_due_reject_replaced_before_its_retry_is_forgotten(
     assert rig.source._stuck == {}
     assert await rig.scan() == ["a.hl7"]
     assert rig.handed_off == [_HL7]
+
+
+async def test_a_full_memory_still_reschedules_a_retried_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A retried reject already holds its slot, so a full memory does not stop it being remembered
+    again, due after ``STUCK_RETRY_SECONDS``, and the full memory is not logged for it.
+
+    Mutation: refuse every remember once the memory is full. Red: read again on the next scan."""
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 2)  # bounds the settle map too
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a0.hl7", _PDF)
+    rig.drop("a1.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 2
+    _age_stuck(rig)
+    assert await rig.scan() == ["a0.hl7", "a1.hl7"]
+    assert await rig.scan() == [], "remembered again, not due"
+    assert not any("is full" in r.message for r in caplog.records)
+
+
+async def test_a_copy_left_in_error_waits_like_a_lasting_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A copy archived whose original could not be removed for a transient reason is not retried on
+    the next scan, which would write another copy and event each time; and the "stays in place"
+    WARNING is written once, not per retry.
+
+    Mutation: remember it as transient. Red: a second copy on the next scan."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
+    archives: list[str] = []
+
+    def archive(_pin: Any, _dest: Any, name: str) -> bool:
+        archives.append(name)
+        return False  # linked or copied: the caller removes the original
+
+    def remove(_pin: Any) -> None:
+        raise OSError(errno.EBUSY, "busy")
+
+    monkeypatch.setattr(file_mod, "_archive", archive)
+    monkeypatch.setattr(file_mod, "_remove_pinned", remove)
+    rig.drop("a.hl7", _PDF)
+    for _ in range(4):
+        await rig.scan()
+    assert archives == ["a.hl7"]
+    _age_stuck(rig)
+    await rig.scan()
+    await rig.scan()
+    assert archives == ["a.hl7", "a.hl7"]
+    stays = [r for r in caplog.records if "stays in place" in r.message]
+    assert stays, "the line was logged at all"
+    assert sum(r.levelno >= logging.WARNING for r in stays) == 1
