@@ -200,7 +200,7 @@ def build_idp_opener_from_settings(
     ``anchor=False`` leaves the anchor and its pin out, for the federation check's revocation row
     alone. The CRL file is the hop's own knob (BACKLOG #299) and is passed either way.
 
-    The check legs in ``messagefoundry/checks.py`` load their settings through one shared
+    At least ten check legs in ``messagefoundry/checks.py`` load their settings through one shared
     ``_leg_settings`` helper (vault BACKLOG #3145). That loading is not done here: this function
     takes settings already loaded."""
     return build_idp_opener(

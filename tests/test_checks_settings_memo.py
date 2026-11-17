@@ -60,6 +60,32 @@ def test_a_run_reads_refused_settings_once_and_every_leg_fails_alike(
     assert calls["source"] == 2
 
 
+def test_a_run_loads_good_settings_once_and_hands_each_leg_its_own_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: an environment-declared instance's settings load more than once in a run, or two
+    legs get the same model object, so one leg's change to it would reach the next. Control: legs
+    graded those settings, so the single load was used."""
+    calls = _count_reads(monkeypatch)
+    handed: list[object] = []
+    real = checks._load_check_settings
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        settings = real(*args, **kwargs)
+        handed.append(settings)
+        return settings
+
+    monkeypatch.setattr(checks, "_load_check_settings", spy)
+    report = run_checks(
+        SAMPLES_CONFIG, run_lint=False, env="dev", suppress_service_toml_search=True
+    )
+    graded = [r for r in report.results if "settings from environment only" in r.detail]
+    assert graded, [r.name for r in report.results]
+    assert calls["load"] == 1
+    assert len(handed) > 1
+    assert len({id(s) for s in handed}) == len(handed)
+
+
 def test_a_leg_called_outside_a_run_reads_afresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -74,4 +100,7 @@ def test_a_leg_called_outside_a_run_reads_afresh(
         checks._settings_source(
             SAMPLES_CONFIG, service_config=toml, suppress_search=False, env=None
         )
+        with pytest.raises(checks._SETTINGS_LOAD_ERRORS):
+            checks._load_check_settings(toml)
     assert calls["source"] == 2
+    assert calls["load"] == 2

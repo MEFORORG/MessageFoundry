@@ -58,10 +58,11 @@ pytestmark = pytest.mark.timeout(
 #: The sign-in read this module's clients take, in seconds (vault BACKLOG #2950 added items 24 and
 #: 31). The shipped read, 150 s, outlasts the 120 s budget above on its own, so a sign-in to a
 #: stalled engine was certain to meet pytest-timeout's thread method, which ends the whole run
-#: rather than this test. Sign-ins here run after the engine spawns and the load hold, so this is
-#: kept short: it makes a stalled sign-in fail its own call far more often, and does not guarantee
-#: it, since a late enough stall can still run past the budget.
-_SMOKE_SIGN_IN_READ_S = 15.0
+#: rather than this test. Sign-ins here run after the engine spawns and the load hold, so this
+#: makes a stalled sign-in fail its own call more often, and does not guarantee it: a late enough
+#: stall can still run past the budget. It is not shorter because a healthy sign-in on a loaded
+#: runner (password hashing on freshly spawned engines) must still fit inside it.
+_SMOKE_SIGN_IN_READ_S = 30.0
 
 
 @pytest.fixture(autouse=True)

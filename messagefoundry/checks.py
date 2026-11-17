@@ -2257,8 +2257,9 @@ def _load_check_settings(
     ``env`` is ``check --env``, applied as ``serve`` applies its own ``--env``: a CLI override of
     ``[ai].environment``, above the file and ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355).
 
-    Inside :func:`run_checks` the load runs once per distinct argument set, a refusal included,
-    and every later leg gets that answer (:data:`_RUN_MEMO`)."""
+    Inside :func:`run_checks` the load runs once per distinct argument set, a refusal of
+    :data:`_SETTINGS_LOAD_ERRORS` included, and every later leg gets that answer
+    (:data:`_RUN_MEMO`): its own deep copy, so no leg sees another's change to the model."""
     memo = _RUN_MEMO.get()
     if memo is None:
         return _load_check_settings_uncached(toml, cli=cli, env=env)
@@ -2268,11 +2269,12 @@ def _load_check_settings(
             memo[key] = _load_check_settings_uncached(toml, cli=cli, env=env)
         except _SETTINGS_LOAD_ERRORS as exc:
             memo[key] = exc
+            raise  # the first leg gets the refusal with its own traceback
     cached = memo[key]
     if isinstance(cached, BaseException):
         # Shed the earlier raise's frames, so the one stored refusal does not pile up every leg's.
         raise cached.with_traceback(None)
-    return cast("ServiceSettings", cached)
+    return cast("ServiceSettings", cached).model_copy(deep=True)
 
 
 def _load_check_settings_uncached(
