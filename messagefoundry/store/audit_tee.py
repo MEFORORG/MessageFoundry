@@ -238,50 +238,27 @@ def _scrub_field(value: str, *, detail: bool = False) -> str: ...
 def _scrub_field(value: None, *, detail: bool = False) -> None: ...
 def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     """One tee field, scrubbed by the handlers' text passes before ``json.dumps`` escapes a C0
-    control in it (BACKLOG #3045). A value with no C0 control in the part it scans, the window
+    control in it (BACKLOG #3045). A value the scrub finds no C0 control in, within the window
     :func:`_window` names, is returned unchanged.
 
-    Otherwise the value, cut to that window, is scrubbed as written, which the patterns read with
-    a control as a break, as they read any non-word character. Then two readings, every control
-    as a space, and every control the patterns do not read as whitespace removed (:func:`_read`),
-    are scrubbed, each taken from that plain result and, where the plain pass changed anything,
-    from the value. A reading of the plain result has found more when it shows fewer of its
-    letters and digits; a reading of the value, which can also show what the plain result hid,
-    when it does not show every word the plain result shows, equal words counted apart. If one
-    has, the whole field ships as :data:`_FIELD_REDACTED`: a reading changes the text's length,
-    so its redactions cannot be merged into the plain result without mapping spans between the
-    two texts, and that mapping is where an earlier design of this fix leaked. The word check
-    also fires where a removed control glues a kept word to a redacted one, so it can cost a
-    field that hid nothing more.
+    Otherwise the windowed value is scrubbed as written, the plain result. Two readings, every
+    control as a space and every control the patterns do not read as whitespace removed
+    (:func:`_read`), are scrubbed too, of the plain result and, where the plain pass changed
+    anything, of the value. If a reading of the plain result shows fewer of its letters and
+    digits, or a reading of the value does not show every word the plain result shows, counted,
+    the whole field is returned as :data:`_FIELD_REDACTED`. A reading changes the text's length,
+    so its redactions are not merged into the plain result.
 
-    Otherwise, where the plain result changed nothing, the value itself ships, so its line is the
-    line before this scrub and the handler chain treats it as it did. Where the plain result
-    changed something, it ships only if it hides every word the handler chain alone hides over the
-    value as the line carries it, encoded. The plain pass can read a span differently from that
-    chain, as a name run that takes a ``Bearer`` label with it and leaves the token, and where it
-    does the whole field ships as :data:`_FIELD_REDACTED` instead. That check, over the field
-    alone, is NOT what holds the tee line to the line before #3045: the chain over the whole
-    record can hide more than over one field, and :func:`_tee_line` holds the line to that.
+    Where the plain result changed nothing, the value is returned. Otherwise the plain result is
+    returned only if, encoded, it shows no word, counted, beyond what the handler chain alone
+    leaves of the encoded value, and the whole field is returned if not. A field other than
+    ``detail`` gets the window's note appended to its plain result; :func:`_bounded_detail`
+    appends a ``detail``'s.
 
-    A value longer than the window ships with the note naming what was left unscanned: any field
-    but ``detail`` with the window's own note appended here, and a ``detail`` with the note
-    :func:`~messagefoundry.redaction.safe_text` gives the value, appended by
-    :func:`_bounded_detail` after the bound. A whole-field return below ships without the note,
-    except for a ``detail``, which gets it there too.
-
-    So, at least, this returns the whole field as :data:`_FIELD_REDACTED` where a reading found
-    more, where the plain result shows a word the chain alone hides, and on a fault; a JSON
-    ``detail`` as the JSON string ``"[redacted]"`` in those cases and where the passes leave it
-    unparseable. What ships is :func:`_tee_line`'s choice, which can still be the line before
-    #3045, with the field unscrubbed.
-
-    With ``detail``, where the value parses as JSON and holds no raw control, which is how most
-    writers hand ``detail`` over, each JSON escape that spells a C0 control is decoded to the
-    control first and encoded again after, read left to right so an escaped backslash is never
-    half of one. Such a ``detail`` that the passes leave unparseable ships as the JSON string
-    ``"[redacted]"``, as it does on a fault; any other field ships as :data:`_FIELD_REDACTED` on a
-    fault.
-    :func:`emit_audit_tee` states what this covers and what it leaves."""
+    With ``detail``, a value that parses as JSON and holds no raw control has each JSON escape
+    that spells a C0 control decoded first and encoded again after, and the whole field is then
+    the JSON string ``"[redacted]"``, as it is where the result no longer parses. On a fault the
+    whole field is returned. :func:`_tee_line` chooses what ships."""
     if value is None:
         return None
     as_json = False
@@ -322,7 +299,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         # This result must hide every word the handler chain alone hides, over the value as the
         # line carries it. The plain pass can redact a span the chain read differently, a name
         # run that takes a ``Bearer`` label with it, and leave the credential the chain would have
-        # caught. A stricter bar than the one that binds, which is :func:`_tee_line`'s.
+        # caught. The bar that binds the line is :func:`_tee_line`'s.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
         if not _shows_no_more(json.dumps(result, ensure_ascii=False)[1:-1], _line_words(alone)):
             return whole
@@ -365,36 +342,18 @@ def _tee_line(
     whole_detail: Callable[[], str] = lambda: _FIELD_REDACTED,
 ) -> str:
     """The line to log for a record whose fields the C0 scrub turned from ``before`` into
-    ``after``. NO LESS THAN BEFORE, BY CONSTRUCTION (BACKLOG #3045): ``before`` is the record as
-    the code before #3045 built it, and the bar is what the handler chain left of THAT LINE, the
-    whole record encoded, which is what used to ship. The chain over a whole record can hide what
-    the same chain over one field does not, because a span can reach across a field's escapes or
-    its neighbours, so no check over a field alone can stand for it; an earlier version of this
-    fix compared against one and shipped words the old line hid.
+    ``after`` (BACKLOG #3045). ``before`` is the record as the code before #3045 built it, the old
+    line. A scrubbed candidate ships only if every word, meaning a run of letters and digits, that
+    the old line hid stays hidden on each modelled sink, and its reading parses as JSON on each
+    sink where the old line's did. The bar is the whole old line, not each field, because the
+    chain over a whole record can hide what it does not over one field.
 
-    Each candidate is logged only if, on EVERY sink, every word the modelled reading of that sink
-    shows for it, counted and in both :func:`_line_words` readings, is one the same sink's reading
-    showed for the old line, and that reading parses as JSON wherever the old line's did (the
-    parse floor, review round-f23e89a6): the line with every scrubbed field, then
-    the old line with each field the scrub changed shipped as :data:`_FIELD_REDACTED`, a changed
-    ``detail`` as what ``whole_detail`` returns, then the old line itself, which meets the bar
-    trivially and so ends the search. ``whole_detail`` is called only where the ``detail`` changed,
-    so an unchanged one costs none of its parses; :func:`emit_audit_tee` passes one that returns
-    the JSON string ``"[redacted]"`` where the old ``detail`` parsed, and otherwise ``[redacted]``
-    with the bound note of a ``detail`` longer than the window, which is not itself a JSON string.
-    A sink's reading is :func:`~messagefoundry.logging_setup.sink_readings`, a model, not the
-    formatter's output: each handler runs the whole installed filter chain again over the one
-    shared record, so the Nth reading is what N passes of those filters leave of the message, and
-    the forwarder, the copy that leaves the box, is the last of up to three; a bar taken over
-    the first pass alone let a later sink show words main's same sink hid. The last candidate
-    loses the C0 scrub for that record, and is reached only where hiding the changed fields
-    whole still fails the bar on some sink, for either of two reasons: it shows a word the old
-    line hid elsewhere in it, or its reading does not parse as JSON where the old line's did. It
-    is logged naming no field value and the reasons the last candidate checked, the line with
-    the changed fields hidden whole, failed for, where it names a reason this process has not
-    logged yet, so a logged reason can be named again
-    beside a new one.
-    On a fault, the old line ships, which meets the bar by definition."""
+    The candidates, in order: the line with every scrubbed field; the old line with each changed
+    field as :data:`_FIELD_REDACTED` and a changed ``detail`` as what ``whole_detail`` returns;
+    then the old line. A sink's reading is :func:`~messagefoundry.logging_setup.sink_readings`, a
+    model, not the formatter's output. Where the scrubbed candidates fail, a warning names why the
+    last one failed, unless this process has logged each of those reasons. On a fault the old
+    line ships."""
     old_line = json.dumps(before, ensure_ascii=False)
     if after == before:
         return old_line
@@ -526,82 +485,31 @@ def emit_audit_tee(
     ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
     word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
-    **A C0 control beside a name or a credential no longer hides it, in the cases measured
-    (BACKLOG #3045).** ``json.dumps`` escapes the 32 C0 controls, and each escape ends in a word
-    character, as ``\\u0001`` and ``\\t`` do, so a pattern that needs a word boundary or
-    whitespace missed the text on either side when only the handler chain ran. So each text field,
-    ``action``, ``actor``, ``channel_id``, ``client`` and ``detail``, is first scrubbed by the same
-    text passes before it is encoded, wherever it holds a C0 control in the window
-    :func:`_scrub_field` scans; a control only past that window is not seen. :func:`_scrub_field`
-    says how. The line that ships is then held, by :func:`_tee_line`, to hide every word the handler
-    chain hid of the whole record as it was encoded before #3045, on each of up to three sinks,
-    so on each sink it redacts no less than that line did there, and parses as JSON wherever that
-    line did. Each sink there is a modelled reading, passes of the installed filter chain, not the
-    formatter's output. The whole-field ``detail`` that check can fall back to, and the parses
-    that build it, are built only for a ``detail`` the scrub changed.
-    ``tests/test_audit_offbox_tee.py`` sweeps all 32 code points
-    through the 19 placements its ``_C0_SWEEP_TEMPLATES`` lists, each beside or inside a name, a
-    ``password=`` or ``token=`` value, a date, a bearer token or an MRN, one of them after an
-    HL7-shaped run, in each of those fields and in ``detail`` as a JSON document too, and finds no
-    leak there except where the control is one the patterns read as whitespace and the handler
-    chain over the same text unencoded leaks the same word; such a value, at least ``MRN 1234``,
-    a tab and ``5678``, ships that word, as any plain log line with a tab there does. Its comparison with the scrub switched off, over that sweep, two-control pairs and
-    the review values, runs for ``actor``, ``client`` and ``detail``, plain and as JSON, and finds
-    no word the line before #3045 hid. What that leaves, at least:
+    **A C0 control in a text field is scrubbed before it is encoded (BACKLOG #3045).**
+    ``json.dumps`` escapes the 32 C0 controls, and each escape ends in a word character, as
+    ``\\u0001`` and ``\\t`` do, so a pattern that needs a word boundary or whitespace missed the
+    text beside one when only the handler chain ran. So ``action``, ``actor``, ``channel_id``,
+    ``client`` and ``detail`` are first scrubbed by the same text passes where they hold a C0
+    control in the window :func:`_scrub_field` scans. :func:`_scrub_field` says how, and
+    :func:`_tee_line` chooses the line that ships. What that leaves, at least:
 
-    * Every control in a value is read the same way, as a space or as nothing. Text that needs one
-      control read as a space and another as nothing, such as a date split by two controls after a
-      word glued to it by a third, is missed by every reading and ships beside its escapes. The
-      tests pin one such case as a strict xfail.
-    * A pattern that misses the same text with a space, or nothing, in the control's place misses
-      it here too.
-    * Where a reading finds more than the plain passes, the whole field ships as ``[redacted]``, so
-      that record loses at least one of its ``action``, ``actor``, ``channel_id``, ``client`` or
-      ``detail``. A typed sign-in name of ``CORP`` and ``JONES`` joined by a control is one: it
-      reads as the two-word name the patterns redact. Where :func:`_tee_line` finds the scrubbed
-      line would show a word the line before #3045 hid, or would not parse as JSON on a sink
-      where that line did, every field the scrub changed ships as ``[redacted]``, the one that
-      did not cause it included; and where even that would show such a word, or would not parse
-      on such a sink, the record ships as the line before #3045 did, so the scrub is lost for
-      it. A field holding a
-      segment-shaped token, such as ``ABC|``, does that: on the old line the HL7 segment pattern
-      ran from it to the end of the line and hid the record's keys and anchors after it, which
-      hiding the field shows again. So a client can switch the scrub off for its own record by
-      typing a few characters, and its text beside a control then passes, as before #3045.
-      A client can use this on purpose: a failed sign-in sets ``actor`` to the typed name, so a
-      client that types a control beside a name- or credential-shaped word makes its own typed
-      name ship as ``[redacted]`` in the off-box copy, and that copy then holds no typed name to
-      attribute the attempt by. The ``client`` address and the rest of the record still ship.
-      ``detail`` is scrubbed before ``safe_text`` bounds it, so that holds for a control
-      anywhere in the scanned window, even in text past the 200 characters that would ship.
-    * A field holding a control and longer than the handler chain's 64 KiB window does not, in
-      practice, ship scrubbed. A shorter field whose encoded form is longer than that window, as
-      where it holds many controls, each encoded as up to six characters, can lose its scrub the
-      same way: a ``detail`` of 12,023 characters, 72,028 encoded, was measured shipping as
-      ``[redacted]``. A ``detail`` is longer, encoded, than the window the per-field
-      check reads, so it ships whole as ``[redacted]`` with its bound note, which is not itself
-      a JSON string. Any other such field
-      ships as the line before #3045 did, losing the scrub: that line was cut inside the field,
-      so it hid every field after it, and hiding the field whole shows them. Its text beside a
-      control can then pass, as before #3045.
-    * The comparisons that decide it count words, runs of letters and digits, so a redaction that
-      hides only punctuation is not counted, and a reading of the plain result that hides some
-      letters while showing others it hid is not seen.
-    * A control the patterns read as whitespace, at least tab, LF, VT, FF, CR and U+001C to
-      U+001F, is never read as nothing, because gluing two lines made names and dates that were
-      not in the text. Inside a word it splits the word, as it does on any plain log line.
-    * In a JSON ``detail``, only an escape that spells a C0 control is decoded. Most writers call
-      ``json.dumps`` with its default ``ensure_ascii=True``, so a non-ASCII character, such as a
-      no-break space between the parts of a name, arrives as an escape such as ``\\u00a0``,
-      which ends in a word character too, and the text beside it is read by the handler chain
-      alone, as before.
-    * In ``detail``, a JSON escape is read as the control it spells only where the detail parses as
-      JSON within the handler chain's bound and holds no raw control, which is how ``json.dumps``
-      writes it, and only one level deep. Elsewhere, at least a pretty-printed JSON detail, a
-      longer one, and a JSON string holding JSON text, where the control's escape is escaped
-      again, the escape is read by the handler chain alone, as before. So is a control spelled
-      as text another way, such as ``\\x01`` in a Python repr in an exception's text: that is not
-      a control, and the field scrub never sees one there.
+    * A control only past the scanned window is not seen.
+    * All controls in a value are read the same way, as a space or as nothing, so text that needs
+      one read each way is missed. The tests pin one such case as a strict xfail.
+    * A pattern that misses the text with a space, or nothing, in the control's place misses it
+      here too. A control the patterns read as whitespace, at least tab, LF and CR, is not
+      removed in either reading, so inside a word it splits the word, as on a plain log line.
+    * The comparisons count words, runs of letters and digits, so punctuation the old line hid
+      can ship.
+    * A field holding a control can ship whole as ``[redacted]``, so a client can make its own
+      typed sign-in name ship that way. A record can ship as the line before #3045, losing the
+      scrub; a segment-shaped token such as ``ABC|`` after a control in a field can cause that,
+      so a client can turn the scrub off for its own record.
+    * A field whose encoded form is longer than the handler chain's 64 KiB window, as one holding
+      many controls, can lose its scrub.
+    * In a JSON ``detail``, an escape is decoded only where it spells a C0 control, one level deep,
+      and where the detail parses as JSON within the bound and holds no raw control. Elsewhere,
+      as for ``\\u00a0``, the text beside an escape is read by the handler chain alone.
 
     **At least two residuals remain, and both can break the JSON a collector receives.** The
     first can also alter it silently.
@@ -611,14 +519,10 @@ def emit_audit_tee(
       sink, with no escaped character involved. When two fields carry attacker-influenced text,
       the document can instead still parse, with the fields between them missing. Those can be
       at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
-      such as ``actor``, can then carry another field's text. The field scrub adds cases of its
-      own: where it writes a credential placeholder, as in ``Bearer <redacted>``, just before an
-      escape on the line, the chain over the line can take the placeholder and the escape's
-      backslash as one credential value, and a quote that backslash escaped then ends the string.
-      On each modelled sink the parse floor in :func:`_tee_line` then ships another candidate or
-      the line before #3045, so a record that parsed there before #3045 still does. A sink outside
-      that model is not checked, at least a handler past the third or one with filters of its own,
-      so there a record that parsed before #3045 can fail to.
+      such as ``actor``, can then carry another field's text. The field scrub adds a case: a
+      credential placeholder it writes just before an escape can be taken, with the escape's
+      backslash, as one credential value, and a quote that backslash escaped then ends the string.
+      :func:`_tee_line` checks the parse only on the modelled sinks.
     * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
       run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
       ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,

@@ -719,9 +719,9 @@ def test_the_oracle_reads_a_doubly_escaped_control_as_a_break() -> None:
 def test_the_field_scrub_shows_no_word_the_line_chain_alone_hides(
     field: str, capsys, monkeypatch
 ) -> None:
-    """Closing step 3 of BACKLOG #3045: the change redacts no less than the handler chain did on
-    its own. Engine PR 2040's first version lost a redaction that way. No word of a value that the
-    line hid before may show after, over the sweep and the two-control corpus. Synthetic values."""
+    """Closing step 3 of BACKLOG #3045: no word of a value that the line hid before may show after,
+    over the sweep and the two-control corpus. Engine PR 2040's first version lost a redaction.
+    Synthetic values."""
     hidden_before, shown = _shown_after_hidden_before(field, _corpus(), capsys, monkeypatch)
     # The control: the line chain alone hides words in this corpus, so the rule is not vacuous.
     assert hidden_before

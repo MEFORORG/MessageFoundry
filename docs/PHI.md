@@ -2157,15 +2157,11 @@ JSON object, but the handler filters can rewrite it as text afterwards. On a fir
 collector could receive a record that fails to parse. It could also receive one that parses with
 fields missing, or with one field's text under another key. The `emit_audit_tee`
 docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least two
-residuals that cause these. A text field holding a C0 control, such as a typed sign-in name, is
-scrubbed before it is encoded where the control lies in the window `_scrub_field` in the same
-file scans, and in at least the cases `_scrub_field` in the same file lists,
-the whole field ships as `[redacted]`, unless the record ships as it did before that scrub, which
-the `_tee_line` docstring in the same file says when. A client can bring that about for its own
-record by typing a few characters, such as a segment-shaped token like `ABC|`, and its text beside
-a control then passes as it did before the scrub. That includes a typed sign-in name a client chose to put a
-control in, so on a first deployment a client could keep its own typed name out of the off-box
-copy. The `emit_audit_tee` docstring says what that scrub does not cover.
+residuals that cause these.
+
+Since BACKLOG #3045 the tee scrubs a text field holding a C0 control in the window it scans, such
+as a typed sign-in name, with the log filters' text passes before it encodes the field. The
+`emit_audit_tee` docstring states the cases and what that scrub leaves.
 
 ### Logging inventory (16.1.1 / 16.2.3)
 

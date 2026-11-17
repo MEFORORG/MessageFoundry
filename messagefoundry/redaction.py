@@ -2526,12 +2526,9 @@ def safe_text_bound(text: str) -> tuple[str, str]:
     """``(head, note)``: the part of ``text`` that :func:`safe_text` scans, and the bound note it
     appends to its result, with its leading space, or ``""`` when the text fit and ``head is text``.
 
-    For a caller that must scrub that part itself before :func:`safe_text` bounds it, as the
-    off-box audit tee does (BACKLOG #3045): ``safe_text(head) + note`` is ``safe_text(text)``, so
-    handing :func:`safe_text` a scrubbed ``head`` and appending ``note`` keeps both of its counts
-    exactly true while the scrubbed ``head`` still fits the window. A scrub that lengthens it past
-    the window, as many short redactions can, makes :func:`safe_text` cut it again and append a
-    second bound note, and that note counts text the caller's scrub already read as unscanned."""
+    For a caller that scrubs that part itself before :func:`safe_text` bounds it, as the off-box
+    audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
+    :func:`safe_text` cut it again and append a second bound note."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 
