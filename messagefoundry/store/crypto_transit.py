@@ -56,6 +56,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
@@ -318,29 +319,46 @@ def _names_aead_failure(exc: Exception) -> bool:
 #: signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
-_logged_at: dict[str, float] = {}
+_logged_at: dict[object, float] = {}
 _logged_at_lock = threading.Lock()
 
 
-def _log_due(kind: str) -> bool:
-    """Whether the warning ``kind`` is due: not logged in the last
-    :data:`_WARNING_LOG_INTERVAL_S`. A True answer records it as logged now."""
-    now = time.monotonic()
-    with _logged_at_lock:
-        last = _logged_at.get(kind)
-        if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
-            return False
-        _logged_at[kind] = now
+def _warn_quietly(message: str, *args: object) -> bool:
+    """``log.warning(message, *args)`` that never raises, and whether it was emitted (BACKLOG
+    #6707). The audit verify path logs beside a verdict; a log, a handler or a filter that raises
+    there would otherwise turn a row's break into a walk that could not run. A failure is reported
+    by its class alone on the last-resort stderr line."""
+    try:
+        log.warning(message, *args)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring
+        with contextlib.suppress(Exception):
+            _last_resort(
+                f"a Transit cipher warning could not be logged ({ascii(type(fault).__name__)})"
+            )
+        return False
     return True
 
 
+def _warn_when_due(kind: object, message: str, *args: object) -> None:
+    """:func:`_warn_quietly`, unless the warning ``kind`` was logged in the last
+    :data:`_WARNING_LOG_INTERVAL_S`. Only an emitted warning counts as logged, so one that failed
+    is tried again next time."""
+    with _logged_at_lock:
+        last = _logged_at.get(kind)
+        now = time.monotonic()
+        if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
+            return
+    if _warn_quietly(message, *args):
+        with _logged_at_lock:
+            _logged_at[kind] = now
+
+
 def _log_unread_decrypt_body(length: int) -> None:
-    """Log, when due (:func:`_log_due`), that a data-key decrypt 400 was not read for its AEAD
-    reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal stays the
-    cipher's plain error."""
-    if not _log_due("decrypt-body-unread"):
-        return
-    log.warning(
+    """Log, when due (:func:`_warn_when_due`), that a data-key decrypt 400 was not read for its
+    AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal stays
+    the cipher's plain error."""
+    _warn_when_due(
+        "decrypt-body-unread",
         "a Transit data-key decrypt got a 400 whose %d-character body is past the %d-character "
         "bound; not read as a tag refusal, so the value keeps the cipher's plain error",
         length,
@@ -781,7 +799,7 @@ class TransitCipher(_UnmarkedPolicy):
             try:
                 self.audit_hmac(data)
             except CipherError as exc:
-                log.warning(
+                _warn_quietly(
                     "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
                 )
             return False
@@ -819,20 +837,17 @@ class TransitCipher(_UnmarkedPolicy):
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
-            # Whatever the log raises (memory, stack, a log filter's fault), it is dropped and the
-            # label still stands, so the row stays a break rather than a walk that could not run.
-            with contextlib.suppress(Exception):
-                if _log_due(f"unconfirmed {self._audit_key!r}: {reason} {raised}"):
-                    log.warning(
-                        "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
-                        "because %s%s (key=%r); logged at most once in %d seconds for this key "
-                        "and this cause",
-                        version,
-                        reason,
-                        f" {raised}" if raised else "",
-                        self._audit_key,
-                        _WARNING_LOG_INTERVAL_S,
-                    )
+            _warn_when_due(
+                ("unconfirmed", self._audit_key, reason, raised),
+                "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "
+                "because %s%s (key=%r); logged at most once in %d seconds for this key "
+                "and this cause",
+                version,
+                reason,
+                " " + raised if raised else "",
+                self._audit_key,
+                _WARNING_LOG_INTERVAL_S,
+            )
             return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
@@ -880,7 +895,7 @@ class TransitCipher(_UnmarkedPolicy):
                 f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
                 f"{vault_failure_text(again)}"
             ) from again
-        log.warning(
+        _warn_quietly(
             "Transit refused the audit MAC verify of one row twice while a verify over fixed "
             "input succeeded before and after (key=%r): %s; read as a break at that row",
             self._audit_key,
@@ -949,7 +964,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            log.warning(
+            _warn_quietly(
                 "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
                 "latest version failed too (key=%r): %s",
                 key_version,
@@ -966,7 +981,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             return is_vault_unavailable(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
-            log.warning(
+            _warn_quietly(
                 "Transit failure classifier raised %s; read as an outage", type(fault).__name__
             )
             return True
@@ -980,7 +995,7 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             mac = self._probe_mac()
             if not isinstance(mac, str) or transit_mac_version(mac) is None:
-                log.warning(
+                _warn_quietly(
                     "an audit MAC verify failed, and the fixed-input probe answered no "
                     "well-formed MAC (key=%r)",
                     self._audit_key,
@@ -988,14 +1003,14 @@ class TransitCipher(_UnmarkedPolicy):
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
-            log.warning(
+            _warn_quietly(
                 "an audit MAC verify failed, and a verify over fixed input failed too (key=%r): %s",
                 self._audit_key,
                 vault_failure_text(probe_exc),
             )
             return False
         if valid is not True:
-            log.warning(
+            _warn_quietly(
                 "an audit MAC verify failed, and a verify over fixed input did not answer valid "
                 "(key=%r)",
                 self._audit_key,

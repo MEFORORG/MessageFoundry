@@ -1625,6 +1625,77 @@ def test_a_fault_in_the_unconfirmed_log_keeps_the_label(
     )
 
 
+class _RaisingFilter(logging.Filter):
+    """A log filter that fails on every record, as a broken redaction filter would."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise ValueError("filter fault")
+
+
+@pytest.fixture
+def _raising_log_filter() -> Any:
+    """A :class:`_RaisingFilter` on the Transit cipher's logger for one test."""
+    from messagefoundry.store import crypto_transit
+
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        yield raising
+    finally:
+        crypto_transit.log.removeFilter(raising)
+
+
+@pytest.mark.usefixtures("_raising_log_filter")
+def test_a_raising_log_filter_never_turns_a_break_into_could_not_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #6707: every audit verify path that logs beside a break keeps the break when the
+    log itself raises: the unconfirmed label, a row refused twice, and a malformed stored MAC
+    whose cost-only call failed. The failure is reported by its class on stderr."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+    cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+    class _DownTransit(_FakeTransit):
+        def generate_hmac(self, **_kw: Any) -> dict[str, Any]:
+            raise RuntimeError("down")
+
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    assert (
+        TransitCipher(_FakeClient(_DownTransit()), _KEY_NAME).verify_audit_hmac(b"row", "not a mac")
+        is False
+    )
+    assert "could not be logged ('ValueError')" in capsys.readouterr().err
+
+
+def test_a_failed_unconfirmed_log_is_tried_again(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: only a warning that was emitted uses up its interval, so one whose log
+    failed is logged on the next unconfirmed 400."""
+    from messagefoundry.store import crypto_transit
+
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    assert len(logged) == 1, logged
+
+
 def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
