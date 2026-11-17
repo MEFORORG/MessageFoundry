@@ -1971,20 +1971,27 @@ def redact(text: str) -> str:
 #: because this module is pure stdlib and must not import ``parsing``; a test pins it to ``MARKER``.
 #:
 #: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``, as
-#: every stdlib URL encoder writes them), and a run whose ``+``, ``/`` or ``=`` is percent-encoded or
-#: whose ``/`` is JSON-escaped (``\/``), so such a carriage is cut whole rather than at its first
-#: encoded character. The marker is case-insensitive. Nothing wider: a ``-``, ``_`` or bare ``\`` in the
-#: run let it swallow a credential label after it (``\nPassword:`` in a ``repr``), whose value the
+#: every stdlib URL encoder writes them) or JSON unicode-escaped (``\u003A``), and a run whose ``+``,
+#: ``/`` or ``=`` is percent-encoded or JSON unicode-escaped, or whose ``/`` is JSON-escaped (``\/``),
+#: so such a carriage is cut whole rather than at its first encoded character. The marker and the
+#: escapes are case-insensitive. The run ends at its padding, so a word after ``=`` keeps its word
+#: boundary: ``mfb64:v1:QUJDRA==/Password: x`` leaves ``/Password: x`` for the credential filter, and
+#: ``==MRN: 123`` its label for the MRN pass. Nothing wider: a ``-``, ``_`` or bare ``\`` in the run
+#: let it swallow a credential label after it (``\nPassword:`` in a ``repr``), whose value the
 #: credential filter then had no label to find. One run character is required, so the placeholder left
 #: behind (``[`` is outside the run) never re-matches, and prose that merely names the marker, such as
 #: ``missing mfb64:v1: marker``, is kept. The support bundle uses this same pattern
 #: (``support/redact.py`` ``_MFB64``).
 #:
-#: Residuals, at least these: a word glued to the end of the run with no separator is taken with it,
-#: a credential label included; a carriage broken by whitespace keeps every piece after the first
-#: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its first
-#: such character; and a marker escaped any other way (``\x3a``, ``\u003a``) is not read at all.
-_BINARY_CARRIAGE = re.compile(r"(?i)(mfb64(?::|%3A)v1(?::|%3A))(?:[A-Z0-9+/=]|%2[BF]|%3D|\\/)++")
+#: Residuals, at least these: a run with no padding takes a word glued to its end with it, a credential
+#: or PHI label included, whenever the glue is in the base64 alphabet (``/``, ``+``, or none); a
+#: carriage broken by whitespace keeps every piece after the first break (``encode`` never writes
+#: one); a URL-safe (``-``/``_``) carriage keeps the part after its first such character; and a marker
+#: escaped any other way (``\x3a``) is not read at all.
+_BINARY_CARRIAGE = re.compile(
+    r"(?i)(mfb64(?::|%3A|\\u003A)v1(?::|%3A|\\u003A))"
+    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\u002[BF])++(?:=|%3D|\\u003D){0,2}"
+)
 
 
 def _redact_binary_carriage(text: str) -> str:

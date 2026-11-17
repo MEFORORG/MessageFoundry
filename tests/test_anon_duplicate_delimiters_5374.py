@@ -70,7 +70,26 @@ def test_the_structural_leak_check_reports_repeating_delimiters(leak: ModuleType
     """Found by code review round 1: a refused header read as "no parseable MSH" to the leak
     check, which returns no hit for that, so a direct caller saw a clean structural result."""
     hits = leak.structural_phi_hits(f"MSH|{enc}{_BODY}", set())
-    assert hits == ["MSH-2 repeats an encoding character, so no field could be read"]
+    assert hits == [leak.REPEATED_ENCODING_HIT]
+
+
+@pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])
+def test_a_token_only_leak_report_reports_repeating_delimiters(leak: ModuleType) -> None:
+    """Found by code review round 2: with no rules the structural walk is skipped, so the repeat
+    was reported nowhere and a token-only call read the message as clean."""
+    report = leak.leak_report(f"MSH|^~^&{_BODY}")
+    assert leak.REPEATED_ENCODING_HIT in report.hits
+    assert leak.REPEATED_ENCODING_HIT in report.structural_hits
+    assert leak.leak_report(f"MSH|^~\\&{_BODY}").structural_hits == []
+
+
+@pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])
+def test_the_refusal_advice_says_to_repair_the_header(leak: ModuleType) -> None:
+    """Found by code review round 2: the hit read as a PHI shape, so the advice was to extend the
+    rule map, which cannot fix it."""
+    advice = leak.refusal_advice(leak.leak_report(f"MSH|^~^&{_BODY}"))
+    assert "Repair the header" in advice
+    assert "Extend the rule map" not in advice
 
 
 @pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])

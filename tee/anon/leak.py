@@ -917,6 +917,14 @@ def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
     return hits
 
 
+#: The hit for a header that repeats an MSH-2 encoding character (BACKLOG #5374). No field of such
+#: a message can be read, so it is reported whether or not ``rules`` were given, and it carries
+#: advice of its own: no rule can fix it.
+REPEATED_ENCODING_HIT = "MSH-2 repeats an encoding character, so no field could be read"
+#: The step for :data:`REPEATED_ENCODING_HIT`.
+_REPEATED_ENCODING_ADVICE = "Repair the header: MSH-2 must hold four different encoding characters."
+
+
 def structural_phi_hits(
     text: str, mapped_paths: set[str], *, version: str | None = None
 ) -> list[str]:
@@ -941,7 +949,7 @@ def structural_phi_hits(
     parsed = read_message_seps(text)
     if parsed is None:
         if repeats_encoding_characters(text):
-            return ["MSH-2 repeats an encoding character, so no field could be read"]
+            return [REPEATED_ENCODING_HIT]
         return []
     seps, field_sep = parsed
     hits: list[str] = []
@@ -1132,7 +1140,9 @@ def leak_report(
     undecided: tuple[str, ...] = ()
     if rules is None:
         unmapped: tuple[str, ...] = ()
-        structural: list[str] = []
+        # Without rules no field is walked, but a header no field can be read under is still
+        # reported, or a token-only call would read it as clean (BACKLOG #5374).
+        structural: list[str] = [REPEATED_ENCODING_HIT] if repeats_encoding_characters(text) else []
     else:
         # A KEEP rule rewrote nothing, so its field stays in the detectors' scope; it only
         # counts as DECIDED for the coverage switch (BACKLOG #1710).
@@ -1267,7 +1277,8 @@ def refusal_advice(
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
     shape_hit = any(
-        hit != MALFORMED_LINE_HIT and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
+        hit not in (MALFORMED_LINE_HIT, REPEATED_ENCODING_HIT)
+        and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
         for hit in report.structural_hits
     )
     if token_hit or shape_hit:
@@ -1276,6 +1287,8 @@ def refusal_advice(
         # No rule may rewrite MSH-2, so the step above cannot reach the text after its
         # encoding characters (BACKLOG #5654).
         steps.append(_MSH2_ADVICE)
+    if REPEATED_ENCODING_HIT in report.structural_hits:
+        steps.append(_REPEATED_ENCODING_ADVICE)
     steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")

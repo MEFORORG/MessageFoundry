@@ -23,6 +23,9 @@ _KEPT = "mfb64:v1:[redacted]"
 _JSON_ESCAPED = _CARRIAGE.replace("/", "\\/")
 _PERCENT_RUN = _CARRIAGE.replace("+", "%2B").replace("/", "%2F").replace("=", "%3D")
 _PERCENT_ALL = _PERCENT_RUN.replace(":", "%3A")
+_UNICODE_ESCAPED = (
+    _CARRIAGE.replace("+", "\\u002B").replace("/", "\\u002f").replace("=", "\\u003D")
+).replace(":", "\\u003A")
 
 
 def test_the_payload_holds_every_character_the_run_reads_encoded() -> None:
@@ -45,8 +48,18 @@ def test_the_literal_marker_is_the_carriage_marker() -> None:
         (f"body {_PERCENT_RUN} end", f"body {_KEPT} end"),
         (f"body {_PERCENT_ALL} end", "body mfb64%3Av1%3A[redacted] end"),
         (f"body {_CARRIAGE.upper()} end", "body MFB64:V1:[redacted] end"),
+        (f"body {_UNICODE_ESCAPED} end", "body mfb64\\u003Av1\\u003A[redacted] end"),
     ],
-    ids=["plain", "mid-line", "repr", "json-escaped", "percent-run", "percent-marker", "upper"],
+    ids=[
+        "plain",
+        "mid-line",
+        "repr",
+        "json-escaped",
+        "percent-run",
+        "percent-marker",
+        "upper",
+        "unicode-escaped",
+    ],  # fmt: skip
 )
 def test_a_carriage_payload_is_withheld_whole(text: str, expected: str) -> None:
     out = redact_untrusted(text)
@@ -85,10 +98,11 @@ def test_the_shipped_log_filters_withhold_a_carriage_in_message_and_traceback() 
 
 #: Not ``_``: ``QUJDRA==_Password: v`` prints its value with this rule switched off too, a
 #: credential-filter gap of its own, outside BACKLOG #5378.
-@pytest.mark.parametrize("glue", ["\\n", "\\r\\n", " ", "-"])
+@pytest.mark.parametrize("glue", ["\\n", "\\r\\n", " ", "-", "", "/", "+", "="])
 def test_a_credential_label_after_a_carriage_still_reaches_the_credential_filter(glue: str) -> None:
-    """Found by code review round 1: a run that read ``\\``, ``-`` or ``_`` swallowed the label, and
-    the credential filter then had no label to find the value by."""
+    """Found by code review rounds 1 and 2: a run that read ``\\``, ``-`` or ``_``, or ran on past
+    its padding, swallowed the label, and the credential filter then had no label to find the
+    value by. The run ends at its padding, so glue in the base64 alphabet after it is kept too."""
     record = logging.LogRecord(
         "mf.test",
         logging.ERROR,
@@ -103,8 +117,17 @@ def test_a_credential_label_after_a_carriage_still_reaches_the_credential_filter
     assert "QUJDRA" not in rendered
 
 
+@pytest.mark.parametrize("glue", ["", "/", " "], ids=["glued", "slash", "space"])
+def test_an_mrn_label_after_a_padded_carriage_keeps_its_value_withheld(glue: str) -> None:
+    out = safe_text(f"bad {MARKER}QUJDRA=={glue}MRN: 12345678")
+    assert "12345678" not in out
+    assert "QUJDRA" not in out
+
+
 @pytest.mark.parametrize(
-    "carriage", [_CARRIAGE, _JSON_ESCAPED, _PERCENT_RUN, _PERCENT_ALL], ids=lambda c: c[:12]
+    "carriage",
+    [_CARRIAGE, _JSON_ESCAPED, _PERCENT_RUN, _PERCENT_ALL, _UNICODE_ESCAPED],
+    ids=["plain", "json-escaped", "percent-run", "percent-marker", "unicode-escaped"],
 )
 def test_the_support_bundle_withholds_the_same_forms(carriage: str) -> None:
     """The bundle's own carriage rule is the shared pattern, so it cuts an encoded run whole too."""
