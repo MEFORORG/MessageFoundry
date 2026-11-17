@@ -26,7 +26,8 @@ failed write and nothing clears it on its own: *repaired* and *still broken* are
 from memory, which is exactly the distinction recovery has to make. The engine gates every re-arm
 path on that answer. (The state :meth:`LogWriteGuard.status` reports may also include the flap
 latch, see :meth:`LogWriteGuard.record_rollover`; :meth:`LogWriteGuard.revalidate` releases the
-latch on every sink it does not probe, and then answers as :meth:`LogWriteGuard.can_log` does.)
+latch on every sink whose own state is not unwritable, and then answers as
+:meth:`LogWriteGuard.can_log` does.)
 
 **Scope of the stop is the PROCESS, and the code says so rather than pretending otherwise.** The
 application log is a process-global handler set on the root logger — a write failure is a property of
@@ -213,9 +214,9 @@ class LogWriteGuard:
         starts runners back to back), so the honest handling is to be loud about it. The last-resort
         channel rather than ``logging``: this class must not depend on the tree it guards.
 
-        Wiring a responder also fires each stage-2 event still owed (see :meth:`record_unwritable`)
-        for a sink whose own state is still unwritable, without waiting for that sink's next
-        failure."""
+        Wiring a responder also fires each stage-2 event already owed (see
+        :meth:`record_unwritable`) for a sink whose own state is still unwritable, without waiting
+        for that sink's next failure."""
         with self._lock:
             previous = self._escalation
             self._escalation = callback
@@ -297,8 +298,9 @@ class LogWriteGuard:
         nothing above:** it is an overlay in its own field, never touches a sink, and the code that
         computes the bound, its window and streak, the events this method and
         :meth:`record_unwritable` fire, the stop requests and every field of the recorded status
-        does not read it. It changes what :meth:`status` and :meth:`can_log` answer, and only towards
-        ``unwritable``.
+        does not read it. It changes at least what :meth:`status`, :meth:`can_log` and
+        :meth:`revalidate` answer, only towards ``unwritable``, and what the stage-2 stderr line
+        says about the other sinks.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -353,7 +355,9 @@ class LogWriteGuard:
         """Stage 2: the replacement could not be written either. Escalates ONCE per break, except
         that a break whose event was not delivered owes it: no responder was wired, or the responder
         reported that it dropped the event. An owed event is fired again on the next failure of the
-        break, and by :meth:`set_escalation` when it wires a responder, until one is delivered.
+        break until one is delivered. :meth:`set_escalation` also fires each event already owed
+        when it wires a responder; one a failure records as owed just after that waits for the
+        sink's next failure.
         ``cause`` is a literal phrase for the stderr line saying how the sink came to be
         unwritable.
 
@@ -488,8 +492,8 @@ class LogWriteGuard:
         answering False would fail closed on a premise it cannot support. A sink the flap latch holds
         counts as unwritable here, as it does on :meth:`status`.
 
-        The #122 halt's stop request is decided in :meth:`record_unwritable`, from each sink's own
-        state without the latch. Its re-arms ask :meth:`revalidate`, which answers as this does."""
+        The #122 halt's stop request is decided from each sink's own state without the latch, when
+        a stage-2 event is built. Its re-arms ask :meth:`revalidate`, which answers as this does."""
         with self._lock:
             return self._process_can_log()
 

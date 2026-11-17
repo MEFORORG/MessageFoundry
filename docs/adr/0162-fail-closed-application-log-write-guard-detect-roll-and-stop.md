@@ -461,9 +461,10 @@ before, so a sink that keeps flapping across bound windows pages stage 2 once pe
 in. Whether the bound itself should hold across windows is left open with the latch's enforcement
 question. One retry is kept: a stage-2 event that was not delivered, because no responder was
 wired or the engine's responder had no open event loop to hand it to, is fired again on each
-later failure of the break, at most once per failure and without another stderr line, and once
-when a responder is wired, until one is delivered. A break that ends with a heal roll before
-any such failure is not asked to stop again, as before this amendment.
+later failure of the break, at most once per failure and without another stderr line, until one
+is delivered. Wiring a responder also fires each event already owed at that moment. A break that
+ends with a heal roll before any such failure is not asked to stop again, as before this
+amendment.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
 the flap latch, the line now says so, instead of Amendment B's "another sink is still writable".

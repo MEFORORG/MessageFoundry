@@ -902,8 +902,10 @@ def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The roll that trips the bound fires stage 2 while no responder is wired, as in the gap between
-    # a runner's revalidate and its set_escalation. The next roll past the bound fires it again,
-    # once a responder is there, so the stop is still asked for. Once answered, nothing more fires.
+    # a runner's revalidate and its set_escalation. Wiring the responder fires it, so the stop is
+    # still asked for. Once delivered, the later rolls past the bound fire nothing more. The
+    # retry on a later failure is pinned by
+    # test_a_stage2_event_the_responder_dropped_is_fired_again.
     # NEGATIVE CONTROL: with one page per break and no owed event, nothing fired at all.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)

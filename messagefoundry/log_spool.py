@@ -74,8 +74,9 @@ from messagefoundry import file_lock
 #: (counted as unreadable) rather than guessing at its shape.
 SPOOL_FORMAT_VERSION = 1
 
-#: ``errno`` values that say the spool directory itself is out of reach: a network mount that
-#: dropped, or a stale handle on one. ``getattr``: a platform's ``errno`` may lack either name.
+#: ``errno`` values that say, on POSIX, that the spool directory itself is out of reach: a network
+#: mount that dropped, or a stale handle on one. ``getattr``: a platform's ``errno`` may lack
+#: either name.
 _DIRECTORY_GONE_ERRNOS = frozenset(
     code
     for code in (getattr(errno, "ENOTCONN", None), getattr(errno, "ESTALE", None))
@@ -432,7 +433,8 @@ class LogSpool:
         here would end the listener thread for good. Only a segment that is GONE is retired, and the
         read then moves on to the next segment: answering ``None`` there would read as drained, and
         the forwarder would send live records ahead of the older ones still spooled (BACKLOG #5811).
-        A spool DIRECTORY that is missing or out of reach is not a gone segment: like any other
+        A spool DIRECTORY that is missing, or that the read error names as out of reach
+        (:func:`_directory_unreachable`), is not a gone segment: like any other
         ``OSError`` (out of descriptors, a sharing violation) it keeps every file and returns
         ``None``, so the caller tries again later instead of deleting undelivered records. It also
         closes the writer, for the reason the comment below gives."""
