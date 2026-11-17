@@ -255,10 +255,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     operator, held or cluster-convergence reload or a DR activation, finds it only after the store
     was opened with it, and the open store keeps connecting with it until a restart, so refusing
     there would protect nothing and would block the reload or the failover. The check logs a
-    warning and writes ONE ``pin_outside_validity`` row, with the warning as its ``reason``, per
-    pin file content in each engine process (:data:`_VALIDITY_WARNED`, keyed on the
-    fingerprint, and kept only once the row is written), so a convergence retry writes no
-    further row, and the check goes on. Every other content check above still refuses.
+    warning, writes a ``pin_outside_validity`` row with the warning as its ``reason``, and goes
+    on. Every other content check above still refuses. The engine process remembers the pin
+    file's fingerprint (:data:`_VALIDITY_WARNED`) once every audit call of that check has
+    succeeded, and a later check of the same content, such as a convergence retry, then writes
+    no further row and logs nothing. A store fault on any of the check's audit calls leaves it
+    unremembered, so the next check writes the row again. Only the fingerprint is remembered,
+    not which warning was written, so a pin warned as not yet valid is not warned again when it
+    later expires unless its content changes.
 
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
@@ -362,8 +366,8 @@ log = logging.getLogger(__name__)
 #: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
 #: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too; its
 #: ``reason`` is the refusal's text, vault BACKLOG #4569), ``pin_outside_validity`` (a SQL
-#: Server pin outside its validity period, a warning and not a refusal, written once per file
-#: content in each engine process; module item 11, vault BACKLOG #3714), and
+#: Server pin outside its validity period, a warning and not a refusal; module item 11 says when
+#: it is written again; vault BACKLOG #3714), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -779,15 +783,16 @@ def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> str | None:
         return (
             f"{spec.setting} {spec.path!r}: the pinned certificate is not valid until "
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The open store "
-            "keeps connecting with it until a restart, and the next store open refuses it."
+            "keeps connecting with it until a restart, and a store open before that date "
+            "refuses it."
         )
     return None
 
 
-#: The pin content each SQL Server pin's validity warning was last audited for, keyed by label and
-#: path, so a pin outside its validity period writes ONE ``pin_outside_validity`` row per file
-#: content (its fingerprint), and repeated settings checks, such as convergence retries, write no
-#: more (module item 11). An entry is dropped once the pin is back inside its validity period.
+#: The pin content each SQL Server pin's validity warning was last audited for (its fingerprint),
+#: keyed by label and path, so a repeated settings check of the same content, such as a
+#: convergence retry, writes no further ``pin_outside_validity`` row; module item 11 says when it
+#: is written again. An entry is dropped once the pin is back inside its validity period.
 _VALIDITY_WARNED: dict[tuple[str, str], str] = {}
 
 
@@ -2749,8 +2754,8 @@ async def _preflight_checks(
         ) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
-    # A pin outside its validity period is warned about, not refused, once per file content
-    # (_VALIDITY_WARNED), so retries write no further rows (module item 11).
+    # A pin outside its validity period is warned about, not refused, and a repeat of content
+    # already recorded (_VALIDITY_WARNED) writes no further row (module item 11).
     warned_key = (spec.label, spec.path)
     if validity is None:
         _VALIDITY_WARNED.pop(warned_key, None)
