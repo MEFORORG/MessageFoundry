@@ -903,8 +903,10 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 
 # The segment's raw index map for the joined readings, built at most once per segment object and kept
 # on it (review round 84a1c1fd70): built per reading, a line of a few hundred invocations re-ran the
-# span scanner for each one, which grows as the square of the line and can pass the hook's timeout.
-# Rule 3's branch-switch text and rule 3d still build their own. $false stands for "no map".
+# span scanner for each one. That removed one square-of-the-line cost, not all of them: Get-JoinedReading
+# still walks every reading's window, and the windows overlap, so a long line can still pass the hook's
+# timeout (review round c49803c0c3). Rule 3's branch-switch text and rule 3d still build their own map.
+# $false stands for "no map".
 function Get-JoinMap($Seg) {
     if ($null -eq $Seg) { return $null }
     $have = $Seg.PSObject.Properties['JoinMap']
@@ -927,8 +929,9 @@ function Get-JoinMap($Seg) {
 # it as an empty argument of its own. A leading pair joins under POSIX only:
 # PowerShell passes a leading `''` as an argument of its own (measured in review round 34781a2201).
 # The `$` is dropped only before a `-C`, `--work-tree`, `--git-dir`, GIT_WORK_TREE or GIT_DIR value,
-# POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
-# as a relative path too, which can only add a deny.
+# POSIX only, and the word is then read literally: bash decodes backslash escapes inside `$'...'`, so a
+# word holding one is misread, in either direction. The window cannot tell a `$'<word>'` from a variable
+# there either, so a variable's name is read as a relative path too.
 #
 # The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
 # where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
