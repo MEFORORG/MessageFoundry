@@ -879,10 +879,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             continue
         # The id is read from the anonymized body, with the reader the relay used for row.control_id,
         # so it follows the rules; it is None when that body has no MSH-10. received_at is the
-        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). A field no rule
-        # rewrites, and a component an identifier rule keeps, holds what was captured, and this
-        # runs outside the catch above, so a character latin-1 cannot hold must give None rather
-        # than end the run.
+        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The text was
+        # decoded from latin-1 and no anonymizer pass is meant to add a character latin-1 cannot
+        # hold, but this runs outside the catch above, so if one did it gives None rather than
+        # ending the run.
         try:
             control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
         except UnicodeEncodeError:
