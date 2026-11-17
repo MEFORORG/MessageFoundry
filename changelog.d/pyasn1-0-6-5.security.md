@@ -8,4 +8,4 @@
   [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249).** Both are development
   dependencies, so the packaged extension's file list is unchanged. The `overrides` entries in
   `ide/package.json` hold mocha to the fixed versions, because it has not released a version that
-  requires them. They do not reach vsce, which has left the lock (see the vsce entry).
+  requires them. They do not reach vsce, which has left the lock (see the entry on `@vscode/vsce` leaving the extension's locked build tree).
