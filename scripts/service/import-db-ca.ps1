@@ -39,7 +39,7 @@
 
     The file is read once. Every certificate it holds is shown, checked, and only then added, so
     nothing reaches a store that the operator was not shown. Roots are added first. The whole
-    file is refused, and nothing is imported, when any certificate in it is not marked as a CA by
+    file is refused, and nothing is imported, in at least these cases: when any certificate in it is not marked as a CA by
     its basic constraints, has a key usage that cannot sign certificates, carries a private key,
     is signed in a way this script does not verify, or has expired, when it holds no self-signed
     root, when a CA in it does not chain to a self-signed root in the file, when a DER value in it
@@ -384,6 +384,13 @@ function Test-SelfSigned {
     return (Test-SignedBy -Certificate $Certificate -Signer $Certificate)
 }
 
+# Whether the certificate's subject and issuer are the same name, byte for byte. Nothing is verified.
+function Test-SelfIssued {
+    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    return ([Convert]::ToBase64String($Certificate.SubjectName.RawData) -ceq
+        [Convert]::ToBase64String($Certificate.IssuerName.RawData))
+}
+
 # Why the certificate does not chain to a self-signed root in the file, or $null when it does. The
 # walk follows issuer links through the file only, never a machine store: each step needs a
 # certificate in $Bundle whose subject is the issuer's name and whose key verifies the signature
@@ -484,6 +491,7 @@ $refusals = [System.Collections.Generic.List[string]]::new()
 # A certificate that passes on its own must also reach a root through this file's own certificates,
 # so a root that signed none of them cannot carry an unrelated issuing CA in beside it.
 Write-Host "The file holds $($bundle.Count) certificate(s):"
+$unverifiedRoot = $false
 $entries = @(foreach ($cert in $bundle) {
     $target = $stores[(Get-CaStoreName -Certificate $cert)]
     $why = Get-CaRefusal -Certificate $cert -NowUtc $nowUtc
@@ -495,7 +503,13 @@ $entries = @(foreach ($cert in $bundle) {
     Write-Host "  Not before : $($cert.NotBefore.ToUniversalTime().ToString('u'))"
     Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
     if ($cert.NotBefore.ToUniversalTime() -gt $nowUtc) {
-        Write-Host "  Not valid yet: nothing that chains through it validates before its start."
+        Write-Warning "$($cert.Thumbprint) is not valid yet; nothing that chains through it validates before its start."
+    }
+    # A self-issued certificate refused for a signature this script cannot verify may be the file's
+    # root, so the error must not say the file holds none.
+    if ($why -and -not $target.Equals($stores['Root']) -and (Test-SelfIssued -Certificate $cert) -and
+        -not $SignatureHashes.ContainsKey($cert.SignatureAlgorithm.Value)) {
+        $unverifiedRoot = $true
     }
     if ($why) {
         Write-Host "  Refused    : $why"
@@ -509,7 +523,7 @@ $entries = @(foreach ($cert in $bundle) {
 # it would be trusted with no root's revocation or constraints over it (the help's "Where each CA
 # goes"), so a rootless file is refused rather than imported. Every CA in such a file is also refused
 # for reaching no root, so the error leads with the one cause that explains them.
-$rootless = -not ($entries | Where-Object { $_.Target -eq $stores['Root'] })
+$rootless = -not $unverifiedRoot -and -not ($entries | Where-Object { $_.Target -eq $stores['Root'] })
 if ($rootless -or $refusals.Count -gt 0) {
     # Printed one per line for the operator: pwsh 7's default error view rewraps a message at the
     # console width, which can split a line. The error carries the same lines, joined into its one
@@ -542,8 +556,9 @@ $approved = @(foreach ($entry in $entries) {
         $entry
     }
 })
-# Under -Confirm the operator may decline a root. An approved CA must still reach a root through the
-# approved certificates alone, or it would land in LocalMachine\CA with no root over it.
+# Under -Confirm the operator may decline a root or an intermediate CA. An approved CA must still
+# reach a root through the approved certificates alone, or it would land in LocalMachine\CA with no
+# root over it.
 $approvedSet = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
 foreach ($entry in $approved) { [void]$approvedSet.Add($entry.Certificate) }
 $orphans = @(foreach ($entry in $approved) {
@@ -552,15 +567,17 @@ $orphans = @(foreach ($entry in $approved) {
     }
 })
 if ($orphans.Count -gt 0) {
-    throw ("Nothing was imported. A root was declined that these approved CAs chain to, and a CA " +
-        "is not imported without its root: $($orphans -join '; ').")
+    throw ("Nothing was imported. A root or intermediate CA was declined that these approved CAs " +
+        "chain through, and a CA is not imported without the path to its root: $($orphans -join '; ').")
 }
 
 if ($approved.Count -gt 0) {
-    # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent). Roots go
-    # first, so a failure part way never leaves an approved issuing CA added and an approved root not.
-    # Nothing is rolled back; the error says how many were added.
+    # Each store keys on thumbprint, so re-importing the same CA is a no-op (idempotent). One the
+    # store already held is named as such, since a later rotation must not remove it as the file's.
+    # Roots go first, so a failure part way never leaves an approved issuing CA added and an approved
+    # root not. Nothing is rolled back; the error says how many were added.
     $added = 0
+    $present = 0
     try {
         foreach ($name in 'Root', 'CertificateAuthority') {
             $batch = @($approved | Where-Object { $_.Target -eq $stores[$name] })
@@ -569,6 +586,14 @@ if ($approved.Count -gt 0) {
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
             try {
                 foreach ($entry in $batch) {
+                    $thumb = $entry.Certificate.Thumbprint
+                    if ($store.Certificates.Find(
+                            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                            $thumb, $false).Count -gt 0) {
+                        Write-Host "Already in $($stores[$name].Label), left as it was: $thumb"
+                        $present++
+                        continue
+                    }
                     $store.Add($entry.Certificate)
                     $added++
                 }
@@ -581,12 +606,12 @@ if ($approved.Count -gt 0) {
             "failed: $($_.Exception.Message)")
     }
     Write-Host ""
-    Write-Host "Imported $added CA certificate(s)."
-    # Every approved CA reached an approved root above, so a root is among what was imported.
+    Write-Host "Imported $added CA certificate(s); $present were already in their store."
+    # Every approved CA reached an approved root above, so a root is now in the Root store.
     Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
     Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
-    Write-Host "roll the server cert, then remove the OLD file's certificates by the thumbprints listed"
-    Write-Host "above, keeping any that was in the store before -- see docs/DEPLOY-SERVER-DB.md."
+    Write-Host "roll the server cert, then remove only the old certificates that the new chain and"
+    Write-Host "nothing else still needs -- see docs/DEPLOY-SERVER-DB.md section 5.3."
 }

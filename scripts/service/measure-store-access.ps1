@@ -126,6 +126,9 @@ $ProvisionHint = "provision-admin --username"
 # phrases above too, so without this an engine that started and served would pass step 1 of every
 # arm; Test-GateRefusalLine requires both on one line.
 $StartRefused = "refusing to start"
+# The openings of the gate's two lines that let a start go on: the skipped-gate warning and the
+# warn-mode line (app.py). A regex, matched as is.
+$GateLetStart = "the engine is starting with the notice gate skipped: |PHI instance with no deliverable security-notice recipient: "
 $ProvisionDecline = "already has an enabled Administrator"
 $OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
 # store.py logs these and carries on; each means that open did not restrict the trio as it tried to
@@ -654,9 +657,12 @@ function Wait-ForGateRefusal([string]$Phase) {
         Update-OwnerSample "during $Phase"
         $gate = @(Get-LogMatches ([regex]::Escape($GateRefusal)))
         if (@($gate | Where-Object { Test-GateRefusalLine $_.Line }).Count -gt 0) { return $true }
-        if ($gate.Count -gt 0) {
+        # Only the gate's own two let-it-start lines end the wait: other engine lines carry the
+        # clause too, and say nothing about this gate.
+        $letStart = @($gate | Where-Object { $_.Line -match $GateLetStart })
+        if ($letStart.Count -gt 0) {
             Add-Reading ("during $Phase the service reached the ADR 0167 gate, which did not refuse " +
-                "the start: $(Get-Excerpt $gate[0].Line 300)")
+                "the start: $(Get-Excerpt $letStart[0].Line 300)")
             return $false
         }
         Start-Sleep -Seconds 1

@@ -61,7 +61,7 @@ $ErrorActionPreference = 'Stop'
 $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile({_psq(str(_SCRIPT))}, [ref]$null, [ref]$errs)
 if (@($errs).Count) {{ throw "the script does not parse: $($errs[0])" }}
-foreach ($var in @('GateRefusal', 'NoAdminRefusal', 'StartRefused')) {{
+foreach ($var in @('GateRefusal', 'NoAdminRefusal', 'StartRefused', 'GateLetStart')) {{
   $set = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
       $args[0].Left.Extent.Text -eq ('$' + $var) }}, $false)
   if (-not $set) {{ throw "missing assignment `${{var}}" }}
@@ -75,6 +75,7 @@ $lines = {_psq(json.dumps(lines))} | ConvertFrom-Json
 ConvertTo-Json -Compress -InputObject @{{
   refusal = @($lines | ForEach-Object {{ [bool](Test-GateRefusalLine $_) }})
   no_admin = @($lines | ForEach-Object {{ [bool](Test-GateRefusalLine $_ $NoAdminRefusal) }})
+  let_start = @($lines | ForEach-Object {{ $_ -match $GateLetStart }})
   clause = @($lines | ForEach-Object {{ $_ -match [regex]::Escape($GateRefusal) }}) }}
 """
     f = tmp_path / f"gate-{uuid.uuid4().hex}.ps1"
@@ -111,10 +112,19 @@ def test_the_engine_still_words_the_three_gate_lines_so() -> None:
 
 @pytest.mark.parametrize("host", ["pwsh", "powershell"])
 def test_only_the_refusal_counts_as_a_refused_start(tmp_path: Path, host: str) -> None:
-    got = _judge(host, tmp_path, [_REFUSAL[1], _SKIPPED[1], _WARN_MODE[1], "unrelated line"])
-    assert got["refusal"] == [True, False, False, False], got
+    # Another engine line that carries the clause and is not the gate's.
+    census = (
+        "WARNING messagefoundry.auth.service: no enabled Administrator can sign in without an"
+        " outside identity service"
+    )
+    got = _judge(
+        host, tmp_path, [_REFUSAL[1], _SKIPPED[1], _WARN_MODE[1], census, "unrelated line"]
+    )
+    assert got["refusal"] == [True, False, False, False, False], got
     # The narrower clause the StartFirstEndToEnd arm passes: the no-Administrator refusal only.
-    assert got["no_admin"] == [True, False, False, False], got
+    assert got["no_admin"] == [True, False, False, False, False], got
+    # Only the gate's two let-it-start lines end the wait early, not the census line.
+    assert got["let_start"] == [False, True, True, False, False], got
     # The control: the clause the wait used to match alone is in both warning lines, so the old
     # criterion took an engine that went on to serve for a refused one.
-    assert got["clause"] == [True, True, True, False], got
+    assert got["clause"] == [True, True, True, True, False], got

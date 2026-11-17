@@ -574,6 +574,16 @@ def test_a_bundle_holding_a_refused_certificate_imports_nothing(
     assert "What if" not in out
 
 
+def test_a_root_signed_in_a_way_the_script_cannot_verify_is_not_reported_missing(
+    extra: dict[str, x509.Certificate], files: dict[str, Path]
+) -> None:
+    proc = _run_script(files["pem_pss_root"])
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    message = _error_message(proc)
+    assert "holds no self-signed root" not in message, message
+    assert f"{_thumb(extra['pss_root'])} (" in message and "it is signed with " in message, message
+
+
 def test_the_error_names_the_first_five_refusals_and_counts_the_rest(
     tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]]
 ) -> None:

@@ -603,8 +603,8 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
    - **SQL Server:** delete the old CA's certificates, the root from `LocalMachine\Root` and any
      issuing CA from `LocalMachine\CA`, by the thumbprints the helper listed when it imported that
      file. An issuing CA left in `LocalMachine\CA` stays a trust anchor for the engine's Python TLS
-     (§5.2). The helper lists a certificate the store already held too, so keep any that something
-     else installed or still needs (Group Policy, say). For example
+     (§5.2). Keep any certificate the new chain, or something else (Group Policy, say), still needs;
+     the helper's import names each one the store already held as "Already in". For example
      `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -in @('<old root>', '<old issuing CA>') | Remove-Item`.
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 
