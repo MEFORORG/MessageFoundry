@@ -1764,8 +1764,9 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
-    # same builder (`_per_connection_ssl_connect`), and that builder either sets the flag or raises,
-    # so the verdict reached here holds for every connection the pool opens.
+    # same builder (`_per_connection_ssl_connect`). With ssl_crl_file set it either sets the flag or
+    # raises; unset, it loads no CRL. Either way the verdict reached here holds for every connection
+    # the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
 

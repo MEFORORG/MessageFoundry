@@ -7,8 +7,10 @@ form: the context sets ``CERT_REQUIRED``, does not skip validity-period checks, 
 At least ``RevocationHopGuard.capture`` and the Vault and proxy legs in
 ``transports/strict_requests.py`` read it; until this change those two legs read
 ``context_checks_revocation`` alone. The leg tests below hand each leg a relaxed context. The guard
-words its record from the same reason, so a hop whose context does not set ``CERT_REQUIRED`` is
-never called verified and is never offered a CRL.
+words its record from the same reason. On a hop whose context does not set ``CERT_REQUIRED``, the
+records the guard writes do not call the hop verified where the caller's words say "verified "
+(the tests below pin the shipped words), and its default remedy offers no CRL. A remedy the
+caller passes is used as given, and can still offer one.
 
 The scan fails a read of ``context_checks_revocation`` by that name anywhere in the engine package
 except inside the module-level ``crl_no_credit``. It reads names, not values, so a guard that reads
@@ -198,8 +200,8 @@ def test_a_peer_not_required_refusal_calls_nothing_verified_and_offers_no_crl(
 ) -> None:
     """The refusal on a hop whose context does not set ``CERT_REQUIRED`` does not say the peer
     certificate is verified, offers no CRL, no removal of ``tls_allow_expired`` and no
-    attestation, and names making the hop require its peer certificate (vault BACKLOG #4912).
-    Attesting revocation cover on such a hop would rest on a false premise. Red with the guard
+    attestation, and names setting the context to ``CERT_REQUIRED`` (vault BACKLOG #4912). The
+    disposition still ALLOWs an attested hop; only the text changed. Red with the guard
     keyed on ``expiry_relaxed`` alone, as before."""
     guard = _peer_not_required_guard(relaxed, mode)
     assert guard.no_credit is CrlNoCredit.PEER_NOT_REQUIRED
@@ -252,9 +254,11 @@ def test_an_attested_peer_not_required_hop_crosses_and_its_line_does_not_say_ver
 
 
 def _caller_words() -> list[tuple[str, str]]:
-    """Every string a ``RevocationHopGuard.capture`` call in the engine package passes as its
+    """The literal words ``RevocationHopGuard.capture`` calls in the engine package pass as their
     ``cell`` or ``description``: each literal piece of the argument, an f-string's included, and a
-    module-level string constant it names. ``(where, text)`` pairs."""
+    module-level string constant it names. A value bound any other way, such as rest.py's local
+    ``description``, is not read here; the REST end-to-end test below covers that default.
+    ``(where, text)`` pairs."""
     found: list[tuple[str, str]] = []
     for path in sorted(_PACKAGE.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
@@ -295,9 +299,11 @@ def _caller_words() -> list[tuple[str, str]]:
 def test_no_callers_words_call_a_peer_not_required_hop_verified(
     mode: ssl.VerifyMode, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every caller's own ``cell`` and ``description`` words, on a hop whose context does not set
-    ``CERT_REQUIRED``: neither the refusal nor the attested crossing line says "verified" (vault
-    BACKLOG #4912). Red with the guard writing the caller's words unchanged."""
+    """The literal ``cell`` and ``description`` words of the capture callers, through the guard,
+    on a hop whose context does not set ``CERT_REQUIRED``: neither the refusal nor the attested
+    crossing line the guard writes says "verified" (vault BACKLOG #4912). The AI broker's own
+    record is not written by the guard, so this does not cover it. Red with the guard writing the
+    caller's words unchanged."""
     words = _caller_words()
     # A floor, so a broken scan cannot pass over nothing: at least these callers say "verified".
     where = {w.split(":", 1)[0] for w, text in words if _VERIFIED.search(text)}
@@ -306,7 +312,6 @@ def test_no_callers_words_call_a_peer_not_required_hop_verified(
         "messagefoundry/transports/mllp.py",
         "messagefoundry/auth/ldap.py",
         "messagefoundry/store/postgres.py",
-        "messagefoundry/transports/ai_broker.py",
     ):
         assert rel in where, (rel, sorted(where))
     lines: list[dict[str, Any]] = []

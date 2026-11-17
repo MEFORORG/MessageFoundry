@@ -504,9 +504,12 @@ _RELAXED_DETAIL = (
     "are not"
 )
 
-#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
+#: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089). It names
+#: no setting, since a hop whose context skips the check without one takes it too (vault BACKLOG
+#: #4912).
 _RELAXED_CROSSING = (
-    "verified TLS hop with tls_allow_expired crossed without a revocation check the guard credits"
+    "verified TLS hop that skips validity-period checks crossed without a revocation check the "
+    "guard credits"
 )
 
 #: The suffix the MLLP, DICOM SCU and FTPS call sites put on their description only on a hop that
