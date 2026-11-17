@@ -66,6 +66,7 @@ from .surrogates import (
     dropped,
     message_has_site_code,
     read_message_seps,
+    repeats_encoding_characters,
     trim,
     unescape,
     unescaped_fields,
@@ -895,9 +896,14 @@ def structural_phi_hits(
     is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465).
 
     The header, which the walk skips, is read for a routable IPv6 address alone
-    (:func:`_header_ipv6_hits`, BACKLOG #5654)."""
+    (:func:`_header_ipv6_hits`, BACKLOG #5654).
+
+    A header that repeats an MSH-2 encoding character is a hit by itself (BACKLOG #5374): no field
+    of such a message can be read, so an empty result would read as clean."""
     parsed = read_message_seps(text)
     if parsed is None:
+        if repeats_encoding_characters(text):
+            return ["MSH-2 repeats an encoding character, so no field could be read"]
         return []
     seps, field_sep = parsed
     hits: list[str] = []
