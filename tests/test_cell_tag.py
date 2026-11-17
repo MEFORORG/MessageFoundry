@@ -232,6 +232,74 @@ async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
     assert rows == [MESSAGE_TAG_FAILED_ACTION]  # written, so muted for the interval
 
 
+def _failing_sink(exc: Exception) -> Any:
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            raise exc
+
+    return _Sink()
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_the_audit_failure_line_names_the_cell_and_a_checked_error_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6697 items 4 and 10: the ERROR line names the cell and row reference, and logs
+    SQLite's error name only when it has SQLite's own shape."""
+    good = sqlite3.OperationalError("synthetic-driver-text")
+    good.sqlite_errorname = "SQLITE_BUSY"
+    bad = sqlite3.OperationalError("synthetic-driver-text")
+    bad.sqlite_errorname = "not-a-name synthetic-planted"
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(good), CellTagError("messages", "summary", "au-name-1", "A")
+        )
+        await report_cell_tag_failure(
+            _failing_sink(bad), CellTagError("messages", "summary", "au-name-2", "A")
+        )
+    first, second = (r.getMessage() for r in caplog.records if r.name == cell_tag.__name__)
+    assert "messages.summary" in first and "au-name-1" in first and "SQLITE_BUSY" in first
+    assert "synthetic-planted" not in second and "code None" in second
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_an_audit_failure_from_our_own_bug_keeps_its_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6697 item 7: a TypeError is not a driver's, so its traceback is logged; a driver
+    error's is not (the control above)."""
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(TypeError("synthetic")), CellTagError("messages", "raw", "au-bug", "A")
+        )
+        await report_cell_tag_failure(
+            _failing_sink(sqlite3.OperationalError("x")),
+            CellTagError("messages", "raw", "au-drv", "A"),
+        )
+    bug, driver = (r for r in caplog.records if r.name == cell_tag.__name__)
+    assert bug.exc_info is not None and driver.exc_info is None
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_a_failing_error_code_lookup_does_not_escape_the_audit_report(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6697 item 5: an audit failure is logged and swallowed even when reading its driver
+    code raises."""
+    from messagefoundry.store import base
+
+    def _boom(_exc: BaseException) -> str | None:
+        raise RuntimeError("synthetic lookup failure")
+
+    monkeypatch.setattr(base, "driver_sqlstate", _boom)
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(
+            _failing_sink(sqlite3.OperationalError("x")),
+            CellTagError("messages", "raw", "au-lookup", "A"),
+        )
+    assert any("au-lookup" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.usefixtures("fresh_audit_memo")
 async def test_a_concurrent_report_is_not_lost_when_the_first_write_fails_or_is_cancelled() -> None:
     """BACKLOG #6697: a report that runs while another write of the same cell is in flight writes
@@ -336,14 +404,21 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
     async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
         return True
 
-    with pytest.raises(TypeError, match="keyword-only"):
+    # Each refusal has its own message, so `match=` pins which branch refused (BACKLOG #6698).
+    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
         dead_letters_on_cell_tag(positional)
 
     async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
         return True
 
-    with pytest.raises(TypeError, match="no default"):  # a call could omit it from kwargs
+    with pytest.raises(TypeError, match="no default$"):  # a call could omit it from kwargs
         dead_letters_on_cell_tag(defaulted)
+
+    async def absent(self: _DeadLetterSink, *, other: str) -> bool:
+        return True
+
+    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
+        dead_letters_on_cell_tag(absent)
     # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
     # evaluated at decoration.
     namespace: dict[str, Any] = {}
