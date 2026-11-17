@@ -208,7 +208,7 @@ def test_a_configured_credential_beside_oauth2_is_not_held_or_judged(
     d = _build(spec.settings)
     assert d._token_provider is not None
     assert _auth_keys(d) == []
-    assert all(v not in d._headers.values() for v in cred.values())
+    assert not any(v in held for v in cred.values() for held in d._headers.values())
     d._token_provider = _Provider()
     opener = _RecordingOpener()
     d._opener = opener  # type: ignore[assignment]
