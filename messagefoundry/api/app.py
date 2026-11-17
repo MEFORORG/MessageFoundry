@@ -571,6 +571,7 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
     UploadContentError,
+    UploadDamagedError,
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
@@ -9043,6 +9044,14 @@ def create_app(
         "with 'messagefoundry rotate-key', or restore the retired key it was sealed under. If "
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
+    # BACKLOG #5388: a damaged file (UploadDamagedError) is refused with the same status but its
+    # own text, because no key and no rotate-key repairs it, and a keyless store has no key at all.
+    # It promises no removal, because some damaged files are kept by the prune and refused by the
+    # delete; docs/PHI.md section 3 lists them. It says only what holds for every file that gets it.
+    _UPLOAD_DAMAGED = (
+        "this uploaded file is damaged, so it was not read and is not served. No key and no "
+        "command repairs it. An operator may try to delete it, and the delete may be refused too"
+    )
 
     _UPLOAD_UNAVAILABLE = (
         "the store's key service could not complete the request, so nothing was read, stored or "
@@ -9080,10 +9089,17 @@ def create_app(
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
-        still remove an upload ``rotate-key`` never seals (BACKLOG #2322)."""
+        still remove an upload ``rotate-key`` never seals (BACKLOG #2322). ``damaged`` carries a
+        damaged sidecar's own text (BACKLOG #5388), and DELETE then lets the store read it again."""
 
-        def __init__(self) -> None:
-            super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE)
+        def __init__(self, damaged: bool = False) -> None:
+            super().__init__(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged))
+            self.damaged = damaged
+
+    def _upload_refused_text(damaged: bool) -> str:
+        """The 423 text of a refused file, a damaged file's own (BACKLOG #5388). Callers pass only
+        the refusal's class, so its message reaches no response."""
+        return _UPLOAD_DAMAGED if damaged else _UPLOAD_UNREADABLE
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -9113,8 +9129,8 @@ def create_app(
         except UploadUnavailableError as exc:
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
             override_answer = partial(_upload_unavailable, str(exc), op)
-        except UploadUnreadableError:
-            override_answer = _UploadSidecarRefused
+        except UploadUnreadableError as exc:
+            override_answer = partial(_UploadSidecarRefused, isinstance(exc, UploadDamagedError))
         if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
@@ -9223,7 +9239,8 @@ def create_app(
             )
             raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
-            # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
+            # ASVS 5.2.2: disallowed extension or content/extension mismatch, or (BACKLOG #5387,
+            # UploadFieldError) a field the sidecar reader would refuse. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
             # both POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
             await engine.store.record_audit(
@@ -9410,8 +9427,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
@@ -9571,8 +9589,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9653,8 +9672,10 @@ def create_app(
         refused = False
         try:
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
-        except _UploadSidecarRefused:
-            refused = True
+        except _UploadSidecarRefused as exc:
+            # A damaged sidecar is read again by the store, which classes it as the scan does and
+            # answers its own refusal (BACKLOG #5388); the flag would skip that read.
+            refused = not exc.damaged
         client = client_ip(request)
         actor = identity.username
 
@@ -9703,8 +9724,9 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             outage = str(exc)
-        except UploadUnreadableError:
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        except UploadUnreadableError as exc:
+            damaged = isinstance(exc, UploadDamagedError)
+            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)

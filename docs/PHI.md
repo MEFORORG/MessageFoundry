@@ -836,10 +836,48 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    delete it through `DELETE /uploads/{id}`, after step-up, which writes the same blank-owner
    `upload.delete` row. Its owner cannot,
    and gets 404. At least these are still outside retention, and the API cannot delete them: a
-   blank sidecar, or one that is not UTF-8 within the part the class check reads, and a plaintext
-   sidecar over a body that is oversized and not text, or is not a regular file. A plaintext
-   sidecar that is not UTF-8 only past that part is removed by the prune at expiry, but the API
-   cannot delete it either: its read fails before the class check.
+   plaintext sidecar over a body that is oversized and not text, or is not a regular file. A
+   blank sidecar, or one that is not UTF-8, is the damaged kind below. A plaintext
+   sidecar that is not UTF-8 only past that part is removed by the prune at expiry, and since
+   BACKLOG #5388 the same override holder can delete it through the API too: the read's decode
+   error is refused as damaged, and the delete then classes it.
+   **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
+   #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
+   whose `file_id` is not its own path id, a count that is negative or above 2^53, an
+   `uploaded_at` that is missing, not a number, 0 or less, or above 2^53, and a text field that
+   is not a string, is longer than the store allows, or holds a lone surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
+   host clock is stepped back every genuine upload is dated ahead, so such an upload is still
+   listed, billed by the quota and readable by its owner. A missing or non-positive `uploaded_at`
+   is refused rather than read as 1970, which the prune would take as past every window and
+   delete on its first pass; refused, the pair is aged by its mtimes as below. An upload never
+   writes an over-long or surrogate field, or an `uploaded_at` the reader refuses, such as one
+   from a clock set before 1970: the save refuses it up front, and the API answers 400 with
+   nothing stored.
+   Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
+   left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
+   override holder, with text naming the file as damaged and saying it is not served. That text
+   promises no removal, because at least the cases kept out of retention below are not removed,
+   and the delete it says may be refused does succeed for the non-UTF-8 never-sealable kind above.
+   The web console's `/ui` page does not
+   pass that text on: it shows its one locked notice for every 423, which names `rotate-key` as
+   the conditional fix, and `rotate-key` does not repair a damaged file. It is not left out of
+   retention: the prune removes the pair once the later of its
+   sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
+   claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, so a damaged
+   pair whose mtimes are set ahead stays on disk until they pass.
+   The prune logs each such removal as one of a refused sidecar, and its audit row carries blank
+   owner fields. A sound sidecar whose `uploaded_at` is more than a day ahead of the prune's clock
+   is aged the same way, by its pair's mtimes and never by an mtime ahead of the clock, since that
+   stamp alone would never pass the window; its audit row carries the sidecar's own owner fields,
+   and the prune logs it as one whose `uploaded_at` is ahead of the clock. Neither kind is
+   always removed once its mtimes pass the window: a `rotate-key` run that re-seals either half
+   writes it through an atomic replace, which resets that half's mtime, so a pair re-sealed at
+   least as often as the retention window is kept. A damaged sidecar with no body leaves no audit row, as for any body-less pair, so
+   that log line is its only record. A sidecar the cipher declines is not
+   this kind: a key rotated away must not destroy data, so it waits for `rotate-key` as above. At
+   least a sidecar that is a link or is not a regular file, such as a directory or a FIFO, and a
+   body that is a directory, are still outside retention, and the API cannot delete them either,
+   so an operator removes them by hand, which leaves no audit row.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
    `rotate-key` refuses to run in that mode (BACKLOG #1165, #2109). So no command could ever seal the upload, and refusing it
    would strand the file for good. The transit cipher still refuses unmarked values in the store's own
