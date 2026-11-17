@@ -6,6 +6,7 @@ unchanged."""
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -30,7 +31,9 @@ def _registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wiring, "_active", Registry())
 
 
-@pytest.mark.parametrize("default", [SENTINEL, ["X-A", "b"], 5])
+@pytest.mark.parametrize(
+    "default", [SENTINEL, ["X-A", "b"], 5, MappingProxyType({"X-A": "b"})], ids=str
+)
 @pytest.mark.parametrize("factory", sorted(HEADERS_FACTORIES))
 def test_a_non_table_default_is_refused(factory: str, default: Any) -> None:
     with pytest.raises(WiringError, match="default= is not a table") as excinfo:

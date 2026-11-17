@@ -26,7 +26,9 @@ def test_generator_allowlist_entries_are_still_validated() -> None:
         _inbound(MLLP(port=2575), (entry for entry in ["127.0.0.1", "999.1.1.1"]))
 
 
-@pytest.mark.parametrize("value", ["127.0.0.1", b"127.0.0.1", 5, {"10.0.0.1": "lab"}])
+@pytest.mark.parametrize(
+    "value", ["127.0.0.1", b"127.0.0.1", 5, {"10.0.0.1": "lab"}, {"10.0.0.1"}, frozenset()]
+)
 def test_a_value_that_is_not_a_list_is_refused(value: object) -> None:
     with pytest.raises(WiringError, match="must be a list of IP addresses"):
         _inbound(MLLP(port=2575), value)

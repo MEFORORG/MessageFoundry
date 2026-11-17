@@ -654,7 +654,8 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
         default = headers.default
         if default is _UNSET or default is None:
             return
-        if not isinstance(default, Mapping):
+        # A dict, the one table type every connector's header builder sends.
+        if not isinstance(default, dict):
             raise WiringError(
                 f"{factory} headers is an env() reference whose default= is not a table but "
                 f"{type(default).__name__} (value withheld). The default is sent as the headers "
@@ -888,22 +889,31 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 )
 
 
-def _unread_ca_on_tls_off(factory: str, tls: object, tls_ca_file: object) -> str | None:
-    """The unread reason for a factory's literal ``tls``, after refusing a non-bool one beside a CA,
-    since the reason reads it by truthiness. An ``env()`` ``tls`` is truthy here, and
-    :func:`refuse_resolved_verify_off` reads it once resolved."""
-    if tls_ca_file is None:
-        return None
-    _refuse_bool_literals({"tls": tls}, factory)
+def _tls_off_reason(tls: object) -> str | None:
+    """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
+    :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
+    ``tls`` is truthy, so it reads as on until it resolves."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
 
 
+def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
+    """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
+    reason reads it by truthiness."""
+    factory = _UNREAD_CA_ON_TLS_OFF[type_]
+    if ca is not None:
+        _refuse_bool_literals({"tls": tls}, factory)
+    _check_tls_ca_file(factory, ca, unread=None if ca is None else _tls_off_reason(tls))
+    _check_tls_ca_pin(factory, pin, ca)
+
+
 def refuse_resolved_verify_off(
     type_: ConnectorType, settings: Mapping[str, Any], where: str
 ) -> None:
-    """Re-run the DICOMweb factory's unread-CA refusal on RESOLVED settings.
+    """Re-run a factory's unread-CA refusal on RESOLVED settings: DICOMweb's, Ftp's, and the
+    ``tls``-off one of the factories in :data:`_UNREAD_CA_ON_TLS_OFF`.
 
     The factory refuses ``tls_ca_file`` with a falsy literal ``verify_tls``, because nothing would
     read the CA. An ``env()`` reference is truthy there, so it passes. Once it resolves, it can be
@@ -918,11 +928,9 @@ def refuse_resolved_verify_off(
     a ``tls`` that resolved off is refused here."""
     label = _UNREAD_CA_ON_TLS_OFF.get(type_)
     if label is not None:
-        if settings.get("tls_ca_file") and not bool_setting(settings, "tls", default=False):
-            raise WiringError(
-                f"{where}: {label} tls_ca_file would never be read: tls resolved off, which "
-                "builds no TLS context."
-            )
+        reason = _tls_off_reason(settings.get("tls"))
+        if settings.get("tls_ca_file") and reason is not None:
+            raise WiringError(f"{where}: {label} tls_ca_file would never be read: {reason}.")
         return
     if type_ is ConnectorType.REMOTEFILE:
         if remote_file_protocol(settings) == "ftp" and settings.get("tls_ca_file"):
@@ -2898,10 +2906,7 @@ def MLLP(
         # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
         _refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
-    _check_tls_ca_file(  # BACKLOG #5329
-        "MLLP", tls_ca_file, unread=_unread_ca_on_tls_off("MLLP", tls, tls_ca_file)
-    )
-    _check_tls_ca_pin("MLLP", tls_ca_pin, tls_ca_file)
+    _check_listener_ca(ConnectorType.MLLP, tls, tls_ca_file, tls_ca_pin)
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -3378,11 +3383,8 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
-    _check_tls_ca_file(  # BACKLOG #5329
-        "Http", tls_ca_file, unread=_unread_ca_on_tls_off("Http", tls, tls_ca_file)
-    )
-    _check_tls_ca_pin("Http", tls_ca_pin, tls_ca_file)
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
+    _check_listener_ca(ConnectorType.HTTP, tls, tls_ca_file, tls_ca_pin)
     settings: dict[str, Any] = {
         "port": port,
         "encoding": encoding,
@@ -4587,10 +4589,7 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
-    _check_tls_ca_file(  # BACKLOG #5331
-        "DICOM", tls_ca_file, unread=_unread_ca_on_tls_off("DICOM", tls, tls_ca_file)
-    )
-    _check_tls_ca_pin("DICOM", tls_ca_pin, tls_ca_file)
+    _check_listener_ca(ConnectorType.DIMSE, tls, tls_ca_file, tls_ca_pin)
     settings: dict[str, Any] = {
         "ae_title": ae_title,
         "host": host,
@@ -8339,8 +8338,13 @@ def _check_metadata(name: str, metadata: Mapping[str, Any] | None) -> None:
         raise WiringError(f"connection {name!r}: metadata must be a table (key/value mapping)")
 
 
+#: What ``source_ip_allowlist`` takes: a list, a tuple or a single-pass iterator of entries. Not
+#: ``Iterable[str]``, which a bare ``str`` satisfies, so mypy still catches that mistake.
+SourceIpAllowlist = list[str] | tuple[str, ...] | Iterator[str]
+
+
 def _check_source_ip_allowlist(
-    name: str, listens: bool, allowlist: Iterable[str] | None
+    name: str, listens: bool, allowlist: SourceIpAllowlist | None
 ) -> tuple[str, ...] | None:
     """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
     address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE/HTTP
@@ -8356,7 +8360,10 @@ def _check_source_ip_allowlist(
             f"inbound connection {name!r}: source_ip_allowlist does not take an env() reference; "
             "write the list of IP addresses or CIDR networks"
         )
-    if isinstance(allowlist, (str, bytes, Mapping)) or not isinstance(allowlist, Iterable):
+    # A set would freeze in hash order, so the stored tuple and a refusal's entry index would
+    # differ between processes.
+    refused = (str, bytes, Mapping, set, frozenset)
+    if isinstance(allowlist, refused) or not isinstance(allowlist, Iterable):
         raise WiringError(
             f"inbound connection {name!r}: source_ip_allowlist must be a list of IP addresses or "
             f"CIDR networks, not {type(allowlist).__name__}"
@@ -8432,7 +8439,7 @@ def build_inbound_connection(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: Iterable[str] | None = None,
+    source_ip_allowlist: SourceIpAllowlist | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
@@ -8713,7 +8720,7 @@ def inbound(
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
-    source_ip_allowlist: Iterable[str] | None = None,
+    source_ip_allowlist: SourceIpAllowlist | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
     messages_days: int | None = None,
