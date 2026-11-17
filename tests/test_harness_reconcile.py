@@ -1754,8 +1754,8 @@ def test_rig_reconciles_a_reset_does_not_claim_the_drain_arm_went_unjudged() -> 
 
 
 def test_batchbox_stranding_arm_must_agree_with_the_rest_of_the_band_report() -> None:
-    # Item 3: a published arm that agrees with itself but not with the band's traffic, its own
-    # sign, or the band's own verdict does not clear the arm. Each case used to clear the cell.
+    # Item 3: a published arm that agrees with itself but not with the band's traffic or its own
+    # sign does not clear the arm. Each case used to clear the cell.
     for stranding, timeouts in (
         ({"unconfirmed": -1, "budget": 8, "over_budget": False}, 0),
         ({"unconfirmed": 0, "budget": -1, "over_budget": True}, 0),
@@ -1771,17 +1771,11 @@ def test_batchbox_stranding_arm_must_agree_with_the_rest_of_the_band_report() ->
         assert bb._band_stranding(band) == (None, ""), stranding
         rec = bb.aggregate_cell_record(_cell(), [band, _pair()])
         assert not rec.no_loss.ok and rec.no_loss.inconclusive, (stranding, rec.no_loss.detail)
-    # An over-budget arm beside a band verdict of INCONCLUSIVE contradicts the band's reconcile,
-    # which counts that arm as a proven loss; a band that does not say is not trusted either.
-    for inconclusive in (True, None):
-        flood = _remote_band(8)
-        no_loss = flood["no_loss"]
-        assert isinstance(no_loss, dict)
-        if inconclusive is None:
-            del no_loss["inconclusive"]
-        else:
-            no_loss["inconclusive"] = inconclusive
-        assert bb._band_stranding(flood) == (None, ""), inconclusive
+    # A report whose no_loss or traffic is not an object is malformed too, and does not raise.
+    for key in ("no_loss", "traffic"):
+        broken = _pair()
+        broken[key] = None
+        assert bb._band_stranding(broken) == (None, ""), key
     # The controls: the producer's own report is read as published, within and over budget.
     assert bb._band_stranding(_remote_band(7)) == (False, "")
     over, why = bb._band_stranding(_remote_band(8))
@@ -1795,8 +1789,21 @@ def test_a_failed_cell_keeps_a_stranding_loss_a_surviving_band_proved() -> None:
     assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
     assert "cell drive failed: band 2 raised OSError: boom" in rec.no_loss.detail
     assert "8 unconfirmed sends exceed its stranding budget (7)" in rec.no_loss.detail
-    # The controls: survivors within budget, or none, prove nothing, so the cell stays INCONCLUSIVE.
-    for survivors in ([_remote_band(7), _pair()], [], None):
+    # A survivor whose own reconcile proved a loss on client counters alone, across a reset, is a
+    # loss too, as aggregate_cell_record keeps it.
+    flood = _pair(counter_reset=_RESET, ok=False, inconclusive=False)
+    flood_no_loss = flood["no_loss"]
+    assert isinstance(flood_no_loss, dict)
+    del flood_no_loss["stranding"]
+    rec = bb._failed_cell_record(_cell(), "boom", [flood])
+    assert not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "proved a loss on client counters alone" in rec.no_loss.detail
+    # The controls: survivors within budget, or none, prove nothing, so the cell stays INCONCLUSIVE;
+    # a malformed survivor does not raise.
+    broken = _pair()
+    broken["no_loss"] = None
+    unsure = _pair(counter_reset=_RESET, ok=False, inconclusive=True)
+    for survivors in ([_remote_band(7), _pair()], [broken], [unsure], [], None):
         control = bb._failed_cell_record(_cell(), "boom", survivors)
         assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
 

@@ -378,19 +378,21 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
     ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
     say, or says something its own numbers contradict (BACKLOG #5574): a missing or malformed field
     must not clear the arm. The verdict is read, never worked out again here, because only the band
-    knows the budget argument it passed (connscale-remote computes it with the same ``_excusal`` call
-    ``_reconcile`` makes); the check here is only that ``over_budget`` is ``unconfirmed > budget``,
-    the comparison ``_excusal`` makes. The numbers must also agree with the rest of the report: neither
-    is negative, the unconfirmed count is no more than the band's ``traffic.timeouts`` (``_excusal``
-    takes it out of them), and a band over budget did not call its own verdict INCONCLUSIVE, since
-    the band's ``_reconcile`` counts that arm as a proven loss.
+    knows the budget argument it passed (connscale-remote publishes the excusal its
+    ``_reconcile_judged`` verdict rests on); the check here is only that ``over_budget`` is
+    ``unconfirmed > budget``, the comparison ``_excusal`` makes. The numbers must also agree with
+    the rest of the report: neither is negative, and the unconfirmed count is no more than the
+    band's ``traffic.timeouts``, which ``_excusal`` takes it out of.
     """
-    no_loss = report.get("no_loss", {})
+    no_loss = report.get("no_loss")
+    traffic = report.get("traffic")
+    if not isinstance(no_loss, Mapping) or not isinstance(traffic, Mapping):
+        return None, ""
     stranding = no_loss.get("stranding")
     if not isinstance(stranding, Mapping):
         return None, ""
     over, unconfirmed, budget = (stranding.get(k) for k in ("over_budget", "unconfirmed", "budget"))
-    timeouts = report.get("traffic", {}).get("timeouts")
+    timeouts = traffic.get("timeouts")
     if (
         not isinstance(over, bool)
         # Each isinstance is spelled out so the comparisons below are typed; bool is an int subtype.
@@ -402,7 +404,6 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
         or unconfirmed < 0
         or budget < 0
         or unconfirmed > timeouts
-        or (over and no_loss.get("inconclusive") is not False)
     ):
         return None, ""
     if not over:
@@ -412,6 +413,20 @@ def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
         f"band at engine index {band}: {unconfirmed} unconfirmed sends exceed its stranding budget "
         f"({budget}) — systemic no-ACK fault, judged on that band's client counters alone"
     )
+
+
+def _band_client_only_loss(report: Mapping[str, Any]) -> bool:
+    """The band's own reconcile proved a loss while it judged no engine-delta arm (the counters
+    reset, or it could not read the engine), so only its client-counter arms ran, and no other band
+    can correct those. The condition :func:`aggregate_cell_record` counts as ``client_lost``."""
+    no_loss = report.get("no_loss")
+    if not isinstance(no_loss, Mapping):
+        return False
+    backlog = no_loss.get("backlog")
+    engine_unjudged = no_loss.get("counter_reset") is not None or (
+        isinstance(backlog, int) and backlog < 0
+    )
+    return engine_unjudged and no_loss.get("ok") is False and no_loss.get("inconclusive") is False
 
 
 def aggregate_cell_record(
@@ -710,13 +725,13 @@ def _failed_cell_record(
     """A cell whose >= 6 sink-PROCESS fleet could not be driven or aggregated (a crashed remote band, an
     empty/short fleet, a fleet that sent nothing, a null engine gauge), materialised as an EXPLICIT
     failed :class:`ConnScaleRecord` (``no_loss.ok = False``, zero throughput) tagged with the cell's
-    A/B arm. It is INCONCLUSIVE, not LOSS (BACKLOG #5574): the cell measured nothing, so nothing
-    proved a message lost, which is how the reconcilers label a step that sent nothing. It fails
-    closed all the same.
+    A/B arm. It fails closed whatever it is labelled.
 
-    ``survivors`` are the band reports that did come back. A band among them over its own stranding
-    budget (:func:`_band_stranding`) proved a loss that no other band can correct, so the cell is
-    LOSS, not INCONCLUSIVE, and says which band.
+    It is INCONCLUSIVE (BACKLOG #5574) unless a band that did report proved a loss no other band can
+    correct: the cell measured nothing as a whole, which is how the reconcilers label a step that
+    sent nothing. ``survivors`` are the band reports that came back. A band among them over its own
+    stranding budget (:func:`_band_stranding`), or one whose own reconcile proved a loss on client
+    counters alone (:func:`_band_client_only_loss`), makes the cell LOSS, and the detail says so.
 
     It surfaces in the ``zero_loss`` SLO (``all(r.no_loss.ok …)`` turns False) and, because it carries the
     cell's ``batch_handoff_statements``/``fuse_thread_hops``/``claim_mode`` tags, in the B0/B1 batch
@@ -724,7 +739,17 @@ def _failed_cell_record(
     band FAILS the cell loudly instead of vanishing from the no-loss accounting — the same "fail the step,
     never drop it" posture the connscale runner takes. ``drain_seconds=None`` poisons the worst-case
     drain (a cell that never ran never drained)."""
-    proven = [why for over, why in map(_band_stranding, survivors or []) if over]
+    proven: list[str] = []
+    for r in survivors or []:
+        over, why = _band_stranding(r)
+        if over:
+            proven.append(why)
+        elif _band_client_only_loss(r):
+            band = escape_for_terminal(str(r.get("engine_index_base", "?")), single_line=True)
+            proven.append(
+                f"band at engine index {band} proved a loss on client counters alone (its engine "
+                f"arms were not judged) — see the band report"
+            )
     no_loss = NoLoss(
         ok=False,
         sent=0,
@@ -1065,9 +1090,10 @@ def _ready_number[N: (int, float)](
 class CellFleetFailed(ConnScaleError):
     """A band of one cell's fleet raised. ``reports`` are the reports its sibling bands wrote."""
 
-    def __init__(self, message: str, reports: list[dict[str, Any]]) -> None:
+    def __init__(self, message: str, reports: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
-        self.reports = reports
+        # A default, so a copy or unpickle that rebuilds the error from its message alone works.
+        self.reports = reports or []
 
 
 async def _drive_cell_fleet(

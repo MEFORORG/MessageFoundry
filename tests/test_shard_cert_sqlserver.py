@@ -174,8 +174,25 @@ def test_reset_store_empties_a_seeded_store_on_a_real_server() -> None:
         finally:
             await store.close()
 
+    async def unseed() -> None:
+        # Children first, for the foreign key; a no-op once the reset has emptied both tables.
+        store = await open_store()
+        try:
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute("DELETE FROM queue WHERE id = ?", ("reset-seed-q1",))
+                await cur.execute("DELETE FROM messages WHERE id = ?", ("reset-seed-1",))
+                await conn.commit()
+        finally:
+            await store.close()
+
+    # A seed left by an earlier failed run would refuse this one's on its primary key.
+    asyncio.run(unseed())
     asyncio.run(seed())
-    # The control: the read-back finds the seeded rows before the reset.
-    assert {"messages", "queue"} <= set(asyncio.run(leftovers()))
-    asyncio.run(shardcert._reset_store(env))
-    assert asyncio.run(leftovers()) == []
+    try:
+        # The control: the read-back finds the seeded rows before the reset.
+        assert {"messages", "queue"} <= set(asyncio.run(leftovers()))
+        asyncio.run(shardcert._reset_store(env))
+        assert asyncio.run(leftovers()) == []
+    finally:
+        asyncio.run(unseed())

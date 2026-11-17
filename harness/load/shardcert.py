@@ -1232,10 +1232,11 @@ async def _await_port(host: str, port: int, *, timeout: float) -> bool:
 #: The tables :func:`_reset_store` empties, children before ``messages`` (``queue`` and ``response``
 #: carry a foreign key to it, and SQL Server refuses a DELETE while a row still refers to it). The names
 #: are spliced into T-SQL, so this must stay a LITERAL constant: never build it from settings or input.
-#: It covers every table a certification verdict reads: this module's store-truth scan and the engine's
-#: ``/stats`` read ``queue`` alone (tests/test_shardcert_pass_bars.py pins that). ``message_events`` is
-#: left out on purpose: no verdict here reads it, and scripts/bench/stage_residency.py segments a
-#: climb's rungs out of it, which needs every rung's rows kept (BACKLOG #5576).
+#: This module's store-truth scan and the store methods behind the engine's ``/stats`` read ``queue``
+#: alone, and tests/test_shardcert_pass_bars.py fails if their SQL names a table missing here.
+#: ``message_events`` is left out on purpose: no verdict here reads it, and
+#: scripts/bench/stage_residency.py segments a climb's rungs out of it, which needs every rung's rows
+#: kept (BACKLOG #5576).
 _RESET_TABLES = (
     "queue",
     "response",
