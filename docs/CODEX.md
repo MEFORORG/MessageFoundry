@@ -35,7 +35,7 @@ command that cannot start, a defect of its own such as an unsupported handler
 type or shell, or a defect in its group, such as a matcher that is not a valid
 regex, that keeps it from running. Any other hook failure is a
 non-blocking error, except where the PowerShell tail below exits 2. The bridge
-reports it on stderr and as a `systemMessage`, naming the hook, ignores that
+reports it on stderr and as a `systemMessage`, ignores that
 hook's output, and runs the remaining hooks. A JSON
 `permissionDecision` deny from a hook is a decision, not a failure, and is passed
 on as before.
@@ -66,10 +66,7 @@ When `pwsh` itself cannot start, nothing reports it: the line would exit 0 under
 Windows PowerShell 5.1, which proceeds as if every hook passed, 9009 under `cmd`
 and 127 under `sh`; this is reasoned, not measured.
 
-At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
-reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
-lost when another hook on the same event exited non-zero, which raised before
-the merged result was printed. **A future guard that must block when it fails sets
+**A future guard that must block when it fails sets
 `"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
 launcher with no decision, or a bridge fault, such as a payload with no session
 id, never blocks.
