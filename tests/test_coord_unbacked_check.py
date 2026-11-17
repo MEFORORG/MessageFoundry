@@ -1165,6 +1165,7 @@ def test_a_FAILED_remote_listing_is_unverifiable_never_no_remote(
     assert r.returncode == 2, r.stdout + r.stderr
     assert "git FAILED for: (remote listing)" in r.stdout
     assert "NO-REMOTE" not in r.stdout
+    assert "0 of 0 configured" not in r.stdout, r.stdout
 
 
 @pytest.mark.parametrize("name", ["wt-é", "wt-e"], ids=["non-ascii", "ascii"])

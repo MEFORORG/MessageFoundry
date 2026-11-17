@@ -518,13 +518,16 @@ def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     assert got == state
 
 
-@pytest.mark.parametrize(("hours_ahead", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN")])
+@pytest.mark.parametrize(
+    ("hours_ahead", "state"), [(0, "UNREADABLE"), (48, "UNKNOWN"), (-1, "UNREADABLE")]
+)
 def test_a_callers_now_ages_the_anonymous_records(
     config_root: Path, tmp_path: Path, hours_ahead: int, state: str
 ) -> None:
     """box-activity.ps1 passes its own -Now. A fresh record naming no session vetoes at the real
     time and has aged out 48 hours later, by the caller's clock rather than the wall clock. A
-    nullable -Now read through .Value threw here under StrictMode."""
+    nullable -Now read through .Value threw here under StrictMode. A record written after a clock
+    taken an hour ago is the freshest kind: it used to read as future-dated and drop out."""
     wt = tmp_path / "wt-now"
     _anonymous(config_root, "99017.json", {"startedAt": NOW_MS, "cwd": str(wt)})
     got = _strict(

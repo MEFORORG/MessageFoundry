@@ -117,7 +117,8 @@
     is not the same as landed, and this measures durability only. A remote is trusted when it
     answered the probe with at least one branch or tag, and of its tracking refs only those its
     fetch refspecs map back to a branch or tag it advertised (a tracking ref whose branch was deleted
-    there backs nothing). With -SkipReachability, or when none answered (UNVERIFIABLE), every
+    there backs nothing), plus, unchecked, those a refspec maps to a source outside refs/heads/ and
+    refs/tags/, which the probe does not list. With -SkipReachability, or when none answered (UNVERIFIABLE), every
     non-symref remote-tracking ref still excludes; in the UNVERIFIABLE case no patch-id match is read
     from them, so a squash-landed branch counts in that floor.
 
@@ -753,6 +754,8 @@ if ($SkipReachability) {
 } else {
     $reach = ($repos | Measure-Object -Property RemotesReachable -Sum).Sum
     $conf = ($repos | Measure-Object -Property RemotesConfigured -Sum).Sum
+    # Measure-Object sums a null as 0, and a failed `git remote` is not zero remotes.
+    if ($repos | Where-Object { $null -eq $_.RemotesConfigured }) { $conf = "$conf or more (git remote failed)" }
     Write-Host "           $reach of $conf configured remote(s) answered$(if ($repos | Where-Object { $_.RemotesEmpty.Count -gt 0 }) { ' (a remote that answered with no refs is not counted)' })"
     # Named, because a branch held only by one of these reads as "exist on no remote" above, and
     # the remedy for that is restoring the remote, not a rescue push.

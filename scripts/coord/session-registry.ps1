@@ -327,10 +327,13 @@ function Get-AnonymousSessionRecords {
         $state = (Test-RecordLiveness -Record $r.Record -StartSkewMinutes $StartSkewMinutes).State
         if ($state -in @('DEAD', 'STALE')) { continue }
         $item = Get-Item -LiteralPath $r.File -Force -EA SilentlyContinue
+        # A future value is judged against the wall clock, never -Now: a record written after the
+        # caller took its clock is the freshest kind, and ages 0 rather than dropping out.
+        $wall = [DateTime]::UtcNow.AddMinutes(1)
         $times = @((Get-RecordStartedUtc $r.Record), $(if ($item) { $item.LastWriteTimeUtc })) |
-            Where-Object { $null -ne $_ -and $_ -le $now.AddMinutes(1) }
+            Where-Object { $null -ne $_ -and $_ -le $wall }
         $ageH = if (-not $item) { 0 }
-                elseif ($times) { ($now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours }
+                elseif ($times) { [math]::Max(0, ($Now - ($times | Sort-Object -Descending | Select-Object -First 1)).TotalHours) }
                 else { [double]::PositiveInfinity }
         $cwd = Get-RecordField $r.Record 'cwd'
         $out += [pscustomobject]@{
@@ -356,7 +359,8 @@ function Test-AnonymousRecordReaches {
     if (-not $Anonymous.Cwd -or -not $w) { return $true }
     $c = $Anonymous.Cwd
     if (($c -eq $w) -or $c.StartsWith($w + '\', 'Ordinal')) { return $true }
-    return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath (Join-Path $c '.git'))
+    # A string, not Join-Path, which throws on a drive this process does not have.
+    return $w.StartsWith($c + '\', 'Ordinal') -and (Test-Path -LiteralPath "$c\.git")
 }
 
 # Look one session up by id (full or unique prefix) and fence it.
