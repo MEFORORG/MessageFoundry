@@ -2249,18 +2249,23 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 #
 # BACKLOG #5346 extended this DENYLIST rather than narrowing the gate to an allowlist of read tokens:
 # a SELECT names arbitrary tables, columns and functions, so an allowlist of words cannot be written,
-# and a grammar-level allow shape is a SQL parser, which this gate says it is not. The extension is
-# every T-SQL statement verb that can follow a SELECT with no `;` and change state on the pooled
-# autocommit connection or beyond it: `SET` (`SET IMPLICIT_TRANSACTIONS ON` would leave every later
-# lookup on that connection in an open transaction), `USE` and `SETUSER` (session database and
-# identity), `COMMIT`/`ROLLBACK`/`SAVE` (transaction control, as `BEGIN` is), `SEND` and `MOVE`
-# (Service Broker), `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `DBCC`, `RECONFIGURE`, `CHECKPOINT`,
-# `ADD` (`ADD SIGNATURE`) and `ENABLE`/`DISABLE` (`... TRIGGER`). `OPENROWSET`, `OPENDATASOURCE`
-# and `OPENQUERY` are refused too, though they sit inside a read's FROM: each sends a pass-through
-# query this scan cannot read to another server or provider, and `OPENROWSET(BULK ...)` reads a
-# server-side file. PostgreSQL and MySQL need a `;` between statements, which rule 3 refuses, so their
-# own statement verbs are not listed. Fail-closed costs at least a MySQL `USE INDEX` hint, a MySQL
-# `CHARACTER SET` cast and any unquoted name spelled like one of these words; quote such a name.
+# and a grammar-level allow shape is a SQL parser, which this gate says it is not. The extension
+# covers at least these T-SQL verbs that can follow a SELECT with no `;` and change state on the
+# pooled autocommit connection or beyond it: `SET` (`SET IMPLICIT_TRANSACTIONS ON` would leave every
+# later lookup on that connection in an open transaction), `USE` and `SETUSER` (session database and
+# identity), `REVERT`, `COMMIT`/`ROLLBACK`/`SAVE` (transaction control, as `BEGIN` is),
+# `DECLARE`/`OPEN`/`CLOSE`/`DEALLOCATE` (a global cursor, or an opened symmetric or master key, would
+# outlive the lookup on the pooled connection), `RAISERROR` (`WITH LOG` writes the server error log),
+# `SEND` and `MOVE` (Service Broker), `BACKUP`, `RESTORE`, `KILL`, `SHUTDOWN`, `DBCC`, `RECONFIGURE`,
+# `CHECKPOINT`, `ADD` (`ADD SIGNATURE`) and `ENABLE`/`DISABLE` (`... TRIGGER`). It is not proved to be
+# every such verb; one it lacks passes. `OPENROWSET`, `OPENDATASOURCE` and `OPENQUERY` are refused
+# too, though they sit inside a read's FROM: each sends a pass-through query this scan cannot read to
+# another server or provider, and `OPENROWSET(BULK ...)` reads a server-side file. PostgreSQL and
+# MySQL need a `;` between statements, which rule 3 refuses, so their own statement verbs are not
+# listed. Fail-closed costs at least a read through `OPENQUERY` or `OPENROWSET`, a T-SQL
+# `OPTION (USE HINT(...))` or `USE PLAN` hint, a MySQL `USE INDEX` hint, a MySQL `CHARACTER SET`
+# cast, and any unquoted name spelled like one of these words, at least the names `send`, `move`,
+# `enable`, `disable`, `open` and `close`, which T-SQL does not reserve; quote such a name.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
         "ADD",
@@ -2268,9 +2273,12 @@ _SQL_WRITE_KEYWORDS = frozenset(
         "BACKUP",
         "BEGIN",
         "CHECKPOINT",
+        "CLOSE",
         "COMMIT",
         "CREATE",
         "DBCC",
+        "DEALLOCATE",
+        "DECLARE",
         "DELETE",
         "DENY",
         "DISABLE",
@@ -2284,12 +2292,15 @@ _SQL_WRITE_KEYWORDS = frozenset(
         "KILL",
         "MERGE",
         "MOVE",
+        "OPEN",
         "OPENDATASOURCE",
         "OPENQUERY",
         "OPENROWSET",
+        "RAISERROR",
         "RECEIVE",
         "RECONFIGURE",
         "RESTORE",
+        "REVERT",
         "REVOKE",
         "ROLLBACK",
         "SAVE",

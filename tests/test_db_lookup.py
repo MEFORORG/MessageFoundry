@@ -717,6 +717,13 @@ _STATE_CHANGING_TSQL = [
     ("SELECT 1 ADD SIGNATURE TO p BY CERTIFICATE c", "ADD"),
     ("SELECT 1 DISABLE TRIGGER t ON patients", "DISABLE"),
     ("SELECT 1 ENABLE TRIGGER t ON patients", "ENABLE"),
+    ("SELECT 1 REVERT", "REVERT"),
+    ("SELECT 1 DECLARE c CURSOR GLOBAL FOR SELECT 1", "DECLARE"),
+    ("SELECT 1 OPEN SYMMETRIC KEY k DECRYPTION BY CERTIFICATE c", "OPEN"),
+    ("SELECT 1 CLOSE ALL SYMMETRIC KEYS", "CLOSE"),
+    ("SELECT 1 DEALLOCATE c", "DEALLOCATE"),
+    ("SELECT 1 RAISERROR('x', 10, 1) WITH LOG", "RAISERROR"),
+    # Already in the set before #5346 (BACKLOG #5259); pinned here because the row names it.
     ("SELECT 1 WRITETEXT t.c @p 'x'", "WRITETEXT"),
     ("SELECT * FROM OPENROWSET('SQLNCLI', 's', 'DELETE FROM p')", "OPENROWSET"),
     ("SELECT * FROM OPENQUERY(linked, 'DELETE FROM p')", "OPENQUERY"),
@@ -729,7 +736,7 @@ _STATE_CHANGING_TSQL = [
 def test_a_state_changing_tsql_verb_after_a_select_is_refused(
     stmt: str, keyword: str, dialect: str
 ) -> None:
-    """BACKLOG #5346. Each passed onto the autocommit lookup pool before: none was in the set.
+    """BACKLOG #5346. Each but the WRITETEXT case passed onto the autocommit lookup pool before.
     Red mutation: drop any one keyword from `_SQL_WRITE_KEYWORDS`. Its case reds."""
     with pytest.raises(DbLookupError, match=f"found a '{keyword}' keyword"):
         database._require_read_only(stmt, dialect=dialect)
@@ -747,6 +754,21 @@ def test_an_odbc_call_escape_after_a_select_is_refused(stmt: str) -> None:
 def test_a_quoted_name_spelled_like_a_new_keyword_is_still_read() -> None:
     """Control for #5346: the refusal is of the bare word, so a quoted name passes."""
     database._require_read_only('SELECT [set], "use", [backup] FROM t WHERE [kill] = 1')
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        "SELECT mrn FROM p OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL'))",
+        "SELECT * FROM OPENQUERY(clarity, 'SELECT pat_id FROM patient')",
+        "SELECT open, close FROM prices",
+    ],
+)
+def test_the_documented_fail_closed_costs_of_5346_are_refused(stmt: str) -> None:
+    """Pins the costs the keyword-set comment and docs/CONNECTIONS.md name, so a change that admits
+    one of them updates both. Red mutation: drop `USE`, `OPENQUERY` or `OPEN`."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt)
 
 
 _MYSQL_COMMENT_MISSES = [
