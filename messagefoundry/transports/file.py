@@ -142,9 +142,8 @@ class _Archived(NamedTuple):
     lasting: bool  # it stays for a reason judged not to clear by itself (:func:`_lasting`)
 
 
-# Failures that may clear by themselves (BACKLOG #5717). A reject whose move hit one is remembered with
-# the shorter ``STUCK_TRANSIENT_RETRY_SECONDS`` back-off, so it is tried again sooner, without spending
-# the per-tick budget. At
+# Failures that may clear by themselves (BACKLOG #5717): :func:`_lasting` reads a failed move that hit
+# one as not lasting, and FileSource._quarantine says what that means for the reject's retry. At
 # least: another process holds the file open or locked, the file vanished, the disk or quota is full,
 # or a share timed out or dropped. Any other failure (access denied, a read-only volume, a link) is
 # taken as lasting, and the file is examined again after ``STUCK_RETRY_SECONDS``, which bounds what a
@@ -227,8 +226,8 @@ SETTLE_MISS_LIMIT = 3
 # STUCK_RETRIES_PER_SCAN_MAX of them and often fewer (FileSource._retry_allowance), and spend none of
 # the per-tick budget, so they cannot crowd healthy drops out of a scan however many rejects are stuck.
 STUCK_RETRY_SECONDS = 300.0
-# The same wait for a reject whose move failed for a reason that may clear by itself (_lasting), such
-# as a full disk or a dropped share: shorter, so a recovery is picked up sooner, but long enough that
+# The shorter wait FileSource._quarantine gives a reject that stays after a move failure _lasting
+# reads as not lasting, such as a full disk or a dropped share: so a recovery is picked up sooner, but
 # such a reject is not read and scan-hooked again on every poll.
 STUCK_TRANSIENT_RETRY_SECONDS = 30.0
 STUCK_RETRIES_PER_SCAN_MAX = 100
@@ -1517,7 +1516,7 @@ class FileSource(SourceConnector):
             # mirroring the transient-read path). Logged, never a silent pass-through, and scoped to
             # THIS file so a scanner hiccup can't abort the whole tick's remaining candidates.
             logger.warning(
-                "file %s: pre-ingest scan hook errored (%s); leaving in place, will retry next scan",
+                "file %s: pre-ingest scan hook errored (%s); leaving in place, will retry on a later scan",
                 safe_name(path.name),
                 safe_exc(exc, file_name=path.name),
             )
@@ -1539,7 +1538,7 @@ class FileSource(SourceConnector):
             # (duplicates, acceptable — handlers are idempotent), but the file is NEVER moved with
             # only some of its messages emitted (no accept-and-drop of the tail).
             logger.warning(
-                "handler failed for %s (will retry next scan): %s",
+                "handler failed for %s (will retry on a later scan): %s",
                 safe_name(path.name),
                 safe_exc(exc, file_name=path.name),
             )
@@ -2112,10 +2111,10 @@ class FileSource(SourceConnector):
 
     @staticmethod
     def _log_unreadable(path: Path, exc: OSError) -> None:
-        """Transient (file locked / vanished mid-scan): the caller leaves it in place to retry next
-        scan rather than quarantining a healthy file. Logged, never silently swallowed."""
+        """Transient (file locked / vanished mid-scan): the caller leaves it in place to retry on a
+        later scan rather than quarantining a healthy file. Logged, never silently swallowed."""
         logger.warning(
-            "could not read %s (will retry next scan): %s",
+            "could not read %s (will retry on a later scan): %s",
             safe_name(path.name),
             safe_exc(exc, file_name=path.name),
         )
@@ -3806,8 +3805,8 @@ def _transient_stat_failure(exc: OSError) -> bool:
 def _lasting(exc: OSError, *, stage: Literal["file", "archive_dir", "archive"] = "file") -> bool:
     """Whether a failed move or delete is expected to fail the same way on the next scan, as opposed
     to clearing by itself (BACKLOG #5717). A guess either way: a wrong True delays the next attempt
-    by ``STUCK_RETRY_SECONDS``, and a wrong False retries the file after the shorter
-    ``STUCK_TRANSIENT_RETRY_SECONDS``, in the bounded retry pass.
+    by ``STUCK_RETRY_SECONDS``, and a wrong False may retry the file sooner, in the bounded retry
+    pass (:meth:`FileSource._quarantine` says when).
 
     A file replaced since the read is not lasting: the next scan reads the new one. A link is. A
     missing file is not. ``stage`` says where the failure came from: ``archive_dir`` is opening the
