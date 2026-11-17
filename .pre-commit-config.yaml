@@ -194,10 +194,9 @@ repos:
       # mechanism. Run `pre-commit run --all-files` once after creating the token file to confirm.
       #
       # `--` ends the options, so a staged file named `--path` or `--require-tokens` is scanned, not
-      # read as the flag. `types: [file]`, not `[text]`: pre-commit's text test calls UTF-16 binary.
-      # The scanner decodes text behind a UTF-16 or UTF-32 byte-order mark and BOM-less UTF-16 of the
-      # shape it tests, and judges any other file with NULs near its start by name and path only
-      # (BACKLOG #5585).
+      # read as the flag. `types: [file]`, not `[text]`: pre-commit's text test calls UTF-16 binary,
+      # and the scanner decides for itself which files it reads as text; `_read_text` in
+      # scripts/security/scan_forbidden.py holds the rule (BACKLOG #5585).
       - id: forbidden-content
         name: forbidden-content (customer/PHI leak guard)
         entry: python scripts/security/scan_forbidden.py

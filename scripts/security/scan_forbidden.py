@@ -2214,7 +2214,7 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
         what = (
             "does not exist"
             if exc.errno == errno.ENOENT
-            else "not a directory"
+            else "not a readable directory"
             if exc.errno == errno.ENOTDIR
             else f"unreadable directory ({why})"
         )
@@ -3185,8 +3185,8 @@ def main(argv: list[str]) -> int:
         print(
             f"scan_forbidden: examined {scanned} file(s) across {len(paths)} named path(s); "
             f"{unread} more were binary, not regular files, unreadable or under a forbidden path, "
-            "so their content "
-            f"was not scanned, and {unlisted} director(ies) could not be listed.",
+            f"so their content was not scanned, and {unlisted} named path(s) or director(ies) "
+            "under them could not be walked.",
             file=sys.stderr,
         )
 
