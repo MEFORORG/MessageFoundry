@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import bisect
 import codecs
+import errno
 import hashlib
 import importlib.util
 import io
@@ -2119,12 +2120,20 @@ def test_a_snapshot_shaped_like_a_bare_repository_is_still_walked_whole(
         sf_main._ls_files(root)
 
 
-def test_an_untracked_copy_inside_a_work_tree_is_walked_whole(sf_main, tmp_path: Path) -> None:
-    """A directory git tracks nothing under, inside some work tree, is a copy of content git cannot
-    describe, so its build directories are read."""
+def test_an_untracked_root_inside_a_work_tree_prunes_build_directories_by_name(
+    sf_main, tmp_path: Path
+) -> None:
+    """A --path root git tracks nothing under, inside a work tree, skips SKIP_DIRS by name, as
+    origin/main's walk did. The walk read them whole, a virtual environment included."""
     root = _git_tree(
-        tmp_path / "tree", {"ok.md": "fine\n"}, {"copy/build/leak.md": "contact ACME\n"}
+        tmp_path / "tree",
+        {"ok.md": "fine\n"},
+        {"copy/ok.md": "fine\n", "copy/.venv/leak.md": "contact ACME\n"},
     )
+    assert sf_main._tracked_under(root / "copy") == set()
+    assert sf_main.main(["--path", str(root / "copy")]) == 0
+    # The control: the same file outside a skipped directory is read.
+    (root / "copy" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
     assert sf_main.main(["--path", str(root / "copy")]) == 1
 
 
@@ -3080,18 +3089,19 @@ def test_a_named_path_under_a_forbidden_location_keeps_its_location_hit(
     assert err.count("docs/security/model.md:0: ") == 2, err
 
 
-def test_a_location_hit_names_the_root_relative_path(
+def test_a_location_hit_names_the_root_in_a_multi_root_scan(
     sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A --path walk reported a forbidden location by its absolute path, which can carry a user-home
-    path; every other hit is root-relative."""
-    root = tmp_path / "tree"
-    (root / "docs" / "security").mkdir(parents=True)
-    (root / "docs" / "security" / "note.md").write_text("fine\n", encoding="utf-8")
-    assert sf_main.main(["--path", str(root)]) == 1
+    """The branch leak scan walks one root per pushed commit, named by its SHA. A location hit names
+    the root it sits under, as origin/main's did, so the report says which commit holds it."""
+    roots = [tmp_path / "snap" / sha for sha in ("a" * 40, "b" * 40)]
+    for root in roots:
+        (root / "docs" / "security").mkdir(parents=True)
+        (root / "docs" / "security" / "note.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", *map(str, roots)]) == 1
     err = capsys.readouterr().err
-    assert "  docs/security/note.md:0: " in err, err
-    assert str(tmp_path) not in err.split("FORBIDDEN CONTENT", 1)[-1], err
+    for sha in ("a" * 40, "b" * 40):
+        assert f"{sha}/docs/security/note.md:0: " in err, err
 
 
 #: #5582 item 2: an HTML tag before a verdict, gap or map. Each fires; the control below keeps a leading
@@ -3199,12 +3209,21 @@ def test_a_repository_config_fsmonitor_command_is_not_run(
     index, so every git call the scanner makes overrides it."""
     root = _git_tree(tmp_path / "tree", {"ok.md": "fine\n"}, {})
     marker = tmp_path / "marker"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     subprocess.run(
         ["git", "-C", str(root), "config", "core.fsmonitor", f"echo x > '{marker.as_posix()}'"],
         check=True,
         timeout=60,
-        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        env=env,
     )
+    # The negative control: without the override, the same listing runs the command.
+    subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=60, env=env
+    )
+    assert marker.exists(), (
+        "the configured fsmonitor command did not run, so this test shows nothing"
+    )
+    marker.unlink()
     _no_git_location_env(monkeypatch)
     monkeypatch.chdir(root)
     assert sf_main.main(args) == 0
@@ -3263,3 +3282,50 @@ def test_the_tracked_scan_lists_the_repository_git_dir_names(
     monkeypatch.chdir(root)
     monkeypatch.setenv("GIT_DIR", str(git_dir))
     assert sf_main.main([]) == 1
+
+
+@pytest.mark.parametrize("how", ["on-disk", "simulated"])
+def test_a_tracked_file_under_a_directory_replaced_by_a_file_is_passed_over(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """A tracked ``a/b.md`` whose ``a`` is now a regular file: POSIX lstat raises ENOTDIR, not ENOENT,
+    and the tracked scan failed with exit 2 where origin/main passed it over. ``simulated`` raises
+    ENOTDIR on every platform, since Windows reports the on-disk case as ENOENT."""
+    root = _git_tree(tmp_path / "tree", {"ok.md": "fine\n", "a/b.md": "fine\n"}, {})
+    (root / "a" / "b.md").unlink()
+    (root / "a").rmdir()
+    (root / "a").write_text("fine\n", encoding="utf-8")
+    _no_git_location_env(monkeypatch)
+    monkeypatch.chdir(root)
+    if how == "simulated":
+        gone = Path("a/b.md")
+        real_lstat = Path.lstat
+
+        def lstat(self: Path) -> os.stat_result:
+            if self == gone:
+                raise NotADirectoryError(errno.ENOTDIR, "not a directory", str(self))
+            return real_lstat(self)
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+    assert sf_main.main([]) == 0
+
+
+def test_a_walked_directory_replaced_by_a_file_is_passed_over(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory the walk listed that is a file by the time it is opened raises ENOTDIR, and is
+    passed over as one removed since it was listed is, as origin/main's rglob did."""
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "x.md").write_text("fine\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    sub = root / "sub"
+    real = os.scandir
+
+    def refuse(path=".", *args, **kwargs):
+        if Path(os.fsdecode(path)) == sub:
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", os.fsdecode(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    assert sf_main.main(["--path", str(root)]) == 0

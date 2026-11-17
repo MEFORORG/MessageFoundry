@@ -51,9 +51,10 @@ Token-file format (sectioned; ``#`` comments and blank lines ignored):
   [site_prefix]  one numeric prefix per line; the detector matches PREFIX + four digits.
 
 Usage:
-  scan_forbidden.py [FILE ...]      # scan the given files; after a ``--`` every argument is a file,
+  scan_forbidden.py [FILE ...]      # scan the given files; after a ``--`` every argument is a path,
                                     #   never an option (how pre-commit invokes it)
-  scan_forbidden.py --path DIR      # scan every text file under DIR
+  scan_forbidden.py --path DIR      # scan the files under DIR, less the build and environment
+                                    #   directories ``_walk`` prunes
   scan_forbidden.py --show-context ...  # FIRST argument only; also print the matched line/value (NEVER used in CI -- a hit
                                     #   means the content already sits in a tracked file, so echoing
                                     #   it would copy the leak into public CI logs; default is
@@ -1490,8 +1491,7 @@ _SITE_SKIP_NAMES = {
 #: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
 #: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
 #: in ``--path`` mode only, as ``_walk`` describes; there a tracked file is pruned too where git
-#: cannot list the tracked files. The tracked and staged scans read every file they name, whatever
-#: directory it sits in (BACKLOG #5585).
+#: cannot list the tracked files. The tracked and staged scans prune no directory (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -2146,6 +2146,10 @@ _GIT_LOCATION_ENV = frozenset(
     {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE"}
 )
 
+#: The errnos that mean a path is not there. POSIX gives ENOTDIR, not ENOENT, for ``a/b.md`` when
+#: ``a`` is a regular file, as it is when a tracked directory was replaced by a file.
+_GONE = frozenset({errno.ENOENT, errno.ENOTDIR})
+
 
 def _path_key(rel: str) -> str:
     """A root-relative path as the walk compares it with git's list: NFC and case-folded, because a
@@ -2159,14 +2163,14 @@ def _git_tracked() -> list[str]:
 
 
 def _tracked_under(root: Path) -> set[str] | None:
-    """The files git tracks under ``root``, relative to it, an empty set, or ``None``.
+    """The files git tracks under ``root``, relative to it, possibly none, or ``None``.
 
-    ``None`` when no directory from ``root`` up holds a ``.git`` entry, and git is then not run (a
-    pushed commit's snapshot written outside any work tree is such a root, and a snapshot inside one
-    is not told apart from the work tree); and when git tracks no file under
-    ``root``, which is then an untracked copy of content that cannot be told apart. ``None`` prunes
-    nothing. An empty set when git is not on PATH or fails, such as when it refuses the directory: the
-    walk then prunes SKIP_DIRS by name, tracked or not, as it did before git was asked."""
+    ``None`` when no directory from ``root`` up holds a ``.git`` entry, and git is then not run: a
+    pushed commit's snapshot written outside any work tree is such a root, and ``None`` prunes
+    nothing (BACKLOG #5595). A snapshot inside a work tree is not told apart from the work tree. An
+    empty set when git tracks no file under ``root``, and when git is not on PATH or fails, such as
+    when it refuses the directory: the walk then prunes SKIP_DIRS by name, as it did before git was
+    asked, and in the failure case tracked files are pruned with them."""
     resolved = root.resolve()
     if not root.is_dir() or not any((d / ".git").exists() for d in (resolved, *resolved.parents)):
         return None
@@ -2179,16 +2183,16 @@ def _tracked_under(root: Path) -> set[str] | None:
             file=sys.stderr,
         )
         return set()
-    return tracked or None
+    return tracked
 
 
 def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
     SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
-    files it does not list; where git cannot list them, by name, tracked files included; outside a
-    work tree, or under a root git tracks nothing under, not at all. ``.git`` is always pruned. A
-    directory the walk cannot list is reported in ``errors``,
-    where ``rglob`` used to drop it without a word."""
+    files it does not list, so by name under a root git tracks nothing under; where git cannot list
+    them, by name, tracked files included; outside a work tree, not at all. ``.git`` is always
+    pruned. A directory the walk cannot list is reported in ``errors``, where ``rglob`` used to drop
+    it without a word."""
     root = Path(raw)
     tracked = _tracked_under(root)
     tracked_dirs = {
@@ -2196,17 +2200,17 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     }
 
     def refused(exc: OSError) -> None:
-        # Root-relative, as every hit is: the absolute form can carry a user-home path. The root itself
-        # is named as the caller wrote it.
+        # Root-relative, as a content hit is: the absolute form can carry a user-home path. The root
+        # itself is named as the caller wrote it.
         try:
             name = Path(os.fsdecode(exc.filename)).relative_to(root).as_posix()
         except (TypeError, ValueError):
             name = "."
-        if name != "." and exc.errno == errno.ENOENT:
+        if name != "." and exc.errno in _GONE:
             return  # Removed after it was listed (a cache cleared mid-walk): nothing left to read.
         name = raw if name == "." else name
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-        what = "does not exist" if exc.errno == errno.ENOENT else f"unreadable directory ({why})"
+        what = "does not exist" if exc.errno in _GONE else f"unreadable directory ({why})"
         errors.append(f"{name}/:0: {what}, so its files were not scanned (fail closed)")
 
     for top, dirs, files in os.walk(root, onerror=refused):
@@ -2352,9 +2356,13 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
 def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
-    non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit."""
+    non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit.
+
+    A location hit names ``path``, the root the caller wrote joined to ``posix``, so in a scan of
+    several roots it names the root (the branch leak scan's commit directory). Under an absolute root
+    that path can carry a user-home path."""
     if reason := forbidden_path_reason(posix):
-        return [f"{posix}:0: {reason}"], True
+        return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
     # filename, and a module need not repeat its own name in its text. Placed before the binary
@@ -3029,7 +3037,7 @@ def main(argv: list[str]) -> int:
     # Anywhere else ``_parse_require_flag`` refuses it.
     show_context = bool(argv) and argv[0] == "--show-context"
     rest = argv[1:] if show_context else list(argv)
-    # Everything after the first ``--`` is a file or directory to scan, never an option, so a staged
+    # Everything after the first ``--`` is a path operand, never an option, so a staged
     # file named ``--path`` or ``--require-tokens`` is scanned rather than read as the flag. pre-commit
     # passes ``--`` ahead of the staged names for that reason (BACKLOG #5585).
     operands: list[str] = []
@@ -3106,17 +3114,18 @@ def main(argv: list[str]) -> int:
     unread = 0
     unreadable = len(hits)
     for abs_path, rel in candidates:
-        # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans read
-        # every file they name.
+        # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
+        # directory.
         if _is_skipped(rel):
             continue
         if not abs_path.is_file():
             # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,
-            # an lstat of the entry itself that fails other than ENOENT fails the run. In
-            # staged mode (any path named on the command line, with or without ``--``, outside --path)
-            # a directory, a link to a directory, a link whose target cannot be stat'ed, or a missing
-            # name also fails the run. ENOENT is passed over in the --path walk (removed since it was
-            # listed) and in the tracked scan (deleted in the work tree). Anything else whose lstat
+            # an lstat of the entry itself that fails other than ENOENT or ENOTDIR (_GONE) fails the
+            # run. In staged mode (any path named on the command line, with or without ``--``, outside
+            # --path) a directory, a link to a directory, a link whose target cannot be stat'ed, or a
+            # missing name also fails the run. _GONE is passed over in the --path walk (removed since
+            # it was listed) and in the tracked scan (deleted in the work tree, or under a directory
+            # replaced by a file). Anything else whose lstat
             # succeeds, such as a FIFO, or outside staged mode a dangling link, is judged by its path
             # and name only; the walk never lists a link to a directory, so that is not judged. Every
             # entry that reaches the hits is also judged by its path and name.
@@ -3135,11 +3144,11 @@ def main(argv: list[str]) -> int:
                             reason = f"a link whose target cannot be stat'ed ({why})"
             except OSError as exc:
                 # Gone since it was listed, or a tracked file deleted in the work tree.
-                if exc.errno == errno.ENOENT and (path_mode or not paths):
+                if exc.errno in _GONE and (path_mode or not paths):
                     continue
                 reason = (
                     "does not exist"
-                    if exc.errno == errno.ENOENT
+                    if exc.errno in _GONE
                     else f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
                 )
             unread += 1
