@@ -582,8 +582,9 @@ class ReferenceSyncRunner:
             refuse_bool_literals(spec.source.settings, f"reference set {spec.name!r}")
         except WiringError as exc:
             # Vault BACKLOG #3139: sync_all logs only the error class, since a source error can hold
-            # a reference key. This refusal's text is config only: the set's name, the flag and a
-            # type name, never a value or the reason. So it is logged whole, or the operator learns
+            # a reference key. These refusals' text is config only: the set's name, the setting, a
+            # type name and a fixed remedy, never a value or the reason. So it is logged whole, or
+            # the operator learns
             # nothing beyond "WiringError".
             # The text already leads with "reference set '<name>': ", so it is not repeated.
             log.error("%s (not synced)", exc)
