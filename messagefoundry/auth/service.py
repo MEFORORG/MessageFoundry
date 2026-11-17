@@ -3036,6 +3036,18 @@ def _log_totp_refused(username: str) -> None:
     )
 
 
+def _log_combined_totp_defect(user_id: str, exc: Exception) -> None:
+    """Log a defect the combined sign-in met reading or checking a TOTP code (BACKLOG #5335): by
+    the exception's type name and the account id, never its text, the username or a traceback, on a
+    path reachable with a username alone. The code is read as wrong."""
+    _log.error(
+        "combined sign-in: reading the TOTP secret of account id %r raised %s; the code is read as "
+        "wrong",
+        user_id,
+        type(exc).__name__,
+    )
+
+
 def _log_totp_malformed(username: str) -> None:
     """Log an account whose TOTP cell opens to a value that is not base32, so no code can be
     computed from it. Judged unknown rather than refused (BACKLOG #3422), so the gates still count it
@@ -4244,11 +4256,12 @@ class AuthService:
         # _lock_notice_held_back.
         self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
-        # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
-        # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
-        # never a live count evicted) and carried across a rotation by _rekey_token_state.
-        # PROCESS-LOCAL, with the same accepted caveat as _action_step_up_grants: a restart forgets the counts, and a topology
-        # that serves the API from more than one process gives each process its own budget.
+        # session, monotonic time of the first, the account's user id). At lockout_threshold the
+        # session is revoked, so a stolen session gets that many guesses in total however often the
+        # account lock expires. Bounded (_REPROOF_SESSION_MAX, never a live count evicted) and
+        # carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the same accepted
+        # caveat as _action_step_up_grants: a restart forgets the counts, and a topology that serves
+        # the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
@@ -6361,29 +6374,34 @@ class AuthService:
         # exception: this decrypt is reachable WITHOUT the password here, so an unpadded 500 would
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510, and the open runs off the
-        # loop (:meth:`_open_totp_cell`, BACKLOG #3929). Every cipher refuses a cell as
-        # ``CipherError``, the Transit one included, and a value that opens but is not base32 raises
-        # ``ValueError``; both fail CLOSED (the code is wrong) and are logged by the census's own
-        # one-line loggers, with no traceback (BACKLOG #5335). Anything else is a defect and is
-        # raised. ``consume_totp_step`` below is outside the catch, reached only once a code matched.
+        # loop (:meth:`_open_totp_cell`, BACKLOG #3929). At least the shipped ciphers, Transit
+        # included, refuse a cell as ``CipherError``, and a value that opens but is not base32
+        # raises ``ValueError`` from the verify; each is logged by the census's own one-line logger
+        # (BACKLOG #5335). Anything else is a defect, but raising it would be that unpadded 500, so
+        # it too is a wrong code, logged at ERROR by its type name and the account id alone, with
+        # no traceback. Every arm fails CLOSED. ``consume_totp_step`` below is outside the catch,
+        # reached only once a code matched.
+        step: int | None = None
         try:
             secret = await self._totp_secret(user)
-            step = (
-                totp.verify_totp_step(
+        except CipherError:
+            _log_totp_undecryptable(user.username)
+            secret = None
+        except Exception as exc:  # noqa: BLE001 -- see above: a raise here is an enrolment oracle
+            _log_combined_totp_defect(user.id, exc)
+            secret = None
+        if secret:
+            try:
+                step = totp.verify_totp_step(
                     secret,
                     code,
                     window=self._settings.totp_skew_steps,
                     now=arrived,
                 )
-                if secret
-                else None
-            )
-        except CipherError:
-            _log_totp_undecryptable(user.username)
-            step = None
-        except ValueError:  # binascii.Error is a ValueError: opened, but not base32
-            _log_totp_malformed(user.username)
-            step = None
+            except ValueError:  # binascii.Error is a ValueError: opened, but not base32
+                _log_totp_malformed(user.username)
+            except Exception as exc:  # noqa: BLE001 -- as above
+                _log_combined_totp_defect(user.id, exc)
         # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
         # purpose). Asked on every combined sign-in, it would be a store call only an account with
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
@@ -14912,8 +14930,17 @@ class AuthService:
             for stale in [h for h, (_, seen, _) in failures.items() if now - seen > lifetime]:
                 del failures[stale]
         if no_room():
-            # No live count is dropped for this one, its account's own included (BACKLOG #5336).
-            return max(self._policy.lockout_threshold, 1)
+            # No live count is dropped for this one, its account's own included (BACKLOG #5336). It
+            # is recorded AT the cap, past the bound, so a revoke that fails leaves the next attempt
+            # revoking unverified; _revoke_for_budget drops it once the revoke commits.
+            cap = max(self._policy.lockout_threshold, 1)
+            _log.warning(
+                "re-proof failure counts: no room for a new session of account id %r; that "
+                "session is revoked on this failure (BACKLOG #5336)",
+                user_id,
+            )
+            failures[token_hash] = (cap, now, user_id)
+            return cap
         failures[token_hash] = (1, now, user_id)
         return 1
 

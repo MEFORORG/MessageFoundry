@@ -452,8 +452,9 @@ async def test_a_threshold_of_zero_revokes_on_the_first_failure_not_on_every_rep
 async def test_one_account_cannot_evict_another_sessions_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Evicting a live count hands that session a fresh budget. One account's entries are capped and
-    evict only its own; a full map revokes a new session on its first failure instead of evicting."""
+    """Evicting a live count hands that session a fresh budget. One account's entries are capped, and
+    at its cap or with the map full a new session is answered at the cap, so its caller revokes it on
+    its first failure, instead of anything being evicted (BACKLOG #5336)."""
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_MAX", 3)
     store = await MessageStore.open(":memory:")
@@ -466,7 +467,8 @@ async def test_one_account_cannot_evict_another_sessions_count(
         owned = [
             h for h, (_, _, uid) in service._reproof_session_failures.items() if uid == "u-attacker"
         ]
-        assert len(owned) == 2
+        assert sorted(owned)[:2] == ["attacker-0", "attacker-1"], "a live count was evicted"
+        assert all(service._session_reproof_failures(h) == 5 for h in sorted(owned)[2:])
         # Full: a third account's new session is answered at the cap, so its caller revokes it.
         assert service._charge_reproof_failure("other", "u-other") == 5
         assert service._session_reproof_failures("victim") == 1
@@ -490,9 +492,30 @@ async def test_an_account_at_its_cap_keeps_every_live_count_and_a_new_session_me
         assert service._charge_reproof_failure("s-2", "u-bob") == 5, "a new session was tracked"
         assert service._session_reproof_failures("s-0") == 2, "a live count was evicted"
         assert service._session_reproof_failures("s-1") == 1
-        assert "s-2" not in service._reproof_session_failures
+        # Held AT the cap, so a revoke that fails still leaves the next attempt revoking unverified.
+        assert service._session_reproof_failures("s-2") == 5
         # Another account is not touched by bob's cap.
         assert service._charge_reproof_failure("s-other", "u-other") == 1
+    finally:
+        await store.close()
+
+
+async def test_a_reauth_past_the_account_cap_revokes_the_session_on_its_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336, end to end: with the account's live counts at the cap, a wrong re-proof on a
+    new session ends that session rather than evicting another's count."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        service._reproof_session_failures["another-session"] = (1, time.monotonic(), "u-bob")
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost, "a session past the cap kept its budget"
+        assert service._session_reproof_failures("another-session") == 1
+        assert hash_token(token) not in service._reproof_session_failures
     finally:
         await store.close()
 
