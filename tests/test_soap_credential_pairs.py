@@ -220,6 +220,47 @@ def test_a_configured_credential_beside_oauth2_is_not_held_or_judged(
         assert sent == ["Bearer AT-synthetic"]
 
 
+@pytest.mark.parametrize("provider", [None, object()], ids=["missing", "unexpected"])
+def test_bearer_settings_that_disagree_with_the_built_provider_refuse_the_build(
+    monkeypatch: pytest.MonkeyPatch, provider: object
+) -> None:
+    """_build_headers drops every static credential on the OAuth2/SMART settings predicates, so a
+    provider the builder did not return would leave the hop with no credential (#5526)."""
+    from messagefoundry.transports import http_auth
+
+    monkeypatch.setattr(http_auth, "bearer_provider_from_settings", lambda *a, **k: provider)
+    if provider is None:
+        spec = with_oauth2_client_credentials(
+            Soap(url=URL, basic_user="svc", basic_password=_PW),
+            token_url="https://auth.example.com/token",
+            client_id="cid",
+            client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+        )
+        settings = spec.settings
+    else:
+        settings = Soap(url=URL, basic_user="svc", basic_password=_PW).settings
+    with pytest.raises(ValueError, match="disagree") as ei:
+        _build(settings)
+    assert _PW not in str(ei.value)
+
+
+def test_a_dropped_static_authorization_is_not_named_by_the_refusal() -> None:
+    """Beside OAuth2 the static header is not sent, so the verify-off refusal names the minted
+    bearer and not that header (#5526)."""
+    from messagefoundry.transports.soap import _settings_as_sent
+
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, headers={"authorization": "Basic STATIC", "X-Trace": "1"}),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    sent = _settings_as_sent(spec.settings)
+    assert sent["headers"] == {"X-Trace": "1"}
+    plain = Soap(url=URL, headers={"authorization": "Basic STATIC"}).settings
+    assert _settings_as_sent(plain) is plain
+
+
 def test_control_a_static_authorization_header_alone_is_kept() -> None:
     d = _dest(headers={"authorization": "Basic STATIC"})
     assert _auth_keys(d) == ["authorization"]

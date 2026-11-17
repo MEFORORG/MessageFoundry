@@ -585,6 +585,23 @@ def _drop_authorization(headers: dict[str, str]) -> None:
         del headers[key]
 
 
+def _settings_as_sent(s: dict[str, Any]) -> dict[str, Any]:
+    """``s`` as the credential refusals should read it (BACKLOG #5526): with a minted bearer
+    configured, ``_build_headers`` drops every static ``Authorization`` header, so the refusal does
+    not name one as sent. The minted bearer is still named."""
+    from messagefoundry.transports.http_auth import (
+        is_authorization_header_name,
+        oauth2_auth_configured,
+    )
+    from messagefoundry.transports.smart import smart_auth_configured
+
+    static = s.get("headers")
+    if not isinstance(static, dict) or not (oauth2_auth_configured(s) or smart_auth_configured(s)):
+        return s
+    kept = {k: v for k, v in static.items() if not is_authorization_header_name(str(k))}
+    return {**s, "headers": kept}
+
+
 def _iso(t: float) -> str:
     """An XSD ``dateTime`` in UTC, e.g. ``2026-06-15T05:30:00Z`` (WS-Security Created/Expires)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -700,7 +717,7 @@ class SoapDestination(DestinationConnector):
             self.url,
             credentials=http_credentials_sent(
                 ConnectorType.SOAP,
-                s,
+                _settings_as_sent(s),
                 cleartext=True,
                 proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
             ),
@@ -768,7 +785,7 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 connector="SOAP destination",
                 connection=config.name,
-                credentials=http_credentials_sent(ConnectorType.SOAP, s),
+                credentials=http_credentials_sent(ConnectorType.SOAP, _settings_as_sent(s)),
                 attested=attested,
             )
             if guard is not None:
@@ -800,7 +817,7 @@ class SoapDestination(DestinationConnector):
         ):
             raise HttpAuthError(
                 f"{hop_name_prefix(self._connection_name)}SOAP destination bearer auth settings "
-                "did not build a token provider"
+                "and the token provider built from them disagree"
             )
         if self._token_provider is not None:
             refuse_cleartext_credentials(
@@ -1018,8 +1035,8 @@ class SoapDestination(DestinationConnector):
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
         """SOAP Content-Type (+ SOAPAction for 1.1) + static ``headers`` + optional bearer/basic auth.
 
-        The construction length gate and the cleartext refusal read this table. The cleartext refusal
-        also reads the settings (``http_credentials_sent``); the verify-off refusal reads only those.
+        At least the construction length gate and the cleartext refusal read this table. The
+        cleartext and verify-off refusals also read the settings (``http_credentials_sent``).
         A signing header is not in it (see :func:`_drop_authorization`)."""
         action = str(s.get("soap_action") or "")
         headers: dict[str, str] = {}
