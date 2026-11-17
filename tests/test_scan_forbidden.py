@@ -2926,6 +2926,51 @@ def test_utf16_text_whose_first_character_is_nul_is_scanned(sf, tmp_path: Path) 
     assert any("customer name (ACME)" in h for h in sf.scan_file(p)), sf.scan_file(p)
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        # UTF-16 text behind what reads as a UTF-32 mark: three readings.
+        codecs.BOM_UTF16_LE + "\x00first\nACME and IP here\nlast\n".encode("utf-16-le"),
+        # UTF-8 text behind a stray UTF-16 mark: two readings.
+        codecs.BOM_UTF16_LE + b"first\nACME and IP here\nlast\n",
+    ],
+    ids=["utf32-mark", "utf16-mark"],
+)
+def test_a_disputed_reading_reports_each_hit_once_at_its_true_line(
+    sf, tmp_path: Path, data: bytes
+) -> None:
+    """The readings of a file whose bytes disagree with its mark were joined into one text, so a hit
+    from a later reading was numbered past the end of the file, and one the readings shared repeated."""
+    p = tmp_path / "wide.txt"
+    wide = data[2:3] == b"\x00"
+    ip = _routable_ip().encode("utf-16-le" if wide else "ascii")
+    p.write_bytes(data.replace("IP".encode("utf-16-le") if wide else b"IP", ip))
+    hits = sf.scan_file(p, "wide.txt")
+    assert hits == ["wide.txt:2: customer name (ACME)", "wide.txt:2: routable IP address"], hits
+
+
+def test_two_findings_of_one_kind_on_one_line_stay_two(sf, tmp_path: Path) -> None:
+    """The control for the de-duplication above: it joins readings, not occurrences."""
+    p = tmp_path / "plain.txt"
+    ip = _routable_ip()
+    p.write_text(f"x\n{ip} then {ip}\n", encoding="utf-8")
+    assert sf.scan_file(p, "plain.txt") == ["plain.txt:2: routable IP address"] * 2
+
+
+def test_a_location_hit_names_the_root_relative_path(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --path walk reported a forbidden location by its absolute path, which can carry a user-home
+    path; every other hit is root-relative."""
+    root = tmp_path / "tree"
+    (root / "docs" / "security").mkdir(parents=True)
+    (root / "docs" / "security" / "note.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "  docs/security/note.md:0: " in err, err
+    assert str(tmp_path) not in err.split("FORBIDDEN CONTENT", 1)[-1], err
+
+
 #: #5582 item 2: an HTML tag before a verdict, gap or map. Each fires; the control below keeps a leading
 #: quote marker stripped.
 @pytest.mark.parametrize(

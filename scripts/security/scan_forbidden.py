@@ -2287,8 +2287,9 @@ def _wide_shape(body: bytes, codec: str, bom: bytes) -> bool:
     return len(nuls) >= 3 and nuls.count(0) * 10 >= len(nuls) * 9
 
 
-def _read_text(path: Path) -> str | None:
-    """The file's text, or ``None`` for binary. Raises ``OSError`` when the file cannot be read, which
+def _read_text(path: Path) -> list[str] | None:
+    """The file's readings as text, one unless the bytes disagree with a byte-order mark, or ``None``
+    for binary. Raises ``OSError`` when the file cannot be read, which
     ``scan_file`` reports as a hit: an unread file is not a clean one (BACKLOG #5583).
 
     A NUL near the start used to mean binary outright, so UTF-16 and UTF-32 text, which a Windows tool
@@ -2307,7 +2308,7 @@ def _read_text(path: Path) -> str | None:
         bom, codec = bom_codec
         wide_text = data.decode(codec, errors="replace")
         if _wide_shape(head[len(bom) :], codec, bom):
-            return wide_text
+            return [wide_text]
         # The bytes disagree with the mark: a UTF-8 body behind a stray mark, or wide text mostly above
         # U+00FF (box drawing, CJK). Neither reading can be ruled out, so both are scanned: picking one
         # hid every token of the other (fail closed). A UTF-32 mark is also UTF-16 text whose first
@@ -2316,8 +2317,8 @@ def _read_text(path: Path) -> str | None:
         if codec == "utf-32":
             utf16 = "utf-16-le" if bom == codecs.BOM_UTF32_LE else "utf-16-be"
             readings.append(data.decode(utf16, errors="replace"))
-        return "\n".join(readings)
-    return data.decode(wide or "utf-8", errors="replace")
+        return readings
+    return [data.decode(wide or "utf-8", errors="replace")]
 
 
 def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = False) -> list[str]:
@@ -2334,7 +2335,7 @@ def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are, and whether or not it can be opened."""
     if reason := forbidden_path_reason(posix):
-        return [f"{path}:0: {reason}"], True
+        return [f"{posix}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
     # filename, and a module need not repeat its own name in its text. Placed before the binary
@@ -2351,6 +2352,79 @@ def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     if _ESTATE_ID_SHAPE.search(posix):
         hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
     return hits, False
+
+
+def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tuple[int, str, str]]:
+    """Content hits in one reading of a file, as (line, key, hit). The key is the hit without the
+    matched value or line, plus its count on that line, so the same finding on the same line in
+    another reading is one hit."""
+    ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
+    site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
+    out: list[tuple[int, str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+
+        def add(reason: str, extra: str = "", lineno: int = lineno) -> None:
+            hit = f"{posix}:{lineno}: {reason}"
+            # The nth such finding on this line: two on one line stay two, as they always were.
+            nth = sum(1 for _, k, _ in out if k.startswith(hit + "#"))
+            out.append((lineno, f"{hit}#{nth}", hit + extra))
+
+        if any(a.search(line) for a in ALLOWLIST):
+            continue
+        ctx = f": {line.strip()[:120]}" if show_context else ""
+        before = len(out)
+        # ``_`` is a WORD character, so a \b-anchored name pattern cannot see its token inside an
+        # identifier: ``\bTOKEN\b`` does not match ``OB_TOKEN_ORU``. That blindness has hidden real
+        # leaks in this repo more than once, and the estate set only covers it for tokens that happen
+        # to appear in BOTH lists. Scanning a shadow copy with identifier separators neutralised closes
+        # it for EVERY name pattern rather than for the instances someone remembered to duplicate.
+        # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
+        unwrapped = _IDENT_SEP.sub(" ", line)
+        for pat, reason in FORBIDDEN:
+            if _name_matches(pat, line, unwrapped):
+                add(reason, ctx)
+        if site_scan:
+            for m in _SITE_CODE_FILE.finditer(line):
+                value = f" ({m.group(0)})" if show_context else ""
+                add("site code", f"{value}{ctx}")
+            if _SITE_CODE_PATTERN_LITERAL.search(line):
+                add("site-code pattern written out", ctx)
+        if ip_scan:
+            for m in _IPV4.finditer(line):
+                ip = m.group(0)
+                if not _ALLOWED_IP.match(ip):
+                    value = f" ({ip})" if show_context else ""
+                    add("routable IP address", f"{value}{ctx}")
+        # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
+        # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
+        if any(p.search(line) for p in _WORKTREE_SLUG_DETECTORS):
+            add("worktree/branch slug (internal project name)")
+        if _HOME_PATH.search(line):
+            add("absolute user-home path (OS account name)")
+        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
+        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
+        # access. Echoing it into a public CI log would hand out the capability the hit reports.
+        if _ARTIFACT_URL.search(line):
+            add("private artifact URL (the link itself grants access)")
+        # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
+        # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
+        # public CI log would publish exactly what the hit reports.
+        if any(p.search(line) for p in _RECORD_PAIR):
+            add("security-record content (requirement id beside a verdict)")
+        # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
+        # show_context: the identifier IS the disclosure.
+        if _ESTATE_ID_SHAPE.search(line):
+            add(f"{_ESTATE_ID_REASON} (the ported-estate site-code shape)")
+        # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
+        # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
+        # rather than information. What this adds is the case no other detector can reach -- a token
+        # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
+        if len(out) == before:
+            for _token, estate_pat in _ESTATE_FILE_RES:
+                if estate_pat.search(line):
+                    add("estate token", ctx)
+                    break
+    return out
 
 
 #: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
@@ -2376,76 +2450,24 @@ def _scan_file(
     if stop:
         return hits, "unread"
     try:
-        text = _read_text(path)
+        texts = _read_text(path)
     except OSError as exc:
         # The errno name only: the message can carry the path's absolute form, a user-home path.
         why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
         hits.append(f"{posix}:0: unreadable ({why}), so its content was not scanned (fail closed)")
         return hits, "unreadable"
-    if text is None:
+    if texts is None:
         return hits, "unread"
-    ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
-    site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if any(a.search(line) for a in ALLOWLIST):
-            continue
-        ctx = f": {line.strip()[:120]}" if show_context else ""
-        before = len(hits)
-        # ``_`` is a WORD character, so a \b-anchored name pattern cannot see its token inside an
-        # identifier: ``\bTOKEN\b`` does not match ``OB_TOKEN_ORU``. That blindness has hidden real
-        # leaks in this repo more than once, and the estate set only covers it for tokens that happen
-        # to appear in BOTH lists. Scanning a shadow copy with identifier separators neutralised closes
-        # it for EVERY name pattern rather than for the instances someone remembered to duplicate.
-        # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
-        unwrapped = _IDENT_SEP.sub(" ", line)
-        for pat, reason in FORBIDDEN:
-            if _name_matches(pat, line, unwrapped):
-                hits.append(f"{posix}:{lineno}: {reason}{ctx}")
-        if site_scan:
-            for m in _SITE_CODE_FILE.finditer(line):
-                value = f" ({m.group(0)})" if show_context else ""
-                hits.append(f"{posix}:{lineno}: site code{value}{ctx}")
-            if _SITE_CODE_PATTERN_LITERAL.search(line):
-                hits.append(f"{posix}:{lineno}: site-code pattern written out{ctx}")
-        if ip_scan:
-            for m in _IPV4.finditer(line):
-                ip = m.group(0)
-                if not _ALLOWED_IP.match(ip):
-                    value = f" ({ip})" if show_context else ""
-                    hits.append(f"{posix}:{lineno}: routable IP address{value}{ctx}")
-        # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
-        # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
-        if any(p.search(line) for p in _WORKTREE_SLUG_DETECTORS):
-            hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
-        if _HOME_PATH.search(line):
-            hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
-        # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
-        # withhold the value because it NAMES someone; this one withholds it because the URL IS the
-        # access. Echoing it into a public CI log would hand out the capability the hit reports.
-        if _ARTIFACT_URL.search(line):
-            hits.append(f"{posix}:{lineno}: private artifact URL (the link itself grants access)")
-        # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
-        # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
-        # public CI log would publish exactly what the hit reports.
-        if any(p.search(line) for p in _RECORD_PAIR):
-            hits.append(
-                f"{posix}:{lineno}: security-record content (requirement id beside a verdict)"
-            )
-        # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
-        # show_context: the identifier IS the disclosure.
-        if _ESTATE_ID_SHAPE.search(line):
-            hits.append(
-                f"{posix}:{lineno}: {_ESTATE_ID_REASON} (the ported-estate site-code shape)"
-            )
-        # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
-        # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
-        # rather than information. What this adds is the case no other detector can reach -- a token
-        # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
-        if len(hits) == before:
-            for _token, estate_pat in _ESTATE_FILE_RES:
-                if estate_pat.search(line):
-                    hits.append(f"{posix}:{lineno}: estate token{ctx}")
-                    break
+    # Each reading is numbered on its own, so a hit names a line of that reading, never one past
+    # its end, and a finding two readings share on one line is reported once (BACKLOG #8244).
+    seen: set[str] = set()
+    found: list[tuple[int, str]] = []
+    for text in texts:
+        for lineno, key, hit in _line_hits(text, posix, path, show_context):
+            if key not in seen:
+                seen.add(key)
+                found.append((lineno, hit))
+    hits.extend(hit for _, hit in sorted(found, key=lambda f: f[0]))
     return hits, "read"
 
 
@@ -3058,10 +3080,12 @@ def main(argv: list[str]) -> int:
         if _is_skipped(rel):
             continue
         if not abs_path.is_file():
-            # An entry that cannot be stat'ed (a directory that lists but does not open), and a name
-            # given after ``--`` that is a directory or does not exist, are not clean: each fails the
-            # run. A tracked path the work tree no longer holds is passed over, as before. Any other
-            # entry that is not a regular file, a link or a FIFO, is still judged by its path and name.
+            # Not a regular file. In every mode, a stat that fails other than ENOENT fails the run. In
+            # staged mode (any path named on the command line, with or without ``--``, outside --path)
+            # a directory or a missing name also fails the run. ENOENT is passed over in the --path
+            # walk (removed since it was listed) and in the tracked scan (deleted in the work tree).
+            # Anything else that stats, such as a dangling link or a FIFO, is judged by its path and
+            # name only; the walk never lists a link to a directory, so that is not judged.
             try:
                 st_mode = abs_path.lstat().st_mode
                 reason = (
