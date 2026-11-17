@@ -18,6 +18,7 @@ import errno
 import os
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -881,6 +882,12 @@ def test_a_file_only_the_engine_writes_owned_by_another_account_is_refused() -> 
         "\\\\2130706433\\c$\\keys\\k.key",  # 127.0.0.1 as one decimal number
         "\\\\0.0.0.0\\c$\\keys\\k.key",
         "\\\\192.0.2.10\\c$\\keys\\k.key",  # this host's own address, by the route below
+        "\\\\0--1.ipv6-literal.net.\\c$\\keys\\k.key",  # the fully qualified spelling
+        "\\\\localhost@SSL\\DavWWWRoot\\keys\\k.key",  # WebDAV over TLS
+        "\\\\localhost@8080\\keys\\k.key",  # WebDAV on a port
+        "\\\\localhost@SSL@8443\\DavWWWRoot\\keys\\k.key",
+        "\\\\localhost$NOCSC$\\c$\\keys\\k.key",  # the offline-files bypass
+        "\\\\MYHOST$NOCSC$\\keys\\k.key",
     ],
 )
 def test_a_share_that_is_this_host_itself_is_refused(path: str) -> None:
@@ -1700,13 +1707,108 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
     _icacls(top, "/remove:g", f"*{_USERS}")
     _icacls(mid, "/grant", f"*{_USERS}:(DC)")  # Users may delete the drive root's own folder
     problem = str(surroundings(Path("Q:\\"), host))
-    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+    assert "the folder holding it or a folder above that, where a subst drive" in problem
+    assert f"Users ({_USERS})" in problem
     # A letter onto a share: neither the loopback test nor the holder read sees that share.
     onto_share = dataclasses.replace(
         host, drive_target=lambda d: "\\??\\UNC\\localhost\\c$" if d.upper() == "Q:" else None
     )
     problem = str(surroundings(Path("Q:\\keys\\store.key"), onto_share))
     assert "onto a network share" in problem
+
+
+@windows_only
+def test_windows_a_subst_root_secrets_directory_gets_the_link_rule_on_its_holder(
+    tmp_path: Path,
+) -> None:
+    """A ``subst`` drive root named as the secrets directory: the folder holding the target got
+    only the holder rule, which passes a single account that is not an administrator owning it,
+    and that account could rename the target away. It now gets the link rule too."""
+    mid = tmp_path / "mid"
+    secrets = mid / "secrets"
+    secrets.mkdir(parents=True)
+    target = "\\??\\" + str(secrets)
+    base = _host_judging_only_under(
+        tmp_path, drive_target=lambda d: target if d.upper() == "Q:" else None
+    )
+    stranger = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+    def read_security(obj: str, kind: str) -> WinSecurity:
+        if obj.lower() == str(mid).lower():
+            return WinSecurity(stranger, ((_ALLOW, 0, _FULL, _SYSTEM),))
+        return base.read_security(obj, kind)
+
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(Path("Q:\\"), base) is None  # the control
+    host = dataclasses.replace(base, read_security=read_security)
+    problem = str(surroundings(Path("Q:\\"), host))
+    assert "the folder holding it or a folder above that, where a subst drive" in problem
+    assert str(tmp_path) not in problem
+
+
+def _probe_with_links(links: Mapping[str, str]) -> Any:
+    """The real probe, answering each path in ``links`` (lower-cased) as a link to its value."""
+    import messagefoundry.auth.anchor_path as anchor_path
+
+    real = anchor_path._win_probe
+
+    def probe(path: str) -> tuple[str, str | None]:
+        if path.lower() in links:
+            return LINK, links[path.lower()]
+        return real(path)
+
+    return probe
+
+
+@windows_only
+def test_windows_a_mapped_network_drive_is_read_as_a_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mapped drive was walked as a local volume, so a junction on the file server was spliced in
+    as a path on this host and the holder read here: a locked-down local folder of the same name
+    passed. The drive letter and the server's junction are stand-ins, so no drive is mapped."""
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    write_restricted_file(secure / "client.key", b"KEY-MATERIAL-STAND-IN")
+    monkeypatch.setattr(
+        restricted_file, "_is_remote_drive", lambda root: root.upper() == "Y:\\", raising=False
+    )
+    monkeypatch.setattr(restricted_file, "_win_probe", _probe_with_links({"y:\\keys": str(secure)}))
+    monkeypatch.setattr(
+        restricted_file, "_is_reparse_point", lambda path: path.lower() == "y:\\keys"
+    )
+    host = _host_judging_only_under(tmp_path, drive_target=lambda _d: None)
+    surroundings = restricted_file._windows_surroundings_problem
+    # The control: the local folder the server's junction names passes when named directly.
+    assert surroundings(secure / "client.key", host) is None
+    problem = str(surroundings(Path("Y:\\keys\\client.key"), host))
+    assert "the folder that holds it on the share is a junction or link" in problem
+
+
+@windows_only
+def test_windows_a_link_or_subst_drive_onto_a_mapped_drive_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link or ``subst`` drive onto a mapped drive letter reaches a share, as one onto a UNC
+    share does, and is refused the same way. The letters and the link are stand-ins."""
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    write_restricted_file(secure / "client.key", b"KEY-MATERIAL-STAND-IN")
+    monkeypatch.setattr(
+        restricted_file, "_is_remote_drive", lambda root: root.upper() == "Y:\\", raising=False
+    )
+    link = str(tmp_path / "lnk")
+    monkeypatch.setattr(
+        restricted_file, "_win_probe", _probe_with_links({link.lower(): "Y:\\real"})
+    )
+    host = _host_judging_only_under(
+        tmp_path, drive_target=lambda d: "\\??\\Y:\\real" if d.upper() == "Q:" else None
+    )
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(secure / "client.key", host) is None  # the control
+    for path in (Path(link) / "client.key", Path("Q:\\client.key")):
+        problem = str(surroundings(path, host))
+        assert "onto a network share or a mapped network drive" in problem, path
 
 
 @windows_only

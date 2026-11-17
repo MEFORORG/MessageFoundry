@@ -159,17 +159,18 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   and access list of the folder that holds the directory where the walk ends, after every
   junction, link and `subst` drive.
 
-  - On a share the path names, that folder is read through the share at `full.parent`. It is
-    refused when it is a junction or link there.
+  - A mapped network drive is read as a share: the walk stops at it.
+  - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
+    through the share at `full.parent`. It is refused when it is a junction or link there.
   - Inherit-only entries are skipped.
   - Where a `subst` drive is on the path, every folder above that folder is judged by the link
     rule.
-  - A link or `subst` drive onto a network share is refused.
+  - A link or `subst` drive onto a network share or a mapped network drive is refused.
   - A share spelled with at least some of this host's own names or addresses is refused.
     `_loopback_share_problem` says which. A mapped drive is not among them.
 
-  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root. It is still
-  open for a mapped network drive root, which the walk reads as a volume root. A broad group's
+  So the drive-root gap in the 2026-11-13 list is closed for a `subst` drive root. A mapped
+  network drive root is read as a share root, so nothing on this host holds it. A broad group's
   `DELETE` on any holder is still not counted. The code is the record of the rest. The check is
   still not a complete check of the directory's surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,

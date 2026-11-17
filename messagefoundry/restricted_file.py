@@ -626,10 +626,12 @@ _LINK_FINDING_SUBJECT: Mapping[str, str] = MappingProxyType(
 )
 
 
-def _link_finding_problem(finding: ChainFinding) -> str:
-    """The refusal for one anchor-path ``finding`` about a link on a key file's path. The finding's
-    reason names accounts and modes, never a path, so it is quoted."""
-    subject = _LINK_FINDING_SUBJECT.get(finding.kind, "a part of its path")
+def _link_finding_problem(finding: ChainFinding, subject: str | None = None) -> str:
+    """The refusal for one anchor-path ``finding`` about a link on a key file's path, about
+    ``subject`` when given, else about what the finding's kind names. The finding's reason names
+    accounts and modes, never a path, so it is quoted."""
+    if subject is None:
+        subject = _LINK_FINDING_SUBJECT.get(finding.kind, "a part of its path")
     if not finding.insecure:
         return f"{subject} could not be judged: {finding.reason}"
     return (
@@ -684,9 +686,11 @@ def _windows_judged_problem(
     targets: Sequence[tuple[str, str]],
     read_security: Callable[[str, str], WinSecurity],
     trust: WinTrust,
+    subject: str | None = None,
 ) -> str | None:
-    """The first trust-anchor finding on ``targets``, as a refusal, or ``None``. A volume root
-    cannot be renamed, so ``DELETE`` on one is not counted."""
+    """The first trust-anchor finding on ``targets``, as a refusal about ``subject``
+    (:func:`_link_finding_problem`), or ``None``. A volume root cannot be renamed, so ``DELETE`` on
+    one is not counted."""
     for target, as_kind in targets:
         security = read_security(target, as_kind)
         if ntpath.dirname(target) == target and security.aces is not None:
@@ -697,12 +701,16 @@ def _windows_judged_problem(
             )
         findings = evaluate_windows_object(target, as_kind, security, trust)
         if findings:
-            return _link_finding_problem(findings[0])
+            return _link_finding_problem(findings[0], subject)
     return None
 
 
 #: What a folder judged because a ``subst`` drive is on the path is, for the refusal text.
 _SUBST_FOLDER_SUBJECT = "a folder above the one holding it, where a subst drive on its path leads,"
+#: The same, when the path is a ``subst`` drive's own root, so the folder holding it is judged too.
+_SUBST_ROOT_FOLDER_SUBJECT = (
+    "the folder holding it or a folder above that, where a subst drive on its path leads,"
+)
 
 #: The suffix Windows uses to spell an IPv6 address as a UNC server name.
 _IPV6_LITERAL_SUFFIX = ".ipv6-literal.net"
@@ -710,7 +718,8 @@ _IPV6_LITERAL_SUFFIX = ".ipv6-literal.net"
 
 def _share_server(path: str) -> str:
     """The server name of a UNC ``path`` (``\\\\server\\share``, ``\\\\?\\UNC\\server\\share`` or
-    ``\\\\.\\UNC\\server\\share``), lower-cased, or ``""`` when it names none."""
+    ``\\\\.\\UNC\\server\\share``), lower-cased and without the decorations below, or ``""`` when
+    it names none."""
     text = path.replace("/", "\\")
     if text[:8].lower() in ("\\\\?\\unc\\", "\\\\.\\unc\\"):
         rest = text[8:]
@@ -718,7 +727,10 @@ def _share_server(path: str) -> str:
         rest = text[2:]
     else:
         return ""
-    return rest.split("\\", 1)[0].lower()
+    server = rest.split("\\", 1)[0].lower()
+    # At least the WebDAV forms (``host@SSL``, ``host@8080``) and the offline-files bypass
+    # (``host$NOCSC$``) decorate the name of the same server.
+    return server.partition("@")[0].replace("$nocsc$", "")
 
 
 _LOOPBACK_SHARE = (
@@ -745,7 +757,8 @@ def _loopback_share_problem(
     this host's first label is refused. Kept free of I/O, ``source_of`` aside."""
     from messagefoundry.config.settings import _bare_host, _host_ip_literal, _names_this_host
 
-    server = _share_server(path)
+    # A trailing dot (the fully qualified spelling) goes before the suffix test.
+    server = _share_server(path).rstrip(".")
     if not server:
         return None
     if server.endswith(_IPV6_LITERAL_SUFFIX):
@@ -797,16 +810,19 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     did not finish (:func:`_windows_cause_problem`), a share that may be this host itself
     (:func:`_loopback_share_problem`), a junction or link above it that another account can change
     (:func:`_windows_link_problem`), a ``subst`` drive on its path whose folders above the holder
-    another account can change, then the directory that holds it (:func:`_windows_holder_problem`).
+    another account can change (the holder too, when ``path`` is that drive's root), then the directory that holds it (:func:`_windows_holder_problem`).
     Windows only.
 
     ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
     are judged even when it resolves to a volume root. The holder is the folder that holds where
     the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
-    entries are read there. A walk that reached a share the path names reads the holder through
-    the share by its path as written, and refuses it when it is a junction or link; one that
-    reached a share through a junction, link or ``subst`` drive is refused. The caller has read
-    ``path`` itself and refused it if it is a link. ``host`` holds the readers."""
+    entries are read there. A mapped network drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is
+    a share: the walk stops at it, as at a UNC share, and reads nothing on it. A walk that reached
+    a share the path names, by a UNC path or a mapped drive letter, reads the holder through the
+    share by its path as written, and refuses it when it is a junction or link; one that reached a
+    share, a mapped drive included, through a junction, link or ``subst`` drive is refused. A
+    mapped drive onto this host itself is not recognized as such. The caller has read ``path``
+    itself and refused it if it is a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
     try:
@@ -814,6 +830,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
     substituted: list[str] = []
+    remote: list[str] = []
 
     def drive_target(drive: str) -> str | None:
         answer = host.drive_target(drive)
@@ -821,15 +838,28 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             substituted.append(drive)
         return answer
 
-    chain, cause = windows_chain(str(full), os.getcwd, _win_probe, drive_target=drive_target)
+    def volume_cause(root: str) -> str | None:
+        # Walked as a local volume, a junction on the file server would be spliced in as a path on
+        # this host, and the holder read here instead of on the server.
+        if _is_remote_drive(root):
+            remote.append(root)
+            return SHARE_CAUSE
+        return None
+
+    chain, cause = windows_chain(
+        str(full), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
+    )
+    if remote:  # the volume cause above ends the walk, so this is the cause it answered
+        cause = WalkCause.plain(SHARE_CAUSE)
     problem = _windows_cause_problem(cause)
     if problem is None and cause is not None:
         if substituted or any(kind == LINK for _obj, kind in chain):
             # The share is not the one the path names, so neither the loopback test nor the
             # holder read below would read the share the walk reached.
             return (
-                "it is reached through a junction, link or subst drive onto a network share, whose "
-                "folders this check does not walk; name it by its share path instead"
+                "it is reached through a junction, link or subst drive onto a network share or a "
+                "mapped network drive, whose folders this check does not walk; name it by its "
+                "share path instead"
             )
         try:
             host_name = _host_name()
@@ -847,9 +877,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         holder_path = str(full.parent)
         if holder_path == str(full):
             holder_path = None  # a share's root: nothing on this host holds it
-    elif not chain:
-        return "the folders on its path could not be walked (the walk read nothing)"
-    elif chain[-1][1] == LINK:
+    elif chain[-1][1] == LINK:  # a walk with no cause has added at least the volume root
         # windows_chain adds an object once, so a path that resolves to a folder it already
         # passed ends on the link that led there; that folder is not resolved here.
         return (
@@ -871,12 +899,16 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             # rename what lies below, as those above a link can. The walk does not say where the
             # target was, so every folder above the holder is judged by the link rule: stricter
             # than for a link, whose rule starts at the link. The holder is judged below.
-            problem = _windows_judged_problem(
-                _folders_above(holder_path, set()), host.read_security, trust
-            )
+            targets = _folders_above(holder_path, set())
+            subject = _SUBST_FOLDER_SUBJECT
+            if ntpath.dirname(str(full)) == str(full):
+                # The path is the subst drive's own root, so the holder holds the subst target and
+                # can rename it, as the folder holding a link can: it gets the link rule too.
+                targets = [(holder_path, DIRECTORY), *targets]
+                subject = _SUBST_ROOT_FOLDER_SUBJECT
+            problem = _windows_judged_problem(targets, host.read_security, trust, subject)
             if problem is not None:
-                # The finding text speaks of a junction or link; this folder is above a subst drive.
-                return problem.replace(_LINK_FINDING_SUBJECT[DIRECTORY], _SUBST_FOLDER_SUBJECT, 1)
+                return problem
         if cause is not None and _is_reparse_point(holder_path):
             # Read with FILE_FLAG_OPEN_REPARSE_POINT, a junction's own list would stand in for the
             # folder it points at, which this check does not read through a share.
@@ -902,6 +934,20 @@ def _is_reparse_point(path: str) -> bool:
     when it cannot be read. Windows only."""
     attributes = getattr(os.lstat(path), "st_file_attributes", 0)
     return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+#: ``GetDriveTypeW``'s answer for a mapped network drive.
+_DRIVE_REMOTE = 4
+
+
+def _is_remote_drive(root: str) -> bool:
+    """Whether ``GetDriveTypeW`` answers ``root`` (``Z:\\``) is a network drive. A seam for tests.
+    Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the drive type is read only on Windows")
+    import ctypes
+
+    return bool(ctypes.WinDLL("kernel32").GetDriveTypeW(root) == _DRIVE_REMOTE)
 
 
 def _host_name() -> str:
