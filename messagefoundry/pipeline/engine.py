@@ -398,8 +398,9 @@ class ReloadStepFailure:
 
 
 def _outbound_close_failure(close_failures: Sequence[tuple[str, str]]) -> ReloadStepFailure:
-    """The ``outbound_close`` step for the connectors a reload replaced and could not close, as
-    ``(outbound name, reason)`` pairs from :meth:`RegistryRunner.reload` (engine PR 2815)."""
+    """The ``outbound_close`` step for the connectors a reload replaced or retired and could not
+    close, as ``(outbound name, reason)`` pairs from :meth:`RegistryRunner.reload` (engine PR 2815,
+    BACKLOG #5755)."""
     return ReloadStepFailure(
         "outbound_close",
         "; ".join(f"outbound {name!r}: {detail}" for name, detail in close_failures),
