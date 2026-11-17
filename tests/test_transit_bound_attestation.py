@@ -1675,12 +1675,53 @@ def test_a_raising_log_filter_never_turns_a_break_into_could_not_run(
         TransitCipher(_FakeClient(_DownTransit()), _KEY_NAME).verify_audit_hmac(b"row", "not a mac")
         is False
     )
-    assert "could not be logged ('ValueError')" in capsys.readouterr().err
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 3
 
 
-def test_a_failed_unconfirmed_log_is_tried_again(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+class _FullDict(dict[object, float]):
+    """A throttle table whose write fails, as a dict resize short of memory would."""
+
+    def __setitem__(self, key: object, value: float) -> None:
+        raise MemoryError
+
+
+def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """BACKLOG #6707: the throttle's key and its slot are built inside the warning's guard, so a
+    fault there leaves the unconfirmed label standing and is reported on stderr."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    monkeypatch.setattr(crypto_transit, "_logged_at", _FullDict())
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+    assert "could not be logged ('MemoryError')" in capsys.readouterr().err
+
+
+def test_a_fault_rendering_a_break_warning_keeps_the_break(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a warning's text is rendered inside its guard, so a fault there, such as a
+    lazy import in ``vault_failure_text``, leaves a row refused twice a break."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store import crypto_transit
+
+    cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    stored = cipher.audit_hmac(b"row")
+
+    def broken(_exc: object) -> str:
+        raise ImportError("lazy import failed")
+
+    monkeypatch.setattr(crypto_transit, "vault_failure_text", broken)
+    assert cipher.verify_audit_hmac(b"row", stored) is False
+    assert "could not be logged ('ImportError')" in capsys.readouterr().err
+
+
+def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixture) -> None:
     """BACKLOG #6707: only a warning that was emitted uses up its interval, so one whose log
     failed is logged on the next unconfirmed 400."""
     from messagefoundry.store import crypto_transit
