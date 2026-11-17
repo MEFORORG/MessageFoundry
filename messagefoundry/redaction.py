@@ -1085,7 +1085,9 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: Read last, every labelled value is already hidden as it was before this pass existed, and the
 #: run then takes what is left. A placeholder an earlier pass wrote inside the run (a date-shaped
 #: piece between two ``/``) is read as part of the run, so the run is not cut there and its tail is
-#: taken too.
+#: taken too. So is a marker whose ``mfb64`` an earlier pass replaced: the MRN pass reads it as the
+#: value of ``MRN: mfb64:v1:...`` and writes ``[redacted]:v1:...``, and the run after that head is
+#: still a body.
 #:
 #: Beyond the literal form, the pattern reads a marker whose colons are percent-encoded (``%3A``) or
 #: JSON unicode-escaped (``:``, also with the backslash doubled, as a ``repr`` writes it), and a
@@ -1099,7 +1101,7 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
 #: first such character; and a marker escaped any other way (``\x3a``) is not read at all.
 _BINARY_CARRIAGE = re.compile(
-    r"(?i)(mfb64(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
+    r"(?i)((?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
     r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>)++"
     r"(?:=|%3D|\\u003D|\\\\u003D){0,2}",
     re.ASCII,
@@ -1111,9 +1113,9 @@ def redact_binary_carriage(text: str) -> str:
     reader can still see a binary body was withheld (BACKLOG #5378).
 
     **Call it last**, after every label and credential pass over the same text, as
-    :data:`_BINARY_CARRIAGE` says. The ``64`` screen holds for every form of the marker, so most
-    text skips the case-insensitive search."""
-    if "64" not in text:
+    :data:`_BINARY_CARRIAGE` says. Every marker it reads, a replaced ``mfb64`` head included,
+    holds ``v1`` or ``V1``, so most text skips the case-insensitive search."""
+    if "v1" not in text and "V1" not in text:
         return text
     return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
 

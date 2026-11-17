@@ -87,9 +87,14 @@ def test_a_token_only_leak_report_reports_repeating_delimiters(leak: ModuleType)
 def test_the_refusal_advice_says_to_repair_the_header(leak: ModuleType) -> None:
     """Found by code review round 2: the hit read as a PHI shape, so the advice was to extend the
     rule map, which cannot fix it."""
-    advice = leak.refusal_advice(leak.leak_report(f"MSH|^~^&{_BODY}"))
+    report = leak.leak_report(f"MSH|^~^&{_BODY}")
+    advice = leak.refusal_advice(report)
     assert "Repair the header" in advice
-    assert "Extend the rule map" not in advice
+    # A token hit asks for the rule map on its own account; which fires depends on the ambient token
+    # source (a loaded site prefix can match the header's timestamp), so only a report with none
+    # is held to leaving that step out.
+    if report.hits == report.structural_hits:
+        assert "Extend the rule map" not in advice
 
 
 @pytest.mark.parametrize("leak", [toolkit_leak, tee_leak], ids=["toolkit", "tee"])

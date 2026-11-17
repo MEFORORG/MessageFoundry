@@ -86,7 +86,7 @@ from typing import TYPE_CHECKING, Literal, TextIO
 # Bound at MODULE scope, not inlined: that is what lets a test force the scrubber itself to raise
 # and assert the notice is emitted anyway, with no production test hook (BACKLOG #1591).
 from messagefoundry.controlchars import scrub_control_chars
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import redact_binary_carriage, safe_exc
 from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
@@ -585,8 +585,10 @@ def _scrub_diagnostic(text: str) -> str:
     and reversing it here would not merely diverge, it would DEFEAT the credential pass: the patterns
     are whitespace-delimited, so ``bearer<LF>tok...`` matches while the escaped ``bearer\\ntok...``
     does not — the token would then reach every consumer in plaintext. The order this module needs is
-    the order the chain already uses, for the same reason."""
-    return scrub_control_chars(scrub_credentials(text))
+    the order the chain already uses, for the same reason. The carriage pass sits between them, as
+    ``BinaryCarriageScrubFilter`` does in the chain: after the credential pass, so a label joined to a
+    carriage run keeps its value hidden (BACKLOG #5378)."""
+    return scrub_control_chars(redact_binary_carriage(scrub_credentials(text)))
 
 
 def _safe_diagnostic(text: str) -> str:

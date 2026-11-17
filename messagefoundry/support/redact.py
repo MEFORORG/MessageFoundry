@@ -74,6 +74,29 @@ REDACTION_PLACEHOLDER = "[REDACTED]"
 # passes in :func:`redact_log_line`, for the reason it states (BACKLOG #5378).
 _MFB64 = _BINARY_CARRIAGE
 
+#: How many characters at the end of a long carriage run the label passes still see. The run is
+#: replaced LAST, so without a bound every pass here scanned the whole body: a 1 MiB line took
+#: about 450 ms against under 1 ms when the run went first (measured, code review of BACKLOG
+#: #5378). A label joined to the run sits at its end, so keeping the end keeps the label's context.
+_CARRIAGE_TAIL_KEPT = 256
+
+
+def _shrink_carriage(match: re.Match[str]) -> str:
+    """A long carriage run with its middle replaced by the placeholder, which the final carriage
+    pass reads as part of the run, and its last :data:`_CARRIAGE_TAIL_KEPT` characters kept. The
+    kept end starts where it still reads as a run on its own, so an escape or a placeholder is
+    never cut in half and left behind."""
+    run = match.group(0)
+    head = match.group(1)
+    if len(run) - len(head) <= 2 * _CARRIAGE_TAIL_KEPT:
+        return run
+    tail = run[-_CARRIAGE_TAIL_KEPT:]
+    for start in range(len(tail)):
+        if _MFB64.fullmatch(head + tail[start:]) is not None:
+            return f"{head}{REDACTION_PLACEHOLDER}{tail[start:]}"
+    return run
+
+
 # An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label
 # reaches the keyword at its tail.
 #
@@ -619,6 +642,9 @@ def redact_log_line(line: str) -> str:
     ts = _LEADING_TS.match(line)
     prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
     logged_placeholder = REDACTION_PLACEHOLDER in body
+    # Bound the carriage run the passes below scan; it is replaced after them (BACKLOG #5378).
+    if "v1" in body or "V1" in body:
+        body = _MFB64.sub(_shrink_carriage, body)
     body = _MEFOR_SECRET.sub(_keep_label, body)
     body = _BEARER.sub(_keep_label, body)
     body = _AUTH_SCHEME.sub(_keep_scheme, body)

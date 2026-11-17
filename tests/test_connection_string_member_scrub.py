@@ -402,6 +402,12 @@ _RULE_CONTROLS = (
         _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[0],
     ),
     (
+        "replaced bundle marker head",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace(r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:|", "")),
+        ';PWD="family": .=amfb64:v1:a1qkey=/"family": ',
+    ),
+    (
         "bundle marker after a glued word",
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),

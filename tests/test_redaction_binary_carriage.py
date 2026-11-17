@@ -165,7 +165,26 @@ _LABELLED = {
     "spaces-mrn": (f"bad {MARKER}QUJD/MRN{' ' * 70}12345678", "12345678"),
     "padded-slash-password": (f"bad {MARKER}QUJDRA==/Password: zqsecretvalue", "zqsecretvalue"),
     "repr-newline-password": (repr(f"{MARKER}QUJDRA==\nPassword: zqsecretvalue"), "zqsecretvalue"),
+    "long-run-then-label": (f"bad {_CARRIAGE.removesuffix('=')}/MRN: 12345678", "12345678"),
 }
+
+
+@_BOTH
+@pytest.mark.parametrize("label", ["MRN: ", "MRN:", "mrn=", "MRN#", "patient MRN ", '"mrn": "'])
+def test_a_carriage_that_is_a_labels_value_is_withheld(chain: str, label: str) -> None:
+    """Found by code review: the MRN pass reads ``mfb64`` as the value and writes
+    ``[redacted]:v1:``, so the pass after it must still read that head as a marker."""
+    _no_payload(_CHAINS[chain](f"bad {label}{_CARRIAGE}"))
+    _no_payload(_CHAINS[chain](f"bad {label}{MARKER}WlpURVNUXkFMUEhB"))
+    assert "WlpURVNUXkFMUEhB" not in _CHAINS[chain](f"bad {label}{MARKER}WlpURVNUXkFMUEhB")
+
+
+def test_the_bundle_bounds_a_long_run_before_its_label_passes() -> None:
+    """Found by code review: the run replaced last made every bundle pass scan the whole body."""
+    long_carriage = encode(bytes(range(256)) * 4096)
+    out = _bundle(f"bad {long_carriage}/MRN: 12345678 end")
+    assert "12345678" not in out
+    assert long_carriage[20:40] not in out and long_carriage[-40:-20] not in out
 
 
 @_BOTH

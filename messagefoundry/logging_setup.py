@@ -265,7 +265,7 @@ class RedactionFilter(logging.Filter):
     exception message, so what a bound drops is the peer-sized payload and what it keeps is the part
     an operator reads.
 
-    **The bound reaches the three filters installed after this one too, and by order rather than by
+    **The bound reaches the filters installed after this one too, and by order rather than by
     their own code.** :class:`CredentialScrubFilter` and :class:`CredentialQueryScrubFilter` walk the
     same fields, and ``secretscrub``'s DSN-password pattern is itself superlinear over dotted text.
     They are bounded today only because this filter runs first and writes the clamped text back onto
@@ -1219,7 +1219,8 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
     Order matters: redact PHI from the raw content first (which also renders ``exc_info`` into
     ``exc_text``, so the credential passes have a traceback to read), scrub credentials from the
-    result, then scrub control chars last. Applied to **every** handler a logger carries (stdout,
+    result, then replace a binary-carriage body, after every label pass so a label joined to the
+    run keeps its value hidden (BACKLOG #5378), then scrub control chars last. Applied to **every** handler a logger carries (stdout,
     stderr, and the off-box forwarder's queue handler) so the forwarded stream is held to the same
     PHI-safety, secret-safety and log-injection guarantees as stdout. Every handler re-runs the
     chain over the ONE shared record, so a later handler filters the earlier one's escaped output.

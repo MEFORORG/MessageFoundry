@@ -1489,14 +1489,17 @@ _MEMBER_KEEP = re.compile(
 #: PHI pass's userinfo opener, the support bundle's ``mfb64:v1:`` marker and a DICOM tag.
 #:
 #: The marker is spelled in its literal lowercase form only. ``support/redact.py`` ``_MFB64`` reads
-#: more forms, which ``redaction._BINARY_CARRIAGE`` states; this unit keeps none of them. A word
+#: more forms, which ``redaction._BINARY_CARRIAGE`` states; this unit keeps one more of them, a
+#: marker whose ``mfb64`` an earlier pass replaced with a placeholder (``[redacted]:v1:``), which
+#: the carriage pass still reads (BACKLOG #5378). A word
 #: ends where the marker or the userinfo opener starts, so a word glued on before either
 #: (``amfb64:v1:``, ``xnonnumeric port: ``) cannot take its head: neither reader has a word
 #: boundary. Masking the marker's ``v1`` printed, on a chain line the bundle read back, the body
 #: ``origin/main`` hid (BACKLOG #5030). :func:`_masked_word` keeps where the marker's base64 run
 #: ends, since it keeps the class of each character.
 _MEMBER_VALUE_UNIT = re.compile(
-    r"<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: |mfb64:v1:"
+    r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:"
+    r"|<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: |mfb64:v1:"
     r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|((?:(?!mfb64:v1:|nonnumeric port: )[\w.\-])++)"
 )
 #: What must follow a word that holds a kept word anywhere inside it for the mask to keep the whole
