@@ -264,11 +264,12 @@ def _http_literal_static(
     credential, by name or by value, the test the off-box cleartext refusal applies, so at least a
     ``Proxy-Authorization`` entry counts too. A static ``Authorization`` header does not count when
     ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
-    every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
-    the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
-    added). So a REST, FHIR or DICOMweb ``"Authorization "``, with a trailing space, still counts:
-    it goes on the wire beside the connector's own. A query parameter counts when
-    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
+    every spelling ``http_auth.is_authorization_header_name`` matches, and REST and FHIR set the
+    plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
+    added). So a REST or FHIR ``"Authorization "``, with a trailing space, still counts: it goes on
+    the wire beside the connector's own. A query parameter counts when
+    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses,
+    except on a destination type in ``URL_QUERY_REFUSED_DESTINATIONS``.
 
     A table counts only as a ``dict``, the one type every connector's header builder sends.
 

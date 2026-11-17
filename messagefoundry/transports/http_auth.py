@@ -97,9 +97,9 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     """Whether a settings mapping has OAuth2 client-credentials auth turned ON.
 
     ON means ``oauth2_token_url`` holds a non-blank value and ``oauth2_enabled`` is absent, a real
-    ``True``, or an unresolved ``env()`` reference; every other reading is OFF (the strict read
-    below). The SINGLE definition, shared by at least :func:`oauth2_cc_provider_from_settings`
-    (which builds the provider), the mutual-exclusion screen in
+    ``True``, or an unresolved ``env()`` reference; every other reading is OFF. The SINGLE
+    definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the
+    provider), the mutual-exclusion screen in
     :func:`bearer_provider_from_settings`, the static-credential hop reader (BACKLOG #1182) and
     :func:`~messagefoundry.config.wiring.oauth_request_advisories`. Before it existed the builder
     treated any falsy ``oauth2_enabled`` as off while the screen treated only a literal ``False``
@@ -108,10 +108,9 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     Read strictly (vault BACKLOG #5362), and total: it never raises, because readers of the loaded
     graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate. A
     truthiness read used to take the string ``"false"`` or ``"0"`` as on and an explicit ``None``
-    as off. :func:`refuse_oauth2_settings` refuses the same settings when a REST, SOAP or FHIR
-    destination builds (through :func:`bearer_provider_from_settings`). The loader refuses a
-    non-bool literal too (``Registry.bool_literal_problems``), and
-    :func:`with_oauth2_client_credentials` a literal blank token URL."""
+    as off. The loader refuses a non-bool literal too (``Registry.bool_literal_problems``), and
+    :func:`with_oauth2_client_credentials` a literal blank token URL when ``enabled`` is
+    ``True``."""
     if _oauth2_setting_problem(s) is not None:
         return False
     enabled = s.get("oauth2_enabled", True)
@@ -344,10 +343,9 @@ def oauth2_cc_provider_from_settings(
     didn't configure it is byte-identical. That includes the settings :func:`refuse_oauth2_settings`
     refuses: this function does not call it and returns ``None`` for them;
     :func:`bearer_provider_from_settings` refuses them before it gets here. ``proxy`` (ADR 0126)
-    routes the
-    token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
-    re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
-    construction.
+    routes the token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176,
+    ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually
+    exclusive by construction.
 
     ``trust_anchor_policy`` (#1660) is the instance-wide ``[tls]`` policy the caller already holds, off
     its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
@@ -648,7 +646,8 @@ def with_oauth2_client_credentials(
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     if enabled is True and isinstance(token_url, str) and not token_url.strip():
-        # A literal blank or whitespace-only string is refused here (vault BACKLOG #5362).
+        # A literal blank or whitespace-only string is refused here when enabled is True
+        # (vault BACKLOG #5362).
         raise HttpAuthError(
             "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
         )
