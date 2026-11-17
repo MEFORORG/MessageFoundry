@@ -4089,7 +4089,9 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 
 **A PKCS#12 bundle for `cert import`** passes in one of two shapes:
 
-- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor;
+- PBES2 bags at the floor, or unencrypted bags, with a **PBMAC1** MAC at the floor whose PBKDF2
+  keyLength is present and equals the HMAC's output size (32 octets for HMAC-SHA-256), as RFC 9579
+  asks and as the `openssl pkcs12 -pbmac1_pbkdf2` export writes;
 - unencrypted bags with no MAC at all (`openssl pkcs12 -export -keypbe NONE -certpbe NONE -nomac
   -in <cert> -inkey <key> -out <new pfx>`). Nothing in it comes from a password, so it needs no
   passphrase. **It also has no integrity check**: nothing detects a change to the file, the same as
@@ -4098,9 +4100,16 @@ openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 600000 -in <old
 A MAC keyed by an empty passphrase passes at the floor too, but it checks no more than no MAC does:
 anyone can recompute it.
 
-Every other MAC is refused, unencrypted bags or not, because it runs the passphrase through the
-PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's default
-included. It also holds when the passphrase is empty, as in `cryptography`'s `NoEncryption` output.
+A MAC that is not PBMAC1 is refused, unencrypted bags or not, because it runs the passphrase
+through the PKCS#12 KDF. That holds even over SHA-256, and it is what most exports carry, OpenSSL's
+default included. It also holds when the passphrase is empty, as in `cryptography`'s
+`NoEncryption` output.
+
+A PBMAC1 MAC is refused too when its PBKDF2 keyLength is absent or is not the output size of the
+HMAC it keys (BACKLOG #5377). RFC 9579 requires keyLength and asks for that size. A short key
+could be found from the file's own MAC with no passphrase, and a MAC then forged over a changed
+file. A PBMAC1 MAC under the PBKDF2 floor, or over an HMAC weaker than HMAC-SHA-256, is refused as
+well.
 
 A key inside an encrypted part of the bundle is checked too (BACKLOG #1352). `cert import` opens
 each encrypted part with the passphrase and holds every key in it to the same floor before anything

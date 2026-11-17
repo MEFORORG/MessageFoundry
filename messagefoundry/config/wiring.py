@@ -2335,8 +2335,11 @@ def _names_a_credential(name: str) -> bool:
 
     A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
     such as ``pageToken``) is not one, unless a credential word also sits outside that ending. The
-    ending is judged without a trailing index or digits, as the warning detector judges it, so
-    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not."""
+    ending is judged without one trailing index or digits, by :func:`_base_name`, so
+    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not.
+    The warning detector reads more (:func:`~messagefoundry.secretscrub._base_names`: every
+    trailing index, and bracket keys as segments), so it may call a name such as
+    ``pageToken[0][0]`` a cursor while this withholds it. That only over-masks."""
     squashed = _squash_name(name)
     if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
         return False

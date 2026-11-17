@@ -1865,9 +1865,9 @@ _QUERY_NOT_CREDENTIAL_TAILS = (
 )
 
 #: Names the HTTP family's no-escape credential refusals count beside the heuristic, as the whole
-#: name after :func:`_base_name`, ignoring case (``refusal=True``). ``code`` carries an Azure
-#: Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
-#: also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
+#: of any reading :func:`_base_names` gives, ignoring case (``refusal=True``). ``code`` carries an
+#: Azure Functions function key, and an OAuth authorization code. The heuristic leaves it out,
+#: because it also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
 #: warns and reports. A refusal of a hop that already relaxed verification, or that crosses plain
 #: ``http`` off this machine, takes that over-refusal (vault BACKLOG #3533 item 7).
 _QUERY_REFUSAL_NAMES = frozenset({"code"})
@@ -1888,19 +1888,71 @@ def _camel_tail(name: str, word: str) -> bool:
     return before.islower() or before.isdigit() or (before.isupper() and rest.islower())
 
 
+def _clean_name(name: str) -> str:
+    """``name`` without tab, CR or LF, which ``urlsplit`` drops, so the detector never sees them."""
+    return name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+
+
+def _strip_digits(name: str) -> str:
+    return name.rstrip("0123456789") or name
+
+
 def _base_name(name: str) -> str:
-    """``name`` without tab, CR or LF (which ``urlsplit`` drops, so the detector never sees them),
-    without a trailing index such as ``[]`` or ``[0]``, and without trailing digits. So
-    ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as ``token``, ``token``, ``key``
-    and ``apiKey``."""
-    base = name.replace("\t", "").replace("\r", "").replace("\n", "").strip()
+    """``name`` after :func:`_clean_name`, without a trailing index such as ``[]`` or ``[0]``, and
+    without trailing digits. So ``token[]``, ``token[0]``, ``key1`` and ``apiKey2`` are judged as
+    ``token``, ``token``, ``key`` and ``apiKey``."""
+    return _cut_last_bracket(_clean_name(name))
+
+
+def _cut_last_bracket(base: str) -> str:
+    """:func:`_base_name` over a name :func:`_clean_name` already cleaned."""
     if base.endswith("]") and "[" in base:
         base = base[: base.rfind("[")]
-    return base.rstrip("0123456789") or base
+    return _strip_digits(base)
+
+
+def _base_names(name: str) -> tuple[str, ...]:
+    """Every reading of ``name`` the detector judges: :func:`_base_name`'s, and for a bracket-keyed
+    name of ``k`` pieces up to ``k`` more (BACKLOG #5379). The name is cut at every ``[`` and
+    ``]``, each piece stripped of spaces (``parse_qsl`` decodes ``+`` to one) and empty pieces
+    dropped. Trailing pieces that are
+    indexes (all digits) are dropped, all of them, so ``token[0][0]`` is judged as ``token``. Then
+    the first piece is one reading, and each piece joined by ``.`` to the piece before it is
+    another. So ``user[password]`` and ``user[password][x]`` are both judged as ``user.password``,
+    which ends in the credential word, and ``sort[key]`` as ``sort.key``, which the non-secret
+    list still reads as a sort key. A name matches when any reading does, so this only widens what
+    :func:`_base_name` alone matched. Linear in ``name``: one split, and each piece is in at most
+    two of the readings this adds, beside the :func:`_base_name` one."""
+    cleaned = _clean_name(name)
+    readings = [_cut_last_bracket(cleaned)]
+    if "[" in cleaned or "]" in cleaned:
+        pieces = [piece.strip() for piece in cleaned.replace("]", "[").split("[")]
+        pieces = [piece for piece in pieces if piece]
+        while pieces and pieces[-1].isdigit():
+            pieces.pop()
+        if pieces:
+            readings.append(_strip_digits(pieces[0]))
+            readings.extend(
+                _strip_digits(f"{before}.{piece}")
+                for before, piece in zip(pieces, pieces[1:], strict=False)
+            )
+    return tuple(dict.fromkeys(readings))
 
 
 def _is_credential_param(name: str) -> bool:
-    base = _base_name(name)
+    return _readings_are_credential(_base_names(name))
+
+
+def _readings_are_credential(readings: tuple[str, ...], *, refusal: bool = False) -> bool:
+    """Whether any of ``readings`` (from :func:`_base_names`) names a credential, and with
+    ``refusal`` also whether any is one of :data:`_QUERY_REFUSAL_NAMES`."""
+    if any(_is_credential_base(base) for base in readings):
+        return True
+    return refusal and any(base.casefold() in _QUERY_REFUSAL_NAMES for base in readings)
+
+
+def _is_credential_base(base: str) -> bool:
+    """:func:`_is_credential_param` over one reading from :func:`_base_names`."""
     folded = base.casefold()
     if folded in _QUERY_KEY_MATERIAL or folded in _QUERY_CREDENTIAL_TAILS:
         return True
@@ -1938,7 +1990,8 @@ def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
     raising, because a parser error would quote the URL.
 
     A heuristic over names, from this module's own vocabulary plus :data:`_QUERY_CREDENTIAL_WORDS`.
-    A name is judged after dropping a trailing index (``[0]``) and trailing digits. It matches as a
+    A name is judged after dropping trailing indexes (``[0]``) and trailing digits, with a bracket
+    key read as a segment (``user[password]``), by :func:`_base_names`. It matches as a
     whole word, as its last segment after ``.``, ``_``, ``-`` or a space (a decoded ``+``), as a
     one-word compound (:data:`_QUERY_CREDENTIAL_COMPOUNDS`), or as a camelCase tail
     (``accessToken``), unless it is a known non-secret (:data:`_QUERY_NOT_CREDENTIAL_TAILS`). It
@@ -1965,8 +2018,7 @@ def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
         {
             _display_name(name)
             for name, _ in pairs
-            if _is_credential_param(name)
-            or (refusal and _base_name(name).casefold() in _QUERY_REFUSAL_NAMES)
+            if _readings_are_credential(_base_names(name), refusal=refusal)
         }
     )
 
