@@ -26,7 +26,14 @@ from typing import Literal, TypeVar
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, Field, RootModel, ValidationError
+from pydantic import (
+    BaseModel,
+    Field,
+    RootModel,
+    ValidationError,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+)
 
 from messagefoundry.api.auth_models import (
     STEP_UP_VIA_HEADER,
@@ -164,14 +171,15 @@ class MfaConfirmed:
     to end the caller's other sessions after the factor change (BACKLOG #1147, #3393).
 
     ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end,
-    or None when the engine could not count them. The rotated session token is not here: the
+    or None when the engine could not count them or sent a count this client cannot read. The
+    rotated session token is not here: the
     client has already adopted it, unless ``token_adopted`` is False.
 
     ``token_adopted`` is False when the reply carried codes but no rotated token this client can
-    send: missing, null, or not sendable (BACKLOG #5344). The codes are still good and are returned, because the engine committed
-    them before replying and will not show them again. The held token was left in place and may
-    already be dead, since the engine rotated the session, so the caller should save the codes
-    first and then sign in again."""
+    send: missing, null, or not sendable (BACKLOG #5344). The codes are still good and are
+    returned, because the engine committed them before replying and will not show them again.
+    The held token was left in place and may already be dead, since the engine rotated the
+    session, so the caller should save the codes first and then sign in again."""
 
     recovery_codes: tuple[str, ...]
     other_sessions: int | None
@@ -323,6 +331,18 @@ class _MfaConfirmCodes(BaseModel):
 
     recovery_codes: list[str]
     other_sessions: int | None = None
+
+    @field_validator("other_sessions", mode="wrap")
+    @classmethod
+    def _unknown_when_unreadable(
+        cls, value: object, handler: ValidatorFunctionWrapHandler
+    ) -> object:
+        """An unreadable count is "unknown" (None): it is advisory, and failing the decode on it
+        would lose the one-time codes beside it."""
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
 
 
 class _UserListRow(RootModel[UserListEntry]):
@@ -1246,7 +1266,7 @@ class EngineClient:
         the value-free :class:`ApiError` of :func:`_decode`, with ``status`` None, and the current
         token is left in place rather than cleared (BACKLOG #5344). A sendable token is non-empty,
         RFC 6750 token68 characters only, and short enough that ``Bearer <token>`` fits
-        :data:`MAX_REQUEST_HEADER_VALUE_LEN`; :class:`_RotatedToken` holds both limits.
+        :data:`MAX_REQUEST_HEADER_VALUE_LEN`; :class:`_RotatedToken` holds these limits.
         Returning normally would report the elevation as a success. What happened to the session
         is not known: the engine may have rotated it, so the held token may already be dead, or an
         intermediary may have answered without reaching the engine, so it may still be live.
@@ -1323,10 +1343,11 @@ class EngineClient:
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
         token is adopted here — the caller gets the codes and the count, never the token.
 
-        The token and the codes are read independently (BACKLOG #5344). A token that passes the
-        sendable-token rule :meth:`_adopt_rotated` applies is adopted first, whatever the rest of
-        the reply holds, since the engine has already rotated the session. A reply whose codes do
-        not decode then raises :class:`ApiError`. A reply whose codes decode but whose token is
+        The token and the codes are read independently (BACKLOG #5344). A token is adopted first
+        through :meth:`_adopt_rotated`, whatever the rest of the reply holds, since the engine has
+        already rotated the session. A reply whose codes do not decode then raises
+        :class:`ApiError`; an ``other_sessions`` count this client cannot read is None, "unknown",
+        rather than a reason to drop the codes. A reply whose codes decode but whose token is
         missing, null or not sendable does NOT raise: the codes are returned with
         ``token_adopted`` False, the held token is left in place and may be dead, and a value-free
         warning is logged. Raising there would lose codes the engine has already committed and
@@ -1351,21 +1372,20 @@ class EngineClient:
         # The token and the codes are read independently. The engine has rotated the session and
         # committed the codes before it replies, so neither half's failure may take the other down.
         try:
-            token: str | None = _decode(response, _RotatedToken).token
+            self._adopt_rotated(response)
+            adopted = True
         except ApiError:  # nothing is raised from here, so nothing chains a value
-            token = None
-        if token is None:
+            adopted = False
+        confirmed = _decode(response, _MfaConfirmCodes)
+        if not adopted:  # logged only once the codes have decoded, so it never contradicts a raise
             _log.warning(
                 "MFA enrolment confirmed, but the reply carries no session token this client can "
                 "send; the token is not adopted."
             )
-        else:
-            self._hold_issued(token)
-        confirmed = _decode(response, _MfaConfirmCodes)
         return MfaConfirmed(
             recovery_codes=tuple(confirmed.recovery_codes),
             other_sessions=confirmed.other_sessions,
-            token_adopted=token is not None,
+            token_adopted=adopted,
         )
 
     def verify_mfa(self, code: str) -> None:

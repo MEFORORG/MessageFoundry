@@ -300,11 +300,11 @@ def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_missing(
 
 def test_confirm_mfa_adopts_a_sendable_token_even_when_the_codes_do_not_decode() -> None:
     """The engine has rotated the session by the time it replies, so a sendable token is adopted
-    before the rest of the reply is read: a skewed ``other_sessions`` then raises ApiError, but
-    the client stays signed in on the new token (BACKLOG #5344, review round one).
+    before the rest of the reply is read: codes that do not decode then raise ApiError, but the
+    client stays signed in on the new token (BACKLOG #5344, review round one).
 
     Mutation: adopt the token only after the codes decode. Red: the token is still ``before``."""
-    reply = {"recovery_codes": ["code-one"], "token": "rotatedOK", "other_sessions": "many"}
+    reply = {"recovery_codes": "code-one", "token": "rotatedOK"}
     with _client_answering(json.dumps(reply).encode()) as client:
         client._token = "before"
         with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
@@ -312,6 +312,36 @@ def test_confirm_mfa_adopts_a_sendable_token_even_when_the_codes_do_not_decode()
         assert client.token == "rotatedOK"
     assert "code-one" not in str(excinfo.value) and "rotatedOK" not in str(excinfo.value)
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+def test_confirm_mfa_reads_an_unreadable_session_count_as_unknown() -> None:
+    """``other_sessions`` is advisory, so a count this client cannot read is None ("unknown") and
+    the codes beside it are kept (BACKLOG #5344, review round two).
+
+    Mutation: drop the wrap validator on ``other_sessions``. Red: ApiError, the codes lost."""
+    reply = {"recovery_codes": ["code-one"], "token": "rotatedOK", "other_sessions": "many"}
+    with _client_answering(json.dumps(reply).encode()) as client:
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one",)
+        assert confirmed.other_sessions is None
+        assert confirmed.token_adopted is True
+        assert client.token == "rotatedOK"
+
+
+def test_confirm_mfa_logs_no_confirmation_for_a_reply_that_does_not_decode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reply that is not JSON raises ApiError, and no WARNING claims the enrolment was confirmed
+    (BACKLOG #5344, review round two).
+
+    Mutation: log the missing-token warning before the codes decode. Red: the warning is logged."""
+    with (
+        _client_answering(b"not json") as client,
+        caplog.at_level("WARNING"),
+        pytest.raises(ApiError, match="invalid response from engine"),
+    ):
+        client.confirm_mfa("123456")
+    assert not [r for r in caplog.records if "MFA enrolment confirmed" in r.getMessage()]
 
 
 def test_confirm_mfa_adopts_a_sendable_token() -> None:
