@@ -817,7 +817,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     are judged even when it resolves to a volume root. The holder is the folder that holds where
     the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
     entries are read there. A mapped network drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is
-    a share: the walk stops at it, as at a UNC share, and reads nothing on it. A walk that reached
+    a share: the walk stops at it, as at a UNC share, and follows no junction or link on it. A walk
+    that reached
     a share the path names, by a UNC path or a mapped drive letter, reads the holder through the
     share by its path as written, and refuses it when it is a junction or link; one that reached a
     share, a mapped drive included, through a junction, link or ``subst`` drive is refused. A
@@ -894,16 +895,17 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         if holder_path is None or problem is not None:
             return problem
         holder_is_root = ntpath.dirname(holder_path) == holder_path
-        if substituted and not holder_is_root:
+        if substituted:
             # A subst letter is spliced in with no link entry, but the folders above its target can
             # rename what lies below, as those above a link can. The walk does not say where the
             # target was, so every folder above the holder is judged by the link rule: stricter
             # than for a link, whose rule starts at the link. The holder is judged below.
-            targets = _folders_above(holder_path, set())
+            targets = [] if holder_is_root else _folders_above(holder_path, set())
             subject = _SUBST_FOLDER_SUBJECT
             if ntpath.dirname(str(full)) == str(full):
                 # The path is the subst drive's own root, so the holder holds the subst target and
-                # can rename it, as the folder holding a link can: it gets the link rule too.
+                # can rename it, as the folder holding a link can: it gets the link rule too, a
+                # volume root included.
                 targets = [(holder_path, DIRECTORY), *targets]
                 subject = _SUBST_ROOT_FOLDER_SUBJECT
             problem = _windows_judged_problem(targets, host.read_security, trust, subject)

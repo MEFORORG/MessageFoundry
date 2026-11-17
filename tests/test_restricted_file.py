@@ -1746,11 +1746,47 @@ def test_windows_a_subst_root_secrets_directory_gets_the_link_rule_on_its_holder
     assert str(tmp_path) not in problem
 
 
-def _probe_with_links(links: Mapping[str, str]) -> Any:
-    """The real probe, answering each path in ``links`` (lower-cased) as a link to its value."""
+@windows_only
+def test_windows_a_subst_root_onto_a_folder_under_a_volume_root_judges_that_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same, with the target straight under a volume root: the holder is the root, which the
+    subst rule skipped. The target folder and the root's owner are stand-ins."""
+    target = "C:\\mf-stand-in-certs"
+    real = _real_win_probe()
+    monkeypatch.setattr(
+        restricted_file,
+        "_win_probe",
+        lambda path: (DIRECTORY, None) if path.lower() == target.lower() else real(path),
+    )
+    base = _host_judging_only_under(
+        tmp_path, drive_target=lambda d: "\\??\\" + target if d.upper() == "Q:" else None
+    )
+    stranger = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+    def read_security(obj: str, kind: str) -> WinSecurity:
+        if obj.lower() == "c:\\":
+            return WinSecurity(stranger, ((_ALLOW, 0, _FULL, _SYSTEM),))
+        return base.read_security(obj, kind)
+
+    surroundings = restricted_file._windows_surroundings_problem
+    assert surroundings(Path("Q:\\"), base) is None  # the control
+    problem = str(
+        surroundings(Path("Q:\\"), dataclasses.replace(base, read_security=read_security))
+    )
+    assert "the folder holding it or a folder above that, where a subst drive" in problem
+
+
+def _real_win_probe() -> Any:
+    """The real Windows probe, which ``restricted_file`` does not re-export."""
     import messagefoundry.auth.anchor_path as anchor_path
 
-    real = anchor_path._win_probe
+    return anchor_path._win_probe
+
+
+def _probe_with_links(links: Mapping[str, str]) -> Any:
+    """The real probe, answering each path in ``links`` (lower-cased) as a link to its value."""
+    real = _real_win_probe()
 
     def probe(path: str) -> tuple[str, str | None]:
         if path.lower() in links:
