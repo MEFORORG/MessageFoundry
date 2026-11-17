@@ -11957,7 +11957,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
         async def open_record(opening: object) -> None:
             # BACKLOG #3737, #4936: inside the store open, before its first write under the key,
-            # on every store, so a kill after it, the open's own writes and either data pass
+            # so a kill after it, the open's own writes and either data pass
             # included, leaves any record it opened open until a run closes it.
             nonlocal record_named
             # Every backend's store has cipher_info(); the hook is typed for any of them.

@@ -848,8 +848,7 @@ the next start may do.
   use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
   that range under the key in use, never verifies there, and the chain breaks at that row.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
-  and every other start check. The setting changes nothing on a
-  start the refusal would not stop.
+  and every other start check.
 - **When acceptable:** only when the key the chain's newest range is under is truly lost. If the
   key exists anywhere, put it back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key`
   instead. Its audit chain step says whether it rolled the chain and, where it refuses, why. Where
@@ -857,8 +856,9 @@ the next start may do.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
-- **Reversible:** no, once a start has used it: the chain stays broken at that row. Set only and
-  never used, it changes nothing and can be removed.
+- **Reversible:** no, once a start has used it: the chain stays broken at that row. Turned back
+  off, the next start refuses again while the lost range key is still not configured. Set only and
+  never used, it can be removed.
 
 ### `[cert_monitor].warn_days` or `[secret_rotation].warn_days` at `0`, or below its default — a credential reminder is off or late
 Named as `cert_monitor.warn_days` and `secret_rotation.warn_days` (ASVS 6.4.5, BACKLOG #2227). A

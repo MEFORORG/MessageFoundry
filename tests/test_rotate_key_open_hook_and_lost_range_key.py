@@ -3,7 +3,7 @@
 """BACKLOG #4936 and #4934, the owner rulings of 2026-11-04.
 
 #4936: ``rotate-key`` opens its rotation record through ``open_store``'s ``before_first_write``
-hook, on every store, so a run killed inside the store open after the hook leaves any record it
+hook, so a run killed inside the store open after the hook leaves any record it
 opened.
 
 #4934: ``serve``'s start refusal of a store key change the keyed audit chain cannot follow, with
