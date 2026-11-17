@@ -57,17 +57,50 @@ _SETTINGS = _ROOT / ".claude" / "settings.json"
 # The rules whose loss would be silent and would matter. Not the whole deny-list: the point is a
 # floor under the PHI, secret and local-store rules that CLAUDE.md section 5 and section 9 promise
 # are enforced, so prose and mechanism cannot drift apart without a red test.
+#
+# Keyed by the `.gitignore` line that keeps each path out of a commit, valued by the patterns the
+# deny list names for Read and Edit. It holds secret, credential and store files only; PHI and
+# customer-data ignore lines, such as `harness_io/` and `/migration-local/`, are not mapped.
+# Each key is checked against `.gitignore` below, so a renamed or dropped ignore line turns a test
+# red instead of leaving a mapping from a path nobody ignores. The check runs one way only: a NEW
+# secret line added to `.gitignore` gets no deny rule until someone adds it here. Add the key when
+# you add the ignore line.
+_GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
+    ".env": (".env",),
+    ".env.*": (".env.*",),
+    "secrets/": ("secrets/**", "**/secrets/**"),
+    "*.key": ("*.key",),
+    "*.pem": ("*.pem",),
+    "*.pfx": ("*.pfx",),
+    "*.db": ("*.db",),
+    "*.db-wal": ("*.db-wal",),
+    "*.db-shm": ("*.db-shm",),
+    # The whole store family: a rollback journal, a `.bak` snapshot copy.
+    "*.db*": ("*.db*",),
+    "bootstrap-admin.txt": ("bootstrap-admin.txt",),
+    # A bare filename, so not tied to `docker/`; it still misses the tracked
+    # `docker/secrets.env.example` template.
+    "/docker/secrets.env": ("secrets.env",),
+    "/docker/tls/": ("**/docker/tls/**",),
+    "scripts/security/scan-tokens.local.txt": ("scan-tokens.local.txt",),
+}
+
+# The tool names each protected pattern carries a rule for. Claude Code's permissions page,
+# https://code.claude.com/docs/en/permissions, read 2026-11-16, says `Edit` rules apply to all
+# built-in tools that edit files.
+_FILE_TOOLS = ("Read", "Edit")
+
 _REQUIRED_DENIES = frozenset(
     {
-        "Read(.env)",
-        "Read(secrets/**)",
-        "Read(*.db)",
-        "Edit(.env)",
-        "Edit(secrets/**)",
-        "Write(.env)",
-        "Write(secrets/**)",
+        f"{tool}({p})"
+        for patterns in _GITIGNORED_SECRETS.values()
+        for p in patterns
+        for tool in _FILE_TOOLS
     }
+    | {"Write(.env)", "Write(secrets/**)"}
 )
+
+_FILE_RULE = re.compile(rf"\A({'|'.join(_FILE_TOOLS)})\((.+)\)\Z")
 
 _PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
 
@@ -117,6 +150,44 @@ def _unanchored_refs(settings: dict[str, Any]) -> list[str]:
 
 def _dot_anchored_denies(settings: dict[str, Any]) -> list[str]:
     return [r for r in settings["permissions"]["deny"] if "(./" in r]
+
+
+def _keys_missing_from_gitignore(text: str) -> list[str]:
+    """The `_GITIGNORED_SECRETS` keys that are not a non-comment line of this `.gitignore` text."""
+    lines = {s for s in (line.strip() for line in text.splitlines()) if s and not s.startswith("#")}
+    return sorted(k for k in _GITIGNORED_SECRETS if k not in lines)
+
+
+def _keys_missing_from_planted_gitignore(_settings: dict[str, Any]) -> list[str]:
+    """Detector shim: a `.gitignore` holding every key but `*.pfx`, which appears only commented."""
+    kept = [k for k in _GITIGNORED_SECRETS if k != "*.pfx"]
+    return _keys_missing_from_gitignore("\n".join([*kept, "# *.pfx"]))
+
+
+def _unmirrored_file_denies(settings: dict[str, Any]) -> list[str]:
+    """Every pattern denied to Read with no Edit rule spelled the same, string for string.
+
+    It compares pattern text, not path coverage: a broader Edit rule does not count, except a bare
+    `Edit`, which names the tool on every path.
+
+    One way only: a path hidden from Read is secret enough to deny to Edit by name too, but an
+    Edit-only deny, say on a gate file agents must read, is a legitimate rule on its own.
+    """
+    deny = settings["permissions"]["deny"]
+    everywhere = {rule for rule in deny if rule in _FILE_TOOLS}
+    tools_by_pattern: dict[str, set[str]] = {}
+    for rule in deny:
+        m = _FILE_RULE.match(rule)
+        if m:
+            tools_by_pattern.setdefault(m.group(2), set()).add(m.group(1))
+    out = []
+    for pattern, tools in tools_by_pattern.items():
+        if "Read" not in tools:
+            continue
+        missing = [t for t in _FILE_TOOLS if t not in tools | everywhere]
+        if missing:
+            out.append(f"{pattern}: missing {', '.join(missing)}")
+    return sorted(out)
 
 
 # ------------------------------------------------ does a matcher select the tools it appears to?
@@ -295,6 +366,57 @@ def test_the_phi_and_secret_denies_are_all_present() -> None:
         "These are what CLAUDE.md sections 5 and 9 point at when they say secrets and the local "
         "store are off limits. Removing one makes that prose false. Deny rules cost nothing when "
         "unused and are the only permission rules auto mode cannot override."
+    )
+
+
+def test_every_read_denied_path_is_denied_to_edit_too() -> None:
+    """Every Read-denied pattern also carries an Edit rule of its own.
+
+    Red before BACKLOG #5495, when six Read-denied patterns had no Edit rule.
+    """
+    unmirrored = _unmirrored_file_denies(_load())
+    assert not unmirrored, (
+        f"{len(unmirrored)} pattern(s) denied to Read have no Edit rule: {unmirrored}.\n"
+        "Add the missing Edit rule for the same pattern. Never resolve this by removing the rule "
+        "that is there."
+    )
+
+
+def test_the_mirror_detector_names_only_the_unmirrored_file_pattern() -> None:
+    """Exact output: a detector that also flagged a non-file rule or an Edit-only deny fails."""
+    planted = {
+        "permissions": {
+            "deny": [
+                "Read(*.key)",
+                "Bash(rm -rf:*)",
+                "Edit(gate.txt)",
+                "Read(x.pem)",
+                "Edit(x.pem)",
+                "Read(y.pfx)",
+                "Write(y.pfx)",
+            ]
+        }
+    }
+    assert _unmirrored_file_denies(planted) == ["*.key: missing Edit", "y.pfx: missing Edit"]
+    bare = {"permissions": {"deny": ["Read(*.key)", "Edit"]}}
+    assert _unmirrored_file_denies(bare) == []
+
+
+def test_the_gitignore_detector_names_only_the_missing_key() -> None:
+    """Exact output: the wrong key, an extra key, or a commented line read as live all fail."""
+    assert _keys_missing_from_planted_gitignore({}) == ["*.pfx"]
+
+
+def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
+    """The mapping above is only honest while each key is still a `.gitignore` line.
+
+    Line membership only: a later `!` negation of a key is not seen here.
+    """
+    assert len(_GITIGNORED_SECRETS) >= 14, "the mapping lost entries; never shrink it"
+    gone = _keys_missing_from_gitignore((_ROOT / ".gitignore").read_text(encoding="utf-8"))
+    assert not gone, (
+        f"{gone} no longer appear in .gitignore. Update _GITIGNORED_SECRETS to the line that now "
+        "ignores each path, and keep its deny rules."
     )
 
 
@@ -486,6 +608,17 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
             "dot-anchored deny rule",
         ),
         (
+            # The shape `*.key` had before BACKLOG #5495: a Read rule and no Edit rule.
+            {"permissions": {"deny": ["Read(*.key)"]}, "hooks": {}},
+            _unmirrored_file_denies,
+            "deny pattern named for Read only",
+        ),
+        (
+            {"permissions": {"deny": []}, "hooks": {}},
+            _keys_missing_from_planted_gitignore,
+            "gitignored secret key missing from .gitignore",
+        ),
+        (
             # A settings document that wires NOTHING, checked against a root with no installers.
             # Every real hook script is then unaccounted for except the three on _KNOWN_UNWIRED, so
             # the detector must return a non-empty list. If it returns nothing here, it cannot see
@@ -530,6 +663,8 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
         "unanchored-hook",
         "unanchored-shell-form-hook",
         "dot-anchored-deny",
+        "unmirrored-file-deny",
+        "secret-key-not-ignored",
         "unwired-hook-script",
         "exact-list-matcher",
     ],
@@ -537,10 +672,13 @@ def _unclassified_for_planted(settings: dict[str, Any]) -> list[str]:
 def test_the_checks_can_actually_fail(planted: dict[str, Any], checker: Any, label: str) -> None:
     """A guard that cannot be shown to fail is not a guard.
 
-    Both checks above are absence assertions over a file that is currently correct, which is the
+    The checks above are absence assertions over files that are currently correct, which is the
     shape that passes just as well when the check is broken -- the failure mode this repo has
     already recorded twice (`tests/test_feature_map_claims.py`, the `.claude/` link-gate exemption).
-    Each detector is run here against a settings document carrying exactly the defect it hunts.
+    Each detector is run here against an input carrying exactly the defect it hunts: a planted
+    settings document, or, for the `.gitignore` check, a planted `.gitignore` text the shim builds,
+    in which case the settings document passed is empty and unused. This asserts only that each
+    detector reports something; the two exact-output tests above pin what the newer ones report.
     """
     assert checker(planted), (
         f"the {label} detector returned nothing for a document that contains one. The "

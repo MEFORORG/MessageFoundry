@@ -2802,7 +2802,9 @@ def MLLP(
     path). Both control ids are read separator-aware from the message (never hardcoded ``|^~\\&``).
     ``False`` (the default) leaves delivery **byte-identical** — no correlation is performed. If the
     outgoing message's own MSH-10 is absent/unreadable there is nothing to correlate, so the check is
-    skipped and the message delivers as before. It does not alter a negative ACK's handling.
+    skipped and the message delivers as before. A reject (AR/CR) that names a
+    different, non-empty MSA-2 is the same retryable correlation failure (BACKLOG #5681); a reject
+    with a matching or empty MSA-2 stays final, and AE/CE is not correlated.
 
     ``send_min_interval_seconds`` (**outbound only**, BACKLOG #82) paces this lane's egress: the engine
     holds each ``send`` until at least this many seconds have elapsed since the previous send on the
@@ -3151,6 +3153,35 @@ def X12(
 INTAKE_AUTH_RATE_LIMIT_DEFAULT = 10
 INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT = 60
 
+#: The only text an intake-auth budget may be: plain ASCII digits, nothing around them.
+_INTAKE_BUDGET_TEXT = re.compile(r"[0-9]+")
+
+
+def read_intake_budget(value: Any, knob: str, transport: str) -> int:
+    """One intake-auth failed-attempt budget as a count, ``0`` meaning that budget is off (BACKLOG #5677).
+
+    The one rule for a budget, however it arrived: written in config, an env() ``default=``, or
+    the value the environment resolved. Off is ``None``, an integer ``0``, or plain-digit text that
+    spells zero, such as an uncast env() ``"0"``. Any other text is refused, at least ``""``,
+    whitespace, ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits, so text cannot
+    turn a budget off the way :func:`~messagefoundry.transports.base.cap_setting` alone would read
+    ``""`` or ``"0.0"``. A bool, a fraction, a negative and a zero that is not the integer ``0``
+    (such as ``0.0``) are refused too; a negative budget would refuse every request. Raises ``ValueError`` naming the setting, with the value withheld."""
+    from messagefoundry.transports.base import cap_setting
+
+    if isinstance(value, str) and not _INTAKE_BUDGET_TEXT.fullmatch(value):
+        raise ValueError(f"{transport} {knob} is text other than plain digits (value withheld)")
+    read = cap_setting(value, int, knob=knob, transport=transport)
+    if read is None and value is not None and not isinstance(value, (int, str)):
+        # A float or other numeric zero is not the documented integer 0, so it does not disable.
+        raise ValueError(
+            f"{transport} {knob} is a zero that is not the integer 0 (value withheld); write 0 "
+            "or None to disable it"
+        )
+    if read is not None and read < 0:
+        raise ValueError(f"{transport} {knob} is negative (value withheld)")
+    return read or 0
+
 
 def Http(
     *,
@@ -3418,14 +3449,45 @@ def Http(
                 f"Http sets trusted_proxies but {knob} is off. {reason}. Set {knob}, or remove "
                 "the setting"
             )
-        # The runner reads a budget with int(), so a fraction below 1 would pass the test above
-        # and turn the arm off; a negative, a bool or an env() is no checked budget either.
+        # A budget this rule cannot see at load is no checked budget: an env() could resolve to
+        # 0, which turns the arm off. A fraction, a negative or a bool is no count at all.
         if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
             raise WiringError(
                 f"Http sets trusted_proxies but {knob} is not an integer of at least 1 (value "
-                "withheld). The listener reads it with int(), so a fraction below 1 would turn "
-                "that budget off. Set it to an integer number of failed attempts per minute, or "
-                "remove the setting"
+                "withheld). With trusted_proxies set it must be a whole number written here, not "
+                "an env() reference, a fraction or a negative. Set it to an integer number of "
+                "failed attempts per minute, or remove the setting"
+            )
+    # BACKLOG #5677: each budget is read by read_intake_budget, the rule the runner applies too, so
+    # a bool, a fraction, text other than plain digits or a negative (which would refuse every
+    # intake request) is refused here, where `check` sees it, after the stricter trusted_proxies
+    # rule above. An env() is checked on its default= here and on its resolved value by the
+    # runner's check_intake_budgets, which refuses one that resolves to no value; a default= of
+    # None or "" is refused here for that reason, so check does not pass what serve refuses
+    # wherever the variable is unset.
+    for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
+        written = settings[knob]
+        from_default = isinstance(written, EnvRef)
+        no_value_default = False
+        if isinstance(written, EnvRef):
+            no_value_default = written.default is None or written.default == ""
+            written = None if written.default is _UNSET else written.default
+        budget_refusal: str | None = None
+        if no_value_default:
+            budget_refusal = f"Http {knob} has no value, which the listener refuses whenever the variable is unset"
+        else:
+            try:
+                read_intake_budget(written, knob, "Http")
+            except ValueError as exc:
+                budget_refusal = str(exc)  # withholds the value; raised below, outside this handler
+        if budget_refusal is not None:
+            # An env() budget is refused here only on its default=, so say so: the environment
+            # variable itself is not read until the listener starts.
+            where = f"the env() default= of {knob} is refused: " if from_default else ""
+            fix = f"Set the default= of {knob}" if from_default else "Set it"
+            raise WiringError(
+                f"{where}{budget_refusal}. {fix} to a whole number of failed attempts per minute, "
+                "or 0 to disable that budget"
             )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())

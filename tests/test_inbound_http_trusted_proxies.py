@@ -385,8 +385,9 @@ def test_the_setting_is_refused_with_the_per_peer_budget_off(per_peer: int | Non
 def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
     knob: str, budget: object
 ) -> None:
-    """The runner reads each budget with ``int()``, so 0.5 passed the truthiness test and turned
-    that arm off. Red on b6ed93ab18, which tested only truthiness."""
+    """With trusted_proxies set, each budget must be a whole number of at least 1 written in the
+    config, so neither arm can be off. Once read with ``int()``, 0.5 passed the truthiness test and
+    turned that arm off. Red on b6ed93ab18, which tested only truthiness."""
     knobs: dict[str, Any] = {knob: budget}
     with pytest.raises(WiringError, match=f"{knob} is not an integer of at least 1") as exc:
         Http(
@@ -397,8 +398,15 @@ def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
             **knobs,
         )
     assert str(budget) not in str(exc.value)
-    # Its control: without trusted_proxies this refusal does not read the budget.
-    Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+    # Its control: without trusted_proxies this refusal does not read the budget. Only the general
+    # BACKLOG #5677 rule does: a whole count (10.0, "10" or an env() default of 10) loads, and a
+    # fraction, a negative or a bool is refused by that rule's own message.
+    if isinstance(budget, bool) or budget in (0.5, 1.5, -1):
+        with pytest.raises(WiringError, match=knob) as general:
+            Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+        assert "at least 1" not in str(general.value)
+    else:
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
 
 
 def test_whole_number_budgets_load_with_trusted_proxies() -> None:

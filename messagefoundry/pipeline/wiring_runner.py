@@ -109,6 +109,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import (
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
+    EnvRef,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -120,6 +121,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    read_intake_budget,
     read_lax_flag,
     refuse_capture_conflicts,
     refuse_resolved_verify_off,
@@ -2876,8 +2878,13 @@ class RegistryRunner:
         """
         return dict(self._sync_reply_metrics)
 
-    def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
+    def _make_intake_rate_limiter(
+        self, ic: InboundConnection, settings: Mapping[str, Any]
+    ) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        ``settings`` is the inbound's env()-RESOLVED settings, as the source is built from (BACKLOG
+        #5677): ``ic.spec.settings`` may still hold an unresolved env() reference.
 
         An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
         own and gets the ``Http()`` factory's defaults."""
@@ -2887,8 +2894,9 @@ class RegistryRunner:
             )
         if not self._intake_auth_enabled(ic):
             return None
-        per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
-        glob = int(ic.spec.settings.get("intake_auth_rate_limit_global") or 0)
+        written = ic.spec.settings
+        per_peer = _intake_budget(settings, "intake_auth_rate_limit", ic.name, written)
+        glob = _intake_budget(settings, "intake_auth_rate_limit_global", ic.name, written)
         if not per_peer and not glob:
             return None
         return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
@@ -5834,6 +5842,8 @@ class RegistryRunner:
         # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
         # cleartext escape hatch does not get to waive authentication.
         check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
+        # BACKLOG #5677: the resolved budgets, before the off-loop build below does any TLS work.
+        check_intake_budgets(source_cfg, ic.name, ic.spec.settings)
         # BACKLOG #1729, sited with the gates above because it shares their seam and nothing else does:
         # this is the one point that sees an inbound's OWN streaming settings and the SERVICE-level
         # aggregate budget together, on start, on reload, and on a runtime connection start. It is the
@@ -5862,7 +5872,7 @@ class RegistryRunner:
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
-        source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
+        source.intake_rate_limiter = self._make_intake_rate_limiter(ic, source_cfg.settings)
         # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
         # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
         # reply_from, so every other connection keeps the shipped 202 path byte for byte.
@@ -14032,6 +14042,56 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(created_at))
 
 
+def _intake_budget(
+    settings: Mapping[str, Any], knob: str, name: str, written: Mapping[str, Any]
+) -> int:
+    """One intake-auth failed-attempt budget, read from env()-RESOLVED settings (BACKLOG #5677).
+
+    Read by :func:`~messagefoundry.config.wiring.read_intake_budget`, the rule the ``Http()``
+    factory applies at load, so the outcome does not depend on how the value arrived. The off set
+    is ``None``, an integer ``0``, and plain-digit text that spells zero, such as an env() that
+    resolves to ``"0"``; those return ``0``. Any other text (at least ``""``, whitespace,
+    ``"0.0"``, ``" 0 "``, ``"+5"``, ``"1_000"`` and non-ASCII digits), a bool, a fraction, a
+    negative and a zero that is not the integer ``0`` (such as ``0.0``) are refused. ``written`` is the inbound's settings as configured: where the budget was
+    an env() reference that resolved to ``None`` (an unset variable with ``default=None``) it is
+    refused too rather than turning the bound off, as is one that resolved to ``""``.
+    Refused as a ``WiringError`` naming the connection and the setting, with the value withheld."""
+    refusal: str | None = None
+    budget = 0
+    value = settings.get(knob)
+    ref = written.get(knob)
+    if isinstance(ref, EnvRef) and (value is None or value == ""):
+        raise WiringError(
+            f"inbound connection {name!r}: HTTP {knob} (env {ref.key!r}) resolved to no value, "
+            "which would turn that budget off. Set it to a whole number of failed attempts per "
+            "minute, or to 0 to disable that budget"
+        )
+    try:
+        budget = read_intake_budget(value, knob, "HTTP")
+    except ValueError as exc:
+        refusal = str(exc)  # withholds the value; raised below, outside this handler
+    if refusal is not None:
+        raise WiringError(
+            f"inbound connection {name!r}: {refusal}. Set it to a whole number of failed attempts "
+            "per minute, or 0 to disable that budget"
+        )
+    return budget
+
+
+def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) -> None:
+    """Refuse an HTTP inbound whose resolved failed-attempt budgets are no count (BACKLOG #5677).
+
+    Run beside :func:`check_http_intake_auth` at start AND in the build check, so `messagefoundry
+    check`, promote and a reload's pre-swap check refuse what serve would refuse, before anything
+    stops. The ``Http()`` factory checks a literal and an env() ``default=`` at load; this sees the
+    value the environment resolved; ``written`` is the inbound's configured settings, which say
+    whether a budget was an env() reference."""
+    if source.type is not ConnectorType.HTTP:
+        return
+    for knob in ("intake_auth_rate_limit", "intake_auth_rate_limit_global"):
+        _intake_budget(source.settings, knob, name, written)
+
+
 def _source_config(
     ic: InboundConnection,
     bind_host: str,
@@ -14659,6 +14719,7 @@ def _build_check_connectors(
         # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
         # would leave this gate weaker at check time than every posture-keyed neighbour.
         check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
+        check_intake_budgets(source_cfg, ic.name, ic.spec.settings)  # BACKLOG #5677, as at start
         build_source(source_cfg, egress=egress)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a
@@ -15089,7 +15150,8 @@ def check_inbound_revocation(
     **Measured on this tree**: the three server builders load a CA, set ``CERT_REQUIRED`` and finish
     with ``harden_verify_flags`` -- strict RFC 5280 path validation, NOT revocation -- so a client
     certificate revoked this morning keeps authenticating until its ``notAfter``. Set
-    ``tls_crl_file`` on the connection (a PEM file holding the CA's CRL), or declare
+    ``tls_crl_file`` on the connection (a PEM file holding a CRL from each CA in the client
+    chain, vault BACKLOG #5511), or declare
     ``tls_revocation_attested = true`` with a ``tls_revocation_attested_reason`` on the connection if
     your PKI checks revocation outside the engine (ADR 0173). An attestation that suppresses the
     enforcing refusal is logged at WARNING with its reason, so the crossing stays on the record.
@@ -15132,8 +15194,9 @@ def check_inbound_revocation(
         log.warning(
             "%sinbound requires and verifies a client certificate (mTLS) but checks NO revocation: "
             "a revoked partner certificate would keep authenticating until its notAfter. Set "
-            "tls_crl_file (a PEM file holding the CA's CRL) on the connection, or "
-            "tls_revocation_attested=true with a tls_revocation_attested_reason if your PKI checks "
+            "tls_crl_file (a PEM file holding a CRL from each CA in the client chain) on the "
+            "connection, or tls_revocation_attested=true with a tls_revocation_attested_reason "
+            "if your PKI checks "
             "revocation outside the engine.",
             hop_name_prefix(inbound_record_name(name)),
         )
@@ -15142,7 +15205,7 @@ def check_inbound_revocation(
         f"inbound connection {name!r} requires and verifies a client certificate (mTLS) but checks "
         "no revocation, on an enforcing production-PHI instance; a partner certificate revoked "
         "today would keep authenticating to this interface until its notAfter. Set tls_crl_file "
-        "(a PEM file holding the CA's CRL) on the connection, or set "
+        "(a PEM file holding a CRL from each CA in the client chain) on the connection, or set "
         "tls_revocation_attested=true with a tls_revocation_attested_reason if a "
         "revocation-checking PKI covers these certificates outside the engine. An HTTP proxy can "
         "terminate neither MLLP nor DIMSE, so for those listeners the proxy-based OCSP delegation "

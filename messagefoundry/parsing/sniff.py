@@ -10,7 +10,8 @@ import a transport), and the attachment detach/download paths (``pipeline/wiring
 * **Ingress content-vs-declared-type sniff** (:func:`_content_matches_declared`) — do a body's leading
   bytes structurally match the inbound connection's declared ``content_type``? Rejects a binary/non-HL7
   drop that merely carries the right extension before its bytes reach the pipeline. The file sources
-  call it on a file's original bytes; the network listeners (MLLP/TCP/HTTP/database poll) reach it
+  call it on a file's original bytes first, and on a head decoded with their ``encoding`` only in the
+  case ``docs/CONNECTIONS.md`` states under the untrusted-drop policy; the network listeners (MLLP/TCP/HTTP/database poll) reach it
   through the shared ingress handler in ``pipeline/wiring_runner.py``, on the head that
   :func:`text_sniff_head` derives from their already-decoded body (BACKLOG #1109).
 * **Attachment MIME-vs-magic agreement** (:func:`attachment_mime_agrees`) — do a detached OBX-5 ED
@@ -82,8 +83,9 @@ _TEXT_SNIFF_HEAD_CHARS = 8
 def text_sniff_head(text: str) -> bytes:
     """UTF-8 head bytes of an already-DECODED body, to hand to :func:`_content_matches_declared`.
 
-    The file sources sniff a file's original bytes because they have no declared encoding to decode
-    with. A network listener does: it decodes with the connection's ``encoding`` before anything else,
+    The file sources sniff a file's original bytes first, and a decoded head only in the case
+    ``transports/file.py`` ``_content_matches_encoded`` states. A network listener decodes first:
+    it decodes with the connection's ``encoding`` before anything else,
     so sniffing its ORIGINAL bytes would quarantine a legitimate ``encoding="utf-16"`` JSON body, which
     leads with the two BOM bytes and then ``{`` interleaved with NULs, never a bare ``{``. Sniffing the
     decoded head instead makes the check encoding-independent, and identical to the byte sniff for every

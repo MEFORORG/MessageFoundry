@@ -899,7 +899,8 @@ which the same CRL relaxes the same hop without a sidecar.
 
 - Any AIA or CRL-distribution-point fetch, in either direction. ADR 0078's offline-by-default
   reasoning holds here with full force and is not reopened.
-- `VERIFY_CRL_CHECK_CHAIN` and `capath=` hashed-directory CRL loading. `harden_crl_check`'s own
+- `VERIFY_CRL_CHECK_CHAIN` and `capath=` hashed-directory CRL loading. The chain flag half is no
+  longer out of scope on the listeners that require a client certificate: §14 says where it is on. `harden_crl_check`'s own
   docstring (`tls_policy.py:237-247`) records that `capath=` was measured working while
   `cert_store_stats()["crl"]` reports zero for it, so the helper's liveness assertion would reject a
   working configuration. Anyone adding it needs a different proof.
@@ -1749,3 +1750,22 @@ refused with a CRL on the relaxed context, admitted and audited on the attestati
 credit, warned when not enforcing, and admitted by the same CRL without the relaxation, for each
 hop.
 
+## 14. Amendment 2026-11-16 -- the client-certificate listeners check the whole chain (vault BACKLOG #5627, #5511)
+
+**What changed.** `harden_crl_check(chain=True)` sets `VERIFY_CRL_CHECK_CHAIN`, so a revoked
+intermediate CA refuses the clients under it. The API listener's `[api].tls_client_crl_file` took
+it under vault BACKLOG #5627. The MLLP listener, the inbound HTTP listener that shares its builder,
+and the DICOM SCP take it on `tls_crl_file` under #5511. With the leaf flag alone, a client whose
+intermediate the root's CRL revoked would have completed the handshake on those three.
+
+**The start rule that comes with it.** Under the chain check OpenSSL refuses every client under a
+loaded CA that has no CRL of its own in the file. So `harden_crl_check` refuses that file at start,
+and the running-hop reload refuses it as a file to fix (`messagefoundry.pki.own_crl_reason`, one
+rule and one wording for both). A site that supplies only the issuing intermediate's CRL is refused
+at start, naming the root.
+
+**Still leaf only.** At least every outbound hop under `[tls].crl_file`. Such a hop may verify
+against the OS trust store, whose roots no CRL file names, so the start rule would refuse it.
+`capath=` loading stays out of scope, for the reason the out-of-scope bullet gives.
+
+Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_client_trust.py`.
