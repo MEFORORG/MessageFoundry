@@ -833,9 +833,12 @@ async def test_a_cancelled_pooled_claim_leaves_its_rows_inflight(
 async def _server_claim_raising(
     backend: str, monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> list[str]:
-    """The server twins of :func:`_claim_raising`, offline: lane B's open raises ``error``, which
-    is not a :class:`CipherError`, so it escapes the decode. Assert the claim re-raises it
-    unchanged and return the ids handed to ``release_claimed``."""
+    """The server twins of :func:`_claim_raising`, offline: lane B's head is refused, and the
+    awaited handling of that refusal raises ``error``, so it escapes the decode at the claim's own
+    await point. Assert the claim re-raises it unchanged and return the ids handed to
+    ``release_claimed``."""
+    from messagefoundry.store.queue_tag import QueueTagError  # noqa: PLC0415
+
     store = _server_store(backend, _FakeServer(None))
     released: list[str] = []
 
@@ -850,9 +853,13 @@ async def _server_claim_raising(
 
     def opened(r: Any, *_a: Any) -> Any:
         if r["channel_id"] == "B":
-            raise error
+            raise QueueTagError("t")
         return "body" if backend == "sqlserver" else OutboxItem.from_row(r, "body")
 
+    async def escaping(*_a: Any, **_kw: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(store, "_dead_letter_unopenable", escaping)
     if backend == "sqlserver":
         monkeypatch.setattr(store, "_open_claimed", opened)
         with pytest.raises(type(error)) as raised:

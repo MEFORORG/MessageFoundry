@@ -169,10 +169,10 @@ async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -
     leaves its rows ``inflight`` then, as the pooled dispatcher's teardown leaves a cancelled
     serializer's (ADR 0066), for lease expiry or ``reset_stale_inflight``. A release during a
     demotion's cancel is a return-to-``pending`` write ADR 0157 C1 leaves unfenced, so it could
-    re-pend rows a successor already claimed. A row the claim already settled (dead-lettered) is not ``inflight``, and the release
-    leaves it as it is. A failed release, building the id list included, is logged and swallowed,
-    so the caller re-raises the original error; the rows then stay ``inflight`` until
-    ``reset_stale_inflight``."""
+    re-pend rows a successor already claimed. A row the claim already settled (dead-lettered) is
+    not ``inflight``, and the release leaves it as it is. A failed release, building the id list
+    included, is logged and swallowed, so the caller re-raises the original error; the rows then
+    stay ``inflight`` until ``reset_stale_inflight``."""
     ids: list[str] = []
     try:
         ids = [str(row["id"]) for rows in lanes for row in rows]
