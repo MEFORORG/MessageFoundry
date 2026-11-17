@@ -29,10 +29,10 @@ or :meth:`LogSpool.close` deletes it. One that is still there at the next start 
 because nothing on disk marks it as sent. A write the disk refused is dropped and counted; the empty
 segment it would have started is removed, so a full disk does not fill the directory with empty files.
 
-**Replay order.** First in, first out: segments in sequence order, lines in file order. While the
-spool reads as holding anything, the forwarder appends new records to it rather than sending them
-live. A spool it cannot read, a missing or unreachable directory included, reads as holding
-nothing, so while that read fault stands newer records are sent live ahead of what it keeps.
+**Replay order.** Segments in sequence order, lines in file order. While :attr:`LogSpool.pending`
+is True, the forwarder appends new records to the spool rather than sending them live. A read
+fault, a missing or unreachable directory included, makes ``pending`` False, so newer records can
+then be sent live ahead of what the spool keeps.
 
 **Crash safety.** Each append is flushed to the operating system, so a process crash loses nothing
 already appended. A power loss can lose a tail the OS had not yet written.
@@ -195,7 +195,7 @@ class LogSpool:
         #: Torn, malformed or other-version lines skipped on replay, and segments found gone.
         self.unreadable = 0
         #: Reads that failed for a reason other than a missing segment file, a missing spool
-        #: directory included. Nothing is retired for them; a removed directory took its files.
+        #: directory included. Nothing is retired for them.
         self.read_errors = 0
         #: Whether the LAST read failed that way. :attr:`read_errors` never goes down, so it cannot
         #: say whether a fault is still standing; this can.
@@ -444,10 +444,10 @@ class LogSpool:
         A read error never escapes: ``QueueListener`` catches only ``queue.Empty``, so an exception
         here would end the listener thread for good. Only a segment that is GONE is retired, and the
         read then moves on to the next segment: answering ``None`` there would read as drained, and
-        the forwarder would send live records ahead of the older ones still spooled (BACKLOG #5811).
+        the forwarder could send live records ahead of the older ones still spooled (BACKLOG #5811).
         A spool DIRECTORY that is missing, or that the read error names as out of reach
         (:func:`_directory_unreachable`), is not a gone segment: like any other
-        ``OSError`` (out of descriptors, a sharing violation) it keeps every file and returns
+        ``OSError`` (out of descriptors, a sharing violation) it retires nothing and returns
         ``None``, so the caller tries again later instead of deleting undelivered records. It also
         closes the writer, for the reason the comment below gives."""
         while True:

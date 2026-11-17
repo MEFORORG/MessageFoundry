@@ -454,52 +454,33 @@ amendment disagrees with either, it is the newer text.**
 **Rolls past the bound, and stage-2 events that were not delivered.** Before this amendment
 every roll past section 1's bound wrote the sink's state as `rolled` before escalating, so for
 that interval another thread could read the sink as writable. Now a roll past the bound on a sink
-already unwritable keeps it unwritable. It still fires another stage-2 event and stderr line,
-as `main` does, with the stop request wherever `main`'s would carry one, so the stop is asked for
-again on every such roll whatever the responder answered before. The row's *one page per break* clause is therefore not closed for
-these rolls. A stage-2 event that was not delivered, because no responder was wired, the
-responder raised, or the engine's responder had no open event loop to hand it to, is owed: it is
-fired again on each later failure of the break, at most once per failure and without another
-stage-2 stderr line, until one is delivered. Wiring a responder also fires each event already
-owed at that moment. A break that ends with a heal roll owes nothing.
+already unwritable keeps it unwritable, and still fires a stage-2 event and the stderr line, as
+`main` does. The row's *one page per break* clause is therefore not closed for these rolls. A
+stage-2 event that was not delivered is now owed and fired again later;
+`LogWriteGuard.record_unwritable`'s docstring says when.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
 the flap latch, the line now says so, instead of Amendment B's "another sink is still writable".
 The stop decision is unchanged.
 
-**`revalidate()` and a sink that changes while it is probed.** Each probe runs outside the guard's
-lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no
-longer probed, and is not marked healthy after a probe that landed, so a latch, a failure or the
-bound's streak recorded meanwhile is kept. A change between that check and the probe's own write
-still meets the probe: the lock is never held across a sink's I/O. Its answer is now `can_log()`'s,
-read after the probes, so a flap latch another thread set while the probes ran counts against it,
-and it never answers that the process can log while `GET /status` reads every sink unwritable.
-Amendment B's statement that `revalidate()`, and every re-arm and runner start gated on it, answers
-as section 1 does no longer holds in that case: the re-arm is refused, and the runner starts
-halted.
+**`revalidate()` and a sink that changes while it is probed.** `revalidate()` probes a sink only
+if nothing was recorded on it since its snapshot, and marks it healthy only if nothing was
+recorded on it by the time its probe ends. The guard's lock is not held across the probe's write.
+Its answer is now `can_log()`'s, read under the lock after the probes, so it reads the flap latch,
+where Amendment B said it answered from each sink's own state.
 
-**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). This paragraph is
-where the rule is stated. `handleError` used to roll the sink on any failure, then fail to re-write
-the same record and call the sink unwritable. On the handlers `configure_logging` builds, the
-redaction filter already replaces a record whose message cannot be rendered, so this path needs a
-formatter that fails where the filter did not. Now such a record's place is taken by a fixed notice
-naming its logger and level. When the sink takes the notice, neither stage runs. **This is a
-change from `main`, where such a record went to stage 2, and so asked for the stop when every sink
-was unwritable.** Now the engine keeps processing: only that record's content is replaced by the
-notice, and a rate-limited stderr line is written. Nothing shows on `GET /status`. When it refuses
-it, the sink is the fault and the two stages decide as before. A formatter that cannot format even
-that notice leaves the process unable to log through that sink, so the sink is recorded unwritable
-with a reason that names a formatter fault, and the stop is asked for when every sink is
-unwritable, as before this amendment. The log file is not rolled or renamed, by that failure or by
-`revalidate()`'s probe, because a roll cannot clear a formatter fault. Nothing is written to it
-either, so whether its disk can take a write is not tested until the formatter is fixed. The format faults `handleError` meets before any
-roll are counted: the record's, the notice's, and a logger or level name that cannot be rendered.
-A stderr last-resort line names each kind with its count, at most once a minute per sink. Two
-format faults are not counted there: one formatting `revalidate()`'s probe notice only fails the
-probe, and one formatting the rollover notice or the re-written record after a roll goes to
-stage 2 as a replacement that could not be written. Faults counted
-inside that minute go on the next such line: at the next fault or flush after the minute, or when
-the sink is closed.
+**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). On `main`,
+`handleError` rolls the sink on any failure, so a record its formatter refuses rolls the sink, and
+when the re-write fails too the record goes to stage 2. Now the guard writes in the record's
+place a fixed notice naming the record's logger, its level and the exception's type, where the
+formatter can format that notice. When the sink takes the notice, neither stage runs: the engine keeps processing,
+the fault is counted on a rate-limited stderr line, and nothing shows on `GET /status`. **This is
+weaker than `main`, where such a record went to stage 2. An owner ruling on it is pending.** When
+the sink refuses the notice, the two stages decide, as for any write failure. When the formatter
+cannot format the notice either, the sink is recorded unwritable with a reason that names a
+formatter fault, and the file is not rolled or renamed; stage 2 then decides the stop as for any
+other stage-2 failure. `_GuardedSinkMixin.handleError` and `_report_format_faults` in
+`logging_guard.py` say what is counted and when the stderr line is written.
 
 **Part of the side-by-side check is now committed.**
 `test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on

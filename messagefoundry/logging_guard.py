@@ -15,23 +15,17 @@ module is that second half.
   (``<name>.broken-<UTC>-<n>``), a fresh file is opened at the live path, the **rollover event is
   recorded** into it, and the record whose write failed is re-written. A transient condition — a
   momentary lock, an antivirus scan, a rotation race — heals here and stops nothing.
-* **Stage 2 — STOP.** The guard escalates when the **replacement** also cannot be written, when a
-  sink needs rolling past the flap bound (:meth:`LogWriteGuard.record_rollover`), and when the
-  sink's formatter cannot format even the guard's notice standing in for an unformattable record:
-  that last case is recorded unwritable with no roll, because a roll cannot clear a formatter
-  fault (BACKLOG #5813). A write failure never escalates without a roll attempt first: a single-stage
-  stop would take feeds down on a hiccup; that is an outage generator, not an invariant.
+* **Stage 2 — STOP.** :meth:`LogWriteGuard.record_unwritable` records the sink unwritable and
+  decides whether to ask for the stop. Its docstring names its callers. A write failure reaches it
+  only after a roll was tried: a single-stage stop would take feeds down on a hiccup; that is an
+  outage generator, not an invariant.
 
 **And a third thing, which is not a stage but is half the enforcement: UN-stopping.** Recovery is an
 operator assertion — *"I fixed the disk"* — and a fail-closed control that simply believes it is a
-control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests a dead sink **by
-writing a real record to it**, because ``unwritable``, as a sink's own state, is only ever set by a
-failed write and nothing clears it on its own: *repaired* and *still broken* are indistinguishable
-from memory, which is exactly the distinction recovery has to make. The engine gates every re-arm
-path on that answer. (The state :meth:`LogWriteGuard.status` reports may also include the flap
-latch, see :meth:`LogWriteGuard.record_rollover`; :meth:`LogWriteGuard.revalidate` releases the
-latch on every sink whose own state is not unwritable, and then answers as
-:meth:`LogWriteGuard.can_log` does.)
+control with an off switch. :meth:`LogWriteGuard.revalidate` therefore re-tests each sink whose own
+state is ``unwritable`` **by writing a real record to it**: *repaired* and *still broken* are
+indistinguishable from memory, which is exactly the distinction recovery has to make. The engine
+gates every re-arm path on that answer.
 
 **Scope of the stop is the PROCESS, and the code says so rather than pretending otherwise.** The
 application log is a process-global handler set on the root logger — a write failure is a property of
@@ -168,15 +162,11 @@ class LogWriteGuard:
     """Process-wide state + escalation seam for the guarded application-log sinks.
 
     Thread-safe: log records are emitted from the event loop, from handler worker threads and from
-    connector threads alike, so every mutation is under one lock. Escalation is **latched per sink** —
-    a sink that is already ``unwritable`` does not re-fire on every subsequent record (that would turn
-    one broken disk into an unbounded alert storm), and a later successful Stage-1 roll clears that
-    page latch so a genuine re-break pages again. A roll past the flap bound does not clear it;
-    :meth:`record_rollover` states what such a roll does instead (BACKLOG #5812).
+    connector threads alike, so every mutation is under one lock. Escalation is **latched per sink**:
+    :meth:`record_unwritable` says when a sink already ``unwritable`` fires again.
 
     **The FLAP latch is a different thing**, an overlay on what this class reports (BACKLOG #5812,
-    ADR 0162 amendment B). A successful roll does not always release it. :meth:`record_rollover`
-    states when it holds and what it leaves alone; that statement is not repeated here."""
+    ADR 0162 amendment B). :meth:`record_rollover` says when it holds."""
 
     def __init__(self, *, stop_on_unwritable: bool = True) -> None:
         self._lock = threading.RLock()
@@ -282,33 +272,25 @@ class LogWriteGuard:
     # --- stage transitions ----------------------------------------------------
 
     def record_rollover(self, sink: str, *, reason: str, rolled_aside: str | None) -> None:
-        """Stage 1 succeeded: ``sink`` was rolled and is writable again.
+        """Stage 1 rolled ``sink``, and its replacement took the notice and the re-written record.
 
-        **Bounded, because "heals" and "keeps needing to be healed" are not the same sink.** A sink
-        that accepts the notice and the re-written record and then fails again on the next one would
-        otherwise roll forever — one rename, one fresh file and one escalation per log record. Past
-        :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
-        declared unwritable instead: a log you must replace every few seconds is not a working log,
-        and stage 2 is the honest verdict on it. **This is where the rule for a roll past the
-        bound is stated.** Each further roll past the bound in that window finds the sink already
-        unwritable and leaves it so, and fires the stage-2 event and its stderr line again, as
-        the guard did before ADR 0162 Amendment C, so the stop is asked for again whatever the
-        responder answered before.
+        **Bounded, because "heals" and "keeps needing to be healed" are not the same sink.** A roll
+        past :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` is passed
+        on to :meth:`record_unwritable`: a log you must replace every few seconds is not a working
+        log, and stage 2 is the honest verdict on it. Such a roll on a sink already ``unwritable``
+        keeps it so and passes ``repeat`` (ADR 0162 Amendment C).
 
-        **The flap latch holds what the bound declared unwritable** (BACKLOG #5812; this paragraph
-        is where the rule is stated). The bound's window restarts a minute after its first roll, so a
-        sink still rolling every few seconds would otherwise read ``rolled`` again, and
-        :meth:`can_log` True with no probe, until the bound trips again. So the roll that trips the
-        bound also latches the sink, in the same hold of the lock that writes the bound's state. A
-        later roll keeps the latch while it comes within :data:`_ROLL_FLAP_WINDOW_SECONDS` of the
-        sink's last roll or stage-2 failure, and the first roll after a longer gap releases it.
-        Otherwise only :meth:`revalidate` or :meth:`record_healthy` releases it. **The latch changes
-        nothing above:** it is an overlay in its own field, never touches a sink, and the code that
-        computes the bound, its window and streak, the events this method and
-        :meth:`record_unwritable` fire, the stop requests and every field of the recorded status
-        does not read it. It changes at least what :meth:`status`, :meth:`can_log` and
-        :meth:`revalidate` answer, only towards ``unwritable``, and what the stage-2 stderr line
-        says about the other sinks.
+        **The flap latch holds what the bound declared unwritable** (BACKLOG #5812). The bound's
+        window restarts a minute after its first roll, so a sink still rolling every few seconds
+        would otherwise read ``rolled`` again, and :meth:`can_log` True with no probe, until the
+        bound trips again. So the roll that trips the bound also latches the sink, in the same hold
+        of the lock that writes the bound's state. A later roll keeps the latch while it comes
+        within :data:`_ROLL_FLAP_WINDOW_SECONDS` of the sink's last roll or stage-2 failure, and
+        the first roll after a longer gap releases it; :meth:`revalidate` and
+        :meth:`record_healthy` release it too. The latch is an overlay in its own field and never
+        touches a sink. The bound, the events this method and :meth:`record_unwritable` fire, their
+        stop requests and the recorded status do not read it; :meth:`status`, :meth:`can_log`,
+        :meth:`revalidate` and the stage-2 stderr line do.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -325,8 +307,8 @@ class LogWriteGuard:
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
             tripped = streak > _MAX_ROLLS_PER_WINDOW
-            # A roll past the bound on a sink already unwritable keeps it so, and still escalates;
-            # the docstring above states the rule.
+            # A roll past the bound on a sink already unwritable keeps it so in this same hold of
+            # the lock, so no other thread reads it ``rolled`` in between.
             repeat = tripped and previous is not None and previous.state == "unwritable"
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
@@ -363,20 +345,18 @@ class LogWriteGuard:
         cause: str = "after a rollover attempt",
         repeat: bool = False,
     ) -> None:
-        """Stage 2: the sink cannot take a record. Called when a roll's replacement could not be
+        """Stage 2: record ``sink`` unwritable. Called when a roll's replacement could not be
         written, by :meth:`record_rollover` past the flap bound, and by
-        :meth:`_GuardedSinkMixin.handleError`, with no roll and no replacement, when the sink's
-        formatter cannot format the notice standing in for an unformattable record.
-        Escalates ONCE per break, with two exceptions.
-        A break whose event was not delivered owes it: no responder was wired, or the responder
-        raised or reported that it dropped the event. An owed event is fired again on the next
-        failure of the break until one is delivered. :meth:`set_escalation` also fires each event
-        already owed when it wires a responder; one a failure records as owed just after that
-        waits for the sink's next failure. And ``repeat``, which :meth:`record_rollover` passes
-        for a roll past the flap bound on a sink already unwritable, fires the event and writes
-        the stderr line again; :meth:`record_rollover` states why.
-        ``cause`` is a literal phrase for the stderr line saying how the sink came to be
-        unwritable.
+        :meth:`_GuardedSinkMixin.handleError`, with no roll, when the sink's formatter cannot
+        format the notice standing in for an unformattable record. ``cause`` is a literal phrase
+        for the stderr line saying how the sink came to be unwritable.
+
+        A sink not already unwritable gets the stderr line and a stage-2 event. A sink already
+        unwritable gets neither, with two exceptions. With ``repeat``, which
+        :meth:`record_rollover` passes, it gets both. And when its last stage-2 event was not
+        delivered (see :meth:`_fire`), that event is owed: the sink's next call here fires one.
+        A roll that heals the sink, and :meth:`record_healthy`, clear the debt.
+        :meth:`set_escalation` also fires the owed events when it wires a responder.
 
         **The STOP is asked for only when EVERY guarded sink is unwritable, and that is a
         correctness point, not a softening.** The ruling is *"we never want to process stuff if the
@@ -406,10 +386,8 @@ class LogWriteGuard:
             # other sink only changes what the stderr line says about them.
             all_reported_down = all(self._reads_unwritable(s) for s in self._sinks.values())
             self._latch_after_failure(sink)
-            # A break whose stage-2 event was not delivered is still owed one: each later failure
-            # on it fires the event again, without another stderr line, until one is delivered
-            # (BACKLOG #5812). Taken here, under the lock, so one owed event is fired by one
-            # failure, not by every thread failing at once.
+            # An owed event (BACKLOG #5812) is taken here, under the lock, so one owed event is
+            # fired by one call, not by every thread failing at once.
             owed = already_down and sink in self._unanswered
             if owed:
                 self._unanswered.discard(sink)
@@ -522,34 +500,27 @@ class LogWriteGuard:
 
     def revalidate(self) -> bool:
         """Re-test every sink whose own state is unwritable BY WRITING TO IT, and report whether the
-        process can log, as :meth:`can_log` and :meth:`status` then read it.
+        process can log, as :meth:`can_log` answers after the probes.
 
-        **A cached state cannot answer this, and that is the whole reason this exists.**
-        ``unwritable``, as a sink's own state, is only ever set by a failed write, and nothing clears
-        it on its own — so after an operator fixes the disk the guard still reads "broken", and
-        before they fix it the guard reads "broken" too. The two situations are indistinguishable
-        from memory, which is exactly the distinction the fail-closed recovery path has to make.
-        Each sink's probe writes a real record through the real
-        formatter, rolling the sink first if its live handle is stale (a repaired directory still leaves
-        the old handle closed), so "writable" means *a record landed*, not *a stat call succeeded*.
+        **A cached state cannot answer this, and that is the whole reason this exists.** *Repaired*
+        and *still broken* are indistinguishable from memory, which is exactly the distinction the
+        fail-closed recovery path has to make. Each sink's probe is :meth:`_GuardedSinkMixin._probe_write`,
+        so "writable" means *a record landed*, not *a stat call succeeded*.
 
         This is NOT the timer polling ADR 0162 rejected: it runs once, on an explicit operator recovery
         action, at the moment the decision is made — never on a schedule and never on the hot path.
 
         **A sink the flap latch alone holds is released here WITHOUT being written to** (BACKLOG
-        #5812). Its own state is not ``unwritable``: the last thing it did was a roll whose notice
-        and re-written record landed, and this method answers for it from that, as it would with no
-        latch. Writing to it instead would make this guard weaker than the bound alone, whatever the
-        write: :meth:`record_healthy` resets the bound's window and streak; a roll heals a broken
-        handle the next record would otherwise have rolled through
+        #5812). Its own state is not ``unwritable``: the last thing recorded on it was a roll whose
+        notice and re-written record landed, and this method answers for it from that, as it would
+        with no latch. Writing to it instead would make this guard weaker than the bound alone,
+        whatever the write: :meth:`record_healthy` resets the bound's window and streak; a roll heals
+        a broken handle the next record would otherwise have rolled through
         :meth:`_GuardedSinkMixin.handleError`, where the bound counts it; and even one plain write
         can take a one-shot fault the next record would have met. Each of those lets a sink still
-        flapping trip the bound later. A sink whose own state IS ``unwritable`` gets the probe below,
-        and the latch on it is released only with that state. A sink another thread records a roll
-        or a failure on while the probes run is neither probed after that nor marked healthy; the
-        loop's own comment says what remains of that race. The answer is :meth:`can_log`'s, read
-        under the lock after the probes, so it is never True while :meth:`status` reads every sink
-        unwritable: a latch another thread set while the probes ran counts against it."""
+        flapping trip the bound later. The loop's comment says which sinks whose own state IS
+        ``unwritable`` are probed and marked healthy. The answer is :meth:`can_log`'s, read under
+        the lock after the probes."""
         with self._lock:
             # Every record_* call replaces a sink's status object, so the object itself tells
             # whether anything was recorded on the sink since this snapshot.
@@ -559,12 +530,12 @@ class LogWriteGuard:
             for latched in [sink for sink in self._flap_latch if sink not in dead]:
                 del self._flap_latch[latched]
         for name, seen in dead.items():
-            # Each probe runs outside the lock, so another thread can record a roll or a failure on
-            # this sink meanwhile. A sink that changed since the snapshot is left as that change
-            # wrote it: probing it could write to a sink the latch alone now holds, and marking it
-            # healthy after the probe would drop a latch or a failure recorded during the probe.
-            # What remains: a change between this check and the probe's write still meets the
-            # probe, because the lock is never held across a sink's I/O.
+            # A sink is probed only if nothing was recorded on it since the snapshot, and marked
+            # healthy only if nothing was recorded on it by the time its probe ends. Probing a
+            # changed sink could write to one the latch alone now holds, and marking it healthy
+            # would drop a latch or a failure recorded meanwhile. The lock is not held across a
+            # sink's I/O, so a change between this check and the probe's write still meets the
+            # probe.
             with self._lock:
                 if self._sinks.get(name) is not seen:
                     continue
@@ -878,11 +849,11 @@ class _GuardedSinkMixin(_SinkBase):
         try:
             failure = sys.exception()
             # A record that cannot be formatted is no reason to roll a healthy sink (BACKLOG
-            # #5813). When the stand-in lands, the sink has just taken a write and neither stage
-            # runs; the fault is only counted for the stderr line. When it does not land, the sink is the fault after all and the two stages below
-            # decide. A formatter that cannot format even the stand-in leaves this process unable
-            # to log through this sink, so the sink is recorded unwritable without a roll: a roll
-            # cannot clear a formatter fault. Nothing was written, so the disk was not tested.
+            # #5813). When the formatter can format the stand-in, it is written in the record's
+            # place: if the sink takes it, neither stage runs and the fault is only counted for the
+            # stderr line; if the sink refuses it, the two stages below decide. When the formatter
+            # cannot format the stand-in either, the sink is recorded unwritable without a roll,
+            # because a roll cannot clear a formatter fault.
             stand_in = self._stand_in_for(record)
             stand_in_line: str | None = None
             if stand_in is not None:
@@ -902,7 +873,7 @@ class _GuardedSinkMixin(_SinkBase):
                         reason=(
                             f"formatter fault: the sink's formatter could not format a record "
                             f"({kind}) nor the guard's notice ({notice_kind}); the sink was not "
-                            "rolled and its disk was not tested"
+                            "rolled and nothing was written to it"
                         ),
                         cause="because its formatter fails",
                     )

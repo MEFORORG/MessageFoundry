@@ -1662,7 +1662,7 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             "off-box log forwarding could not read its on-disk spool at %s: %d read(s) failed (%d "
             "since this process started), for a reason other than a missing segment file; a "
             "missing spool directory counts. No segment is retired for it, and what the spool "
-            "holds is not sent until a read succeeds. Newer records are sent ahead of it "
+            "holds is not sent until a read succeeds. Newer records can be sent ahead of it "
             "meanwhile.",
             self.spool.directory,
             batch,
