@@ -100,3 +100,34 @@ def test_an_environment_table_still_resolves() -> None:
     spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
     resolved = resolve_env_settings(spec.settings, {"all_headers": {"X-Trace": "probe-1"}})
     assert resolved["headers"] == {"X-Trace": "probe-1"}
+
+
+#: A header NAME this test invents and plants in an environment value. The environment is where
+#: secrets live, so an error about a resolved value must never quote a name taken from it.
+NAME_MARKER = "MFTEST-ENV-HEADER-NAME-MARKER"
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        {NAME_MARKER: {"env": "partner_key", "default": SENTINEL}},
+        {NAME_MARKER: [{"env": "partner_key"}]},
+        {NAME_MARKER: "static", "X-B": {"env": NAME_MARKER}},
+    ],
+    ids=["marker-name", "nested-marker", "marker-env-key"],
+)
+def test_a_refused_environment_table_names_nothing_taken_from_the_environment(
+    table: dict[str, Any],
+) -> None:
+    """BACKLOG #1183: the refusal names the connection, the setting and the kind of problem only,
+    never a header name, an env key or a value the environment value carried."""
+    spec = HEADERS_FACTORIES["Rest"](messagefoundry.env("all_headers"))
+    with pytest.raises(WiringError) as excinfo:
+        resolve_env_settings(spec.settings, {"all_headers": table}, connection="OB_ACME_REST")
+    text = str(excinfo.value)
+    assert NAME_MARKER not in text
+    assert "env() reference" in text
+    assert SENTINEL not in text
+    assert "partner_key" not in text
+    assert "'headers'" in text
+    assert "OB_ACME_REST" in text

@@ -689,13 +689,20 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
 def _resolved_headers_problem(value: object) -> str | None:
     """Why the environment value a whole-table ``headers`` reference resolved to cannot be sent,
     or ``None``: the table rule :func:`_reject_envref_headers` holds its ``default=`` to (BACKLOG
-    #5328). Names only the type or the header names, never a value."""
+    #5328).
+
+    The text names only the kind of problem. It does not reuse :func:`_reject_envref_headers`'
+    message, because that one lists the offending header names and env keys, and here every one of
+    them comes from the environment value, which :func:`resolve_env_settings` never shows any part
+    of (BACKLOG #1183). The scan is the same one, :func:`_contains_envref` over both axes."""
     if not isinstance(value, dict):
         return f"value is not a table but {type(value).__name__} (value withheld)"
-    try:
-        _reject_envref_headers("the resolved", value)
-    except WiringError as exc:
-        return str(exc)
+    if _contains_envref(value):
+        return (
+            "the table holds an env() reference, which is never resolved inside a table and would "
+            "reach the partner as its repr; headers may not use env() there (names and value "
+            "withheld)"
+        )
     return None
 
 
@@ -1914,7 +1921,8 @@ def resolve_env_settings(
                 and got is not None
                 and (problem_text := _resolved_headers_problem(got))
             ):
-                bad.append(f"setting {name!r} (env {value.key!r}): {problem_text}")
+                owner = f" of connection {connection!r}" if connection else ""
+                bad.append(f"setting {name!r}{owner} (env {value.key!r}): {problem_text}")
                 continue
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
