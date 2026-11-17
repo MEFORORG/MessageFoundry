@@ -33,6 +33,7 @@ from messagefoundry.redaction import (
     safe_exc,
     safe_name,
     safe_text,
+    safe_text_bound,
 )
 from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
@@ -1705,6 +1706,16 @@ def test_safe_text_reports_the_two_counts_apart() -> None:
     would report a total in neither unit. Both appear when both happened."""
     out = safe_text(_over_window(" tail"), limit=40)
     assert "…(+" in out and "[redaction bound:" in out
+
+
+def test_safe_text_bound_splits_safe_text_into_its_head_and_its_note() -> None:
+    """``safe_text(head) + note`` is ``safe_text(text)`` (BACKLOG #3045). A text that fits has no
+    note and is its own head."""
+    for text in (_over_window(" tail"), "DOE JANE short"):
+        head, note = safe_text_bound(text)
+        assert safe_text(head) + note == safe_text(text)
+        assert (head is text) == (note == "")
+    assert safe_text_bound(_over_window(" tail"))[1].startswith(" [redaction bound: dropped ")
 
 
 #: The three 16 MiB shapes the cost arms use, built on demand.

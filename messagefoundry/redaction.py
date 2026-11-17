@@ -111,6 +111,7 @@ __all__ = [
     "safe_exc",
     "safe_name",
     "safe_text",
+    "safe_text_bound",
     "safe_traceback",
 ]
 
@@ -2533,11 +2534,20 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way."""
-    head, dropped = _clamp(text, _REDACT_WINDOW)
+    head, note = safe_text_bound(text)
     message = _held_back(redact(head).strip(), limit)
-    if dropped:
-        message = f"{message} {_clamp_marker(dropped)}"
-    return message
+    return f"{message}{note}"
+
+
+def safe_text_bound(text: str) -> tuple[str, str]:
+    """``(head, note)``: the part of ``text`` that :func:`safe_text` scans, and the bound note it
+    appends to its result, with its leading space, or ``""`` when the text fit and ``head is text``.
+
+    For a caller that scrubs that part itself before :func:`safe_text` bounds it, as the off-box
+    audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
+    :func:`safe_text` cut it again and append a second bound note."""
+    head, dropped = _clamp(text, _REDACT_WINDOW)
+    return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 
 
 def safe_error(error: str | None, *, show_phi: bool = False) -> str | None:

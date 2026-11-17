@@ -99,6 +99,8 @@ __all__ = [
     "configure_stderr_logging",
     "ensure_logger_sink",
     "install_filtered_last_resort",
+    "scrub_log_text",
+    "sink_readings",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -249,9 +251,9 @@ class RedactionFilter(logging.Filter):
     The "never put PHI in an exception message" convention binds only the engine's own authors, Router
     and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md
     section 7, *Who the exception-message convention binds*).
-    A message escaped before it reaches this filter is another residual: the audit tee's
-    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
-    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
+    A message escaped before it reaches this filter is another residual: a name or date beside an
+    escape can pass. :func:`~messagefoundry.store.audit_tee.emit_audit_tee` says what the audit
+    tee does about that.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
@@ -464,6 +466,25 @@ def _shipped_reading(line: str) -> str | None:
     if out is not None and "\t" in out:
         out = _settled_reading(out.replace("\t", " "), filters)
     return out
+
+
+#: The most handlers :func:`configure_logging` installs: stdout, the file and the forwarder.
+SHIPPED_HANDLER_COUNT = 3
+
+
+def sink_readings(text: str, *, sinks: int = SHIPPED_HANDLER_COUNT) -> list[str]:
+    """the Nth item is what N passes of the installed filters leave, since each handler runs the
+    whole chain over the one shared record, as :func:`_settled_reading` models. For a
+    caller that must hold a line to a bar on every sink, not just the first, as the audit tee
+    does (BACKLOG #3045)."""
+    filters = _shipped_filters()
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    readings = []
+    for _ in range(sinks):
+        for log_filter in filters:
+            log_filter.filter(record)
+        readings.append(record.getMessage())
+    return readings
 
 
 def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
@@ -1192,6 +1213,16 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
+
+
+def scrub_log_text(text: str) -> str:
+    """``text`` through the three text passes :func:`_install_phi_filters` installs, in its order:
+    PHI redaction (bounded), the credential query scrub, then the credential scrub. The control
+    scrub, which runs last on a handler, is left out, so a control character stays as it is.
+
+    For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
+    #3045). A handler still runs its chain over the encoded line afterwards."""
+    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 
 def _build_syslog_handler(

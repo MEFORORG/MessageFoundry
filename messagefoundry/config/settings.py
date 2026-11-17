@@ -75,6 +75,8 @@ from messagefoundry.config.ai_policy import (
 from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
 from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
+    SATURATION_MIN_GROWTH_DEFAULT,
+    SATURATION_MIN_GROWTH_MAX,
     AckAfter,
     BuildupThreshold,
     InternalErrorPolicy,
@@ -2443,7 +2445,14 @@ class DeliverySettings(_Section):
     # burst from sustained growth). Global-only for now (per-connection saturation= override is a
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
-    saturation_sustain_samples: int | None = None
+    saturation_sustain_samples: int | None = Field(default=None, ge=2)
+    # BACKLOG #5768: how many messages a lane's depth must rise above the lowest depth sampled since
+    # the engine started watching the lane before saturation fires, so one arrival on an idle lane
+    # does not page.
+    # SaturationThreshold.min_growth states the default and the cap.
+    saturation_min_growth: int = Field(
+        default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX
+    )
     # Global DR / priority tier default for every connection (#61, ADR 0048). A connection that declares
     # no priority= of its own inherits this (resolution order: per-connection override > [delivery]
     # global default > built-in NORMAL); the DR run-profile then starts only connections whose resolved
@@ -2475,7 +2484,10 @@ class DeliverySettings(_Section):
     def saturation_threshold(self) -> SaturationThreshold:
         """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
         amendment). ``None`` keeps the saturation (rising-backlog derivative) alert off by default."""
-        return SaturationThreshold(sustain_samples=self.saturation_sustain_samples)
+        return SaturationThreshold(
+            sustain_samples=self.saturation_sustain_samples,
+            min_growth=self.saturation_min_growth,
+        )
 
 
 class PipelineSettings(_Section):
@@ -6136,10 +6148,11 @@ class AlertsSettings(_Section):
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
-    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why).
+    # BACKLOG #5770: bounded, and finite only, as each timeout below is (the cap says why). A socket
+    # timeout: it bounds each wait on the webhook host during a POST, not the whole POST.
     webhook_timeout: float = Field(
         default=10.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
-    )  # seconds per POST
+    )
     # Optional egress allowlist for the webhook host (ASVS 1.3.6, SSRF defense-in-depth). Empty =
     # any host (the URL is operator-configured, not request-derived). When set, the webhook_url host
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
@@ -6155,7 +6168,8 @@ class AlertsSettings(_Section):
 
     # --- email / SMTP -------------------------------------------------------
     email_smtp_host: str | None = None
-    email_smtp_port: int = Field(default=587, ge=1, le=65535)
+    # 0 is smtplib's "use the default", port 25.
+    email_smtp_port: int = Field(default=587, ge=0, le=65535)
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
@@ -6185,9 +6199,10 @@ class AlertsSettings(_Section):
     # as before (byte-identical). A reference/label, not the value, so it may live in the config file.
     # Fail-closed: a reference with no [secrets].provider, or an unresolvable one, raises at startup.
     email_password_secret: str | None = None
+    # A socket timeout: it bounds each wait on the SMTP relay during a send, not the whole send.
     email_timeout: float = Field(
         default=30.0, gt=0, le=_ALERT_SEND_TIMEOUT_MAX_SECONDS, allow_inf_nan=False
-    )  # seconds per send
+    )
     # Egress allowlist for the SMTP host (WP-11c, parity with webhook_allowed_hosts). Empty = any.
     smtp_allowed_hosts: list[str] = []
     # #138 (ADR 0127): OPTIONAL operator-editable alert-email templates. All None (the default) = the
