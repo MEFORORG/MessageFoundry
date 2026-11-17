@@ -689,9 +689,6 @@ SITES: dict[str, Site] = {
     "messagefoundry/integrity.py::_attested_asset_files": Site(
         1, INTERNAL, "Fixed asset paths under the installed package."
     ),
-    "messagefoundry/integrity.py::_attest_distribution.record_rel": Site(
-        1, INTERNAL, "A walked file's path under its root, re-anchored where that root resolves."
-    ),
     "messagefoundry/integrity.py::_console_loaded_files": Site(2, INTERNAL, _PKG_WALK),
     "messagefoundry/integrity.py::_import_capable_files": Site(1, INTERNAL, _PKG_WALK),
     "messagefoundry/integrity.py::_record_place": Site(

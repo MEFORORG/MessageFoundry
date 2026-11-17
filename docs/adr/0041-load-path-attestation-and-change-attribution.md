@@ -325,14 +325,16 @@ fingerprint+git-HEAD covers more cheaply for now.
   engine starts, THE SYSTEM SHALL treat attestation as a no-op/advisory and SHALL NOT fail or alert — dev is
   never bricked.
   → `tests/test_startup_attestation.py::test_editable_install_is_noop`
-- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
+- **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation verified **no** file
   against a baseline, and found no drift, on an install that does not declare itself editable — an
-  absent, empty or package-row-less `RECORD`, an unresolvable install root, or a package loaded from
-  outside the install root (since BACKLOG #5376, the `_attest_distribution` docstring in
-  `messagefoundry/integrity.py` states which loads count as outside) — THEN THE SYSTEM SHALL log at
-  WARNING, record the `startup_integrity` row, fire the `AlertSink`, and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
+  absent, empty or package-row-less `RECORD`, an unresolvable install root, a package loaded from
+  outside the install root, or a package directory that is a link out of it (since BACKLOG #5376, the
+  `_attest_distribution` docstring in `messagefoundry/integrity.py` states which loads count) — THEN
+  THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`, and
+  **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
   → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
   → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
+  → `tests/test_startup_attestation.py::test_an_intact_package_directory_linked_out_is_attested_nothing_and_refused`
 - **AC-14** — WHERE `[integrity].fail_closed_on_drift` is true AND the install declares itself editable,
   WHEN the engine starts, THE SYSTEM SHALL log at WARNING naming the reason — the opted-in enforcement
   cannot be honoured on this install — and SHALL still start, record nothing and alert nothing (AC-12 is
@@ -385,7 +387,7 @@ fingerprint+git-HEAD covers more cheaply for now.
 >    serves is one that is attested.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
 >    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
->    Since BACKLOG #5376 the last shape is narrower, as AC-13 says. A console that declares itself editable keeps the AC-12 no-op. So does a console with no
+>    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
 >    distribution beside an engine that declares itself editable: that is a checkout that installed
 >    only the engine, and the engine's exemption already concedes everything this one would.
 > 3. **It attests the whole package, not a suffix list or a file list.** A native module or a
@@ -401,15 +403,14 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `RECORD`.
 >
 > A console pass that raises is attested-nothing (`console_attestation_raised`), not a crash. The arm
-> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift. Until BACKLOG
-> #5376 that held only while the walk listed some console file under the install root.
+> never opens a FIFO, device or socket; one at a `RECORD` path is `missing` drift.
 >
 > **Three residuals, recorded rather than fixed here.** The console arm keys on `sys.modules`, so
 > console code that has already run can remove itself from it and be skipped; that is the D3
 > trust-domain residual again, since such code could as easily rewrite this module. The engine arm
 > still resolves each file before
 > comparing it, so an engine module swapped for a symlink to a file outside the install root is
-> skipped rather than compared; the console arm does not resolve the file and does not have this gap.
+> skipped rather than compared; the console arm resolves only directories and does not have this gap.
 > And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted
 > cache whose header matches its `.py` is imported without either arm looking at it.
 
@@ -453,8 +454,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 >
 > Decided under the owner's standing rule for a clear adversarial-review recommendation, 2026-10-06.
 >
-> **The engine arm no longer resolves each file**, the way the console arm already did, and the same
-> holds for the declared assets. So the symlink residual the 2026-09-25
+> **The engine arm no longer resolves each file**, only the package root, the way the console arm
+> already did, and the same holds for the declared assets. So the symlink residual the 2026-09-25
 > amendment recorded for the engine arm is closed: a module or asset swapped for a symlink to a file
 > outside the install root is hashed in place and reads as `hash_mismatch`, and a planted one has no
 > row. The walk never descends a link or junction and reports one instead, so a junction loop cannot
@@ -465,12 +466,32 @@ fingerprint+git-HEAD covers more cheaply for now.
 > `__pycache__` file is still unread by either arm, for the reason the 2026-09-25 amendment gives.
 > Bytecode planted under the config tree is vault BACKLOG #2596, and `.pth` files and other start-up
 > code in `site-packages` are vault BACKLOG #2701. A FIFO, device or socket planted under an import
-> name is not listed by the engine walk unless it sits at a `RECORD` path. Since BACKLOG #5376 the
-> console arm's walk also names a directory it cannot list, as `missing` drift. Since BACKLOG #5376
-> both arms also walk each package root at its `RECORD` place without resolving it, so a package
-> directory swapped for a link out of the install root is read through the link and compared, as a
-> swapped file is; `_record_place` in `messagefoundry/integrity.py` says why. The D3 trust-domain
+> name is not listed by the engine walk unless it sits at a `RECORD` path. The console arm's walk still
+> skips a directory it cannot list; this amendment changed only the engine arm. The D3 trust-domain
 > residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
+
+> **Note 2026-11-17 (BACKLOG #5376) — what changed in the two amendments above, recorded here rather
+> than edited into them.** Their text stands as written on its date. Since BACKLOG #5376:
+>
+> - **Both arms walk each package root at its `RECORD` place.** The root's parent is resolved and its
+>   own name is not (`_record_place` in `messagefoundry/integrity.py`), so neither arm resolves the
+>   package root itself any more, and the console arm no longer resolves the directories under it.
+>   The 2026-10-06 amendment's *"the way the console arm already did"* described the code of its date.
+> - **A package directory swapped for a link out of the install root is read through the link and
+>   compared**, so a changed file there is `hash_mismatch` drift and a deleted one is `missing` drift.
+>   An intact one is still attested-nothing (`package_directory_links_out_of_install_root`, AC-13),
+>   as it was when the root was resolved and every file fell outside the install root: bytes that sit
+>   outside the install do not make the pass clean.
+> - **A loaded root that is not the package directory but resolves into it**, a link from elsewhere
+>   into the package, is compared where it resolves, as if loaded there. The 2026-09-25 amendment's
+>   attested-nothing shape *"files outside its install root"* is narrower by that.
+> - **The read-back of unmatched `RECORD` rows has a second trigger**, a loaded package root that is,
+>   or resolves to, the package directory `RECORD` describes, so an emptied package is `missing` drift
+>   for each row. The 2026-09-25 amendment's FIFO sentence held only while the walk listed some
+>   console file under the install root; it now holds for an emptied console too.
+> - **The console arm's walk names a directory it cannot list**, as `missing` drift, as the engine
+>   arm's does; the 2026-10-06 amendment's residual *"The console arm's walk still skips a directory it
+>   cannot list"* no longer holds.
 
 ## Options considered
 

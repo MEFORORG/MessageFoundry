@@ -7159,9 +7159,9 @@ class IntegritySettings(_Section):
     # in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a
     # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
     # enforcement on a locked-down instance.
-    # It ALSO refuses when attestation verified NOTHING (BACKLOG #1679); the shapes that count are
-    # listed once, in docs/CONFIGURATION.md under this key. A pass that compared
-    # zero files cannot say the bytes are clean, and stripping the baseline is easier for the stated
+    # It ALSO refuses when attestation verified NOTHING (BACKLOG #1679); `UnattestedReason` in
+    # messagefoundry/integrity.py names the shapes. A pass that verified no
+    # file cannot say the bytes are clean, and stripping the baseline is easier for the stated
     # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
     # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is

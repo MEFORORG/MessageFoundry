@@ -1209,9 +1209,6 @@ def test_a_fifo_at_a_recorded_module_path_is_drift_and_never_read(
     assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction.py", "missing")]
 
 
-_REAL_ATTESTED_ASSET_FILES = integ._attested_asset_files
-
-
 def test_a_security_asset_swapped_for_an_outside_symlink_is_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1777,6 +1774,7 @@ async def test_the_engine_arm_text_is_unchanged(
 
 _NOTHING_READ = "no_file_read_under_install_root"
 _NOTHING_UNDER_ROOT = "no_attested_file_under_install_root"
+_LINKED_OUT = "package_directory_links_out_of_install_root"
 
 
 def _console_module(monkeypatch: pytest.MonkeyPatch, **attrs: object) -> None:
@@ -1915,8 +1913,9 @@ def _link_out(package_dir: Path, outside: Path) -> Path:
 def test_a_console_package_directory_linked_out_of_the_root_is_read_through_the_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
-    """Hashed at its RECORD place: intact reads clean, a changed file is that file's
-    ``hash_mismatch``, and an emptied link target is ``missing`` drift for every row."""
+    """Hashed at its RECORD place: a changed file is that file's ``hash_mismatch``, and an emptied
+    link target is ``missing`` drift for every row. Intact, it is attested-nothing, not clean: the
+    bytes compared sit outside the install root."""
     console_root = _install_engine_and_console(tmp_path, monkeypatch)
     package_dir = console_root / _CONSOLE_PKG
     target = _link_out(package_dir, tmp_path / "outside" / _CONSOLE_PKG)
@@ -1929,9 +1928,11 @@ def test_a_console_package_directory_linked_out_of_the_root_is_read_through_the_
 
     console = integ.attest_console()
     assert console is not None
+    assert console.unattested_reason == _LINKED_OUT
+    assert console.attested_nothing and not console.ok
     if shape == "emptied":
         assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
-        assert console.unattested_reason == _NOTHING_READ
+        assert console.checked == 0
         return
     assert console.checked == len(_CONSOLE_FILES)
     assert _drift(console) == (
@@ -2026,10 +2027,11 @@ def test_an_engine_package_directory_linked_out_of_the_root_is_read_through_the_
             (tmp_path / "site" / rel).unlink()
 
     result = attest_engine()
+    assert result.unattested_reason == _LINKED_OUT
+    assert result.attested_nothing and not result.ok
     if shape == "emptied":
         assert _drift(result) == [(rel, "missing") for rel in sorted(_ENGINE_FILES)]
         assert result.checked == 0
-        assert result.unattested_reason == _NOTHING_READ
         return
     assert result.checked == len(_ENGINE_FILES)
     assert _drift(result) == (
@@ -2219,3 +2221,129 @@ async def test_a_pass_that_compared_nothing_and_found_drift_is_reported_as_drift
         assert detail["unattested_reason"] == _NOTHING_READ
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("fail_closed", [False, True])
+@pytest.mark.parametrize("arm", ["engine", "console"])
+async def test_an_intact_package_directory_linked_out_is_attested_nothing_and_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    arm: str,
+    fail_closed: bool,
+) -> None:
+    """Every file matches its row, read through the link, and the pass is still not clean: the
+    package directory is a link out of the install root, so the arm warns, records a row naming
+    that, alerts on its unattested subject, and refuses under the opt-in, as it did when the walk
+    resolved the root and compared nothing."""
+    if arm == "engine":
+        package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+        _link_out(package_dir, tmp_path / "outside" / _ENGINE_PKG)
+        label, noun = "engine-unattested", "engine"
+    else:
+        console_root = _install_engine_and_console(tmp_path, monkeypatch)
+        package_dir = console_root / _CONSOLE_PKG
+        _link_out(package_dir, tmp_path / "outside" / _CONSOLE_PKG)
+        _load_fake_console(monkeypatch, package_dir)
+        label, noun = "webconsole-unattested", "web console"
+
+    store = await open_store(
+        sqlite_settings(str(tmp_path / "linked.db")), create=True, keyless_chain_refusal=None
+    )
+    sink = _RecordingSink()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
+            if fail_closed:
+                with pytest.raises(
+                    IntegrityError,
+                    match=rf"^{noun} integrity attestation verified nothing \({_LINKED_OUT}\): "
+                    rf"the {noun} package directory is a link out of the install root",
+                ):
+                    await run_startup_attestation(store, sink, fail_closed_on_drift=True)
+            else:
+                await run_startup_attestation(store, sink, fail_closed_on_drift=False)
+        assert_capture_sees(caplog, "messagefoundry.integrity")
+        records = [r for r in caplog.records if r.name == "messagefoundry.integrity"]
+        assert [r.levelno for r in records] == [logging.WARNING], caplog.messages
+        assert "is a link out of the install root" in records[0].getMessage()
+        assert [event[0] for event in sink.events] == [label]
+        assert "is a link out of the install root" in sink.events[0][1]
+        assert sink.events[0][2] == 0
+        rows = _startup_rows(await store.list_audit())
+        assert len(rows) == 1
+        detail = json.loads(str(rows[0]["detail"]))
+        assert detail["unattested_reason"] == _LINKED_OUT
+        assert detail["drift_count"] == 0 and detail["checked"] > 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("arm", ["engine", "console"])
+def test_an_intact_package_reached_through_a_link_inside_the_install_root_reads_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    """``<install root>/sub/<package>`` linked to ``<install root>/<package>``: the files are compared
+    where the link resolves, once each, and not also read as unrowed files at the link's own place."""
+    result: AttestationResult | None
+    if arm == "engine":
+        site = tmp_path / "site"
+        package_dir = _install_and_walk_engine(site, monkeypatch)
+        alias = site / "sub" / _ENGINE_PKG
+        alias.parent.mkdir()
+        _symlink(alias, package_dir, directory=True)
+        monkeypatch.setattr(
+            integ, "_loaded_module_files", lambda: integ._import_capable_files([str(alias)])
+        )
+        monkeypatch.setattr(integ, "_loaded_package_roots", lambda: [str(alias)])
+        result, expected = attest_engine(), len(_ENGINE_FILES)
+    else:
+        console_root = _install_engine_and_console(tmp_path, monkeypatch)
+        alias = console_root / "sub" / _CONSOLE_PKG
+        alias.parent.mkdir()
+        _symlink(alias, console_root / _CONSOLE_PKG, directory=True)
+        _load_fake_console(monkeypatch, alias)
+        result, expected = integ.attest_console(), len(_CONSOLE_FILES)
+    assert result is not None
+    assert result.drift == []
+    assert result.checked == expected
+    assert result.unattested_reason is None and result.ok
+
+
+@pytest.mark.parametrize("arm", ["engine", "console"])
+def test_a_package_root_ending_in_a_parent_reference_reads_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    """A ``__path__`` entry such as ``<package>/sub/..`` names the package directory itself."""
+    result: AttestationResult | None
+    if arm == "engine":
+        package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+        root = str(package_dir / "sub" / "..")
+        monkeypatch.setattr(
+            integ, "_loaded_module_files", lambda: integ._import_capable_files([root])
+        )
+        monkeypatch.setattr(integ, "_loaded_package_roots", lambda: [root])
+        result, expected = attest_engine(), len(_ENGINE_FILES)
+    else:
+        console_root = _install_engine_and_console(tmp_path, monkeypatch)
+        _load_fake_console(monkeypatch, console_root / _CONSOLE_PKG / "static" / "..")
+        result, expected = integ.attest_console(), len(_CONSOLE_FILES)
+    assert result is not None
+    assert result.drift == []
+    assert result.checked == expected
+    assert result.unattested_reason is None and result.ok
+
+
+def test_a_pass_whose_listed_files_none_opened_says_none_was_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no read-back predicate, a file listed under the install root that fails to open still
+    means files were listed and none was read, not that none sat under the install root."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.unlink()
+    asset.mkdir()
+    result = integ._attest_distribution(
+        integ._DIST_NAME, integ._DIST_NAME, lambda: [asset], unmatched_rows=None
+    )
+    assert _drift(result) == [(_ASSET, "missing")]
+    assert result.checked == 0
+    assert result.unattested_reason == _NOTHING_READ

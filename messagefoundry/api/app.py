@@ -12702,9 +12702,9 @@ def create_managed_app(
             # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
             # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
             # the startup guard closes the store and no listener ever binds. It raises for the same
-            # reason when attestation verified NOTHING (BACKLOG #1679; docs/CONFIGURATION.md lists the
-            # shapes under [integrity].fail_closed_on_drift): a pass that compared zero
-            # files cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
+            # reason when attestation verified NOTHING (BACKLOG #1679; `UnattestedReason` in
+            # messagefoundry/integrity.py names the shapes): a pass that verified no
+            # file cannot say the bytes are clean. A no-op only off an install that DECLARES itself editable
             # (`pip install -e .`), so dev is never bricked. Off only if [integrity].enabled=false.
             # It attests the web console too when create_app has imported it (serve_ui on), against the
             # console wheel's own RECORD under the same rules (BACKLOG #1802).
