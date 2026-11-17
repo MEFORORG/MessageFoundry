@@ -819,9 +819,9 @@ class TransitCipher(_UnmarkedPolicy):
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
-            # The log builds text and can run out of memory or stack; then it is dropped and the
-            # label still stands, so the row stays a break.
-            with contextlib.suppress(MemoryError, RecursionError):
+            # Whatever the log raises (memory, stack, a log filter's fault), it is dropped and the
+            # label still stands, so the row stays a break rather than a walk that could not run.
+            with contextlib.suppress(Exception):
                 if _log_due(f"unconfirmed {self._audit_key!r}: {reason} {raised}"):
                     log.warning(
                         "an audit MAC verify at key version %d got a 400 labelled unconfirmed, "

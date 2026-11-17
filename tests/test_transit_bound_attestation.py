@@ -1607,6 +1607,24 @@ def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
     assert not any("400 Bad Request" in line or "reworded" in line for line in logged), logged
 
 
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError, ValueError])
+def test_a_fault_in_the_unconfirmed_log_keeps_the_label(
+    fault: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6707: the log beside an unconfirmed label may fail; the label still stands, so the
+    row stays a break rather than a walk that could not run."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def failing(*_a: Any, **_kw: Any) -> None:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit.log, "warning", failing)
+    assert isinstance(
+        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+    )
+
+
 def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
