@@ -1210,6 +1210,22 @@ def test_census_resolves_env_credentials_before_judging() -> None:  # vault BACK
     assert [hop.name for hop in hops] == ["OB_DW"]
 
 
+def test_census_with_no_values_leaves_an_env_credential_unjudged() -> None:  # vault BACKLOG #5359
+    """With no values, as ``messagefoundry check`` passes, an ``env()`` credential is not judged by
+    its ``default=``: the instance may override it, and check must never list fewer hops than
+    serve. So the hop stays listed."""
+    from messagefoundry.config.static_credentials import static_credential_hops
+    from messagefoundry.config.wiring import Registry, build_outbound_connection, env
+
+    registry = Registry()
+    registry.outbound["OB_DEF"] = build_outbound_connection(
+        "OB_DEF",
+        DICOMweb(url=BASE, bearer_token=env("t2", default="t"), basic_user="s", basic_password="p"),
+    )
+    hops = static_credential_hops(registry=registry, settings=None, env_values=None)
+    assert [hop.name for hop in hops] == ["OB_DEF"]
+
+
 def test_census_leaves_out_the_proxy_hop_of_a_refused_dicomweb() -> None:  # vault BACKLOG #5359
     over: dict[str, object] = {
         "proxy": "http://proxy.example.org:8080",
