@@ -152,7 +152,8 @@ def _strip_before_isa(raw: str, start: int, end: int, terminator: str) -> str:
     whitespace terminator closing its last segment stays (BACKLOG #5921)."""
     kept = raw[start:end].rstrip(_LEADING_NOISE)
     if terminator:
-        at = raw.find(terminator, start + len(kept), end)
+        # Never inside the fixed-width header: whitespace there is element data, not a terminator.
+        at = raw.find(terminator, max(start + len(kept), start + _SEGMENT_TERM_OFFSET), end)
         if at != -1:
             return raw[start : at + len(terminator)]
     return kept

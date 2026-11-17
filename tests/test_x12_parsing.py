@@ -386,16 +386,17 @@ def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at
     assert _frames_of((bad + good).encode(), 4096) == [bad.encode(), good.encode()]
 
 
-# A trailer main framed at once must still close the frame at once, however it is corrupted:
-# the reader cannot see a connection end, so a frame it holds there is dropped with no row.
-_TRAILERS_MAIN_CLOSED = [
+# Three trailers that close the frame at once, two of them not a clean IEA. Any segment opening with
+# IEA closes it (BACKLOG #5807 keeps that rule): the reader cannot see a connection end, so a frame
+# it held there would be dropped with no row.
+_TRAILERS_THAT_CLOSE = [
     pytest.param("IEA1*000000001~", id="dropped-separator"),
     pytest.param("IEAX*1~", id="longer-id"),
     pytest.param("IEA*1*000000001~", id="clean"),
 ]
 
 
-@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
 @pytest.mark.parametrize("chunk", [4096, 7, 1])
 def test_a_segment_opening_with_iea_closes_the_frame_at_once(trailer: str, chunk: int) -> None:
     raw = _without_iea(interchange()) + trailer
@@ -406,7 +407,7 @@ def test_a_segment_opening_with_iea_closes_the_frame_at_once(trailer: str, chunk
     assert split(raw) == [raw]
 
 
-@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
 def test_a_corrupted_trailer_does_not_fold_the_next_interchange_in(trailer: str) -> None:
     raw = _without_iea(interchange()) + trailer
     nxt = interchange(control="000000002")
@@ -415,7 +416,7 @@ def test_a_corrupted_trailer_does_not_fold_the_next_interchange_in(trailer: str)
         assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
 
 
-@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
+@pytest.mark.parametrize("trailer", _TRAILERS_THAT_CLOSE)
 def test_a_ta1_reply_with_a_corrupted_trailer_is_read_at_once(trailer: str) -> None:
     # An outbound send reads its TA1 reply with this reader: a reply it held would read as a
     # timeout, and the send would be retried.
