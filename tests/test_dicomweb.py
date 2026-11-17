@@ -28,6 +28,7 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
+from messagefoundry.transports.rest import HttpAuthError
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 BASE = "https://pacs.example.org/dicom-web"
@@ -999,22 +1000,42 @@ def test_dicomweb_authorization_header_beside_a_credential_refused(
         _dest(headers={name: "x"}, **over)
 
 
-@pytest.mark.parametrize("field", ["bearer_token", "basic_user", "basic_password"])
-def test_dicomweb_surrogate_in_a_credential_refused(field: str) -> None:  # vault BACKLOG #5359
-    """A lone surrogate used to raise UnicodeEncodeError, which names the code point and its offset
-    in the secret."""
+@pytest.mark.parametrize(
+    ("field", "char"),
+    [
+        ("bearer_token", "\udcff"),
+        ("bearer_token", "\u20ac"),  # latin-1 cannot write it, and the bearer goes out raw
+        ("basic_user", "\udcff"),
+        ("basic_password", "\udcff"),
+    ],
+)
+def test_dicomweb_unencodable_credential_refused(
+    field: str, char: str
+) -> None:  # vault BACKLOG #5359
+    """An unencodable character used to build and then raise UnicodeEncodeError, which names the
+    code point and its offset in the secret."""
     over = {"basic_user": "svc", "basic_password": "pw"} if field != "bearer_token" else {}
-    over[field] = "se\udcffcret"
-    with pytest.raises(ValueError, match=f"{field} holds a character UTF-8 cannot encode") as exc:
+    over[field] = f"se{char}cret"
+    with pytest.raises(HttpAuthError, match=f"{field} holds a character the request cannot") as exc:
         _dest(**over)
-    assert "cret" not in str(exc.value) and "udcff" not in str(exc.value)
+    assert "cret" not in str(exc.value) and char not in str(exc.value)
 
 
-def test_dicomweb_credential_refusal_names_the_connection() -> None:  # vault BACKLOG #5359
-    with pytest.raises(
-        ValueError, match=r"^connection 'OB_DCMWEB'; DICOMweb destination basic_user"
-    ):
-        _dest(basic_user="svc")
+def test_dicomweb_non_ascii_basic_credential_still_constructs() -> None:  # vault BACKLOG #5359
+    """The control: a Basic half is UTF-8 inside base64, so a character latin-1 lacks is fine."""
+    basic = _dest(basic_user="svc", basic_password="p\u20acw")._headers["Authorization"]
+    assert basic == "Basic " + base64.b64encode("svc:p\u20acw".encode()).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"basic_user": "svc"}, {"basic_user": "s\nvc", "basic_password": "pw"}],
+)
+def test_dicomweb_credential_refusal_names_the_connection(
+    over: dict[str, str],
+) -> None:  # vault BACKLOG #5359
+    with pytest.raises(HttpAuthError, match=r"^connection 'OB_DCMWEB'; DICOMweb destination "):
+        _dest(**over)
 
 
 def test_dicomweb_single_credentials_still_construct() -> None:  # vault BACKLOG #5359

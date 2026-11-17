@@ -1546,8 +1546,8 @@ _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 #: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
 #: and OAuth2 read it as off, not the composer's default of on: reading a ``None`` as on would start
 #: a token hop the author did not ask for. ``smart_auth_configured`` takes any falsy flag as off;
-#: ``oauth2_auth_configured`` refuses a non-bool flag (vault BACKLOG #5362), so this resolve is what
-#: lets an ``env()`` that resolves to ``None`` read as off there rather than refuse. ``sign_enabled`` keeps
+#: ``oauth2_auth_configured`` reads a non-bool flag as off and the build refuses it (vault BACKLOG
+#: #5362), so this resolve is what lets an ``env()`` that resolves to ``None`` build as off. ``sign_enabled`` keeps
 #: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
 #: Listed rather than imported, so the first resolve does not load the composers' modules and
 #: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
@@ -8505,15 +8505,7 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
         findings.append((name, f"smart_audience is not the token URL: {how}"))
 
     def oauth2_leg(name: str, settings: Mapping[str, Any]) -> None:
-        try:
-            on = oauth2_auth_configured(settings)
-        except ValueError:
-            # The strict read refuses the flag or a blank token URL (vault BACKLOG #5362), and the
-            # connector's build refuses with it, so there is no request to grade. Its text is the
-            # build's to report; this records only that nothing was compared.
-            not_compared.append((name, "the OAuth2 settings refuse the connection's build"))
-            return
-        if not on:
+        if not oauth2_auth_configured(settings):
             return
         if settings.get("oauth2_scope"):
             scope = literal(name, settings, "oauth2_scope")

@@ -74,6 +74,7 @@ from messagefoundry.transports.rest import (
     InsecureHopGuard,
     ProxyConfig,
     _insecure_opener,
+    _latin1_refusal_position,
     _no_redirect_opener,
     _redact_url,
     _shared_no_redirect_opener,
@@ -215,24 +216,27 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
     ``headers``, would have one silently replace the other or go out as a second header. A Basic
     user-id may not hold a colon (RFC 7617 section 2: the first colon ends it, so the server would
     split the pair somewhere else). No credential may hold a control character, which would reach
-    the request as a malformed or injected header, or a lone surrogate, which UTF-8 cannot encode
-    and which would surface as an encoder error quoting part of the secret. A colon in the password
-    is legal and admitted.
+    the request as a malformed or injected header. A Basic half may not hold a lone surrogate, which
+    its UTF-8 encode cannot write, and the bearer token, which goes on the wire as written, may not
+    hold a character ``http.client``'s latin-1 header encode cannot write; either would otherwise
+    surface as an encoder error quoting part of the secret. A colon in the password is legal and
+    admitted.
 
     Called first in the constructor, before any proxy or hop guard records a crossing for a
-    connection that will not build. Names the connection and the settings, never a value."""
+    connection that will not build. Raises :class:`HttpAuthError`, as SOAP's half-pair refusal does,
+    naming the connection and the settings, never a value."""
     # Lazy, as rest.py imports it: http_auth imports this package's siblings at its top.
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     prefix = f"{hop_name_prefix(connection)}DICOMweb destination"
     token, user, password = s.get("bearer_token"), s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):
-        raise ValueError(
+        raise HttpAuthError(
             f"{prefix} basic_user and basic_password must be set together; one without the other "
             "would send no HTTP Basic credential"
         )
     if token and user:
-        raise ValueError(
+        raise HttpAuthError(
             f"{prefix} sets both bearer_token and basic_user/basic_password; set one credential, "
             "since only one Authorization header can be sent"
         )
@@ -242,7 +246,7 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
         and isinstance(extra, dict)
         and any(is_authorization_header_name(str(name)) for name in extra)
     ):
-        raise ValueError(
+        raise HttpAuthError(
             f"{prefix} sets an Authorization entry in headers beside bearer_token or "
             "basic_user/basic_password; set the credential in one place"
         )
@@ -253,11 +257,18 @@ def _refuse_ambiguous_credentials(s: Mapping[str, Any], connection: str | None) 
     ):
         if not value:
             continue
-        _reject_url_control_chars(str(value), field)
-        if has_lone_surrogate(str(value)):
-            raise ValueError(f"{prefix} {field} holds a character UTF-8 cannot encode")
+        text = str(value)
+        if has_control_char(text):
+            raise HttpAuthError(f"{prefix} {field} contains an illegal control character")
+        # The bearer goes out as a raw header value; a Basic half is UTF-8 inside base64.
+        if (
+            _latin1_refusal_position(text) is not None
+            if field == "bearer_token"
+            else has_lone_surrogate(text)
+        ):
+            raise HttpAuthError(f"{prefix} {field} holds a character the request cannot encode")
     if user and ":" in str(user):
-        raise ValueError(f"{prefix} basic_user may not contain a colon (RFC 7617 section 2)")
+        raise HttpAuthError(f"{prefix} basic_user may not contain a colon (RFC 7617 section 2)")
 
 
 def _reply_is_empty(body: str) -> bool:

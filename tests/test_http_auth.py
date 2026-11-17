@@ -31,6 +31,7 @@ from messagefoundry.transports.http_auth import (
     bearer_provider_from_settings,
     digest_handler_from_settings,
     oauth2_auth_configured,
+    refuse_oauth2_settings,
     with_http_digest,
     with_oauth2_client_credentials,
 )
@@ -721,31 +722,48 @@ def test_a_lowercase_sha256_challenge_is_answered_as_sha256() -> None:
 _TOKEN_URL = "https://auth.example.org/token"
 
 
-@pytest.mark.parametrize("enabled", ["false", "0", "", 0, 1, None])
+@pytest.mark.parametrize("enabled", ["false", "true", "0", "", 0, 1, None])
 def test_oauth2_enabled_must_be_a_real_bool(enabled: object) -> None:
     """A truthiness read took ``"false"`` and ``"0"`` as on and ``None`` as off (vault BACKLOG
-    #5362). A mapping written past ``resolve_env_settings`` is refused instead, naming the type."""
+    #5362). The predicate now reads every non-bool flag as off, never raising, and the build seam
+    refuses it, naming the connection and the type."""
     settings = {"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": enabled, "connection_name": "OB"}
+    assert oauth2_auth_configured(settings) is False
     with pytest.raises(HttpAuthError) as exc:
-        oauth2_auth_configured(settings)
+        refuse_oauth2_settings(settings)
     # The whole text, so no spelling of the value can ride in it.
     assert str(exc.value) == (
         f"connection 'OB'; oauth2_enabled must be true or false, not {type(enabled).__name__}"
     )
 
 
-@pytest.mark.parametrize("url", ["", "   ", "\t\n"])
-def test_oauth2_blank_token_url_with_auth_on_is_refused(url: str) -> None:  # vault BACKLOG #5362
-    for settings in ({"oauth2_token_url": url}, {"oauth2_token_url": url, "oauth2_enabled": True}):
-        with pytest.raises(HttpAuthError, match="oauth2_token_url is blank or unset"):
-            oauth2_auth_configured(settings)
-
-
-def test_oauth2_unset_token_url_beside_a_written_flag_is_refused() -> None:  # vault BACKLOG #5362
-    """An env() token URL that resolves to None, beside the flag the composer writes, would read as
-    OAuth2 off and deliver with no bearer."""
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"oauth2_token_url": ""},
+        {"oauth2_token_url": "   "},
+        {"oauth2_token_url": "\t\n", "oauth2_enabled": True},
+        # An env() token URL that resolves to None, beside the flag the composer writes, would read
+        # as OAuth2 off and deliver with no bearer.
+        {"oauth2_token_url": None, "oauth2_enabled": True},
+    ],
+)
+def test_oauth2_blank_token_url_with_auth_on_is_refused(
+    settings: dict[str, object],
+) -> None:  # vault BACKLOG #5362
+    assert oauth2_auth_configured(settings) is False
     with pytest.raises(HttpAuthError, match="oauth2_token_url is blank or unset"):
-        oauth2_auth_configured({"oauth2_token_url": None, "oauth2_enabled": True})
+        refuse_oauth2_settings(settings)
+
+
+def test_oauth2_literal_blank_token_url_refused_at_declaration() -> None:  # vault BACKLOG #5362
+    with pytest.raises(HttpAuthError, match="token_url is blank"):
+        with_oauth2_client_credentials(
+            Rest(url="https://partner.example.org/in"),
+            token_url=" ",
+            client_id="c",
+            client_secret="s",
+        )
 
 
 def test_oauth2_configured_controls() -> None:  # vault BACKLOG #5362
@@ -763,8 +781,11 @@ def test_oauth2_configured_controls() -> None:  # vault BACKLOG #5362
     assert oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": env("x")})
     # An unresolved flag beside a blank URL is the advisory readers' to pass over, not to refuse.
     assert oauth2_auth_configured({"oauth2_token_url": " ", "oauth2_enabled": env("x")}) is False
+    refuse_oauth2_settings({"oauth2_token_url": " ", "oauth2_enabled": env("x")})
     # No flag and no URL is a connection with no OAuth2 at all.
     assert oauth2_auth_configured({"oauth2_token_url": None}) is False
+    refuse_oauth2_settings({"oauth2_token_url": None})
+    refuse_oauth2_settings({"oauth2_token_url": "  ", "oauth2_enabled": False})
 
 
 def test_oauth2_string_flag_refused_at_construction() -> None:  # vault BACKLOG #5362

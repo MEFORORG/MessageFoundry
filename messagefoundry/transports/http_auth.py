@@ -83,6 +83,7 @@ __all__ = [
     "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
+    "refuse_oauth2_settings",
     "proxy_auth_handler_from_settings",
     "with_http_digest",
     "with_oauth2_client_credentials",
@@ -102,33 +103,54 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the screen treated
     only a literal ``False`` as off.
 
-    Read strictly (vault BACKLOG #5362). ``oauth2_enabled`` is absent (on) or a real ``bool``; any
-    other value raises :class:`HttpAuthError`, because a truthiness read takes the string ``"false"``
-    or ``"0"`` as on and an explicit ``None`` as off, contrary to what was written. A resolved
-    ``env()`` flag arrives as a ``bool`` (``resolve_env_settings``, vault BACKLOG #3234), and the
-    loader refuses a non-bool literal (``Registry.bool_literal_problems``), so the refusal here is
-    what catches a mapping that took neither path, such as a registry built in code. An unresolved
-    ``env()`` reference is let through, for the advisory readers of the loaded graph. With the flag
-    a literal ``True``, a token URL that is blank, whitespace-only, or set to ``None`` beside the
-    written flag raises too, rather than reading as configured or as off. The messages name the
-    connection, the keys and the type, never a value."""
-    connection = s.get(MIRRORED_CONNECTION_SETTING)
-    prefix = hop_name_prefix(None if connection is None else str(connection))
+    Read strictly (vault BACKLOG #5362), and total: it never raises, because readers of the loaded
+    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate.
+    ``oauth2_enabled`` counts as on only when absent, a real ``True``, or an unresolved ``env()``
+    reference; a truthiness read used to take the string ``"false"`` or ``"0"`` as on and an
+    explicit ``None`` as off. Any other value, and a blank, whitespace-only or unset token URL beside
+    a written flag, reads as OFF here, and :func:`refuse_oauth2_settings` refuses the same settings
+    when the connector builds, so neither reading reaches the wire. The loader refuses a non-bool
+    literal too (``Registry.bool_literal_problems``), and :func:`with_oauth2_client_credentials` a
+    literal blank token URL."""
+    if _oauth2_setting_problem(s) is not None:
+        return False
+    enabled = s.get("oauth2_enabled", True)
+    return not _blank_token_url(s.get("oauth2_token_url")) and bool(enabled)
+
+
+def refuse_oauth2_settings(s: Mapping[str, Any]) -> None:
+    """Raise :class:`HttpAuthError` for OAuth2 settings :func:`oauth2_auth_configured` reads as off
+    only because they are wrong (vault BACKLOG #5362): a non-bool ``oauth2_enabled``, or a blank or
+    unset token URL beside the flag. Called first by :func:`bearer_provider_from_settings`, the
+    construction seam of every HTTP destination that offers OAuth2. Names the connection, the keys
+    and the type, never a value."""
+    problem = _oauth2_setting_problem(s)
+    if problem is not None:
+        connection = s.get(MIRRORED_CONNECTION_SETTING)
+        raise HttpAuthError(
+            f"{hop_name_prefix(None if connection is None else str(connection))}{problem}"
+        )
+
+
+def _blank_token_url(url: object) -> bool:
+    return not url or (isinstance(url, str) and not url.strip())
+
+
+def _oauth2_setting_problem(s: Mapping[str, Any]) -> str | None:
+    """Why the OAuth2 settings cannot be read as written, or ``None``. The one test behind
+    :func:`oauth2_auth_configured` and :func:`refuse_oauth2_settings`, so the two cannot disagree."""
     enabled = s.get("oauth2_enabled", True)
     if not isinstance(enabled, bool) and not _is_env_ref(enabled):
-        raise HttpAuthError(
-            f"{prefix}oauth2_enabled must be true or false, not {type(enabled).__name__}"
-        )
+        return f"oauth2_enabled must be true or false, not {type(enabled).__name__}"
     url = s.get("oauth2_token_url")
-    blank = not url or (isinstance(url, str) and not url.strip())
-    # Absent flag and absent URL is a connection with no OAuth2 at all, so only a URL that was
-    # written, or the flag itself, makes a blank URL a refusal.
-    if enabled is True and blank and ("oauth2_enabled" in s or url is not None):
-        raise HttpAuthError(
-            f"{prefix}oauth2_token_url is blank or unset while oauth2_enabled is on; set the "
-            "token endpoint URL, or turn oauth2_enabled off"
+    # No flag and no URL is a connection with no OAuth2 at all, so only a URL that was written, or
+    # the flag itself, makes a blank URL a fault.
+    if enabled is True and _blank_token_url(url) and ("oauth2_enabled" in s or url is not None):
+        return (
+            "oauth2_token_url is blank or unset while oauth2_enabled is on; set the token "
+            "endpoint URL, or turn oauth2_enabled off"
         )
-    return not blank and bool(enabled)
+    return None
 
 
 def _is_env_ref(value: object) -> bool:
@@ -385,6 +407,7 @@ def bearer_provider_from_settings(
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
+    refuse_oauth2_settings(s)
     has_smart = smart_auth_configured(s)
     has_oauth = oauth2_auth_configured(s)
     if has_smart and has_oauth:
@@ -618,6 +641,12 @@ def with_oauth2_client_credentials(
     id and secret as written. The section also asks for each to be form-encoded first, and that step
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
+    if enabled is True and isinstance(token_url, str) and not token_url.strip():
+        # A literal blank is refused here, where `messagefoundry check` sees it without building the
+        # connector; an env() that resolves blank is refused at the build (vault BACKLOG #5362).
+        raise HttpAuthError(
+            "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
+        )
     spec.settings.update(
         {
             "oauth2_enabled": enabled,

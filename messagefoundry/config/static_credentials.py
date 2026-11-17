@@ -170,15 +170,9 @@ def _smart(settings: Mapping[str, Any]) -> bool:
 
 
 def _oauth2(settings: Mapping[str, Any]) -> bool:
-    from messagefoundry.transports.http_auth import HttpAuthError, oauth2_auth_configured
+    from messagefoundry.transports.http_auth import oauth2_auth_configured
 
-    try:
-        return oauth2_auth_configured(settings)
-    except HttpAuthError as exc:
-        # A flag or token URL the strict read refuses refuses the connector too (vault BACKLOG
-        # #5362), so no OAuth2 credential crosses; the build reports it loudly, as _digest says.
-        logging.getLogger(__name__).debug("static-credential census: %s", exc)
-        return False
+    return oauth2_auth_configured(settings)
 
 
 def _digest(settings: Mapping[str, Any]) -> bool:
@@ -272,8 +266,9 @@ def _http_literal_static(
     ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
     every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
     the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
-    added). So a REST, FHIR or DICOMweb ``"Authorization "``, with a trailing space, still counts:
-    it goes on the wire beside the connector's own. A query parameter counts when
+    added). So a REST or FHIR ``"Authorization "``, with a trailing space, still counts: it goes
+    on the wire beside the connector's own. DICOMweb refuses to build with any spelling of it beside
+    its own credential (vault BACKLOG #5359), and sets no ``Authorization`` of its own without one. A query parameter counts when
     ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
 
     A table counts only as a ``dict``, the one type every connector's header builder sends.
