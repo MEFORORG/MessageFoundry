@@ -350,7 +350,7 @@ failed** — advisory checks and skips never block.
 | **`dryrun`** | ✅ blocking *(when fixtures exist)* | each synthetic `*.hl7` fixture **routes through its inbound's Router/Handler(s) without erroring** | a transform throws, or the message lands in `ERROR` disposition |
 | **`posture`** | ✅ blocking *(best-effort)* | the active environment's security posture is resolvable | a **custom** env name with no explicit `[ai].data_class`/`[ai].production` — which would make `serve` fail-closed at runtime |
 | **`ruff`** | advisory | config style/lint | only when installed for the Python that runs `check` (ruff also from the user scheme's scripts folder); never blocks |
-| **`mypy`** | advisory | config types, with mypy's defaults: `check` starts it with `--config-file=`, so your repository's own mypy settings (`[tool.mypy]`, `mypy.ini`, `setup.cfg`) and your user mypy file are not read | only when installed for the Python that runs `check`; never blocks |
+| **`mypy`** | advisory | config types; `check` starts it with `--config-file=`, so no mypy configuration file is read ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md#4-the-engine-starts-processes) section 4 says why) | only when installed for the Python that runs `check`; never blocks |
 
 ### Why `dryrun` is the interface gate that matters
 
