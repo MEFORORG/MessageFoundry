@@ -294,3 +294,24 @@ async def test_the_routes_429_sends_the_ceremony_retry_after(
         monkeypatch.setattr(service, "allow_reauth_attempt", real)
         served = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
     assert served.status_code == 200 and served.json()["ok"] is True, served.text
+
+
+async def test_a_body_nested_past_jsons_depth_is_a_malformed_request(engine: Engine) -> None:
+    """RED when: the passkey finish answers a body nested too deep for json's stack with a 500
+    (BACKLOG #5341). Its label cannot be read, so it is the route's malformed-body refusal, which
+    leaves the ceremony in flight: the real response still finishes after it."""
+    service = await _service(engine)
+    identity, token = await _sign_in(service)
+    body = await _staged_body(service, identity, token)
+    depth = 200_000
+    deep = b'{"label": "key", "response": ' + b"[" * depth + b"]" * depth + b"}"
+
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", token)
+        refused = await c.post(
+            _VERIFY, content=deep, headers={**SAME_ORIGIN, "Content-Type": "application/json"}
+        )
+        assert refused.status_code == 400, refused.text
+        assert refused.json() == {"ok": False, "error": "malformed request"}
+        served = await c.post(_VERIFY, json=body, headers=SAME_ORIGIN)
+    assert served.status_code == 200 and served.json()["ok"] is True, served.text

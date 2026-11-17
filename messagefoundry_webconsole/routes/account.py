@@ -893,7 +893,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # ADR 0207: the enrolment code a directory account's first factor needs, or None.
             raw_code = body.get("enrolment_code")
             enrolment_code = raw_code if isinstance(raw_code, str) and raw_code else None
-        except (ValueError, KeyError, TypeError, AttributeError):
+        # RecursionError: a body nested too deep for json's stack (BACKLOG #5341), which uncaught
+        # would answer 500. Its label cannot be read either, so it gets this unaudited malformed-body
+        # answer like any other: the service's audited refusal needs a label the body does not yield.
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
