@@ -381,9 +381,10 @@ def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = N
     caller ``stacklevel`` frames up.
 
     What the warning guards in this module and the store's ``_log_timeout_read_as_unverified``
-    hold, stated once here: at least, an exception the log calls raise at normal depth no longer
-    ends the audit walk or the row check that logs it. Out of memory or stack, an exception can
-    still escape, as it could before BACKLOG #6707."""
+    hold, stated once here: at least, an exception those guarded log calls raise at normal depth
+    no longer ends the audit walk or the row check that logs it. Out of memory or stack, an
+    exception can still escape, as it could before BACKLOG #6707. The store's other log calls in
+    the walk are not guarded."""
     where = build if site is None else site
     try:
         parts = build()

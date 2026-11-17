@@ -473,9 +473,9 @@ section 0): this is what the first deployment's first routine rotation would hav
    `{"errors":true}`. On each, hvac 2.4.0 raises `AttributeError` or `TypeError` in place of
    `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
    truthy `errors` value, before it raises any `InvalidRequest`, is not read as a refusal either.
-   Each is a plain `CipherError`, so a version planted behind a proxy that wrote such a body would
-   not read as a break. Any other failure, an unreachable Vault among them, is a `CipherError`
-   too. In every such case the walk could not run, and no tamper alert fires. The genesis-row
+   Each is read as `TransitCipher.verify_audit_hmac`'s docstring says (corrected 2026-11-17,
+   BACKLOG #6707). An unreachable Vault is a `CipherError`, so the walk could not run, and no
+   tamper alert fires. The genesis-row
    check at open (item 2) catches only `AuditKeyVersionRefusedError`, so there such a
    `CipherError` can fail the store open.
 
