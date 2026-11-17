@@ -128,9 +128,9 @@ def test_a_config_module_edited_on_disk_refuses_the_worker_though_every_name_mat
 ) -> None:
     """Vault BACKLOG #2724 item 3. The engine loaded the config, then a Handler's body changed on
     disk with no reload. Every name is the same, so only the digest of the modules' bytes can tell.
-    The control is the comparison on the same edit with the digest taken out of the engine's shape:
-    the worker then comes up and answers from the edited body, which is the divergence this
-    refuses."""
+    The control is the same edit with no comparison (``graph=None``): the worker then comes up and
+    answers from the edited body, which is the divergence this refuses. An engine shape with its
+    digest taken out no longer passes as that control: it is refused (BACKLOG #5334)."""
     monkeypatch.delenv(_VARIABLE, raising=False)
     registry = load_config(config_dir)
     graph = Path(config_dir) / "graph.py"
@@ -145,13 +145,26 @@ def test_a_config_module_edited_on_disk_refuses_the_worker_though_every_name_mat
     assert "pass_environment" not in text
 
     blind = dataclasses.replace(graph_shape(registry), code_digest=None)
-    session = SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
-        inbound="IB_PARITY",
-        config_dir=config_dir,
-        env=None,
-        graph=lambda: blind,
-    )
+
+    def session_for(graph: Any) -> SandboxSession:
+        return SandboxSession(
+            SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+            inbound="IB_PARITY",
+            config_dir=config_dir,
+            env=None,
+            graph=graph,
+        )
+
+    session = session_for(lambda: blind)
+    try:
+        with pytest.raises(SandboxError) as undigested:
+            transform_one(registry, "h_0", RAW, sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    assert "was not loaded from a config directory" in str(undigested.value)
+    assert "pass_environment" not in str(undigested.value)
+
+    session = session_for(None)
     try:
         deliveries, _, _, _ = transform_one(
             registry, "h_0", RAW, sandbox=session, run_context=RunContext()
@@ -227,7 +240,7 @@ def test_an_unreadable_module_leaves_no_digest_and_says_so(
     monkeypatch.setattr(Path, "read_bytes", refuse)
     with caplog.at_level("WARNING", logger="messagefoundry.config.wiring"):
         assert config_code_digest(tmp_path) is None
-    assert "not compared" in caplog.text and "graph.py" in caplog.text
+    assert "digest unavailable" in caplog.text and "graph.py" in caplog.text
 
 
 def test_the_code_digest_covers_each_module_a_load_may_run(tmp_path: Path) -> None:
@@ -342,7 +355,70 @@ async def test_the_runner_hands_each_session_the_graph_it_is_serving(
         await store.close()
 
 
+@pytest.mark.parametrize("mode", [SandboxMode.SUBPROCESS, SandboxMode.ISOLATED])
+def test_a_graph_with_no_digest_is_refused_at_start_beside_a_config_dir(
+    config_dir: str, mode: SandboxMode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5334. A worker would refuse a graph built in code once per message, after the
+    engine had started and ACKed it, so every message would be accepted and then errored. The
+    runner refuses it when it is made instead, before a listener binds, with the worker's cause
+    and remedy. The control is the same graph loaded, which carries a digest and is made."""
+    monkeypatch.delenv(_VARIABLE, raising=False)
+    loaded = load_config(config_dir)
+    built = Registry(
+        inbound=loaded.inbound,
+        outbound=loaded.outbound,
+        routers=loaded.routers,
+        handlers=loaded.handlers,
+    )
+    assert built.code_digest is None
+
+    def make(registry: Registry) -> RegistryRunner:
+        return RegistryRunner(
+            registry,
+            object(),  # type: ignore[arg-type]
+            sandbox_policy=SandboxPolicy(mode=mode),
+            sandbox_config_source=(config_dir, None),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+    with pytest.raises(ValueError) as refused:
+        make(built)
+    text = str(refused.value)
+    assert f"[sandbox].mode={mode.value}" in text
+    assert "the engine's graph was not loaded from a config directory" in text
+    assert "Serve a graph loaded from the config directory" in text
+    # The other arm: a graph naming its own directory, with no digest and no configured source.
+    named = dataclasses.replace(loaded, code_digest=None)
+    assert named.source_dir is not None
+    with pytest.raises(ValueError, match="was not loaded from a config directory"):
+        RegistryRunner(
+            named,
+            object(),  # type: ignore[arg-type]
+            sandbox_policy=SandboxPolicy(mode=mode),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    make(loaded)  # the control
+
+
+def test_a_graph_with_no_digest_and_no_config_dir_runs_in_process() -> None:
+    """The no-config-dir side of a graph with no digest: it is not refused, and no session is made,
+    so no worker starts for a digest to vouch for."""
+    runner = RegistryRunner(
+        Registry(),
+        object(),  # type: ignore[arg-type]
+        sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS),
+        sandbox_config_source=(None, None),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert runner._sandbox_for("IB_ANY") is None
+
+
 # --- the comparison ------------------------------------------------------------------------------
+
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
 
 
 def _shape(**changes: object) -> GraphShape:
@@ -353,6 +429,8 @@ def _shape(**changes: object) -> GraphShape:
         "handlers": frozenset({"h"}),
         "accepts": frozenset({"h"}),
         "outbound": frozenset({"OB"}),
+        # A loaded graph always carries one (BACKLOG #5334), so the shapes here do too.
+        "code_digest": _DIGEST_A,
     }
     return GraphShape(**{**base, **changes})  # type: ignore[arg-type]
 
@@ -377,23 +455,25 @@ def test_each_part_of_the_shape_is_compared(changes: dict[str, object], expected
     assert difference.startswith(expected + " (")
 
 
-_DIGEST_A = "a" * 64
-_DIGEST_B = "b" * 64
-
-
-def test_the_code_digest_is_compared_whenever_the_engine_has_one() -> None:
+def test_the_code_digest_is_compared_and_an_engine_with_none_is_refused() -> None:
     """A worker of the same build that reports no digest could not read its modules, so it is
-    refused rather than passed. An engine with none, a graph built in code, compares names only."""
-    ours, theirs = _shape(code_digest=_DIGEST_A), _shape(code_digest=_DIGEST_B)
+    refused rather than passed. An engine with none, a graph built in code, is refused too: nothing
+    can say the worker runs the code it holds (BACKLOG #5334)."""
+    ours, theirs = _shape(), _shape(code_digest=_DIGEST_B)
     assert graph_differences(ours, theirs) == [
         "config module content (the engine loaded aaaaaaaaaaaa, the worker loaded bbbbbbbbbbbb)"
     ]
-    assert graph_differences(ours, _shape(code_digest=_DIGEST_A)) == []
-    assert graph_differences(ours, _shape()) == [
+    assert graph_differences(ours, _shape()) == []
+    assert graph_differences(ours, _shape(code_digest=None)) == [
         "config module content (the engine loaded aaaaaaaaaaaa, the worker loaded none: it could "
         "not read them)"
     ]
-    assert graph_differences(_shape(), theirs) == []
+    undigested = [
+        "the engine's graph was not loaded from a config directory (it has no digest to compare "
+        "the worker's with)"
+    ]
+    assert graph_differences(_shape(code_digest=None), theirs) == undigested
+    assert graph_differences(_shape(code_digest=None), _shape(code_digest=None)) == undigested
 
 
 def test_a_difference_names_a_few_of_the_names_and_the_side_that_has_them() -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -24,11 +25,13 @@ from typing import Any, NoReturn
 
 import pytest
 
+from messagefoundry import odbc_call_gate
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
+from messagefoundry.odbc_call_gate import UngatedConnectionError, require_call_gate
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
@@ -1729,8 +1732,375 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
         await _run_one_failed_poll(src, wrapped)
     assert "direct cause of the following exception" in caplog.text
     assert "Exception [23000] driver error 2627" in caplog.text
-    assert "RuntimeError: poll step failed" in caplog.text
+    # No SQLSTATE and not the engine's own error, so its text is withheld (BACKLOG #5348).
+    assert "RedactedDbError: RuntimeError [message withheld]" in caplog.text
+    # The frame's source line still shows the literal; the exception line no longer does.
+    assert "RuntimeError: poll step failed" not in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+#: A connect failure's text quoting DSN attributes back; synthetic, no real server or credential.
+_DSN_ECHO = "login failed for DSN 'SERVER=db.invalid;UID=mefor_svc;PWD=SyntheticSecret1'"
+
+
+@pytest.mark.parametrize("kind", [OSError, RuntimeError, ValueError])
+async def test_source_poll_failure_withholds_a_no_sqlstate_error_text(
+    caplog: pytest.LogCaptureFixture, kind: type[Exception]
+) -> None:
+    """BACKLOG #5348. A poll failure with no SQLSTATE, raised by no driver, logged ``safe_exc``'s
+    bounded, redacted text, and a connect error of that shape can quote the DSN. It is named by its
+    type alone now, as ``_lookup_connect_failure`` names one; the frames are kept.
+
+    Red mutation: return ``_safe_db_error(exc, withhold=under)`` unconditionally in
+    ``_poll_log_line``. The secret prints and every case reds."""
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), kind(_DSN_ECHO))
+    assert "poll failed" in caplog.text
+    assert f"RedactedDbError: {kind.__name__} [message withheld]" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+    assert "mefor_svc" not in caplog.text
+    assert "in _select" in caplog.text  # the frames are kept
+
+
+@pytest.mark.parametrize("stage", ["connect", "probe"])
+async def test_connect_and_probe_errors_carry_no_planted_dsn_credential(stage: str) -> None:
+    """#5348, Manager ruling: ``_connect`` and ``_probe_db`` put ``_safe_db_error``'s text in their
+    ``DeliveryError``, and for a no-SQLSTATE error that is ``safe_exc``'s, which keeps a DSN echo
+    whole. That text would reach last_error, events, the alert and the test_connection detail.
+    Red mutation: restore ``_safe_db_error`` in either arm. That stage reds."""
+    failure = RuntimeError(_DSN_ECHO)
+    dest = _dest()
+    if stage == "connect":
+        dest._pool = _RefusingPool(failure)
+    else:
+        dest._pool = _FakePool(_FakeConn(_FakeCursor(failure)))
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert "SyntheticSecret1" not in str(failed.value)
+    assert "mefor_svc" not in str(failed.value)
+    assert str(failed.value).endswith(": RuntimeError")
+
+
+async def test_source_mark_failure_log_carries_no_planted_dsn_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5348, Manager ruling: the mark's borrow can open a connection, so its WARNING is
+    credential-free. Red mutation: restore ``_safe_db_error`` in the mark-failure log. Reds."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=RuntimeError(_DSN_ECHO),
+        )
+    assert "mark failed (row will re-emit, a duplicate): RuntimeError" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+
+
+async def test_source_finish_stop_log_carries_no_planted_dsn_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5348, Manager ruling: ``_finish_stop`` logs a faulted poll task's error credential-free.
+    Red mutation: restore ``_safe_db_error`` in that log. Reds here."""
+    src = _src(body_column="payload")
+
+    async def fault() -> None:
+        raise RuntimeError(_DSN_ECHO)
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(RuntimeError):
+        await task
+    src._task = task
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await src._finish_stop(task, interrupted=False)
+    assert "poll task failed: RuntimeError" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DATABASE pool acquire timed out after 5s (pool exhausted or DB unresponsive)",
+        "database driver refused statement_timeout (Error); set statement_timeout = 0 on this "
+        "connection if it cannot take one",
+    ],
+)
+async def test_source_poll_failure_keeps_the_engines_own_text(
+    caplog: pytest.LogCaptureFixture, text: str
+) -> None:
+    """#5348, Manager ruling: the engine's own ``DeliveryError`` and ``NegativeAckError`` hold no
+    driver text, so the poll log keeps their remedy. Red mutation: drop ``DeliveryError`` from
+    ``_ENGINE_FIXED_TEXT``. Both red."""
+    exc: Exception = (
+        DeliveryError(text)
+        if "acquire" in text
+        else NegativeAckError(text, code="db", permanent=True)
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+    assert f"RedactedDbError: {type(exc).__name__}: {text}" in caplog.text
+
+
+_BORROW_REFUSALS = [
+    pytest.param(
+        database_module.AutocommitNotConfirmed(
+            "DATABASE: a pooled connection did not keep autocommit mode after it was set; "
+            "refusing to run a statement on it"
+        ),
+        "did not keep autocommit mode",
+        id="autocommit",
+    ),
+    pytest.param(
+        UngatedConnectionError(
+            "odbc: aioodbc Connection cannot be wrapped by the call gate; refusing the connection"
+        ),
+        "cannot be wrapped by the call gate",
+        id="ungated",
+    ),
+]
+
+
+@pytest.mark.parametrize(("exc", "remedy"), _BORROW_REFUSALS)
+async def test_the_engines_borrow_refusals_keep_their_text(
+    caplog: pytest.LogCaptureFixture, exc: Exception, remedy: str
+) -> None:
+    """#5348, Manager ruling: ``AutocommitNotConfirmed`` and ``UngatedConnectionError`` are the
+    engine's fixed text, so the poll log, the mark-failure log and the connect error keep it, as
+    they keep a ``NegativeAckError``'s. Red mutation: drop the class from ``_ENGINE_FIXED_TEXT``.
+    Every stage reds."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=exc,
+        )
+    assert f"RedactedDbError: {type(exc).__name__}: " in caplog.text
+    assert f"a duplicate): {exc}" in caplog.text
+    dest = _dest()
+    dest._pool = _RefusingPool(exc)
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert remedy in str(failed.value)
+
+
+@pytest.mark.parametrize(
+    ("exc", "kept"),
+    [
+        (ImportError("libodbc.so.2: cannot open shared object file"), "libodbc.so.2"),
+        (database_module._DriverMissingError("install the 'sqlserver' extra"), "sqlserver"),
+        (UnicodeDecodeError("utf-16-le", b"\x00", 0, 1, "truncated data"), "truncated data"),
+    ],
+)
+async def test_source_poll_failure_keeps_a_load_failure_text(
+    caplog: pytest.LogCaptureFixture, exc: Exception, kept: str
+) -> None:
+    """Control for #5348: a failed driver load names a library or the extra, and ``safe_exc``
+    renders a codec error from its attributes; no DSN reaches any of them, so the text stays.
+    Red mutation: drop the exemption in ``_poll_log_line``. Every case reds."""
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+    assert f"RedactedDbError: {type(exc).__name__}: " in caplog.text
+    assert kept in caplog.text.split("RedactedDbError:", 1)[1]
+
+
+def test_poll_log_line_names_an_error_with_no_arguments_by_type_alone() -> None:
+    """#5348, review round 2: an empty ``TimeoutError()`` has no text, so 'withheld' would mislead.
+    Red mutation: drop the ``exc.args`` test in ``_poll_log_line``."""
+    assert database_module._poll_log_line(TimeoutError(), under=False) == "TimeoutError"
+
+
+class _UnclassifiableError(Exception):
+    """An error whose ``sqlstate`` property raises something ``getattr`` does not swallow."""
+
+    @property
+    def sqlstate(self) -> str:
+        raise RuntimeError("no state")
+
+
+async def test_source_poll_failure_keeps_the_chain_when_one_link_cannot_be_classified(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5348, review round 1: ``_poll_log_line`` never raises, so one bad link keeps its frames and
+    the rest of the chain. Red mutation: drop its ``try``. The whole traceback is withheld."""
+    try:
+        try:
+            raise _driver_exc("23000", _SQLSERVER_DUP)
+        except Exception as inner:
+            raise _UnclassifiableError("x") from inner
+    except _UnclassifiableError as outer:
+        failure = outer
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), failure)
+    assert "_UnclassifiableError [message withheld: RuntimeError while rendering it]" in caplog.text
+    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "traceback withheld" not in caplog.text
+
+
+def test_credential_free_cause_never_raises() -> None:
+    """#5348, batch 613 review: the mark-failure log and ``_finish_stop`` render through
+    ``_credential_free_cause``, and the ``_safe_db_error`` it replaced there never raised. Red
+    mutation: drop its ``try``. The ``sqlstate`` property's ``RuntimeError`` escapes."""
+    assert database_module._credential_free_cause(_UnclassifiableError("x")) == (
+        "_UnclassifiableError [message withheld: RuntimeError while rendering it]"
+    )
+
+
+@pytest.mark.parametrize("broken", ["fault", "render", "logger"])
+async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, broken: str
+) -> None:
+    """#5348, batch 613 review: ``stop()`` runs during reload quiesce, so a faulted poll task's
+    log line must not keep the pool open, and should not raise. ``fault``: an error whose
+    ``sqlstate`` raises; red when neither ``_credential_free_cause`` nor ``_finish_stop`` guards
+    it, since either guard prints the same note (``test_credential_free_cause_never_raises`` pins
+    the helper's alone). ``render``: the renderer itself raises; red
+    when ``_finish_stop`` does not guard its log line. ``logger``: every warning raises, so the
+    raise reaches an ordinary ``stop()``; red when the close is not in a ``finally``. Under a
+    cancel it must not replace the ``CancelledError``; red when the fallback's raise is kept."""
+    src = _src(body_column="payload")
+    fault_exc: Exception = _UnclassifiableError("x") if broken == "fault" else RuntimeError("y")
+    if broken == "render":
+
+        def raising(exc: BaseException) -> NoReturn:
+            raise RecursionError("too deep")
+
+        monkeypatch.setattr(database_module, "_credential_free_cause", raising)
+    if broken == "logger":
+
+        def refusing(*args: Any, **kwargs: Any) -> NoReturn:
+            raise OSError("log sink gone")
+
+        monkeypatch.setattr(database_module.logger, "warning", refusing)
+    closed: list[float | None] = []
+
+    async def aclose(*, timeout: float | None = None) -> None:
+        closed.append(timeout)
+
+    monkeypatch.setattr(src, "aclose", aclose)
+
+    async def fault() -> None:
+        raise fault_exc
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(type(fault_exc)):
+        await task
+    src._task = task
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        if broken == "logger":
+            with pytest.raises(OSError, match="log sink gone"):
+                await src._finish_stop(task, interrupted=False)
+            src._task = task
+            closed.clear()
+            await src._finish_stop(task, interrupted=True)  # under a cancel it never raises
+            assert closed == [database_module._POOL_CLOSE_TIMEOUT_S]
+            closed[:] = [None]
+        else:
+            await src._finish_stop(task, interrupted=False)
+    assert closed == [None], "the pool was not closed"
+    assert src._task is None
+    if broken == "fault":
+        assert (
+            "poll task failed: _UnclassifiableError [message withheld: RuntimeError while "
+            "rendering it]" in caplog.text
+        )
+    elif broken == "render":
+        assert (
+            "poll task failed: RuntimeError [message withheld: RecursionError while rendering it]"
+            in caplog.text
+        )
+
+
+def _real_ungated_refusal(monkeypatch: pytest.MonkeyPatch) -> UngatedConnectionError:
+    """The call gate's own refusal, raised by ``require_call_gate`` on an object it reads as a
+    real aioodbc connection it cannot wrap, so its text is the shipped one, not a copy. Its
+    once-per-process report set is replaced for the test, so no state leaks to another."""
+    monkeypatch.setattr(odbc_call_gate, "_REPORTED", set())
+    conn = type("Connection", (), {"__module__": "aioodbc.connection"})()
+    with pytest.raises(UngatedConnectionError) as refused:
+        require_call_gate(conn)
+    return refused.value
+
+
+def test_credential_free_cause_bounds_the_engines_text() -> None:
+    """#5348, batch 613 review: an engine error's text is printed, so it takes a bound, as the
+    ``safe_exc`` rendering it replaced did. Red mutation: print ``str(exc)`` unbounded, or cut
+    it at a limit outside 300 to 440, or return no text for an error that has none."""
+    long = DeliveryError("DATABASE connect failed: " + "word " * 4000)
+    out = database_module._credential_free_cause(long)
+    assert out.startswith("DATABASE connect failed: word")
+    assert 300 <= len(out) <= 440  # 400 and the cut note: the remedy fits, little else does
+    assert database_module._credential_free_cause(DeliveryError()) == "DeliveryError"
+
+
+#: The real statement_timeout refusal ``_apply_statement_timeout`` builds, SQLSTATE form.
+_TIMEOUT_REMEDY = (
+    "database driver refused statement_timeout [HYC00]; set statement_timeout = 0 on this "
+    "connection if it cannot take one"
+)
+
+
+@pytest.mark.parametrize("kind", ["ungated", "nak"])
+async def test_the_engines_remedy_survives_whole_on_every_path(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """#5348, batch 613 review: the call-gate refusal is about 235 characters, and its remedy is
+    its tail, so a 200-character bound cuts it. Every path keeps it whole: the poll log, alone and
+    inside a connect failure, the mark log, the connect error, the probe cause and the stopped
+    poll task's log. Red mutation, on ``ungated``: put back ``safe_exc``'s default bound in
+    ``_poll_log_line``'s fixed-text arm, or a bound under 260 in ``_credential_free_cause``.
+    ``nak`` is a control: its text is under 200 characters, and ``_connect`` re-raises it as it
+    stands, so no bound mutation reds it; it shows a ``NegativeAckError`` remedy kept whole."""
+    exc: Exception = (
+        _real_ungated_refusal(monkeypatch)
+        if kind == "ungated"
+        else NegativeAckError(_TIMEOUT_REMEDY, code="HYC00", permanent=True, config_fault=True)
+    )
+    text = str(exc)
+    if kind == "ungated":
+        assert len(text) > 230 and text.endswith("(BACKLOG #5005)")  # the instrument
+    wrapped = DeliveryError(f"DATABASE connect failed: {text}")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+        await _run_one_failed_poll(_src(body_column="payload"), wrapped)
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=exc,
+        )
+    assert f"RedactedDbError: {type(exc).__name__}: {text}\n" in caplog.text
+    assert f"RedactedDbError: DeliveryError: DATABASE connect failed: {text}\n" in caplog.text
+    assert f"a duplicate): {text}\n" in caplog.text
+    dest = _dest()
+    dest._pool = _RefusingPool(exc)
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert str(failed.value).endswith(text)
+    assert database_module._probe_failure_cause(exc) == text
+
+    src = _src(body_column="payload")
+
+    async def aclose(*, timeout: float | None = None) -> None:
+        return None
+
+    monkeypatch.setattr(src, "aclose", aclose)
+
+    async def fault() -> None:
+        raise wrapped
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(DeliveryError):
+        await task
+    src._task = task
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await src._finish_stop(task, interrupted=False)
+    assert f"poll task failed: DATABASE connect failed: {text}\n" in caplog.text
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
@@ -1785,12 +2155,17 @@ async def test_source_poll_failure_log_survives_an_unprintable_error(
     """The render runs in the poll loop's error arm, so an error that cannot be printed must not
     kill the poller: its line becomes a fixed note and its frames are kept.
 
-    Red mutation: drop the ``try`` in ``_safe_db_error``. The ``message withheld`` assertion reds:
-    ``_safe_db_exc_info``'s own fallback then catches the failure, so the poller still survives.
+    Red mutation: drop the ``try`` in ``_safe_db_error``. The direct call below raises. In the poll
+    log ``_poll_log_line``'s own ``try`` (BACKLOG #5348) then prints the same note, so the log
+    assertions alone no longer discriminate that mutation.
     """
+    exc = _UnprintableDriverError("22018", _SQLSERVER_CONVERT)
+    assert _safe_db_error(exc) == (
+        "_UnprintableDriverError [message withheld: AttributeError while rendering it]"
+    )
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
-        await _run_one_failed_poll(src, _UnprintableDriverError("22018", _SQLSERVER_CONVERT))
+        await _run_one_failed_poll(src, exc)
     assert "poll failed" in caplog.text
     assert "message withheld: AttributeError while rendering it" in caplog.text
     assert "in _select" in caplog.text
@@ -1953,7 +2328,10 @@ async def test_a_builtin_cause_under_a_driver_error_is_withheld(
     """asyncpg raises its client-side ``DataError`` from the codec's builtin error, whose message
     quotes the value too, and a traceback prints that cause first.
 
-    Red mutation: drop ``under`` in ``_redacted_copy``. The cause prints through ``safe_exc``.
+    Red mutation: drop ``under`` in ``_redacted_copy``. The cause then renders as
+    ``ValueError [message withheld]`` (BACKLOG #5348's rule), not as withheld under a driver error,
+    so the assertion reds; ``under`` still decides that a SQLSTATE-shaped ``args[0]`` on such a
+    link is not printed.
     """
     try:
         try:
@@ -2000,7 +2378,8 @@ async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_s
     """``_probe_db``'s two no-SQLSTATE arms build the ``DeliveryError`` that ``test_connection``
     raises, so its text is what an operator's connection test shows.
 
-    Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds.
+    Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds. Since
+    #5348 both arms name a no-SQLSTATE error by its type alone (``_credential_free_detail``).
     """
     failure = kind(_QUOTED_ARGUMENT)
     dest = _dest()
@@ -2011,7 +2390,7 @@ async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_s
     with pytest.raises(DeliveryError) as failed:
         await dest.test_connection()
     assert _SYNTHETIC_ID not in str(failed.value)
-    assert f"{kind.__name__} [driver message withheld]" in str(failed.value)
+    assert str(failed.value).endswith(f": {kind.__name__}")
 
 
 async def test_source_run_loop_survives_a_poll_error() -> None:

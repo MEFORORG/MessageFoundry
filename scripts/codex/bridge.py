@@ -18,6 +18,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Must equal $blockExit in invoke.ps1; a mismatch leaves a block at 2, which its caller's
+# pwsh -Command reports as 1.
+BLOCK_EXIT = 10
 EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -113,6 +116,10 @@ def sync_skills(
                 f"MISSING SOURCE: {target.relative_to(root)}; remove or rename this pointer"
             )
     return messages
+
+
+class HookBlocked(Exception):
+    """A hook exited 2."""
 
 
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
@@ -243,7 +250,7 @@ def dispatch(root: Path, payload: dict) -> dict:
             if completed.stderr:
                 print(completed.stderr, file=sys.stderr, end="")
             if completed.returncode == 2:
-                raise PermissionError(completed.stderr or "Claude hook blocked this event")
+                raise HookBlocked(completed.stderr or "Claude hook blocked this event")
             completed.check_returncode()
             output = completed.stdout.strip()
             if not output:
@@ -275,7 +282,14 @@ def main() -> int:
     parser.add_argument("--session-id", default=os.environ.get("CODEX_THREAD_ID", ""))
     parser.add_argument("--migrate-copies", action="store_true")
     parser.add_argument("--include-user-skills", action="store_true")
-    args, rest = parser.parse_known_args()
+    # A hook's exit 2 exits 2, or BLOCK_EXIT where argv is exactly `hook ... --block-exit 10`, the
+    # form invoke.ps1 builds; it ends its process with 2 for it. It is taken out before argparse, so
+    # no prefix of it is captured from a run script's own flags. Nothing inherits argv.
+    argv = sys.argv[1:]
+    block_exit = 2
+    if argv[:1] == ["hook"] and argv[-2:] == ["--block-exit", str(BLOCK_EXIT)]:
+        argv, block_exit = argv[:-2], BLOCK_EXIT
+    args, rest = parser.parse_known_args(argv)
     if args.mode == "sync-skills":
         user_skills = user_skill_directory() if args.include_user_skills else None
         print(
@@ -294,7 +308,11 @@ def main() -> int:
         return 0
     if args.mode == "hook":
         payload = json.load(sys.stdin)
-        result = dispatch(ROOT, payload)
+        try:
+            result = dispatch(ROOT, payload)
+        except HookBlocked as exc:
+            print(f"Codex bridge: {exc}", file=sys.stderr)
+            return block_exit
         if result:
             print(json.dumps(result))
         return 0

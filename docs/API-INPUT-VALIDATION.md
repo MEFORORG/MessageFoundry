@@ -5,19 +5,30 @@ It covers the control plane: the ids, connection names, time bounds and search t
 client sends to the engine. It does not cover message payloads. Those are the data plane, and they
 have their own documents: [HL7-VALIDATION.md](HL7-VALIDATION.md) and [CODESETS.md](CODESETS.md).
 
-The rules live in one module, [`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py).
-The rules table below is quoted from it. `tests/test_api_input_validation.py` checks that six
-phrases on this page still match the code, and fails if the page drops one. It does not check every
-number on this page. The connection-name pattern is the one exception to where it is written:
-it is defined in [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and
-imported by that module, because the config loader enforces the same rule.
+Most of the rules live in one module,
+[`messagefoundry/api/validation.py`](../messagefoundry/api/validation.py), and most of the rules
+table below is quoted from it. `tests/test_api_input_validation.py` checks that six phrases on this
+page still match the code, and fails if the page drops one. It does not check every number on this
+page. At least four rules in the table are written, in whole or in part, elsewhere. The
+connection-name pattern is defined in
+[`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
+module, because the config loader enforces the same rule. The directory user name's NUL rule is
+in `validation.py`, but its length bounds, 1 to 256 characters, are set on the request model in
+[`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py).
+The HL7 field-path grammar is `parse_path` in
+[`messagefoundry/parsing/peek.py`](../messagefoundry/parsing/peek.py). The layered preset ids'
+pattern is in `validation.py`, but their 1024-character bound is set on the route in
+[`messagefoundry/api/app.py`](../messagefoundry/api/app.py).
 
 Two later sections quote rules held in other files: the items checked behind a route, and the rules
 over two or more items. Each entry there names the code that holds its rule. No test compares those
 sections with the code, so read the named code when a number matters.
 
-A value that breaks one of these rules gets an HTTP 422 with the field named. The engine refuses it
-before the value reaches a database query, a filesystem path, a log line or a CSV export.
+A value that breaks one of these rules gets an HTTP 422 with the field named, except a malformed HL7
+field path, which gets a 400: its rule is enforced outside the API models, as the note on the field
+path below says.
+Whatever the status, the value that breaks a rule is refused before it reaches a database query, a
+filesystem path, a log line or a CSV export.
 
 ---
 
@@ -43,10 +54,17 @@ before the value reaches a database query, a filesystem path, a log line or a CS
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
+| Directory user name | No NUL, 1 to 256 characters. Pinned by `tests/test_auth_federated_identity_routes.py::test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory` | `username` on `POST /users/directory` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different
 rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
+
+A NUL in a sign-in name (vault BACKLOG #5342): behaviour pinned by
+`tests/test_api_auth.py::test_login_answers_a_nul_username_as_an_audited_unknown_name`,
+`tests/test_auth_hardening.py::test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces`,
+and, in the web console suite,
+`packaging/messagefoundry-webconsole/tests/test_ui_passkey_body_refusals.py`.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
 range. In practice: no NUL, no tab, no carriage return, no line feed.
@@ -339,7 +357,7 @@ replace it.** The first two are below. The third is the DR archive path, under
 2. A log `level` is checked against the engine's own level names, which is why a wrong one gets a
    400. The shape rule only keeps an arbitrary-length string out of that error message.
 
-**One rule is documented here but enforced elsewhere.** The HL7 field path grammar belongs to
+**The field path is documented here but enforced elsewhere.** The HL7 field path grammar belongs to
 `messagefoundry.parsing.peek.parse_path`, and `messagefoundry.store.content_search.make_spec` applies
 it at every point the API accepts a `field_path`. A malformed path is already a 400. Copying that
 pattern into the API models would create a second definition of a rule that has one.

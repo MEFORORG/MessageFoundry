@@ -838,8 +838,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # or space-only one is still the two-step flow, a padded code still counts, and a non-digit
         # one is still passed on, as before. The passkey challenge was already popped, and the
         # budget charged as _form_fits says.
+        # A NUL name within those bounds (BACKLOG #5342) is passed on, and auth.login refuses and
+        # audits it without looking it up: pinned by
+        # test_ui_passkey_body_refusals.py::test_the_form_sign_in_refuses_a_nul_username_before_the_store.
 
         def _refused() -> Response:
+            # Pinned by test_ui_passkey_body_refusals.py::
+            # test_the_combined_passkey_sign_in_refuses_a_nul_username_and_ends_its_challenge.
             refused = RedirectResponse("/ui/login?e=bad", status_code=303)
             if handle:
                 clear_passkey_sign_in_cookie(refused, request)

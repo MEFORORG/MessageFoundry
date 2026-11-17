@@ -228,6 +228,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxSessionClosed,
     SandboxWorkerRefused,
     graph_shape,
+    undigested_graph_refusal,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import inbound_guard_settings, owner_shard_of_destination
@@ -2019,18 +2020,24 @@ class RegistryRunner:
         # construction (a /config/reload does NOT re-read it — restart to change, like claim_mode).
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
-        if (
-            sandbox_policy is not None
-            and sandbox_policy.mode is SandboxMode.ISOLATED
-            and registry.source_dir is None
-            and (sandbox_config_source is None or sandbox_config_source[0] is None)
-        ):
-            # Refused here, before a listener ACKs anything, rather than once per message by
-            # _sandbox_for, whose refusal stays as the backstop for a reload (vault BACKLOG #3131).
-            raise ValueError(
-                "[sandbox].mode=isolated needs a config directory for its workers to load, and "
-                "this graph has none: it never runs a Router or Handler in the engine process"
+        if sandbox_policy is not None and sandbox_policy.mode is not SandboxMode.OFF:
+            # The same "is a config dir known" test _sandbox_for makes when it picks cfg_dir.
+            has_config_dir = registry.source_dir is not None or (
+                sandbox_config_source is not None and sandbox_config_source[0] is not None
             )
+            if sandbox_policy.mode is SandboxMode.ISOLATED and not has_config_dir:
+                # Refused here, before a listener ACKs anything, rather than once per message by
+                # _sandbox_for, whose refusal stays as the backstop for a reload (vault BACKLOG
+                # #3131).
+                raise ValueError(
+                    "[sandbox].mode=isolated needs a config directory for its workers to load, "
+                    "and this graph has none: it never runs a Router or Handler in the engine "
+                    "process"
+                )
+            if has_config_dir and registry.code_digest is None:
+                # Before a listener binds or a worker spawns (BACKLOG #5334): undigested_graph_refusal
+                # says why, and _sandbox_for why no config dir is exempt.
+                raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         # The running reload's step-3 connectors, built before its quiesce (BACKLOG #5755), set
         # under ``_reload_lock`` only for the step-3 call that takes them.
@@ -7204,10 +7211,22 @@ class RegistryRunner:
         the directory (vault BACKLOG #2596). A graph with no snapshot hands the session
         ``Registry.source_dir``, else the constructor's ``sandbox_config_source``, which the session
         reads once. A reload of a running runner closes the sessions, so a reload from another root
-        moves the children with it (vault BACKLOG #3094). **A graph built in code with no
-        config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
-        library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
-        Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
+        moves the children with it (vault BACKLOG #3094).
+
+        **A graph with no** ``code_digest`` **beside a config dir is refused when the runner is
+        made** (:func:`~messagefoundry.pipeline.sandbox.undigested_graph_refusal`). One swapped in
+        later, by :meth:`reload` or by assigning ``self.registry``, still reaches this method, and
+        its worker refuses it per message through
+        :func:`~messagefoundry.pipeline.sandbox.graph_differences`, which stays the backstop.
+
+        **Under** ``subprocess`` **(isolated refuses it, above), a graph built in code with no
+        config dir cannot isolate**, and degrades to in-process.
+        That degradation is **silent**: a library embedder that asked for ``subprocess`` gets the
+        in-process path and nothing says so. It is not refused for its missing digest, because the
+        digest exists to hold a worker to the code the engine holds, and here no worker starts: the
+        engine runs the very functions it holds. What it gives up is the isolation itself, the
+        import guard and the resource caps, which is this degradation, not a parity gap. Every
+        ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
         here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
         first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
         at :meth:`stop`."""

@@ -18,6 +18,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
+    SIGN_IN_NAME_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -60,6 +61,8 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
+    # A NUL in ``username`` (vault BACKLOG #5342): behaviour pinned by
+    # tests/test_api_auth.py::test_login_answers_a_nul_username_as_an_audited_unknown_name.
     username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
@@ -326,7 +329,9 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    username: str = Field(min_length=1, max_length=_NAME_MAX)
+    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
+    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
+    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 

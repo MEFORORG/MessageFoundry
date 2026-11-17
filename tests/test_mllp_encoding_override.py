@@ -155,22 +155,27 @@ def test_reencode_rejects_unparseable_payload(garbage: str) -> None:
 
 # The re-encoder walks the built-in parse; before python-hl7 left, it was compared with python-hl7's
 # tree walk over 1,870 input and delimiter pairs and none differed. These pin the shapes that
-# comparison covered and the corpus tests do not: an FHS/BHS header, whose raw MSH-1/MSH-2 leaves
-# change only their escape character, and a blank segment line, which survives the rewrite.
+# comparison covered and the corpus tests do not: an FHS/BHS header, whose field 2 now advertises
+# the target set as MSH-2 does (python-hl7 wrote its field separator twice, BACKLOG #5802), and a
+# blank segment line, which survives the rewrite.
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
         (
             "BHS|^~\\&|A|B\\E\\x\rMSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r"
             "PID|1|a\\E\\b^c~d&e\rBTS|1\r",
-            "BHS#|#^~^&#A#B\\x\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rPID#1#a\\b@c$d%e\rBTS#1\r",
+            "BHS#@$^%#A#B\\x\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rPID#1#a\\b@c$d%e\rBTS#1\r",
+        ),
+        (
+            "FHS|^~\\&|A\rBHS|^~\\&|B\rMSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\rBTS|1\rFTS|1\r",
+            "FHS#@$^%#A\rBHS#@$^%#B\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rBTS#1\rFTS#1\r",
         ),
         (
             "MSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r\rPID|1||a^b~c&d\\F\\x\r",
             "MSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\r\rPID#1##a@b$c%d|x\r",
         ),
     ],
-    ids=["batch-header", "blank-line"],
+    ids=["batch-header", "file-and-batch-headers", "blank-line"],
 )
 def test_reencode_batch_header_and_blank_line(payload: str, expected: str) -> None:
     assert reencode_delimiters(payload, parse_encoding_characters("#@$^%")) == expected

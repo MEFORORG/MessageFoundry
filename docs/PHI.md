@@ -751,8 +751,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    uses, where the run prints a note naming the path it read. Before retiring the prior key, confirm
    the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp a
    changed key while the rotation record names it or cannot be read (BACKLOG
-   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
-   (the store open can already have written under the key) and closes it only when a run completes,
+   #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` inside the store open,
+   before the open's first write under the key (BACKLOG #4936; steps that write nothing under the
+   key can run before it, at least the schema step and, on SQL Server, the database option switch),
+   and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. **A sealed record under a key the run
    was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
    seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
@@ -783,10 +785,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    store with no keyed chain to ask, such as one whose audit rows open with no genesis row naming
    its key, so there a stamp proves only a changed key. On such a store, do not start `serve`
    between setting a new key and running `rotate-key`: that stamp stands however the run ends. On a
-   store with a keyed chain, do not start `serve` on the new key alone before a run's roll succeeds:
-   the chain's current range is then under a key it does not hold, so it keys new audit rows under
-   the new key, those rows never verify inside that range, and no later `rotate-key` can roll the
-   chain. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
+   store with a keyed chain, do not start `serve`, or run any other command that writes an audit
+   row, on the new key alone before a run's roll succeeds: the chain's current range is then under
+   a key it does not hold, so it keys new audit rows under the new key, those rows never verify
+   inside that range, and no later `rotate-key` can roll the chain. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
    verifies the whole chain first, so a chain whose rows do not verify, or whose rows open with no
    genesis row, refuses under every key, a new one included, and the record stays open. A newest
    range under a key that is not configured is not one of these, though `audit-verify` reports it

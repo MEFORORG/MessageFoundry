@@ -13,7 +13,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -1819,3 +1821,308 @@ async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() 
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
     finally:
         await store.close()
+
+
+#: How deep the too-deep response nests. Each level costs json's C decoder at least two C frames, so
+#: this many levels need far more than :data:`_SMALL_STACK` bytes on any build these tests run on.
+_DEPTH = 400_000
+#: The stack the deep parse runs on. A fixed thread stack, because a main thread's stack is the
+#: platform's: 100_000 levels raised RecursionError on Windows and decoded on the Linux runner.
+_SMALL_STACK = 2 * 1024 * 1024
+
+#: A ceremony response nested past json's depth limit, under a field a real response carries.
+_TOO_DEEP = '{"id": ' + "[" * _DEPTH + "]" * _DEPTH + "}"
+
+
+def _on_a_small_stack[T](call: Callable[[], T]) -> T:
+    """Run ``call`` on a thread whose stack is :data:`_SMALL_STACK`, re-raising what it raised."""
+    result: list[T] = []
+    raised: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(call())
+        except BaseException as exc:  # handed back to the test thread, which re-raises it
+            raised.append(exc)
+
+    previous = threading.stack_size(_SMALL_STACK)
+    try:
+        worker = threading.Thread(target=_run)
+        worker.start()
+    finally:
+        threading.stack_size(previous)
+    worker.join()
+    if raised:
+        raise raised[0]
+    return result[0]
+
+
+def _refused_on_recursion(
+    excinfo: pytest.ExceptionInfo[wa.WebAuthnVerificationError], caplog: pytest.LogCaptureFixture
+) -> None:
+    """json raises RecursionError on the same stack, the refusal's cause is a RecursionError,
+    and a WARNING names its type."""
+    with pytest.raises(RecursionError):
+        _on_a_small_stack(lambda: json.loads(_TOO_DEEP))
+    assert isinstance(excinfo.value.__cause__, RecursionError), repr(excinfo.value.__cause__)
+    assert any("raw RecursionError" in r.getMessage() for r in caplog.records)
+
+
+def test_a_deeply_nested_registration_response_is_the_audited_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """verify_registration raises WebAuthnVerificationError caused by RecursionError on a too-deep
+    response (vault BACKLOG #5341)."""
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        _on_a_small_stack(
+            lambda: wa.verify_registration(
+                response_json=_TOO_DEEP, challenge=b"c" * 32, rp_id=RP, origin=ORIGIN
+            )
+        )
+    _refused_on_recursion(excinfo, caplog)
+
+
+def test_a_deeply_nested_assertion_response_is_the_audited_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """verify_assertion raises WebAuthnVerificationError caused by RecursionError on a too-deep
+    response (vault BACKLOG #5341)."""
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        _on_a_small_stack(
+            lambda: wa.verify_assertion(
+                response_json=_TOO_DEEP,
+                challenge=b"c" * 32,
+                rp_id=RP,
+                origin=ORIGIN,
+                public_key=soft.cose_public_key(),
+                current_sign_count=0,
+            )
+        )
+    _refused_on_recursion(excinfo, caplog)
+
+
+def _safetynet_jws(header: bytes, payload: bytes) -> bytes:
+    return f"{bytes_to_base64url(header)}.{bytes_to_base64url(payload)}.AA".encode()
+
+
+@pytest.mark.parametrize(
+    "att_stmt",
+    [
+        pytest.param({"ver": "1", "response": "a.b.c"}, id="response-is-text"),
+        pytest.param({"ver": "1", "response": 7}, id="response-is-a-number"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"null", b"{}")}, id="header-null"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"[]", b"{}")}, id="header-list"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"{}", b"null")}, id="payload-null"),
+        pytest.param({"ver": "1", "response": _safetynet_jws(b"1", b"{}")}, id="header-number"),
+    ],
+)
+def test_a_malformed_safetynet_statement_is_the_audited_refusal(
+    att_stmt: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    """verify_registration raises WebAuthnVerificationError caused by AttributeError on each
+    statement, and a WARNING names its type (vault BACKLOG #5341)."""
+    from webauthn.helpers import encode_cbor, parse_cbor
+
+    challenge = b"c" * 32
+    response = json.loads(SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(challenge))
+    attestation = parse_cbor(base64url_to_bytes(response["response"]["attestationObject"]))
+    attestation["fmt"] = "android-safetynet"
+    attestation["attStmt"] = att_stmt
+    response["response"]["attestationObject"] = bytes_to_base64url(encode_cbor(attestation))
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        wa.verify_registration(
+            response_json=json.dumps(response), challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    assert isinstance(excinfo.value.__cause__, AttributeError), repr(excinfo.value.__cause__)
+    assert any("raw AttributeError" in r.getMessage() for r in caplog.records)
+
+
+#: id-ecPublicKey (1.2.840.10045.2.1), and the same arc ending in 9, which names no algorithm.
+_EC_PUBLIC_KEY_OID, _UNKNOWN_KEY_OID = "06072a8648ce3d0201", "06072a8648ce3d0209"
+#: The explicit version field reading v3, and the same field reading 5, which X.509 does not define.
+_VERSION_3, _VERSION_5 = "a003020102", "a003020105"
+#: The id-ce-keyUsage OID and the id-ce-basicConstraints OID (id-ce arcs 15 and 19), one length.
+_KEY_USAGE_OID, _BASIC_CONSTRAINTS_OID = "0603551d0f", "0603551d13"
+#: A subjectAltName GeneralName: a directoryName holding an empty Name, and the same bytes tagged
+#: x400Address and ediPartyName, two forms cryptography does not support.
+_DIRECTORY_NAME, _X400_ADDRESS, _EDI_PARTY_NAME = "a4023000", "a3023000", "a5023000"
+
+
+def _attestation_cert(*, san: bool = False) -> tuple[bytes, Any]:
+    """A self-signed P-256 leaf in DER with an empty subject, BasicConstraints then KeyUsage, and
+    its private key. With ``san`` it also carries a subjectAltName holding one empty
+    directoryName."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "t")]))
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(start)
+        .not_valid_after(start + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, False, False, False, False),
+            critical=False,
+        )
+    )
+    if san:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DirectoryName(x509.Name([]))]), critical=True
+        )
+    cert = builder.sign(key, hashes.SHA256())
+    return cert.public_bytes(Encoding.DER), key
+
+
+def _patched(der: bytes, old: str, new: str) -> bytes:
+    """``der`` with its one occurrence of the hex bytes ``old`` replaced by ``new``."""
+    assert der.count(bytes.fromhex(old)) == 1
+    return der.replace(bytes.fromhex(old), bytes.fromhex(new))
+
+
+def _attested_registration(
+    fmt: str, patch: tuple[str, str] | None, *, san: bool = False
+) -> tuple[str, bytes]:
+    """A registration response re-labelled ``fmt``, its statement carrying a leaf certificate
+    patched by ``patch`` (``None`` leaves it intact), and its challenge. ``san`` is passed to
+    :func:`_attestation_cert`."""
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from webauthn.helpers import decode_credential_public_key, encode_cbor, parse_cbor
+    from webauthn.helpers.decode_credential_public_key import DecodedEC2PublicKey
+
+    challenge = b"c" * 32
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    response = json.loads(soft.create_response(challenge))
+    attestation = parse_cbor(base64url_to_bytes(response["response"]["attestationObject"]))
+    der, key = _attestation_cert(san=san)
+    leaf = der if patch is None else _patched(der, *patch)
+    if fmt == "packed":
+        statement: dict[str, Any] = {"alg": -7, "sig": b"\x30\x00", "x5c": [leaf]}
+    else:
+        point = decode_credential_public_key(soft.cose_public_key())
+        assert isinstance(point, DecodedEC2PublicKey)
+        # TPM_ALG_ECC, nameAlg SHA-256, no attributes or policy, NULL scheme on NIST P-256.
+        pub_area = bytes.fromhex("0023000b00000000000000100010000300100020") + point.x
+        pub_area += b"\x00\x20" + point.y
+        client_data = base64url_to_bytes(response["response"]["clientDataJSON"])
+        extra = hashlib.sha256(
+            attestation["authData"] + hashlib.sha256(client_data).digest()
+        ).digest()
+        name = b"\x00\x0b" + hashlib.sha256(pub_area).digest()
+        cert_info = (
+            bytes.fromhex("ff544347801700000020")  # magic, ATTEST_CERTIFY, no signer
+            + extra
+            + bytes(17 + 8)  # clock info and firmware version
+            + len(name).to_bytes(2, "big")
+            + name
+            + b"\x00\x00"  # no qualified name
+        )
+        statement = {
+            "ver": "2.0",
+            "alg": -7,
+            "x5c": [leaf],
+            "sig": key.sign(cert_info, ec.ECDSA(hashes.SHA256())),
+            "certInfo": cert_info,
+            "pubArea": pub_area,
+        }
+    attestation["fmt"] = fmt
+    attestation["attStmt"] = statement
+    response["response"]["attestationObject"] = bytes_to_base64url(encode_cbor(attestation))
+    return json.dumps(response), challenge
+
+
+@pytest.mark.parametrize(
+    ("fmt", "patch", "raised"),
+    [
+        pytest.param(
+            "packed",
+            (_EC_PUBLIC_KEY_OID, _UNKNOWN_KEY_OID),
+            "UnsupportedAlgorithm",
+            id="packed-unknown-key-algorithm",
+        ),
+        pytest.param("packed", (_VERSION_3, _VERSION_5), "InvalidVersion", id="packed-version"),
+        pytest.param("tpm", (_VERSION_3, _VERSION_5), "InvalidVersion", id="tpm-version"),
+        pytest.param(
+            "tpm",
+            (_KEY_USAGE_OID, _BASIC_CONSTRAINTS_OID),
+            "DuplicateExtension",
+            id="tpm-duplicate-extension",
+        ),
+        pytest.param(
+            "tpm",
+            (_DIRECTORY_NAME, _X400_ADDRESS),
+            "UnsupportedGeneralNameType",
+            id="tpm-san-x400-address",
+        ),
+        pytest.param(
+            "tpm",
+            (_DIRECTORY_NAME, _EDI_PARTY_NAME),
+            "UnsupportedGeneralNameType",
+            id="tpm-san-edi-party-name",
+        ),
+    ],
+)
+def test_a_malformed_attestation_certificate_is_the_audited_refusal(
+    fmt: str, patch: tuple[str, str], raised: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """verify_registration raises WebAuthnVerificationError caused by the listed exception on
+    each patched leaf, and a WARNING names its type (vault BACKLOG #5341)."""
+    san = patch[0] == _DIRECTORY_NAME
+    response_json, challenge = _attested_registration(fmt, patch, san=san)
+    with (
+        caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
+        pytest.raises(wa.WebAuthnVerificationError) as excinfo,
+    ):
+        wa.verify_registration(
+            response_json=response_json, challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    assert type(excinfo.value.__cause__).__name__ == raised, repr(excinfo.value.__cause__)
+    assert any(f"raw {raised}" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "san", "refusal"),
+    [
+        pytest.param(
+            "packed", False, "Could not verify attestation statement signature", id="packed"
+        ),
+        pytest.param("tpm", False, "subjectAltName", id="tpm"),
+        pytest.param("tpm", True, "Subject Alt Name was invalid", id="tpm-san"),
+    ],
+)
+def test_an_intact_attestation_certificate_is_parsed_past_where_the_patched_ones_fail(
+    fmt: str, san: bool, refusal: str
+) -> None:
+    """With the leaf intact, verify_registration raises WebAuthnVerificationError with the listed
+    message, caused by InvalidRegistrationResponse."""
+    response_json, challenge = _attested_registration(fmt, None, san=san)
+    with pytest.raises(wa.WebAuthnVerificationError, match=refusal) as excinfo:
+        wa.verify_registration(
+            response_json=response_json, challenge=challenge, rp_id=RP, origin=ORIGIN
+        )
+    from webauthn.helpers.exceptions import InvalidRegistrationResponse
+
+    assert isinstance(excinfo.value.__cause__, InvalidRegistrationResponse)

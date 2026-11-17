@@ -203,7 +203,7 @@ def test_the_client_surfaces_the_offer_on_both_calls() -> None:
     )
     try:
         assert client.confirm_mfa("123456") == MfaConfirmed(
-            recovery_codes=("c1",), other_sessions=2
+            recovery_codes=("c1",), other_sessions=2, token_adopted=True
         )
         assert client.disable_mfa().other_sessions == 3
     finally:

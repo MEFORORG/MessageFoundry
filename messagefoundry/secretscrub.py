@@ -2125,12 +2125,16 @@ def has_credential_like_segment(text: str) -> bool:
     """Whether any ``name=value`` segment of ``text``, split at every ``?``, ``&``, ``#`` and ``;``,
     has a name that looks like a credential, by the same name test as :func:`credential_query_params`.
 
-    A deliberately coarser reading than the detector's, for a display rule that must fail closed:
-    it also reads a fragment, a second ``?``, a ``;``-split segment and the first segment of a value
-    with no separator at all (``token=...``). The detector, which feeds the construction warning,
-    ``check`` and the posture entry, is unchanged by decision and reads only the ``&``-split query
-    ``urlsplit`` finds; so a ``;`` or second-``?`` credential is withheld in the views and is NOT
-    warned about. That gap is recorded rather than closed here.
+    A deliberately coarser reading than the detector's, which must fail closed: it also reads a
+    fragment, a second ``?``, a ``;``-split segment and the first segment of a value with no
+    separator at all (``token=...``). It is not a display rule alone. At least the settings views
+    withhold a URL on it, and the HTTP family's no-escape verify-off and off-box cleartext
+    credential refusals and the FHIR destination's ``conditional_query`` warning count on it,
+    through ``transports.rest._query_credentials_sent`` (BACKLOG #5350, #5353). Narrowing it
+    narrows those refusals. The detector, which feeds the url construction warning, ``check`` and
+    the posture entry, is unchanged by decision and reads only the ``&``-split query ``urlsplit``
+    finds; so a url ``;`` or second-``?`` credential is withheld in the views and refused on those
+    hops, but is NOT warned about on any other hop. That gap is recorded rather than closed here.
 
     A name drops tab, CR and LF BEFORE it is percent-decoded, as ``urlsplit`` drops them before
     ``parse_qsl`` decodes: ``api%5<TAB>Fkey`` decodes to ``api_key``. Linear in ``text``; it walks
