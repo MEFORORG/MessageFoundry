@@ -173,15 +173,22 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
+    TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -10787,7 +10794,8 @@ class SqlServerStore:
             try:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                await self._dead_letter_unopenable(d, stage, exc)
+                if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                    await self._set_aside_claimed([d], now)
                 continue
             items.append(
                 OutboxItem(
@@ -10817,13 +10825,51 @@ class SqlServerStore:
 
     async def _dead_letter_unopenable(
         self, d: dict[str, Any], stage: str, exc: CipherError
-    ) -> None:
+    ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+
+        A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
+        the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
+        error of a dead-letter write that fails, after a tag failure is still reported. An error in
+        the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
+        the caller does with it."""
+        if is_transient_open_failure(exc):
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
-        await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+        row = {**d, "stage": stage}
+        try:
+            await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                d["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, {**d, "stage": stage})
+            await report_queue_tag_failure(self, self._cipher, row)
+        return None
+
+    async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
+        (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
+        too, its error propagates out of the claim, and on
+        this backend only ``reset_stale_inflight`` at the next start re-pends the rows: a claim
+        here sets no lease."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
+        await self.reschedule_claimed([d["id"] for d in tail], set_aside_deadline(now))
 
     async def _open_queue_body(self, cur: Any, row: dict[str, Any], *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
@@ -10969,7 +11015,8 @@ class SqlServerStore:
         try:
             payload = self._open_claimed(d, stage)
         except CipherError as exc:
-            await self._dead_letter_unopenable(d, stage, exc)
+            if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                await self._set_aside_claimed([d], now)
             return None
         return OutboxItem(
             id=d["id"],
@@ -11033,8 +11080,9 @@ class SqlServerStore:
         directly on the candidate rows, matching the single claim's blocking exactly.
 
         Read with ``fetchall`` under the EF-6 ``_cursor`` close-before-release discipline (no-MARS), like
-        the single claim. An undecryptable row is dead-lettered and DROPPED (poison containment); the
-        surviving tail keeps its order. The outbound/delivery lane is never batched — callers pass an
+        the single claim. A row refused for its own content is dead-lettered and DROPPED (poison
+        containment); the surviving tail keeps its order. Any other open failure sets that row and
+        every later claimed row aside (BACKLOG #5735). The outbound/delivery lane is never batched — callers pass an
         ingress/routed ``stage`` (the H2 skip-and-complete that the single outbound claim runs in-txn is
         deliberately absent here; ingress/routed rows have ``destination_name`` NULL and never hit it)."""
         now = time.time() if now is None else now
@@ -11114,11 +11162,13 @@ class SqlServerStore:
         # read as created_at. The worker then iterates strictly oldest-first (it never re-sorts).
         decoded = sorted((dict(zip(columns, r)) for r in rows), key=lambda d: d["seq"])  # noqa: B905
         items: list[OutboxItem] = []
-        for d in decoded:
+        for i, d in enumerate(decoded):
             try:
                 payload = self._open_claimed(d, stage)
             except CipherError as exc:
-                await self._dead_letter_unopenable(d, stage, exc)
+                if await self._dead_letter_unopenable(d, stage, exc) is not None:
+                    await self._set_aside_claimed(decoded[i:], now)
+                    break  # set aside with the rest of the lane: never deliver past it (#5735)
                 continue
             items.append(
                 OutboxItem(
@@ -11619,42 +11669,76 @@ class SqlServerStore:
                             )
                         raise
         # Group by lane and re-sort by `seq` in memory (OUTPUT order is not guaranteed — same as the
-        # shipped batch claim), then decrypt AFTER the commit: an undecryptable row is dead-lettered
-        # and DROPPED (poison containment); the surviving tail keeps its order.
+        # shipped batch claim), then decrypt AFTER the commit: a row refused for its own content is
+        # dead-lettered and DROPPED (poison containment); the surviving tail keeps its order. Any
+        # other open failure returns the row and its lane's tail as unopened items (#5735).
         by_lane_rows: dict[str, list[dict[str, Any]]] = {}
         for d in claimed_rows:
             by_lane_rows.setdefault(d[lane_col], []).append(d)
-        by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in by_lane_rows.items():
-            items: list[OutboxItem] = []
-            for d in sorted(lane_rows, key=lambda r: r["seq"]):
-                try:
-                    payload = self._open_claimed(d, stage)
-                except CipherError as exc:
-                    await self._dead_letter_unopenable(d, stage, exc)
-                    continue
-                items.append(
-                    OutboxItem(
-                        id=d["id"],
-                        message_id=d["message_id"],
-                        channel_id=d["channel_id"],
-                        destination_name=d["destination_name"],
-                        handler_name=d["handler_name"],
-                        payload=payload,
-                        attempts=d["attempts"],
-                        stage=stage,
-                        # #134 (ADR 0082): the batch delivery body reads the head's created_at for the
-                        # deterministic BHS-7 + the coalescing deadline. The single claim was patched to
-                        # project it; the pooled multi-lane claim must too, else pooled-mode batches on
-                        # SQL Server get an empty BHS-7 and a claim-time (not ingest-time) window.
-                        created_at=d["created_at"],
-                    )
-                )
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        by_lane = await self._open_claimed_heads(by_lane_rows, stage, rearm)
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
+
+    async def _open_claimed_heads(
+        self, by_lane_rows: dict[str, list[dict[str, Any]]], stage: str, rearm: set[str]
+    ) -> dict[str, list[OutboxItem]]:
+        """Open each lane's committed ``claim_fifo_heads`` rows, oldest first (see the caller)."""
+        by_lane: dict[str, list[OutboxItem]] = {}
+        try:
+            for lane, lane_rows in by_lane_rows.items():
+                items: list[OutboxItem] = []
+                in_order = sorted(lane_rows, key=lambda r: r["seq"])
+                for i, d in enumerate(in_order):
+                    try:
+                        payload = self._open_claimed(d, stage)
+                    except CipherError as exc:
+                        fault = await self._dead_letter_unopenable(d, stage, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (BACKLOG #5735).
+                            items.extend(
+                                OutboxItem(
+                                    id=r["id"],
+                                    message_id=r["message_id"],
+                                    channel_id=r["channel_id"],
+                                    destination_name=r["destination_name"],
+                                    handler_name=r["handler_name"],
+                                    payload="",
+                                    attempts=r["attempts"],
+                                    stage=stage,
+                                    created_at=r["created_at"],
+                                    open_fault=fault,
+                                )
+                                for r in in_order[i:]
+                            )
+                            break
+                        continue
+                    items.append(
+                        OutboxItem(
+                            id=d["id"],
+                            message_id=d["message_id"],
+                            channel_id=d["channel_id"],
+                            destination_name=d["destination_name"],
+                            handler_name=d["handler_name"],
+                            payload=payload,
+                            attempts=d["attempts"],
+                            stage=stage,
+                            # #134 (ADR 0082): the batch delivery body reads the head's created_at for the
+                            # deterministic BHS-7 + the coalescing deadline. The single claim was patched to
+                            # project it; the pooled multi-lane claim must too, else pooled-mode batches on
+                            # SQL Server get an empty BHS-7 and a claim-time (not ingest-time) window.
+                            created_at=d["created_at"],
+                        )
+                    )
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except Exception:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error, a
+            # bug or any other escaping error (#5735). A cancellation is not caught, so it leaves
+            # them inflight; release_unreturned says why.
+            await release_unreturned(self, by_lane_rows.values())
+            raise
+        return by_lane
 
     async def list_fifo_lanes(
         self,

@@ -788,21 +788,18 @@ _PR_INLINE_TAG = re.compile(
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
 #: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
 _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
-#: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
-#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
-#: reading did: the rewrites above found more, and missed some main caught, three review rounds
-#: running. Do not tighten them: a change here is a change to the floor. The pass runs this module's
+#: The floor. The baseline reading is one pass of :func:`scan_pr_body` and reads every line as
+#: origin/main did before BACKLOG #5582 changed the reading: the rewrites above found more, and missed
+#: some main caught, three review rounds running. It takes the quote marker out with the pattern below,
+#: as main did, and reads links and splits sentences with :func:`_pr_base_link_sub` and
+#: :func:`_pr_base_split_spans`, which give the output of main's link and split patterns in linear
+#: time; those patterns backtrack on a long run, and tests/test_scan_forbidden.py keeps them as its
+#: oracles and pins the two functions equal to them. Do not
+#: tighten any of the three: a change to one is a change to the floor. The pass runs this module's
 #: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
 #: (_pr_loose_columns).
-_PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
 _PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
-_PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
-#: The longest line, and paragraph, the baseline reads with the patterns above. Their link and split
-#: backtrack on a long run (`[` with no `]`, whitespace with no tag after it, `<x` with no `>`), so past
-#: this the baseline runs :func:`_pr_base_link_sub` and :func:`_pr_base_split_spans` instead, which give
-#: the same output in linear time (a test checks them against the patterns). Nothing is cut.
-_PR_BASE_CAP = 2000
-#: The lookahead class of the full-stop split, as ``_PR_BASE_SENTENCE_SPLIT`` spells it.
+#: The lookahead class of main's full-stop split.
 _PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
@@ -894,8 +891,7 @@ def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> 
     read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
     (offset, line) marks so a hit can be reported at the line its identifier sits on. ``reading`` is
     one of the three readings: the baseline takes the first `>` run of a line out wherever it sits
-    and reads a link as its text, with the link pattern's linear-time equal on a long line (see
-    ``_PR_BASE_CAP``); the other two take only a leading quote marker out and read the line through
+    and reads a link as its text (see ``_PR_BASE_QUOTE``); the other two take only a leading quote marker out and read the line through
     :func:`_pr_inline`, where a line that held only inline tags is transparent. The units, their
     lines and their kinds are the same with delete_invisible or without it; only the text differs,
     with its default-ignorable characters deleted.
@@ -916,10 +912,7 @@ def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> 
         # one is not empty.
         if reading == _PR_BASE:
             unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
-            if len(unquoted) <= _PR_BASE_CAP:
-                structure = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
-            else:
-                structure = _pr_base_link_sub(unquoted)
+            structure = _pr_base_link_sub(unquoted)
         else:
             unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
             structure = _pr_inline(unquoted, reading == _PR_TARGETS).strip()
@@ -950,10 +943,12 @@ def _pr_next(stops: list[int], at: int, end: int) -> int:
 
 
 def _pr_base_link_sub(line: str) -> str:
-    r"""``_PR_BASE_MD_LINK.sub(r"\1", line)``, in linear time. Each part of the pattern stops at the first
-    character it cannot take, and backtracking cannot make a shorter run end on the character the next
-    part needs, so a match is found by lookups: the next `]` or newline, then `(`, then the next `)` or
-    whitespace, which must be `)`."""
+    r"""The output of main's link pattern substituted by ``\1`` (``_MAIN_MD_LINK`` in
+    tests/test_scan_forbidden.py), in linear time. Each part of the pattern stops at the first character it cannot take, and backtracking
+    cannot make a shorter run end on the character the next part needs, so a match is found by lookups:
+    the next `]` or newline, then `(`, then the next `)` or whitespace, which must be `)`."""
+    if "[" not in line:
+        return line
     n = len(line)
     text_ends = [i for i, c in enumerate(line) if c in "]\n"]
     target_ends = [i for i, c in enumerate(line) if c == ")" or c.isspace()]
@@ -973,7 +968,8 @@ def _pr_base_link_sub(line: str) -> str:
 
 
 def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
-    """The (start, end) of every ``_PR_BASE_SENTENCE_SPLIT`` match in ``unit``, in linear time. Each
+    """The (start, end) of every match in ``unit`` of main's split pattern (``_MAIN_SENTENCE_SPLIT`` in
+    tests/test_scan_forbidden.py), in linear time. Each
     alternative's whitespace run ends where the run does, since a shorter run leaves whitespace where
     the lookahead or the `<` must be; the tag runs to the next `>`."""
     n = len(unit)
@@ -1013,14 +1009,10 @@ def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
 
 
 def _pr_base_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
-    """:func:`_pr_sentences` with origin/main's split: the pattern itself up to ``_PR_BASE_CAP``, and
-    its linear-time equal past it."""
+    """:func:`_pr_sentences` with origin/main's split, read by :func:`_pr_base_split_spans`."""
     if is_row:
         return [(0, unit)]
-    if len(unit) <= _PR_BASE_CAP:
-        spans = [(m.start(), m.end()) for m in _PR_BASE_SENTENCE_SPLIT.finditer(unit)]
-    else:
-        spans = _pr_base_split_spans(unit)
+    spans = _pr_base_split_spans(unit)
     sentences, start = [], 0
     for begin, end in spans:
         sentences.append((start, unit[start:begin]))
@@ -1328,8 +1320,7 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
 
     Read three times, and the hits are the union (BACKLOG #5582). The baseline reads the lines as
-    origin/main did before BACKLOG #5582 (``_PR_BASE_QUOTE``, ``_PR_BASE_MD_LINK``,
-    ``_PR_BASE_SENTENCE_SPLIT``). The second reads each link as its text and each inline tag as no
+    origin/main did before BACKLOG #5582 (see ``_PR_BASE_QUOTE``). The second reads each link as its text and each inline tag as no
     edge, and the third keeps each link's target beside it, so a code path only a target names is
     seen; from the third only a map counts. Each reading builds its own units from one line model
     (:func:`_pr_lines`), so every reading keeps each line where it was and the hits merge by (line,

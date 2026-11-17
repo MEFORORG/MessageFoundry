@@ -272,3 +272,168 @@ def test_a_key_or_format_problem_is_not_a_tag_failure() -> None:
     assert not isinstance(unmarked.value, QueueTagError)
     with pytest.raises(QueueTagError):  # control: the held key, the wrong row
         open_queue_cell(sealer, {**row, "channel_id": "IB_B", "payload": sealed})
+
+
+def _raising_transit() -> tuple[Any, Any]:
+    """A real :class:`TransitCipher` over a fake hvac client whose decrypt raises what it is set."""
+    from messagefoundry.store.crypto_transit import TransitCipher  # noqa: PLC0415
+
+    class _Transit:
+        error: Exception | None = None
+
+        def decrypt_data(self, **_kw: Any) -> Any:
+            assert self.error is not None
+            raise self.error
+
+    class _Client:
+        def __init__(self, transit: _Transit) -> None:
+            self.secrets = type("S", (), {"transit": transit})()
+
+    transit = _Transit()
+    return TransitCipher(_Client(transit), "mefor-store"), transit
+
+
+def test_a_transit_outage_is_not_a_queue_tag_failure() -> None:
+    """BACKLOG #5765: Vault Transit cannot name its keys, so ``is_tag_failure`` counts every marked
+    value as held. A failure reaching or authenticating to Vault (an unreachable Vault, a timeout,
+    a 5xx, a refused token's 403) must raise the cipher's own error, never :class:`QueueTagError`,
+    so a claim does not dead-letter the row with a false ``integrity_drift`` alert. A 404 names a
+    path built from engine config, such as a missing mount, so it gives no verdict either. A 400 is a
+    verdict and still a tag failure. Control: Vault's AEAD refusal of a moved cell is still
+    one."""
+    pytest.importorskip("hvac")
+    import requests  # noqa: PLC0415
+    from hvac.exceptions import (  # type: ignore[import-untyped]  # noqa: PLC0415
+        Forbidden,
+        InternalServerError,
+        InvalidPath,
+        InvalidRequest,
+    )
+
+    from messagefoundry.store.crypto import CipherUnavailableError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import is_transient_open_failure  # noqa: PLC0415
+
+    cipher, transit = _raising_transit()
+    row = {**_row(), "payload": "mfenc:v3:vault:v1:AAAA"}
+    outages: list[Exception] = [
+        requests.exceptions.ConnectionError("connection refused"),
+        requests.exceptions.ReadTimeout("read timed out"),
+        InternalServerError("upstream"),
+        Forbidden(errors=["permission denied"]),
+        # A 404 names a path built from engine config, such as a missing mount: no verdict.
+        InvalidPath(errors=["no handler for route"]),
+    ]
+    for exc in outages:
+        transit.error = exc
+        with pytest.raises(CipherError) as refused:
+            open_queue_cell(cipher, row)
+        assert not isinstance(refused.value, QueueTagError), exc
+        assert is_transient_open_failure(refused.value), exc
+    assert is_transient_open_failure(CipherUnavailableError("down"))
+    assert not is_transient_open_failure(QueueTagError("integrity"))
+    assert not is_transient_open_failure(OSError("not a cipher error"))
+
+    # A refusal Vault did give a verdict on still counts as a tag failure: this fix narrows the
+    # control by the outage case only, and does not rest it on matching Vault's AEAD error text.
+    transit.error = InvalidRequest(errors=["ciphertext version is disallowed by policy (too old)"])
+    with pytest.raises(QueueTagError) as policy:
+        open_queue_cell(cipher, row)
+    assert not is_transient_open_failure(policy.value)
+
+    # Control: Transit's AEAD refusal of a cell moved to another row is still a tag failure.
+    transit.error = InvalidRequest(errors=["cipher: message authentication failed"])
+    with pytest.raises(QueueTagError) as moved:
+        open_queue_cell(cipher, row)
+    assert not is_transient_open_failure(moved.value)
+
+
+def test_the_reply_status_attribute_is_the_one_the_vault_client_records() -> None:
+    """BACKLOG #5765: the queue classifier reads a 5xx that hvac raises as ``UnexpectedError`` by
+    the status the store's Vault client records, under the name ``keyprovider_vault`` sets."""
+    from messagefoundry.store import keyprovider_vault, queue_tag  # noqa: PLC0415
+
+    assert queue_tag._REPLY_STATUS_ATTR == keyprovider_vault._REPLY_STATUS_ATTR
+
+
+def _caused(cause: BaseException | None, cls: type[CipherError] = CipherError) -> CipherError:
+    error = cls("Transit decrypt failed")
+    error.__cause__ = cause
+    return error
+
+
+def with_reply_status[E: BaseException](exc: E, status: int) -> E:
+    """``exc`` carrying ``status`` as the store's Vault client records it (BACKLOG #8222), under
+    the client's own attribute name, so a rename cannot leave these tests setting a dead one."""
+    from messagefoundry.store import keyprovider_vault  # noqa: PLC0415
+
+    setattr(exc, keyprovider_vault._REPLY_STATUS_ATTR, status)
+    return exc
+
+
+def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
+    """BACKLOG #5765: only a 400, a 413 or a tag check that ran and failed is a verdict on
+    the row. A recorded reply status decides first, whatever class carries it. A cause the rule
+    names nowhere keeps the verdict it had before the rule was revised."""
+    pytest.importorskip("hvac")
+    import requests  # noqa: PLC0415
+    from hvac import exceptions as hv  # type: ignore[import-untyped]  # noqa: PLC0415
+
+    from messagefoundry.store.crypto import UnauthenticatedCipherError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import is_transient_open_failure  # noqa: PLC0415
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415
+        EgressReplyError,
+        ResponseTooLargeError,
+    )
+    from messagefoundry.transports.strict_requests import VaultHopRefused  # noqa: PLC0415
+
+    no_verdict: list[BaseException] = [
+        hv.Unauthorized(),
+        hv.Forbidden(),
+        hv.RateLimitExceeded(),
+        hv.VaultDown(),
+        hv.UnexpectedError("no status recorded"),
+        with_reply_status(hv.UnexpectedError("timeout"), 408),
+        with_reply_status(TypeError("unreadable body"), 503),
+        with_reply_status(AttributeError("unreadable body"), 401),
+        with_reply_status(hv.InvalidRequest(), 503),  # the status wins over the class
+        hv.InvalidPath(),
+        with_reply_status(hv.InvalidPath(), 404),
+        requests.exceptions.SSLError("certificate verify failed"),
+        requests.exceptions.ChunkedEncodingError("connection broken"),
+        ConnectionResetError("reset by peer"),
+        # The strict Vault adapter raises these unwrapped: a hop it refused, a reply it would not
+        # read, and a reply past its byte bound.
+        VaultHopRefused("vault_transit: refused"),
+        EgressReplyError("a reply the engine cannot read strictly"),
+        ResponseTooLargeError("too large"),
+    ]
+    for cause in no_verdict:
+        assert is_transient_open_failure(_caused(cause)), cause
+    verdict: list[BaseException | None] = [
+        hv.InvalidRequest(),
+        with_reply_status(hv.UnexpectedError("too large"), 413),
+        with_reply_status(hv.Forbidden(), 400),  # the status wins over the class
+        with_reply_status(TypeError("unreadable body"), 400),
+        hv.ParamValidationError("client-side"),  # unknown here: as before the rule
+        KeyError("data"),  # a malformed reply, unknown here: as before the rule
+        None,
+    ]
+    for maybe in verdict:
+        assert not is_transient_open_failure(_caused(maybe)), maybe
+    # A tag check that ran and failed is a verdict whatever its cause says.
+    assert not is_transient_open_failure(
+        _caused(with_reply_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
+    )
+
+
+def test_an_open_fault_names_a_non_cipher_error_by_its_type_alone() -> None:
+    """BACKLOG #5735: the T17 path logs a :class:`QueueOpenFault` at ERROR, so a failed store
+    write's driver text, which can echo a value, must not ride in it. A cipher error's own text,
+    which never holds a value, is kept."""
+    from messagefoundry.store.crypto import CipherUnavailableError  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import queue_open_fault  # noqa: PLC0415
+
+    leaked = "String or binary data would be truncated. Truncated value: 'DOE^JANE'"
+    assert str(queue_open_fault(OSError(leaked))) == "OSError"
+    assert str(queue_open_fault(RuntimeError(leaked))) == "RuntimeError"
+    assert str(queue_open_fault(CipherUnavailableError("down"))) == "CipherUnavailableError: down"
