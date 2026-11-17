@@ -352,22 +352,9 @@ def _attempts(readings: list[float]) -> str:
     return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
 
 
-@pytest.fixture
-def junit_reading(request: pytest.FixtureRequest) -> Callable[[str, object], None]:
-    """Record a named reading in this test's junit properties.
-
-    What pytest's ``record_property`` does, without its warning that ``<properties>`` inside a
-    ``<testcase>`` is outside the xunit2 schema, the default family. pytest writes them there all
-    the same, and the repository's junit readers parse with ElementTree, which does not validate."""
-
-    def record(name: str, value: object) -> None:
-        request.node.user_properties.append((name, value))
-
-    return record
-
-
-def _cpu_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
-    """The control's two inputs timed again on the calling thread's CPU clock, for the record only
+def _cpu_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: int) -> float:
+    """The inputs :func:`_scaling_ratios` builds from ``make`` and ``k``, timed again on the calling
+    thread's CPU clock, for the record only
     (BACKLOG #3452, step 1). Nothing asserts on it.
 
     It tells the two causes of a low wall reading apart, on the runner where the reading was taken.
@@ -375,6 +362,7 @@ def _cpu_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
     beside a CPU reading well over it says the runner took the time. Both under it says the work
     itself scaled less than its square, so a larger ``k`` or another subject is the answer, not a
     better clock. The calls interleave, as :func:`interleaved_thread_cpu` says why."""
+    small, large = make(k), make(4 * k)
     was_enabled = gc.isenabled()
     gc.disable()
     try:
@@ -403,8 +391,11 @@ def test_a_pathological_dn_is_judged_in_linear_time(
     )
 
 
+# record_property warns that <properties> inside a <testcase> is outside the xunit2 schema, the
+# default family. pytest writes them there all the same, which is where the readings are wanted.
+@pytest.mark.filterwarnings("ignore:record_property is incompatible:pytest.PytestWarning")
 def test_the_linear_time_check_fails_a_quadratic_parser(
-    junit_reading: Callable[[str, object], None],
+    record_property: Callable[[str, object], None],
 ) -> None:
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
     It asserts exactly the negation of the linear test's pass condition.
@@ -413,23 +404,23 @@ def test_the_linear_time_check_fails_a_quadratic_parser(
     start at each separator. Its work grows with the square of the length. It runs at ``k`` =
     2,000; :func:`_scaling_ratios` says why the size went up (BACKLOG #3452).
 
-    THE CAUSE OF A LOW READING IS MEASURED HERE, ON EVERY RUN, PASS OR FAIL (BACKLOG #3452, step
-    1). The wall readings and :func:`_cpu_ratio`'s reading go into the failure message and, as
-    ``wall_ratios`` and ``cpu_ratio``, into this test's properties in the junit file. ci.yml writes
-    that file on the engine ``test`` legs and uploads it on every run, pass or fail, as the
-    ``junit-test-shard-*`` artifacts. A passing run is recorded too, because a sample taken only on
-    a red is selected on the outcome and cannot say how often the control reads low."""
+    THE CAUSE OF A LOW READING IS MEASURED HERE, ON EVERY RUN THAT REACHES IT, PASS OR FAIL
+    (BACKLOG #3452, step 1). The wall readings and :func:`_cpu_ratio`'s reading go into the
+    failure message and, as ``wall_ratios`` and ``cpu_ratio``, into this test's junit properties.
+    ci.yml writes that file on the engine ``test`` legs and uploads it on every run, pass or fail,
+    as the ``junit-test-shard-*`` artifacts. A passing run is recorded too, because a sample taken
+    only on a red is selected on the outcome and cannot say how often the control reads low."""
 
     def quadratic(text: str) -> None:
         for end in range(100, len(text) + 1, 100):
             canonical_group_dn(text[:end])
 
-    make = _PATHOLOGICAL_DNS["many-rdns"][0]
-    small, large = make(2_000), make(4 * 2_000)
-    readings = _scaling_ratios(quadratic, make, 2_000)
-    cpu = _cpu_ratio(quadratic, small, large)
-    junit_reading("wall_ratios", ",".join(f"{reading:.3f}" for reading in readings))
-    junit_reading("cpu_ratio", f"{cpu:.3f}")
+    make, k = _PATHOLOGICAL_DNS["many-rdns"][0], 2_000
+    readings = _scaling_ratios(quadratic, make, k)
+    # Recorded before the CPU reading, so a failure inside that reading keeps the wall record.
+    record_property("wall_ratios", ",".join(f"{reading:.3f}" for reading in readings))
+    cpu = _cpu_ratio(quadratic, make, k)
+    record_property("cpu_ratio", f"{cpu:.3f}")
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
         f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)}; "
@@ -449,7 +440,7 @@ def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...])
         return taken[-1]
 
     monkeypatch.setitem(globals(), "_attempt_ratio", read)
-    monkeypatch.setitem(globals(), "_cpu_ratio", lambda judge, small, large: 15.0)
+    monkeypatch.setitem(globals(), "_cpu_ratio", lambda judge, make, k: 15.0)
     return taken
 
 
