@@ -213,6 +213,91 @@ def test_trim_field() -> None:
     assert m["PID-4.1"] == "X42"
 
 
+MSH_ONLY = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101120000||ADT^A01|MSG1|P|2.5.1\r"
+
+
+def test_copy_field_decodes_a_whole_field_into_a_component() -> None:
+    # BACKLOG #5821. A whole field's read is raw text; a component write escapes it again, so the
+    # destination read back the escape sequence. NEGATIVE CONTROL: on the unfixed code NK1-2.1 read
+    # back "O\S\Brien".
+    m = Message.parse(MSH_ONLY + "PID|1||1||O\\S\\Brien\rNK1|1|X^Y\r")
+    copy_field(m, "PID-5", "NK1-2.1")
+    assert m["NK1-2.1"] == "O^Brien"
+    assert m["NK1-2"] == "O\\S\\Brien^Y"
+    copy_field(m, "PID-5", "NK1-2.2.1")
+    assert m["NK1-2.2"] == "O^Brien"
+    # A whole-field destination still takes the raw text as it is.
+    copy_field(m, "PID-5", "NK1-3")
+    assert m["NK1-3"] == "O\\S\\Brien"
+
+
+def test_split_field_decodes_each_whole_field_piece_into_a_component() -> None:
+    # BACKLOG #5821. NEGATIVE CONTROL: on the unfixed code NK1-2.1 read back "O\S\Brien".
+    m = Message.parse(MSH_ONLY + "PID|1||1||O\\S\\Brien^John\rNK1|1|X^Y\r")
+    split_field(m, "PID-5", "^", ["NK1-2.1", "NK1-2.2", "NK1-3"])
+    assert m["NK1-2.1"] == "O^Brien"
+    assert m["NK1-2.2"] == "John"
+    assert m["NK1-3"] is None
+
+
+def test_trim_field_keeps_escapes_on_a_component_path() -> None:
+    # BACKLOG #5928 step 3. The component was read decoded and written back, so its \.br\ became a
+    # CR that the write refused. NEGATIVE CONTROL: on the unfixed code this raised ValueError.
+    m = Message.parse(MSH_ONLY + "PID|1||1||  doe\\.br\\x\\S\\  ^jane\r")
+    trim_field(m, "PID-5.1")
+    assert m["PID-5"] == "doe\\.br\\x\\S\\^jane"
+
+
+def test_trim_field_strips_only_the_ends_of_a_structured_value() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||  doe & x ^ jane  |F\r")
+    trim_field(m, "PID-5.1")
+    assert m["PID-5"] == "doe & x^ jane  "
+    trim_field(m, "PID-5")
+    assert m["PID-5"] == "doe & x^ jane"
+
+
+def test_trim_field_strips_an_escape_that_decodes_to_whitespace_at_an_end() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||\\.fi\\ doe\\.br\\\r")
+    trim_field(m, "PID-5")
+    assert m["PID-5"] == "\\.fi\\doe"
+
+
+def test_append_to_field_keeps_escapes_on_a_component_path() -> None:
+    # BACKLOG #5928 step 3. NEGATIVE CONTROL: on the unfixed code the decoded \.br\ raised ValueError,
+    # and a component holding \S\ came back escaped twice.
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\\.br\\x^jane\r")
+    append_to_field(m, "PID-5.1", "^Z")
+    assert m["PID-5"] == "doe\\.br\\x\\S\\Z^jane"
+    assert m["PID-5.1"] == "doe\rx^Z"
+    m = Message.parse(MSH_ONLY + "PID|1||1||O\\S\\B&a\r")
+    append_to_field(m, "PID-5.1", "!")
+    assert m["PID-5"] == "O\\S\\B&a!"
+
+
+def test_append_to_field_does_not_let_an_unclosed_escape_pair_with_the_suffix() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\\\r")
+    append_to_field(m, "PID-5.1", "&x")
+    assert m["PID-5.1"] == "doe\\&x"
+
+
+def test_append_to_field_whole_field_appends_structure() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\r")
+    append_to_field(m, "PID-5", "^jane")
+    assert m["PID-5.2"] == "jane"
+
+
+def test_transforms_decode_with_the_separators_a_read_uses() -> None:
+    # BACKLOG #5928 step 2. A read decodes with the first header's encoding characters, here BHS-2;
+    # the edit used MSH-2's, whose escape character is "#", so it lower-cased the "S" of \S\.
+    # NEGATIVE CONTROL: on the unfixed code PID-5 became "doe\s\x".
+    batch = "BHS|^~\\&\r" + MSH_ONLY.replace("^~\\&", "^~#&", 1)
+    m = Message.parse(batch + "PID|1||1||DOE\\S\\X\r")
+    assert m["PID-5.1"] == "DOE^X"
+    convert_case(m, "PID-5.1", "lower")
+    assert m["PID-5"] == "doe\\S\\x"
+    assert m["PID-5.1"] == "doe^x"
+
+
 def test_trim_field_absent_is_noop() -> None:
     m = _msg()
     trim_field(m, "PID-99.1")  # absent
@@ -671,8 +756,8 @@ def test_date_diff_field_a_ts_field_with_an_empty_first_value_raises(start: str)
     ("start", "end", "unit"),
     [
         ("20260101^20260201", "20260104", "days"),  # a range, not a timestamp
-        ("20260101120000^D", "20260101180000", "hours"),  # day precision on a time of day
         ("20260101^S", "20260104", "days"),  # second precision on a date
+        ("20260101^Q", "20260104", "days"),  # not a degree-of-precision code
         ("20260101^D^X", "20260104", "days"),  # a third component
         ("20260101^^^X", "20260104", "days"),  # a fourth component, review round e99482de
         ("20260101^D^^X", "20260104", "days"),  # a fourth component after a code
@@ -684,22 +769,61 @@ def test_date_diff_field_a_whole_field_holding_more_than_one_timestamp_raises(
     start: str, end: str, unit: Literal["days", "hours"]
 ) -> None:
     # BACKLOG #5822, review round 4. Main refused each of these whole fields as unparseable; reading
-    # component 1 must not turn them into a silent number. NEGATIVE CONTROL: at 375a4aa8e the first,
-    # second and last wrote 3, 6 and 3.
+    # component 1 must not turn them into a silent number. NEGATIVE CONTROL: at 375a4aa8e the first
+    # and last wrote 3 and 3. A code coarser than its time is no longer here: it reads at that
+    # precision (test_date_diff_field_a_coarser_precision_code_reads_at_its_precision).
     m = _two_stamps(start, end)
     with pytest.raises(ValueError):
         date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
     assert m["ZTS-3"] is None
 
 
-def test_date_diff_field_a_component_path_keeps_mains_reading() -> None:
-    # Main read a component path from the first repetition: an empty one is a no-op, and a later
-    # repetition after an empty second one is not looked at. Both stay as main had them.
+def test_date_diff_field_a_component_path_with_an_empty_first_repetition_is_a_no_op() -> None:
+    # Main read a component path from the first repetition, so an empty one is a no-op.
     m = _two_stamps("~20270101", "20260104")
     date_diff_field(m, "ZTS-1.1", "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] is None
-    m = _two_stamps("20260101~~20270101", "20260104")
-    date_diff_field(m, "ZTS-1.1", "ZTS-2", "ZTS-3", unit="days")
+
+
+@pytest.mark.parametrize("start", ["20260101~~20270101", "20260101~"])
+@pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
+def test_date_diff_field_any_second_repetition_raises_on_either_path(start: str, path: str) -> None:
+    # BACKLOG #5822 added item 2. A component path refused "a~b" but read "a~~b" as "a", since its
+    # second repetition is empty. NEGATIVE CONTROL: on the unfixed code the component path wrote 3
+    # for both values.
+    m = _two_stamps(start, "20260104")
+    with pytest.raises(ValueError, match="repeats"):
+        date_diff_field(m, path, "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "unit", "expected"),
+    [
+        ("198807051200^D", "19890705", "days", "365"),  # the noon is dropped, not counted
+        ("198807052359^D", "198807060001", "hours", "24"),  # read as midnight on its date
+        ("198807052359^H", "198807060001", "minutes", "61"),  # read as 23:00
+        ("19880705^L", "19880801", "days", "31"),  # read as 1 July
+        ("19880705^Y", "19890101", "years", "1"),  # read as 1 January
+    ],
+)
+def test_date_diff_field_a_coarser_precision_code_reads_at_its_precision(
+    start: str, end: str, unit: Literal["days", "years", "hours", "minutes"], expected: str
+) -> None:
+    # BACKLOG #5822 added item 1. HL7 v2.3's TS gives the time's degree of precision in component
+    # 2, and a code coarser than the digits sent says which digits hold. NEGATIVE CONTROL: on the
+    # unfixed code each of these raised ValueError.
+    m = _two_stamps(start, end)
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
+    assert m["ZTS-3"] == expected
+
+
+@pytest.mark.parametrize("start", ["20260101^", "20260101^D^", "20260101^D^^"])
+def test_date_diff_field_ignores_trailing_empty_components(start: str) -> None:
+    # BACKLOG #5822 added item 3. A trailing empty component holds nothing. NEGATIVE CONTROL: on the
+    # unfixed code each of these raised ValueError.
+    m = _two_stamps(start, "20260104")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] == "3"
 
 
