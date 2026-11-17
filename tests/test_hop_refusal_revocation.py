@@ -231,6 +231,8 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "crl_checked",
         # Descriptive only: the record's wording reads it, no disposition does (vault BACKLOG #5086).
         "expiry_relaxed",
+        # Descriptive only too: a context without CERT_REQUIRED (vault BACKLOG #4912).
+        "unverified",
         "ways_across",
         "attested_reason",
         "connection",

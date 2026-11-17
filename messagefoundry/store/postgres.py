@@ -2014,11 +2014,13 @@ def _refuse_store_revocation(
     reviewer can check one named hop against that hop's PKI, and a claim the operator can set without
     naming what was reviewed is the blanket env wearing a different key.
 
-    ``context`` is a real :class:`ssl.SSLContext`, so :func:`context_checks_revocation` reads
-    ``VERIFY_CRL_CHECK_LEAF`` off an object rather than off the presence of a setting. ``_build_ssl``
+    ``context`` is a real :class:`ssl.SSLContext`, so ``capture`` reads it through
+    :func:`~messagefoundry.config.tls_policy.crl_credited`, off an object rather than off the
+    presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
-    :func:`_verifying_context` with the same settings, and that builder either sets the flag or
+    :func:`_verifying_context` with the same settings, and that builder either sets
+    ``VERIFY_CRL_CHECK_LEAF`` or
     raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
