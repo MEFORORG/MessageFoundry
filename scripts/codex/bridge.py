@@ -272,7 +272,7 @@ def group_selected(group: dict, discriminator: set[str] | None) -> bool:
 
 
 def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> int:
-    """Decide one Codex hook event: 0 to proceed or 2 to block, never anything else.
+    """Decide one Codex hook event: 0 to proceed, 2 to block, or 1 for a reported SessionEnd failure.
 
     With no stdin given, the payload is read from this process's stdin as UTF-8 bytes; the text
     stream would decode it with the console code page. `event` is the event Codex registered.
@@ -302,6 +302,10 @@ def run_hook(root: Path, stdin: bytes | str | None = None, event: str = "") -> i
         merge_output(result, {"systemMessage": message})
     if result:
         print(json.dumps(result))
+    # Codex reads no SessionEnd output, so a reported failure there exits non-zero, as on main.
+    reported = str(result.get("systemMessage", "")).splitlines()
+    if event.lower() == "sessionend" and any(m.endswith("(not blocking)") for m in reported):
+        return 1
     return 0
 
 
@@ -352,6 +356,8 @@ def run_one_hook(root: Path, payload: dict, env: dict[str, str], hook: dict, res
         update = None
     if not isinstance(update, dict):
         if event not in PLAIN_CONTEXT_EVENTS:
+            if update is not None:  # JSON that is not an object is a hook defect, as on main.
+                raise ValueError("Hook JSON output must be an object")
             print(output, file=sys.stderr)
             return
         output = output.replace(
@@ -456,7 +462,7 @@ def main() -> int:
         hook_parser = argparse.ArgumentParser(prog="bridge.py hook", allow_abbrev=False)
         hook_parser.add_argument("--event", default="", help="the event Codex registered")
         event = hook_parser.parse_args(rest).event
-        return BLOCK_EXIT if run_hook(ROOT, None, event) == 2 else 0
+        return {2: BLOCK_EXIT, 1: 1}.get(run_hook(ROOT, None, event), 0)
     if args.mode == "doctor":
         config = json.loads((ROOT / ".claude/settings.json").read_text(encoding="utf-8-sig"))
         for event in config.get("hooks", {}):

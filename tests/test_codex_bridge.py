@@ -279,10 +279,15 @@ def test_plain_or_non_object_prompt_hook_output_becomes_context(bridge, tmp_path
     assert result["hookSpecificOutput"]["additionalContext"] == stdout
 
 
-def test_non_object_json_on_a_tool_event_is_not_a_block(bridge, tmp_path, capsys):
-    settings(tmp_path, [handler("3")])
-    assert bridge.dispatch(tmp_path, BASH_CALL) == {}
-    assert "3" in capsys.readouterr().err
+@pytest.mark.parametrize("stdout", ["3", "[1]", '"s"', "true"])
+def test_non_object_json_on_a_tool_event_is_a_reported_hook_defect(bridge, tmp_path, stdout):
+    """As on main: JSON that is not an object is an error, and blocks only under onFailure."""
+    settings(tmp_path, [handler(stdout)])
+    result = bridge.dispatch(tmp_path, BASH_CALL)
+    assert "Hook JSON output must be an object" in result["systemMessage"], result
+    settings(tmp_path, [{**handler(stdout), "onFailure": "block"}])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, BASH_CALL)
 
 
 def test_a_command_only_hook_defaults_to_pwsh_on_windows_else_bash(bridge, tmp_path, monkeypatch):
@@ -879,6 +884,28 @@ def test_hook_mode_exits_the_block_code_only_for_a_decision(bridge, tmp_path, mo
     with pytest.raises(SystemExit) as stopped:
         _main(bridge, monkeypatch, tmp_path, ["hook", "--evnt", "Stop"], b"{}")
     assert stopped.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("hooks", "expected"),
+    [
+        ([exits(1)], 1),
+        ([handler("[1]")], 1),
+        ("not a list", 1),
+        (None, 1),
+        ([handler("{}")], 0),
+    ],
+    ids=["failing-hook", "non-object-json", "defective-group", "fault", "clean"],
+)
+def test_a_session_end_failure_exits_non_zero(bridge, tmp_path, monkeypatch, hooks, expected):
+    """Codex reads no SessionEnd output, so a reported failure exits non-zero, as on main."""
+    (tmp_path / ".claude").mkdir()
+    group = [{"matcher": "", "hooks": hooks}] if isinstance(hooks, list) else hooks
+    text = "{not json" if hooks is None else json.dumps({"hooks": {"SessionEnd": group}})
+    (tmp_path / ".claude/settings.json").write_text(text)
+    payload = json.dumps({"session_id": "x", "hook_event_name": "SessionEnd", "reason": "exit"})
+    argv = ["hook", "--event", "SessionEnd"]
+    assert _main(bridge, monkeypatch, tmp_path, argv, payload.encode()) == expected
 
 
 def test_run_mode_leaves_a_target_scripts_own_event_flag(bridge, monkeypatch):
