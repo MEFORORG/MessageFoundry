@@ -577,11 +577,30 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     is not merged, so the static value crossed too, as a second header a peer may read as
     ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
     REST, FHIR and DICOMweb header builders do not purge. A signing header named ``Authorization``
-    is not in this table: ``_post`` writes it per request, and it is refused only beside Digest."""
+    is not in this table: ``_post`` writes it per request, after the configured or minted
+    credential, which it can replace or sit beside. It is refused only beside Digest."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
         del headers[key]
+
+
+def _settings_as_sent(s: dict[str, Any]) -> dict[str, Any]:
+    """``s`` as the cleartext and verify-off refusals read it (BACKLOG #5526): beside OAuth2 or
+    SMART, ``_build_headers`` drops every static ``Authorization`` header, so this view drops it
+    too and the refusal does not name it as sent. The minted bearer is still named. Beside a
+    configured ``bearer_token`` or Basic pair the view is unchanged."""
+    from messagefoundry.transports.http_auth import (
+        is_authorization_header_name,
+        oauth2_auth_configured,
+    )
+    from messagefoundry.transports.smart import smart_auth_configured
+
+    static = s.get("headers")
+    if not isinstance(static, dict) or not (oauth2_auth_configured(s) or smart_auth_configured(s)):
+        return s
+    kept = {k: v for k, v in static.items() if not is_authorization_header_name(str(k))}
+    return {**s, "headers": kept}
 
 
 def _iso(t: float) -> str:
@@ -699,7 +718,7 @@ class SoapDestination(DestinationConnector):
             self.url,
             credentials=http_credentials_sent(
                 ConnectorType.SOAP,
-                s,
+                _settings_as_sent(s),
                 cleartext=True,
                 proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.url),
             ),
@@ -767,7 +786,7 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 connector="SOAP destination",
                 connection=config.name,
-                credentials=http_credentials_sent(ConnectorType.SOAP, s),
+                credentials=http_credentials_sent(ConnectorType.SOAP, _settings_as_sent(s)),
                 attested=attested,
             )
             if guard is not None:
@@ -777,14 +796,14 @@ class SoapDestination(DestinationConnector):
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener(*proxy_handlers)
-        # #65: opt-in generic HTTP auth on the SOAP transport (independent of WS-Security, which secures
-        # the SOAP *message*; this secures the HTTP *hop*). A bearer provider (OAuth2 client-credentials —
-        # SMART is FHIR/REST-only) injected per-request in _post, OR HTTP Digest folded into the opener.
-        # Both None (default) → byte-identical. Mutually exclusive with each other.
+        # #65: an opt-in bearer provider (OAuth2 client-credentials) for the HTTP *hop*, independent
+        # of WS-Security, which secures the SOAP *message*. Minted in _post and _probe. Built after
+        # the gates above, so a build one of them refuses never builds it.
         from messagefoundry.transports.http_auth import (
             bearer_provider_from_settings,
-            digest_handler_from_settings,
+            oauth2_auth_configured,
         )
+        from messagefoundry.transports.smart import smart_auth_configured
 
         # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
         # #1660: and the instance [tls] trust-anchor policy, resolved for the TOKEN host, so the hop
@@ -792,6 +811,15 @@ class SoapDestination(DestinationConnector):
         self._token_provider = bearer_provider_from_settings(
             s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
         )
+        # BACKLOG #5526: _build_headers dropped every static credential on these predicates. A
+        # provider missing where they hold would send no credential, so refuse that build.
+        if (self._token_provider is not None) != (
+            oauth2_auth_configured(s) or smart_auth_configured(s)
+        ):
+            raise HttpAuthError(
+                f"{hop_name_prefix(self._connection_name)}SOAP destination bearer auth settings "
+                "and the token provider built from them disagree"
+            )
         if self._token_provider is not None:
             refuse_cleartext_credentials(
                 scheme,
@@ -800,6 +828,9 @@ class SoapDestination(DestinationConnector):
                 credentials=(),
                 connection=config.name,
             )
+        # #65: or HTTP Digest folded into the opener. None (default) -> byte-identical.
+        from messagefoundry.transports.http_auth import digest_handler_from_settings
+
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
             # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
@@ -1003,7 +1034,12 @@ class SoapDestination(DestinationConnector):
             )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
-        """SOAP Content-Type (+ SOAPAction for 1.1) + static ``headers`` + optional bearer/basic auth."""
+        """SOAP Content-Type (+ SOAPAction for 1.1) + static ``headers`` + optional bearer/basic auth.
+
+        At least the construction length gate and the cleartext refusal read this table. The
+        cleartext and verify-off refusals also read the settings through the filtered
+        :func:`_settings_as_sent` view (``http_credentials_sent``).
+        A signing header is not in it (see :func:`_drop_authorization`)."""
         action = str(s.get("soap_action") or "")
         headers: dict[str, str] = {}
         if self.version == "1.2":
@@ -1017,6 +1053,17 @@ class SoapDestination(DestinationConnector):
         extra = s.get("headers") or {}
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
+        from messagefoundry.transports.http_auth import oauth2_auth_configured
+        from messagefoundry.transports.smart import smart_auth_configured
+
+        # Read from the settings, because the provider is built later, after the data-hop gates.
+        # bearer_provider_from_settings builds one exactly when one of these predicates holds.
+        if oauth2_auth_configured(s) or smart_auth_configured(s):
+            # A minted bearer owns the header: _post and _probe write it per request (#5526). Neither
+            # a static `headers` Authorization nor a configured bearer_token or Basic pair is kept in
+            # this table, since none of them is sent, so the construction length gate judges none.
+            _drop_authorization(headers)
+            return headers
         token = s.get("bearer_token")
         user, password = s.get("basic_user"), s.get("basic_password")
         auth: str | None = None
@@ -1024,19 +1071,8 @@ class SoapDestination(DestinationConnector):
             auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         elif token:
             auth = f"Bearer {token}"
-        from messagefoundry.transports.http_auth import oauth2_auth_configured
-        from messagefoundry.transports.smart import smart_auth_configured
-
-        # A minted bearer owns the header too: _post and _probe write it per request (#5526). A static
-        # `headers` Authorization is purged here, before the length gate judges this table, so the
-        # gate does not refuse that header, which is never sent. One case the purge does not cover:
-        # with OAuth2 or SMART configured, a configured bearer_token or Basic pair is still written
-        # back below and judged by the length gate, although the minted bearer replaces it on every
-        # request, so an over-long bearer_token beside OAuth2 is refused at construction.
-        # The cleartext and verify-off refusals read the settings (http_credentials_sent), not this.
-        if auth is not None or oauth2_auth_configured(s) or smart_auth_configured(s):
-            _drop_authorization(headers)
         if auth is not None:
+            _drop_authorization(headers)
             headers["Authorization"] = auth
         return headers
 
@@ -1127,37 +1163,16 @@ class SoapDestination(DestinationConnector):
         # credentials would be rejected — surface that as a failure. Connection/DNS/TLS/timeout fails.
         # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
         assert_probe_hop(self._hop_guard, self.url, connector="SOAP")
-        headers = self._headers
-        if self._token_provider is not None:
-            # BACKLOG #5526: the probe presents the credential a send presents. Construction purges a
-            # static `headers` Authorization once a provider exists, but keeps a configured
-            # bearer_token or Basic pair, so a probe that did not mint would carry either no
-            # credential or that static one, never the minted bearer a send presents. A
-            # token-endpoint failure raises DeliveryError.
-            headers = {
-                **self._headers,
-                "Authorization": f"Bearer {self._token_provider.access_token()}",
-            }
+        # BACKLOG #5526: mint as a send does; a token-endpoint failure raises DeliveryError.
+        headers = self._send_headers()
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url, headers=headers, method="HEAD"
         )
         # ASVS 4.2.5: the minted bearer is the one value the construction gate could not see; the URL
         # and the static headers were bounded there. As in the REST and FHIR probes.
-        try:
-            enforce_send_time_length_limits(
-                req.full_url,
-                headers,
-                connector=f"SOAP {_redact_url(self.url)} probe",
-                minted_credential_names=(
-                    frozenset({"Authorization"})
-                    if self._token_provider is not None
-                    else frozenset()
-                ),
-            )
-        except NegativeAckError as exc:
-            if exc.credential_fault and self._token_provider is not None:
-                self._token_provider.invalidate()
-            raise
+        self._bound_sent_headers(
+            req.full_url, headers, connector=f"SOAP {_redact_url(self.url)} probe"
+        )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
@@ -1188,6 +1203,35 @@ class SoapDestination(DestinationConnector):
             raise DeliveryError(
                 f"SOAP {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
             ) from exc
+
+    def _send_headers(self) -> dict[str, str]:
+        """A fresh copy of the header table, with the provider's bearer as ``Authorization`` when
+        one is configured. The one mint ``_post`` and ``_probe`` share."""
+        headers = dict(self._headers)
+        if self._token_provider is not None:
+            headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
+        return headers
+
+    def _bound_sent_headers(
+        self, full_url: str, headers: dict[str, str], *, connector: str
+    ) -> None:
+        """The send-time length gate ``_post`` and ``_probe`` share. A refused minted bearer is
+        invalidated, so the next attempt mints afresh."""
+        try:
+            enforce_send_time_length_limits(
+                full_url,
+                headers,
+                connector=connector,
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
 
     def _post_and_classify(
         self, payload: str
@@ -1261,17 +1305,13 @@ class SoapDestination(DestinationConnector):
         # payload is the FINAL wire body (in WS-* mode _post_and_classify already wrapped + stamped it),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
-        headers = self._headers
-        if self._token_provider is not None or self._signer is not None:
-            headers = dict(self._headers)
-            if self._token_provider is not None:
-                # #65: a fresh OAuth2-CC bearer per request, acquired off-loop past the queue boundary (a
-                # retry re-mints — re-run purity holds). Overrides any static bearer_token.
-                headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
-            if self._signer is not None:
-                # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
-                # boundary so a retry re-mints it (re-run purity holds, like the WS-Security nonce).
-                headers.update(self._signer.signature_headers(data))
+        # #65: a fresh OAuth2-CC bearer per request, acquired off-loop past the queue boundary (a
+        # retry re-mints — re-run purity holds).
+        headers = self._send_headers()
+        if self._signer is not None:
+            # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
+            # boundary so a retry re-mints it (re-run purity holds, like the WS-Security nonce).
+            headers.update(self._signer.signature_headers(data))
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
             data=data,
@@ -1281,21 +1321,7 @@ class SoapDestination(DestinationConnector):
         # ASVS 4.2.5: bound what actually ships. SOAP has no message-derived header class (see send()
         # -- metadata is documented as unused here), so the only values added after the construction
         # gate are the minted bearer and the JWS headers.
-        try:
-            enforce_send_time_length_limits(
-                req.full_url,
-                headers,
-                connector=f"SOAP {_redact_url(self.url)}",
-                minted_credential_names=(
-                    frozenset({"Authorization"})
-                    if self._token_provider is not None
-                    else frozenset()
-                ),
-            )
-        except NegativeAckError as exc:
-            if exc.credential_fault and self._token_provider is not None:
-                self._token_provider.invalidate()
-            raise
+        self._bound_sent_headers(req.full_url, headers, connector=f"SOAP {_redact_url(self.url)}")
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # BACKLOG #5798: a 2xx ends a WS-Security 401 run. First, so a 2xx whose read below
