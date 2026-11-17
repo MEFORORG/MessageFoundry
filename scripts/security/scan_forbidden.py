@@ -1609,6 +1609,13 @@ TOKENS_PRESENT: bool = False
 #: real scan from a vacuous one, so a floor built on it would have inherited the same blindness.
 _SITE_PREFIXES: tuple[str, ...] = ()
 
+#: The width of a site prefix the anonymizer loads (``messagefoundry_toolkit/anon/surrogates.py``
+#: ``_load_site_prefixes``: a two-digit prefix plus four digits). A loaded prefix of another width
+#: still arms this scan, but the anonymizer drops it, so its site-code scrub and leak check match
+#: nothing for it while this gate counts it live. :func:`token_floor_failure` refuses such a source
+#: (BACKLOG #5366). ``tests/test_scan_forbidden_site_prefix_width.py`` holds the two widths together.
+_SITE_PREFIX_WIDTH = 2
+
 
 def _resolve_token_text() -> str | None:
     """The active token content, or ``None`` if no source is configured.
@@ -1806,6 +1813,15 @@ def _parse_tokens(
             # would compile into the site-code alternation and never match an ASCII site code.
             if line.isdigit() and line.isascii():
                 prefixes.append(line)
+                if len(line) != _SITE_PREFIX_WIDTH:
+                    # Kept, so this scan loses no detector, and named: the anonymizer drops it
+                    # (BACKLOG #5366). Position only, as below -- a site prefix is customer data.
+                    print(
+                        f"scan_forbidden: line {lineno}: [site_prefix] entry is not exactly "
+                        f"{_SITE_PREFIX_WIDTH} ASCII digits -- this scan matches it but the anonymizer "
+                        "cannot load it, so a required-token run refuses this source (content withheld)",
+                        file=sys.stderr,
+                    )
             else:
                 # Position only -- see the [names] branch above. A site prefix is customer data.
                 print(
@@ -1981,6 +1997,17 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
             "scripts/security/scan-tokens.local.txt) — refusing to run structural-only"
         )
     counts = loaded_token_counts()
+    wide = sum(len(p) != _SITE_PREFIX_WIDTH for p in _SITE_PREFIXES)
+    if wide:
+        # A count only, never the entry: a site prefix is customer data. This scan matches the entry,
+        # so the counts read it as live, but the anonymizer loads two-digit prefixes only and its
+        # site-code scrub and leak check would match nothing for it (BACKLOG #5366).
+        return (
+            f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
+            f"{_SITE_PREFIX_WIDTH} ASCII digits — the anonymizer cannot load "
+            f"{'it' if wide == 1 else 'them'}, so its site-code scrub and leak check would not "
+            "match what this gate reports as loaded. Correct the entry in the token source"
+        )
     empty = [s for s in _FLOOR_SECTIONS if not counts[s]]
     if empty:
         return (

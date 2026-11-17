@@ -6,15 +6,17 @@
 formatter and no filter, and the poller logs with ``exc_info``, so a traceback carrying engine reply
 text or a credential would have reached the file verbatim on a first deployment.
 
-The engine's own chain is four ``logging.Filter`` classes in ``messagefoundry.logging_setup``. The
-tray cannot import that module: it imports ``messagefoundry.config.tls_policy``, and ADR 0113 section
-1 forbids the tray ``config``. So this module composes the same three stdlib-only leaves those
-filters call, in the same order:
+The engine's own chain is the ``logging.Filter`` classes ``messagefoundry.logging_setup``
+installs. The tray cannot import that module: it imports ``messagefoundry.config.tls_policy``, and
+ADR 0113 section 1 forbids the tray ``config``. So this module composes the stdlib-only leaves
+those filters call, in the same order:
 
 1. :func:`~messagefoundry.redaction.redact_untrusted` (the engine's ``RedactionFilter``), after the
    traceback is rendered into ``exc_text`` and ``exc_info`` is cleared.
 2. :func:`~messagefoundry.secretscrub.scrub_credentials` (``CredentialScrubFilter``).
-3. :func:`~messagefoundry.controlchars.scrub_control_chars` (``ControlCharScrubFilter``), last,
+3. :func:`~messagefoundry.redaction.redact_binary_carriage` (``BinaryCarriageScrubFilter``), after
+   every label pass, as BACKLOG #5378 requires.
+4. :func:`~messagefoundry.controlchars.scrub_control_chars` (``ControlCharScrubFilter``), last,
    because escaping removes the whitespace the credential patterns end on. A traceback keeps its
    line breaks and every line is indented, as the engine does.
 
@@ -34,7 +36,11 @@ from __future__ import annotations
 import logging
 
 from messagefoundry.controlchars import scrub_control_chars
-from messagefoundry.redaction import prepare_log_record, redact_untrusted
+from messagefoundry.redaction import (
+    prepare_log_record,
+    redact_binary_carriage,
+    redact_untrusted,
+)
 from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = ["TrayLogScrubFilter"]
@@ -45,8 +51,9 @@ _CONTINUATION_PREFIX = "    | "
 
 
 def _scrub_text(text: str) -> str:
-    """Redact PHI, then mask credentials. Control characters are left for the caller."""
-    return scrub_credentials(redact_untrusted(text))
+    """Redact PHI, mask credentials, then replace a carriage body. Control characters are left for
+    the caller."""
+    return redact_binary_carriage(scrub_credentials(redact_untrusted(text)))
 
 
 def _scrub_block(text: str) -> str:

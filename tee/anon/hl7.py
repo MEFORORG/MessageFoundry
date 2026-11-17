@@ -41,6 +41,7 @@ from .surrogates import (
     obx5_kind,
     preserve_obx5_value,
     read_message_seps,
+    repeats_encoding_characters,
     scrub_message_site_codes,
     surrogate_field_recorded,
 )
@@ -74,6 +75,8 @@ def anonymize_message(
     )
     parsed = read_message_seps(text)
     if parsed is None:
+        if repeats_encoding_characters(text):
+            raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, field_sep = parsed
     segments = [seg.split(field_sep) for seg in text.split("\r")]

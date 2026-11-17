@@ -66,6 +66,7 @@ from .surrogates import (
     dropped,
     message_has_site_code,
     read_message_seps,
+    repeats_encoding_characters,
     trim,
     unescape,
     unescaped_fields,
@@ -878,12 +879,21 @@ def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
     return hits
 
 
+#: The hit for a header that repeats an MSH-2 encoding character (BACKLOG #5374). No field of such
+#: a message can be read, so it is reported whether or not ``rules`` were given, and it carries
+#: advice of its own: no rule can fix it.
+REPEATED_ENCODING_HIT = "MSH-2 repeats an encoding character, so no field could be read"
+#: The step for :data:`REPEATED_ENCODING_HIT`.
+_REPEATED_ENCODING_ADVICE = "Repair the header: MSH-2 must hold four different encoding characters."
+
+
 def structural_phi_hits(
     text: str, mapped_paths: set[str], *, version: str | None = None
 ) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
     ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
-    result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
+    result is safe to raise/log. Empty when the message has no parseable MSH, except for
+    :data:`REPEATED_ENCODING_HIT` (see below). ``version`` is
     handed to the walk behind :func:`unmapped_field_values`.
 
     A line no rule can reach (kinds include at least a malformed segment id, a short header line,
@@ -895,9 +905,14 @@ def structural_phi_hits(
     is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465).
 
     The header, which the walk skips, is read for a routable IPv6 address alone
-    (:func:`_header_ipv6_hits`, BACKLOG #5654)."""
+    (:func:`_header_ipv6_hits`, BACKLOG #5654).
+
+    A header that repeats an MSH-2 encoding character is a hit by itself (BACKLOG #5374): no field
+    of such a message can be read, so an empty result would read as clean."""
     parsed = read_message_seps(text)
     if parsed is None:
+        if repeats_encoding_characters(text):
+            return [REPEATED_ENCODING_HIT]
         return []
     seps, field_sep = parsed
     hits: list[str] = []
@@ -1042,7 +1057,8 @@ class LeakReport:
 
     * ``hits`` — every leak reason (token/IP/site + structural); non-empty means refuse.
     * ``unmapped_fields`` — the addresses present but matched by no rule (the coverage report).
-    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors.
+    * ``structural_hits`` — the subset of ``hits`` from the structural PHI-shape detectors,
+      and :data:`REPEATED_ENCODING_HIT`, which is reported with or without ``rules``.
     * ``token_tables_live`` — whether the denylist tables loaded from a real token source.
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
@@ -1077,7 +1093,8 @@ def leak_report(
     call over a bare string) structural detection is skipped and the check is token-only, as the
     legacy one was, except that the token scan also reads the text decoded from its HL7 escape
     sequences when it has a parseable MSH (BACKLOG #5532), so it can name a token the legacy check
-    missed.
+    missed, and a header that repeats an MSH-2 encoding character is still reported as
+    :data:`REPEATED_ENCODING_HIT` (BACKLOG #5374).
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
@@ -1094,7 +1111,9 @@ def leak_report(
     undecided: tuple[str, ...] = ()
     if rules is None:
         unmapped: tuple[str, ...] = ()
-        structural: list[str] = []
+        # Without rules no field is walked, but a header no field can be read under is still
+        # reported, or a token-only call would read it as clean (BACKLOG #5374).
+        structural: list[str] = [REPEATED_ENCODING_HIT] if repeats_encoding_characters(text) else []
     else:
         # A KEEP rule rewrote nothing, so its field stays in the detectors' scope; it only
         # counts as DECIDED for the coverage switch (BACKLOG #1710).
@@ -1216,7 +1235,8 @@ def refusal_advice(
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
     shape_hit = any(
-        hit != MALFORMED_LINE_HIT and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
+        hit not in (MALFORMED_LINE_HIT, REPEATED_ENCODING_HIT)
+        and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
         for hit in report.structural_hits
     )
     if token_hit or shape_hit:
@@ -1225,6 +1245,8 @@ def refusal_advice(
         # No rule may rewrite MSH-2, so the step above cannot reach the text after its
         # encoding characters (BACKLOG #5654).
         steps.append(_MSH2_ADVICE)
+    if REPEATED_ENCODING_HIT in report.structural_hits:
+        steps.append(_REPEATED_ENCODING_ADVICE)
     steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")

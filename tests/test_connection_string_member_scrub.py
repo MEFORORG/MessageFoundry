@@ -622,7 +622,11 @@ def test_each_mask_rule_is_needed(
     monkeypatch: pytest.MonkeyPatch, attr: str, off: object, shape: str
 ) -> None:
     """With one rule of the word mask off, its shape prints a value the baseline hid on a later
-    redaction; with every rule on, it does not."""
+    redaction; with every rule on, it does not.
+
+    The log chain's carriage pass (BACKLOG #5378) is off throughout. It reaches some marker shapes
+    below on its own, so with it on these controls would no longer see a mask rule deleted."""
+    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
     on = getattr(secretscrub, attr)
     if isinstance(off, re.Pattern):
         assert on.pattern != off.pattern  # the switch is not a no-op
@@ -840,3 +844,20 @@ def test_the_bundle_runs_the_member_pass_after_its_second_layer() -> None:
     that layer hid, and the bundle printed it (round 2 of the review)."""
     out = redact_log_line(";KeyStorePwd=Authorization: Bearer api_token='a1q b2q'")
     assert "a1q" not in out and "b2q" not in out, out
+
+
+def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5378: the PHI pass can replace a marker's ``mfb64`` and leave ``[redacted]:v1:``,
+    which the log chain's carriage pass still reads. A mask that took that ``v1`` printed the body
+    on the chain where the baseline hid it; the fuzz differential found the line below. With the
+    unit's alternative removed, it prints again."""
+    line = ';PWD="family": .=amfb64:v1:a1qkey=/"family": '
+    unit = secretscrub._MEMBER_VALUE_UNIT.pattern
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = [_every_redaction_path(line)]
+    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline) == []
+    stripped = unit.replace(r"(?:<redacted>|\[(?:REDACTED|redacted)\]):v1:|", "")
+    assert stripped != unit
+    monkeypatch.setattr(secretscrub, "_MEMBER_VALUE_UNIT", re.compile(stripped))
+    assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)
