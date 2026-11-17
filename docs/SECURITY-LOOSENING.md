@@ -848,18 +848,21 @@ the next start may do.
   key the chain's newest range is under is not configured. It refuses whether or not the key in
   use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
   that range under the key in use, never verifies there, and the chain breaks at that row, and
-  `rotate-key` cannot roll the chain afterwards. The `admin-*` commands do not refuse, so do not
-  run them in that state.
+  `rotate-key` cannot roll the chain afterwards. At least the `admin-*` commands,
+  `issue-enrolment-code`, `provision-admin` and `backup` do not refuse; one run of any of them in
+  that state breaks the chain, and `rotate-key` then refuses for good, even after the key is put
+  back.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
   and every other start check.
 - **When acceptable:** only when the key the chain's newest range is under is truly lost. If the
-  key exists anywhere, put it back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key`
-  instead. Its audit chain step says whether it rolled the chain and, where it refuses, why. Where
+  key exists anywhere and no command that writes an audit row has run in that state, put it back in
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key` instead. Its audit chain step says whether it rolled the chain and, where it refuses, why. Where
   the key in use already keyed an earlier range, that step refuses and asks for a new key.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
-- **Reversible:** no, once a start has used it: the chain stays broken at that row. Turned back
+- **Reversible:** no, once a start has used it, or any command that writes an audit row has run in
+  that state: the chain stays broken at that row. Turned back
   off, the next start refuses again while the lost range key is still not configured. Set only and
   never used, it can be removed.
 

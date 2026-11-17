@@ -776,9 +776,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `[secret_rotation].allow_lost_audit_range_key` entry in
    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) states when, and the way out. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
    verifies the whole chain first, so a chain whose rows do not verify, or whose rows open with no
-   genesis row, refuses under every key, a new one included, and the record stays open. A newest
-   range under a key that is not configured is not one of these, though `audit-verify` reports it
-   too: put that key back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and re-run. Where a run that
+   genesis row, refuses under every key, a new one included, and the record stays open. Where a run that
    opened the record meets a refusal for good, it names at least two ways out:
    `[secret_rotation].store_key_last_rotated`, set to the date of a run that re-sealed the data with
    no skip, and `[secret_rotation].enforce_store_key_expiry = false`, which lifts only the start
