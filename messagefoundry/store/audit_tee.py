@@ -207,10 +207,9 @@ def _encode_c0(text: str) -> str:
 def _window(value: str, *, detail: bool) -> tuple[str, str]:
     """``(head, note)``: the part of ``value`` the field scrub reads, and the note naming what it
     left unread, ``""`` when the value fit and ``head is value``. A ``detail``'s window is
-    :func:`~messagefoundry.redaction.safe_text`'s, so the bound note and the ``(+N chars)`` count
-    it ships with are the ones ``safe_text`` gives the value; any other field's is the handler
-    chain's, :func:`~messagefoundry.redaction.clamp_untrusted`, and its note keeps that cut's
-    newline joiner."""
+    :func:`~messagefoundry.redaction.safe_text`'s; any other field's is the handler chain's,
+    :func:`~messagefoundry.redaction.clamp_untrusted`, and its note keeps that cut's newline
+    joiner."""
     if detail:
         return safe_text_bound(value)
     clamped = clamp_untrusted(value)
@@ -224,8 +223,7 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     """``kept``, the scrubbed detail, bounded by :func:`~messagefoundry.redaction.safe_text` as
     the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
     own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
-    and the bounded result does not, because a redaction made it longer and the cut then landed
-    inside it, it ships as the JSON string ``"[redacted]"`` instead."""
+    and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
     shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
@@ -381,7 +379,7 @@ def _tee_line(
             reasons = [_SHOWS_A_WORD] if shows else []
             if unparsed:
                 reasons.append(_UNPARSED)
-    except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
+    except Exception as exc:  # noqa: BLE001 - the tee must still ship the record
         _log_line_fault(exc)
         return old_line
     if not _OLD_LINE_REASONS_LOGGED.issuperset(reasons):

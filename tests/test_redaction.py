@@ -1709,8 +1709,8 @@ def test_safe_text_reports_the_two_counts_apart() -> None:
 
 
 def test_safe_text_bound_splits_safe_text_into_its_head_and_its_note() -> None:
-    """``safe_text(head) + note`` is ``safe_text(text)``, so a caller that scrubs the head itself
-    keeps both counts exact (BACKLOG #3045). A text that fits has no note and is its own head."""
+    """``safe_text(head) + note`` is ``safe_text(text)`` (BACKLOG #3045). A text that fits has no
+    note and is its own head."""
     for text in (_over_window(" tail"), "DOE JANE short"):
         head, note = safe_text_bound(text)
         assert safe_text(head) + note == safe_text(text)

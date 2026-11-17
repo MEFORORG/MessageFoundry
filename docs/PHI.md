@@ -2145,7 +2145,7 @@ high-volume feed prefer UDP to a collector on another host, which the forwarding
 under `enforcement = "warn"` (BACKLOG #1966).
 
 The tamper-evident **`audit_log`** is **also tee'd off-box** (sec-offbox-log #361/#363): every committed
-audit row is emitted as metadata, with only best-effort PHI redaction of its `detail` (stream 3
+audit row is emitted as metadata, with best-effort PHI redaction of its `detail` (stream 3
 below), through the `messagefoundry.audit` logger to the same
 handlers, across all three store backends
 ([`store/audit_tee.py`](../messagefoundry/store/audit_tee.py)). That logger is **pinned to `INFO`**, so
@@ -2160,8 +2160,8 @@ docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names 
 residuals that cause these.
 
 Since BACKLOG #3045 the tee scrubs a text field holding a C0 control in the window it scans, such
-as a typed sign-in name, with the log filters' text passes before it encodes the field. The
-`emit_audit_tee` docstring states the cases and what that scrub leaves.
+as a typed sign-in name, with the log filters' text passes before it encodes the field. Text
+beside a control can still pass in the cases the `emit_audit_tee` docstring lists.
 
 ### Logging inventory (16.1.1 / 16.2.3)
 
