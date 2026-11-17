@@ -168,7 +168,9 @@ _HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 #: ``Content-Length`` and ``Transfer-Encoding`` frame the body, which ``http.client`` already
 #: frames, so a second value would send conflicting framing. The hop-by-hop fields of RFC 9110
 #: section 7.6.1, RFC 2616's ``Trailer`` and ``Expect`` belong to the connection, not to one
-#: message. ``Cookie`` is a session credential the redaction screen does not read by name.
+#: message. ``Cookie`` is dropped as a session credential: the redaction screen already masks it
+#: by name, so :func:`refuse_held_dynamic_headers` refused it on a verify-off or off-box cleartext
+#: hop, but on any other hop a Handler's Cookie was sent.
 PER_MESSAGE_DENIED_HEADERS = frozenset(
     {
         "authorization",
@@ -1443,17 +1445,19 @@ def _query_credentials_sent(setting: str, value: Any, *, query_only: bool) -> li
     return []
 
 
-#: Where a ``name=value`` segment of a whole URL can start: a ``;`` path parameter or the query.
-_URL_SEGMENT_START = re.compile(r"[;?]")
+#: Where a ``name=value`` segment of a whole URL can start: a ``;`` path parameter, the query, or
+#: a ``#`` that urllib sends because a later ``#`` starts the fragment.
+_URL_SEGMENT_START = re.compile(r"[;?#]")
 
 
 def _url_segments_sent(url: str) -> str:
-    """The part of ``url`` :func:`_query_credentials_sent` screens for a segment credential: from
-    the first ``;`` or ``?`` up to the LAST ``#``, where urllib's ``Request`` splits off the
-    fragment it never sends; text between two ``#`` is sent, so it is read. The scheme, host and
-    the path before the first ``;`` or ``?`` are left out, so a path predicate there, such as
-    OData's ``Orders(OrderKey=5)``, is not read as one (the rule does not read the path, owner
-    ruling 2026-10-26). Everything after that first ``;`` or ``?`` is read, path or not."""
+    """The part of ``url`` :func:`_query_credentials_sent` screens for a segment credential: what
+    urllib sends, cut at the LAST ``#``, where its ``Request`` splits off the fragment it never
+    sends, and read from the first ``;``, ``?`` or ``#`` before that cut. So any earlier ``#`` is
+    sent and starts the read: ``/x#a=1&api_key=S#b`` sends ``/x#a=1&api_key=S``. The scheme, host
+    and the path before that first ``;``, ``?`` or ``#`` are left out, so a path predicate there,
+    such as OData's ``Orders(OrderKey=5)``, is not read as one (the rule does not read the path,
+    owner ruling 2026-10-26). Everything after it is read, path or not."""
     sent = url.rpartition("#")[0] if "#" in url else url
     start = _URL_SEGMENT_START.search(sent)
     return "" if start is None else sent[start.start() :]
@@ -2835,8 +2839,8 @@ def _refuse_unsendable_static_auth(s: Mapping[str, Any], *, connection: str | No
     user, password = s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):
         raise HttpAuthError(
-            f"{prefix}REST destination basic_user and basic_password must be set together, and "
-            "neither may resolve empty; one without the other would send no HTTP Basic credential"
+            f"{prefix}REST destination basic_user and basic_password must be set together; one "
+            "without the other, or one that resolves empty, would send no HTTP Basic credential"
         )
     if user and ":" in str(user):
         raise HttpAuthError(

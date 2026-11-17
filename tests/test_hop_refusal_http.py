@@ -691,6 +691,12 @@ def test_url_segment_and_conditional_query_readings() -> None:
     assert http_credentials_sent(ConnectorType.REST, {"url": twice}) == [
         "url segment with a credential-looking name"
     ]
+    # With no ';' or '?' before it, the earlier '#' itself starts the read (urllib sends
+    # '/x#a=1&api_key=S').
+    bare = "https://partner.example/x#a=1&api_key=S#b"
+    assert http_credentials_sent(ConnectorType.REST, {"url": bare}) == [
+        "url segment with a credential-looking name"
+    ]
     assert _query_credentials_sent("conditional_query", "identifier=s|1", query_only=True) == []
     secret = f"_id=1&client_secret={_SECRET}"
     assert _query_credentials_sent("conditional_query", secret, query_only=True) == [
