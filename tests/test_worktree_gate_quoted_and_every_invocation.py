@@ -420,7 +420,8 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
 # ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6
 #
 # Each row of test_closing_step_shapes_are_denied was measured ALLOW on origin/main f0e49f45c5c, run
-# from an ungoverned repository. Other DENY rows below pin refusals origin/main already made.
+# from an ungoverned repository. Other DENY rows below are not all origin/main's: several are refusals
+# this branch adds.
 
 
 @pytest.mark.parametrize(
@@ -498,6 +499,13 @@ def test_a_misanchored_read_is_not_called_a_change(rig: SimpleNamespace) -> None
     first = reason.splitlines()[0]
     assert "could not clear as a bare read" in first, reason
     assert "changing" not in first and "setting" not in first, reason
+
+
+def test_a_config_path_component_does_not_move_the_refusal_wording(rig: SimpleNamespace) -> None:
+    # Review round e6039d36, finding 1: a `config` path component after `--file=` moved the wording
+    # to the read text, though `--unset` removes the key. origin/main says "changing".
+    reason = _reason(rig, "git config --unset --file=.git/config core.hooksPath", rig.primary)
+    assert reason.splitlines()[0].startswith("BLOCKED: changing"), reason
 
 
 # Quoted forms the gate's unquoting does not read as the shell does (closing step 7), left ALLOW as on

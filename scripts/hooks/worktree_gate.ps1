@@ -845,7 +845,7 @@ function Get-ScanRawIndexMap($Seg) {
 # --hard` is allowed (fail-open, f0e49f45c5c has it too).
 #
 # KNOWN FALSE DENIES OF THESE READINGS, left open, at least these. Each one with an example command
-# here is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
+# here, unless it says "not pinned", is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
 # test_known_false_denies_of_the_added_readings_still_deny:
 #   * a later disarm judged by rule 3c's first chain can take an earlier command's `-C`;
 #   * an earlier bracket-joined command's `-C` or `--git-dir` can decide (`if (git -C <p> diff
@@ -864,7 +864,10 @@ function Get-ScanRawIndexMap($Seg) {
 #     core.hooksPath` from outside);
 #   * the $absC fold reads a `-C` inside a closed `$( )` as the outer invocation's, after an earlier
 #     line's chdir in parentheses (`(cd <tmp> && ls)`, then `git -c a=$(git -C '<p>' log -1) config
-#     <key>` from outside).
+#     <key>` from outside);
+#   * a `.git` path segment inside a closed `${ }` is taken as rule 3c's git word, so the reading falls
+#     back to the session cwd (`git -C <o> config --file=${GIT_DIR:-.git}/config <key>` from the
+#     primary; not pinned).
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -910,7 +913,8 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     # `git -C '<p>' reset --hard` on the next line was allowed. (Under Bash that chdir is a subshell's;
     # under the PowerShell tool `(Set-Location <p>)` moves the shell, and a relative `-C` after it is
     # still not read -- see WHAT IT DOES NOT READ.) Not where the window also names a work tree or git
-    # dir in any spelling. Git roots a relative one against the `-C` directory, not the unknown one; the
+    # dir in a spelling the regex below matches; a quote-joined one such as `''--git-dir=` is not
+    # matched, so that window is read. Git roots a relative one against the `-C` directory, not the unknown one; the
     # exclusion leaves those windows unread all the same, and the shapes it allows are listed under
     # WHAT IT DOES NOT READ. The fold does not skip a `-C` inside a closed
     # `$( )`, which is a known false deny listed there.
@@ -3775,21 +3779,22 @@ if ($tool -in @("Bash", "PowerShell")) {
         # `get --all`). None of these tokens takes a value or sets anything; what follows the key is
         # $rest, and the one exemption left requires it empty.
         $viaRead = $viaConfig -and ($via -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
-        # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
-        # shape may REMOVE the key, so "setting" would misdescribe it.
-        $viaWrite = $viaConfig -and -not $viaRead -and ($via -cnotmatch '^config(?:\s+(?:--local|--global|--system|--worktree))*\s+$')
         # THE REFUSAL TEXT IS WORDED FROM THE LAST `config` WORD IN $via, the one nearest the key, and
-        # nothing else reads these two (PR 3030 review, finding 4). $via starts at the FIRST `config`
+        # nothing else reads $textRead or $textWrite (PR 3030 review, finding 4). A config-form disarm
+        # that is not the plain `config <key> <v>` shape may REMOVE the key, so $textWrite words it
+        # "changing" rather than "setting". $via starts at the FIRST `config`
         # word, which can sit in a closed `$( )` ahead of the outer invocation's own (`-c
         # user.name=$(git config user.name) config --get <key>`), and the refusal then said "changing"
-        # about a read. The verdict still comes from $viaRead above. $textRead is the bare read, which
-        # the exemption below would have passed had $via started at that last word: read options only,
-        # and nothing after the key. Where $via has one `config` word, the exemption has already
-        # passed that shape, so $textRead is true only of such a misanchored line.
+        # about a read. The verdict still comes from $viaRead above. Only a `config` with whitespace on
+        # both sides counts as a later word, so a path component such as `--file=.git/config` does not
+        # move the wording; with none, $via is used whole. That word is still found by text, not by
+        # parsing the invocation, so the wording can name the wrong action on a line whose `config`
+        # argument stands alone (a known limit). $textRead is the bare read the exemption below would
+        # have passed had $via started at that word: read options only, and nothing after the key.
         $textVia = $via
         if ($viaConfig) {
-            $cfgAt = [regex]::Matches($via, '\bconfig\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            $textVia = $via.Substring($cfgAt[$cfgAt.Count - 1].Index)
+            $cfgAt = [regex]::Matches($via, '(?<=\s)config(?=\s)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($cfgAt.Count -gt 0) { $textVia = $via.Substring($cfgAt[$cfgAt.Count - 1].Index) }
         }
         $textReadForm = $viaConfig -and ($textVia -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
         $textRead = $textReadForm -and $rest -notmatch '\S'
@@ -4194,8 +4199,12 @@ What to do instead:
         # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
         # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
         #
-        # Its window starts after the last separator before a git word that owns the disarm (a
-        # `git.EXE` or `GIT` the token pattern misses must not reach back over `;`), and for a `-c <key>=<v>` disarm it runs
+        # Its first window starts after the last separator before the last git word ahead of the disarm
+        # (a `git.EXE` or `GIT` the token pattern misses must not reach back over `;`). That word comes
+        # from Get-AnyGitWordBefore, which can match a `.git` path segment, the git in `--git-dir`, or a
+        # git inside a closed `$( )` that owns nothing, so this window is not always the owning
+        # invocation's; the known false denies that follow are listed in THE ADDED READINGS. For a
+        # `-c <key>=<v>` disarm it runs
         # on over the global options that follow, so `git -c <key>=<v> -C <ungoverned> commit` reads that
         # `-C` (review round b62475f26d). A `config` disarm has every global option before it.
         if (-not $govCfg) {
