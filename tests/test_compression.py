@@ -589,6 +589,46 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
         zip_decompress(_hostile_zip({"doc.pdf": _BODY}), max_output_bytes=None)
 
 
+@pytest.mark.parametrize(
+    ("name", "fragment"),
+    [
+        ("adt.hl7:stream", "colon"),  # an NTFS alternate data stream of adt.hl7
+        ("sub/adt.hl7:x.hl7", "colon"),
+        ("adt.hl7.", "dot or space"),  # Windows opens adt.hl7, and the extension reads as "."
+        ("adt.hl7 ", "dot or space"),
+        ("dir./adt.hl7", "dot or space"),  # a directory component, not only the leaf
+        ("NUL", "reserves"),
+        ("con.hl7", "reserves"),  # the stem before the first dot is what Windows matches
+        ("sub/COM1.txt", "reserves"),
+        ("CONIN$", "reserves"),
+        ("COM¹.hl7", "reserves"),  # a superscript-digit port
+        ("a?b.hl7", "reserves"),  # a character Windows refuses in a name
+    ],
+)
+def test_archive_member_name_reason_refuses_names_windows_rewrites(
+    name: str, fragment: str
+) -> None:
+    """BACKLOG #5369: a name Windows would open as another object is refused on every platform,
+    and the reason does not echo the name."""
+    reason = archive_member_name_reason(name)
+    assert reason is not None and fragment in reason
+    assert name not in reason
+
+
+def test_zip_decompress_refuses_a_windows_device_member_name() -> None:
+    with pytest.raises(CompressionError, match="reserves"):
+        zip_decompress(_hostile_zip({"aux.hl7": _BODY}), max_output_bytes=None)
+
+
+def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:
+    """BACKLOG #5369: ``.hl7v2`` is an HL7 extension the uploads allowlist names, so it is checked
+    as one rather than accepted unchecked."""
+    with pytest.raises(CompressionError, match=r"does not match the \.hl7v2 extension"):
+        zip_decompress(_hostile_zip({"adt.hl7v2": b"%PDF-1.7 not hl7"}), max_output_bytes=None)
+    entries = {"adt.HL7V2": _BODY}
+    assert zip_decompress(_hostile_zip(entries), max_output_bytes=None) == entries
+
+
 def test_zip_decompress_admits_members_matching_their_extension() -> None:
     entries = {
         "adt.hl7": _BODY,

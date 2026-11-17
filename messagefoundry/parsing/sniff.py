@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ntpath
 
 from messagefoundry.content_type import ContentType
 from messagefoundry.controlchars import has_control_char
@@ -287,6 +288,7 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
 #: the ContentType so the check is literally :func:`_content_matches_declared` — one definition.
 _EXTENSION_CONTENT_TYPE: dict[str, ContentType] = {
     ".hl7": ContentType.HL7V2,
+    ".hl7v2": ContentType.HL7V2,  # the uploads allowlist's alias (BACKLOG #5369)
     ".json": ContentType.JSON,
     ".fhir": ContentType.FHIR,
     ".xml": ContentType.XML,
@@ -336,6 +338,14 @@ def archive_member_name_reason(name: object) -> str | None:
     a Windows separator smuggled through a slash-only check), a drive-relative prefix (``C:x.hl7`` carries
     no separator at all), and any control character.
 
+    A Handler may write a member on Windows, so a name Windows would open as some OTHER object is
+    refused too (BACKLOG #5369): a colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of
+    ``a.hl7``), a component ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension
+    would read as ``.`` and skip the content check), and a component :func:`ntpath.isreserved` names,
+    at least a device stem (``NUL``, ``con.hl7``, ``COM1``, ``CONIN$``) and a character Windows
+    refuses in a name. That test runs on every platform: the archive's name is judged for where it
+    may be written, not where it was read.
+
     Two of those arms are unreachable through CPython's own reader, which is a fact about the library and
     not a reason to drop them. ``zipfile._sanitize_filename`` runs inside ``ZipInfo.__init__`` on the read
     path as well as the write path: it truncates a member name at the first NUL everywhere, and replaces
@@ -349,11 +359,17 @@ def archive_member_name_reason(name: object) -> str | None:
         return "member name contains a backslash, which a slash-only containment check cannot see"
     if len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":":
         return "member name is drive-relative"
+    if ":" in name:
+        return "member name contains a colon, which Windows reads as a drive or a data stream"
     if name.startswith("/"):
         return "member name is an absolute path"
     for part in name.split("/"):
         if part in ("", ".", ".."):
             return "member name has an empty or relative path component"
+        if part.endswith((".", " ")):
+            return "member name has a component ending in a dot or space, which Windows drops"
+        if ntpath.isreserved(part):
+            return "member name has a component Windows reserves as a device or refuses outright"
     return None
 
 
