@@ -2333,8 +2333,8 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
 
 def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
-    Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read; the
-    non-file branch of ``main`` uses them only for an entry it can lstat."""
+    Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
+    non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit."""
     if reason := forbidden_path_reason(posix):
         return [f"{posix}:0: {reason}"], True
     hits: list[str] = []
@@ -2356,19 +2356,23 @@ def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
 
 
 def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tuple[int, str, str]]:
-    """Content hits in one reading of a file, as (line, key, hit). The key is the hit without the
-    matched value or line, plus its count on that line, so the same finding on the same line in
-    another reading is one hit."""
+    """Content hits in one reading of a file, as (line, key, hit). The key is the hit, what it matched
+    (the value, or the name pattern) and its count on that line, so the same finding on the same line
+    in another reading is one hit, and two different findings of one kind stay two."""
     ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
     site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
     out: list[tuple[int, str, str]] = []
+    # How many times each (hit, matched) pair has been seen, so counting the nth costs one lookup.
+    counts: dict[str, int] = {}
     for lineno, line in enumerate(text.splitlines(), 1):
 
-        def add(reason: str, extra: str = "", lineno: int = lineno) -> None:
+        def add(reason: str, matched: str, extra: str = "", lineno: int = lineno) -> None:
             hit = f"{posix}:{lineno}: {reason}"
             # The nth such finding on this line: two on one line stay two, as they always were.
-            nth = sum(1 for _, k, _ in out if k.startswith(hit + "#"))
-            out.append((lineno, f"{hit}#{nth}", hit + extra))
+            key = f"{hit}\0{matched}"
+            nth = counts.get(key, 0)
+            counts[key] = nth + 1
+            out.append((lineno, f"{key}\0{nth}", hit + extra))
 
         if any(a.search(line) for a in ALLOWLIST):
             continue
@@ -2383,49 +2387,57 @@ def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tu
         unwrapped = _IDENT_SEP.sub(" ", line)
         for pat, reason in FORBIDDEN:
             if _name_matches(pat, line, unwrapped):
-                add(reason, ctx)
+                add(reason, pat.pattern, ctx)
         if site_scan:
             for m in _SITE_CODE_FILE.finditer(line):
                 value = f" ({m.group(0)})" if show_context else ""
-                add("site code", f"{value}{ctx}")
-            if _SITE_CODE_PATTERN_LITERAL.search(line):
-                add("site-code pattern written out", ctx)
+                add("site code", m.group(0), f"{value}{ctx}")
+            if lit := _SITE_CODE_PATTERN_LITERAL.search(line):
+                add("site-code pattern written out", lit.group(0), ctx)
         if ip_scan:
             for m in _IPV4.finditer(line):
                 ip = m.group(0)
                 if not _ALLOWED_IP.match(ip):
                     value = f" ({ip})" if show_context else ""
-                    add("routable IP address", f"{value}{ctx}")
+                    add("routable IP address", ip, f"{value}{ctx}")
         # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
         # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
-        if any(p.search(line) for p in _WORKTREE_SLUG_DETECTORS):
-            add("worktree/branch slug (internal project name)")
-        if _HOME_PATH.search(line):
-            add("absolute user-home path (OS account name)")
+        if (slug := _first_match(_WORKTREE_SLUG_DETECTORS, line)) is not None:
+            add("worktree/branch slug (internal project name)", slug)
+        if home := _HOME_PATH.search(line):
+            add("absolute user-home path (OS account name)", home.group(0))
         # Reason-only, and NOT ctx-appended even under show_context. The other reason-only detectors
         # withhold the value because it NAMES someone; this one withholds it because the URL IS the
         # access. Echoing it into a public CI log would hand out the capability the hit reports.
-        if _ARTIFACT_URL.search(line):
-            add("private artifact URL (the link itself grants access)")
+        if url := _ARTIFACT_URL.search(line):
+            add("private artifact URL (the link itself grants access)", url.group(0))
         # Security-record content (BACKLOG #1337). REASON-ONLY, never the value, for the same reason
         # as the slug above: the identifier-verdict pair IS the disclosure, so echoing it into a
         # public CI log would publish exactly what the hit reports.
-        if any(p.search(line) for p in _RECORD_PAIR):
-            add("security-record content (requirement id beside a verdict)")
+        if (pair := _first_match(_RECORD_PAIR, line)) is not None:
+            add("security-record content (requirement id beside a verdict)", pair)
         # Reason-only for the same reason as the two above, and NOT ``ctx``-appended even under
         # show_context: the identifier IS the disclosure.
-        if _ESTATE_ID_SHAPE.search(line):
-            add(f"{_ESTATE_ID_REASON} (the ported-estate site-code shape)")
+        if shape := _ESTATE_ID_SHAPE.search(line):
+            add(f"{_ESTATE_ID_REASON} (the ported-estate site-code shape)", shape.group(0))
         # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
         # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
         # rather than information. What this adds is the case no other detector can reach -- a token
         # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
         if len(out) == before:
-            for _token, estate_pat in _ESTATE_FILE_RES:
+            for token, estate_pat in _ESTATE_FILE_RES:
                 if estate_pat.search(line):
-                    add("estate token", ctx)
+                    add("estate token", token, ctx)
                     break
     return out
+
+
+def _first_match(patterns: tuple[re.Pattern[str], ...], line: str) -> str | None:
+    """The text the first of ``patterns`` to match ``line`` matched, or ``None``."""
+    for p in patterns:
+        if m := p.search(line):
+            return m.group(0)
+    return None
 
 
 #: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
@@ -3088,7 +3100,8 @@ def main(argv: list[str]) -> int:
             # walk (removed since it was listed) and in the tracked scan (deleted in the work tree).
             # Anything else whose lstat succeeds, such as a dangling link, a link whose target cannot be
             # stat'ed, or a FIFO, is judged by its path and name only; the walk never lists a link to
-            # a directory, so that is not judged.
+            # a directory, so that is not judged. Every entry that reaches the hits is also judged by
+            # its path and name.
             try:
                 st_mode = abs_path.lstat().st_mode
                 reason = (
@@ -3106,8 +3119,10 @@ def main(argv: list[str]) -> int:
                     else f"unreadable ({errno.errorcode.get(exc.errno or 0, type(exc).__name__)})"
                 )
             unread += 1
+            # The path alone decides a location or name hit, so it is kept whatever became of the
+            # entry: a missing or unstatable name under docs/security/ still exits 1, not 2.
+            hits.extend(_name_hits(abs_path, rel)[0])
             if reason is None:
-                hits.extend(_name_hits(abs_path, rel)[0])
                 continue
             hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
             unreadable += 1

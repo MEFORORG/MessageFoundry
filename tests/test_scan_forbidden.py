@@ -2957,6 +2957,74 @@ def test_two_findings_of_one_kind_on_one_line_stay_two(sf, tmp_path: Path) -> No
     assert sf.scan_file(p, "plain.txt") == ["plain.txt:2: routable IP address"] * 2
 
 
+#: Assembled at runtime, as _routable_ip is, so this file carries no routable dotted-quad.
+@pytest.mark.parametrize(("second", "count"), [(".".join("8844"), 2), (".".join("8888"), 1)])
+def test_two_readings_with_different_values_on_one_line_stay_two(
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second: str, count: int
+) -> None:
+    """The cross-reading key held the reason and line only, so a different value of one kind on the
+    same line of another reading was folded into the first and went unreported. The same value is
+    still one hit (the control)."""
+    p = tmp_path / "two.txt"
+    p.write_text("x\n", encoding="utf-8")
+    first = ".".join(("8", "8", "8", "8"))
+    monkeypatch.setattr(sf, "_read_text", lambda _path: [f"x\n{first}\n", f"x\n{second}\n"])
+    assert sf.scan_file(p, "two.txt") == ["two.txt:2: routable IP address"] * count
+
+
+def test_many_hits_in_one_file_cost_linear_time(sf, tmp_path: Path) -> None:
+    """Counting a line's nth finding by scanning every earlier hit made a file's cost quadratic in its
+    hits: 16000 took about 65 times as long as 2000 where linear is 8."""
+    p = tmp_path / "many.txt"
+
+    def best(n: int) -> float:
+        p.write_text("contact ACME\n" * n, encoding="utf-8")
+        times = []
+        for _ in range(3):
+            began = time.perf_counter()
+            assert len(sf.scan_file(p, "many.txt")) == n
+            times.append(time.perf_counter() - began)
+        return min(times)
+
+    small, large = best(2000), best(16000)
+    assert large < 30 * small, (small, large)
+
+
+@pytest.mark.parametrize("how", ["missing", "unstatable"])
+def test_a_named_path_under_a_forbidden_location_keeps_its_location_hit(
+    sf_main,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    how: str,
+) -> None:
+    """A staged name under docs/security/ that is missing or cannot be stat'ed exited 2 with only the
+    unread hit, so the location the path alone shows was not reported and the run did not exit 1."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docs" / "security").mkdir(parents=True)
+    name = Path("docs/security/model.md")
+    if how == "unstatable":
+        name.write_text("fine\n", encoding="utf-8")
+        real_is_file, real_lstat = Path.is_file, Path.lstat
+
+        def is_file(self: Path, **kwargs: bool) -> bool:
+            return False if self == name else real_is_file(self, **kwargs)
+
+        def lstat(self: Path) -> os.stat_result:
+            if self == name:
+                raise PermissionError(13, "denied", str(self))
+            return real_lstat(self)
+
+        monkeypatch.setattr(Path, "is_file", is_file)
+        monkeypatch.setattr(Path, "lstat", lstat)
+    assert sf_main.main(["--", name.as_posix()]) == 1
+    err = capsys.readouterr().err
+    assert "FORBIDDEN CONTENT" in err, err
+    expected = "does not exist" if how == "missing" else "unreadable (EACCES)"
+    assert f"docs/security/model.md:0: {expected}" in err, err
+    assert err.count("docs/security/model.md:0: ") == 2, err
+
+
 def test_a_location_hit_names_the_root_relative_path(
     sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
