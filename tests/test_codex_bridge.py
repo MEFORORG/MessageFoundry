@@ -187,22 +187,24 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
         ("trap {{ exit 2 }}; throw 'boom'", "block"),
         ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
-        # A native 2 passed on by `exit` blocks; one left as the last statement is -Command's
-        # own 1, as Claude Code would see it, so it does not block.
+        # A native 2 blocks, passed on by `exit` or left as the last statement, which -Command
+        # alone reports as 1.
         ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
-        ("& '{py}' -c 'import sys; sys.exit(2)'", "exit-1"),
-        # A stale 2 never blocks.
+        ("& '{py}' -c 'import sys; sys.exit(2)'", "block"),
+        ("& '{py}' -c 'import sys; sys.exit(3)'", "exit-1"),
+        # A stale 2 does not block after a last statement that succeeds, and does after one
+        # that fails.
         ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
         (
             "& '{py}' -c 'import sys; sys.exit(2)'; Get-Item -LiteralPath 'no-such-item-b4'",
-            "exit-1",
+            "block",
         ),
         (
             "& '{py}' -c 'import sys; sys.exit(2)'; "
             "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction Ignore",
-            "exit-1",
+            "block",
         ),
-        ("& '{py}' -c 'import sys; sys.exit(2)'; $null = Get-Item -LiteralPath 'no-b4'", "exit-1"),
+        ("& '{py}' -c 'import sys; sys.exit(2)'; $null = Get-Item -LiteralPath 'no-b4'", "block"),
         ("Get-Item -LiteralPath 'no-such-item-b4'", "exit-1"),
         ("if ($true) {{ return }}; exit 2", "allow"),
     ],
@@ -213,6 +215,7 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "reads-input",
         "native-2-passed-on",
         "native-2-last",
+        "native-3-last",
         "stale-2-then-success",
         "stale-2-then-failed-cmdlet",
         "stale-2-then-ignored-cmdlet",
@@ -221,9 +224,7 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "early-return",
     ],
 )
-def test_a_powershell_hook_takes_the_process_exit_code_unchanged(
-    bridge, tmp_path, command, outcome
-):
+def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command, outcome):
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
     settings(tmp_path, [hook])
     if outcome == "block":
@@ -237,12 +238,30 @@ def test_a_powershell_hook_takes_the_process_exit_code_unchanged(
         assert "hook exited 1: " in result["systemMessage"], result
 
 
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize(
+    "command",
+    ["& ./guard.ps1", ". ./guard.ps1", "& ./guard.ps1 # the guard decides"],
+    ids=["called", "dot-sourced", "called-before-a-comment"],
+)
+def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):
+    """-Command alone reports a guard script's `exit 2` as 1, which would not block."""
+    (tmp_path / "guard.ps1").write_text("exit 2\n", encoding="utf-8")
+    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command}])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, BASH_CALL)
+    # A later statement that succeeds is the hook's own outcome.
+    settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command + "\n$null"}])
+    assert bridge.dispatch(tmp_path, BASH_CALL) == {}
+
+
 def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
     structured = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/guard", "args": ["a"]}
     assert bridge.hook_argv(tmp_path, structured) == [f"{tmp_path}/guard", "a"]
     shell = {"type": "command", "shell": "powershell", "command": "'${CLAUDE_PROJECT_DIR}_x'"}
     # Braced, so a following name character cannot join the variable name.
-    assert bridge.hook_argv(tmp_path, shell)[-1].endswith("'${env:CLAUDE_PROJECT_DIR}_x'")
+    command = bridge.hook_argv(tmp_path, shell)[-1].removesuffix(bridge.POWERSHELL_TAIL)
+    assert command.endswith("'${env:CLAUDE_PROJECT_DIR}_x'")
 
 
 def test_each_event_matches_its_own_discriminator_field(bridge, tmp_path):

@@ -68,8 +68,9 @@ and 127 under `sh`; this is reasoned, not measured.
 At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
 reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
 unaffected. **A future guard that must block when it fails sets
-`"onFailure": "block"`.** That holds only once the bridge runs and reads the
-settings: a launcher with no decision, or a bridge fault, never blocks.
+`"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
+launcher with no decision, or a bridge fault, such as a payload with no session
+id, never blocks.
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
@@ -83,11 +84,14 @@ Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
 Structured `command` and `args` avoid shell parsing. A command-only PowerShell
 hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
 PowerShell hook with an explicit `exit 2`. The bridge runs it under
-`pwsh -Command` and takes the exit code unchanged, so a final native program's
-exit 2 does not block unless the hook ends with `exit $LASTEXITCODE`. The bridge
+`pwsh -Command`. That reports as 1 a 2 from a native program, or from a guard
+script the hook calls or dot-sources, when it ends the hook. So the bridge puts
+one line after the hook: when the last statement failed and `$LASTEXITCODE` is 2,
+it exits 2. That line also blocks a hook whose last statement fails while an
+earlier command's 2 is still in `$LASTEXITCODE`. The bridge
 puts one line before the hook, turning `$PSNativeCommandUseErrorActionPreference`
 off, so a hook that must open with `param()`, a `using` statement or a named
-block fails to parse and cannot block.
+block fails on every call with exit 1.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

@@ -199,14 +199,17 @@ def git_bash() -> str | None:
     return None
 
 
-# A command-only PowerShell hook runs under pwsh -Command and its exit code is taken unchanged: it
-# blocks by `exit 2`, the way Claude Code's hooks reference blocks a PowerShell hook. That reference
-# does not say which flags Claude Code passes, or how a native exit code propagates; under -Command
-# a final native program's exit 2 is reported as 1. The one line put before the hook keeps a
-# native non-zero exit from throwing where a PowerShell build defaults that preference on. A hook
-# that must open with at least param(), a using statement or a named block cannot take that line,
-# fails to parse, and so cannot block.
+# A command-only PowerShell hook runs under pwsh -Command and blocks by `exit 2`, the way Claude
+# Code's hooks reference blocks a PowerShell hook. That reference does not say which flags Claude
+# Code passes, or how a native exit code propagates. Under -Command, a 2 from a guard script the
+# hook calls or dot-sources, or from a native program, is reported as 1 when it ends the hook, so
+# the line put after the hook exits 2 when the last statement failed with $LASTEXITCODE at 2,
+# whichever command left that 2. The tail goes on its own line so a trailing comment cannot
+# swallow it. The one line put before the hook keeps a native non-zero exit from throwing where a
+# PowerShell build defaults that preference on. A hook that must open with at least param(), a
+# using statement or a named block cannot take that line, and fails on every call with exit 1.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
+POWERSHELL_TAIL = "\nif (-not $? -and $LASTEXITCODE -eq 2) { exit 2 }"
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
@@ -229,7 +232,8 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_HEAD + command]
+        script = POWERSHELL_HEAD + command + POWERSHELL_TAIL
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 
