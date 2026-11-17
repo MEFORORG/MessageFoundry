@@ -33,8 +33,19 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
+- **A Direct outbound's `subject` is refused at load under the Email destination's rule.** A
+  subject holding a C0 control character (TAB included), DEL, a Unicode line break, or an encoded
+  word that decodes to one of those now fails `check` and start; before, a control the header
+  writes raw went out in the S/MIME `Subject`. See the `subject` rows in
+  [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #5360`)
 
 ### Fixed
+- **A REST, SOAP or FHIR outbound that names a signing key but resolves it empty is refused at
+  load instead of sending unsigned.** An empty `sign_private_key` read as signing off whatever
+  `sign_enabled` said. It now refuses unless `sign_enabled` reads as false. (`BACKLOG #5364`)
+- **A non-capturing X12 outbound's unparseable-reply error is scrubbed and unchained.** Its text
+  goes through the same scrub as the captured arm's detail, and the parse error is no longer its
+  cause or context. (`BACKLOG #5365`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a

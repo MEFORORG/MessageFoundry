@@ -532,18 +532,14 @@ class X12Destination(DestinationConnector):
         try:
             msg = X12Message.parse(interchange)
         except X12PeekError as exc:
+            # Scrubbed, because a bad reply can embed a fragment (#120), and acted on below, outside
+            # this handler, so a raise chains no parse error as cause or context (BACKLOG #5365).
+            unparseable = f"unparseable X12 reply: {safe_exc(exc)}"
+        if unparseable is not None:
             # A reply interchange WAS received but won't parse. Capturing → outcome='unparseable' (a reply
             # arrived; we just can't read it — NOT "no reply"). Non-capturing → a retryable DeliveryError.
             if self.capture_response:
-                return DeliveryResponse(
-                    body=text,
-                    outcome="unparseable",
-                    detail=f"unparseable X12 reply: {safe_exc(exc)}",  # scrub: a bad reply can embed a fragment (#120)
-                )
-            # Scrubbed like the capturing arm, and raised below, outside this handler, so neither
-            # __cause__ nor __context__ carries the parse error's raw text (BACKLOG #5365).
-            unparseable = f"unparseable X12 reply: {safe_exc(exc)}"
-        if unparseable is not None:
+                return DeliveryResponse(body=text, outcome="unparseable", detail=unparseable)
             raise DeliveryError(unparseable)
         functional = [sid for sid in msg.segment_ids() if sid != "ISA"]
         if functional and functional[0] == "TA1":

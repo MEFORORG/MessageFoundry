@@ -795,10 +795,11 @@ def test_construction_probe_refuses_an_unsupported_algorithm(
         "Referral\nBcc: someone@hisp.example",
         # A lone TRAILING newline, which the header would RFC 2047-encode rather than refuse.
         "Referral\n",
+        # A Unicode line break, which the build probe refused too.
+        "Referral\u2028note",
         # Controls no build refuses, which the header would write raw.
         "Referral\x01note",
         "Referral\x00note",
-        "Referral\u2028note",
     ],
 )
 def test_a_subject_with_a_control_character_is_refused_at_construction(

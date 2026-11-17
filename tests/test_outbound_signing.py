@@ -323,16 +323,25 @@ def test_from_settings_enabled_with_empty_key_refuses(key: str | None, enabled: 
         signer_from_destination(Destination(name="OB", type=ConnectorType.REST, settings=settings))
 
 
-@pytest.mark.parametrize("settings", [{"sign_enabled": False}, {"sign_enabled": "false"}, {}])
-def test_from_settings_empty_key_not_enabled_stays_off(settings: dict[str, object]) -> None:
-    assert OutboundSigning.from_settings({**settings, "sign_private_key": ""}) is None
+@pytest.mark.parametrize("key", ["", None])
+def test_from_settings_named_empty_key_with_no_flag_refuses(key: str | None) -> None:
+    # The model's default for an absent flag is on, so a named but empty key is not "off".
+    with pytest.raises(ValueError, match="sign_private_key is empty"):
+        OutboundSigning.from_settings({"sign_private_key": key, "sign_key_id": "k1"})
 
 
-def test_from_settings_unreadable_flag_with_empty_key_hides_the_value() -> None:
-    # The flag is read with its input hidden, as the model reads it (BACKLOG #296).
-    with pytest.raises(ValidationError) as caught:
+@pytest.mark.parametrize("enabled", [False, "false", "off", 0])
+def test_from_settings_empty_key_flag_false_stays_off(enabled: object) -> None:
+    assert OutboundSigning.from_settings({"sign_enabled": enabled, "sign_private_key": ""}) is None
+
+
+def test_from_settings_unreadable_flag_with_empty_key_names_the_setting_only() -> None:
+    # Raised outside the pydantic handler, so neither text, errors() nor chain holds the value.
+    with pytest.raises(ValueError, match="sign_enabled must be a boolean") as caught:
         OutboundSigning.from_settings({"sign_enabled": "probe-7f3a", "sign_private_key": ""})
+    assert not isinstance(caught.value, ValidationError)
     assert "probe-7f3a" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 def test_outbound_signing_forbids_unknown_field(ec_pem: str) -> None:
