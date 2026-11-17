@@ -62,6 +62,7 @@ from messagefoundry.pipeline.phase_timing import (
     lane_episode_timing_enabled,
 )
 from messagefoundry.store import ClaimedHeads, OutboxItem, QueueStore, Stage
+from messagefoundry.store.queue_tag import QueueOpenFault
 
 log = logging.getLogger(__name__)
 
@@ -442,6 +443,15 @@ class _WindowedCount:
             return 0
         n, self.pending, self.last_emit = self.pending, 0, now
         return n
+
+
+def _fresh_open_fault(shared: QueueOpenFault) -> QueueOpenFault:
+    """A new :class:`QueueOpenFault` with ``shared``'s text, constructed and never raised, so its
+    ``__traceback__``, ``__cause__`` and ``__context__`` are all None and logging it reaches no
+    frame, the dispatcher's included, whose items hold other rows' plaintext (BACKLOG #6706). The
+    claim hands one fault object to every unopened row of a lane, so T17 logs a copy rather than
+    ``shared`` itself: whatever chain or traceback ``shared`` may carry stays off the log."""
+    return QueueOpenFault(*shared.args)
 
 
 class StageDispatcher:
@@ -1830,6 +1840,17 @@ class StageDispatcher:
         i = 0
         try:
             for i, item in enumerate(items):
+                if item.open_fault is not None:
+                    # The claim could not open this row for a reason that is not the row (a key
+                    # service with no verdict, a failed store read or dead-letter write), so it is
+                    # an infra fault at this item, never content poison (BACKLOG #5735). It takes
+                    # the T17 outcome directly and is never raised: a raise would give the fault a
+                    # traceback reaching this frame, whose `items` hold other rows' plaintext
+                    # (BACKLOG #6706). T17 logs a fresh, never-raised copy with no traceback,
+                    # cause or context.
+                    return self._infra_fault_outcome(
+                        lane, items, i, _fresh_open_fault(item.open_fault)
+                    )
                 result = await self._process_item(lane, item)
                 if result.kind is LaneResultKind.RESOLVED:
                     continue
@@ -1851,34 +1872,38 @@ class StageDispatcher:
             return _LaneOutcome(None), [], None  # all RESOLVED
         except asyncio.CancelledError:
             raise  # teardown: leave the whole prefix INFLIGHT for reset_stale_inflight (crash-safety)
-        except Exception:  # noqa: BLE001 — T17 machinery fault: re-pend head w/ backoff, release tail
-            # Fix A: re-pend the UNHANDLED head items[i] at an exponential-capped backoff so it reads
-            # NOT-due (collapsing the spin). A zero-progress (i==0) fault escalates the backoff by the
-            # lane's streak; a fault that made forward progress (i>0) resets the streak (fix B terminal
-            # block), so it retries at the base backoff.
-            st = self._states.get(lane)
-            streak = st.infra_error_streak if (st is not None and i == 0) else 0
-            park_until = self._clock() + self._infra_backoff(streak)
-            log.error(
-                "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
-                "re-pending head with backoff until %.3f",
-                self._stage.value,
-                lane,
-                i,
-                park_until,
-                exc_info=True,
-            )
-            head_id = items[i].id
-            tail = [
-                it.id for it in items[i + 1 :]
-            ]  # tail only — the head is re-pended, not released
-            return (
-                _LaneOutcome(
-                    LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)
-                ),
-                tail,
-                (head_id, park_until),
-            )
+        except Exception as exc:  # noqa: BLE001 — T17 machinery fault: re-pend head w/ backoff, release tail
+            return self._infra_fault_outcome(lane, items, i, exc)
+
+    def _infra_fault_outcome(
+        self, lane: str, items: list[OutboxItem], i: int, exc: Exception
+    ) -> tuple[_LaneOutcome, list[str], tuple[str, float] | None]:
+        """The T17 outcome for an infra fault ``exc`` at ``items[i]`` (see :meth:`_drain_lane`)."""
+        # Fix A: re-pend the UNHANDLED head items[i] at an exponential-capped backoff so it reads
+        # NOT-due (collapsing the spin). A zero-progress (i==0) fault escalates the backoff by the
+        # lane's streak; a fault that made forward progress (i>0) resets the streak (fix B terminal
+        # block), so it retries at the base backoff.
+        st = self._states.get(lane)
+        streak = st.infra_error_streak if (st is not None and i == 0) else 0
+        park_until = self._clock() + self._infra_backoff(streak)
+        log.error(
+            "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
+            "re-pending head with backoff until %.3f",
+            self._stage.value,
+            lane,
+            i,
+            park_until,
+            exc_info=exc,
+        )
+        head_id = items[i].id
+        tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
+        return (
+            _LaneOutcome(
+                LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)
+            ),
+            tail,
+            (head_id, park_until),
+        )
 
     # --- lane state transition helpers --------------------------------------
 
