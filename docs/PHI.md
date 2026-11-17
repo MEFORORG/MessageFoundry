@@ -2550,7 +2550,7 @@ both are described below:
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or components 5, 7 and 13, where CX.5, XON.7 and XCN.13 carry an id type, in any of their subcomponents too, such as `ID^^^AUTH^MR&local`. Those components are read so in every field whatever its type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
-| The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
+| The denylist tables did not load or failed the floor check, or the site-code check's prefixes differ from the publish guard's `[site_prefix]` table (BACKLOG #5541), and the caller passed `require_live_denylist=True` | The token source |
 
 The rows describe both anonymizers, the toolkit's `messagefoundry_toolkit/anon/` and the tee's
 `tee/anon/`. The inputs on which the two are known to differ are listed in one place, the list
@@ -2568,11 +2568,12 @@ as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is 
 component read and one subcomponent on a subcomponent read, and `Peek` decodes a subcomponent,
 reading the first one where a component has several. An escape can pair across the subcomponent
 separator in the first reading and not in the second, so the check takes both. The shape
-detectors read each unmapped value as written, then each of its components decoded whole and each
-of its subcomponents decoded on its own, also with `\H\` and `\N\` dropped and with invisible
-characters removed. The MRN-typed check reads every component, its first subcomponent and each
-subcomponent of components 5, 7 and 13, as written, decoded, and with invisible characters
-removed, each trimmed and never split; `tests/test_anon_b224_5654.py` is the specification
+detectors read each unmapped value as written and with invisible characters removed, then each
+of its components decoded whole and each of its subcomponents decoded on its own, also with
+`\H\` and `\N\` dropped and with invisible characters removed. The MRN-typed check reads every
+component, its first subcomponent and each subcomponent of components 5, 7 and 13, as written,
+decoded, and with invisible characters removed, each trimmed, also folded to Unicode
+compatibility form, and never split; `tests/test_anon_b224_5654.py` is the specification
 of which forms count (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
@@ -2598,8 +2599,8 @@ still pass:
   and a code written as the argument of a well-formed hex or multi-byte character-set escape,
   such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
   not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
-- The IPv6 check can miss a routable address written in a form none of its candidate texts
-  parses (BACKLOG #5654).
+- The IPv6 check misses some routable addresses. At least this passes: one written with
+  fullwidth hex digits, which the IPv6 check does not fold (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
@@ -2741,8 +2742,8 @@ which cause applies to each, and the `error:` line that ends the run repeats the
 
 `python -m tee anonymize-captures` logs the summary at INFO once per run, after it has checked
 the captures, with a count per address. A quieter `--log-level` does not hide it: the line is
-then printed plain to stderr. It says the denylist tables were live only when they loaded and
-passed the floor check on every message. Read that list before you share a dataset. Map any
+then printed plain to stderr. It says the denylist tables were live only when they loaded,
+passed the floor check and matched the site-code check's prefixes on every message. Read that list before you share a dataset. Map any
 field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### A captured record's id follows the rules, and its time is the real capture time

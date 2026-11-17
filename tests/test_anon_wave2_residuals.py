@@ -138,7 +138,7 @@ def test_the_opt_in_refuses_on_a_split_table(
     ):
         anon.anonymize_checked(f"{_HEAD}\rPV2|1", salt=_SALT, require_live_denylist=True)
     # The source is loaded, so the advice is to fix the entry, not to load a source.
-    assert "two digits" in str(caught.value)
+    assert "Start a new run so the site-code check and the publish guard" in str(caught.value)
     assert "Load the denylist token source." not in str(caught.value)
 
 

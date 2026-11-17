@@ -824,13 +824,14 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
 #: interleaved with one, such as ``971234\\X00\\``, ``97\\XAD\\1234`` or ``MR`` with a U+200B, reads
 #: as the value without it (BACKLOG #5632, #5654).
 _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
-#: The Unicode default-ignorable code points outside Cc and Cf (DerivedCoreProperties.txt,
-#: Default_Ignorable_Code_Point), as inclusive ranges: among them U+2065, unassigned, the
+#: Unicode default-ignorable code points (DerivedCoreProperties.txt, Default_Ignorable_Code_Point)
+#: that Cc and Cf do not all cover, as inclusive ranges: among them U+2065, unassigned, the
 #: combining grapheme joiner
 #: U+034F and the variation selectors, category Mn, and the Hangul fillers U+115F, U+1160, U+3164
 #: and U+FFA0, category Lo. A consumer shows none of them, so a site code or ``MR`` they
-#: interleave reads as the value without them (BACKLOG #5654). Most ranges inside Cc or Cf are
-#: left to :data:`_INVISIBLE_CATEGORIES`; a few listed here hold Cf code points as well.
+#: interleave reads as the value without them (BACKLOG #5654). Ranges wholly inside Cc or Cf are
+#: mostly left to :data:`_INVISIBLE_CATEGORIES`; some listed here hold Cf code points too, and
+#: two, U+1BCA0 to U+1BCA3 and U+1D173 to U+1D17A, are wholly Cf. Listing one twice is harmless.
 _DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
     (0x034F, 0x034F),
     (0x115F, 0x1160),

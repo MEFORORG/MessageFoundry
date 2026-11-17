@@ -1297,8 +1297,9 @@ def refusal_advice(
         if reason.startswith(SITE_PREFIX_SPLIT_LEAD):
             # The source loaded; the site-code table and the guard's differ (BACKLOG #5541).
             steps.append(
-                "Make every [site_prefix] entry in the token source two digits, then run again "
-                "so both tables load from it."
+                "Start a new run so the site-code check and the publish guard load the same token "
+                "source. An entry that is not two digits keeps them apart: the site-code check "
+                "reads two-digit prefixes only."
             )
         else:
             steps.append("Load the denylist token source.")
