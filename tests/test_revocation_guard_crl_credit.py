@@ -289,7 +289,7 @@ def test_the_proxy_leg_reads_the_rule(relaxed: bool) -> None:
 
 
 def _rule_body(tree: ast.Module) -> set[int]:
-    """The node ids inside the one module-level ``crl_credited``; asserts there is exactly one."""
+    """The node ids inside the one module-level ``crl_no_credit``; asserts there is exactly one."""
     rules = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == _RULE]
     assert len(rules) == 1, f"expected one module-level def {_RULE}, found {len(rules)}"
     return {id(inner) for inner in ast.walk(rules[0])}
@@ -327,7 +327,8 @@ def test_only_the_rule_reads_the_crl_flag_alone() -> None:
     assert _POLICY in scanned, scanned
     assert not reads, (
         f"{_NAME} read outside {_RULE}: {reads}. A guard that credits a CRL reads {_RULE}, which "
-        "also refuses the credit on a context that skips validity-period checks (ADR 0173 §13)."
+        "also refuses the credit on a context without CERT_REQUIRED or one that skips "
+        "validity-period checks (ADR 0173 §13)."
     )
 
 

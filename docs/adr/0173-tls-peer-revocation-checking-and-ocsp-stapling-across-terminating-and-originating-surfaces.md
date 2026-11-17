@@ -787,10 +787,11 @@ that context's CRL, with no attestation, so the rule rests on each caller passin
 *(Note 2026-11-04: no longer so. `crl_is_a_check` and the `context_skips_validity` field are
 gone, and the guard decides on one field, `crl_checked`, which the disposition, the line and the
 AI broker all read (vault BACKLOG #5086, owner ruling 2026-11-03). `capture()` sets it True only
-when the context passes `crl_credited` in `config/tls_policy.py`, whose docstring states the
-conditions, and the caller did not pass `expiry_relaxed=True`, so the flag can only take the credit
-away. *(Corrected 2026-11-17, vault BACKLOG #4912: this listed two conditions on the context, a
-CRL and a kept time check, and left out a third, that the context verifies the peer.)* A CRL on a context that skips time
+when the context checks a CRL, the context does not skip time validity, and the caller did not pass
+`expiry_relaxed=True`, so the flag can only take the credit away. *(Note 2026-11-17, vault BACKLOG
+#4912: since then the context must also set `CERT_REQUIRED`. `capture()` reads `crl_no_credit` in
+`config/tls_policy.py`, whose docstring states the conditions; on a context without
+`CERT_REQUIRED` the record's words and default remedy follow that reason, not the relaxation.)* A CRL on a context that skips time
 validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
 at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
@@ -1654,8 +1655,8 @@ note (decision log `d20261026T140954228-ff8cff`).
 - It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
   on the hop's posture and attestation, as the Vault leg's guard does. *(Note 2026-11-17, vault
   BACKLOG #4912: both legs now read the flag through `crl_credited` in `config/tls_policy.py`, the
-  rule `RevocationHopGuard.capture` reads. Its docstring states the conditions and which of them
-  can decide on these legs.)* For this leg a proxy on
+  yes-or-no form of `crl_no_credit`, the rule `RevocationHopGuard.capture` reads. The docstring of
+  `crl_no_credit` states the conditions and which of them can decide on these legs.)* For this leg a proxy on
   a loopback address is on the box, decided without DNS, but the Vault leg's guard still counts
   any proxied hop as off the box. A proxy that takes no credentials is judged the same way,
   because the host name still crosses.

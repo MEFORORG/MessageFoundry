@@ -2015,7 +2015,8 @@ def _refuse_store_revocation(
     naming what was reviewed is the blanket env wearing a different key.
 
     ``context`` is a real :class:`ssl.SSLContext`, so ``capture`` reads it through
-    :func:`~messagefoundry.config.tls_policy.crl_credited`, off an object rather than off the
+    :func:`~messagefoundry.config.tls_policy.crl_no_credit`, the rule
+    :func:`~messagefoundry.config.tls_policy.crl_credited` answers yes or no, off an object rather than off the
     presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from

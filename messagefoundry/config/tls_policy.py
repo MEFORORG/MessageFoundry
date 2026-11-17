@@ -1059,9 +1059,9 @@ def crl_no_credit(ctx: ssl.SSLContext | None) -> CrlNoCredit | None:
     :meth:`RevocationHopGuard.capture` and the Vault and proxy legs in
     ``transports/strict_requests.py`` read one. The verify condition can decide only where a
     reader is handed a context that does not set ``CERT_REQUIRED``, as ``capture`` can be. The two
-    legs read a context from the hop's own factory, and the shipped factory's context sets it; on
-    those legs a connection that verifies no peer is refused by
-    ``NarrowedHTTPSConnection.connect``, not here. ``tests/test_revocation_guard_crl_credit.py``
+    legs read a context from the hop's own factory, and the shipped factory's context sets it.
+    ``NarrowedHTTPSConnection.connect`` on those legs is a separate check: it reads the
+    connection's ``cert_reqs``, not this context. ``tests/test_revocation_guard_crl_credit.py``
     fails a read of :func:`context_checks_revocation` by that name elsewhere in the engine package.
     A guard that reads the CRL flag another way passes that test, so review still owns it."""
     if ctx is None:
@@ -1083,7 +1083,8 @@ def crl_credited(ctx: ssl.SSLContext | None) -> bool:
 
 #: The remedy a revocation refusal names on a hop whose context skips validity-period checks
 #: (``tls_allow_expired``, :func:`skips_validity_period`), where the caller tells the guard so
-#: (``RevocationHopGuard.capture(expiry_relaxed=True)``, which names it by default). No CRL can
+#: (``RevocationHopGuard.capture(expiry_relaxed=True)``, which names it by default unless the
+#: context does not set ``CERT_REQUIRED``, where :data:`UNVERIFIED_WAYS_ACROSS` wins). No CRL can
 #: relax that refusal, so the connection-shaped default, which offers ``[tls].crl_file``, would
 #: name a lever that cannot work there (SDS-3.7). Since vault BACKLOG #5086 a guard handed such a
 #: context without that flag credits no CRL either, and names this text the same way.
@@ -2869,8 +2870,9 @@ class RevocationHopGuard:
     expiry_relaxed: bool = False
     #: Whether the context handed to :meth:`capture` does not set ``ssl.CERT_REQUIRED``
     #: (:attr:`CrlNoCredit.UNVERIFIED`). Descriptive only, like :attr:`expiry_relaxed`, and it
-    #: outranks that field in :attr:`no_credit`, so the record never calls such a hop's peer
-    #: certificate verified (vault BACKLOG #4912).
+    #: outranks that field in :attr:`no_credit`, so the guard's own words never call such a hop's
+    #: peer certificate verified. The caller's ``description`` and ``cell`` lead the record and are
+    #: the caller's words (vault BACKLOG #4912).
     unverified: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). That is not only a hop outside a connection: a connection hop whose CRL
@@ -2931,7 +2933,7 @@ class RevocationHopGuard:
         hop (scheme/host only — never a credential or a body).
 
         ``context`` is the :class:`ssl.SSLContext` this hop's handshake will actually use. When supplied,
-        :func:`crl_credited` reads it, so a hop whose CRL was
+        :func:`crl_no_credit` reads it, so a hop whose CRL was
         really loaded stops being refused while a sibling hop that never got one keeps its guard. Passing
         the context rather than a ``[tls].crl_file`` boolean is what makes the CRL relaxation per-hop:
         one instance-wide setting must never silence a hop whose handshake does not consult it.
