@@ -4367,9 +4367,10 @@ load, such as one holding a `TRUSTED CERTIFICATE` block. The one exception is a 
 no hop needs in its CA file (BACKLOG #3745).
 
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
-is empty or whitespace; leave it out for no pin. On every factory named above, and on `Http()`,
-a literal pin that breaks the pin syntax is refused at load too, and an `env()` pin once it
-resolves. On `MLLP()`, `Http()` and `DICOM()`, inbound or outbound, a `tls_ca_file` beside
+is empty or whitespace; leave it out for no pin. On every factory named above, on `Http()`, and
+on an inbound `MLLP()` or `DICOM()`, a literal pin that breaks the pin syntax is refused at load
+too, and an `env()` pin once it resolves. On `MLLP()` and `DICOM()`, inbound or outbound, and on
+the inbound-only `Http()`, a `tls_ca_file` beside
 `tls = false` is refused at load, with or without a pin, since the hop never reads it; one beside
 an `env()` `tls` is refused once that resolves off (BACKLOG #5329, #5331).
 
