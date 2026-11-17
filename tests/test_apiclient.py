@@ -606,16 +606,48 @@ def test_transport_guard_refuses_a_base_url_with_no_host(
         EngineClient(base_url, allow_insecure=allow_insecure)
 
 
-def test_httpx_dials_a_base_url_with_no_host() -> None:
+def test_httpx_dials_a_base_url_with_no_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """The premise of the no-host refusal: httpx does not refuse a hostless URL, it dials the empty
     host, which the resolver may map to a non-loopback address of this machine.
 
-    Measured on the installed httpx at the transport seam, which is the host the request goes to;
-    the URL's string form is not, since ``str()`` reads ``//engine...`` back as an authority. A
-    future httpx that refused such a URL would turn this red and make the refusal belt-and-braces."""
-    with httpx.Client(base_url="http:////engine.example.com:8765") as http:
-        built = http.build_request("GET", "/health").url
-    assert built.raw_host == b""
+    Measured at httpcore's TCP connect, which is where the request goes; the URL's string form is
+    not, since ``str()`` reads ``//engine...`` back as an authority. A future httpx or httpcore
+    that refused such a URL would turn this red and make the refusal belt-and-braces."""
+    import httpcore
+    from httpcore._backends.sync import SyncBackend
+
+    dialed: list[tuple[str, int]] = []
+
+    def _connect_tcp(self: object, host: str, port: int, *args: object, **kwargs: object) -> None:
+        dialed.append((host, port))
+        raise httpcore.ConnectError("not dialed in a test")
+
+    monkeypatch.setattr(SyncBackend, "connect_tcp", _connect_tcp)
+    with (
+        httpx.Client(base_url="http:////engine.example.com:8765") as http,
+        pytest.raises(httpx.ConnectError),
+    ):
+        http.get("/health")
+    assert dialed == [("", 80)]
+
+
+def test_transport_guard_refuses_a_base_url_carrying_userinfo() -> None:
+    """httpx would send ``user:password@`` as Basic auth on every request, over whatever hop the
+    URL names, so the gate refuses it before anything is built (BACKLOG #5343).
+
+    Mutation: delete the userinfo refusal. Red: DID NOT RAISE."""
+    for base_url in ("http://user:s3cret@10.0.0.5:8765", "https://user@engine.example.com:8765"):
+        with pytest.raises(ApiError, match="user name or password") as excinfo:
+            EngineClient(base_url, allow_insecure=True)
+        assert "s3cret" not in str(excinfo.value)
+
+
+def test_transport_guard_raises_no_raw_idna_error() -> None:
+    """A malformed IDNA A-label raises ApiError or constructs, never a raw ``idna`` error: the gate
+    reads ``raw_host``, which does not decode (BACKLOG #5343).
+
+    Mutation: read ``url.host``. Red: ``idna.core.IDNAError`` escapes the constructor."""
+    EngineClient("https://xn--ab-.example:8765").close()
 
 
 @pytest.mark.parametrize(

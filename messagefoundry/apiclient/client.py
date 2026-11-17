@@ -367,10 +367,11 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
     credential on such a hop; see :meth:`EngineClient._refuse_credential_on_cleartext`.
 
-    Three checks, in this order, and the order is load-bearing.
+    The URL is parsed first; the checks that follow run in this order, and the order is
+    load-bearing.
 
     **Scheme allow-list (ASVS 1.2.2, BACKLOG #1107).** Only ``http`` and ``https`` are permitted.
-    This has to run FIRST because everything below it is keyed on the HOST, and a URL like
+    This has to run before the host checks because everything below it is keyed on the HOST, and a URL like
     ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no hostname
     at all -- ``parts.hostname`` was ``None``, so the former ``host == ""`` early return waved it
     through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
@@ -388,6 +389,11 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     resolver may map to a non-loopback address of this machine (measured on httpx 0.28.1), with the
     credential in cleartext. No URL without a host can name an engine, so it is refused for both
     schemes.
+
+    **No userinfo (BACKLOG #5343).** httpx turns a ``user:password@`` in the base URL into a Basic
+    ``Authorization`` header on every request, over whatever hop the URL names, and the error text
+    that quotes the base URL would carry the password. The client's credential is the bearer
+    token, so a base URL carrying userinfo is refused rather than sent.
 
     **One parser decides (BACKLOG #5343).** The URL is parsed with ``httpx.URL``, the parser the
     transport dials with, not ``urllib.parse``. Two parsers that disagree on a URL are how a check
@@ -428,11 +434,17 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
             f"refusing a base URL with {found}: this client permits only the "
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
-    host = url.host
+    # raw_host, not host: it is what the transport dials, and host IDNA-decodes and can raise.
+    host = url.raw_host.decode("ascii").lower()
     if not host:
         raise ApiError(
             "refusing a base URL with no host: name the engine host, for example "
             "https://engine.example:8765 or http://127.0.0.1:8765."
+        )
+    if url.userinfo:
+        raise ApiError(
+            "refusing a base URL that carries a user name or password: this client authenticates "
+            "with its session token, never with credentials in the URL."
         )
     if scheme == "https":
         return False
@@ -715,7 +727,7 @@ class EngineClient:
         #: How many requests hold each transport right now, from the read of `_http` to the end of
         #: the buffered reply. A transport absent here is held by none.
         self._in_use: dict[httpx.Client, int] = {}
-        if self.base_url.lower().startswith("https"):
+        if httpx.URL(self.base_url).scheme == "https":
             before = _read_pin(cacert) if cacert is not None else None
             try:
                 verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
@@ -982,7 +994,7 @@ class EngineClient:
         """
         if not self._cleartext_hop:
             return
-        host = httpx.URL(self.base_url).host  # the constructor refused a URL with no host
+        host = httpx.URL(self.base_url).raw_host.decode("ascii")  # refused at construction if empty
         raise ApiError(
             f"refusing to send {what} over plaintext http to non-loopback host {host!r}: "
             "allow_insecure permits unauthenticated reads on a declared-plaintext engine, never a "
