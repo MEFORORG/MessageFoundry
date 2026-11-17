@@ -610,12 +610,18 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
     **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
     identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
-    Shared (parity)."""
+    Also ``None`` when the first MSH that carries four encoding characters repeats one of them
+    (BACKLOG #5374; MSH-2 is read up to the first MSH-1, so it never holds that one): such a header
+    cannot say which structure a character marks, so the surrogate rewriters and the leak check
+    would split fields at the wrong places. The anonymizer then refuses the message rather than
+    rewriting it. Shared (parity)."""
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if seg[:3].upper() == "MSH" and len(seg) >= 5:
             field = seg[3]
             enc = seg[4:].split(field, 1)[0]
             if len(enc) >= 4:
+                if len(set(enc[:4])) != 4:
+                    return None
                 seps = Seps(component=enc[0], repetition=enc[1], escape=enc[2], subcomponent=enc[3])
                 return seps, field
     return None
