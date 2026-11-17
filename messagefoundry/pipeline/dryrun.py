@@ -1239,9 +1239,10 @@ def split_messages(raw: bytes) -> list[bytes]:
     charset-agnostic — correct for every ASCII-compatible encoding without being told which one — and
     each member re-encodes to the file's own bytes. A payload holding a **single** message returns the
     original bytes verbatim, exactly as the File source hands a non-batch file off, unless a byte
-    order mark or an ``FHS``/``BHS`` header the parser refuses leads it; only a true batch pays the
-    normalize (line endings collapsed to ``\\r``, the ``FHS``/``BHS`` envelope
-    dropped), which is the same transformation that source applies to a batch.
+    order mark or an ``FHS``/``BHS`` header the parser refuses leads it, or envelope lines end it
+    (BACKLOG #5806); only a batch, or such a message, pays the normalize (line endings collapsed to
+    ``\\r``, the envelope lines dropped), which is the same transformation that source applies to a
+    batch.
 
     A UTF-16/32 payload has no ``b"\\x0dMSH"`` to find, so it comes back as one message and
     :func:`dry_run` decodes and parses it whole. That is narrower than the live File source, which
@@ -1257,9 +1258,12 @@ def split_messages(raw: bytes) -> list[bytes]:
     # The view spells each UTF-8 mark as U+FEFF, so split_batch reads the marks exactly as the live
     # split reads the UTF-8 decode. A mark the split keeps is spelled back before the latin-1 encode.
     view = raw.decode("latin-1")
-    if _LATIN1_BOM in view:
+    marked = _LATIN1_BOM in view
+    if marked:
         view = view.replace(_LATIN1_BOM, _BOM)
-    messages = [m.replace(_BOM, _LATIN1_BOM) for m in split_batch(view)]
+    messages = split_batch(view)
+    if marked:
+        messages = [m.replace(_BOM, _LATIN1_BOM) for m in messages]
     # A non-batch payload goes back byte-identical, as the File source hands one off, unless the
     # parser would refuse what leads it, or envelope lines end it; that source then hands the
     # message as the split read it.

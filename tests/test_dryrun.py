@@ -440,8 +440,8 @@ def test_split_messages_splits_where_byte_order_marks_lead_a_later_msh(
 ) -> None:
     """BACKLOG #5918 step 1: the live File source decodes, then splits past marks between a line
     break and a later MSH. The dry run's latin-1 view spelled each mark as three characters, so it
-    read such a file as one message. Mutation: drop the ``_LATIN1_MARKED_BOUNDARY`` substitution.
-    Red: one message."""
+    read such a file as one message. Mutation: drop the ``view.replace(_LATIN1_BOM, _BOM)``
+    spelling. Red: one message."""
     first = ADT_A01.encode("utf-8").rstrip(b"\r")
     second = ADT_A01.replace("MSG1", "MSG2").encode("utf-8")
     raw = first + brk + b"\xef\xbb\xbf" * marks + second

@@ -20,14 +20,21 @@ def test_b64_head_allocates_for_its_prefix_not_the_document() -> None:
     document, several MiB, where the prefix needs a few hundred bytes."""
     encoded = base64.b64encode(PNG * 65536).decode("ascii")  # about 6 MiB of base64
     wrapped = "\r\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
-    tracemalloc.start()
+    # Traced already (-X tracemalloc) or not, the peak is measured from here, and tracing someone
+    # else started is left on.
+    started_here = not tracemalloc.is_tracing()
+    if started_here:
+        tracemalloc.start()
     try:
+        before, _ = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
         head = b64_head(wrapped)
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
+        if started_here:
+            tracemalloc.stop()
     assert head.startswith(b"\x89PNG\r\n\x1a\n")
-    assert peak < 64 * 1024
+    assert peak - before < 64 * 1024
 
 
 @pytest.mark.parametrize("wrap", [1, 4, 76])

@@ -100,8 +100,8 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     first, *rest = _OLD_MSH_BOUNDARY.split(text)
     messages = [chunk[1:].lstrip(BOM) for chunk in rest]  # BACKLOG #5918: was chunk[1:]
     head = first.lstrip(_LEADING_WS_STR)
-    # BACKLOG #5806: was ("FHS", "BHS").
-    while head.startswith(_OLD_ENVELOPE_LINES):
+    # BACKLOG #5806: was head.startswith(("FHS", "BHS")).
+    while _old_envelope(head.partition("\r")[0]):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
     if head.strip():
         messages.insert(0, head)
@@ -109,24 +109,33 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
     return messages or [text]
 
 
-#: BACKLOG #5806: the envelope lines, dropped before the first message and at a message's end.
+#: BACKLOG #5806: the envelope segment ids, dropped before the first message and at a message's end.
 _OLD_ENVELOPE_LINES = ("FHS", "BHS", "BTS", "FTS")
+#: BACKLOG #5806: the noise around a message's closing envelope lines, whitespace and the mark.
+_OLD_TRAILING_NOISE = "".join(chr(c) for c in range(0x3001) if chr(c).isspace()) + BOM
+
+
+def _old_envelope(line: str) -> bool:
+    """BACKLOG #5806: noise, an envelope id, then the line's end or a character that is neither a
+    word character nor whitespace."""
+    rest = line.lstrip(_OLD_TRAILING_NOISE)
+    if not rest.startswith(_OLD_ENVELOPE_LINES):
+        return False
+    return len(rest) == 3 or not (rest[3].isalnum() or rest[3] == "_" or rest[3].isspace())
 
 
 def _old_drop_trailer(message: str) -> str:
     """BACKLOG #5806, written as lines rather than as the live code's scan from the end: an
-    ``MSH``-led message loses the trailing run of noise-only and envelope lines (an envelope line
-    perhaps led by noise) from its first envelope line on, keeping the CR before it; one whose run
-    holds no envelope line is unchanged."""
+    ``MSH``-led message loses the trailing run of noise-only and envelope lines from its first
+    envelope line on, keeping the CR before it; one whose run holds no envelope line is
+    unchanged."""
     if not message.startswith("MSH"):
         return message
 
     def noise(line: str) -> bool:
-        return line.strip(_LEADING_WS_STR) == ""
+        return line.strip(_OLD_TRAILING_NOISE) == ""
 
-    def envelope(line: str) -> bool:
-        return line.lstrip(_LEADING_WS_STR).startswith(_OLD_ENVELOPE_LINES)
-
+    envelope = _old_envelope
     lines = message.split("\r")
     run = len(lines)
     while run > 1 and (noise(lines[run - 1]) or envelope(lines[run - 1])):
@@ -141,7 +150,8 @@ def _old_drop_trailer(message: str) -> str:
 
 #: Tokens for each shape the readings tell apart: both line ends, a whole and a broken ``MSH``,
 #: the byte order mark, other leading whitespace and a vertical tab, a field separator, the batch
-#: envelope headers and a trailer (BACKLOG #5806), another segment, and a non-Latin-1 character (a wider string kind).
+#: envelope headers and a trailer (BACKLOG #5806), another segment, and a non-Latin-1 character (a
+#: wider string kind).
 TOKENS = ("\r", "\n", "MSH", "MS", "H", BOM, " ", "\x0b", "|", "FHS|", "BHS|", "BTS|", "PID|", "王")
 #: Every string of up to this many tokens, then a seeded sample of longer ones, which is where a
 #: marked second boundary or two boundaries behind an envelope header first fit.

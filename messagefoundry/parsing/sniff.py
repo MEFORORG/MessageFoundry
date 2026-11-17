@@ -249,8 +249,8 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
 
     Only the prefix is read, never the whole document: windows of ``b64`` that double in width are
     compacted until they hold enough characters, so the work grows with the text that holds them,
-    whitespace included, and not with the document (BACKLOG #5805). A ``max_bytes`` of zero or less gives ``b""``. The
-    decode validates, so a character outside the base64 alphabet gives ``b""`` rather than being
+    whitespace included, and not with the document (BACKLOG #5805). A ``max_bytes`` of zero or less
+    gives ``b""``. The decode validates, so a character outside the base64 alphabet gives ``b""`` rather than being
     skipped, which could otherwise line later characters up into a magic signature."""
     if max_bytes <= 0:
         return b""

@@ -13,6 +13,7 @@ All HL7 here is synthetic (fake MSH/PID/OBR/OBX), never real PHI.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -95,7 +96,7 @@ def test_split_batch_drops_fhs_bhs_envelope() -> None:
 def test_split_batch_drops_every_envelope_line_of_a_multi_batch_file() -> None:
     """BACKLOG #5806: the trailer and the next batch's header ended the message before them, so the
     last message of each batch carried envelope lines into the pipeline as segments. Mutation: drop
-    the ``_without_envelope_trailer`` pass in split_batch. Red: the members end with BTS/BHS/FTS."""
+    the ``_without_trailer`` pass in split_batch. Red: the members end with BTS/BHS/FTS."""
     filed = (
         "FHS|^~\\&|SEND|FAC\rBHS|^~\\&|SEND|FAC\r"
         + ADT_A01
@@ -138,11 +139,47 @@ def test_split_batch_reads_an_envelope_run_past_tolerated_noise(tail: str) -> No
     assert split_batch(ADT_A01 + tail + ADT_A02)[0] == ADT_A01
 
 
-def test_the_trailer_noise_class_is_the_tolerated_leading_noise() -> None:
-    """The class in split's envelope-line patterns is spelled out for the ReDoS scanner; it must
-    stay the content sniff's one definition of tolerated noise."""
-    matched = {chr(c) for c in range(0x10000) if split_module._NOISE_LINE.fullmatch(chr(c))}
-    assert matched == set(_LEADING_WS_STR)
+def test_the_split_noise_classes_are_the_ones_they_name() -> None:
+    """The leading class is spelled out for the ReDoS scanner and must stay the content sniff's one
+    definition of tolerated noise; the class an envelope line opens with must be the trailing noise
+    the end of a message is read back past."""
+    chars = [chr(c) for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF]
+    leading = {ch for ch in chars if split_module._LEADING_NOISE.fullmatch(ch)}
+    assert leading == set(_LEADING_WS_STR)
+    opener = {ch for ch in chars if split_module._ENVELOPE_LINE.match(ch + "BTS")}
+    assert opener == set(split_module._TRAILING_NOISE)
+
+
+@pytest.mark.parametrize(
+    "data", ["FHS 140 bpm regular", "BTSX|1", "FTS_LIKE"], ids=["space", "letter", "underscore"]
+)
+def test_a_data_line_that_only_begins_with_an_envelope_id_is_kept(data: str) -> None:
+    """Round-two review of BACKLOG #5806: any line beginning with the letters was dropped, so a
+    wrapped text line such as a fetal heart rate note was cut from the stored message. Mutation:
+    drop the separator lookahead from ``_ENVELOPE_LINE``. Red: the line is gone."""
+    body = ADT_A01 + data + "\r"
+    assert split_batch(body) == [body]
+    assert split_batch_bytes(body.encode("utf-8"), "utf-8") == [body.encode("utf-8")]
+
+
+def test_a_trailer_followed_by_a_frame_end_byte_is_still_dropped() -> None:
+    """Round-two review of BACKLOG #5806: an MLLP capture can end with ``\\x1c``, whitespace to
+    ``str.isspace``, and the narrower noise class kept the trailer before it. Red with the
+    sniff's class: the member ends with ``BTS|1``."""
+    assert split_batch(ADT_A01 + "BTS|1\rFTS|1\r\x1c\r" + ADT_A02)[0] == ADT_A01
+
+
+@pytest.mark.parametrize("where", ["head", "tail"])
+def test_many_envelope_lines_split_in_linear_time(where: str) -> None:
+    """Round-two review of BACKLOG #5806: the first chunk was copied once per envelope line, so a
+    file of many such lines took time quadratic in its size (33 s measured at 1.6 MB before the
+    walk by index). Mutation: walk the first chunk with ``partition`` and ``lstrip`` again. Red:
+    the call outlasts the bound."""
+    lines = "BTS|\r" * 400_000
+    text = "FHS|\r" + lines + ADT_A01 if where == "head" else ADT_A01 + lines
+    began = time.perf_counter()
+    assert split_batch(text)[0].startswith("MSH")
+    assert time.perf_counter() - began < 10
 
 
 def test_split_batch_drops_an_empty_leading_batch() -> None:
