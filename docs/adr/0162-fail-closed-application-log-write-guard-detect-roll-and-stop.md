@@ -491,7 +491,8 @@ it, the sink is the fault and the two stages decide as before. A formatter that 
 that notice leaves the process unable to log through that sink, so the sink is recorded unwritable
 with a reason that names a formatter fault, and the stop is asked for when every sink is
 unwritable, as before this amendment. The log file is not rolled or renamed, by that failure or by
-`revalidate()`'s probe, because it is healthy. The format faults `handleError` meets before any
+`revalidate()`'s probe, because a roll cannot clear a formatter fault. Nothing is written to it
+either, so whether its disk can take a write is not tested until the formatter is fixed. The format faults `handleError` meets before any
 roll are counted: the record's, the notice's, and a logger or level name that cannot be rendered.
 A stderr last-resort line names each kind with its count, at most once a minute per sink. Two
 format faults are not counted there: one formatting `revalidate()`'s probe notice only fails the

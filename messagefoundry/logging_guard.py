@@ -153,9 +153,10 @@ class LogSinkStatus:
 
 #: Called (synchronously, from whatever thread was logging) on every stage transition. It MUST be
 #: cheap, non-blocking and never raise — the guard is already handling a failure. It returns False
-#: when it dropped the event, so that the guard can fire an owed stage-2 event again (see
-#: :meth:`LogWriteGuard.record_unwritable`); a raise counts as a drop too, and any other return
-#: counts as delivered.
+#: when it could not hand the event on, so that the guard can fire an owed stage-2 event again
+#: (see :meth:`LogWriteGuard.record_unwritable`); a raise counts as that too, and any other return
+#: counts as delivered. An event handed on and lost later, as the engine's responder can lose one
+#: it scheduled when the runner tears down, counts as delivered.
 EscalationCallback = Callable[[LogSinkEvent], bool | None]
 
 #: One sink's "are you writable again?" self-test. Writes a real record to itself and RAISES if the
@@ -170,9 +171,8 @@ class LogWriteGuard:
     connector threads alike, so every mutation is under one lock. Escalation is **latched per sink** —
     a sink that is already ``unwritable`` does not re-fire on every subsequent record (that would turn
     one broken disk into an unbounded alert storm), and a later successful Stage-1 roll clears that
-    page latch so a genuine re-break pages again. A roll past the flap bound does not clear it: the
-    bound calls that roll a failure, so the sink stays unwritable, and the roll fires the stage-2
-    event again, as :meth:`record_rollover` states (BACKLOG #5812).
+    page latch so a genuine re-break pages again. A roll past the flap bound does not clear it;
+    :meth:`record_rollover` states what such a roll does instead (BACKLOG #5812).
 
     **The FLAP latch is a different thing**, an overlay on what this class reports (BACKLOG #5812,
     ADR 0162 amendment B). A successful roll does not always release it. :meth:`record_rollover`
@@ -289,9 +289,10 @@ class LogWriteGuard:
         otherwise roll forever — one rename, one fresh file and one escalation per log record. Past
         :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
         declared unwritable instead: a log you must replace every few seconds is not a working log,
-        and stage 2 is the honest verdict on it. Each further roll past the bound in that window
-        finds the sink already unwritable and leaves it so, and fires the stage-2 event and its
-        stderr line again, as origin/main did, so the stop is asked for again whatever the
+        and stage 2 is the honest verdict on it. **This is where the rule for a roll past the
+        bound is stated.** Each further roll past the bound in that window finds the sink already
+        unwritable and leaves it so, and fires the stage-2 event and its stderr line again, as
+        the guard did before ADR 0162 Amendment C, so the stop is asked for again whatever the
         responder answered before.
 
         **The flap latch holds what the bound declared unwritable** (BACKLOG #5812; this paragraph
@@ -324,10 +325,8 @@ class LogWriteGuard:
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
             tripped = streak > _MAX_ROLLS_PER_WINDOW
-            # A roll past the bound on a sink already unwritable keeps it so, so that no other
-            # thread reads it ``rolled`` in between (BACKLOG #5812). The escalation below still
-            # fires stage 2 again for it, as origin/main did, so the stop is asked for again
-            # whatever the responder answered last time.
+            # A roll past the bound on a sink already unwritable keeps it so, and still escalates;
+            # the docstring above states the rule.
             repeat = tripped and previous is not None and previous.state == "unwritable"
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
@@ -375,7 +374,7 @@ class LogWriteGuard:
         already owed when it wires a responder; one a failure records as owed just after that
         waits for the sink's next failure. And ``repeat``, which :meth:`record_rollover` passes
         for a roll past the flap bound on a sink already unwritable, fires the event and writes
-        the stderr line again, as origin/main did for every roll past the bound.
+        the stderr line again; :meth:`record_rollover` states why.
         ``cause`` is a literal phrase for the stderr line saying how the sink came to be
         unwritable.
 
@@ -882,8 +881,8 @@ class _GuardedSinkMixin(_SinkBase):
             # #5813). When the stand-in lands, the sink has just taken a write and neither stage
             # runs; the fault is only counted for the stderr line. When it does not land, the sink is the fault after all and the two stages below
             # decide. A formatter that cannot format even the stand-in leaves this process unable
-            # to log through this sink, so the sink is recorded unwritable without a roll: the
-            # file is healthy and a roll cannot clear a formatter fault.
+            # to log through this sink, so the sink is recorded unwritable without a roll: a roll
+            # cannot clear a formatter fault. Nothing was written, so the disk was not tested.
             stand_in = self._stand_in_for(record)
             stand_in_line: str | None = None
             if stand_in is not None:
@@ -901,9 +900,9 @@ class _GuardedSinkMixin(_SinkBase):
                     self._guard.record_unwritable(
                         self._sink_label,
                         reason=(
-                            f"formatter fault, not a disk fault: the sink's formatter could not "
-                            f"format a record ({kind}) nor the guard's notice ({notice_kind}); the "
-                            "sink was not rolled"
+                            f"formatter fault: the sink's formatter could not format a record "
+                            f"({kind}) nor the guard's notice ({notice_kind}); the sink was not "
+                            "rolled and its disk was not tested"
                         ),
                         cause="because its formatter fails",
                     )

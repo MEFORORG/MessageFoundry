@@ -213,8 +213,8 @@ def test_rolls_past_the_bound_ask_for_the_stop_again_as_main_does(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Each roll past the bound fires stage 2 with the stop request and writes the stderr line, as
-    # origin/main does, so the stop is asked for again whatever the responder answered before
-    # (BACKLOG #5812). The sink stays unwritable throughout. Driven by real rolls: a sink that
+    # main did before this change, so the stop is asked for again whatever the responder answered
+    # before (BACKLOG #5812). The sink stays unwritable throughout. Driven by real rolls: a sink that
     # heals on every roll and breaks on every record, well past the bound.
     # NEGATIVE CONTROL: on ce55b5324d a roll past the bound on a sink already unwritable fired
     # nothing, so a stop the responder had taken as delivered and then lost was never asked again:
@@ -943,7 +943,7 @@ def test_a_formatter_that_fails_on_every_record_halts_without_renaming_the_log(
     handler.emit(_record("anything"))
 
     assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
-    assert "formatter fault, not a disk fault" in events[0].reason
+    assert "its disk was not tested" in events[0].reason
     assert [s.state for s in guard.status()] == ["unwritable"]
     assert guard.can_log() is False
     assert guard.revalidate() is False

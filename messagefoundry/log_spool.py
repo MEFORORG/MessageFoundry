@@ -29,9 +29,10 @@ or :meth:`LogSpool.close` deletes it. One that is still there at the next start 
 because nothing on disk marks it as sent. A write the disk refused is dropped and counted; the empty
 segment it would have started is removed, so a full disk does not fill the directory with empty files.
 
-**Replay order.** Strictly first in, first out: segments in sequence order, lines in file order. While
-anything is spooled, the forwarder appends new records to the spool rather than sending them live,
-so nothing overtakes older evidence.
+**Replay order.** First in, first out: segments in sequence order, lines in file order. While the
+spool reads as holding anything, the forwarder appends new records to it rather than sending them
+live. A spool it cannot read, a missing or unreachable directory included, reads as holding
+nothing, so while that read fault stands newer records are sent live ahead of what it keeps.
 
 **Crash safety.** Each append is flushed to the operating system, so a process crash loses nothing
 already appended. A power loss can lose a tail the OS had not yet written.
