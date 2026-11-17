@@ -157,6 +157,9 @@ class Attribution:
     committer_linked: bool
     #: The raw git author name, whoever the action attributes the commit to.
     author_name: str = ""
+    #: Set when the author is unlinked and the committer could not be read. Rule 1 refuses the
+    #: commit anyway; the key the action would file it under is unknown.
+    committer_fault: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,7 +204,15 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     author_user = _user(author)
     # The action never reads the committer when the author is linked, so neither does this: a
     # malformed committer there must not fault the run and drop every other commit's refusal.
-    committer_user = _user(_person(commit, "committer")) if author_user is None else None
+    committer_user: Mapping[str, Any] | None = None
+    committer_fault: str | None = None
+    if author_user is None:
+        # An unlinked author is refused whatever the committer, so a null or malformed committer
+        # must not turn that refusal into a fault, which the workflow passes.
+        try:
+            committer_user = _user(_person(commit, "committer"))
+        except PrecheckFault as exc:
+            committer_fault = str(exc)
     if author_user is not None:
         chosen = author_user
     elif committer_user is not None:
@@ -217,6 +228,7 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
         author_linked=author_user is not None,
         committer_linked=committer_user is not None,
         author_name=str(author.get("name") or ""),
+        committer_fault=committer_fault,
     )
 
 
@@ -374,9 +386,16 @@ def evaluate(
             slots.append(None)
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
-    seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
+    # A commit whose committer could not be read has no known key, so it shields nobody.
+    seen_by_action = {
+        slot.name
+        for slot in slots[: read.first_page]
+        if slot is not None and slot.committer_fault is None
+    }
     checked: set[int] = set()  # linked accounts already judged under rule 2
     for who in (slot for slot in slots if slot is not None):
+        if who.committer_fault is not None:
+            faults.append(who.committer_fault)
         if not who.author_linked:
             # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed.
             refusals.append(

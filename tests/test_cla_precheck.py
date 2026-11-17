@@ -338,6 +338,37 @@ def test_a_linked_author_with_a_malformed_committer_is_not_a_fault() -> None:
         assert attribute({**commit, "committer": committer}).name == "a"
 
 
+@pytest.mark.parametrize(
+    "committer", [None, "not-an-object", {"name": "C", "user": "not-an-object"}, "absent"]
+)
+def test_an_unlinked_author_with_a_null_or_malformed_committer_is_refused(
+    committer: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5644 added item 1: rule 1 refuses an unlinked author whatever the committer, so a
+    committer that cannot be read must not turn the refusal into a fault, which the workflow
+    passes. Before the fix this exited 3."""
+    commit: dict[str, object] = {"oid": f"{1:040x}", "author": {"name": "Mallory", "user": None}}
+    if committer != "absent":
+        commit["committer"] = committer
+    pages = [_page([commit], 1, False)]
+    assert _run(_ENV, _serve(pages)) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "refused::" in out and "'Mallory'" in out
+
+
+def test_a_commit_whose_committer_is_unreadable_shields_no_later_author() -> None:
+    """The action's key for such a commit is unknown, so it must not hide a page-two author who
+    happens to share the unlinked author's name from rule 2."""
+    malformed = {"oid": f"{1:040x}", "author": {"name": "new-person", "user": None}}
+    pages = [
+        _page([malformed], 2, True),
+        _page([_commit(2, "New Person", "new-person", 90000003)], 2, False),
+    ]
+    verdict = evaluate(fetch_commits(_serve(pages), "M", "N", 7), _ALLOWLIST, _no_signatures)
+    assert len(verdict.refusals) == 2, verdict.refusals
+    assert verdict.fault and "committer" in verdict.fault
+
+
 def test_the_signature_file_parses_as_the_action_writes_it() -> None:
     assert cla_precheck.parse_signatures({"signedContributors": []}) == frozenset()
     entry = {"name": "octo-contributor", "id": 90000001, "comment_id": 1, "pullRequestNo": 7}
