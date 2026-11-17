@@ -672,7 +672,9 @@ def test_a_fault_under_the_tracked_settings_is_reported_and_never_blocks(
 )
 def test_a_fault_on_any_event_is_reported_and_never_blocks(bridge, tmp_path, capsys, event):
     write_settings(tmp_path, {event: [DENY_GROUP]})
-    assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == 0
+    # A PermissionRequest fault exits non-zero, as on main, but never with the block code.
+    expected = 1 if event == "PermissionRequest" else 0
+    assert run(bridge, tmp_path, {"hook_event_name": event, "tool_name": "Bash"}, event) == expected
     reported(capsys)
 
 
