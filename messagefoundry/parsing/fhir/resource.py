@@ -105,16 +105,18 @@ class FhirResource:
             model = model_class.model_validate(data)
         except ValidationError as exc:
             summary = _safe_validation_summary(resource_type, version, exc)
-        except (KeyError, TypeError, RecursionError) as exc:
-            # fhir.resources resolves a nested resource (a Bundle entry, a `contained` item) by its
-            # untrusted resourceType outside pydantic's error collection: an unknown type escapes as
-            # a KeyError quoting it, a non-string one as a TypeError, and nesting deep enough to
-            # overflow the stack as a RecursionError (BACKLOG #5367; measured on fhir.resources
-            # 8.3.0). Name only the exception type, and raise outside the handler so neither chain
-            # holds the value.
+        except Exception as exc:
+            # Broad on purpose, and it wraps ONLY the model_validate call, as signature.verify does
+            # (Manager decision, batch 614). fhir.resources resolves a nested resource (a Bundle
+            # entry, a `contained` item) by its untrusted resourceType outside pydantic's error
+            # collection: measured on 8.3.0, an unknown type escapes as a KeyError quoting it, a
+            # non-string one as a TypeError, and nesting deep enough to overflow the stack as a
+            # RecursionError (BACKLOG #5367). A list of types would let the next unmeasured one
+            # escape with its text. Name only the exception type, and raise outside the handler so
+            # neither chain holds the value. Nothing is swallowed: every failure still raises.
             summary = (
-                f"FHIR {resource_type} ({version}) failed validation: a nested resource could not "
-                f"be validated ({type(exc).__name__})"
+                f"FHIR {resource_type} ({version}) failed validation: the resource or a nested "
+                f"resource could not be validated ({type(exc).__name__})"
             )
         if summary is not None:
             raise FhirValidationError(summary)

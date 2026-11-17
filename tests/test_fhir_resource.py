@@ -160,3 +160,25 @@ def test_nested_resource_failure_is_a_phi_safe_validation_error(
     assert PHI_CANARY not in str(exc) and PHI_CANARY not in repr(exc)
     assert exc.__cause__ is None
     assert exc.__context__ is None
+
+
+def test_an_unmeasured_exception_type_is_also_converted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The catch is broad, so a type nobody measured cannot escape quoting the body either."""
+    import messagefoundry.parsing.fhir.resource as resource_module
+
+    class _Faulty:
+        @staticmethod
+        def model_validate(data: object) -> object:
+            raise AttributeError(PHI_CANARY)
+
+    monkeypatch.setattr(
+        resource_module, "load_get_fhir_model_class", lambda version: lambda rt: _Faulty
+    )
+    with pytest.raises(
+        FhirValidationError, match=r"could not be validated \(AttributeError\)"
+    ) as ei:
+        FhirResource.parse(as_json({"resourceType": "Patient"}))
+    exc = ei.value
+    assert PHI_CANARY not in str(exc) and PHI_CANARY not in repr(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
