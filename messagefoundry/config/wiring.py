@@ -107,6 +107,7 @@ from messagefoundry.config.snapshot import (
     _UNREACHABLE_WINERRORS,
     ConfigDirMissing,
     ConfigSnapshot,
+    _is_module_rel,
     config_py_files,
     is_missing_directory,
     read_config_snapshot,
@@ -649,9 +650,7 @@ def _reject_envref_headers(factory: str, headers: Any) -> None:
     if headers is None:
         return
     if isinstance(headers, EnvRef):
-        # Wherever the key is unset the reference resolves to its default=, which reaches the
-        # connector unchanged, so a default is held to the table rule below (BACKLOG #5328). A
-        # default of None is no headers, as a literal None is.
+        # The default is held to the table rule (BACKLOG #5328); None is no headers, as a literal is.
         default = headers.default
         if default is _UNSET or default is None:
             return
@@ -2865,10 +2864,7 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
-    # A blank tls_ca_file reads as unset, so it would turn the listener's client-certificate check,
-    # or the destination's private CA, off; a malformed pin, or one with no CA, would pass check.
-    # The same two checks every other TLS factory makes (BACKLOG #5329).
-    _check_tls_ca_file("MLLP", tls_ca_file)
+    _check_tls_ca_file("MLLP", tls_ca_file)  # BACKLOG #5329
     _check_tls_ca_pin("MLLP", tls_ca_pin, tls_ca_file)
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
@@ -3351,9 +3347,7 @@ def Http(
     An inbound **without** ``reply_from`` keeps the receipt behaviour above (``202`` for a committed
     body, ``503``, ``413`` or ``422`` for a refused one); every knob above is inert without it, and setting one alone is
     refused rather than silently ignored."""
-    # A blank tls_ca_file reads as unset, so it would turn client-certificate verification off; a
-    # malformed pin, or one with no CA, would pass check (BACKLOG #5329).
-    _check_tls_ca_file("Http", tls_ca_file)
+    _check_tls_ca_file("Http", tls_ca_file)  # BACKLOG #5329
     _check_tls_ca_pin("Http", tls_ca_pin, tls_ca_file)
     subjects = _intake_subjects_by_issuer(intake_client_subjects)
     settings: dict[str, Any] = {
@@ -4560,10 +4554,7 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
-    # The checks every other TLS factory makes (BACKLOG #5331): a blank tls_ca_file reads as unset,
-    # so the hop would fall back to the instance or OS trust while the config reads as pinned; a CA
-    # beside tls=False is never read, since neither the SCP nor the SCU builds a TLS context then;
-    # and a malformed pin, or one with no CA, would pass check.
+    # BACKLOG #5331.
     if tls_ca_file is not None:
         # The unread reason below reads tls by truthiness, so 0 would be refused as TLS off. Only
         # here: elsewhere inbound()/outbound() refuse it, naming the connection.
@@ -8330,12 +8321,8 @@ def _check_source_ip_allowlist(
     address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE **listen**
     source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention).
 
-    The allowlist is read once into a tuple before anything tests or iterates it, so a single-pass
-    iterable such as a generator is validated and returned whole, rather than consumed by the
-    validation loop and frozen empty, which a listener would read as no restriction (BACKLOG
-    #5333). A bare string is refused rather than read as one entry per character. An allowlist
-    given on a source that does not listen is refused even when it is empty, so the listen-source
-    rule does not depend on the value."""
+    It is read once, so a generator is not consumed by validation and frozen empty, which a
+    listener would read as no restriction (BACKLOG #5333)."""
     if allowlist is None:
         return None
     if isinstance(allowlist, (str, bytes)) or not isinstance(allowlist, Iterable):
@@ -9221,15 +9208,9 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
     snapshot = (
         source if isinstance(source, ConfigSnapshot) else read_config_snapshot(source, strict=False)
     )
-    # Only an unread module (a top-level ``*.py``), or the unlistable directory, takes the digest
-    # away: a load refuses both (_require_loadable). A suffix test alone also caught a file in a
-    # folder, such as a value file named ``*.py``, which no load runs and none refuses, so the
-    # graph would load with no digest and the sandbox would skip its comparison (BACKLOG #5334).
-    unread = [
-        rel
-        for rel in snapshot.unreadable
-        if rel == "." or ("/" not in rel and rel.lower().endswith(".py"))
-    ]
+    # Only an unread module, or the unlistable directory, takes the digest away, as only those are
+    # what a load refuses: a suffix test also caught a value file named ``*.py`` (BACKLOG #5334).
+    unread = [rel for rel in snapshot.unreadable if rel == "." or _is_module_rel(rel)]
     if unread:
         # A module it could not read is not described by the rest.
         _logger.warning(
@@ -9927,9 +9908,7 @@ def load_snapshot(
     directory = snapshot.directory
     code_digest = config_code_digest(snapshot)
     if code_digest is None:
-        # A sandbox worker's graph is compared with this digest only when there is one, so a load
-        # that recorded none would accept a worker running other config code. Refuse instead
-        # (BACKLOG #5334); _require_loadable above already refuses every case known to reach here.
+        # The sandbox compares a worker's digest only when the engine has one (BACKLOG #5334).
         raise WiringError(
             f"{_CONFIG_SOURCE_LEAD} {directory}: the config modules' digest could not be "
             "computed; see the engine log"
