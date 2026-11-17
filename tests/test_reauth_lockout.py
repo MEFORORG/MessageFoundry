@@ -675,6 +675,43 @@ async def test_the_reproved_session_keeps_its_count_whatever_the_listing_says(
         await store.close()
 
 
+async def test_a_forward_clock_step_does_not_reset_a_live_sessions_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the drop at the account's cap read the store's listing, which filters on
+    ``expires_at >= now``. During a forward wall-clock step past the session lifetime every older
+    session dropped out of it, so their counts were dropped; once the clock was set right those
+    sessions came back live on a fresh budget. Only a revoked or deleted session's count goes.
+    The session cap is off, because its own revoke ends the older sessions at the stepped sign-in,
+    and a count of a session the store ended is rightly dropped."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(lockout_threshold=5, require_mfa=False, max_sessions_per_user=0)
+        )
+        await _local_user(store)
+        old: list[str] = []
+        for _ in range(2):
+            identity, token = await _signed_in(service)
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+            old.append(hash_token(token))
+        real_time = time.time
+        stepped = real_time() + service._settings.session_absolute_hours * 3600 + 60
+        monkeypatch.setattr(time, "time", lambda: stepped)
+        identity, token = await _signed_in(service)
+        out = await service.reauth(identity, WRONG, token=token)
+        monkeypatch.setattr(time, "time", real_time)
+        assert all(service._session_reproof_failures(h) == 1 for h in old), "a budget was reset"
+        for h in old:  # control: the store never ended them, so they are live again now
+            row = await store.get_session(h)
+            assert row is not None and row.revoked_at is None
+        # The account had no room left, so the new session was answered at the cap (fail closed).
+        assert out.session_lost and not out.ok
+    finally:
+        await store.close()
+
+
 async def test_a_refused_read_at_the_reproof_cap_leaves_the_reproof_to_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

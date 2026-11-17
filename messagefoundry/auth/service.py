@@ -898,7 +898,8 @@ def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
 # cap, which goes past both. A count leaves the map in at least these ways (BACKLOG #5336). The
 # service drops it when it ends the session itself: a sign-out, a revoke, the budget revoke, the
 # idle or expiry revoke a request meets. At the account's cap, a re-proof first drops the counts of
-# the account's sessions the store no longer lists. When a new session's first failure finds the
+# the account's sessions the store shows as revoked or holds no row for, whatever the wall clock
+# reads. When a new session's first failure finds the
 # account at its cap or the map full, the age prune runs. If there is still no room, that session
 # is revoked on that failure (fail closed), and its entry is held at the cap. It leaves in at least
 # these ways: the budget revoke commits, a later re-proof finds the session gone (or lapsed, once
@@ -15007,29 +15008,37 @@ class AuthService:
             self._reproof_session_failures.pop(token_hash, None)
 
     async def _drop_unlisted_reproof_counts(self, user_id: str, *, keep: str | None = None) -> None:
-        """Drop the re-proof counts of ``user_id``'s sessions the store no longer lists, revoked or
-        past their absolute expiry (BACKLOG #5336). For an end the store does not name by hash: at
-        least the session cap's revoke, and an expiry no request met. **The caller holds the
-        account's re-proof lock**, which every rotation of the account also holds, so no entry is
-        re-keyed between the read and the drop and a live session's count is never dropped. A
-        session the store still lists, idle or not, keeps its count, and so does ``keep``."""
+        """Drop the re-proof counts of ``user_id``'s sessions the store shows as revoked or holds no
+        row for (BACKLOG #5336). For an end the store does not name by hash: at least the session
+        cap's revoke, and a row the session reaper purged. **The caller holds the account's
+        re-proof lock**, which every rotation of the account also holds, so no entry is re-keyed
+        between the read and the drop. Every unrevoked row keeps its count, past its expiry or idle
+        window or not, and so does ``keep``.
+
+        The read passes ``now=0.0``, so the listing's ``expires_at >= now`` filter holds for every
+        row and the wall clock decides nothing here, as BACKLOG #2283 made the AD-map revoke match
+        every unrevoked row whatever the clock says. With the clock's own ``now``, a forward
+        wall-clock step would leave live sessions out of the listing, their counts would be
+        dropped, and once the clock was set right those sessions would come back on a fresh budget.
+        A lapsed session's count is not judged here: a re-proof on it is refused as gone and ends
+        it first (:meth:`_end_lapsed_reproof_session`), and the age prune can reach it otherwise."""
         if not self._reproof_counts_of(user_id, keep=keep):
             return
-        live = {s.token_hash for s in await self._store.list_sessions(user_id)}
+        live = {s.token_hash for s in await self._store.list_sessions(user_id, now=0.0)}
         self._forget_reproof_counts(
             h for h in self._reproof_counts_of(user_id, keep=keep) if h not in live
         )
 
     async def _drop_ended_reproof_counts(self, user_id: str, token_hash: str) -> None:
         """At the account's cap, before a re-proof's verify, :meth:`_drop_unlisted_reproof_counts`
-        (BACKLOG #5336): the ends this service names by hash drop their own counts, but at least an
-        expiry no request met does not, so without this a busy account's cap could still fill with
-        dead counts. Run under the lock :meth:`_reproof` holds. The read is made only at the cap,
+        (BACKLOG #5336): the ends this service names by hash drop their own counts, but at least a
+        row the session reaper purged does not, so without this a busy account's cap could still
+        fill with dead counts. Run under the lock :meth:`_reproof` holds. The read is made only at the cap,
         so the charge after the verdict stays synchronous.
 
         ``token_hash``, the session being re-proved, keeps its count whatever the listing says: it
-        was found live just before, but the listing is read at a later instant, and a session that
-        expires between the two would otherwise lose its count and be verified on a fresh budget.
+        was found live just before, but the listing is read at a later instant, and a session ended
+        between the two would otherwise lose its count while this re-proof still verifies it.
         The drop is housekeeping, so a refused read is logged and the re-proof goes on, its counts
         kept (fail closed)."""
         mine = len(self._reproof_counts_of(user_id))
@@ -15135,10 +15144,9 @@ class AuthService:
             return _Reproof(ok=False, session_gone=True, user=user)
         if not session.is_live(now=time.time(), idle_seconds=self.session_idle_seconds):
             # Past its absolute expiry or idle window while this attempt waited behind the lock, so
-            # the validator would refuse it now: gone, and never verified (BACKLOG #5336). Checked
-            # BEFORE the drop below, which reads the store's listing, and that listing leaves out a
-            # session past its expiry: a just-expired session's count would otherwise be dropped
-            # and its queued guesses verified on a fresh budget.
+            # the validator would refuse it now: gone, and never verified (BACKLOG #5336). The drop
+            # below keeps the count of a lapsed session's unrevoked row, so the session is ended
+            # here rather than verified.
             await self._end_lapsed_reproof_session(token_hash)
             return _Reproof(ok=False, session_gone=True, user=user)
         # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
