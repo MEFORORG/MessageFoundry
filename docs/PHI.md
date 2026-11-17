@@ -739,8 +739,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp a
    changed key while the rotation record names it or cannot be read (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` inside the store open,
-   before the open's first write under the key (BACKLOG #4936; only the open's schema step, which
-   writes nothing under the key, can run before it), and closes it only when a run completes,
+   before the open's first write under the key (BACKLOG #4936; steps that write nothing under the
+   key can run before it, at least the schema step and, on SQL Server, the database option switch),
+   and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. **A sealed record under a key the run
    was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
    seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
