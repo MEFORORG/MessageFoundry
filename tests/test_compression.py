@@ -597,19 +597,18 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
         ("adt.hl7.", "dot or space"),  # Windows opens adt.hl7, and the extension reads as "."
         ("adt.hl7 ", "dot or space"),
         ("dir./adt.hl7", "dot or space"),  # a directory component, not only the leaf
-        ("NUL", "reserves"),
-        ("con.hl7", "reserves"),  # the stem before the first dot is what Windows matches
-        ("sub/COM1.txt", "reserves"),
-        ("CONIN$", "reserves"),
-        ("COM¹.hl7", "reserves"),  # a superscript-digit port
-        ("a?b.hl7", "reserves"),  # a character Windows refuses in a name
+        ("NUL", "reserved"),
+        ("con.hl7", "reserved"),  # the stem before the first dot is what ntpath.isreserved matches
+        ("sub/COM1.txt", "reserved"),
+        ("CONIN$", "reserved"),
+        ("COM¹.hl7", "reserved"),  # a superscript-digit port
+        ("a?b.hl7", "refuses"),  # a character Windows refuses in a name
     ],
 )
-def test_archive_member_name_reason_refuses_names_windows_rewrites(
-    name: str, fragment: str
-) -> None:
-    """BACKLOG #5369: a name Windows would open as another object is refused on every platform,
-    and the reason does not echo the name."""
+def test_archive_member_name_reason_refuses_windows_name_shapes(name: str, fragment: str) -> None:
+    """BACKLOG #5369: a colon, a trailing dot or space, and a reserved device stem or refused
+    character are refused on every platform, and the reason does not echo the name. The device
+    arm deliberately over-refuses: of these stems only NUL is rewritten on current Windows."""
     reason = archive_member_name_reason(name)
     assert reason is not None and fragment in reason
     assert name not in reason
@@ -633,9 +632,46 @@ def test_archive_member_name_reason_windows_arms_can_be_turned_off(name: str) ->
     assert archive_member_name_reason("../" + name, windows_names=False) is not None
 
 
-def test_zip_decompress_refuses_a_windows_device_member_name() -> None:
-    with pytest.raises(CompressionError, match="reserves"):
-        zip_decompress(_hostile_zip({"aux.hl7": _BODY}), max_output_bytes=None)
+@pytest.mark.parametrize(
+    ("name", "fragment"),
+    [("aux.hl7", "reserved"), ("adt.hl7:stream", "colon"), ("adt.hl7.", "dot or space")],
+)
+def test_zip_decompress_refuses_windows_name_shapes(name: str, fragment: str) -> None:
+    # End to end through the reader: each shape must survive zipfile's own name handling.
+    blob = _hostile_zip({name: _BODY})
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert zf.namelist() == [name]
+    with pytest.raises(CompressionError, match=fragment):
+        zip_decompress(blob, max_output_bytes=None)
+
+
+def test_dr_config_restore_passes_windows_names_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5369: the DR config restore keeps its earlier name check, so it calls the shared
+    guard with the Windows-name arms off. The guard is imported inside the function, so the
+    module attribute is what it reads."""
+    import tarfile
+
+    from messagefoundry.parsing import sniff
+    from messagefoundry.pipeline import dr_backup
+
+    seen: list[object] = []
+    real = sniff.archive_member_name_reason
+
+    def recording(name: object, **kwargs: bool) -> str | None:
+        seen.append(kwargs.get("windows_names", "default"))
+        return real(name, **kwargs)
+
+    monkeypatch.setattr(sniff, "archive_member_name_reason", recording)
+    tar_path = tmp_path / "bundle.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        info = tarfile.TarInfo("config/plain.toml")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"x=1"))
+    landed = dr_backup._extract_config_members(tar_path, tmp_path / "out")
+    assert landed == 1
+    assert seen == [False]
 
 
 def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:

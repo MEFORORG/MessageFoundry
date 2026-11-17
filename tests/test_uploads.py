@@ -1699,9 +1699,8 @@ def test_validate_upload_content_reads_past_the_first_8_kib(
 @pytest.mark.parametrize("signature", [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08"])
 @pytest.mark.parametrize("after", [b"", b"y" * 20_000], ids=["at-the-end", "in-the-middle"])
 def test_a_nul_free_zip_record_past_the_head_is_refused(signature: bytes, after: bytes) -> None:
-    """BACKLOG #5368: a ZIP reader finds the archive from its end, so a container appended after a
-    text head is still an archive. The record signature alone refuses it, with no NUL in the body
-    to fall back on, and the reason does not echo the body."""
+    """BACKLOG #5368, defence in depth: a real archive is refused by its NUL bytes, so this pins the
+    signature arm on a NUL-free run past the head. The reason does not echo the body."""
     from messagefoundry.parsing.sniff import nontext_upload_reason
 
     data = b"MSH|^~\\&|A|B\r" + _PAST_THE_SAMPLE + signature + b"\x01\x02word/doc" + after

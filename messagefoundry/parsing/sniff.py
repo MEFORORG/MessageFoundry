@@ -197,9 +197,10 @@ _CONTROL_DENSITY_LIMIT = 0.30
 #: the body's end. A dense run that straddles two windows is judged as two halves.
 _TEXT_WINDOW_BYTES = 8192
 #: The ZIP record signatures (local file header, central directory header, end of central directory,
-#: data descriptor). A ZIP reader finds the archive from its END, so a ZIP or DOCX appended after a
-#: text head is still an archive; a signature anywhere in the body is refused, not only a leading one
-#: (BACKLOG #5368). Each carries two C0 control bytes, so a text log does not contain one by chance.
+#: data descriptor), refused anywhere in the body as defence in depth (BACKLOG #5368). An appended ZIP
+#: or DOCX that a reader can extract already carries NUL bytes, which the NUL check refuses; this adds
+#: a NUL-free run carrying a signature. Each carries two C0 control bytes, so a text log does not
+#: contain one by chance.
 _ZIP_SIGNATURES = (*_MAGIC_PREFIXES["application/zip"], b"PK\x01\x02")
 
 
@@ -209,8 +210,8 @@ def nontext_upload_reason(data: bytes) -> str | None:
 
     * a leading magic-byte signature of a metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX,
       GIF, TIFF) — these carry embedded metadata (EXIF/XMP/docProps) the text-only feature refuses to store;
-    * a ZIP record signature anywhere in the body, since a ZIP or DOCX appended after a text head is
-      still readable as an archive (BACKLOG #5368);
+    * a ZIP record signature anywhere in the body, as defence in depth behind the NUL check
+      (BACKLOG #5368);
     * a body that is not plausibly plain text — it contains a NUL byte anywhere, or one of its
       consecutive 8 KiB windows has a high density of non-printable control bytes.
 
@@ -345,14 +346,16 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
     ``os.sep`` with ``/`` — so the backslash arm is live wherever ``os.sep`` is not a backslash and dead on
     Windows. Measured on CPython 3.14. A caller reading the archive by some other route still gets both.
 
-    With ``windows_names`` (the default), some names Windows would open as another object are refused
-    too, because a Handler may write a member on Windows (BACKLOG #5369): at least a colon anywhere
-    (``a.hl7:x`` names an NTFS alternate data stream of ``a.hl7``), a component ending in a dot or
-    space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and skip the content
-    check), and a component :func:`ntpath.isreserved` names, such as a device stem (``NUL``,
-    ``con.hl7``, ``COM1``, ``CONIN$``) or a character Windows refuses in a name. They run on every
-    platform, since an archive's name is judged for where it may be written, not where it was read.
-    They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
+    With ``windows_names`` (the default), three more arms run, because a Handler may write a member
+    on Windows (BACKLOG #5369). A colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of
+    ``a.hl7``) and a component ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension
+    would read as ``.`` and skip the content check) are refused. So is a component
+    :func:`ntpath.isreserved` names: a reserved device stem (``NUL``, ``con.hl7``, ``COM1``,
+    ``CONIN$``) or a character Windows refuses in a name. That arm deliberately over-refuses: of the
+    reserved device stems, only ``NUL`` is rewritten on current Windows (Windows 11 build 26300,
+    measured; see :func:`messagefoundry.pipeline.dr_backup._win_opens_another`), and the others open
+    as ordinary files. The arms run on every platform, since an archive's name is judged for where it
+    may be written, not where it was read. They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
     a long name beside its 8.3 short form still pass, so a Handler writing members on Windows keeps
     its own collision check. ``windows_names=False`` turns off only these arms; the drive-relative
     and backslash arms above still bind. The DR config restore passes it, for the reason its own
@@ -378,7 +381,10 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
         if part.endswith((".", " ")):
             return "member name has a component ending in a dot or space, which Windows drops"
         if ntpath.isreserved(part):
-            return "member name has a component Windows reserves as a device or refuses outright"
+            return (
+                "member name has a component that is a reserved Windows device name or holds a "
+                "character Windows refuses in a name"
+            )
     return None
 
 
