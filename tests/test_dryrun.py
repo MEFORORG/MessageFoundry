@@ -22,6 +22,7 @@ from messagefoundry.config.wiring import (
     handler_item_fault,
 )
 from messagefoundry.parsing.message import Message, RawMessage
+from messagefoundry.parsing.split import split_batch_bytes
 from messagefoundry.pipeline.dryrun import (
     AmbiguousInboundError,
     DeliveryPreview,
@@ -430,6 +431,29 @@ def test_split_messages_pipe_batch_and_single() -> None:
     two = (ADT_A01 + ADT_A01.replace("MSG1", "MSG2")).encode("utf-8")
     assert len(split_messages(two)) == 2
     assert len(split_messages(ADT_A01.encode("utf-8"))) == 1
+
+
+@pytest.mark.parametrize("marks", [1, 2], ids=["one-mark", "two-marks"])
+@pytest.mark.parametrize("brk", [b"\r", b"\n", b"\r\n"], ids=["cr", "lf", "crlf"])
+def test_split_messages_splits_where_byte_order_marks_lead_a_later_msh(
+    marks: int, brk: bytes
+) -> None:
+    """BACKLOG #5918 step 1: the live File source decodes, then splits past marks between a line
+    break and a later MSH. The dry run's latin-1 view spelled each mark as three characters, so it
+    read such a file as one message. Mutation: drop the ``_LATIN1_MARKED_BOUNDARY`` substitution.
+    Red: one message."""
+    first = ADT_A01.encode("utf-8").rstrip(b"\r")
+    second = ADT_A01.replace("MSG1", "MSG2").encode("utf-8")
+    raw = first + brk + b"\xef\xbb\xbf" * marks + second
+    live = split_batch_bytes(raw, "utf-8")
+    assert len(live) == 2
+    assert split_messages(raw) == live
+
+
+def test_split_messages_keeps_a_mark_that_leads_no_msh() -> None:
+    """Control: marks after a line break that no MSH follows are data, kept byte for byte."""
+    raw = ADT_A01.encode("utf-8") + b"NTE|1||\xef\xbb\xbfnote\r\xef\xbb\xbfNTE|2\r"
+    assert split_messages(raw) == [raw]
 
 
 def test_select_inbound_requires_name_when_ambiguous() -> None:

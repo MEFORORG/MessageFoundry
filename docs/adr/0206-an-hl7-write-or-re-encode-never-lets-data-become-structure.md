@@ -275,8 +275,10 @@ open points settled below.
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
   with `MSH` after whitespace is still handed over as its own bytes. The split drops an envelope's
-  header lines but not its `BTS`/`FTS` trailer lines, so the last message of an enveloped file, and
-  now its only message, carries them to the Handler; dropping them is not built here.
+  header lines. *(Changed by BACKLOG #5806: it also drops the run of `FHS`, `BHS`, `BTS` and `FTS`
+  lines that ends an `MSH`-led message, so neither the last message of an enveloped file nor its
+  only message carries the trailer to the Handler. A file handed over as its own bytes keeps
+  whatever it holds.)*
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -1218,6 +1219,16 @@ def dry_run(
     )
 
 
+#: A run of UTF-8 byte order marks, as the latin-1 view spells each (three characters), between a
+#: line break and a later ``MSH``: the boundary the live split finds after its decode (BACKLOG #5918).
+_LATIN1_MARKED_BOUNDARY = re.compile("(?<=[\r\n])(?:ï»¿)+(?=MSH)")
+
+
+def _spell_marks(found: re.Match[str]) -> str:
+    """The marks ``found`` holds, one U+FEFF for each three characters of the latin-1 view."""
+    return "\N{ZERO WIDTH NO-BREAK SPACE}" * (len(found.group()) // 3)
+
+
 def split_messages(raw: bytes) -> list[bytes]:
     """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries — as BYTES.
 
@@ -1247,12 +1258,18 @@ def split_messages(raw: bytes) -> list[bytes]:
 
     A leading UTF-8 byte order mark is read past whatever the connection's charset. The live sources
     do that only under a UTF-8 charset; under a single-byte one they keep the three bytes and the
-    parser refuses the file, so there the dry run is more lenient than the engine (ADR 0206).
+    parser refuses the file, so there the dry run is more lenient than the engine (ADR 0206). The
+    same holds for UTF-8 marks between a line break and a later ``MSH``: the dry run splits there
+    whatever the charset, where the live sources split there under a UTF-8 charset only (BACKLOG
+    #5918).
     """
     # A UTF-8 byte order mark reads as three characters in the latin-1 view, so split_batch could
     # not see past it as the live split, which decodes first, does (ADR 0206). Strip it, with the
-    # whitespace around it, before the view.
-    messages = split_batch(_lstrip_bom_ws(raw).decode("latin-1"))
+    # whitespace around it, before the view. Marks between a line break and a later MSH are spelled
+    # as the mark itself, which split_batch cuts past, so it splits there as the live split does
+    # (BACKLOG #5918); no mark survives into a member, so each still re-encodes in latin-1.
+    view = _LATIN1_MARKED_BOUNDARY.sub(_spell_marks, _lstrip_bom_ws(raw).decode("latin-1"))
+    messages = split_batch(view)
     # A non-batch payload goes back byte-identical, as the File source hands one off, unless the
     # parser would refuse what leads it; that source then hands the message as the split read it.
     if len(messages) == 1:

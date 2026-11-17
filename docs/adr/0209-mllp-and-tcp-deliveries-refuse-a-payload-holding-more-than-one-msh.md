@@ -36,7 +36,8 @@ outbound row is one delivered message. A Handler bug or a pasted batch is the re
 `MSH`.**
 
 1. **Which payload.** One that opens with `MSH` after whitespace and any byte order mark
-   (U+FEFF), and holds another line that starts with `MSH`. The mark is read past because
+   (U+FEFF), and holds another line that starts with `MSH`, or with a run of byte order marks and
+   then `MSH`. The mark is read past because
    `split_batch` reads past it too, and a receiver that drops it reads the messages behind it,
    although the engine's own parser refuses a body it leads. A line break is a CR or an LF, so a
    payload with LF or CRLF segment ends is read the way a receiver that normalizes them reads it. The reading is ADR 0206's: `_holds_more_than_one_message`, the ingress guard's,
@@ -84,7 +85,7 @@ remote-file outbounds, which may legitimately write a batch file.
 ## Acceptance Criteria
 
 - **AC-1** -- IF an MLLP or TCP delivery's payload opens with `MSH` and holds a second `MSH` line,
-  with CR, LF or CRLF line ends, leading whitespace or a leading byte order mark, THEN THE SYSTEM SHALL refuse it before any
+  one that starts with `MSH` or with byte order marks and then `MSH`, with CR, LF or CRLF line ends, leading whitespace or a leading byte order mark, THEN THE SYSTEM SHALL refuse it before any
   dial, on all four MLLP send paths and both TCP send paths, with `NegativeAckError(permanent=True)`,
   code `multiple-messages`, and text that holds no message content.
   -> `tests/test_one_frame_one_message.py::test_all_four_mllp_send_paths_refuse_two_messages_before_any_dial`,

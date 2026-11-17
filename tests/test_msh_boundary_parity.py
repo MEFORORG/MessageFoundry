@@ -20,6 +20,9 @@ BACKLOG #5918 widened three readings on purpose, and edited their copies here to
 split, the ingress guard and the byte scan now take a later ``MSH`` line that byte order marks
 lead as a boundary, as the delivery reading already did, and the split cuts past those marks.
 Each edited line says what it read at a0a5e4f5a4.
+
+BACKLOG #5806 changed the split on purpose too, and its copy with it: an ``MSH``-led message no
+longer ends with the batch envelope lines that followed it in the file.
 """
 
 from __future__ import annotations
@@ -96,7 +99,28 @@ def _old_split_batch(raw: str | bytes) -> list[str]:
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
     if head.strip():
         messages.insert(0, head)
+    messages = [_old_drop_trailer(m) for m in messages]  # BACKLOG #5806: was not there
     return messages or [text]
+
+
+#: BACKLOG #5806: the envelope lines a message's chunk may end with, dropped from it.
+_OLD_ENVELOPE_LINES = ("FHS", "BHS", "BTS", "FTS")
+
+
+def _old_drop_trailer(message: str) -> str:
+    """BACKLOG #5806, written as lines rather than as the live code's scan from the end: an
+    ``MSH``-led message loses the trailing run of empty and envelope lines from its first envelope
+    line on, keeping the CR before it; one whose run holds no envelope line is unchanged."""
+    if not message.startswith("MSH"):
+        return message
+    lines = message.split("\r")
+    run = len(lines)
+    while run > 1 and (lines[run - 1] == "" or lines[run - 1].startswith(_OLD_ENVELOPE_LINES)):
+        run -= 1
+    envelope = [i for i in range(run, len(lines)) if lines[i].startswith(_OLD_ENVELOPE_LINES)]
+    if not envelope:
+        return message
+    return "\r".join(lines[: envelope[0]]) + "\r"
 
 
 # --- the corpus ---------------------------------------------------------------------------------

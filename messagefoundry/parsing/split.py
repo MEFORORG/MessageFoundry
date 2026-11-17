@@ -146,6 +146,10 @@ _LEADING_BOM = re.compile(rb"\s*" + _BOM_BYTES)
 #: The batch-envelope header lines a first chunk may open with; neither is a message.
 _ENVELOPE_HEADERS = ("FHS", "BHS")
 
+#: The batch-envelope lines that may close a message's chunk: a batch's or file's trailer, and the
+#: next batch's header in a file of several batches (BACKLOG #5806). None is a message's segment.
+_ENVELOPE_LINES = ("FHS", "BHS", "BTS", "FTS")
+
 #: Codecs (by ``codecs.lookup`` name) that write every ASCII character as that one byte and use no
 #: ASCII byte for anything else, so a byte scan for a later ``MSH`` answers what a decode would.
 _ASCII_SAFE_CODECS = frozenset({"utf-8", "ascii"})
@@ -161,7 +165,9 @@ def split_batch(raw: str | bytes) -> list[str]:
     too, and the cut is past those marks, so the message starts with ``MSH`` (BACKLOG #5918). Each
     returned message is ``\r``-delimited. The leading ``FHS``/``BHS`` envelope header lines before
     the first ``MSH`` are dropped, since each split message is routed on its own and the batch
-    framing has no per-message meaning.
+    framing has no per-message meaning. So are the ``FHS``/``BHS``/``BTS``/``FTS`` lines that end an
+    ``MSH``-led message, such as a batch's trailer or the next batch's header (BACKLOG #5806), so a
+    batch :func:`encode_batch` framed splits back to its members.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
     whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
@@ -188,7 +194,25 @@ def split_batch(raw: str | bytes) -> list[str]:
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
     if head.strip():  # a chunk of other whitespace alone is not a message either
         messages.insert(0, head)
+    messages = [_without_envelope_trailer(m) if m.startswith(_MSH) else m for m in messages]
     return messages or [text]
+
+
+def _without_envelope_trailer(message: str) -> str:
+    """``message`` without the run of envelope lines (:data:`_ENVELOPE_LINES`) that ends it, and
+    without the empty lines between and after them; ``message`` itself when it ends with none,
+    empty lines aside. The CR that ends the last line kept stays. The ``MSH`` line
+    is never one: a message is cut back to its last other line at the latest. Each line is found
+    from the end, so a message with no trailer is not copied."""
+    cut = len(message)
+    while True:
+        end = cut
+        while end and message[end - 1] == "\r":
+            end -= 1
+        start = message.rfind("\r", 0, end) + 1
+        if start == 0 or not message.startswith(_ENVELOPE_LINES, start):
+            return message if cut == len(message) else message[:cut]
+        cut = start
 
 
 def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:

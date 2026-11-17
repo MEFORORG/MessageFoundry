@@ -21,6 +21,7 @@ import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.parsing import Message, split_batch, split_by_obr
+from messagefoundry.parsing.split import encode_batch
 from messagefoundry.transports import build_source
 
 # --- synthetic fixtures ------------------------------------------------------
@@ -85,6 +86,42 @@ def test_split_batch_drops_fhs_bhs_envelope() -> None:
     msgs = split_batch(enveloped)
     assert [Message.parse(m).control_id for m in msgs] == ["MSG1", "MSG2"]
     assert all(m.startswith("MSH") for m in msgs)  # no FHS/BHS leftover at the head of a message
+    # BACKLOG #5806: nor a BTS/FTS trailer at the end of the last one.
+    assert msgs[-1] == ADT_A02
+
+
+def test_split_batch_drops_every_envelope_line_of_a_multi_batch_file() -> None:
+    """BACKLOG #5806: the trailer and the next batch's header ended the message before them, so the
+    last message of each batch carried envelope lines into the pipeline as segments. Mutation: drop
+    the ``_without_envelope_trailer`` pass in split_batch. Red: the members end with BTS/BHS/FTS."""
+    filed = (
+        "FHS|^~\\&|SEND|FAC\rBHS|^~\\&|SEND|FAC\r"
+        + ADT_A01
+        + "BTS|1\rBHS|^~\\&|SEND|FAC\r"
+        + ADT_A02
+        + ADT_A03
+        + "BTS|2\r\rFTS|2\r"
+    )
+    # A member cut at the next MSH loses the CR before it, as every batch member always has.
+    assert split_batch(filed) == [ADT_A01, ADT_A02.rstrip("\r"), ADT_A03]
+
+
+def test_split_batch_and_encode_batch_round_trip_a_batch_with_its_trailer() -> None:
+    """BACKLOG #5806: the encode side writes a BTS trailer, and the split gave it back as a segment
+    of the last member. Mutation as above. Red: the last member ends with ``BTS|3``."""
+    members = [ADT_A01, ADT_A02, ADT_A03]
+    envelope = encode_batch([*members], control_id="1", timestamp="20260101120000")
+    split = split_batch(envelope)
+    # A member cut at the next MSH loses the CR before it; the last keeps its own.
+    assert split == [ADT_A01.rstrip("\r"), ADT_A02.rstrip("\r"), ADT_A03]
+
+
+def test_split_batch_keeps_a_segment_that_only_follows_an_envelope_line() -> None:
+    """Control: only the run of envelope lines that ENDS a message goes. A BTS line inside a
+    message, before its own segments, is the parser's to read, and a lone MSH line is kept."""
+    inner = ADT_A01 + "BTS|1\rNTE|1||note\r"
+    assert split_batch(inner) == [inner]
+    assert split_batch("MSH|^~\\&|A\r") == ["MSH|^~\\&|A\r"]
 
 
 def test_split_batch_custom_separators() -> None:
