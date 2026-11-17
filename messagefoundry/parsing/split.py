@@ -177,9 +177,7 @@ def split_batch(raw: str | bytes) -> list[str]:
     framing has no per-message meaning. So is the run of envelope trailer lines that ends an
     ``MSH``-led message (:func:`_trailer_start`, BACKLOG #5806): each line of it starts with
     ``BTS``, ``FTS``, ``BHS`` or ``FHS`` and then that message's own field separator (MSH-1),
-    when that is ASCII. The run must end the message, past one final CR, so a trailer that an
-    empty or whitespace line follows is kept. Every other line is kept, and every other cut is the
-    one the split made before that change.
+    when that is ASCII. Every other cut is the one the split made before that change.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
     whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
@@ -289,7 +287,7 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
         if not decode:
             # The byte scan alone hands this file over as its bytes; the decode only finds the
             # trailer lines to cut from them.
-            return [_less_the_trailer_lines(raw, text, messages[0], encoding)]
+            return [_less_the_trailer_lines(raw, messages[0])]
         return [one_message_bytes(raw, text, _without_trailer(messages[0]), encoding)]
     return [_without_trailer(message).encode(encoding) for message in messages]
 
@@ -299,56 +297,53 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     where ``text`` is the text the split was given: ``raw`` decoded with ``encoding``, or the dry
     run's latin-1 view of it.
 
-    ``raw`` itself, byte for byte, when the parser reads ``text`` as it is: ``text`` starts with
-    ``MSH`` after whitespace, or the split found no ``MSH``-led message in it either. From the
-    first of those the trailer lines the split dropped are cut (BACKLOG #5806), as
-    :func:`_less_the_trailer_lines` says: under an encoding that writes ASCII as itself, at the
-    line break before them, keeping every other byte. Otherwise the split read the message past leading noise the
-    parser refuses, a byte order mark or an ``FHS``/``BHS`` envelope header, so ``message`` is
-    handed over re-encoded, as each member of a batch is. Without this, one such message was an
-    ``ERROR`` where the same message in a batch of two was recorded."""
+    ``raw`` when the parser reads ``text`` as it is: ``text`` starts with ``MSH`` after whitespace,
+    or the split found no ``MSH``-led message in it either. In the first case the trailer lines the
+    split dropped (BACKLOG #5806) are cut from ``raw`` at the line break before them, and every
+    other byte stays, but only under an ``encoding`` that writes ASCII as itself: one
+    :func:`_writes_ascii_as_itself` accepts, a codec that ``_ASCII_SAFE_CODECS`` or
+    ``_ASCII_SAFE_PREFIXES`` names. ``utf-8-sig``, UTF-16 and cp932 are not. Under any other
+    encoding ``raw`` is handed over whole, trailer lines included, as it was before that change.
+
+    Otherwise the split read the message past leading noise the parser refuses, a byte order mark
+    or an ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member
+    of a batch is. Without this, one such message was an ``ERROR`` where the same message in a
+    batch of two was recorded."""
     if not message.startswith(_MSH):
         return raw
     if starts_with_msh(text):
-        if _TRAILER_ID.search(text) is None:
+        if not _writes_ascii_as_itself(encoding) or _TRAILER_ID.search(text) is None:
             return raw
         # The split's message, before it dropped the trailer, runs from the first MSH to the end.
         full = normalize(text)
-        return _less_the_trailer_lines(raw, text, full[full.find(_MSH) :], encoding)
+        return _less_the_trailer_lines(raw, full[full.find(_MSH) :])
     return message.encode(encoding)
 
 
-#: A line break as :func:`~messagefoundry.parsing.peek.normalize` reads one, in text and in bytes.
-_LINE_BREAK = re.compile("\r\n|\r|\n")
+#: A line break as :func:`~messagefoundry.parsing.peek.normalize` reads one, in bytes.
 _LINE_BREAK_BYTES = re.compile(b"\r\n|\r|\n")
 
 
-def _less_the_trailer_lines(raw: bytes, text: str, message: str, encoding: str) -> bytes:
+def _less_the_trailer_lines(raw: bytes, message: str) -> bytes:
     """``raw`` less the trailer lines :func:`_trailer_start` finds at the end of ``message``, the
-    split's reading of ``text`` before it dropped them, which ends where ``text`` ends. The cut is
-    at the line break before the first of them, in ``raw``'s own bytes, so every other byte stays.
-    Under an encoding that does not write ASCII as itself, ``text`` is cut instead and re-encoded
-    with ``encoding``, which gives back the file's own bytes only where that codec writes its
-    decode back the same."""
+    split's reading of ``raw`` before it dropped them, which ends where ``raw`` ends. The cut is at
+    the line break before the first of them, in ``raw``'s own bytes. Only the caller's
+    :func:`_writes_ascii_as_itself` check makes that byte cut the line cut."""
     cut = _trailer_start(message)
     if cut == len(message):
         return raw
     dropped = len(message) - cut
     lines = message[cut:].removesuffix("\r").count("\r") + 1
-    if _writes_ascii_as_itself(encoding):
-        # A normalized character is at most two of the file's, each at most four bytes.
-        return raw[: _start_of_last_lines(raw, lines, 8 * dropped + 8, _LINE_BREAK_BYTES)]
-    return text[: _start_of_last_lines(text, lines, 2 * dropped + 2, _LINE_BREAK)].encode(encoding)
+    # A normalized character is at most two of the file's, each at most four bytes.
+    return raw[: _start_of_last_lines(raw, lines, 8 * dropped + 8)]
 
 
-def _start_of_last_lines[S: (str, bytes)](
-    text: S, lines: int, span: int, breaks: re.Pattern[S]
-) -> int:
-    """Where the last ``lines`` lines of ``text`` start, one final line break ending the last of
-    them, when those lines and the break before them lie in the last ``span`` units of ``text``.
+def _start_of_last_lines(raw: bytes, lines: int, span: int) -> int:
+    """Where the last ``lines`` lines of ``raw`` start, one final line break ending the last of
+    them, when those lines and the break before them lie in the last ``span`` bytes of ``raw``.
     Only that tail is scanned, so a cut costs the length of what it drops."""
-    ends = [found.end() for found in breaks.finditer(text, max(0, len(text) - span))]
-    if ends and ends[-1] == len(text):
+    ends = [found.end() for found in _LINE_BREAK_BYTES.finditer(raw, max(0, len(raw) - span))]
+    if ends and ends[-1] == len(raw):
         ends.pop()
     return ends[-lines]
 
