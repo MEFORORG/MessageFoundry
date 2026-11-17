@@ -216,7 +216,10 @@ def test_a_repeated_commit_is_a_fault_too() -> None:
 def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
     """The reviewer's case: page one is [malformed, octo], page two [new-person, unsigned]. The
     malformed commit must still count toward the first page, or new-person slides into the
-    action's simulated view and its refusal is lost."""
+    action's simulated view and its refusal is lost. A null author is now refused under rule 1,
+    so the malformed shape here is one GitHub never sends: this guards the slot-keeping path as
+    defence in depth, and test_only_a_readable_unlinked_commit_keys_the_actions_view covers it
+    for a refused commit."""
     malformed = {"oid": f"{1:040x}", "author": "not-an-object", "committer": None}
     pages = [
         _page([malformed, _commit(2, "Octo", "octo-contributor", 90000001)], 3, True),
@@ -338,7 +341,7 @@ def test_a_linked_author_with_a_malformed_committer_is_not_a_fault() -> None:
         assert attribute({**commit, "committer": committer}).name == "a"
 
 
-_SIGNED_PAGE_ONE = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
+_LINKED_PAGE_ONE = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
 
 
 @pytest.mark.parametrize(
@@ -353,24 +356,24 @@ def test_an_unlinked_author_with_a_null_or_malformed_committer_is_refused(
     commit: dict[str, object] = {"oid": f"{2:040x}", "author": {"name": "Mallory", "user": None}}
     if committer != "absent":
         commit["committer"] = committer
-    pages = [_SIGNED_PAGE_ONE, _page([commit], 2, False)]
+    pages = [_LINKED_PAGE_ONE, _page([commit], 2, False)]
     assert _run(_ENV, _serve(pages)) == EXIT_REFUSED
     out = capsys.readouterr().out
     assert "refused::" in out and "'Mallory'" in out
 
 
-@pytest.mark.parametrize("author", [None, "absent"])
-def test_a_null_or_absent_author_is_refused_as_unlinked(
-    author: object, capsys: pytest.CaptureFixture[str]
+def test_a_null_author_is_refused_and_an_absent_one_is_a_fault(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A commit with no author object has no account linked to its author, so rule 1 refuses it
-    rather than faulting; before the fix this exited 3 past the action's page."""
+    """A null author (schema-legal) has no account linked, so rule 1 refuses it rather than
+    faulting; before the fix this exited 3 past the action's page. An absent ``author`` key is a
+    reply in the wrong shape, which stays a fault."""
     commit: dict[str, object] = {"oid": f"{2:040x}", "committer": {"name": "C", "user": None}}
-    if author != "absent":
-        commit["author"] = author
-    pages = [_SIGNED_PAGE_ONE, _page([commit], 2, False)]
-    assert _run(_ENV, _serve(pages)) == EXIT_REFUSED
-    assert f"commit {2:040x} has a git author" in capsys.readouterr().out
+    assert _run(_ENV, _serve([_LINKED_PAGE_ONE, _page([commit], 2, False)])) == EXIT_FAULT
+    capsys.readouterr()
+    commit["author"] = None
+    assert _run(_ENV, _serve([_LINKED_PAGE_ONE, _page([commit], 2, False)])) == EXIT_REFUSED
+    assert f"commit {2:040x} has no git author GitHub reports" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -394,7 +397,9 @@ def test_only_a_readable_unlinked_commit_keys_the_actions_view(
     ]
     verdict = evaluate(fetch_commits(_serve(pages), "M", "N", 7), _ALLOWLIST, _no_signatures)
     assert len(verdict.refusals) == refusals, verdict.refusals
-    assert verdict.fault is None
+    # The unreadable committer is reported, naming its commit, beside the refusal.
+    assert (verdict.fault is None) == (refusals == 1)
+    assert verdict.fault is None or f"commit {1:040x}:" in verdict.fault
 
 
 def test_the_signature_file_parses_as_the_action_writes_it() -> None:

@@ -32,7 +32,8 @@ EVERY commit, paging on ``hasNextPage``:
      from the FIRST PAGE only, first commit seen under each key.
 
 It faults in at least these cases: the pull request's head moved while it read, it read fewer
-distinct commits than GitHub's ``totalCount``, or a commit it does not refuse is malformed.
+distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
+not be read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -155,8 +156,6 @@ class Attribution:
     database_id: int | None
     author_linked: bool
     committer_linked: bool
-    #: The raw git author name, whoever the action attributes the commit to.
-    author_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -216,20 +215,20 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
         database_id=raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None,
         author_linked=author_user is not None,
         committer_linked=committer_user is not None,
-        author_name=str(author.get("name") or ""),
     )
 
 
 def unlinked_author(commit: Mapping[str, Any]) -> str | None:
     """Rule 1's input, read from the author alone: the git author name when no account is linked
-    to the author (a null or absent author counts), or None when one is or the author is malformed.
+    to the author, ``""`` for a null author, or None when one is linked or the author is malformed.
+    An absent ``author`` key is a reply in the wrong shape, so it is malformed, not unlinked.
 
     Kept apart from :func:`attribute`, so a fault while working out the action's key for a commit
     can never drop the refusal rule 1 already owes it.
     """
-    author = commit.get("author")
-    if author is None:
+    if "author" in commit and commit["author"] is None:
         return ""
+    author = commit.get("author")
     if isinstance(author, Mapping) and author.get("user") is None:
         return str(author.get("name") or "")
     return None
@@ -383,19 +382,26 @@ def evaluate(
     slots: list[Attribution | None] = []
     for commit in read.commits:
         unlinked = unlinked_author(commit)
-        if unlinked is not None:
+        oid = commit.get("oid", "")
+        if unlinked is not None and commit.get("author") is None:
+            # Rule 1, a commit GitHub reports no author for: nobody can be shown to have signed.
+            refusals.append(
+                f"commit {oid} has no git author GitHub reports, so no author can be shown to have "
+                "signed the CLA; re-author the commit"
+            )
+        elif unlinked is not None:
             # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed. Judged
             # before the key below, so a commit whose committer cannot be read is still refused.
             refusals.append(
-                f"commit {commit.get('oid', '')} has a git author, {unlinked!r}, linked to no "
-                "GitHub account, so that author cannot be shown to have signed the CLA; link the "
-                "author's email to an account, or re-author the commit"
+                f"commit {oid} has a git author, {unlinked!r}, linked to no GitHub account, so "
+                "that author cannot be shown to have signed the CLA; link the author's email to "
+                "an account, or re-author the commit"
             )
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            if unlinked is None:  # a refused commit's unreadable key changes no verdict
-                faults.append(f"commit {commit.get('oid', '')}: {exc}")
+            # Recorded even for a refused commit: its key is then missing from the action's view.
+            faults.append(f"commit {oid}: {exc}")
             slots.append(None)
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
