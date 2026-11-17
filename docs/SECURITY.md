@@ -8163,8 +8163,9 @@ engine cannot read, refuses the start or the reload. These settings take no pin.
 refuse rather than warn). Every anchor the engine checks at start and reload takes it, the dialling
 CAs above and a connection's own `tls_ca_file` included, and so do at least the SQL Server
 `[store].ssl_root_cert` pin, a generic DATABASE connection's `odbc_params` `sslca` file and a Vault
-hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it only in `serve`'s start and reload
-check, after the store has opened with the file, as a paragraph below says. Not covered: at least
+hop's CA text. The PostgreSQL `[store].ssl_root_cert` takes it only in `serve`'s settings check, at
+least at start, reload and DR activation, after the store has opened with the file, as a paragraph
+below says. Not covered: at least
 the Vault CA files (`MEFOR_STORE_VAULT_CA_FILE`, `MEFOR_SECRETS_VAULT_CA_FILE`), which their hops
 load by path with no such check. The check refuses a PEM label ending in `PRIVATE KEY` anywhere after the file's first
 `-----BEGIN `, of any kind: plain, PKCS#8 encrypted, `RSA` or `EC`. A TLS load skips a key block and
@@ -8187,11 +8188,11 @@ cannot vouch for its own hop.** The `store_sqlserver_pin` item of the
 [trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
 can hide and which checks still refuse.
 
-**The PostgreSQL `[store].ssl_root_cert` CA is checked at `serve`'s start and reload too, but only
-after the store has opened with it** (vault BACKLOG #4203). It takes the permission, path and change
+**The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
+DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes the permission, path and change
 checks and the private-key refusal, not the SQL Server pin's certificate checks. Under `enforce`, a
 file or folder a broad principal can write, or one whose permissions the engine cannot read,
-refuses the start or the reload. The store runs none of these
+refuses the start, the reload or the DR activation. The store runs none of these
 checks when it opens, so a start may already have trusted the file and sent the store login, and a
 command that opens the store without this check does not check the file at all. The same docstring
 item says what else the check does not cover.

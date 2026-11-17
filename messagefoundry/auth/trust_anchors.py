@@ -241,8 +241,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): at least no encryption header
     (BACKLOG #3090), no private-key label (BACKLOG #3745), one server certificate, inside its
     validity period. So a pin past notAfter refuses at least every reload and DR activation until
-    the file is replaced. The store open checks the file's size on disk before
-    it reads it; this check does not, and refuses the bytes as too large once they are read. At
+    the file is replaced. Like the store open, it refuses a file larger than
+    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` from its size on disk before it reads it,
+    with no row, and refuses the bytes as too large once they are read. At
     ``warn`` the start logs the pin's warning once: the preflight skips one the store open just
     logged (:data:`_WARNED_AT_OPEN`).
 
@@ -343,7 +344,8 @@ log = logging.getLogger(__name__)
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
 #: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025; and,
 #: since BACKLOG #3745, a file naming a private-key label, which the TLS library would load, on
-#: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too), and
+#: every anchor; at least the other refusals of :func:`_refuse_by_path_content` write it too; its
+#: ``reason`` is the refusal's text, vault BACKLOG #4569), and
 #: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
 #: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
@@ -451,7 +453,8 @@ class AnchorSpec:
 
     ``server_pin`` adds the SQL Server pin's certificate checks to a ``False`` spec's content
     checks (module item 11): one server certificate, inside its validity period. A ``True`` spec
-    never reaches those checks, so the two together are refused at construction."""
+    never reaches those checks, so the two together are refused at construction. Those checks
+    run in place of ``refuses_encryption_header``'s, so ``server_pin`` with it is refused too."""
 
     label: str
     setting: str
@@ -465,6 +468,11 @@ class AnchorSpec:
     def __post_init__(self) -> None:
         if self.server_pin and self.loads_verified_bytes:
             raise ValueError("server_pin needs loads_verified_bytes=False, or its checks never run")
+        if self.server_pin and self.refuses_encryption_header:
+            raise ValueError(
+                "server_pin refuses an encryption header in the pin's own words, so it takes no "
+                "refuses_encryption_header"
+            )
 
 
 @dataclass(frozen=True)
@@ -712,12 +720,14 @@ def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
     if moment > not_after.timestamp():
         raise TrustAnchorError(
             f"{spec.setting} {spec.path!r}: the pinned certificate expired at "
-            f"{log_timestamp(not_after)}. Pin the server's renewed certificate."
+            f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
+            "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
         )
     if moment < not_before.timestamp():
         raise TrustAnchorError(
             f"{spec.setting} {spec.path!r}: the pinned certificate is not valid until "
-            f"{log_timestamp(not_before)}. The engine refuses a pin outside its validity period."
+            f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
+            "refuses a pin outside its validity period."
         )
 
 
@@ -2555,7 +2565,9 @@ async def _audit_verdict(
             **extra,
         )
     if shape_error is not None:
-        await record("pem_refused", fingerprint=verdict.fingerprint)
+        # The refusal's own text, which the start or reload raises too, so the row says which
+        # content check refused the file (vault BACKLOG #4569).
+        await record("pem_refused", fingerprint=verdict.fingerprint, reason=str(shape_error))
     if faults:
         raise faults[0]
 
@@ -2622,6 +2634,13 @@ async def _preflight_checks(
 ) -> str:
     """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
+    if verdict is None and spec.server_pin:
+        # The read below takes the whole file, so a pin too large to be one is refused from its
+        # size on disk first, in the store open's words, before any row (vault BACKLOG #3714).
+        from messagefoundry.pki import oversized_pin_reason  # lazy: pki loads cryptography
+
+        if (too_large := await asyncio.to_thread(oversized_pin_reason, spec.path)) is not None:
+            raise TrustAnchorError(f"{spec.setting} {spec.path!r} {too_large}")
     try:
         if verdict is None:
             verdict = await asyncio.to_thread(evaluate_anchor, spec)
