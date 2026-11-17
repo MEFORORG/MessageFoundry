@@ -5706,7 +5706,7 @@ def _apply_insert_row(
         for kw in ("occurrence", "repetition"):
             if kw in params:
                 raise LensRewriteError(
-                    f"insert_row: a Copy Field from a whole field into a component cannot take "
+                    f"insert_row: a copy_field from a whole field into a component cannot take "
                     f"{kw!r}; it is written as copy_field(msg, src, dst), which has no {kw!r}"
                 )
     if action in _NATIVE_INSERT_ACTIONS and not wrapped_copy:
