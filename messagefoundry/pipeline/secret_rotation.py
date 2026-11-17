@@ -284,7 +284,9 @@ async def open_rotation_record(
     before the open's first write under the key. Steps that write nothing under the key can run
     before it, at least the schema step, the store id pin check and, on SQL Server, the database
     option switch. A ``serve`` start calls it too, after its own open has written under the key,
-    for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
+    through :func:`reconcile_rotation_meta`, for a changed key the keyed audit chain has not rolled
+    to, or one it has rolled to while a record stands open for another key (BACKLOG #4942), with
+    ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
     let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates. A start on
