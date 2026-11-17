@@ -1010,6 +1010,34 @@ def test_a_seeded_fuzz_shows_no_word_on_any_sink_the_line_before_3045_hid(monkey
     assert not unparsed, unparsed[:10]
 
 
+def test_an_over_window_record_shows_no_text_past_mains_cut(monkeypatch) -> None:
+    """An over-window record, read by each modelled sink, shows no text past the sink clamp's cut
+    that main's own line, read by the same sink, does not show. A marker word sits past the
+    window in each case; the control first checks main's sinks drop it. Synthetic values."""
+    from messagefoundry.logging_setup import sink_readings
+
+    tail = "PASTCUTTAIL"
+    filler = "word " * 14000
+    cases: list[dict[str, str | None]] = [
+        {"actor": f"\x01DOE JANE {filler}{tail}"},
+        {"client": f"\x1bhunter2 {filler}{tail}"},
+        {"detail": f"\x01DOE JANE {filler}{tail}"},
+        {"detail": json.dumps({"error": f"\x01DOE JANE {filler}{tail}"})},
+        # Each field under the window, the line over it.
+        {"actor": "\x01DOE JANE " + "word " * 7000, "detail": "word " * 7000 + tail},
+        {"actor": "\x01secret " + "word " * 7000, "client": "word " * 7000 + tail},
+    ]
+    before = _raw_tee_lines(cases, monkeypatch, scrub=False)
+    after = _raw_tee_lines(cases, monkeypatch, scrub=True)
+    for case, old, new in zip(cases, before, after, strict=True):
+        old_reads, new_reads = sink_readings(old), sink_readings(new)
+        # The control: the marker is past main's cut on every sink, so this test measures that cut.
+        assert all(tail not in r for r in old_reads), ascii(case)[:80]
+        assert all(tail not in r for r in new_reads), ascii(case)[:80]
+    shown = _shown_per_sink_that_main_hid(cases, monkeypatch)
+    assert not shown, [(sink, case[:80], words) for sink, case, words in shown[:10]]
+
+
 def test_a_fault_in_the_line_check_ships_the_line_before_3045(monkeypatch) -> None:
     """The Lander's hold on engine PR 2864 (B2): a fault while reading the sinks ships the old
     line, which meets the bar by definition, never an unchecked candidate. Synthetic values."""
