@@ -149,10 +149,11 @@ _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bou
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
-#: What reading a 400 may raise on a reply it cannot read: ``MemoryError`` or ``RecursionError``
-#: on a huge or deeply nested one, and ``ValueError``, the family of the parse refusals
-#: :func:`~messagefoundry.redaction.json_loads_or_refusal` documents. Only these label the 400
-#: unconfirmed; anything else the read raises propagates (BACKLOG #6707).
+#: The failures that, raised while a 400 is read, label it unconfirmed (BACKLOG #6707): anything
+#: else the read raises propagates. ``MemoryError`` is the one a reply is known to cause, on a huge
+#: body. ``RecursionError`` and ``ValueError``, the classes of the parse refusals
+#: :func:`~messagefoundry.redaction.json_loads_or_refusal` documents, are caught as well, though
+#: that function returns those refusals rather than raising them.
 _READ_FAULTS = (MemoryError, RecursionError, ValueError)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
@@ -890,10 +891,9 @@ class TransitCipher(_UnmarkedPolicy):
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
             # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
-            # label, so a failure the read is known to raise on a hostile or huge reply
-            # (_READ_FAULTS) picks the unconfirmed one: escaping here, it would make the walk
-            # "could not run" and drop the row's break and its alert. Any other exception is a
-            # programming error and propagates.
+            # label, so a failure in _READ_FAULTS picks the unconfirmed one: escaping here, it
+            # would make the walk "could not run" and drop the row's break and its alert. Any
+            # other exception propagates.
             reason: str | None
             raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:
