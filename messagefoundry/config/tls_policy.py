@@ -1040,7 +1040,7 @@ def crl_credited(ctx: ssl.SSLContext | None) -> bool:
     guard that reads the CRL flag another way passes that test, so review still owns it."""
     return (
         ctx is not None
-        and ctx.verify_mode is not ssl.CERT_NONE
+        and ctx.verify_mode != ssl.CERT_NONE
         and context_checks_revocation(ctx)
         and not skips_validity_period(ctx)
     )
@@ -2651,9 +2651,9 @@ def revocation_hop_disposition(
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
        A CRL on a context that skips time validity (:func:`skips_validity_period`) is accepted past
        ``nextUpdate``, so ``capture`` passes False for one (vault BACKLOG #5086). This function does
-       not read the context: a caller that derives the flag itself, as the Vault and proxy legs in
-       ``transports/strict_requests.py`` do, reads it through :func:`crl_credited`, the rule
-       ``capture`` reads (vault BACKLOG #4912).
+       not read the context: a caller that derives the flag itself carries the rule only if it
+       reads :func:`crl_credited`, as the Vault and proxy legs in ``transports/strict_requests.py``
+       do (vault BACKLOG #4912). Nothing here can make a new caller do so.
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2779,9 +2779,8 @@ class RevocationHopGuard:
     #: field is exactly what let one env var cross every enforcing hop in the instance.
     blanket_attested: bool = False
     #: Whether this hop's OWN context checks a CRL that is a real revocation check: the context
-    #: passes :func:`crl_credited` (it sets ``VERIFY_CRL_CHECK_LEAF`` and does not skip time
-    #: validity, which would let a CRL past ``nextUpdate`` through), and the caller did not pass
-    #: ``expiry_relaxed=True``. Derived in :meth:`capture`, never from a
+    #: passes :func:`crl_credited`, whose docstring states the conditions, and the caller did not
+    #: pass ``expiry_relaxed=True``. Derived in :meth:`capture`, never from a
     #: global setting. It is the one field that decides both the disposition's CRL arm and whether
     #: the attested crossing is logged (vault BACKLOG #5086, owner ruling 2026-11-03). Find its
     #: readers by symbol; at least :meth:`enforce_construction`, the AI broker and the

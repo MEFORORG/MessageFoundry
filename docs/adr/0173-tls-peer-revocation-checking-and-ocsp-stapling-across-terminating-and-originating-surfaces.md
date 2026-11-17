@@ -1650,7 +1650,10 @@ note (decision log `d20261026T140954228-ff8cff`).
   tunnelled connection runs it in `connect`, before its socket opens, so before `CONNECT` and
   before any proxy credentials cross.
 - It reads the CRL flag off that leg's own context and decides with `revocation_hop_disposition`
-  on the hop's posture and attestation, as the Vault leg's guard does. For this leg a proxy on
+  on the hop's posture and attestation, as the Vault leg's guard does. *(Note 2026-11-17, vault
+  BACKLOG #4912: both legs now read the flag through `crl_credited` in `config/tls_policy.py`, the
+  rule `RevocationHopGuard.capture` reads, so a context that skips validity-period checks or
+  verifies no peer earns no CRL credit on either leg.)* For this leg a proxy on
   a loopback address is on the box, decided without DNS, but the Vault leg's guard still counts
   any proxied hop as off the box. A proxy that takes no credentials is judged the same way,
   because the host name still crosses.

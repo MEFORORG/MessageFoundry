@@ -248,10 +248,9 @@ def _refuse_an_unrevoked_ai_hop(
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
-      through, never off a setting. It is ``True`` only when that context checks a CRL
-      (``context_checks_revocation``) and does not skip time validity
-      (``skips_validity_period``), which would accept a CRL past its ``nextUpdate`` (vault
-      BACKLOG #5086). It is ``True`` when ``[tls].crl_file`` reached the hop through
+      through, never off a setting. It is ``True`` only when that context passes
+      ``crl_credited``, which among other conditions refuses a context that skips time validity
+      and so would accept a CRL past its ``nextUpdate`` (vault BACKLOG #5086, #4912). It is ``True`` when ``[tls].crl_file`` reached the hop through
       :func:`_endpoint_opener` (BACKLOG #5527). Otherwise the opener is rest.py's shared one,
       which loads no CRL, or one carrying only ``[tls].internal_ca_file``, so it is ``False``.
     * An attestation with no reason or a blank one, and a reason holding a control character or a

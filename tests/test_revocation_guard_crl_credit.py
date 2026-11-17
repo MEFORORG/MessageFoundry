@@ -22,6 +22,7 @@ import pytest
 
 from messagefoundry.config.tls_policy import (
     HopPosture,
+    RevocationHopGuard,
     context_checks_revocation,
     crl_credited,
     relax_verify_expiry,
@@ -40,7 +41,7 @@ def _context(*, crl: bool, relaxed: bool, verifies: bool = True) -> ssl.SSLConte
     """A client context with the CRL flag, the time-check relaxation and verification as asked.
 
     Setting the flags is enough here: every predicate reads them and nothing dials."""
-    ctx = ssl.create_default_context()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if crl:
         ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if relaxed:
@@ -72,6 +73,24 @@ def test_no_context_and_a_non_verifying_context_earn_no_credit() -> None:
     assert crl_credited(ctx) is False
 
 
+@pytest.mark.parametrize(
+    ("relaxed", "verifies", "credited"),
+    [(False, True, True), (True, True, False), (False, False, False)],
+)
+def test_capture_reads_the_rule(relaxed: bool, verifies: bool, credited: bool) -> None:
+    """A guard handed a context with a CRL credits it only as the rule does. The non-verifying arm
+    is red with the bare ``context_checks_revocation`` read capture used before this change."""
+    guard = RevocationHopGuard.capture(
+        host="partner.example",
+        cell="test hop",
+        description="test hop",
+        attested=False,
+        context=_context(crl=True, relaxed=relaxed, verifies=verifies),
+        connection=None,
+    )
+    assert guard.crl_checked is credited
+
+
 @pytest.mark.parametrize("relaxed", [False, True])
 def test_the_vault_leg_reads_the_rule(relaxed: bool) -> None:
     """The adapter's kept CRL read, the Vault leg's input. Red with ``context_checks_revocation``
@@ -85,7 +104,7 @@ def test_the_vault_leg_reads_the_rule(relaxed: bool) -> None:
         revocation_attested=False,
         attestation_section="store",
     )
-    assert adapter._checks_revocation() is not relaxed
+    assert adapter._checks_revocation() is (not relaxed)
 
 
 @pytest.mark.parametrize("relaxed", [False, True])
