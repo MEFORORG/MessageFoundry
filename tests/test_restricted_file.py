@@ -1902,6 +1902,48 @@ def test_windows_a_drive_type_that_cannot_be_read_is_refused(
 
 
 @windows_only
+def test_windows_an_unknown_drive_type_is_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``DRIVE_UNKNOWN`` and ``DRIVE_NO_ROOT_DIR`` are read as a drive type that cannot be read,
+    so the walk refuses them as it refuses an ``OSError``. ``GetDriveTypeW`` is a stand-in."""
+    import ctypes
+
+    class _Kernel32:
+        def __init__(self, answer: int) -> None:
+            self.answer = answer
+
+        def GetDriveTypeW(self, _root: str) -> int:  # noqa: N802 - the Win32 name
+            return self.answer
+
+    for answer in (0, 1):
+        monkeypatch.setattr(ctypes, "WinDLL", lambda _name, a=answer: _Kernel32(a))
+        with pytest.raises(OSError):
+            restricted_file._is_remote_drive("Q:\\")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda _name: _Kernel32(4))
+    assert restricted_file._is_remote_drive("Q:\\") is True
+    monkeypatch.setattr(ctypes, "WinDLL", lambda _name: _Kernel32(3))
+    assert restricted_file._is_remote_drive("Q:\\") is False
+
+
+@windows_only
+def test_windows_a_volume_the_host_cannot_judge_is_judged_as_before(tmp_path: Path) -> None:
+    """The walk asked ``host.volume_cause``, which refuses a volume whose file system is neither
+    NTFS nor ReFS, such as CSVFS or FAT, or cannot be read, so a key file on such a volume that the
+    check passed before the walk was refused.
+    Only the drive type is now read on the walk. The CSVFS volume is a stand-in."""
+    secure = tmp_path / "secure"
+    secure.mkdir()
+    key = secure / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    host = _host_judging_only_under(
+        tmp_path,
+        volume_cause=lambda _root: (
+            "it is a CSVFS volume, whose permissions this check does not read"
+        ),
+    )
+    assert restricted_file._windows_surroundings_problem(key, host) is None
+
+
+@windows_only
 def test_windows_a_subst_root_reached_through_a_link_gets_the_link_rule_on_its_holder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

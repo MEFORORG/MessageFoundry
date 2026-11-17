@@ -160,8 +160,10 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   junction, link and `subst` drive.
 
   - A mapped network drive is read as a share: the walk stops at it.
-  - Any other volume that `volume_cause` in `messagefoundry/auth/anchor_path.py` cannot judge,
-    or whose drive type cannot be read, ends the walk and is refused.
+  - Only each volume's drive type is read on the walk. A volume whose drive type cannot be read
+    ends the walk and is refused. The walk does not read its file system, so it does not refuse
+    a CSVFS or FAT volume, or one whose file system cannot be read, as it did not before this
+    amendment.
   - On a share the path names, by a UNC path or a mapped drive letter, that folder is read
     through the share at `full.parent`. It is refused when it is a junction or link there.
   - Inherit-only entries are skipped.

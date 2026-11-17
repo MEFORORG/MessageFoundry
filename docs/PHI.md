@@ -453,7 +453,9 @@ than a path is not checked
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
   the owner and access list of the folder that holds the key file where its path resolves to,
   after any junction, link or `subst` drive (on a network share or mapped network drive the path
-  names, by its path as written, and refused when that folder is a junction or link), and
+  names, by its path as written, and refused when that folder is a junction or link; a volume
+  on the way whose drive type cannot be read is refused, and the walk to that folder does not read
+  a volume's file system), and
   refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
   folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list

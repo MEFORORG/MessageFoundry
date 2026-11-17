@@ -818,9 +818,9 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     ``path`` itself is walked, so a ``subst`` drive root is resolved too, and the links on the way
     are judged even when it resolves to a volume root. The holder is the folder that holds where
     the walk ends, after every junction, link and ``subst`` drive on the way, and its owner and
-    entries are read there. Each volume not read as a mapped network drive is asked
-    ``host.volume_cause``, and a volume it answers, or whose drive type cannot be read, ends the
-    walk and is refused. A mapped network
+    entries are read there. Each volume's drive type is read, not its file system, so
+    ``host.volume_cause`` is not asked: a volume whose drive type cannot be read ends the walk and
+    is refused. A mapped network
     drive (``GetDriveTypeW`` answers ``DRIVE_REMOTE``) is a share: the walk stops at it, as at a
     UNC share, and follows no junction or link on it. A walk that reached a share the path names,
     by a UNC path or a mapped drive letter, reads the holder through the share by its path as
@@ -853,13 +853,15 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         # Walked as a local volume, a junction on the file server would be spliced in as a path on
         # this host, and the holder read here instead of on the server. A drive type that cannot
         # be read ends the walk with a cause, which is refused, rather than escaping the check.
+        # Only the drive type is read: host.volume_cause's file-system read would refuse volumes,
+        # such as CSVFS or FAT, that this check judged before the walk read any volume.
         try:
             if _is_remote_drive(root):
                 remote.append(root)
                 return SHARE_CAUSE
-            return host.volume_cause(root)
         except OSError as exc:
             return f"its drive type could not be read ({exc.strerror or type(exc).__name__})"
+        return None
 
     chain, cause = windows_chain(
         str(full), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
@@ -967,16 +969,22 @@ def _is_reparse_point(path: str) -> bool:
 
 #: ``GetDriveTypeW``'s answer for a mapped network drive.
 _DRIVE_REMOTE = 4
+#: ``GetDriveTypeW``'s answers when it cannot tell: ``DRIVE_UNKNOWN`` and ``DRIVE_NO_ROOT_DIR``.
+_DRIVE_TYPE_UNREADABLE = (0, 1)
 
 
 def _is_remote_drive(root: str) -> bool:
-    """Whether ``GetDriveTypeW`` answers ``root`` (``Z:\\``) is a network drive. A seam for tests.
-    Windows only."""
+    """Whether ``GetDriveTypeW`` answers ``root`` (``Z:\\``) is a network drive. Raises ``OSError``
+    when it answers ``DRIVE_UNKNOWN`` or ``DRIVE_NO_ROOT_DIR``, so the drive type cannot be read. A
+    seam for tests. Windows only."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive type is read only on Windows")
     import ctypes
 
-    return bool(ctypes.WinDLL("kernel32").GetDriveTypeW(root) == _DRIVE_REMOTE)
+    drive_type = ctypes.WinDLL("kernel32").GetDriveTypeW(root)
+    if drive_type in _DRIVE_TYPE_UNREADABLE:
+        raise OSError(errno.EIO, f"drive type {drive_type}")
+    return bool(drive_type == _DRIVE_REMOTE)
 
 
 def _mapped_drive_share(drive: str) -> str:

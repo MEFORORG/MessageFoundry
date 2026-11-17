@@ -8,5 +8,7 @@
   [ADR 0214](../docs/adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments).
   A key reached through a junction, link or `subst` drive onto a network share or a mapped
   network drive is refused, and
-  so is one on a share named by at least some of this host's own names or addresses.
+  so is one on a share named by at least some of this host's own names or addresses, and one on
+  a volume whose drive type cannot be read. The walk to that folder does not read a volume's file
+  system.
   (`BACKLOG #5657`, `BACKLOG #5656`)
