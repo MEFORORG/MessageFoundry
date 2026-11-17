@@ -56,6 +56,8 @@ from messagefoundry.serviceenv import (
 #: these strings in what the reading returns.
 _KEY_VALUE = "synthetic-store-key-value"
 _PASSWORD_VALUE = "synthetic-store-password-value"
+#: Split so the gitleaks private-key rule reads no PEM key marker in this file.
+_PEM_BEGIN = "-----BEGIN " + "PRIVATE KEY-----"
 
 
 @dataclass
@@ -348,10 +350,10 @@ def test_a_console_script_launcher_under_nssm_names_only_the_unobservable_entry(
 def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> None:
     path = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:/keys/oidc.pem"])
     assert path.listed == ()
-    inline = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY----- x"])
+    inline = _service([f"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY={_PEM_BEGIN} x"])
     assert inline.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
     # A whole inline key whose header starts on its second line is still the inline key.
-    later = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\r\n-----BEGIN PRIVATE KEY-----\r\nx"])
+    later = _service([f"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\r\n{_PEM_BEGIN}\r\nx"])
     assert later.listed_directory_names == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
 
 
@@ -382,9 +384,7 @@ def test_an_env_value_on_a_later_line_of_one_value_refuses() -> None:
 def test_a_later_line_of_key_material_is_never_read_as_a_name() -> None:
     """A padded base64 line holds an equals sign. Read as ``NAME=value`` it would put key
     material in ``listed``; only a name the refusal is about is read off a later line."""
-    posture = _service(
-        ["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\nMIIB==\n-----END"]
-    )
+    posture = _service([f"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY={_PEM_BEGIN}\nMIIB==\n-----END"])
     assert posture.listed == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
 
 
@@ -465,7 +465,7 @@ def test_an_empty_store_key_above_another_variable_still_refuses(key: str) -> No
     "entry",
     [
         "MEFOR_STORE_PASSWORD=\nPass=word",
-        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\nFOO=bar\n-----BEGIN PRIVATE KEY-----\nx",
+        f"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=\nFOO=bar\n{_PEM_BEGIN}\nx",
         "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\oidc.pem\nMEFOR_AI_ENVIRONMENT=-----BEGIN x",
     ],
 )
@@ -573,7 +573,7 @@ def test_a_store_key_in_the_nssm_list_refuses(key: str) -> None:
 def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> None:
     """Vault BACKLOG #2595 slice B: the rule a store key there follows, for each secret the
     secrets directory supplies. The refusal names the directory as the way in."""
-    value = "-----BEGIN PRIVATE KEY----- x" if name == "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY" else "x"
+    value = f"{_PEM_BEGIN} x" if name == "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY" else "x"
     posture = _service([f"{name}={value}", "MEFOR_AI_ENVIRONMENT=prod"])
     refusal = service_env_refusal(posture)
     assert refusal is not None
