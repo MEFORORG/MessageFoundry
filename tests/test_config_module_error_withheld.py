@@ -550,13 +550,29 @@ def raises_this_type(kind):
 _ENGINE_DIR = Path(messagefoundry.__file__).parent
 
 
+def _exec_as(source: str, file: Path, namespace: dict[str, object]) -> None:
+    """Run ``source`` compiled under ``file``, which may name no file, in ``namespace``.
+
+    ``__file__`` is free to set: :func:`messagefoundry.exception_origin._in_the_engine` does not
+    read it. Coverage prefers ``__file__`` to the compiled name when the two share a base name, and
+    never records a ``<...>`` name, so a ``<...>`` ``__file__`` keeps a name with no file out of its
+    data. Recorded, such a name stopped ``coverage xml`` with "No source for code", and the
+    diff-coverage job wrote no report. A real file is its own ``__file__``, as on an import.
+
+    The fix stays in this test. A file written into the package would be gone before the report,
+    ``purge_files`` keeps the file's entry, and an omit rule would change the coverage config."""
+    namespace["__file__"] = str(file) if file.exists() else f"<not on disk>/{file.name}"
+    exec(compile(source, str(file), "exec"), namespace)
+
+
 @pytest.fixture
 def engine_probe(monkeypatch: pytest.MonkeyPatch) -> str:
     """A module whose frames count as the engine's, to call with a planted value. The rule reads
     its compiled file name and its module name, so it needs no file under ``messagefoundry``."""
     name = "messagefoundry._probe_3765"
+    file = _ENGINE_DIR / "_probe_3765.py"
     module = ModuleType(name)
-    exec(compile(_ENGINE_SOURCE, str(_ENGINE_DIR / "_probe_3765.py"), "exec"), module.__dict__)
+    _exec_as(_ENGINE_SOURCE, file, module.__dict__)
     monkeypatch.setitem(sys.modules, name, module)
     return name
 
@@ -2153,9 +2169,8 @@ def test_a_harness_knob_refusal_is_printed_while_the_loader_withholds_it(
 
 
 def _raised_in(module_name: str, file: Path, source: str) -> BaseException:
-    namespace: dict[str, object] = {"__name__": module_name}
     with pytest.raises(Exception) as ei:  # noqa: PT011 - each caller's source picks the type
-        exec(compile(source, str(file), "exec"), namespace)
+        _exec_as(source, file, {"__name__": module_name})
     return ei.value
 
 
@@ -2210,13 +2225,10 @@ def test_a_raise_outside_the_engine_counts_only_for_the_loaders_rule() -> None:
     # The CLI and the probes keep the frame rule: a library raising an engine exception again must
     # not cost them its text.
     engine: dict[str, object] = {"__name__": "messagefoundry.x"}
-    exec(compile(f"def boom():\n    {_RAISE}\n", str(_IN_THE_ENGINE), "exec"), engine)
+    _exec_as(f"def boom():\n    {_RAISE}\n", _IN_THE_ENGINE, engine)
     outside = "try:\n    boom()\nexcept ValueError as exc:\n    raise exc\n"
     with pytest.raises(ValueError) as ei:  # noqa: PT011 - no text to match
-        exec(
-            compile(outside, str(_IN_A_CONFIG_DIR), "exec"),
-            {**engine, "__name__": "mefor_config_a"},
-        )
+        _exec_as(outside, _IN_A_CONFIG_DIR, {**engine, "__name__": "mefor_config_a"})
     assert raised_by_the_engine(ei.value)
     assert not raised_only_by_the_engine(ei.value)
     assert not worded_by_the_engine(ei.value)
