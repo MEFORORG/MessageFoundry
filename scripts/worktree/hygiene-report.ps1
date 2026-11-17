@@ -375,7 +375,9 @@ $script:envHold = if ($envSet.Count -gt 0) {
 function Get-CloneReport($R) {
     # The liveness fence first: it also parses `worktree list` (with HEAD) and names the primary, so
     # this report reads the same worktree set and the same primary as prune-merged.ps1.
-    $occ = Get-WorktreeOccupancy -Repo $R.Hint -ConfigRoot $ConfigRoot
+    # The skew is unbounded, as in remove.ps1, prune-merged.ps1 and the nightly removal (vault BACKLOG
+    # #2985, added item 4), so a session all four read as LIVE is not read as STALE here.
+    $occ = Get-WorktreeOccupancy -Repo $R.Hint -ConfigRoot $ConfigRoot -StartSkewMinutes ([int]::MaxValue)
     $root = $occ.PrimaryPath
     $rep = [ordered]@{ root = $root; role = $R.Role; commonDir = $R.Common }
     $rep.fence = [ordered]@{

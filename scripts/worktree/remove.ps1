@@ -58,11 +58,12 @@
         (vault BACKLOG #8225 item 2);
       * the target you are standing in, and a target that holds the copy of this script being run
         (-Name since BACKLOG #5648). Each side is matched by its spelling and, where git can place
-        it, by the real path git resolves, so a junction, subst or 8.3 alias is caught (vault
+        it, by the real path git resolves, so a junction or 8.3 alias is caught (vault
         BACKLOG #8225 item 8);
       * a target whose HEAD reflog or own per-worktree refs (refs/worktree, refs/bisect,
         refs/rewritten) hold a commit no shared ref holds. The removal deletes that reflog and those
-        refs, so nothing would reach the commits. -Name since vault BACKLOG #8225 item 9;
+        refs, so nothing would reach the commits. -Name since vault BACKLOG #8225 item 9; there,
+        without -DeleteBranch, a commit the kept branch's own reflog holds does not count;
       * a target that still holds a work claim (claim.ps1), or any target when a claim file cannot
         be read, parses to something other than one record, or names no worktree. The registry is
         found the way claim.ps1 finds it, mefor.claimsRoot included;
@@ -306,17 +307,19 @@ function Test-UnderManagedSegment([string]$Path) {
 # since BACKLOG #5648). Standing in it, git's own removal fails part-way, after it has deleted what it
 # could; the copy being run would be deleted part-way through its own run. -Force overrides neither.
 #
-# THE SPELLING IS NOT THE ONLY COMPARISON (vault BACKLOG #8225 item 8). A junction, subst or 8.3 alias
-# of the target is a different string, so each side is also read through git, which resolves all three
-# (measured on Git for Windows 2.5x: `rev-parse --show-toplevel` through a junction and through an 8.3
-# name prints the real path). A directory git cannot place in a repository falls back to its spelling
-# alone; the target itself is a worktree, so a directory inside it is one git can place.
+# THE SPELLING IS NOT THE ONLY COMPARISON (vault BACKLOG #8225 item 8). A junction or 8.3 alias of the
+# target is a different string, so each side is also read through git, which resolves both (measured
+# 2026-11-17 on Git for Windows: `rev-parse --show-toplevel` through a junction and through an 8.3 name
+# prints the real path). A subst drive was not measured. A directory git cannot place in a repository
+# falls back to its spelling alone; the target itself is a worktree, so a directory inside it is one
+# git can place.
 function Get-ResolvedGitDir([string]$Dir) {
     $top = "$(& git -C $Dir rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
     if ($LASTEXITCODE -ne 0 -or -not $top) { return '' }
     $prefix = "$(& git -C $Dir rev-parse --show-prefix 2>$null)".Trim()
     if ($LASTEXITCODE -ne 0) { return '' }
-    return ConvertTo-Norm $(if ($prefix) { Join-Path $top $prefix } else { $top })
+    # Concatenated, not Join-Path, which asks the provider for a drive and throws on a root it lacks.
+    return ConvertTo-Norm $(if ($prefix) { "$top/$prefix" } else { $top })
 }
 function Assert-NotInsideTarget([string]$Target, [string]$Remedy) {
     $there = @(ConvertTo-Norm $Target)
@@ -559,8 +562,20 @@ if ($LASTEXITCODE -ne 0) {
         throw ("The HEAD reflog and per-worktree refs of '$WorktreePath' name $($logTips.Count) commits, " +
             "more than this route checks. Nothing was removed.")
     }
+    # ON -Name WITHOUT -DeleteBranch THE BRANCH STAYS, and its own reflog lives in the common dir, so
+    # a commit that reflog holds (an amend, a rebase) survives the removal and is not counted. -Path is
+    # unchanged: it reaches checkouts the caller did not make. A branch reflog that cannot be read, or
+    # is longer than the cap, is used as far as it goes, which only makes this stricter.
+    $branchKept = @()
+    if (-not $byPath -and -not $DeleteBranch) {
+        $ownBranch = "$(& git -C $WorktreePath symbolic-ref -q HEAD 2>$null)".Trim()
+        if ($LASTEXITCODE -eq 0 -and $ownBranch -like 'refs/heads/*') {
+            $branchKept = @(& git -C $GitRoot reflog show --format=%H $ownBranch 2>$null |
+                    Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' } | Select-Object -Unique -First 400)
+        }
+    }
     if ($logTips.Count -gt 0) {
-        $looseCommits = @(& git -C $GitRoot rev-list @logTips --not @transientRefExcludes --glob=refs/* 2>$null)
+        $looseCommits = @(& git -C $GitRoot rev-list @logTips --not @transientRefExcludes --glob=refs/* @branchKept 2>$null)
         if ($LASTEXITCODE -ne 0) {
             throw ("Could not tell whether a ref holds the commits in the HEAD reflog and per-worktree " +
                 "refs of '$WorktreePath'. Nothing was removed.")
@@ -738,10 +753,12 @@ function Get-TargetClaimsDirs {
     return @($dirs | Sort-Object -Unique { ConvertTo-Norm $_ })
 }
 
-# A claims or allocation registry, read the way the nightly removal reads one (vault BACKLOG #2985,
-# added item 1): $false only when it is CONFIRMED absent, which Test-ConfirmedGoneOrThrow decides by
-# listing the nearest folder above it, so a registry under a dead link or an unreachable share is not
-# "no records". $true when it is there as a plain directory, and a throw for anything else, a file or a
+# A claims or allocation registry, read with the nightly removal's readers but not its exact rule
+# (vault BACKLOG #2985, added item 1): $false only when it is CONFIRMED absent, which
+# Test-ConfirmedGoneOrThrow decides by listing the nearest folder above it, so a registry under a dead
+# link or an unreachable share is not "no records". The nightly also requires the folder above to be
+# there (Test-RegistryPresentOrThrow); this does not, because a clone that never used coordination has
+# no such folder. $true when it is there as a plain directory, and a throw for anything else, a file or a
 # link where the registry should be included. A clone with no coordination folder at all still reads as
 # absent, because its git dir lists without it.
 function Test-RegistryDirPresent([string]$Dir, [string]$What) {

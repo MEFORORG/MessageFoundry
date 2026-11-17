@@ -523,6 +523,27 @@ def test_name_refuses_a_commit_only_the_head_reflog_holds_even_with_force(fx: Fi
     assert not wt.exists()
 
 
+def test_name_removes_a_tree_whose_amended_commit_only_the_kept_branch_reflog_holds(
+    fx: Fixture,
+) -> None:
+    """The twin of the reflog refusal. Without -DeleteBranch the branch stays, and its own reflog
+    with it, so an amended commit survives the removal and must not refuse it. With -DeleteBranch
+    that reflog goes too, so the same tree refuses."""
+    wt = fx.add("amended")
+    _commit(wt, "a.txt", "v1")
+    _git(wt, "commit", "-q", "--amend", "-m", "v1 amended")
+
+    refused = run(fx, "-Name", "amended", "-DeleteBranch")
+    assert refused.returncode != 0, refused.stdout + refused.stderr
+    assert "no shared ref holds" in refused.stdout, refused.stdout + refused.stderr
+    assert wt.exists() and fx.is_registered(wt)
+
+    proc = run(fx, "-Name", "amended")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not wt.exists()
+    assert fx.branch_exists("amended")
+
+
 @pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
 def test_name_refuses_a_flagged_file_and_force_overrides_it_by_name(fx: Fixture, flag: str) -> None:
     """Red before the fix: git status does not read a flagged file, so an edit to one read as a clean
@@ -637,6 +658,7 @@ def test_a_claims_registry_under_a_dead_link_refuses(fx: Fixture) -> None:
     try:
         proc = run(fx, "-Name", "unreached", "-Force")
         assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "the claims directory" in proc.stdout + proc.stderr, proc.stdout + proc.stderr
         assert wt.exists() and fx.is_registered(wt)
     finally:
         os.rmdir(common / "mefor-coord")
