@@ -8186,8 +8186,7 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 change check reads its baseline from, and writes its rows to, the store that pin secures, so it
 cannot vouch for its own hop.** Item 11 of the
 [trust anchors module](../messagefoundry/auth/trust_anchors.py) docstring says what a swapped pin
-can hide, which checks still refuse, and why a pin outside its validity period warns there
-rather than refusing.
+can hide, and which checks refuse there and which warn with an audited row instead.
 
 **The PostgreSQL `[store].ssl_root_cert` CA is checked in `serve` too, at least at start, reload and
 DR activation, but only after the store has opened with it** (vault BACKLOG #4203). It takes at least the permission, path and change

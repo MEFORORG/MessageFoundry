@@ -1465,10 +1465,10 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 
 #: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
 #: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte, and so do
-#: the pin's trust-anchor checks (``AnchorSpec.max_bytes``); the PostgreSQL CA has its own cap. At store open the cap is judged on the size
-#: on disk, then on the bytes those checks read. A reload judges it on those bytes, with an
-#: audited row (vault BACKLOG #3714); at start the store open refuses first. At least the expiry
-#: monitor and ``cert inventory`` read the file with no cap.
+#: the pin's trust-anchor checks (``AnchorSpec.max_bytes``). The store open refuses a longer file,
+#: judged on the size on disk, then on the bytes those checks read. A settings check warns about
+#: one instead (``messagefoundry.auth.trust_anchors`` module item 11). At least the expiry monitor
+#: and ``cert inventory`` read the file with no cap.
 PIN_FILE_MAX_BYTES = 1 << 20
 
 _TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"
@@ -1499,10 +1499,15 @@ def unreadable_pin_reason(exc: OSError | ValueError | TypeError) -> str:
     return f"could not be read: the path is not usable ({type(exc).__name__})"
 
 
-def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
+def pinned_server_certificate(
+    data: bytes, *, raise_memory_error: bool = False
+) -> x509.Certificate | str:
     """:func:`read_pinned_server_certificate` over bytes already read, for a caller that has read
     the file once for another check (vault BACKLOG #3714). Bytes past
-    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand."""
+    :data:`PIN_FILE_MAX_BYTES` are refused as too large, so the cap judges the bytes in hand.
+
+    ``raise_memory_error`` re-raises a ``MemoryError`` from the parse rather than returning it as
+    a reason, for a caller that must not record it as a verdict on the file."""
     if len(data) > PIN_FILE_MAX_BYTES:
         return _TOO_LARGE
     reason: str
@@ -1512,6 +1517,8 @@ def pinned_server_certificate(data: bytes) -> x509.Certificate | str:
         reason = f"is not a usable SQL Server pin: {exc}"
     except MemoryError:
         # Not a verdict on the file: the parse ran out of memory (vault BACKLOG #4203).
+        if raise_memory_error:
+            raise
         reason = "could not be loaded (out of memory)"
     except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like
         reason = f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"

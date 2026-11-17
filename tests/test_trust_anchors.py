@@ -13,6 +13,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -62,10 +63,11 @@ async def store(tmp_path: Path):
 @pytest.fixture(autouse=True)
 def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each test starts with no consumer load recorded (BACKLOG #2185), and no open-time warning
-    (BACKLOG #3714), and no pin validity warning remembered, whatever ran before it."""
+    (BACKLOG #3714), and no store anchor content row remembered, whatever ran before it."""
     monkeypatch.setattr(ta, "_LOADED", {})
     monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
     # raising=False: the negative controls run this file against a head without the memo.
+    monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
     monkeypatch.setattr(ta, "_VALIDITY_WARNED", {}, raising=False)
 
 
@@ -3335,99 +3337,185 @@ def _two_certificates(pin: Path) -> bytes:
     return pin.read_bytes() + pki.make_self_signed("db2.example", [], 30)[0]
 
 
-@pytest.mark.parametrize(
-    ("shape", "refusal"),
-    [
-        pytest.param(
-            lambda p: p.read_bytes().replace(
-                b"-----BEGIN CERTIFICATE-----\n",
-                b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\n",
-            ),
-            ta.ENCRYPTION_HEADER_SCOPE,
-            id="encryption header",
-        ),
-        # The store open's order: the header is refused before the key, in the pin's words.
-        pytest.param(
-            lambda p: (
-                p.read_bytes().replace(
-                    b"-----BEGIN CERTIFICATE-----\n",
-                    b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\n",
-                )
-                + _marked_key_block("PRIVATE" + " KEY")
-            ),
-            ta.ENCRYPTION_HEADER_SCOPE + ". The ODBC driver",
-            id="header and key",
-        ),
-        pytest.param(_two_certificates, "holds 2 certificates", id="two certificates"),
-        pytest.param(lambda p: b"not a certificate", "it is not a certificate", id="no cert"),
-    ],
-)
-async def test_a_reload_runs_the_store_pins_content_checks(
-    store: MessageStore,
+def _signing_ca(pin: Path) -> bytes:
+    """A self-signed CA certificate marked ``keyCertSign``, which the store open refuses as a pin."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "db-ca.example")])
+    now = datetime.datetime.now(datetime.UTC)
+    usage = x509.KeyUsage(
+        digital_signature=True,
+        content_commitment=False,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=True,
+        crl_sign=True,
+        encipher_only=False,
+        decipher_only=False,
+    )
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(usage, critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def _with_header(pin: Path) -> bytes:
+    return pin.read_bytes().replace(
+        b"-----BEGIN CERTIFICATE-----\n",
+        b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\n",
+    )
+
+
+#: Each content outcome the store open refuses: (the file, the clock or None, text the warning holds).
+_PIN_OUTCOMES = [
+    pytest.param(_with_header, None, ta.ENCRYPTION_HEADER_SCOPE, id="encryption-header"),
+    pytest.param(_two_certificates, None, "holds 2 certificates", id="multi-cert"),
+    pytest.param(_signing_ca, None, "it is a CA certificate", id="ca-cert"),
+    pytest.param(lambda p: b"not a certificate", None, "it is not a certificate", id="no-cert"),
+    pytest.param(
+        lambda p: p.read_bytes() + b"\n" * PIN_FILE_MAX_BYTES, None, "larger than", id="oversize"
+    ),
+    pytest.param(
+        lambda p: p.read_bytes(), 10.0**10, "the pinned certificate expired at", id="expired"
+    ),
+    pytest.param(lambda p: p.read_bytes(), 0.0, "is not valid until", id="not-yet-valid"),
+]
+
+
+def _warning_rows(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if r["event"] == "pin_content_warning"]
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+@pytest.mark.parametrize(("shape", "moment", "warning"), _PIN_OUTCOMES)
+async def test_a_store_pin_content_problem_warns_on_every_reload_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    route: Any,
     shape: Any,
-    refusal: str,
+    moment: float | None,
+    warning: str,
 ) -> None:
-    """Vault BACKLOG #3714 step 12 (d): a reload refuses a pin file the next store open would
-    refuse, with a ``pem_refused`` row. Red under: ``server_pin`` dropped from
-    :func:`store_pin_anchor_spec`, where the reload passes the file."""
+    """Vault BACKLOG #3714, the Manager's ruling on review finding R1-2: at a reload, a convergence
+    reload or a DR activation, a pin the store open would refuse warns with one
+    ``pin_content_warning`` row across retries and does not refuse, as main did not refuse it.
+    Red on 956b262201, where each outcome but the validity period refused the route with a
+    ``pem_refused`` row. The control is the first reload, which writes no warning row."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        await engine.reload_detail(cfg)  # a graph goes live; the DR route only acts on a live one
+        assert _warning_rows(await _rows(engine.store, "store_sqlserver_pin")) == []
+        pin.write_bytes(shape(pin))
+        if moment is not None:
+            monkeypatch.setattr(ta, "_clock", lambda: moment)
+        for _retry in range(3):
+            await route(engine, cfg)  # nothing raised
+        rows = await _rows(engine.store, "store_sqlserver_pin")
+        (row,) = _warning_rows(rows)
+        assert warning in row["reason"] and "[store].ssl_root_cert" in row["reason"]
+        assert "pem_refused" not in [r["event"] for r in rows]
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.parametrize("route", _ROUTES)
+async def test_a_private_key_in_the_store_pin_still_refuses_with_one_row_across_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: Any
+) -> None:
+    """BACKLOG #3745: a private key in the pin refused a reload on main, and still does on every
+    route. Retries, a convergence retry's included, write one ``pem_refused`` row, so they cannot
+    push another anchor's baseline out of the look-back (review finding R1-6). Red on 956b262201,
+    where each retry wrote its own row."""
     from messagefoundry.config.wiring import WiringError
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     pin = _sqlserver_pin(tmp_path)
-    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
-    await run_anchor_preflight(specs, store, enforcing=True)  # the start, and the control
-    preflight = ta.make_settings_anchor_preflight(specs, store, enforcing=True)
-    assert preflight is not None
-    pin.write_bytes(shape(pin))
-    with pytest.raises(WiringError, match=r"\[store\]\.ssl_root_cert") as err:
-        await preflight()
-    assert isinstance(err.value.__cause__, TrustAnchorError)
-    assert refusal in str(err.value.__cause__)
-    assert "pem_refused" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    engine, cfg = await _anchored_engine(tmp_path, spec)
+    try:
+        await engine.reload_detail(cfg)
+        live = engine.registry_runner.registry
+        pin.write_bytes(pin.read_bytes() + _marked_key_block("PRIVATE" + " KEY"))
+        for _retry in range(3):
+            with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+                await route(engine, cfg)
+            assert ta.PRIVATE_KEY_SCOPE in str(err.value.__cause__)
+        assert engine.registry_runner.registry is live  # nothing was swapped
+        rows = await _rows(engine.store, "store_sqlserver_pin")
+        assert [r["event"] for r in rows].count("pem_refused") == 1
+    finally:
+        await engine.stop()
 
 
-def _validity_rows(rows: list[dict]) -> list[dict]:
-    return [r for r in rows if r["event"] == "pin_outside_validity"]
-
-
-@pytest.mark.parametrize(
-    ("moment", "warning"),
-    [(10.0**10, "the pinned certificate expired at"), (0.0, "is not valid until")],
-    ids=["expired", "not yet valid"],
-)
-async def test_a_store_pin_outside_its_validity_period_warns_once_and_does_not_refuse(
-    store: MessageStore,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    moment: float,
-    warning: str,
+async def test_a_store_anchor_content_row_is_written_again_for_a_new_outcome(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #3714, the Manager's decision of round 5: a settings check passes a pin
-    outside its validity period, as main did, and writes ONE ``pin_outside_validity`` row per pin
-    file content however often it runs. Red on 8b10c967e3, where the check refused the pin with a
-    ``pem_refused`` row at every run. The control is the same pin at the real time, which writes
-    no such row; a changed file writes one more."""
-    from messagefoundry import pki
-
+    """One memo for the pin: a repeat with the same content and outcome writes no row, while the
+    same bytes with a new outcome, or a clean check followed by the same problem, write one more.
+    The PostgreSQL CA's ``pem_refused`` rows take the same memo."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     pin = _sqlserver_pin(tmp_path)
     specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
-    await run_anchor_preflight(specs, store, enforcing=True)  # the control
-    assert _validity_rows(await _rows(store, "store_sqlserver_pin")) == []
-    monkeypatch.setattr(ta, "_clock", lambda: moment)
-    for _retry in range(4):
-        await run_anchor_preflight(specs, store, enforcing=True)
-    (row,) = _validity_rows(await _rows(store, "store_sqlserver_pin"))
-    assert warning in row["reason"] and "[store].ssl_root_cert" in row["reason"]
-    assert "pem_refused" not in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
-    pin.write_bytes(pki.make_self_signed("db.example", [], 30)[0])  # new content: one more row
+    monkeypatch.setattr(ta, "_clock", lambda: 0.0)  # not yet valid
     await run_anchor_preflight(specs, store, enforcing=True)
     await run_anchor_preflight(specs, store, enforcing=True)
-    assert len(_validity_rows(await _rows(store, "store_sqlserver_pin"))) == 2
+    monkeypatch.setattr(ta, "_clock", lambda: 10.0**10)  # the same bytes, now expired
+    await run_anchor_preflight(specs, store, enforcing=True)
+    monkeypatch.setattr(ta, "_clock", time.time)  # clean: the memo is dropped
+    await run_anchor_preflight(specs, store, enforcing=True)
+    monkeypatch.setattr(ta, "_clock", lambda: 10.0**10)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    reasons = [r["reason"] for r in _warning_rows(await _rows(store, "store_sqlserver_pin"))]
+    assert len(reasons) == 3, reasons
+    ca = tmp_path / "pg-ca.pem"
+    ca.write_bytes(pin.read_bytes() + _marked_key_block("PRIVATE" + " KEY"))
+    pg = _store_specs(backend="postgres", ssl_root_cert=str(ca))
+    for _retry in range(3):
+        with pytest.raises(TrustAnchorError):
+            await run_anchor_preflight(pg, store, enforcing=True)
+    events = [r["event"] for r in await _rows(store, "store_postgres_ca")]
+    assert events.count("pem_refused") == 1
+
+
+async def test_a_store_fault_leaves_the_content_row_unremembered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo is set only once its row is written: a check whose audit write failed writes the
+    row again at the next check."""
+    _judged_clean(monkeypatch)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    monkeypatch.setattr(ta, "_clock", lambda: 10.0**10)
+    faulty = _FaultyAuditStore("record_audit")
+    with pytest.raises(ta.AnchorStoreUnavailable):
+        await run_anchor_preflight(specs, faulty, enforcing=True)  # type: ignore[arg-type]
+    faulty.fail = None
+    await run_anchor_preflight(specs, faulty, enforcing=True)  # type: ignore[arg-type]
+    await run_anchor_preflight(specs, faulty, enforcing=True)  # type: ignore[arg-type]
+    events = [json.loads(d)["event"] for d in faulty.writes]
+    assert events.count("pin_content_warning") == 1, events
 
 
 @pytest.mark.parametrize("moment", [10.0**10, 0.0], ids=["expired", "not yet valid"])
@@ -3463,47 +3551,12 @@ def test_a_store_pin_validity_warning_names_what_the_store_open_refuses(
     assert "the engine refuses" not in warning
 
 
-@pytest.mark.parametrize("route", _ROUTES)
-async def test_an_expired_store_pin_does_not_refuse_a_reload_or_a_dr_activation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: Any
-) -> None:
-    """Vault BACKLOG #3714, the Manager's decision of round 5: the open store keeps connecting
-    with an expired pin, so every reload route, the convergence retry and DR activation included,
-    goes on as main did, and repeated runs write one ``pin_outside_validity`` row. Red on
-    8b10c967e3, where each route was refused and each run wrote a ``pem_refused`` row. A pin
-    holding a private key still refuses the route, as the negative control."""
-    from messagefoundry.config.wiring import WiringError
-
-    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
-    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
-    pin = _sqlserver_pin(tmp_path)
-    (spec,) = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
-    engine, cfg = await _anchored_engine(tmp_path, spec)
-    try:
-        await engine.reload_detail(cfg)  # a graph goes live; the DR route only acts on a live one
-        monkeypatch.setattr(ta, "_clock", lambda: 10.0**10)
-        for _retry in range(3):
-            await route(engine, cfg)  # nothing raised
-        rows = await _rows(engine.store, "store_sqlserver_pin")
-        assert len(_validity_rows(rows)) == 1
-        assert "pem_refused" not in [r["event"] for r in rows]
-        pin.write_bytes(pin.read_bytes() + _marked_key_block("PRIVATE" + " KEY"))
-        live = engine.registry_runner.registry
-        with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
-            await route(engine, cfg)
-        assert ta.PRIVATE_KEY_SCOPE in str(err.value.__cause__)
-        assert engine.registry_runner.registry is live  # nothing was swapped
-    finally:
-        await engine.stop()
-
-
-async def test_an_oversized_store_pin_is_refused_with_its_row_from_a_bounded_read(
+async def test_an_oversized_store_pin_warns_with_its_row_from_a_bounded_read(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #3714, the Manager's ruling on review round-44dc8b48's Q2: a pin file
-    larger than ``PIN_FILE_MAX_BYTES`` is refused in the store open's words, after a read of at
-    most that many bytes and one more, and the refusal leaves a ``pem_refused`` row naming it. Red
-    under: the size check of a7fff14a81, which refused from the size on disk before any row."""
+    """Vault BACKLOG #3714: a pin file larger than ``PIN_FILE_MAX_BYTES`` is judged after a read of
+    at most that many bytes and one more, and warns in the store open's words with a
+    ``pin_content_warning`` row. Red under: the read left unbounded."""
     from messagefoundry import pki
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3521,15 +3574,13 @@ async def test_an_oversized_store_pin_is_refused_with_its_row_from_a_bounded_rea
         return data
 
     monkeypatch.setattr(ta, "read_if_regular", counting)
-    with pytest.raises(TrustAnchorError) as err:
-        await run_anchor_preflight(specs, store, enforcing=True)
-    assert str(err.value) == (
+    assert await run_anchor_preflight(specs, store, enforcing=True)
+    assert reads == [pki.PIN_FILE_MAX_BYTES + 1]  # bounded, not the whole file
+    (row,) = _warning_rows(await _rows(store, "store_sqlserver_pin"))
+    assert row["reason"].startswith(
         f"[store].ssl_root_cert {str(pin)!r} is not a usable SQL Server pin: it is larger than "
         f"{pki.PIN_FILE_MAX_BYTES} bytes"
     )
-    assert reads == [pki.PIN_FILE_MAX_BYTES + 1]  # bounded, not the whole file
-    (row,) = [r for r in await _rows(store, "store_sqlserver_pin") if r["event"] == "pem_refused"]
-    assert row["reason"] == str(err.value)
 
 
 async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
@@ -3572,12 +3623,12 @@ async def test_a_postgres_store_ca_bundle_past_the_pin_cap_still_passes(
     assert "pem_refused" not in [r["event"] for r in await _rows(store, "store_postgres_ca")]
 
 
-async def test_a_memory_error_parsing_a_store_pin_says_so(
+async def test_a_memory_error_parsing_a_store_pin_is_no_verdict_on_the_file(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review round-7b4c181a42 OPEN 5: a ``MemoryError`` while the pin is parsed is refused as a
-    pin that could not be loaded, never as "not a certificate". Red on 8b10c967e3, whose text read
-    "it is not a certificate (MemoryError)"."""
+    """Review finding R1-3: a ``MemoryError`` while the pin is parsed is raised as it is, and writes
+    neither a ``pem_refused`` nor a ``pin_content_warning`` row. Red on 956b262201, where it was a
+    refusal with a ``pem_refused`` row."""
     from messagefoundry import pki
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3589,22 +3640,19 @@ async def test_a_memory_error_parsing_a_store_pin_says_so(
         raise MemoryError
 
     monkeypatch.setattr(pki, "load_pinned_server_certificate", huge)
-    with pytest.raises(TrustAnchorError) as err:
+    with pytest.raises(MemoryError):
         await run_anchor_preflight(specs, store, enforcing=True)
-    assert str(err.value) == (
-        f"[store].ssl_root_cert {str(pin)!r} could not be loaded (out of memory)"
-    )
-    assert "not a certificate" not in str(err.value)
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert "pem_refused" not in events and "pin_content_warning" not in events
 
 
 @pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
-async def test_a_memory_error_reading_a_store_anchor_is_an_anchor_refusal(
+async def test_a_memory_error_reading_a_store_anchor_is_not_a_refusal(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
-    """Vault BACKLOG #4203, review round-44dc8b48 finding 3: a ``MemoryError`` raised while a
-    store anchor is read does not escape :func:`run_anchor_preflight`; it is a refusal naming the setting. The previous round
-    pinned that escape for the PostgreSQL CA as its control. Red under: the ``MemoryError`` arm
-    dropped from :func:`_preflight_checks`."""
+    """Review finding R1-3: a ``MemoryError`` raised while a store anchor is read is a resource
+    fault, raised as it is, never a :class:`TrustAnchorError`. Red on 956b262201, which turned it
+    into a refusal naming the setting."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     pin = _sqlserver_pin(tmp_path)
@@ -3614,13 +3662,63 @@ async def test_a_memory_error_reading_a_store_anchor_is_an_anchor_refusal(
         raise MemoryError
 
     monkeypatch.setattr(ta, "evaluate_anchor", huge)
-    with pytest.raises(TrustAnchorError) as err:
+    with pytest.raises(MemoryError):
         await run_anchor_preflight(specs, store, enforcing=True)
-    assert str(err.value) == (
-        f"[store].ssl_root_cert: could not read or load the trust anchor {str(pin)!r}: the engine "
-        "ran out of memory"
-    )
-    assert err.value.setting == "[store].ssl_root_cert"
+
+
+async def test_a_memory_error_in_the_lane_check_is_not_remembered_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding R1-1: a ``MemoryError`` in a lane's content check is not cached as that
+    lane's refusal, so the next check runs again, as on main. Red on 956b262201, where the next
+    check re-raised a remembered refusal without reading the file."""
+    _judged_clean(monkeypatch)
+    store = _FaultyAuditStore(None)
+    check = ta.make_lane_anchor_check(store, enforcing=True)  # type: ignore[arg-type]
+    settings = {"tls_ca_file": str(_pem(tmp_path))}
+    real = ta._refuse_by_path_content
+
+    def huge(_data: bytes, _spec: AnchorSpec) -> Any:
+        raise MemoryError
+
+    monkeypatch.setattr(ta, "_refuse_by_path_content", huge)
+    with pytest.raises(MemoryError):
+        await check("outbound", "OUT", settings)
+    monkeypatch.setattr(ta, "_refuse_by_path_content", real)
+    await check("outbound", "OUT", settings)  # nothing raised
+
+
+def test_a_bounded_read_asks_for_no_more_than_the_file_and_one_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding R1-8: :func:`read_if_regular` lowers a ``limit`` to the file's size and one
+    byte, so a small file under a large cap is not read into a buffer of the cap's size. Red on
+    956b262201, which asked the reader for the whole cap."""
+    small = tmp_path / "small.pem"
+    small.write_bytes(b"x" * 10)
+    asked: list[int] = []
+    real = os.fdopen
+
+    class _Reader:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _Reader:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._handle.close()
+
+        def read(self, n: int = -1) -> bytes:
+            asked.append(n)
+            data: bytes = self._handle.read(n)
+            return data
+
+    monkeypatch.setattr(os, "fdopen", lambda fd, *a, **kw: _Reader(real(fd, *a, **kw)))
+    assert ta.read_if_regular(str(small), 1 << 24) == b"x" * 10
+    assert asked == [11]
+    assert ta.read_if_regular(str(small), 4) == b"xxxx"  # a smaller limit still applies
+    assert ta.read_if_regular(str(small)) == b"x" * 10  # and no limit reads it all
 
 
 async def test_a_pem_refused_row_carries_the_refusal(
@@ -3675,7 +3773,7 @@ def test_a_server_pin_spec_takes_exactly_the_pin_cap(max_bytes: int | None) -> N
     """Review round-b56972e6b4 finding 1: the bound a server pin's read takes is enforced, not
     left to prose. A ``server_pin`` spec with any ``max_bytes`` but
     :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` is refused at construction: ``None`` would read
-    the whole file, a smaller bound would refuse a pin the store open takes, and a larger one
+    the whole file, a smaller bound would warn about a pin the store open takes, and a larger one
     would read more than the store open does. Red under: the ``server_pin`` cap check dropped
     from ``AnchorSpec.__post_init__``."""
     with pytest.raises(ValueError, match="max_bytes"):
