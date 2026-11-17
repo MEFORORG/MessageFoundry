@@ -237,10 +237,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
     **A reload runs the anchor checks and the store's content checks.** It checks the ACL, a
     change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it cannot
-    read. It then runs the private-key refusal (BACKLOG #3745) and the store's certificate checks
-    (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): no encryption header (BACKLOG
-    #3090), one server certificate, inside its validity period. So a pin past notAfter refuses
-    every reload until the file is replaced. The store open checks the file's size on disk before
+    read. It then runs the store open's content checks, in the store's order and words
+    (:func:`_refuse_an_unusable_server_pin`, vault BACKLOG #3714): at least no encryption header
+    (BACKLOG #3090), no private-key label (BACKLOG #3745), one server certificate, inside its
+    validity period. So a pin past notAfter refuses at least every reload and DR activation until
+    the file is replaced. The store open checks the file's size on disk before
     it reads it; this check does not, and refuses the bytes as too large once they are read. At
     ``warn`` the start logs the pin's warning once: the preflight skips one the store open just
     logged (:data:`_WARNED_AT_OPEN`).
@@ -668,9 +669,13 @@ def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
 def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
     """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
     the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
-    refusal (BACKLOG #3745), in the order the DATABASE build runs them, then the server pin's
-    certificate checks when ``spec`` asks for them (:func:`_refuse_an_unusable_server_pin`). The
-    refusal names the setting and the path, never the content."""
+    refusal (BACKLOG #3745), in the order the DATABASE build runs them. A server pin
+    (``spec.server_pin``) takes the store open's checks instead, in the store's order and words
+    (:func:`_refuse_an_unusable_server_pin`), which refuse an encryption header and a private key
+    too. The refusal names the setting and the path, never the content."""
+    if spec.server_pin:
+        _refuse_an_unusable_server_pin(data, spec)
+        return
     if spec.refuses_encryption_header and has_encryption_header_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. Its hop "
@@ -678,8 +683,6 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
             "password on an encrypted block. Keep only the CA certificates here"
         )
     _refuse_a_private_key(data, spec)
-    if spec.server_pin:
-        _refuse_an_unusable_server_pin(data, spec)
 
 
 #: The wall clock the server pin's validity check reads; a test replaces it.
@@ -688,12 +691,16 @@ _clock: Callable[[], float] = time.time
 
 def _refuse_an_unusable_server_pin(data: bytes, spec: AnchorSpec) -> None:
     """The SQL Server pin's certificate checks, which the store runs at each open, run here too so a
-    reload refuses what the next store open would (vault BACKLOG #3714): the bytes must be one
-    server certificate (:func:`~messagefoundry.pki.pinned_server_certificate`), inside its validity
-    period now (:data:`_clock`). notAfter itself still counts as valid, as the store's check reads
-    it. So once the pin passes notAfter, every reload that runs this check is refused until the
-    file is replaced, though the open store keeps connecting until a restart, which the store open
-    refuses too."""
+    reload refuses what the next store open would (vault BACKLOG #3714): the bytes must pass
+    :func:`~messagefoundry.pki.pinned_server_certificate`, which refuses at least an encryption
+    header, a private-key label and anything but one server certificate, and that certificate must
+    be inside its validity period now (:data:`_clock`). notAfter itself still counts as valid, as
+    the store's check reads it.
+
+    So once the pin passes notAfter, every settings check is refused until the file is replaced:
+    at least a reload and a DR activation, though the open store keeps connecting until a restart,
+    which the store open refuses too. The certificate-expiry monitor, where it runs, watches this
+    file to warn before that date."""
     from messagefoundry.pki import pinned_server_certificate  # lazy: pki loads cryptography
     from messagefoundry.redaction import log_timestamp
 

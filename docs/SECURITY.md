@@ -8160,7 +8160,8 @@ can hide and which checks still refuse.
 **The PostgreSQL `[store].ssl_root_cert` CA is checked at `serve`'s start and reload too, but only
 after the store has opened with it** (vault BACKLOG #4203). It takes the permission, path and change
 checks and the private-key refusal, not the SQL Server pin's certificate checks. Under `enforce`, a
-file another account could replace refuses the start or the reload. The store runs none of these
+file or folder a broad principal can write, or one whose permissions the engine cannot read,
+refuses the start or the reload. The store runs none of these
 checks when it opens, so a start may already have trusted the file and sent the store login, and a
 command that opens the store without this check does not check the file at all. The same docstring
 item says what else the check does not cover.

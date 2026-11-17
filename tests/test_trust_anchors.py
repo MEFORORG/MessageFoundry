@@ -3306,6 +3306,26 @@ async def test_a_postgres_ssl_root_cert_holding_a_private_key_refuses(
     assert "pem_refused" in [r["event"] for r in await _rows(store, "store_postgres_ca")]
 
 
+async def test_a_postgres_ssl_root_cert_takes_the_acl_check_and_not_the_pins_checks(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #4203: a CA bundle of two certificates passes, since the SQL Server pin's
+    one-certificate check is not applied to it, and a file a broad principal can write refuses at
+    ``enforce`` with its ``acl_insecure`` row. Red under: the PostgreSQL spec left out of
+    :func:`collect_anchor_specs` (the ACL arm), or built with ``server_pin`` (the bundle arm)."""
+    acl: dict[str, bool] = {"ok": True}
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl["ok"])
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = _sqlserver_pin(tmp_path)
+    ca.write_bytes(_two_certificates(ca))
+    specs = _store_specs(backend="postgres", ssl_root_cert=str(ca))
+    assert await run_anchor_preflight(specs, store, enforcing=True)
+    acl["ok"] = False
+    with pytest.raises(TrustAnchorError, match=r"\[store\]\.ssl_root_cert"):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    assert "acl_insecure" in [r["event"] for r in await _rows(store, "store_postgres_ca")]
+
+
 def _two_certificates(pin: Path) -> bytes:
     from messagefoundry import pki
 
@@ -3322,6 +3342,18 @@ def _two_certificates(pin: Path) -> bytes:
             ),
             ta.ENCRYPTION_HEADER_SCOPE,
             id="encryption header",
+        ),
+        # The store open's order: the header is refused before the key, in the pin's words.
+        pytest.param(
+            lambda p: (
+                p.read_bytes().replace(
+                    b"-----BEGIN CERTIFICATE-----\n",
+                    b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\n",
+                )
+                + _marked_key_block("PRIVATE" + " KEY")
+            ),
+            ta.ENCRYPTION_HEADER_SCOPE + ". The ODBC driver",
+            id="header and key",
         ),
         pytest.param(_two_certificates, "holds 2 certificates", id="two certificates"),
         pytest.param(lambda p: b"not a certificate", "it is not a certificate", id="no cert"),
@@ -3377,6 +3409,7 @@ async def test_a_reload_refuses_a_store_pin_outside_its_validity_period(
     with pytest.raises(TrustAnchorError, match=refusal) as err:
         await run_anchor_preflight(specs, store, enforcing=True)
     assert "[store].ssl_root_cert" in str(err.value)
+    assert "pem_refused" in [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
 
 
 def test_a_server_pin_spec_must_be_read_by_path() -> None:
