@@ -172,7 +172,7 @@ _TRANSIENT_ERRNOS = frozenset(
     )
     if hasattr(errno, name)
 )
-# Windows maps several of these to EACCES or EINVAL, which alone would read as lasting, so the Windows
+# Windows maps several of these errnos to EACCES or EINVAL, which alone would read as lasting, so the Windows
 # code is checked first: ERROR_NOT_READY 21, ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
 # ERROR_BAD_NETPATH 53, ERROR_UNEXP_NET_ERR 59, ERROR_NETNAME_DELETED 64, ERROR_BAD_NET_NAME 67,
 # ERROR_DEV_NOT_EXIST 55, ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240,
