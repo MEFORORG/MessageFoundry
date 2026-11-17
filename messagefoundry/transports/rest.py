@@ -2257,9 +2257,7 @@ class _HostProxy:
 
     @property
     def answers_digest(self) -> bool:
-        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
-        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
-        decide from one rule (BACKLOG #2989)."""
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener."""
         return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:

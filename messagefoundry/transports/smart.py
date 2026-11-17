@@ -77,6 +77,7 @@ from messagefoundry.transports.rest import (
     _redact_url,
     _shared_no_redirect_opener,
     auth_challenge_refused,
+    digest_proxy_meets_the_token_connect,
     ech_readdressed_request,
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
@@ -179,8 +180,8 @@ def _read_token_reply(
         # BACKLOG #1171, #2989: the proxy Digest handler's refusal, classified as the delivery hop
         # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
         # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
-        # where no Digest handler runs; _open_token_hop refuses a Digest proxy there at build (ADR
-        # 0095 B.1). Kept so a refusal that did arrive would still be this fault rather than escape
+        # where no Digest handler runs; the build refuses a Digest proxy there (ADR 0095 B.1, the
+        # rule in rest.digest_proxy_meets_the_token_connect). Kept so a refusal that did arrive would still be this fault rather than escape
         # the DeliveryError contract as a ValueError. Fixed text: the peer's algorithm token stays
         # on the cause only.
         raise auth_challenge_refused(endpoint) from exc
@@ -351,12 +352,16 @@ class _TokenEndpointProvider(abc.ABC):
         token_proxy = proxy.for_host(token_url) if proxy and ech_sidecar is None else None
         # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
         # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
-        # setup could never answer a challenge on this hop (ADR 0095 B.1). Keyed on the proxy
-        # resolved for the TOKEN host, so a token host the proxy bypasses builds. A built
-        # connection meets this refusal earlier, in rest.proxy_auth_handler_from_settings, before
-        # its proxy credential is judged (BACKLOG #2989 items 20 and 21); this one serves a provider built
-        # directly.
-        if scheme == "https" and token_proxy is not None and token_proxy.answers_digest:
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). A built connection meets
+        # this refusal earlier, in rest.proxy_auth_handler_from_settings, before its proxy
+        # credential is judged (BACKLOG #2989 items 20 and 21); this one serves a provider built
+        # directly. Both read the one rule, so a token host the proxy bypasses builds.
+        if (
+            proxy is not None
+            and ech_sidecar is None
+            and proxy.digest is not None
+            and digest_proxy_meets_the_token_connect(token_url, proxy.bypass)
+        ):
             raise self.digest_proxy_refusal(connection)
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``

@@ -871,6 +871,75 @@ def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build()
         )
 
 
+@pytest.mark.usefixtures("no_bypass")
+def test_a_built_connection_whose_token_host_the_proxy_bypasses_still_builds() -> None:
+    """THE CONTROL for the build-path refusal above, which reads ``proxy_no_proxy`` from the
+    settings: the same destination with its token host on the bypass list builds."""
+    dest = _build(
+        ConnectorType.REST,
+        "http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+        proxy_no_proxy=["auth.partner.invalid"],
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+    assert dest._token_provider is not None
+
+
+def test_a_built_connection_whose_token_host_urllib_bypasses_still_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same control for urllib's own bypass list, which the build-path refusal reads too."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+    dest = _build(
+        ConnectorType.REST,
+        "http://127.0.0.1:9/x",
+        proxy="http://127.0.0.1:3128",
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type="digest",
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+    assert dest._token_provider is not None
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_built_smart_connection_behind_a_digest_proxy_is_refused_at_build(ec_pem: str) -> None:
+    """The build-path refusal on the SMART provider, in its own error type."""
+    from messagefoundry.transports.smart import SmartAuthError, with_smart_backend
+
+    spec = with_smart_backend(
+        Rest(
+            url="http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+        ),
+        token_url=_HTTPS_TOKEN_URL,
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    with (
+        active_hop_posture(_WARN_DIAL),
+        pytest.raises(SmartAuthError, match=f"^connection 'OB'; SMART {_DIGEST_PROXY_REFUSED} "),
+    ):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=spec.settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(spec.settings),
+        )
+
+
 #: A non-loopback proxy, so its credential's hop is judged and, when accepted, recorded. Nothing
 #: dials it.
 _OFF_BOX_PROXY = "http://10.0.0.9:3128"

@@ -105,6 +105,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import (
     _UNRESOLVED,
     _WITHHELD_PEER,
+    EnvRef,
     Registry,
     WiringError,
     _db_setting,
@@ -371,23 +372,26 @@ def _is_https(url: object) -> bool:
         return False
 
 
-def _digest_proxy_refused(targets: Sequence[object], no_proxy: object) -> bool:
+def _digest_proxy_refused(targets: Sequence[object], settings: Mapping[str, Any]) -> bool:
     """Whether a web proxy set up for Digest never carries this connection's credential, read from
     the targets :func:`_proxy_targets` lists (vault BACKLOG #2989 item 28).
 
     The build refuses Digest for a connection whose own ``url`` is ``https``, whatever the bypass
-    list says (ADR 0126 AC-6). Where that ``url`` bypasses the proxy, only a token hop could use
-    it, and an ``https`` token URL the bypass list does not name either meets the proxy on a
-    ``CONNECT``, which the build refuses (ADR 0095 B.1), or is one urllib's own bypass list names,
-    so the proxy is never used. That list lives in the sending process, so it is not read here; both
-    outcomes mean no hop. An ``env()`` reference is not read, so a hop whose URL comes from one is
-    still listed."""
+    list says (ADR 0126 AC-6). A connection that also mints a bearer cannot use the proxy either:
+    its own ``url``, if not ``https``, must be loopback, which is dialled direct, since a bearer over
+    cleartext http off this machine is refused; and its token URL, if ``https``, meets the proxy
+    on a ``CONNECT``, which the build refuses (ADR 0095 B.1), or bypasses it, and if ``http`` is
+    loopback too. The bearer counts only where nothing from ``env()`` decides it: a literal token
+    URL and no ``env()`` switch on either provider. Otherwise the hop is listed."""
     if not targets:
         return False
     url, *token_urls = targets
     if _is_https(url):
         return True
-    return bool(token_urls) and _proxy_bypasses(url, no_proxy) and any(map(_is_https, token_urls))
+    switches_literal = not any(
+        isinstance(settings.get(key), EnvRef) for key in ("smart_enabled", "oauth2_enabled")
+    )
+    return switches_literal and any(isinstance(t, str) and t for t in token_urls)
 
 
 def _proxy_targets(
@@ -450,7 +454,7 @@ def _proxy_hop(
     # From a closed set, not echoed: only a known scheme name reaches the detail. The type is read
     # the way the transport reads it.
     kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
-    if kind == "digest" and _digest_proxy_refused(targets, no_proxy):
+    if kind == "digest" and _digest_proxy_refused(targets, settings):
         return None  # the build refuses this Digest proxy, or never sends through it
     if kind not in ("basic", "digest"):
         kind = "static"
