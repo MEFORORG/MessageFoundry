@@ -404,7 +404,8 @@ def test_conditional_query_credential_is_warned(
     conditional: str, query: str, shown: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5350: a credential in conditional_query rides the request line or the If-None-Exist
-    header to a verified peer too, so it is warned about, by name and never by value."""
+    header to a verified peer too, so it is warned about, never by value. A parameter of the
+    ``&``-split query is named; a ``;`` segment is reported unnamed, as a segment."""
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.fhir"):
         _dest(conditional=conditional, conditional_query=query)
     lines = [r.getMessage() for r in caplog.records if "conditional_query" in r.getMessage()]
