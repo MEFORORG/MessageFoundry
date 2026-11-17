@@ -406,8 +406,8 @@ def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, st
     NOT checked, so it can ride beside the validated element under a valid result, at least: the
     Header's element children (header blocks, which SOAP leaves open), attributes and namespace
     declarations on the Envelope, Header and Body, and comments and processing instructions
-    anywhere, which are skipped. Reasons name
-    only the SOAP grammar's own QNames and counts, never content."""
+    anywhere, which are skipped. Reasons name only the SOAP grammar's own QNames and counts, never
+    content."""
     root = parse_bytes(envelope)
     env_ns = next(
         (ns for ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS) if _clark(root) == f"{{{ns}}}Envelope"),
