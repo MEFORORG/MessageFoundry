@@ -474,6 +474,44 @@ def test_transport_guard_permits_https_and_loopback_http() -> None:
     EngineClient("http://127.0.0.1:8765").close()
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    ["http:////engine.example.com:8765", "http:///engine.example.com", "http://", "https:////x"],
+)
+@pytest.mark.parametrize("allow_insecure", [False, True], ids=["strict", "allow_insecure"])
+def test_transport_guard_refuses_a_base_url_with_no_host(
+    base_url: str, allow_insecure: bool
+) -> None:
+    """An empty host is not loopback (BACKLOG #5343). ``urlsplit`` reads no host in a multi-slash
+    URL, yet httpx re-reads the URL it builds and names the remote host, so an empty host waved
+    through as loopback would skip the plaintext refusal and the cleartext credential refusal.
+
+    ``allow_insecure`` does not rescue it: a URL with no host names no engine at all.
+
+    Mutation: restore ``or host == ""`` on the loopback early return. Red: DID NOT RAISE."""
+    with pytest.raises(ApiError, match="no host"):
+        EngineClient(base_url, allow_insecure=allow_insecure)
+
+
+def test_a_multi_slash_url_reaches_the_remote_host_through_httpx() -> None:
+    """The premise of the no-host refusal: httpx sends ``http:////host`` to ``host``.
+
+    Measured on the installed httpx rather than assumed, so a future httpx that refused such a URL
+    would turn this red and say the refusal is belt-and-braces rather than load-bearing."""
+    with httpx.Client(base_url="http:////engine.example.com:8765") as http:
+        built = http.build_request("GET", "/health").url
+    assert httpx.URL(str(built)).host == "engine.example.com"
+
+
+def test_transport_guard_refuses_an_unparsable_base_url_as_api_error() -> None:
+    """An unparsable URL raises :class:`ApiError`, the client's only error type (BACKLOG #5343),
+    not ``urlsplit``'s ``ValueError``, and chains nothing that could quote the URL."""
+    with pytest.raises(ApiError, match="does not parse") as excinfo:
+        EngineClient("http://user:s3cret@[::1:8765")
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+    assert "s3cret" not in str(excinfo.value)
+
+
 # --- ASVS 14.2.1 (BACKLOG #1184): the search needle never rides the query string -------------------
 
 

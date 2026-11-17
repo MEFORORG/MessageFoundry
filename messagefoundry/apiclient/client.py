@@ -368,12 +368,12 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
     credential on such a hop; see :meth:`EngineClient._refuse_credential_on_cleartext`.
 
-    Two checks, in this order, and the order is load-bearing.
+    Three checks, in this order, and the order is load-bearing.
 
     **Scheme allow-list (ASVS 1.2.2, BACKLOG #1107).** Only ``http`` and ``https`` are permitted.
     This has to run FIRST because everything below it is keyed on the HOST, and a URL like
     ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no hostname
-    at all -- ``parts.hostname`` is ``None``, so the ``host == ""`` early return below waves it
+    at all -- ``parts.hostname`` was ``None``, so the former ``host == ""`` early return waved it
     through. That made the shipped check a host-keyed deny-list for plaintext http rather than a
     protocol allow-list, and the two schemes the ASVS verb names by name were exactly the two that
     passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
@@ -382,6 +382,12 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     A base URL with no scheme at all fails here too (``urlsplit("127.0.0.1:8765")`` yields scheme
     ``""``), which is a deliberate change: such a URL could never have reached an engine, and
     failing at construction beats failing later with an opaque transport error.
+
+    **A host is required (BACKLOG #5343).** An empty or unparsable host is not loopback. httpx
+    re-reads a multi-slash URL such as ``http:////engine.example:8765``, whose ``urlsplit`` host is
+    empty, and connects to ``engine.example``, so treating the empty host as loopback would have let
+    a malformed URL skip both the plaintext refusal and the cleartext credential refusal. No URL
+    without a host can name an engine, so it is refused for both schemes.
 
     **Plaintext http to a remote host (CONSOLE-3, ASVS 12.3.3, BACKLOG #1179).** A remote
     ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a remote engine
@@ -404,7 +410,12 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     expression. Every caller that threads ``allow_insecure=True`` today polls tokenless, so the clamp
     costs them nothing.
     """
-    parts = urlsplit(base_url)
+    try:
+        parts = urlsplit(base_url)
+    except ValueError:  # an unbalanced IPv6 bracket, say
+        parts = None
+    if parts is None:  # raised outside the handler, so it chains no error quoting the URL
+        raise ApiError("refusing a base URL that does not parse as a URL.")
     scheme = parts.scheme.lower()
     if scheme not in _ALLOWED_URL_SCHEMES:
         found = f"scheme {scheme!r}" if scheme else "no scheme"
@@ -412,10 +423,15 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
             f"refusing a base URL with {found}: this client permits only the "
             f"{' and '.join(sorted(_ALLOWED_URL_SCHEMES))} schemes."
         )
+    host = (parts.hostname or "").lower()
+    if host == "":
+        raise ApiError(
+            "refusing a base URL with no host: name the engine host, for example "
+            "https://engine.example:8765 or http://127.0.0.1:8765."
+        )
     if scheme == "https":
         return False
-    host = (parts.hostname or "").lower()
-    if host in _LOOPBACK_HOSTS or host == "":
+    if host in _LOOPBACK_HOSTS:
         return False
     if allow_insecure:
         _log.warning(
