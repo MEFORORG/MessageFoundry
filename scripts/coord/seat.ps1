@@ -814,7 +814,8 @@ function Invoke-ClearHandoff {
         if ($bad.Count -gt 0) {
             return (Refuse "$($bad.Count) session registry file(s) cannot be read, so the fence is incomplete; first: $($bad[0].File) ($($bad[0].Error)).")
         }
-        $l = Get-SessionLiveness -SessionId $sid
+        # The seat's worktree scopes the veto by records that name no session to this tree.
+        $l = Get-SessionLiveness -SessionId $sid -Worktree $(if ($names -contains 'worktree') { [string]$rec.worktree } else { '' })
     } catch {
         return (Refuse "the liveness lookup for session $sid failed: $($_.Exception.Message)")
     }
@@ -1081,6 +1082,13 @@ try {
                       else { $null }
     $seatRoster = Resolve-SeatAgainstRoster -Label $labelUnderTest
 
+    # Capped by the COLLAPSED length (BACKLOG #5764): the raw length overran a collapsed string.
+    $collapsedNotes = if ($Notes) { $Notes -replace '\s+', ' ' } else { '' }
+    if ($collapsedNotes.Length -gt 2000) {
+        # Never split a surrogate pair: a lone high half would not survive the UTF-8 write.
+        $cut = if ([char]::IsHighSurrogate($collapsedNotes[1999])) { 1999 } else { 2000 }
+        $collapsedNotes = $collapsedNotes.Substring(0, $cut)
+    }
     $rec = [ordered]@{
         schema           = $SCHEMA
         writerVersion    = $WRITER
@@ -1140,7 +1148,7 @@ try {
         allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $lifecycleAt)
         handoff          = $handoffObj
         predecessor      = $pred
-        notes            = if ($Declare -and $Notes) { ($Notes -replace '\s+', ' ').Substring(0, [Math]::Min(2000, $Notes.Length)) } else { Prior 'notes' '' }
+        notes            = if ($Declare -and $Notes) { $collapsedNotes } else { Prior 'notes' '' }
     }
 
     # Carried forward ONLY where it exists, so a record never cleared keeps its old shape. Without

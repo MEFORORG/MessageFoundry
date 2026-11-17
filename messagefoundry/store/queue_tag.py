@@ -33,11 +33,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
     CipherError,
+    CipherUnavailableError,
     UnauthenticatedCipherError,
     cell_aad,
 )
@@ -52,10 +55,17 @@ __all__ = [
     "LIVE_INLINE_ROW",
     "QUEUE_TAG_COLUMNS",
     "QUEUE_TAG_SELECT",
+    "PROGRAMMING_ERRORS",
     "QUEUE_TAG_FAILED_ACTION",
+    "TRANSIENT_OPEN_BACKOFF_SECONDS",
+    "QueueOpenFault",
+    "queue_open_fault",
+    "release_unreturned",
+    "set_aside_deadline",
     "QueueTagError",
     "alert_queue_tag_failure",
     "is_tag_failure",
+    "is_transient_open_failure",
     "open_queue_cell",
     "queue_payload_aad",
     "queue_row_aad",
@@ -99,6 +109,86 @@ QUEUE_TAG_COLUMNS: Final = (
 )
 #: :data:`QUEUE_TAG_COLUMNS` as a SELECT list.
 QUEUE_TAG_SELECT: Final = ", ".join(QUEUE_TAG_COLUMNS)
+
+#: How long a per-lane claim sets a row aside when opening it failed for a reason that is not the
+#: row (BACKLOG #5735): the row goes back to ``pending`` with ``next_attempt_at`` this far past the
+#: fault (:func:`set_aside_deadline`), so a key service that gave no verdict is retried no sooner
+#: than this rather than on every sweep, with no cap and no alert of its own. Only
+#: ``claim_fifo_heads`` does not use it: it hands the fault to the pooled dispatcher's ADR 0070 T17
+#: path, whose own backoff, ``infra_fault_policy`` and ``lane_stuck`` alert bound it. Pooled mode
+#: still runs per-lane claims, at least an unordered lane's ``claim_ready`` and a batch window's
+#: ``claim_next_fifo``, and those are not bounded.
+TRANSIENT_OPEN_BACKOFF_SECONDS: Final = 5.0
+
+
+def set_aside_deadline(claim_now: float | None) -> float:
+    """The ``next_attempt_at`` a per-lane claim sets a row aside to (BACKLOG #5735):
+    :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` after the fault, read from the clock at the set-aside
+    write, not from the claim's start. A decrypt that timed out slowly would otherwise leave a
+    deadline already past, and the row would be re-claimed at once. Never earlier than the claim's
+    own ``claim_now`` plus the backoff either, so a claim given an injected time later than the
+    clock still finds the row not due."""
+    fault_at = time.time()
+    return max(fault_at, claim_now or fault_at) + TRANSIENT_OPEN_BACKOFF_SECONDS
+
+
+#: The errors a claim never contains as a failed dead-letter write (BACKLOG #5735): each names a
+#: fault in the engine's own code, which must stay loud, never one in the store or the key service.
+PROGRAMMING_ERRORS: Final = (AssertionError, AttributeError, LookupError, NameError, TypeError)
+
+
+class QueueOpenFault(Exception):
+    """A claimed queue row that could not be opened for a reason that is not the row (BACKLOG
+    #5735): a key service that gave no verdict, a failed store read, or a failed dead-letter write.
+    Built by :func:`queue_open_fault` with no cause, context or traceback, so a handler that logs
+    it with ``exc_info`` prints neither the raw key-service error, which can echo a URL or a
+    request body (BACKLOG #2318), nor the claim's frames, which hold other rows' plaintext (BACKLOG
+    #6706)."""
+
+
+def queue_open_fault(exc: BaseException) -> QueueOpenFault:
+    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
+    is a :class:`CipherError`, whose text never holds a value. Any other error, a failed store read
+    or dead-letter write, is named by its type alone: a driver's text can echo a statement, a key
+    or a truncated value, and the T17 path logs this fault at ERROR."""
+    if isinstance(exc, CipherError):
+        return QueueOpenFault(f"{type(exc).__name__}: {exc}")
+    return QueueOpenFault(type(exc).__name__)
+
+
+class _Releaser(Protocol):
+    async def release_claimed(self, ids: Sequence[str], now: float | None = None) -> None: ...
+
+
+async def release_unreturned(store: _Releaser, lanes: Iterable[Iterable[Any]]) -> None:
+    """Return every row of ``lanes`` that ``claim_fifo_heads`` claimed but will not return to
+    ``pending``, through ``store.release_claimed``, before the claim re-raises an ``Exception``
+    that escaped its decode (BACKLOG #5735). The claim committed before it decoded, so without
+    this every lane's rows stay ``inflight`` and the next claim delivers past them. A cancellation,
+    or any other ``BaseException`` that is not an ``Exception``, that escapes the decode never
+    reaches this: the claim leaves its rows ``inflight`` then, as the pooled dispatcher's teardown
+    leaves a cancelled serializer's (ADR 0066), for lease expiry or ``reset_stale_inflight``, with
+    the claim's ``attempts`` increment left in place. A release during a demotion's cancel is a
+    return-to-``pending`` write ADR 0157 C1 leaves unfenced, so it could re-pend rows a successor
+    already claimed. A row the claim already settled (dead-lettered) is
+    not ``inflight``, and the release leaves it as it is. A release that fails with an
+    ``Exception``, building the id list included, is logged and swallowed, so the caller re-raises
+    the original error; the rows then stay ``inflight`` until ``reset_stale_inflight``. A
+    cancellation delivered while the release awaits is not swallowed: it propagates in place of
+    the original error, which survives only as its ``__context__``, and the release may not land,
+    leaving the rows ``inflight`` as any other cancellation does."""
+    ids: list[str] = []
+    try:
+        ids = [str(row["id"]) for rows in lanes for row in rows]
+        await store.release_claimed(ids)
+    except Exception as failed:  # noqa: BLE001 -- the error being re-raised must stay the caller's
+        _log.error(
+            "could not release %d claimed queue row(s) after an error in the claim (%s);"
+            " they stay inflight until the next start",
+            len(ids),
+            type(failed).__name__,
+        )
+
 
 #: The audit action written when a queue row's payload does not open under its own tag.
 QUEUE_TAG_FAILED_ACTION: Final = "integrity.queue_tag_failed"
@@ -168,11 +258,119 @@ def is_tag_failure(cipher: Cipher, stored: str) -> bool:
 
     An unmarked value is the cipher's own refusal, which raises its own alert, and a value under a
     key that is not configured is a key-configuration fault. Neither is a tag failure. A cipher that
-    cannot say which keys it holds (Vault Transit) counts every marked value as held."""
+    cannot say which keys it holds (Vault Transit) counts every marked value as held. This reads the
+    VALUE only: whether a given failed open was the key service failing instead is the caller's
+    question, :func:`is_transient_open_failure` (BACKLOG #5765)."""
     if not cipher.is_encrypted(stored):
         return False
     holds = getattr(cipher, "holds_key_for", None)
     return bool(holds(stored)) if callable(holds) else True
+
+
+#: The only HTTP statuses that are the key service's verdict on the row (BACKLOG #5765): 400 and
+#: 413. A 400 is at least invalid ciphertext or input, or a key version that is unknown or below
+#: the key's ``min_decryption_version``, and Transit also answers it when the configured key itself
+#: is missing ("encryption key not found"); this rule reads every 400 as a verdict all the same. A
+#: 413 is a payload too large. A 404 is not a verdict: Vault answers it for a path it has no handler
+#: for, such as a missing mount or a wrong namespace, and the path is built from engine config,
+#: never from the row.
+_VERDICT_STATUSES: Final = frozenset({400, 413})
+
+#: The ``hvac`` error classes for a reply whose status is not a verdict, as hvac 2.4.0's
+#: ``VaultError.from_status`` maps them: 401 ``Unauthorized``, 403 ``Forbidden``, 404
+#: ``InvalidPath``, 429 ``RateLimitExceeded``, 500 ``InternalServerError``, 501
+#: ``VaultNotInitialized``, 502 ``BadGateway``, 503 ``VaultDown`` (a sealed or standby node), and
+#: ``UnexpectedError`` for every other status. hvac also defines ``UnsupportedOperation`` and
+#: ``PreconditionFailed``, which that map does not raise; they are kept in case another hvac
+#: release or caller raises them for a 405 or 412, neither of which is a verdict. Read only when no
+#: status was recorded on the error. ``InvalidRequest`` (400) is a verdict, so it is not here. Named
+#: rather than imported, so ``hvac`` stays imported in ``keyprovider_vault`` only (BACKLOG #2337).
+_NO_VERDICT_HVAC_ERRORS: Final = frozenset(
+    {
+        "Unauthorized",
+        "Forbidden",
+        "UnsupportedOperation",
+        "InvalidPath",
+        "PreconditionFailed",
+        "RateLimitExceeded",
+        "InternalServerError",
+        "VaultNotInitialized",
+        "BadGateway",
+        "VaultDown",
+        "UnexpectedError",
+    }
+)
+
+#: The attribute the store's Vault client sets on an error raised for a reply, to that reply's
+#: HTTP status (``keyprovider_vault._REPLY_STATUS_ATTR``, BACKLOG #8222). It is set on whatever
+#: class hvac raised, an ``UnexpectedError``, a ``TypeError`` or any other, so it is read on a
+#: cause of any class, and before the cause's class.
+_REPLY_STATUS_ATTR: Final = "mefor_reply_status"
+
+#: The engine's own refusal of a hop's TLS settings, ``tls_policy.InsecureHopRefused``, which the
+#: strict Vault adapter raises as its subclass ``VaultHopRefused``. Named rather than imported, so
+#: this module adds no TLS-policy use to the crypto inventory.
+_HOP_REFUSED: Final = ("messagefoundry.config.tls_policy", "InsecureHopRefused")
+
+
+def _key_service_gave_no_verdict(exc: CipherError) -> bool:
+    """Whether ``exc`` says nothing about the row, because the key service gave no verdict on it.
+
+    **The rule, stated here once (BACKLOG #5765, #5735).** A failed open is the key service's
+    verdict on the row only when the service answered HTTP 400 (invalid ciphertext or input) or 413
+    (payload too large), or when a decrypt or tag check ran and failed
+    (:class:`UnauthenticatedCipherError`). Everything else about reaching or authenticating to the
+    key service gives no verdict, at least: a 401, 403 or 408; a 404, which names a path the
+    engine's config built, such as a missing mount or a wrong namespace; a 429 or any
+    5xx; a connection failure, timeout, dropped connection or cut-off reply (an ``OSError`` cause,
+    which every ``requests`` error is); a TLS or certificate refusal, the engine's own hop refusal
+    (``InsecureHopRefused``) among them; a reply the engine would not read (``EgressReplyError``,
+    which the strict Vault adapter raises unwrapped); an ``UnexpectedError`` with
+    no recorded status; and a :class:`CipherUnavailableError`. A reply status the store's client
+    recorded (:data:`_REPLY_STATUS_ATTR`) decides first, on a cause of any class.
+
+    Any other cipher error keeps the classification it had before this rule, a verdict: one with
+    no cause, or whose cause none of the above names, such as a malformed reply's ``KeyError`` or
+    hvac's client-side ``ParamValidationError``.
+
+    Deliberately not :func:`~messagefoundry.store.crypto.gave_no_verdict` or
+    :func:`~messagefoundry.store.keyprovider_vault.is_vault_timeout_reply`: other modules read
+    those, and this rule does not change them. Nor does it rest on the Transit cipher's own split
+    into :class:`CipherUnavailableError` (``keyprovider_vault.is_vault_unavailable``), which keeps
+    a 403, a 504 and a certificate refusal as plain refusals for the upload routes' 423: this rule
+    reads the cause itself, so for those three the two answers differ on purpose."""
+    if isinstance(exc, UnauthenticatedCipherError):
+        return False  # the decrypt ran and the tag check failed
+    if isinstance(exc, CipherUnavailableError):
+        return True
+    cause = exc.__cause__
+    if cause is None:
+        return False  # nothing to read: a verdict, as before this rule
+    status = getattr(cause, _REPLY_STATUS_ATTR, None)
+    if type(status) is int:
+        return status not in _VERDICT_STATUSES
+    if type(cause).__module__.split(".")[0] == "hvac":
+        return type(cause).__name__ in _NO_VERDICT_HVAC_ERRORS
+    from messagefoundry.transports.bounded_read import EgressReplyError  # noqa: PLC0415
+
+    # The strict Vault adapter raises these itself, unwrapped: a hop it refused, and a reply it
+    # would not read. A cause none of the above names is unknown here: a verdict, as before.
+    return isinstance(cause, (OSError, EgressReplyError)) or any(
+        (kind.__module__, kind.__qualname__) == _HOP_REFUSED for kind in type(cause).__mro__
+    )
+
+
+def is_transient_open_failure(exc: BaseException) -> bool:
+    """Whether a failed open said nothing about the cell (BACKLOG #5765, #5735), by the rule
+    :func:`_key_service_gave_no_verdict` states. Such a failure is never a tag failure, and a claim
+    sets the row aside with a backoff (:data:`TRANSIENT_OPEN_BACKOFF_SECONDS`) rather than
+    dead-lettering it. A :class:`QueueTagError` is never transient: it is raised only after this
+    check passed."""
+    return (
+        isinstance(exc, CipherError)
+        and not isinstance(exc, QueueTagError)
+        and _key_service_gave_no_verdict(exc)
+    )
 
 
 def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | None:
@@ -194,12 +392,25 @@ def reseal_unless_tag_failure(cipher: Cipher, stored: str, aad: bytes) -> str | 
     return cipher.encrypt(plaintext, aad=aad)
 
 
+def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
+    """Whether ``exc``, raised opening the marked value ``stored``, says the cell failed its tag.
+
+    A key service that gave no verdict (:func:`is_transient_open_failure`, BACKLOG #5765) says
+    nothing about the cell, so it is never a tag failure. Otherwise :func:`is_tag_failure` decides, so under Vault Transit, which
+    cannot name its keys, every other refusal of a marked value still counts as one. That is
+    deliberately louder than :func:`~messagefoundry.store.cell_tag.open_tagged_cell`, which keeps a
+    non-AEAD Transit refusal as the cipher's own error: narrowing this control would rest on
+    matching Vault's error text, and that change is not this fix's to make."""
+    return not is_transient_open_failure(exc) and is_tag_failure(cipher, stored)
+
+
 def open_queue_cell(cipher: Cipher, row: Any) -> str:
     """Open ``row``'s ``payload`` under its own tag: the body for an inline row, the sealed
     ``shared_body`` key for a ``ref`` row.
 
     Raises :class:`QueueTagError` when the cell does not open under the row's tag (see
-    :func:`is_tag_failure`; a key or format problem raises the cipher's own error), when a keyed
+    :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and so does
+    a key service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
     store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
     differs from its ``body_ref`` column. A keyless store writes plaintext and has no tag to check,
     so there only the reference comparison binds anything."""
@@ -215,8 +426,8 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
-        if not is_tag_failure(cipher, payload):
-            raise  # a key or format problem, which the cipher's own error names
+        if not _names_tag_failure(cipher, payload, exc):
+            raise  # a key, format or key-service problem, which the cipher's own error names
         raise QueueTagError(
             f"integrity: the queue row's payload does not open under its own tag ({exc})"
         ) from exc
@@ -239,13 +450,17 @@ class _AuditSink(Protocol):
     ) -> None: ...
 
 
-async def report_queue_tag_failure(store: _AuditSink, cipher: object, row: Any) -> None:
+async def report_queue_tag_failure(
+    store: _AuditSink, cipher: object, row: Any, *, outcome: str = "was dead-lettered"
+) -> None:
     """Record that ``row`` failed its queue tag: a WARNING, a :data:`QUEUE_TAG_FAILED_ACTION` audit
     row and an ``integrity_drift`` alert through the cipher's tag-failure hook (BACKLOG #2593).
 
-    The caller has already dead-lettered the row, so the lane has moved on and the message is
-    ``ERROR``. Names the row by a short id prefix and its stage, never a row value. An audit or
-    alert failure is logged and swallowed: reporting must never undo the dead-letter."""
+    The caller has usually dead-lettered the row, so the lane has moved on and the message is
+    ``ERROR``. A caller whose dead-letter write failed reports the tag failure all the same, with
+    ``outcome`` saying so (BACKLOG #5735). Names the row by a short id prefix and its stage, never
+    a row value. An audit or alert failure is logged and swallowed: reporting must never undo the
+    dead-letter."""
     ref = str(row["id"])[:_ROW_REF_LEN]
     stage = row["stage"]
     try:
@@ -257,7 +472,7 @@ async def report_queue_tag_failure(store: _AuditSink, cipher: object, row: Any) 
         )
     except Exception:  # noqa: BLE001 -- the dead-letter stands whatever the audit write does
         _log.exception("the %s audit row could not be written", QUEUE_TAG_FAILED_ACTION)
-    alert_queue_tag_failure(cipher, row, outcome="was dead-lettered")
+    alert_queue_tag_failure(cipher, row, outcome=outcome)
 
 
 def alert_queue_tag_failure(cipher: object, row: Any, *, outcome: str) -> None:

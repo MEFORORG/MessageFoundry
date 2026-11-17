@@ -45,6 +45,7 @@ from tests._ast_sites import (
     code_names,
     code_strings,
     delete_keeping_a_mention,
+    keyword_value,
     named_func,
     parse_source,
     source_calls,
@@ -318,9 +319,10 @@ def test_guard_detects_a_planted_omission() -> None:
 def test_every_message_event_kind_is_named_in_row_6() -> None:
     """Row 6's "what events are logged" cell — the exact column 16.1.1 words — must be complete.
 
-    RULE: the cell enumerated 9 kinds and read as exhaustive; the engine emits 19. Derived from
-    ``MESSAGE_EVENT_KINDS``, itself cross-checked against the literal ``_event`` / ``_event_stmt``
-    call sites below, so a new kind cannot ship undocumented.
+    RULE: the cell enumerated 9 kinds and read as exhaustive, while the engine emitted more. Derived
+    from ``MESSAGE_EVENT_KINDS``, itself cross-checked against the string-literal kinds at the
+    ``_event`` / ``_event_stmt`` / ``_event_sync`` call sites below. A kind passed to those helpers
+    by variable, or written by a raw INSERT, is not cross-checked.
     """
     from messagefoundry.store.store import MESSAGE_EVENT_KINDS
 
@@ -355,28 +357,129 @@ def test_every_audit_floor_event_is_named_as_such_in_row_6() -> None:
     )
 
 
-def test_message_event_constant_matches_the_literal_emit_sites() -> None:
-    """The constant is trustworthy only while it tracks the code that writes the rows."""
-    import ast
+#: The store's message_events write helpers. Each backend defines its own, with its own leading
+#: parameters (SQLite's ``_event`` takes none, Postgres takes ``conn``, SQL Server takes ``cur``), so
+#: the ``event`` slot is read from each file's own ``def`` rather than assumed.
+_EVENT_HELPERS = frozenset({"_event", "_event_stmt", "_event_sync"})
 
+
+def _literal_event_kinds(source: str) -> set[str]:
+    """Every literal ``event`` a backend source passes to its own message_events write helpers.
+
+    The ``event`` position comes from each helper's signature in ``source``, minus ``self``, and a
+    keyword ``event=`` is read too. A helper with no ``event`` parameter, or a call to a helper the
+    file does not define, fails here rather than being skipped, because a skipped helper is the
+    blind spot this guard exists to close.
+
+    A call whose ``event`` argument cannot be placed (a starred argument at or before the slot, or
+    ``event`` passed through ``**kwargs``) fails too.
+
+    Scope, which this does NOT read: a kind passed as a variable or a name rather than a string
+    literal at the call (the routed/filtered/unrouted mapping, for one), a helper reached under
+    another name (an alias or a ``functools.partial``), and a raw
+    ``INSERT INTO message_events`` that bypasses the helpers, as three of SQLite's do. Nothing in
+    this module checks a kind written on those paths. ``check_caller_event_kind`` refuses an
+    undeclared kind at run time only on the public ``record_message_event`` path, not inside the
+    store's own ``_event`` calls.
+    """
+    slots: dict[str, int] = {}
+    calls: list[tuple[str, ast.Call]] = []
+    for node in ast.walk(parse_source(source)):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in _EVENT_HELPERS:
+            params = [a.arg for a in (*node.args.posonlyargs, *node.args.args)]
+            params = params[1:] if params[:1] in (["self"], ["cls"]) else params
+            assert "event" in params, f"{node.name} has no `event` parameter; re-aim this guard"
+            slot = params.index("event")
+            assert slots.setdefault(node.name, slot) == slot, f"two {node.name} signatures disagree"
+        elif isinstance(node, ast.Call) and (name := callee_name(node)) in _EVENT_HELPERS:
+            calls.append((name, node))
+    undefined = sorted({name for name, _call in calls} - set(slots))
+    assert not undefined, (
+        f"calls to {undefined}, which this source does not define; re-aim the scan"
+    )
+    kinds: set[str] = set()
+    unread: list[str] = []
+    for name, call in calls:
+        slot = slots[name]
+        if any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1]):
+            unread.append(ast.unparse(call))  # the event's position is known only at run time
+            continue
+        value = call.args[slot] if slot < len(call.args) else keyword_value(call, "event")
+        if value is None:
+            unread.append(ast.unparse(call))  # passed through **kwargs, or not at all
+        elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+            kinds.add(value.value)
+    assert not unread, f"event helper calls whose `event` argument the scan cannot place: {unread}"
+    return kinds
+
+
+def test_message_event_constant_matches_the_literal_emit_sites() -> None:
+    """The constant is trustworthy only while it tracks the code that writes the rows.
+
+    RULE (BACKLOG #5498): this read ``args[:2]`` of ``_event`` / ``_event_stmt`` calls in every
+    backend. Postgres and SQL Server pass ``conn`` / ``cur`` first, so ``event`` sits at ``args[2]``
+    there, and SQL Server's ``_event_sync`` was not read at all; a literal undeclared kind written by
+    either backend would have passed. Every backend must now yield the SAME non-empty set: the three
+    are parity twins, so a scan that goes wholly or partly blind on one file fails instead of
+    passing on what it still sees. The scope :func:`_literal_event_kinds` states still applies.
+    """
     from messagefoundry.store.store import MESSAGE_EVENT_KINDS
 
-    emitted: set[str] = set()
-    for name in ("store.py", "postgres.py", "sqlserver.py"):
-        source = (_ROOT / "messagefoundry" / "store" / name).read_text(encoding="utf-8")
-        for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Call):
-                continue
-            if callee_name(node) not in {"_event", "_event_stmt"}:
-                continue
-            for arg in node.args[:2]:
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    emitted.add(arg.value)
-    undeclared = sorted(emitted - set(MESSAGE_EVENT_KINDS))
-    assert not undeclared, (
-        "message_events kind(s) written by the store but absent from MESSAGE_EVENT_KINDS: "
-        f"{undeclared}. Add them to the constant AND to docs/PHI.md §7 row 6."
+    emitted = {
+        name: _literal_event_kinds(
+            (_ROOT / "messagefoundry" / "store" / name).read_text(encoding="utf-8")
+        )
+        for name in ("store.py", "postgres.py", "sqlserver.py")
+    }
+    union = set().union(*emitted.values())
+    assert all(kinds == union for kinds in emitted.values()), (
+        "the backends' literal message_events kinds differ; each backend lacks: "
+        f"{ {name: sorted(union - kinds) for name, kinds in emitted.items()} }"
     )
+    # The declared kinds that no helper call in any backend spells as a string literal.
+    non_literal = {
+        "error",
+        "failed",
+        "filtered",
+        "not_deployed",
+        "reply_returned",
+        "reply_timeout",
+        "routed",
+        "unrouted",
+        "viewed",
+    }
+    expected = set(MESSAGE_EVENT_KINDS) - non_literal
+    assert union == expected, (
+        f"literal kinds written but not expected: {sorted(union - expected)} (an undeclared one "
+        "goes into MESSAGE_EVENT_KINDS AND docs/PHI.md §7 row 6); expected literal kinds no longer "
+        f"seen: {sorted(expected - union)}. Update `non_literal` only for a kind that moved."
+    )
+
+
+def test_the_emit_site_scan_reads_every_backend_signature() -> None:
+    """Prove the scan reads the ``event`` slot of each backend's helper shape, and nothing else."""
+    source = (
+        "class S:\n"
+        "    async def _event(self, conn, message_id, event, destination, detail, now): ...\n"
+        "    def _event_sync(self, cur, message_id, event, destination, detail, now): ...\n"
+        "    def _event_stmt(self, message_id, event, destination, detail, now): ...\n"
+        "    async def run(self, conn, cur, kind):\n"
+        "        await self._event(conn, 'mid', 'pg_kind', None, 'detail_literal', 0.0)\n"
+        "        self._event_sync(cur, 'mid', 'sync_kind', None, None, 0.0)\n"
+        "        self._event_stmt('mid', 'stmt_kind', None, None, 0.0)\n"
+        "        await self._event(conn, 'mid', event='kw_kind', destination=None, detail=None,"
+        " now=0.0)\n"
+        "        await self._event(conn, 'mid', kind, None, None, 0.0)\n"
+    )
+    assert _literal_event_kinds(source) == {"pg_kind", "sync_kind", "stmt_kind", "kw_kind"}
+    with pytest.raises(AssertionError, match="no `event` parameter"):
+        _literal_event_kinds("def _event(self, conn, message_id, kind): ...\n")
+    with pytest.raises(AssertionError, match="does not define"):
+        _literal_event_kinds("self._event_sync(cur, 'mid', 'moved_kind', None, None, 0.0)\n")
+    helper = "def _event(self, conn, message_id, event, destination, detail, now): ...\n"
+    for call in ("_event(*head, 'starred_kind', None, None, 0.0)", "_event(conn, **parts)"):
+        with pytest.raises(AssertionError, match="cannot place"):
+            _literal_event_kinds(helper + call + "\n")
 
 
 def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
@@ -447,7 +550,7 @@ def _quarantine_kinds(tree: ast.Module) -> tuple[set[str], list[int]]:
     kinds: set[str] = set()
     unread: list[int] = []
     for call in calls:
-        kind = next((kw.value for kw in call.keywords if kw.arg == "kind"), None)
+        kind = keyword_value(call, "kind")
         # A starred argument at or before the slot moves the kind to a position only run time knows.
         if (
             kind is None

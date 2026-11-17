@@ -1266,6 +1266,20 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
     return missing
 
 
+def own_crl_reason(ca_ders: Iterable[bytes], crl_pem: bytes) -> str | None:
+    """Why a whole-chain CRL check on a hop listing ``ca_ders`` refuses ``crl_pem``, after the
+    setting or the file, or ``None`` when every CA has a CRL of its own (vault BACKLOG #5627,
+    #5511). A start and the running-hop reload both ask this, so the rule and its words are one."""
+    try:
+        missing = cas_without_own_crl(ca_ders, crl_pem)
+    except ValueError as exc:
+        return (
+            "it could not be checked against the client CAs the hop loaded from its client-CA "
+            f"setting, such as tls_ca_file or [api].tls_client_ca_file: {exc}"
+        )
+    return own_crl_refusal(missing) if missing else None
+
+
 def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
     """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
     after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is

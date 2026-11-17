@@ -14,6 +14,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+#: SDDL aliases icacls may print for the account running the tests: the built-in Administrator,
+#: which the hosted runners run as (CI run 36039014999), and the service accounts a self-hosted
+#: runner's service may run as.
+_ACCOUNT_ALIASES = ("LA", "SY", "LS", "NS")
+
+
+def my_sids(sid: str) -> set[str]:
+    """The ways SDDL may spell the account whose SID is ``sid``: the SID, and each alias in
+    :data:`_ACCOUNT_ALIASES` that Windows converts to exactly that SID. ``LA`` is this machine's
+    built-in Administrator, so a domain account with RID 500 does not get it. Windows only."""
+    from messagefoundry.config.atomic_edit import _canonical_sid
+
+    return {sid} | {alias for alias in _ACCOUNT_ALIASES if _canonical_sid(alias) == sid}
+
 
 def protected_entries(path: Path) -> tuple[str, str | None, list[tuple[str, str, str, str]]]:
     """The SDDL of ``path``, its owner, and its entries as ``(kind, flags, rights, sid)``, each SID

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import inspect
 import io
 import os
 import re
@@ -69,7 +70,7 @@ from types import MappingProxyType
 
 import pytest
 
-from tests._ast_sites import code_strings, parse_source
+from tests._ast_sites import call_sites, code_strings, keyword_value, named_func, parse_source
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
@@ -873,6 +874,82 @@ def _vault_reply_bytes() -> int:
     return _source_int_constant("transports/strict_requests.py", "MAX_VAULT_REPLY_BYTES")
 
 
+def _literal_number(node: ast.expr | None, where: str) -> int | float:
+    assert (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int | float)
+        and not isinstance(node.value, bool)
+    ), f"{where} is no longer a numeric literal; teach this reader the new shape"
+    return node.value
+
+
+@functools.cache
+def _get_route_query_bound(path: str, param: str, keyword: str) -> int | float:
+    """A ``Query(...)`` keyword on one ``GET`` route's parameter in ``api/app.py``, read from source.
+
+    BACKLOG #5499: the doc-side table carried these route bounds as a bare literal on BOTH sides,
+    so a changed ``le=`` reached no test in this module.
+    """
+    where = f"GET {path} `{param}` Query({keyword}=...)"
+    tree = parse_source((_PKG / "api" / "app.py").read_text(encoding="utf-8"))
+    routes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(
+            isinstance(dec, ast.Call)
+            and isinstance(dec.func, ast.Attribute)
+            and dec.func.attr == "get"
+            and dec.args
+            and isinstance(dec.args[0], ast.Constant)
+            and dec.args[0].value == path
+            for dec in node.decorator_list
+        )
+    ]
+    assert len(routes) == 1, f"{len(routes)} GET {path} routes in api/app.py; expected exactly 1"
+    args = routes[0].args
+    positional = [*args.posonlyargs, *args.args]
+    pairs = [
+        *zip(positional[len(positional) - len(args.defaults) :], args.defaults, strict=True),
+        *zip(args.kwonlyargs, args.kw_defaults, strict=True),
+    ]
+    found = next((default for arg, default in pairs if arg.arg == param), None)
+    assert (
+        isinstance(found, ast.Call)
+        and isinstance(found.func, ast.Name)
+        and found.func.id == "Query"
+    ), f"{where}: not a Query"
+    return _literal_number(keyword_value(found, keyword), where)
+
+
+@functools.cache
+def _db_poll_seconds_default() -> int | float:
+    """``DatabaseSource``'s ``poll_seconds`` default, the ``default=`` it passes ``poll_interval``.
+
+    BACKLOG #5499: like the route bounds above, this was a literal on both sides of the table.
+    """
+    where = "transports/database.py poll_interval(..., transport='DATABASE source') default"
+    tree = parse_source((_PKG / "transports" / "database.py").read_text(encoding="utf-8"))
+    calls = [
+        call
+        for call in call_sites(tree, "poll_interval", bare_only=True)
+        if isinstance(transport := keyword_value(call, "transport"), ast.Constant)
+        and transport.value == "DATABASE source"
+    ]
+    assert len(calls) == 1, f"{where}: {len(calls)} calls; expected exactly 1"
+    return _literal_number(keyword_value(calls[0], "default"), where)
+
+
+@functools.cache
+def _claim_limit_default() -> int:
+    """``RegistryRunner``'s ``claim_limit`` default, the rows one delivery claim takes."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    default = inspect.signature(RegistryRunner).parameters["claim_limit"].default
+    assert type(default) is int, f"RegistryRunner claim_limit default is {default!r}, not an int"
+    return default
+
+
 def _checks() -> list[tuple[str, object, object]]:
     """The ``(label, live value, transcribed bound)`` rows that BOTH bound tests read.
 
@@ -909,6 +986,35 @@ def _checks() -> list[tuple[str, object, object]]:
         ("15.1.3 HL7 parse cap = 16 MiB", peek.DEFAULT_MAX_MESSAGE_BYTES, 16 * mib),
         ("15.1.3 HL7 segment cap = 10,000", peek.DEFAULT_MAX_SEGMENTS, 10_000),
         ("15.1.3 escape repeat clamp = 512", _builtin_hl7.MAX_ESCAPE_REPEAT, 512),
+        # BACKLOG #5499: the rows from here to the export floor had a doc-side entry and no row
+        # here, so on a checkout without the document nothing pinned them.
+        (
+            "15.1.3 counted escape-opener budget = 100,000",
+            _builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS,
+            100_000,
+        ),
+        ("15.1.3 DB poll interval = 5.0 s", _db_poll_seconds_default(), 5.0),
+        ("15.1.3 delivery claim_limit = 20", _claim_limit_default(), 20),
+        (
+            "15.1.3 /logs/tail page limit = 2,000",
+            _get_route_query_bound("/logs/tail", "limit", "le"),
+            2_000,
+        ),
+        (
+            "15.1.3 /messages/export limit = 100,000",
+            _get_route_query_bound("/messages/export", "limit", "le"),
+            100_000,
+        ),
+        (
+            "15.1.3 /logs/tail page floor = 1",
+            _get_route_query_bound("/logs/tail", "limit", "ge"),
+            1,
+        ),
+        (
+            "15.1.3 /messages/export limit floor = 1",
+            _get_route_query_bound("/messages/export", "limit", "ge"),
+            1,
+        ),
         (
             "15.1.3 strict-validate backstop = 5.0 s",
             wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS,
@@ -980,6 +1086,7 @@ def _checks() -> list[tuple[str, object, object]]:
         # document would trade a stale row for an unverifiable anchor.
         ("15.1.3 outbound retry cap = 100 attempts by default", RetryPolicy().max_attempts, 100),
         ("15.1.3 retry backoff = 5.0 s", RetryPolicy().backoff_seconds, 5.0),
+        ("15.1.3 retry backoff multiplier = 2.0", RetryPolicy().backoff_multiplier, 2.0),
         ("15.1.3 retry backoff cap = 300.0 s", RetryPolicy().max_backoff_seconds, 300.0),
         ("15.1.3 queue_buildup depth dimension OFF", BuildupThreshold().max_depth, None),
         ("15.1.3 queue_buildup age = 300.0 s", BuildupThreshold().max_oldest_seconds, 300.0),
@@ -1601,6 +1708,7 @@ def test_the_open_gap_is_tracked_against_an_artifact_that_exists() -> None:
 #: this closes the other half: the rendered value must appear in that row's own line.
 def _doc_side_bounds() -> list[tuple[str, object, str]]:
     from messagefoundry.auth.service import _ARGON2_MAX_CONCURRENCY
+    from messagefoundry.config.models import BuildupThreshold, RetryPolicy
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.parsing import _builtin_hl7, peek
     from messagefoundry.transports import bounded_read, database, dicom, http_listener, mllp
@@ -1609,8 +1717,17 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
 
     s = ServiceSettings()
     mib = 1024 * 1024
+    # BACKLOG #5499: these were literals on BOTH sides of the tuple, so no code change reached them.
+    retry = RetryPolicy()
+    buildup_age = BuildupThreshold().max_oldest_seconds
+    claim_limit = _claim_limit_default()
+    db_poll = _db_poll_seconds_default()
+    tail_min = _get_route_query_bound("/logs/tail", "limit", "ge")
+    tail_max = _get_route_query_bound("/logs/tail", "limit", "le")
+    export_min = _get_route_query_bound("/messages/export", "limit", "ge")
+    export_max = _get_route_query_bound("/messages/export", "limit", "le")
     return [
-        ("**HL7 parse**", peek.DEFAULT_MAX_MESSAGE_BYTES // mib, "16 MiB"),
+        ("**HL7 parse**", peek.DEFAULT_MAX_MESSAGE_BYTES, "16 MiB"),
         ("**HL7 parse**", peek.DEFAULT_MAX_SEGMENTS, "10,000"),
         ("**HL7 escape expansion**", _builtin_hl7.MAX_ESCAPE_REPEAT, "512"),
         ("**HL7 escape expansion**", _builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS, "100,000"),
@@ -1626,8 +1743,8 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
             mllp.DEFAULT_RECEIVE_TIMEOUT,
             f"`DEFAULT_RECEIVE_TIMEOUT` **{mllp.DEFAULT_RECEIVE_TIMEOUT} s**",
         ),
-        ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_BODY_BYTES // mib, "16 MiB"),
-        ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_HEADER_BYTES // 1024, "64 KiB"),
+        ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_BODY_BYTES, "16 MiB"),
+        ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_HEADER_BYTES, "64 KiB"),
         # From here the entries added by BACKLOG #1961 (DICOM) and #1935 (the rest) share two rules.
         # Each renders a FULL phrase that names its constant or sits in the sentence that does,
         # never a bare number: the DICOM row states 128 MiB and 16 MiB more than once and carries
@@ -1666,7 +1783,7 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
             mllp.DEFAULT_MAX_MESSAGES_PER_SECOND,
             f"`DEFAULT_MAX_MESSAGES_PER_SECOND = {mllp.DEFAULT_MAX_MESSAGES_PER_SECOND}`",
         ),
-        ("**File source**", file_transport.DEFAULT_MAX_FILE_BYTES // mib, "16 MiB"),
+        ("**File source**", file_transport.DEFAULT_MAX_FILE_BYTES, "16 MiB"),
         (
             "**File source**",
             DEFAULT_MAX_ITEMS_PER_POLL,
@@ -1677,7 +1794,7 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
             DEFAULT_MAX_ITEMS_PER_POLL,
             f"`poll_max_files` **{DEFAULT_MAX_ITEMS_PER_POLL}** files per poll",
         ),
-        ("**Database poll source**", 5, "5.0"),
+        ("**Database poll source**", db_poll, f"`poll_seconds` **{db_poll}**"),
         (
             "**Database poll source**",
             DEFAULT_MAX_ITEMS_PER_POLL,
@@ -1726,13 +1843,34 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
         ("**argon2 verification**", _ARGON2_MAX_CONCURRENCY, "cpu_count"),
         ("**Per-actor PHI reads**", s.auth.phi_read_rate_limit_per_actor, "120"),
         ("**Per-actor admin writes**", s.auth.admin_write_rate_limit_per_actor, "12"),
-        ("**`GET /logs/tail`**", 2_000, "2,000"),
-        ("**`GET /messages/export`**", 100_000, "100,000"),
-        ("**`POST /uploads`**", s.store.max_upload_bytes // mib, "25 MiB"),
-        ("**Outbound retry**", 5.0, "5.0"),
-        ("**Outbound retry**", 300.0, "300"),
-        ("**Queue claim sizing**", 20, "20"),
-        ("**Backlog alerting**", 300.0, "300"),
+        ("**`GET /logs/tail`**", tail_max, f"`limit` **{tail_min}..{tail_max:,}** lines"),
+        ("**`GET /logs/tail`**", tail_min, f"`limit` **{tail_min}..{tail_max:,}** lines"),
+        ("**`GET /messages/export`**", export_max, f"`limit` **{export_min}..{export_max:,}**"),
+        ("**`GET /messages/export`**", export_min, f"`limit` **{export_min}..{export_max:,}**"),
+        ("**`POST /uploads`**", s.store.max_upload_bytes, "25 MiB"),
+        (
+            "**Outbound retry**",
+            retry.max_attempts,
+            f"`max_attempts` **defaults to a finite `{retry.max_attempts}`**",
+        ),
+        ("**Outbound retry**", retry.backoff_seconds, f"backoff **{retry.backoff_seconds} s**"),
+        # U+00D7, the multiplication sign the row writes, escaped so this file adds no glyph.
+        ("**Outbound retry**", retry.backoff_multiplier, f"\u00d7 **{retry.backoff_multiplier}**"),
+        (
+            "**Outbound retry**",
+            retry.max_backoff_seconds,
+            f"capped **{retry.max_backoff_seconds} s**",
+        ),
+        (
+            "**Queue claim sizing**",
+            claim_limit,
+            f"`claim_limit` **{claim_limit}** rows per delivery claim",
+        ),
+        (
+            "**Backlog alerting**",
+            buildup_age,
+            f"`max_oldest_seconds` **{buildup_age} s**",
+        ),
     ]
 
 
@@ -1753,27 +1891,26 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
     from messagefoundry.verify import cipher_policy
 
     s = ServiceSettings()
-    mib = 1024 * 1024
     return [
-        ("**Sandbox IPC deserialization**", sandbox._MAX_FRAME // mib, "64 MiB"),
+        ("**Sandbox IPC deserialization**", sandbox._MAX_FRAME, "64 MiB"),
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS),
+            oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS,
             "**10 s** per round trip",
         ),
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            oidc_flow._MAX_TOKEN_RESPONSE_BYTES // 1024,
+            oidc_flow._MAX_TOKEN_RESPONSE_BYTES,
             "256 KiB",
         ),
-        ("**OIDC token-endpoint POST + JWKS GET**", jwks._MAX_JWKS_BYTES // 1024, "512 KiB"),
+        ("**OIDC token-endpoint POST + JWKS GET**", jwks._MAX_JWKS_BYTES, "512 KiB"),
         ("**OIDC token-endpoint POST + JWKS GET**", jwks._MIN_RSA_BITS, "2048"),
-        ("**OIDC token-endpoint POST + JWKS GET**", int(jwks.DEFAULT_JWKS_TTL_SECONDS), "3600"),
+        ("**OIDC token-endpoint POST + JWKS GET**", jwks.DEFAULT_JWKS_TTL_SECONDS, "3600"),
         # Rendered as the FULL phrase, not the bare number: the row carries two independent 300 s
         # constants and three "512"s, so a bare token let a planted lie be satisfied by its sibling.
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(jwks.DEFAULT_JWKS_MIN_REFETCH_SECONDS),
+            jwks.DEFAULT_JWKS_MIN_REFETCH_SECONDS,
             "min-refetch floor of 300 s",
         ),
         (
@@ -1783,7 +1920,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
         ),
         (
             "**OIDC token-endpoint POST + JWKS GET**",
-            int(s.auth.oidc_flow_ttl_seconds),
+            s.auth.oidc_flow_ttl_seconds,
             "`[auth].oidc_flow_ttl_seconds` **300 s**",
         ),
         ("**Operator-configured SHELL execution**", s.dr.takeover_timeout_seconds, "30.0 s"),
@@ -1795,7 +1932,7 @@ def _dangerous_doc_side_bounds() -> list[tuple[str, object, str]]:
             cipher_policy._PROBE_TIMEOUT_S,
             f"each cipher-policy probe {cipher_policy._PROBE_TIMEOUT_S:g} s",
         ),
-        ("**HTTP uploads**", s.store.max_upload_bytes // mib, "25 MiB"),
+        ("**HTTP uploads**", s.store.max_upload_bytes, "25 MiB"),
     ]
 
 
@@ -1828,6 +1965,93 @@ def test_every_quoted_bound_appears_in_its_own_doc_row(heading: str, which: str)
         f"{problems}. A doc-side edit is the rot mode that matters for a cell scored on the "
         "documentation, and the code-side check alone cannot see it."
     )
+
+
+#: Numbers as the rendered phrases write them: ``2,000``, ``5.0``, ``16`` (of ``16 MiB``).
+#: The lookbehinds refuse a digit inside a name and the fraction half of ``5.0``; ``1..2,000`` is two.
+_RENDERED_NUMBER_RE = re.compile(r"(?<!\w)(?<!\d\.)\d[\d,]*(?:\.\d+)?(?!\w)")
+
+#: Doc-side entries whose rendered form states the bound as a formula, not a number. Each is pinned
+#: by value elsewhere: the argon2 clamp by ``_checks``' ``max(2, min(8, cpu_count))`` row.
+_RENDERED_WITHOUT_A_NUMBER: dict[str, set[str]] = {"15.1.3": {"**argon2 verification**"}}
+
+
+def _rendered_numbers(rendered: str) -> set[float]:
+    return {float(token.replace(",", "")) for token in _RENDERED_NUMBER_RE.findall(rendered)}
+
+
+def _rendered_units(rendered: str) -> set[float]:
+    """The divisors that turn a live value into the phrase's number. A size entry carries its live
+    value in bytes and renders it in the binary unit it names; any other entry renders as it is.
+    A value already denominated in MiB, as ``s.sandbox.mem_mb`` is, is rendered without a unit."""
+    named = {
+        multiplier
+        for unit, multiplier in _UNIT_MULTIPLIER.items()
+        if unit.endswith("iB") and re.search(rf"\b{unit}\b", rendered)
+    }
+    return named or {1}
+
+
+@pytest.mark.parametrize("which", ["15.1.3", "15.1.5"])
+def test_every_doc_side_bound_renders_its_live_value(which: str) -> None:
+    """The live value in each doc-side entry must be the number its rendered phrase states.
+
+    RULE (BACKLOG #5499): the doc-side test above unpacks ``_live`` and never reads it, so an entry
+    whose rendered phrase is a literal (``"16 MiB"``, ``"2048"``) stayed green when its constant
+    changed, and an entry whose ``_live`` was itself a literal reached no code at all. This runs
+    without the document, so it holds on every checkout, where the document-reading half is inert.
+    """
+    bounds = _doc_side_bounds() if which == "15.1.3" else _dangerous_doc_side_bounds()
+    problems: list[str] = []
+    numberless: set[str] = set()
+    for label, live, rendered in bounds:
+        if isinstance(live, bool) or not isinstance(live, int | float):
+            # A non-numeric live value must appear as itself, as the pacer's ``= None`` does.
+            if f"= {live}" not in rendered:
+                problems.append(f"{label!r}: renders {rendered!r}, but the live value is {live!r}")
+            continue
+        stated = _rendered_numbers(rendered)
+        if not stated:
+            numberless.add(label)
+        elif not {live / unit for unit in _rendered_units(rendered)} & stated:
+            problems.append(f"{label!r}: renders {rendered!r}, but the live value is {live!r}")
+    # Equality, not a subset, so an exemption whose entry was re-rendered or removed goes stale loudly.
+    assert numberless == _RENDERED_WITHOUT_A_NUMBER.get(which, set()), (
+        f"doc-side entries rendering no number, so nothing ties them to code: {sorted(numberless)}; "
+        f"exempted: {sorted(_RENDERED_WITHOUT_A_NUMBER.get(which, set()))}"
+    )
+    assert not problems, (
+        f"{which} doc-side entries whose rendered phrase no longer states the live bound: "
+        f"{problems}. Render the phrase from the live value, then re-check THREAT-MODEL.md's row."
+    )
+
+
+def test_no_doc_side_entry_carries_a_literal_live_value() -> None:
+    """The check above compares a phrase with its live value, so a live value written as a literal
+    beside a matching literal phrase would satisfy it while reaching no code (BACKLOG #5499)."""
+    tree = parse_source(Path(__file__).read_text(encoding="utf-8"))
+    literal: list[str] = []
+    for name in ("_doc_side_bounds", "_dangerous_doc_side_bounds"):
+        returns = [n for n in ast.walk(named_func(tree, name)) if isinstance(n, ast.Return)]
+        assert len(returns) == 1 and isinstance(returns[0].value, ast.List), name
+        for entry in returns[0].value.elts:
+            assert isinstance(entry, ast.Tuple) and len(entry.elts) == 3, ast.unparse(entry)
+            if isinstance(entry.elts[1], ast.Constant):
+                literal.append(ast.unparse(entry))
+    assert not literal, f"doc-side entries whose live value is a literal, not code: {literal}"
+
+
+def test_the_rendered_number_reader_reads_the_forms_the_tables_use() -> None:
+    """Prove the reader above can tell a stated bound from a stale one."""
+    assert _rendered_numbers("`limit` **1..2,000** lines") == {1.0, 2000.0}
+    assert _rendered_numbers("backoff **5.0 s**") == {5.0}
+    assert _rendered_numbers("`DEFAULT_MAX_CONNECTIONS_PER_HOST` allows **32**") == {32.0}
+    assert _rendered_numbers("min(2, cpu_count)") == {2.0}
+    assert _rendered_units("`MAX_TOKEN_RESPONSE_BYTES` **256 KiB**") == {1024}
+    assert _rendered_units("**16 MiB** binary ingress") == {1024 * 1024}
+    assert _rendered_units("min-refetch floor of 300 s") == {1}
+    assert _rendered_numbers("cpu_count") == set()
+    assert 1024.0 not in _rendered_numbers("2048")
 
 
 #: Each entry: (import path, dotted symbol, what it implements, phrases the doc must NOT contain).

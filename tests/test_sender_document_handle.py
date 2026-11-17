@@ -585,21 +585,22 @@ async def test_server_retention_decrefs_in_python_order_whatever_the_collation(
     async def _decref(_conn: object, ref: str, count: int = 1) -> None:
         released.append((ref, count))
 
+    # One row per deleted join row (BACKLOG #5740: the release counts what its DELETE reports).
     class _PgConn:
         async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
-            return [{"attachment_id": high, "n": 1}, {"attachment_id": low, "n": 2}]
+            return [{"attachment_id": high}, {"attachment_id": low}, {"attachment_id": low}]
 
         async def execute(self, sql: str, *args: object) -> str:
             return "DELETE 3"
 
     class _MsCursor:
-        description = (("attachment_id",), ("n",))
+        description = (("attachment_id",),)
 
         async def execute(self, sql: str, params: object = ()) -> None:
             return None
 
-        async def fetchall(self) -> list[tuple[str, int]]:
-            return [(high, 1), (low, 2)]
+        async def fetchall(self) -> list[tuple[str]]:
+            return [(high,), (low,), (low,)]
 
     pg = object.__new__(PostgresStore)
     monkeypatch.setattr(pg, "_decref_attachment", _decref)

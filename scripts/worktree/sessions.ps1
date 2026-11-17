@@ -251,9 +251,22 @@ if ($Rehome) {
     # (no heartbeat, and registry writes are event-driven), so only the positive answer is trustworthy.
     # A negative from one signal must never by itself authorise a destructive move.
     . "$PSScriptRoot\..\coord\session-registry.ps1"
-    $reg = Get-SessionLiveness -SessionId $s.Id
-    if ($reg.State -in @("LIVE", "UNVERIFIED") -and -not $Force -and -not $WhatIfPreference) {
-        throw ("Session $($s.Id) is $($reg.State) in the session registry (pid $($reg.Record.pid)" +
+    $reg = Get-SessionLiveness -SessionId $s.Id -Worktree $s.BornCwd
+    # UNREADABLE vetoes too: the fence could not be evaluated, or a record naming no session may be
+    # this one (session-registry.ps1's header). Such a record used to throw here, which stopped the
+    # move; reading UNREADABLE must stop it the same way (BACKLOG #5491).
+    $anonymous = @($reg.Anonymous | Where-Object { $_ })
+    if ($anonymous.Count -gt 0 -and -not $Force -and -not $WhatIfPreference) {
+        # The refusal names its real reason: not this session's own record, but one that names no
+        # session in its birth tree. Saying "still RUNNING" over a blank pid would push toward -Force.
+        $named = @($anonymous | ForEach-Object { if ($_.Cwd) { "$($_.File) (cwd $($_.Cwd))" } else { "$($_.File) (no readable cwd)" } })
+        throw ("Session $($s.Id) cannot be told apart from a registry record that names no session and may be " +
+               "this session mid-write: $($named -join '; '). Its own record: " +
+               "$(if ($reg.Found) { $reg.Detail } else { 'none' }). Wait for that record to gain its session id " +
+               "or go away, then retry (or -Force once you have checked it).")
+    }
+    if ($reg.State -in @("LIVE", "UNVERIFIED", "UNREADABLE") -and -not $Force -and -not $WhatIfPreference) {
+        throw ("Session $($s.Id) is $($reg.State) in the session registry (pid $(if ($reg.Record) { $reg.Record.pid } else { 'none recorded' })" +
                "$(if ($reg.Detail) { "; $($reg.Detail)" })) -- it is still RUNNING and moving its " +
                "transcript would corrupt it. Its transcript may look idle: subagent output is filed " +
                "elsewhere, so mtime is not liveness. Close that window, then retry (or -Force).")

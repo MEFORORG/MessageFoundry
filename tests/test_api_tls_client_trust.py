@@ -265,12 +265,16 @@ def _crl_checked_server(
     cert: Path, key: Path, ca_file: Path, crl: Path, *, chain: bool = False
 ) -> ssl.SSLContext:
     """A server context that requires a client certificate and checks it against ``crl``, built
-    by hand rather than by the listener, so a test can show what OpenSSL does with that CRL."""
+    by hand rather than by the listener, so a test can show what OpenSSL does with that CRL. The
+    chain flag is set by hand too: ``harden_crl_check(chain=True)`` refuses a CA without its own
+    CRL before OpenSSL could be asked (vault BACKLOG #5511)."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(cafile=ca_file)
-    harden_crl_check(ctx, str(crl), record_held_copy=False, chain=chain)
+    harden_crl_check(ctx, str(crl), record_held_copy=False)
+    if chain:
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
     return ctx
 
 

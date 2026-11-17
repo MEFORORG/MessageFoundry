@@ -48,6 +48,8 @@ opt-in and off by default (2026-09-23).
 connector does with those keys: a client certificate counts only with ``tls`` on, HTTP Basic only when
 both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, and a static
 ``Authorization`` credential not at all when SMART or OAuth2 replaces that header with a minted token.
+An HTTP-family hop's ``headers`` table and ``url`` query are read too (BACKLOG #5510), by the
+redaction screen's header test and the query-credential reader; ``_http_literal_static`` says how.
 
 **Out of scope, at least these, stated so the silence is not read as coverage.**
 
@@ -73,9 +75,10 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from :func:`apply_static_credential_gate`, which also logs, and ``_digest``, which logs
-at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529): every function reads its arguments
-and touches nothing else.
+Pure apart from :func:`apply_static_credential_gate`, which also logs, ``_digest``, which logs
+at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), and ``_http_literal_static``, whose
+``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510): every function
+reads its arguments and touches nothing else.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -100,14 +103,18 @@ from messagefoundry.config.settings import (
     SyslogProtocol,
 )
 from messagefoundry.config.wiring import (
+    _UNRESOLVED,
     _WITHHELD_PEER,
     Registry,
     WiringError,
+    _db_setting,
+    _is_secret_header,
     _peer_label,
     guarded_env_values,
     static_credential_db_hops,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
+from messagefoundry.secretscrub import credential_query_params
 
 __all__ = [
     "SETTINGS_PREFIX",
@@ -180,6 +187,16 @@ def _digest(settings: Mapping[str, Any]) -> bool:
         return False
 
 
+def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
+    """The static credentials the connector writes into its own ``Authorization`` header."""
+    out: list[str] = []
+    if settings.get("bearer_token"):
+        out.append("static bearer token")
+    if settings.get("basic_user") and settings.get("basic_password"):
+        out.append("HTTP Basic")
+    return out
+
+
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
@@ -190,12 +207,7 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
     stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
     ``body_secret_tokens``."""
-    out: list[str] = []
-    if not token:
-        if settings.get("bearer_token"):
-            out.append("static bearer token")
-        if settings.get("basic_user") and settings.get("basic_password"):
-            out.append("HTTP Basic")
+    out = [] if token else _static_authorization(settings)
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
     if _digest(settings):
@@ -229,11 +241,71 @@ def http_hop_credentials(
     it sends none.
 
     The connectors' refusal of a credential over ``verify_tls = false`` reads this (vault BACKLOG
-    #3230), so the two agree on every credential this module reads.
-    A credential written into the literal ``headers`` table, or into the ``url`` query, is not a
-    setting this module reads; the refusal adds those itself (``transports.rest.http_credentials_sent``)."""
+    #3230), so the two agree on every auth setting this module reads.
+    A credential written into the ``headers`` table, or into the ``url`` query, is not listed here:
+    the inventory counts those in :func:`_http_hop` (BACKLOG #5510), and the refusal adds them by its
+    own wider rule (``transports.rest.http_credentials_sent``)."""
     token = _http_token(ctype, settings, lookup=lookup)
     return (["minted bearer token"] if token else []) + _http_static(ctype, settings, token)
+
+
+def _http_literal_static(
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    *,
+    displaced: bool,
+    env_values: Mapping[str, Any] | None,
+) -> list[str]:
+    """The static credentials an HTTP-family hop writes outside its auth settings (BACKLOG #5510):
+    an entry of its ``headers`` table, or a parameter of its ``url`` query.
+
+    A header counts when the redaction screen (``config.wiring._is_secret_header``) reads it as a
+    credential, by name or by value, the test the off-box cleartext refusal applies, so at least a
+    ``Proxy-Authorization`` entry counts too. A static ``Authorization`` header does not count when
+    ``displaced``, because the connector then writes its own ``Authorization`` over it: SOAP drops
+    every spelling ``http_auth.is_authorization_header_name`` matches, and the other connectors set
+    the plain name, which replaces only a spelling urllib folds into it (any letter case, nothing
+    added). So a REST, FHIR or DICOMweb ``"Authorization "``, with a trailing space, still counts:
+    it goes on the wire beside the connector's own. A query parameter counts when
+    ``secretscrub.credential_query_params`` names it, the reader ``query_credential_hops`` uses.
+
+    A table counts only as a ``dict``, the one type every connector's header builder sends.
+
+    An ``env()`` reference standing for the whole ``headers`` table, or for the ``url``, is read as
+    the build resolves it (``config.wiring._db_setting``), against ``env_values``, else its literal
+    ``default=``. A ``headers`` reference this reading cannot resolve is listed as possibly a
+    credential, as ``static_credential_db_hops`` lists an unresolved dialect, so ``messagefoundry
+    check``, which passes no values, does not report as credential-free a hop the serve-time guard
+    may refuse. An unresolved ``url`` is not read, as ``query_credential_hops`` leaves one: a URL from
+    ``env()`` is the ordinary case, and listing every one would bury the hops that matter. So
+    ``check`` and the serve-time guard can still differ on at least a credential in an ``env()``
+    URL's query. Each label is fixed text, so no header name, parameter name or value reaches a
+    detail."""
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
+    def overwritten(key: str) -> bool:
+        if not displaced:
+            return False
+        if ctype is ConnectorType.SOAP:
+            return is_authorization_header_name(key)
+        return key.lower() == "authorization"
+
+    out: list[str] = []
+    values = env_values or {}
+    headers = _db_setting(settings, "headers", None, values)
+    if headers is _UNRESOLVED:
+        out.append(
+            "possibly a credential in a headers table from env() this reading cannot resolve"
+        )
+    elif isinstance(headers, dict) and any(
+        _is_secret_header(str(key), value) and not overwritten(str(key))
+        for key, value in headers.items()
+    ):
+        out.append("a credential in the headers table")
+    url = _db_setting(settings, "url", None, values)
+    if isinstance(url, str) and credential_query_params(url):
+        out.append("a credential in the url query")
+    return out
 
 
 def _http_hop(
@@ -243,12 +315,18 @@ def _http_hop(
     peer: str,
     *,
     lookup: bool = False,
+    env_values: Mapping[str, Any] | None = None,
 ) -> StaticCredentialHop | None:
     """One HTTP-family hop. DICOMweb cannot take the SMART or OAuth2 composition and has no
-    client-certificate arm, so it alone has no compliant kind. A ``FhirLookup`` takes SMART only."""
+    client-certificate arm, so it alone has no compliant kind. A ``FhirLookup`` takes SMART only.
+
+    A credential in the ``headers`` table or the ``url`` query is static whatever else the hop
+    presents (:func:`_http_literal_static`), so it lists the hop even beside a compliant kind."""
     compliant_kind = ctype is not ConnectorType.DICOMWEB
     token = _http_token(ctype, settings, lookup=lookup)
     static = _http_static(ctype, settings, token)
+    displaced = token or bool(_static_authorization(settings))
+    static += _http_literal_static(ctype, settings, displaced=displaced, env_values=env_values)
     if static:
         return StaticCredentialHop(
             name, "static", f"presents {' + '.join(static)} ({peer})", compliant_kind
@@ -401,7 +479,10 @@ def _remote_file_hop(
 
 
 def _connection_hop(
-    name: str, ctype: ConnectorType, settings: Mapping[str, Any]
+    name: str,
+    ctype: ConnectorType,
+    settings: Mapping[str, Any],
+    env_values: Mapping[str, Any] | None = None,
 ) -> StaticCredentialHop | None:
     """Classify one dialled connection's own hop. DATABASE is not here: the database arm owns it."""
     peer = _peer_label(settings)
@@ -420,7 +501,7 @@ def _connection_hop(
             False,
         )
     if ctype in _HTTP_FAMILY:
-        return _http_hop(name, ctype, settings, peer)
+        return _http_hop(name, ctype, settings, peer, env_values=env_values)
     if ctype in (ConnectorType.EMAIL, ConnectorType.DIRECT):
         # SMTP AUTH is a static username/password; no certificate or token arm is built.
         if settings.get("username") or settings.get("password"):
@@ -467,7 +548,7 @@ def _graph_hops(
         if ic.deployed and ic.spec.type in _DIALLED_INBOUND
     ]
     for name, spec in dialled:
-        hop = _connection_hop(name, spec.type, spec.settings)
+        hop = _connection_hop(name, spec.type, spec.settings, env_values)
         if hop is not None:
             out.append(hop)
         if spec.type in _HTTP_FAMILY and (
@@ -483,7 +564,12 @@ def _graph_hops(
     for lk in registry.fhir_lookups.values():
         name = fhir_lookup_record_name(lk.name)
         hop = _http_hop(
-            name, ConnectorType.FHIR, lk.settings, _peer_label(lk.settings), lookup=True
+            name,
+            ConnectorType.FHIR,
+            lk.settings,
+            _peer_label(lk.settings),
+            lookup=True,
+            env_values=env_values,
         )
         if hop is not None:
             out.append(hop)
@@ -593,7 +679,8 @@ def static_credential_hops(
     its own output. With both, the graph half also reads ``[egress].proxy_url`` and
     ``[egress].proxy_no_proxy`` to decide whether a connection's proxy credential is ever sent.
     ``env_values``, when the caller has the running instance's, resolves a database hop's ``env()``
-    dialect as the build does (see ``static_credential_db_hops``)."""
+    dialect as the build does (see ``static_credential_db_hops``), and an HTTP-family hop's
+    ``env()`` ``headers`` table or ``url`` (see ``_http_literal_static``)."""
     out: list[StaticCredentialHop] = []
     if registry is not None:
         site_proxy = None if settings is None else (settings.egress.proxy_url or "")

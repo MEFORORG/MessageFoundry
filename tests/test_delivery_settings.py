@@ -115,6 +115,29 @@ def test_saturation_threshold_default_off_and_toml_override(tmp_path: Path) -> N
     assert sat.sustain_samples == 4
 
 
+def test_saturation_min_growth_default_bounds_and_toml_override(tmp_path: Path) -> None:
+    # BACKLOG #5768: the growth floor has a documented default, loads from the file, and refuses a
+    # value out of range or a boolean (the boolean refusal is the shared one, BACKLOG #5509).
+    from pydantic import ValidationError
+
+    from messagefoundry.config.models import (
+        SATURATION_MIN_GROWTH_DEFAULT,
+        SATURATION_MIN_GROWTH_MAX,
+    )
+
+    assert DeliverySettings().saturation_threshold().min_growth == SATURATION_MIN_GROWTH_DEFAULT
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text("[delivery]\nsaturation_sustain_samples = 4\nsaturation_min_growth = 20\n")
+    assert load_settings(config_path=cfg).delivery.saturation_threshold().min_growth == 20
+    for bad in (0, SATURATION_MIN_GROWTH_MAX + 1, True):
+        with pytest.raises(ValidationError, match="saturation_min_growth"):
+            DeliverySettings.model_validate({"saturation_min_growth": bad})
+    # The key that turns the alert on is refused at load by its own name too.
+    for bad in (1, True):
+        with pytest.raises(ValidationError, match="saturation_sustain_samples"):
+            DeliverySettings.model_validate({"saturation_sustain_samples": bad})
+
+
 def test_outbound_stall_override_kept_when_set(tmp_path: Path) -> None:
     # A per-connection stall= is preserved on the OutboundConnection (resolution to the global default
     # happens later in the runner, like retry/buildup).

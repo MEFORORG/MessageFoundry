@@ -52,7 +52,14 @@ from tests._restricted_token import (
     WRITE_RESTRICTED_SID,
     spawn_restricted,
 )
-from tests.test_service_install_manifest import _extract, _notice, _ok, _preflight_facts, _psq
+from tests.test_service_install_manifest import (
+    _extract,
+    _named,
+    _notice,
+    _ok,
+    _preflight_facts,
+    _psq,
+)
 
 _SCRIPT = svc.install_script_path()
 _UNINSTALL = svc.uninstall_script_path()
@@ -290,25 +297,42 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     commands = facts["commands"]
 
     def calls(name: str) -> list[dict[str, Any]]:
-        return [c for c in commands if c["name"] == name]
+        # PowerShell resolves a command name without regard to case, so the guard does too.
+        return [c for c in commands if _named(c, name)]
 
-    problems = []
+    names = (
+        "Set-ServiceTokenHardening",
+        "Set-ServiceAccount",
+        "Get-ServiceSidTypeChoice",
+        "Get-WriteGrantProblem",
+        "Set-SecureDataDirAcl",
+    )
+    # A call inside a function runs when the function is called, so its offset says nothing about
+    # its order. The order checks below read offsets.
+    problems = [
+        f"{c['name']} at line {c['line']} is inside a function, so its offset is not its run order"
+        for c in commands
+        if c["inFunction"] and any(_named(c, n) for n in names)
+    ]
     setters = calls("Set-ServiceTokenHardening")
     if len(setters) != 1:
-        return [f"expected one Set-ServiceTokenHardening call, found {len(setters)}"]
+        return [*problems, f"expected one Set-ServiceTokenHardening call, found {len(setters)}"]
     setter = setters[0]
+    # Variable and parameter names resolve without regard to case too, so every text match below
+    # is made in lower case.
     for needle in ("$SidChoice.SidType", "-Privileges $ServicePrivileges"):
-        if needle not in setter["text"]:
+        if needle.lower() not in setter["text"].lower():
             problems.append(f"the call does not pass {needle}: {setter['text']}")
     accounts = calls("Set-ServiceAccount")
     if not accounts or setter["start"] < max(c["outerIfEnd"] for c in accounts):
         problems.append("the token is set before the run-as account it depends on")
     choices = calls("Get-ServiceSidTypeChoice")
-    if len(choices) != 1 or "-Skip:$SkipRestrictedServiceSid" not in choices[0]["text"]:
+    choice = choices[0]["text"].lower() if len(choices) == 1 else ""
+    if "-skip:$skiprestrictedservicesid" not in choice:
         problems.append("the SID type is not chosen from the account and the opt-out switch")
-    elif "-ServiceAccount $ServiceAccount" not in choices[0]["text"]:
+    elif "-serviceaccount $serviceaccount" not in choice:
         problems.append("the SID type choice is not handed the account that carries the grants")
-    lists = [a for a in facts["assignments"] if a["lhs"] == "ServicePrivileges"]
+    lists = [a for a in facts["assignments"] if str(a["lhs"]).lower() == "serviceprivileges"]
     if len(lists) != 1 or lists[0]["rhsText"] != f'@("{_PRIVILEGE}")':
         problems.append(
             f"$ServicePrivileges is not exactly {_PRIVILEGE}: {[a['rhsText'] for a in lists]}"
@@ -318,11 +342,11 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
     if not grants or not lockdown or grants[0]["start"] < lockdown[0]["start"]:
         problems.append("the service's grant is not read back after the data-directory lockdown")
     rhs = {
-        a["lhs"]: a["rhsText"]
+        str(a["lhs"]).lower(): str(a["rhsText"]).lower()
         for a in facts["assignments"]
-        if a["lhs"] in ("storeDir", "writeDirs")
+        if str(a["lhs"]).lower() in ("storedir", "writedirs")
     }
-    if "$DbPath" not in rhs.get("storeDir", "") or rhs.get("writeDirs") != "$storeDir":
+    if "$dbpath" not in rhs.get("storedir", "") or rhs.get("writedirs") != "$storedir":
         problems.append(
             "the store's own directory is not read back, so a -DbPath elsewhere is missed"
         )
@@ -331,6 +355,29 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
 
 def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Path) -> None:
     assert _wiring_problems(_preflight_facts(tmp_path)) == []
+
+
+_SETTER_CALL = (
+    "Set-ServiceTokenHardening -ServiceName $ServiceName -SidType $SidChoice.SidType"
+    " -Privileges $ServicePrivileges"
+)
+
+
+def test_the_wiring_guard_reads_a_call_spelled_in_another_case(tmp_path: Path) -> None:
+    """PowerShell runs ``set-servicetokenhardening`` as the same command, so the guard must still
+    find the call, and still find nothing wrong with it."""
+    assert _SCRIPT is not None
+    source = _SCRIPT.read_text(encoding="utf-8")
+    assert source.count(f"\n{_SETTER_CALL}\n") == 1, "CONTROL FAILED: the call is not in the script"
+    mutated = tmp_path / "install-service.ps1"
+    mutated.write_text(
+        source.replace(
+            f"\n{_SETTER_CALL}\n",
+            f"\n{_SETTER_CALL.replace('Set-ServiceTokenHardening', 'set-servicetokenhardening')}\n",
+        ),
+        encoding="utf-8",
+    )
+    assert _wiring_problems(_preflight_facts(tmp_path, script=mutated)) == []
 
 
 @pytest.mark.parametrize(
@@ -347,6 +394,12 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
             '$ServicePrivileges = @("SeChangeNotifyPrivilege", "SeImpersonatePrivilege")',
             "is not exactly",
         ),
+        (
+            '$ServicePrivileges = @("SeChangeNotifyPrivilege")',
+            '$ServicePrivileges = @("SeChangeNotifyPrivilege")\n'
+            '$serviceprivileges += "SeImpersonatePrivilege"',
+            "is not exactly",
+        ),
         ("$problem = Get-WriteGrantProblem -Path $dir", "$problem = '' # -Path $dir", "read back"),
         ("$writeDirs += $storeDir", "", "store's own directory"),
         (
@@ -355,14 +408,21 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
             'if ($SidChoice.SidType -eq "restricted") {',
             "before the run-as account",
         ),
+        (
+            f"\n{_SETTER_CALL}\n",
+            f"\nfunction Invoke-Hardening {{ {_SETTER_CALL} }}\n",
+            "is inside a function",
+        ),
     ],
     ids=[
         "call-removed",
         "switch-unwired",
         "privilege-added",
+        "privilege-added-in-another-case",
         "grant-not-read",
         "store-not-read",
         "account-set-after",
+        "call-in-a-function",
     ],
 )
 def test_the_wiring_guard_fails_when_a_piece_is_changed(

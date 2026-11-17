@@ -484,6 +484,183 @@ def test_a_prefixed_path_reads_as_its_plain_form() -> None:
     assert _win_chain_verdict({}, "\\\\.\\PhysicalDrive0").ok is None
 
 
+def _probe(links: dict[str, str] | None = None) -> ap.WinProbe:
+    """A probe where every name is a folder or a ``.pem`` file, except the ``links``."""
+    links = {k.lower(): v for k, v in (links or {}).items()}
+
+    def probe(p: str) -> tuple[str, str | None]:
+        key = p.lower()
+        if key in links:
+            return LINK, links[key]
+        return (FILE if key.endswith(".pem") else DIRECTORY), None
+
+    return probe
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Verbatim: Win32 hands the text to the kernel as written, where normpath collapses it.
+        r"\\?\C:\certs\..\other\ca.pem",
+        r"\\?\C:\certs\.\ca.pem",
+        r"\\?\C:\certs/ca.pem",
+        r"\\?\C:\certs\\ca.pem",
+        r"\??\C:\certs\..\ca.pem",
+        r"\\?\Volume{0000}\certs\..\ca.pem",
+        r"\\?\UNC\files.test\share\..\..\C$\ca.pem",
+        # A normalized device path: Win32 collapses `..` against the prefix itself, so this opens
+        # the share \\files.test\share, where normpath stopped at C: and walked C:\UNC\...
+        r"\\.\C:\..\UNC\files.test\share\ca.pem",
+        r"\\.\C:\certs\..\..\D:\ca.pem",
+        "//?/Volume{0000}/../C:/certs/ca.pem",
+        "//./C:/../UNC/files.test/share/ca.pem",
+        # A final `.` or `..` that lands on the first name opens the volume device \\.\C:, where
+        # normpath walked and cleared the root folder C:\.
+        r"\\.\C:\certs\..",
+        r"\\.\C:\.",
+        r"\\.\Volume{0000}\certs\..",
+        # A forward-slash climb from one volume GUID into another: was walked under the first.
+        "//?/Volume{0000}/x/../../Volume{1111}/certs/ca.pem",
+        # A drive letter or volume GUID with no separator after it opens the volume device.
+        r"\\?\C:",
+        r"\\.\C:",
+        r"\\?\Volume{0000}",
+        r"\\.\Volume{0000}",
+        "//?/Volume{0000}",
+    ],
+)
+def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path: str) -> None:
+    """Vault BACKLOG #5515. Red under origin/main's strip-then-normpath, though not every case was
+    cleared there: most were walked and cleared, but ``\\\\.\\C:\\certs\\..\\..\\D:\\ca.pem`` and
+    ``//?/Volume{0000}/../C:/...`` ended as a stream name, ``\\\\?\\C:`` and ``\\\\.\\C:`` as
+    drive-relative, the verbatim UNC case as a share, and ``//./C:/../UNC/...`` already as a
+    device path. This pins the device-path cause for each."""
+    chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert (chain, cause) == ([], "the path is a device path this check does not read")
+
+
+@pytest.mark.parametrize("target", [r"\??\C:\real\..\other", r"\\.\C:\real\..\other"])
+def test_a_link_to_a_device_path_normpath_would_change_is_not_walked(target: str) -> None:
+    """A junction or symlink target is an NT path, read as written, so not even a ``\\\\.\\``
+    target is normalized. Red as above."""
+    links = {"C:\\certs\\lnk": target}
+    _chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(links))
+    assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
+def test_a_link_in_the_form_readlink_returns_is_judged_by_its_rest() -> None:
+    """``os.readlink`` hands back ``\\\\?\\`` where the reparse point stores ``\\??\\``. A plain
+    one is walked; one holding ``..`` is not. Red under: stripping it and normalizing the rest."""
+    plain = {"C:\\certs\\lnk": r"\\?\C:\real"}
+    chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(plain))
+    assert cause is None and chain[-1][0] == "C:\\real\\ca.pem"
+    dotted = {"C:\\certs\\lnk": r"\\?\C:\real\..\other"}
+    _chain, cause = windows_chain("C:\\certs\\lnk\\ca.pem", "C:\\cwd", _probe(dotted))
+    assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
+def test_a_subst_drive_onto_a_verbatim_path_normpath_would_change_is_not_walked() -> None:
+    """A ``subst`` target goes through the same check. Red as above: it walked C:\\other."""
+    _chain, cause = windows_chain(
+        r"S:\ca.pem",
+        r"C:\cwd",
+        _probe(),
+        drive_target=lambda drive: r"\??\C:\certs\..\other" if drive == "S:" else None,
+    )
+    assert cause is not None and cause.kind == "a drive stands for a path this check does not read"
+
+
+def test_a_config_link_to_a_verbatim_path_normpath_would_change_is_refused() -> None:
+    """The config-source link walk shares :func:`_strip_win_prefix` with the anchor walk, so a
+    verbatim link target holding ``..`` refuses in both. That holds for verbatim targets only: the
+    anchor walk reads link targets through the stricter ``_strip_nt_target``, while
+    ``config/wiring.py``'s ``_windows_link_target`` still normalizes a ``\\\\.\\`` or mixed-slash
+    target. Red as above."""
+    from messagefoundry.config.wiring import _windows_link_target
+
+    with pytest.raises(OSError, match="device path"):
+        _windows_link_target(r"\??\C:\real\..\other")
+    assert _windows_link_target(r"\??\C:\real") == r"C:\real"
+
+
+@pytest.mark.parametrize("anchor", [r".\certs\ca.pem", "certs/ca.pem", r"..\certs\ca.pem"])
+def test_a_relative_anchor_under_a_verbatim_working_directory_is_still_walked(anchor: str) -> None:
+    """Win32 normalizes a relative name joined to the working directory, so the join is not read
+    as a verbatim path. Red under: running the verbatim check over the joined text."""
+    _chain, cause = windows_chain(anchor, r"\\?\C:\svc", _probe())
+    assert cause is None
+
+
+@pytest.mark.parametrize(
+    ("cwd", "anchor"),
+    [
+        # A `..` past the first name may be collapsed against the prefix and reach a share.
+        (r"\\.\C:\svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        (r"\\?\C:\svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        # The same under a volume GUID working directory, which the strip leaves as written.
+        (r"\\?\Volume{0000}\svc", r"..\..\Volume{1111}\certs\ca.pem"),
+        ("//?/Volume{0000}/svc", r"..\..\..\UNC\files.test\share\ca.pem"),
+        # A rooted relative name joins to the drive or volume, not to the folder.
+        (r"\\.\C:\svc", r"\..\UNC\files.test\share\ca.pem"),
+        (r"\\?\C:\svc", r"\certs\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"\certs\ca.pem"),
+        # A bare drive or volume GUID working directory names the volume device.
+        (r"\\?\C:", r"certs\ca.pem"),
+        (r"\\.\C:", r"certs\ca.pem"),
+        (r"\\?\Volume{0000}", r"certs\ca.pem"),
+        ("//?/Volume{0000}", r"certs\ca.pem"),
+    ],
+)
+def test_a_relative_anchor_under_a_prefixed_working_directory_it_cannot_place_is_not_walked(
+    cwd: str, anchor: str
+) -> None:
+    """Which object Win32 resolves a relative name to there is not emulated, so these refuse.
+    Red under: joining by normpath, which clamped each at the drive or volume and cleared it."""
+    chain, cause = windows_chain(anchor, cwd, _probe())
+    assert (chain, cause) == ([], "the path is a device path this check does not read")
+
+
+@pytest.mark.parametrize(
+    ("cwd", "anchor", "walked"),
+    [
+        (r"\\.\C:\svc", r"..\certs\ca.pem", "C:\\certs\\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"..\certs\ca.pem", "\\\\?\\Volume{0000}\\certs\\ca.pem"),
+        (r"\\?\Volume{0000}\svc", r"certs\ca.pem", "\\\\?\\Volume{0000}\\svc\\certs\\ca.pem"),
+        ("\\\\?\\C:\\", r"certs\ca.pem", "C:\\certs\\ca.pem"),  # the root, with its separator
+        (r"C:\svc", r"\certs\ca.pem", "C:\\certs\\ca.pem"),  # a plain working directory
+        (r"C:\svc", r"..\..\..\certs\ca.pem", "C:\\certs\\ca.pem"),
+    ],
+)
+def test_a_relative_anchor_under_a_working_directory_it_can_place_is_still_walked(
+    cwd: str, anchor: str, walked: str
+) -> None:
+    """The must-not-trip twins: a `..` that stays inside a prefixed working directory, a root
+    with its separator, and a plain working directory, which Win32 normalizes as normpath does."""
+    chain, cause = windows_chain(anchor, cwd, _probe())
+    assert cause is None
+    assert chain[-1][0] == walked
+
+
+@pytest.mark.parametrize(
+    ("path", "anchor"),
+    [
+        (r"\\?\C:\certs\ca.pem", "C:\\certs\\ca.pem"),
+        ("\\\\?\\C:\\certs\\", "C:\\certs"),  # one trailing separator
+        (r"\\.\C:\certs\..\other\ca.pem", "C:\\other\\ca.pem"),  # `..` that stays under C:
+        (r"\\.\C:/certs/ca.pem", "C:\\certs\\ca.pem"),  # Win32 turns `/` into `\` here
+        ("//?/Volume{0000}/certs/./ca.pem", "\\\\?\\Volume{0000}\\certs\\ca.pem"),
+        (r"\\.\C:\certs\sub\..", "C:\\certs"),  # a final `..` that stays under C:
+    ],
+)
+def test_a_device_path_windows_normalizes_the_same_way_is_still_walked(
+    path: str, anchor: str
+) -> None:
+    """The controls: a plain verbatim path, and a normalized one whose `..` stays inside it."""
+    chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert cause is None
+    assert chain[-1][0] == anchor
+
+
 def test_a_missing_component_is_indeterminate_not_insecure() -> None:
     v = _win_chain_verdict(_pd_objects(), "C:\\ProgramData\\mefor\\gone.pem")
     assert v.ok is None

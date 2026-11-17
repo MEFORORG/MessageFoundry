@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
     redacted_settings,
 )
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.wiring_runner import FailedLine
 from messagefoundry.transports import build_destination, build_source, wincred
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -639,6 +640,60 @@ async def test_metadata_outbound_simulated(
     body = (await client.get("/connections/OB_SIM/metadata")).json()
     assert body["direction"] == "out"
     assert body["simulated"] is True
+
+
+@pytest.mark.parametrize(
+    "down",
+    [
+        "stopping",
+        "stopped",
+        "stop_held",
+        "log_halted",
+        "failed",
+        "filtered",
+        "not_deployed",
+        "graph_stopped",
+    ],
+)
+async def test_metadata_outbound_running_reads_the_lane_not_the_graph(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    down: str,
+) -> None:
+    """BACKLOG #5762: the outbound row read only the graph's running flag, so a lane that delivers
+    nothing read running. Each case first reads running with the graph up, the positive control,
+    then turns on one down state and reads it False. For not_deployed the control is the lane's
+    own outbound_running, since the deployed flag is fixed when the graph is built."""
+    reg = _registry(out_dir=str(tmp_path / "out"))
+    if down == "not_deployed":
+        reg.outbound["OB"] = OutboundConnection(
+            "OB", reg.outbound["OB"].spec, metadata={"tier": "gold"}, deployed=False
+        )
+    rr = engine.add_registry(reg)
+    # The graph runs; monkeypatch restores the flag for the teardown.
+    monkeypatch.setattr(rr, "_running", True)
+    if down == "not_deployed":
+        assert rr.outbound_running("OB") is True
+    else:
+        assert (await client.get("/connections/OB/metadata")).json()["running"] is True
+    if down in ("stopping", "stopped"):
+        rr._outbound_paused.add("OB")  # paused, its in-flight head still resolving
+        if down == "stopped":
+            rr._mark_outbound_quiesced("OB")  # paused and drained: the operator-stopped state
+    elif down == "stop_held":
+        rr._stop_held.add(("outbound", "OB"))
+    elif down == "log_halted":
+        monkeypatch.setattr(rr, "_log_write_stopped", True)
+    elif down == "failed":
+        rr._failed[("outbound", "OB")] = FailedLine("build failed", False)
+    elif down == "filtered":
+        rr._filtered[("outbound", "OB")] = "below the DR priority threshold"
+    elif down == "graph_stopped":
+        rr._running = False
+    body = (await client.get("/connections/OB/metadata")).json()
+    assert body["running"] is False, body
 
 
 async def test_metadata_404(engine: Engine, client: httpx.AsyncClient, tmp_path: Path) -> None:

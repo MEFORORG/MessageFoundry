@@ -37,6 +37,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth.oidc.jwks import JwksCache, JwksError
 from messagefoundry.auth.reconcile import breaker_tripped
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
     AiSettings,
@@ -1088,13 +1089,13 @@ def test_the_jwks_direction_is_the_consumers(ttl: int, min_refetch: int, served:
         min_refetch_seconds=min_refetch,
         clock=lambda: now[0],
     )
-    cache.get_key("old")
+    cache.get_key("old", alg=SignatureAlgorithm.ES256)
     now[0] = 3601.0
     if served:
-        cache.get_key("old")
+        cache.get_key("old", alg=SignatureAlgorithm.ES256)
     else:
         with pytest.raises(JwksError):
-            cache.get_key("old")
+            cache.get_key("old", alg=SignatureAlgorithm.ES256)
 
 
 def test_the_near_off_values_the_vault_measured_are_named() -> None:

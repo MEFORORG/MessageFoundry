@@ -181,15 +181,22 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
+    PROGRAMMING_ERRORS,
     QUEUE_TAG_COLUMNS,
     QUEUE_TAG_SELECT,
+    TRANSIENT_OPEN_BACKOFF_SECONDS,
+    QueueOpenFault,
     QueueTagError,
     alert_queue_tag_failure,
+    is_transient_open_failure,
     open_queue_cell,
+    queue_open_fault,
     queue_payload_aad,
     queue_row_aad,
+    release_unreturned,
     report_queue_tag_failure,
     reseal_unless_tag_failure,
+    set_aside_deadline,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -5123,7 +5130,8 @@ class PostgresStore:
             try:
                 items.append(self._outbox_item(row))
             except CipherError as exc:
-                await self._dead_letter_unopenable(row, exc)
+                if await self._dead_letter_unopenable(row, exc) is not None:
+                    await self._set_aside_claimed([row], now)
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -5272,7 +5280,8 @@ class PostgresStore:
                         )
                         await self._maybe_finalize_message(conn, row["message_id"], now)
                         row = None
-        return await self._fifo_item_or_dead_letter(row)
+        item, _set_aside = await self._fifo_item_or_dead_letter(row, tail=[row], now=now)
+        return item
 
     async def claim_next_fifo_batch(
         self,
@@ -5375,8 +5384,10 @@ class PostgresStore:
         # dead-lettered (its own txn) and dropped; the surviving tail keeps its order.
         ordered = sorted(rows, key=lambda r: r["seq"])
         items: list[OutboxItem] = []
-        for row in ordered:
-            item = await self._fifo_item_or_dead_letter(row)
+        for i, row in enumerate(ordered):
+            item, set_aside = await self._fifo_item_or_dead_letter(row, tail=ordered[i:], now=now)
+            if set_aside:
+                break  # set aside with the rest of the lane: never deliver past it (#5735)
             if item is not None:
                 items.append(item)
         return items
@@ -5552,23 +5563,44 @@ class PostgresStore:
                         continue
                 kept_rows.append(row)
         # Group by lane and sort by `seq` in memory (RETURNING does not guarantee order), then
-        # decode AFTER the claim txn: an undecryptable row is dead-lettered (its own txn) and
-        # DROPPED; the surviving tail keeps its order.
+        # decode AFTER the claim txn: a row refused for its own content is dead-lettered (its own
+        # txn) and DROPPED; the surviving tail keeps its order. Any other open failure returns the
+        # row and its lane's tail as unopened items (#5735).
         by_lane_rows: dict[str, list[Any]] = {}
         for row in kept_rows:
             by_lane_rows.setdefault(row[lane_col], []).append(row)
-        by_lane: dict[str, list[OutboxItem]] = {}
-        for lane, lane_rows in by_lane_rows.items():
-            items: list[OutboxItem] = []
-            for row in sorted(lane_rows, key=lambda r: r["seq"]):
-                item = await self._fifo_item_or_dead_letter(row)
-                if item is not None:
-                    items.append(item)
-            if items:
-                by_lane[lane] = items
-            else:
-                rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        by_lane = await self._open_claimed_heads(by_lane_rows, rearm)
         return ClaimedHeads(by_lane=by_lane, rearm=frozenset(rearm), head_skipped=head_skipped)
+
+    async def _open_claimed_heads(
+        self, by_lane_rows: dict[str, list[Any]], rearm: set[str]
+    ) -> dict[str, list[OutboxItem]]:
+        """Open each lane's committed ``claim_fifo_heads`` rows, oldest first (see the caller)."""
+        by_lane: dict[str, list[OutboxItem]] = {}
+        try:
+            for lane, lane_rows in by_lane_rows.items():
+                items: list[OutboxItem] = []
+                in_order = sorted(lane_rows, key=lambda r: r["seq"])
+                for i, row in enumerate(in_order):
+                    try:
+                        items.append(self._outbox_item(row))
+                    except CipherError as exc:
+                        fault = await self._dead_letter_unopenable(row, exc)
+                        if fault is not None:
+                            # The dispatcher's ADR 0070 T17 path takes it from here (#5735).
+                            items.extend(self._unopened_item(r, fault) for r in in_order[i:])
+                            break
+                if items:
+                    by_lane[lane] = items
+                else:
+                    rearm.add(lane)  # whole prefix consumed (poison) — re-arm the lane
+        except Exception:
+            # Nothing is returned, so no lane's claimed rows may stay inflight behind the error, a
+            # bug or any other escaping error (#5735). A cancellation is not caught, so it leaves
+            # them inflight; release_unreturned says why.
+            await release_unreturned(self, by_lane_rows.values())
+            raise
+        return by_lane
 
     async def list_fifo_lanes(
         self,
@@ -5656,27 +5688,68 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                 )
 
-    async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
+    async def _fifo_item_or_dead_letter(
+        self, row: Any, *, tail: Sequence[Any], now: float | None
+    ) -> tuple[OutboxItem | None, bool]:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
         and return ``None`` so the lane advances on the next poll (mirrors SQLite). Runs AFTER the claim
-        txn so the dead-letter is its own transaction."""
+        txn so the dead-letter is its own transaction. The flag is ``True`` when the row was set
+        aside with ``tail`` instead (BACKLOG #5735), so the caller stops at it."""
         if row is None:
-            return None  # nothing pending, or the head is backing off — block the lane
+            return None, False  # nothing pending, or the head is backing off — block the lane
         try:
-            return self._outbox_item(row)
+            return self._outbox_item(row), False
         except CipherError as exc:
             # An undecryptable head must not stall the lane — dead-letter it and let the next poll
             # advance, rather than raising into the worker (mirrors SQLite).
-            await self._dead_letter_unopenable(row, exc)
-            return None
+            if await self._dead_letter_unopenable(row, exc) is None:
+                return None, False
+            await self._set_aside_claimed(tail, now)
+            return None, True
 
-    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> None:
+    async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). The lane moves on either way."""
+        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+
+        A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
+        the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
+        error of a dead-letter write that fails, after a tag failure is still reported. An error in
+        the engine's own code (:data:`PROGRAMMING_ERRORS`) propagates. The SQLite twin says what
+        the caller does with it."""
+        if is_transient_open_failure(exc):
+            return queue_open_fault(exc)
         log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
-        await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        try:
+            await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+        except PROGRAMMING_ERRORS:
+            raise
+        except Exception as failed:  # noqa: BLE001 -- a store fault, which the caller contains
+            log.warning(
+                "could not dead-letter queue row %s (%s); it is retried",
+                row["id"],
+                type(failed).__name__,
+            )
+            if isinstance(exc, QueueTagError):
+                await report_queue_tag_failure(
+                    self, self._cipher, row, outcome="could not be dead-lettered"
+                )
+            return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
             await report_queue_tag_failure(self, self._cipher, row)
+        return None
+
+    async def _set_aside_claimed(self, tail: Sequence[Any], now: float | None) -> None:
+        """Re-pend claimed rows :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault
+        (:func:`set_aside_deadline`, BACKLOG #5735), for a per-lane claim. If this write fails
+        too, its error propagates out of the claim; the rows'
+        lease and startup recovery re-pend them."""
+        log.warning(
+            "setting aside %d claimed queue row(s) for %.0fs: the first could not be opened or"
+            " dead-lettered, for a reason the claim could not settle",
+            len(tail),
+            TRANSIENT_OPEN_BACKOFF_SECONDS,
+        )
+        await self.reschedule_claimed([r["id"] for r in tail], set_aside_deadline(now))
 
     async def _open_queue_body(self, conn: Any, row: Any, *, alert: bool = True) -> str:
         """The body of queue ``row``, opened under the row's own tag (BACKLOG #2593); the SQLite
@@ -5716,6 +5789,23 @@ class PostgresStore:
             stage=row["stage"],
             handler_name=row["handler_name"],
             created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
+        )
+
+    @staticmethod
+    def _unopened_item(row: Any, fault: QueueOpenFault) -> OutboxItem:
+        """A claimed row whose body was not opened, carrying ``fault`` for the pooled dispatcher's
+        T17 path (BACKLOG #5735). ``payload`` is empty and must not be read."""
+        return OutboxItem(
+            id=row["id"],
+            message_id=row["message_id"],
+            channel_id=row["channel_id"],
+            destination_name=row["destination_name"],
+            payload="",
+            attempts=row["attempts"],
+            stage=row["stage"],
+            handler_name=row["handler_name"],
+            created_at=row["created_at"],
+            open_fault=fault,
         )
 
     def _open_inline_payload(self, row: Any) -> str:
@@ -5947,9 +6037,24 @@ class PostgresStore:
         guard, guard_args = self._resolve_guard(4)
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
-                async with conn.transaction():
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                # READ COMMITTED pinned: the MAX(response_seq) read after the lock must see the
+                # completion it waited on, which a repeatable-read server default would hide.
+                async with conn.transaction(isolation="read_committed"):
+                    # FOR UPDATE (BACKLOG #5752): a second completion of the same row waits here and
+                    # then reads the first one's committed DONE, so only one reply is ever captured.
+                    row = await conn.fetchrow(
+                        "SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id
+                    )
                     if row is None:
+                        return
+                    # A DONE row does not complete again (no second reply or re-ingress child);
+                    # any other still does, as on SQLite, and an armed H1 fence judges it below.
+                    if row["status"] == OutboxStatus.DONE.value:
+                        log.warning(
+                            "complete_with_response: outbound row %s is already %s; nothing written",
+                            outbox_id,
+                            row["status"],
+                        )
                         return
                     message_id = row["message_id"]
                     destination_name = row["destination_name"]
@@ -5969,6 +6074,13 @@ class PostgresStore:
                         outbox_id,
                         *guard_args,
                         checked=bool(guard),
+                    )
+                    # BACKLOG #5752: two rows of one message to one destination (two handlers) would
+                    # read the same MAX unlocked and collide on the response PK, rolling back a
+                    # delivery the partner already accepted. The per-message finalize lock, which
+                    # _maybe_finalize_message re-takes at the end as a no-op, serializes the read.
+                    await self._advisory_lock(
+                        conn, _LOCK_CLASS_FINALIZE, f"{_FINALIZE_LOCK_PREFIX}{message_id}"
                     )
                     seq = await conn.fetchval(
                         "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -7501,9 +7613,9 @@ class PostgresStore:
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
 
-        def _seal() -> tuple[str, int, list[str]]:
-            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
-            # work in proportion to its size, and nothing else would run meanwhile.
+        def _hash() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing here, and sealing in _seal, are CPU
+            # work in proportion to the document's size; nothing else would run meanwhile.
             hasher = hashlib.sha256()
             total = 0
             # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
@@ -7517,26 +7629,45 @@ class PostgresStore:
                 hasher.update(data)
                 total += len(data)
                 plaintext_chunks.append(chunk)
-            ref = hasher.hexdigest()
-            sealed: list[str] = [
+            return hasher.hexdigest(), total, plaintext_chunks
+
+        def _seal(ref: str, plaintext_chunks: list[str]) -> list[str]:
+            return [
                 self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
                 for seq, c in enumerate(plaintext_chunks)
             ]
-            return ref, total, sealed
 
-        ref, total, sealed = await asyncio.to_thread(_seal)
-        now = time.time()
-        async with self._timed_acquire() as conn, conn.transaction():
+        ref, total, plaintext_chunks = await asyncio.to_thread(_hash)
+        # BACKLOG #5753: dedup BEFORE sealing, so a re-put spends no AES-GCM invocation on chunks it
+        # then discards; then reserve the whole burst in the persisted bound (ASVS 11.3.4).
+        async with self._timed_acquire() as conn:
             if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
-                return ref  # dedup: identical content already stored — write nothing
-            await conn.execute(
+                return ref
+        await reserve_invocations_ahead(
+            self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
+        )
+        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        del plaintext_chunks
+        now = time.time()
+        # READ COMMITTED pinned, so the ON CONFLICT below waits out a concurrent put and inserts
+        # nothing, where repeatable read would raise a serialization failure instead.
+        async with (
+            self._timed_acquire() as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
+            # BACKLOG #5753: a concurrent put of the same content waits on the primary key here and
+            # then inserts nothing, rather than failing the upload on a duplicate key. The first
+            # put's copy wins and this one's sealed chunks are dropped.
+            inserted = await conn.fetchval(
                 "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                " VALUES ($1,$2,$3,0,$4)",
+                " VALUES ($1,$2,$3,0,$4) ON CONFLICT (id) DO NOTHING RETURNING 1",
                 ref,
                 content_type,
                 total,
                 now,
             )
+            if inserted is None:
+                return ref
             if sealed:
                 await conn.executemany(
                     "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
@@ -7617,27 +7748,29 @@ class PostgresStore:
 
     async def _release_message_attachments(self, conn: Any, where: str, params: list[Any]) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
-        attachment sibling of the SQLite retention seam). Tally each distinct attachment the matching
-        messages reference via the ``message_attachment`` linkage, decref each by how many of these
-        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even
-        if the purge re-runs. Runs in the CALLER's transaction. **Re-run is a no-op:** a re-run finds the
-        join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
-        an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
-        (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        attachment sibling of the SQLite retention seam). DELETE the matching messages'
+        ``message_attachment`` join rows, then decref each attachment by how many of those rows named
+        it (GC at 0), so the release is exactly-once even if the purge re-runs. Runs in the CALLER's
+        transaction. **Re-run is a no-op:** a re-run finds the join rows gone and decrefs nothing — no
+        double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
+        holds. ``where`` is a code-controlled ``$N`` fragment (numbered from ``$1``)."""
+        # BACKLOG #5740: ONE statement deletes the join rows and reports what it deleted, so the
+        # decref covers exactly the rows removed. A tally SELECT and a separate DELETE each took their
+        # own READ COMMITTED snapshot, so a row that came to match between them was deleted without
+        # its decref (the document kept past retention) or decreffed without its delete (a document
+        # collected while a link still names it). Deleting them makes a re-run decref nothing.
+        deleted = await conn.fetch(
+            f"DELETE FROM message_attachment WHERE {where} RETURNING attachment_id", *params
+        )
+        counts: dict[str, int] = {}
+        for r in deleted:
+            key = str(r["attachment_id"])
+            counts[key] = counts.get(key, 0) + 1
         # The decrefs take the header locks in content-address order, as the ingress and
         # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
         # in Python as those are, so the database collation does not decide the order.
-        rows = await conn.fetch(
-            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
-            *params,
-        )
-        if not rows:
-            return
-        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
-            await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
-        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
-        await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
+        for ref in sorted(counts):
+            await self._decref_attachment(conn, ref, counts[ref])
 
     @staticmethod
     def _attachment_still_referenced_sql(msg_col: str, inflight_ph: int, dead_ph: int) -> str:
@@ -10083,13 +10216,19 @@ class PostgresStore:
             cipher.active_marker_prefix,
             lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
         )
-        # Only records the pass has work on; store.py's reseal_user_records says why.
+        # Only records the pass has work on; store.py's reseal_user_records says why, and why the
+        # prefixes are compared byte-exact rather than with LIKE, which reads `_` as a wildcard
+        # (BACKLOG #5738).
+        seal_prefix = f"{SEAL_PREFIX}{sealer.key_id}:"
+        marker = cipher.active_marker_prefix
         rows = await self._fetchall(
-            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE $1"
-            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE $2))"
+            "SELECT id FROM users WHERE authz_seal <> '' AND (left(authz_seal, $1) <> $2"
+            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND left(totp_secret, $3) <> $4))"
             " ORDER BY id",
-            f"{SEAL_PREFIX}{sealer.key_id}:%",
-            f"{cipher.active_marker_prefix}%",
+            len(seal_prefix),
+            seal_prefix,
+            len(marker),
+            marker,
         )
         resealed = refused = 0
         for row in rows:
@@ -10098,11 +10237,12 @@ class PostgresStore:
             except RowSealError:
                 refused += 1
                 continue
-            resealed += written is not None
-        if resealed:
-            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
-            # 11.3.4); charged here, as each generic rotation batch charges its own.
-            await self._charge_bound_batch()
+            if written is not None:
+                resealed += 1
+                # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key
+                # (ASVS 11.3.4), charged after each committed record, so an interrupted pass
+                # leaves at most the one record in flight to the reserve-ahead (BACKLOG #5738).
+                await self._charge_bound_batch()
         return resealed, refused
 
     async def count_unsealed_users(self) -> int:
@@ -11366,13 +11506,24 @@ class PostgresStore:
         conn: Any,
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
+        *,
+        owner: str | None = None,
     ) -> SessionRecord | None:
         """The one writer of a session's sealed columns (BACKLOG #2592); store.py's
-        ``MessageStore._write_session`` states the contract. Call it inside ``conn``'s transaction.
-        The read takes the row lock, so the compare on the seal is a second guard, not the only one."""
-        row = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
-        )
+        ``MessageStore._write_session`` states the contract, ``owner`` included (BACKLOG #5742).
+        Call it inside ``conn``'s transaction. The read takes the row lock, so the compare on the
+        seal is a second guard, not the only one; with ``owner`` set, a row of another account does
+        not match the read, so ``FOR UPDATE`` does not lock it."""
+        if owner is None:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", token_hash
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE token_hash=$1 AND user_id=$2 FOR UPDATE",
+                token_hash,
+                owner,
+            )
         if row is None:
             return None
         current = SessionRecord.from_mapping(dict(row))
@@ -11585,7 +11736,9 @@ class PostgresStore:
         ``MessageStore._keep_or_end_session`` states the contract."""
         if not outcome.tripped and restamp.kept(
             await write_kept_session(
-                self._write_session(conn, token_hash, restamp), outcome, token_hash
+                self._write_session(conn, token_hash, restamp, owner=restamp.user_id),
+                outcome,
+                token_hash,
             )
         ):
             return RevokeResult(revoked, kept=True)
@@ -11997,8 +12150,39 @@ class PostgresStore:
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
             "destination_name", older_than, connection_cutoffs, start=2
         )
+        # stage is $1 and status $2 for the store-once release; its cutoff numbers from $3.
+        ref_cutoff_sql, ref_cutoff_params, _ = _pg_cutoff_case(
+            "destination_name", older_than, connection_cutoffs, start=3
+        )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # BACKLOG #5740, as on SQLite: release the shared bodies these dead rows reference and
+                # NULL their body_ref BEFORE blanking. This backend writes no store-once row, but a
+                # restored one carries a body_ref, and a blanked payload left with it set still read as
+                # replayable: its shared body (PHI) and its message's attachment were never released.
+                # One statement NULLs and reports the old refs, so the decref covers exactly them.
+                released = await conn.fetch(
+                    "WITH r AS (SELECT id, body_ref FROM queue"
+                    " WHERE stage=$1 AND status=$2 AND body_ref IS NOT NULL"
+                    f" AND updated_at < {ref_cutoff_sql} FOR UPDATE)"
+                    " UPDATE queue q SET body_ref=NULL FROM r WHERE q.id=r.id RETURNING r.body_ref",
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DEAD.value,
+                    *ref_cutoff_params,
+                )
+                ref_counts: dict[str, int] = {}
+                for r in released:
+                    key = str(r["body_ref"])
+                    ref_counts[key] = ref_counts.get(key, 0) + 1
+                for body_hash in sorted(ref_counts):
+                    await conn.execute(
+                        "UPDATE shared_body SET refcount = GREATEST(0, refcount - $1) WHERE hash=$2",
+                        ref_counts[body_hash],
+                        body_hash,
+                    )
+                    await conn.execute(
+                        "DELETE FROM shared_body WHERE hash=$1 AND refcount<=0", body_hash
+                    )
                 # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
                     "UPDATE queue SET payload=''"
@@ -12034,16 +12218,17 @@ class PostgresStore:
         Track B Step 6b: when clustered, bump the version of each DISTINCT namespace a row was purged from
         (atomically with the delete) so a follower's converge_state_cache() re-reads it and drops the same
         keys (the version-scan reload re-seeds the surviving rows, leaving the purged keys gone). Gated, so
-        single-node writes no state_version rows and stays byte-identical."""
+        single-node writes no state_version rows and stays byte-identical.
+
+        One ``DELETE ... RETURNING`` names exactly the rows it removed (BACKLOG #5734). A SELECT of the
+        expired keys followed by a separate DELETE would list a key a concurrent ``state_set`` refreshed
+        between the two, so the cache would drop a key whose row survives."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             rows = await conn.fetch(
-                "SELECT namespace, key FROM state WHERE set_at < $1", older_than
+                "DELETE FROM state WHERE set_at < $1 RETURNING namespace, key", older_than
             )
             purged_keys = [(r["namespace"], r["key"]) for r in rows]
-            if not purged_keys:
-                return 0
-            await conn.execute("DELETE FROM state WHERE set_at < $1", older_than)
             bumped: list[tuple[str, int]] = []
             if self._cluster_state_convergence:
                 for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable

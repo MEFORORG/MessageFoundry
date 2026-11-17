@@ -98,6 +98,10 @@ class LoginDialog(QDialog):
         if not username or not password:
             self._error.setText("Enter a username and password.")
             return
+        # On the GUI thread, so an engine that accepts the connection and then stalls freezes this
+        # dialog for up to the sign-in read, SIGN_IN_TIMEOUT_SECONDS (vault BACKLOG #2950 added item
+        # 15). Kept: this is a test tool aimed at an engine the tester runs, and an unreachable one
+        # still fails at the connect bound.
         try:
             result = self._client.login(
                 username, password, provider=provider, totp_code=self._code.text().strip() or None

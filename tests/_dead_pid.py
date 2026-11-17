@@ -32,9 +32,9 @@ developer box -- which is why it reproduces there and not locally.
 
 WHY THIS VALUE. ``2147483647`` is ``Int32.MaxValue``. It is:
 
-* **within ``[int]``**, which `Test-RecordLiveness` casts to (``$procId = [int]$Record.pid``);
-* **non-zero**, so it takes the liveness path rather than the ``UNREADABLE`` shortcut that a falsy
-  pid triggers -- a record with no pid is deliberately NOT dead there;
+* **within ``[int]``**, which `Test-RecordLiveness` parses the pid into (``[int]::TryParse``);
+* **non-zero**, so it takes the liveness path rather than the ``UNREADABLE`` shortcut that a missing,
+  non-numeric or zero pid triggers -- a record with no pid is deliberately NOT dead there;
 * **structurally unassignable**: Linux caps pids at ``/proc/sys/kernel/pid_max`` (default 4194304,
   ceiling ~2^22) and Windows pids are multiples of 4 far below 2^31.
 

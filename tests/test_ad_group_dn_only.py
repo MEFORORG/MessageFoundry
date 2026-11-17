@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import gc
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from tests._ad_group_map_store_contract import (
     assert_group_map_keys_at_width_store,
 )
 from tests._admin_account import create_local_user_chosen
+from tests._cpu_clock import interleaved_thread_cpu
 from tests._growth import _growth_between
 
 PW = "Sup3rSecret!!"
@@ -304,16 +306,23 @@ _PATHOLOGICAL_DNS: dict[str, tuple[Callable[[int], str], bool]] = {
 _MAX_LINEAR_RATIO = 8.0
 
 
-def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
-    """One attempt: a reading of :func:`_growth_between`, which says how it samples, taken with
-    the collector off."""
+@contextmanager
+def _collector_off() -> Iterator[None]:
+    """The cyclic collector off for a timing, and back to how it was after."""
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        return _growth_between(judge, small, large, rounds=3)
+        yield
     finally:
         if was_enabled:
             gc.enable()
+
+
+def _attempt_ratio(judge: Callable[[str], object], small: str, large: str) -> float:
+    """One attempt: a reading of :func:`_growth_between`, which says how it samples, taken with
+    the collector off."""
+    with _collector_off():
+        return _growth_between(judge, small, large, rounds=3)
 
 
 def _scaling_ratios(
@@ -335,7 +344,9 @@ def _scaling_ratios(
     3 large runs and then 7 small ones of about 1.6 ms at ``k`` = 1,000, a window of about 11 ms
     that one stretch of contention could cover whole. That cause is inferred from the code and
     local timings, not measured on a hosted runner. The interleaved instrument in
-    :func:`_attempt_ratio` and the control's larger ``k`` answer it; the rule is unchanged."""
+    :func:`_attempt_ratio` and the control's larger ``k`` answer it; the rule is unchanged. The
+    control records :func:`_cpu_ratio` beside its wall readings on every run, which is how a hosted
+    run measures that cause; its docstring says where the readings land."""
     small, large = make(k), make(4 * k)
     readings: list[float] = []
     for _ in range(3):
@@ -347,6 +358,31 @@ def _scaling_ratios(
 
 def _attempts(readings: list[float]) -> str:
     return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
+
+
+def _cpu_ratio(judge: Callable[[str], object], make: Callable[[int], str], k: int) -> float:
+    """The inputs :func:`_scaling_ratios` builds from ``make`` and ``k``, timed again on the calling
+    thread's CPU clock, for the record only (BACKLOG #3452, step 1). The control asserts nothing
+    on it, and records a failure inside it instead of failing.
+
+    It tells the two causes of a low wall reading apart, on the runner where the reading was taken.
+    A host that takes the core away charges this clock nothing, so a wall reading under the line
+    beside a CPU reading well over it says the runner took the time. Both under it says the work
+    itself scaled less than its square, so a larger ``k`` or another subject is the answer, not a
+    better clock. The calls interleave, as :func:`interleaved_thread_cpu` says why."""
+    small, large = make(k), make(4 * k)
+    with _collector_off():
+        per_call = interleaved_thread_cpu(
+            {"small": lambda: judge(small), "large": lambda: judge(large)}
+        )
+    return per_call["large"] / per_call["small"]
+
+
+def _quadratic(text: str) -> None:
+    """The control's subject: re-parses a prefix every 100 characters, the shape of a parser that
+    rescans from the start at each separator. Its work grows with the square of the length."""
+    for end in range(100, len(text) + 1, 100):
+        canonical_group_dn(text[:end])
 
 
 @pytest.mark.parametrize(
@@ -365,24 +401,44 @@ def test_a_pathological_dn_is_judged_in_linear_time(
     )
 
 
-def test_the_linear_time_check_fails_a_quadratic_parser() -> None:
+# record_property warns that <properties> inside a <testcase> is outside the xunit2 schema, the
+# default family. pytest writes them there all the same, which is where the readings are wanted.
+@pytest.mark.filterwarnings("ignore:record_property is incompatible:pytest.PytestWarning")
+def test_the_linear_time_check_fails_a_quadratic_parser(
+    record_property: Callable[[str, object], None],
+) -> None:
     """Control: the ratio check must catch a quadratic parser, or its pass above proves nothing.
     It asserts exactly the negation of the linear test's pass condition.
 
-    This one re-parses a prefix every 100 characters, the shape of a parser that rescans from the
-    start at each separator. Its work grows with the square of the length. It runs at ``k`` =
-    2,000; :func:`_scaling_ratios` says why the size went up (BACKLOG #3452)."""
+    Its subject is :func:`_quadratic`. It runs at ``k`` = 2,000; :func:`_scaling_ratios` says why
+    the size went up (BACKLOG #3452).
 
-    def quadratic(text: str) -> None:
-        for end in range(100, len(text) + 1, 100):
-            canonical_group_dn(text[:end])
-
-    make = _PATHOLOGICAL_DNS["many-rdns"][0]
-    readings = _scaling_ratios(quadratic, make, 2_000)
+    THE CAUSE OF A LOW READING IS MEASURED HERE, ON EVERY RUN THAT REACHES IT, PASS OR FAIL
+    (BACKLOG #3452, step 1). The wall readings and :func:`_cpu_ratio`'s reading go into the
+    failure message and, as ``wall_ratios`` and ``cpu_ratio``, into this test's junit properties.
+    ci.yml's engine ``test`` job writes and uploads that file; its ``Upload engine suite junit``
+    steps say when and for how long. A passing run is recorded too, because a sample taken only on
+    a red is selected on the outcome and cannot say how often the control reads low."""
+    make, k = _PATHOLOGICAL_DNS["many-rdns"][0], 2_000
+    readings = _scaling_ratios(_quadratic, make, k)
+    record_property("wall_ratios", ",".join(f"{reading:.3f}" for reading in readings))
+    try:
+        cpu = f"{_cpu_ratio(_quadratic, make, k):.3f}"
+    except RuntimeError as broken:  # interleaved_thread_cpu's spin guard; a reading, not a verdict
+        cpu = f"error: {broken}"
+    record_property("cpu_ratio", cpu)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
-        f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)})"
+        f"a quadratic parser scaled by only {ratio:.2f}x ({_attempts(readings)}; "
+        f"thread CPU clock {cpu})"
     )
+
+
+def test_the_cpu_reading_reads_large_over_small() -> None:
+    """The CPU reading unstubbed, on the control's own subject: large over small, not inverted.
+    An inverted ratio would read near 0.06 and send #3452's cause the wrong way. The bound is far
+    below the 16 a quadratic gives, so it checks direction, not speed."""
+    assert _cpu_ratio(_quadratic, _PATHOLOGICAL_DNS["many-rdns"][0], 2_000) > 2.0
 
 
 def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...]) -> list[float]:
@@ -397,14 +453,15 @@ def _stub_attempts(monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...])
         return taken[-1]
 
     monkeypatch.setitem(globals(), "_attempt_ratio", read)
+    monkeypatch.setitem(globals(), "_cpu_ratio", lambda judge, make, k: 15.0)
     return taken
 
 
 @pytest.mark.parametrize(
     ("attempts", "spent", "failure"),
     [
-        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x)"),
-        ((15.0, 15.0, 4.0), 3, "only 4.00x (attempts: 15.00x, 15.00x, 4.00x)"),
+        ((4.0, 4.0, 4.0), 1, "only 4.00x (attempts: 4.00x; thread CPU clock 15.000)"),
+        ((15.0, 15.0, 4.0), 3, "only 4.00x (attempts: 15.00x, 15.00x, 4.00x; thread"),
         ((8.0, 8.0, 8.0), 3, None),
         ((15.0, 9.0, 12.0), 3, None),
     ],
@@ -416,14 +473,22 @@ def test_the_quadratic_control_passes_only_when_every_attempt_reads_over_the_lin
     """Control of the control (BACKLOG #3452). The linear check passes a parser on any attempt
     under the line. So one attempt under it must fail the control, even after two over it, and
     a check that cannot tell quadratic from linear fails it on the first attempt. A reading of
-    exactly 8.0 fails the linear check, so it passes the control."""
+    exactly 8.0 fails the linear check, so it passes the control. Both readings are recorded on
+    a pass and on a failure alike (BACKLOG #3452, step 1)."""
     taken = _stub_attempts(monkeypatch, attempts)
+    recorded: list[tuple[str, object]] = []
+
+    def record(name: str, value: object) -> None:
+        recorded.append((name, value))
+
     if failure is None:
-        test_the_linear_time_check_fails_a_quadratic_parser()
+        test_the_linear_time_check_fails_a_quadratic_parser(record)
     else:
         with pytest.raises(AssertionError, match=re.escape(failure)):
-            test_the_linear_time_check_fails_a_quadratic_parser()
+            test_the_linear_time_check_fails_a_quadratic_parser(record)
     assert taken == list(attempts[:spent])
+    wall = ",".join(f"{reading:.3f}" for reading in attempts[:spent])
+    assert recorded == [("wall_ratios", wall), ("cpu_ratio", "15.000")]
 
 
 @pytest.mark.parametrize(

@@ -79,7 +79,7 @@ import fastapi.routing
 from fastapi import APIRouter, FastAPI
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.applications import Starlette
-from starlette.routing import BaseRoute, Mount, WebSocketRoute
+from starlette.routing import BaseRoute, Host, Mount, Router, WebSocketRoute
 
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
@@ -534,27 +534,75 @@ def _mounted_app(mount: Mount) -> Any:
     return getattr(mount, "_base_app", mount.app)
 
 
-def _refuse_low_priority_routes(owner: Starlette | APIRouter | Mount) -> None:
-    """Raise when ``owner`` holds a route FastAPI tries only after its ordinary ones.
+def _app_beneath(route: Mount | Host, at: str) -> Any:
+    """The app ``route`` serves, as the low-priority refusal reads it; ``at`` names ``route`` in
+    an error.
+
+    That is a ``Mount``'s app beneath any middleware the mount wraps around it, or a ``Host``'s app,
+    then unwrapped through each ASGI middleware layer that keeps the next app as ``.app``, down to
+    the first Starlette app or router (vault BACKLOG #3177). A layer that keeps the next app under
+    any other name ends the unwrapping there, so the refusal does not reach past it.
+
+    It raises ``ValueError`` on reaching one more object that is neither a Starlette app nor a
+    router after :data:`_MAX_MIDDLEWARE_LAYERS` such objects, rather than unwrap forever, as an
+    object that makes a new ``.app`` on every read would. Each middleware layer counts, and so does
+    a leaf app that is neither, such as a plain ASGI function or ``StaticFiles``. So 64 layers
+    around a FastAPI app are unwrapped, while 64 layers around a plain ASGI app are refused."""
+    app: Any = _mounted_app(route) if isinstance(route, Mount) else route.app
+    # Each layer is held, not only its id, so a freed layer's id cannot come back as a new one's.
+    seen: dict[int, Any] = {}
+    while not isinstance(app, Starlette | Router) and id(app) not in seen:
+        if len(seen) >= _MAX_MIDDLEWARE_LAYERS:
+            raise ValueError(
+                f"under {at!r} the route walk passed {_MAX_MIDDLEWARE_LAYERS} objects that are "
+                "neither a Starlette app nor a router and found another, so it stops there"
+            )
+        seen[id(app)] = app
+        inner = getattr(app, "app", None)
+        if inner is None:
+            break
+        app = inner
+    return app
+
+
+#: How many objects that are neither a Starlette app nor a router :func:`_app_beneath` passes
+#: before it refuses; its docstring says what counts.
+_MAX_MIDDLEWARE_LAYERS = 64
+
+
+def _place(route: Mount | Host, at: str = "") -> str:
+    """How a refusal names ``route``, beneath the parent ``at`` names. Starlette strips a mount at
+    ``/`` to an empty path, so that one is named ``/``; a host follows its parent after a space."""
+    if isinstance(route, Host):
+        return f"{at} [host {route.host}]" if at else f"[host {route.host}]"
+    path = route.path or "/"
+    return at.rstrip("/") + path if at else path
+
+
+def _refuse_low_priority_routes(source: Any, at: str = "") -> None:
+    """Raise when the app ``source`` holds a route FastAPI tries only after its ordinary ones.
 
     ``APIRouter.frontend`` registers such a group, and an included router's group comes along with
     it. ``iter_route_contexts`` never yields one, so the walk would serve it unseen (vault BACKLOG
-    #3055). None is registered today; teach the walk to read one before registering it."""
-    source = _mounted_app(owner) if isinstance(owner, Mount) else owner
+    #3055). None is registered today; teach the walk to read one before registering it. ``at`` is
+    where ``source`` sits beneath the walked app, for the message."""
     router = source.router if isinstance(source, FastAPI) else source
     if not isinstance(router, APIRouter):
         return
     hidden = list(fastapi_symbol(router, "_iter_low_priority_routes")())
     if hidden:
         kinds = sorted({type(getattr(r, "original_route", r)).__name__ for r in hidden})
+        named = f"{type(source).__name__} under {at!r}" if at else type(source).__name__
         raise ValueError(
-            f"{type(source).__name__} holds {len(hidden)} low-priority route(s) of type {kinds}, "
+            f"{named} holds {len(hidden)} low-priority route(s) of type {kinds}, "
             "such as a frontend group. The route walk does not visit them, so it would under-report "
             "them. Teach scripts/security/route_gates.py to read them first."
         )
 
 
-def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[BaseRoute, Any]]:
+def _effective_routes(
+    owner: Starlette | Router | Mount | Host, *, _at: str = ""
+) -> Iterator[tuple[BaseRoute, Any]]:
     """``(route, effective)`` for each route of ``owner``, with every ``include_router`` call unpacked.
 
     FastAPI keeps an included router as one opaque object on the app, and serves its routes
@@ -564,15 +612,32 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
     registered on ``owner`` directly. The walk takes the PATH and methods from it. An HTTP route's
     gate comes from the route's own dependencies.
 
-    Each ``Mount`` is walked through, and every mount beneath it, before it is yielded, so a caller
-    that does not descend is refused as one that does (vault BACKLOG #3177). So the walk raises, at
-    least, :func:`_refuse_low_priority_routes`'s refusal for ``owner`` or any of those mounts, and any
-    other error the walk raises for a route beneath a yielded mount, such as a ``ValueError`` for an
-    included route with no rebuilt copy or :class:`MissingFastAPISymbol`. The descent reads
-    ``Mount.routes``, so it reaches neither a ``Host`` nor an app the mount sees only through a
-    middleware wrapper."""
-    _refuse_low_priority_routes(owner)
-    routes: Sequence[BaseRoute] = owner.routes
+    Each ``Mount`` and ``Host`` is walked through, and every one beneath it, before it is yielded,
+    so a caller that does not descend is refused as one that does (vault BACKLOG #3177). The
+    descent reads the app :func:`_app_beneath` finds, so it passes a middleware layer that keeps
+    the next app as ``.app``, and stops at one that keeps it under another name. Whether or not the
+    caller descends, the walk raises, at least:
+
+    * :func:`_refuse_low_priority_routes`'s ``ValueError`` for ``owner`` or for any app it reaches
+      beneath a yielded ``Mount`` or ``Host``;
+    * the ``ValueError`` for an included non-API route with no rebuilt copy, and
+      :class:`MissingFastAPISymbol`, for a route in ``owner`` or in any such app; and
+    * ``RecursionError`` for a mount cycle, which the walk does not detect: a cycle is refused
+      rather than walked.
+
+    A subtree is walked once for each mount above it, so a caller that descends walks a chain of
+    mounts in time that grows with the square of its depth. That is kept: a served app nests a
+    handful of mounts at most, and one walk per level keeps the refusal free of shared state.
+
+    ``_at`` is where ``owner`` sits beneath the app the walk started from; a ``Mount`` or ``Host``
+    walked from the top is placed by its own path or host."""
+    if isinstance(owner, Mount | Host):
+        _at = _at or _place(owner)
+        source: Any = _app_beneath(owner, _at)
+    else:
+        source = owner
+    _refuse_low_priority_routes(source, _at)
+    routes: Sequence[BaseRoute] = getattr(source, "routes", [])
     # One entry at a time, so a context with no rebuilt copy is known to be the entry itself only
     # when its original IS that entry. A count of direct registrations could not say which context
     # was the direct one: a shared route object included before it is registered here would spend
@@ -601,9 +666,9 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
             served = original
-        if isinstance(served, Mount):
+        if isinstance(served, Mount | Host):
             # Walked through only for its refusals; the docstring says what that covers.
-            for _ in _effective_routes(served):
+            for _ in _effective_routes(served, _at=_place(served, _at)):
                 pass
         yield original, served
 

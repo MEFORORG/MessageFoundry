@@ -2220,6 +2220,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             body = await request.json()
             response_json = json.dumps(body["response"])
+        except RecursionError:
+            # Nested too deep for json's stack (BACKLOG #5341); uncaught, it would answer 500. It is
+            # handed to the service as sent, whose own parse refuses it as a malformed response:
+            # audited, and the staged ceremony spent, as a shallow malformed assertion is.
+            response_json = (await request.body()).decode("utf-8", "replace")
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         elevation = await auth.finish_webauthn_assertion(
@@ -2283,9 +2288,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         return await _ui_dl_replay(request, None, None, engine, identity, gate)
 
+    # Both path routes declare ConnectionName, the rule DeadLetterReplayRequest carries for the same
+    # values, so FastAPI answers 422 before the handler runs (BACKLOG #5500). As plain str, a
+    # hand-built URL's bad name reached the model inside _ui_dl_replay, whose bare ValidationError
+    # no handler maps, so it answered 500 rather than refusing the input.
     @app.post("/ui/dead-letters/{channel_id}/replay")
     async def ui_replay_dead_letters(
-        channel_id: str,
+        channel_id: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_REPLAY)),
@@ -2296,8 +2305,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/dead-letters/{channel_id}/{destination_name}/replay")
     async def ui_replay_dead_letters_dest(
-        channel_id: str,
-        destination_name: str,
+        channel_id: ConnectionName,
+        destination_name: ConnectionName,
         request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_REPLAY)),

@@ -30,10 +30,13 @@ or it would pass on an audit that saw nothing.
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import re
 import shutil
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -128,6 +131,16 @@ def root(tmp_path: Path) -> Path:
     baseline.parent.mkdir(parents=True, exist_ok=True)
     baseline.write_text(_as_toml(_FOUND), encoding="utf-8")
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _no_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reaches GitHub. A stale entry's default lookup then prints a read failure."""
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("network refused in tests")
+
+    monkeypatch.setattr(gate.urllib.request, "urlopen", refuse)
 
 
 def _replay(*outputs: str) -> tuple[list[Path], Any]:
@@ -260,7 +273,9 @@ def test_the_worst_case_retry_ladder_fits_inside_the_job_timeout() -> None:
     job_seconds = int(jobs_of("security.yml")["cla-action-audit"]["timeout-minutes"]) * 60
     back_off = sum(attempt * 15 for attempt in range(1, gate.ATTEMPTS))
 
-    assert _SETUP_ALLOWANCE_S + gate.ATTEMPTS * gate.NPM_TIMEOUT + back_off < job_seconds
+    lookups = gate.LOOKUP_BUDGET
+
+    assert _SETUP_ALLOWANCE_S + gate.ATTEMPTS * gate.NPM_TIMEOUT + back_off + lookups < job_seconds
 
 
 def test_a_missing_npm_fails_closed_at_once(root: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -352,6 +367,221 @@ def test_main_prints_the_record_limitation(root: Path, capsys: pytest.CaptureFix
     gate.main(["--root", str(root), "--report", str(_FIXTURE)])
 
     assert "does NOT prove this bundle was built from them" in capsys.readouterr().out
+
+
+# --- withdrawn_at for a stale entry ------------------------------------------------------------
+
+#: The script's ``Lookup``; the module is loaded by path, so its alias cannot annotate here.
+_Lookup = Callable[[str], str | None]
+
+_WITHDRAWN = ("GHSA-2222-3333-4444", "left-pad")
+
+
+def test_a_stale_entry_prints_its_withdrawn_at_and_stays_red(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """GitHub saying an entry was withdrawn is a hint for the person, never a pass."""
+    (root / gate.BASELINE_PATH).write_text(_as_toml(_FOUND | {_WITHDRAWN}), encoding="utf-8")
+    asked: list[str] = []
+
+    def lookup(ident: str) -> str | None:
+        asked.append(ident)
+        return "2026-10-22T19:21:04Z"
+
+    argv = ["--root", str(root), "--report", str(_FIXTURE)]
+    assert gate.main(argv, lookup=lookup) == 1
+    out = capsys.readouterr().out
+    assert asked == [_WITHDRAWN[0]]
+    assert (
+        f"WITHDRAWN_AT {_WITHDRAWN[0]} in left-pad: GitHub withdrew it at 2026-10-22T19:21:04Z"
+        in out
+    )
+    assert f"::error::STALE BASELINE ENTRY: {_WITHDRAWN[0]}" in out
+
+
+def test_main_looks_up_through_github_by_default(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without an injected lookup, main reads GitHub; here the autouse fixture refuses the socket,
+    so the line must say the read failed, never NOT withdrawn."""
+    (root / gate.BASELINE_PATH).write_text(_as_toml(_FOUND | {_WITHDRAWN}), encoding="utf-8")
+
+    assert gate.main(["--root", str(root), "--report", str(_FIXTURE)]) == 1
+    out = capsys.readouterr().out
+    assert "could not be read from GitHub (OSError: network refused in tests)" in out
+    assert "GitHub records it as NOT withdrawn" not in out
+
+
+def test_a_clean_run_looks_nothing_up(root: Path) -> None:
+    def lookup(ident: str) -> str | None:
+        raise AssertionError(f"looked up {ident} on a run with no stale entry")
+
+    assert gate.main(["--root", str(root), "--report", str(_FIXTURE)], lookup=lookup) == 0
+
+
+def _raise(error: Exception) -> _Lookup:
+    def lookup(_ident: str) -> str | None:
+        raise error
+
+    return lookup
+
+
+@pytest.mark.parametrize(
+    ("lookup", "expected"),
+    [
+        (lambda _ident: None, "GitHub records it as NOT withdrawn"),
+        (
+            _raise(OSError("HTTP Error 403: rate limit")),
+            "could not be read from GitHub (OSError: HTTP Error 403",
+        ),
+        (_raise(ValueError("the reply carries no withdrawn_at field")), "no withdrawn_at field"),
+        (_raise(http.client.IncompleteRead(b"{")), "could not be read from GitHub (IncompleteRead"),
+        (_raise(RuntimeError("boom")), "could not be read from GitHub (RuntimeError: boom)"),
+    ],
+)
+def test_each_lookup_outcome_has_its_own_line(lookup: _Lookup, expected: str) -> None:
+    """A failed read must not print as "not withdrawn", which would send the person the wrong way."""
+    (line,) = gate.withdrawal_lines([_WITHDRAWN], lookup)
+
+    assert line.startswith(f"WITHDRAWN_AT {_WITHDRAWN[0]} in left-pad:")
+    assert expected in line
+    if "NOT withdrawn" not in expected:
+        assert "NOT withdrawn" not in line and f"gh api advisories/{_WITHDRAWN[0]}" in line
+
+
+def test_an_npm_id_is_not_looked_up() -> None:
+    (line,) = gate.withdrawal_lines([("npm-1234", "x")], _raise(AssertionError("looked up")))
+
+    assert "has no GHSA id to look up by" in line
+
+
+def test_lookups_stop_at_the_cap() -> None:
+    """Dozens stale at once is a COVERAGE problem; the job timeout must not be spent on GitHub."""
+    stale = [(f"GHSA-2222-3333-{digit * 4}", f"p{digit}") for digit in "23456789"]
+    asked: list[str] = []
+
+    def lookup(ident: str) -> str | None:
+        asked.append(ident)
+        return None
+
+    lines = gate.withdrawal_lines(stale, lookup)
+
+    assert len(asked) == gate.MAX_LOOKUPS and len(lines) == len(stale)
+    assert sum("past the" in line for line in lines) == len(stale) - gate.MAX_LOOKUPS
+
+
+def test_a_lookup_past_the_budget_is_reported_late_not_waited_for() -> None:
+    """The budget is wall-clock across every lookup, so a hung read cannot spend the job's timeout."""
+    release = threading.Event()
+
+    def hang(_ident: str) -> str | None:
+        release.wait(30)
+        return None
+
+    try:
+        (line,) = gate.withdrawal_lines([_WITHDRAWN], hang, budget=0.2)
+    finally:
+        release.set()
+
+    assert "did not answer within 0.2 s" in line and "NOT withdrawn" not in line
+
+
+def test_one_id_under_several_packages_is_looked_up_once() -> None:
+    asked: list[str] = []
+
+    def lookup(ident: str) -> str | None:
+        asked.append(ident)
+        return "2026-10-22T19:21:04Z"
+
+    stale = [(_WITHDRAWN[0], "a"), (_WITHDRAWN[0], "b"), (_WITHDRAWN[0], "c")]
+    lines = gate.withdrawal_lines(stale, lookup)
+
+    assert asked == [_WITHDRAWN[0]]
+    assert all("withdrew it at 2026-10-22T19:21:04Z" in line for line in lines) and len(lines) == 3
+
+
+def test_a_coverage_failure_looks_nothing_up(
+    root: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every entry reads stale when the audit saw nothing, so its WITHDRAWN_AT lines would mislead."""
+    saved = tmp_path / "no-manifest.json"
+    saved.write_text(json.dumps(_NO_MANIFEST_REPORT), encoding="utf-8")
+
+    def lookup(ident: str) -> str | None:
+        raise AssertionError(f"looked up {ident} on a COVERAGE failure")
+
+    assert gate.main(["--root", str(root), "--report", str(saved)], lookup=lookup) == 1
+    assert "not looked up, because COVERAGE failed" in capsys.readouterr().out
+
+
+def test_no_lookup_keeps_a_stale_run_offline_and_red(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (root / gate.BASELINE_PATH).write_text(_as_toml(_FOUND | {_WITHDRAWN}), encoding="utf-8")
+
+    def lookup(ident: str) -> str | None:
+        raise AssertionError(f"looked up {ident} under --no-lookup")
+
+    argv = ["--root", str(root), "--report", str(_FIXTURE), "--no-lookup"]
+    assert gate.main(argv, lookup=lookup) == 1
+    assert "not looked up (--no-lookup)" in capsys.readouterr().out
+
+
+class _Reply:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> _Reply:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            b'{"ghsa_id": "GHSA-2222-3333-4444", "withdrawn_at": "2026-10-23T12:53:02Z"}',
+            "2026-10-23T12:53:02Z",
+        ),
+        (b'{"ghsa_id": "GHSA-2222-3333-4444", "withdrawn_at": null}', None),
+    ],
+)
+def test_the_github_lookup_reads_withdrawn_at(
+    monkeypatch: pytest.MonkeyPatch, body: bytes, expected: str | None
+) -> None:
+    seen: list[Any] = []
+
+    def urlopen(request: Any, timeout: float) -> _Reply:
+        seen.append((request.full_url, timeout))
+        return _Reply(body)
+
+    monkeypatch.setattr(gate.urllib.request, "urlopen", urlopen)
+
+    assert gate.github_withdrawn_at("GHSA-2222-3333-4444") == expected
+    assert seen == [("https://api.github.com/advisories/GHSA-2222-3333-4444", gate.GITHUB_TIMEOUT)]
+
+
+@pytest.mark.parametrize(
+    "body", [b'{"ghsa_id": "GHSA-2222-3333-4444"}', b"[]", b'{"withdrawn_at": 7}']
+)
+def test_a_reply_without_a_timestamp_is_an_error_not_a_none(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    """A missing field read as None would print "NOT withdrawn" on no evidence."""
+    monkeypatch.setattr(gate.urllib.request, "urlopen", lambda *_a, **_k: _Reply(body))
+
+    with pytest.raises(ValueError):
+        gate.github_withdrawn_at("GHSA-2222-3333-4444")
+
+
+def test_the_github_lookup_refuses_a_non_ghsa_path() -> None:
+    with pytest.raises(ValueError, match="not a GitHub advisory id"):
+        gate.github_withdrawn_at("../users/x")
 
 
 # --- The committed baseline --------------------------------------------------------------------

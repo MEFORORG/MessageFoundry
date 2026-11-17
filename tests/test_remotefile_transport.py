@@ -706,6 +706,117 @@ async def test_source_leave_durable_ledger_read_is_the_dedup(
     assert "/in/a.hl7" in client.files  # left in place
 
 
+async def test_source_utf16_drop_is_sniffed_through_its_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5684: the remote source shares the local one's encoding-aware sniff, so a UTF-16 HL7
+    # drop on an encoding="utf-16" inbound is handed over, not quarantined for its BOM.
+    body = "MSH|^~\\&|A|B\r".encode("utf-16")
+    client = _FakeClient(files={"/in/a.hl7": body})
+    src = _src(monkeypatch, client, encoding="utf-16")
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    await src._poll_once()
+    assert not any(p.startswith("/in/.error") for p in client.files)
+    assert h.bodies, "the drop was quarantined"
+
+
+async def test_source_leave_failing_ledger_hands_each_file_over_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #5685. Red on 896db80ea9: the failed write escaped before the key was cached, so every
+    # poll aborted at the first file and handed it over again. Now the failure is logged, the key is
+    # cached for this process, and the poll goes on to the next file.
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/b.hl7": b"MSH|^~\\&|B"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+
+    async def mark(file_key: str) -> None:
+        raise OSError("synthetic ledger write failure")
+
+    ledger.mark_processed = mark  # type: ignore[method-assign]
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    for _ in range(3):
+        await src._poll_once()
+    assert sorted(h.bodies) == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"], "each handed over exactly once"
+    assert len(ledger.keys) == 0
+    assert ledger.pruned == 0, "a failed write is not counted as recorded, so it draws no prune"
+    assert "processed-ledger write failed (OSError)" in caplog.text
+
+
+async def test_source_leave_refused_ledger_key_hands_each_file_over_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Red on c0df8be6c2: a key that passes the ledger's read check but that its write refuses
+    # (FileKeyError) escaped before the key was cached, so the first file was handed over again on
+    # every poll. On main the key was cached first; now it is cached and the poll goes on.
+    from messagefoundry.transports.base import FileKeyError
+
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/b.hl7": b"MSH|^~\\&|B"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+
+    async def mark(file_key: str) -> None:
+        raise FileKeyError("synthetic")
+
+    ledger.mark_processed = mark  # type: ignore[method-assign]
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    for _ in range(3):
+        await src._poll_once()
+    assert sorted(h.bodies) == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"], "each handed over exactly once"
+    assert "processed-ledger write failed (FileKeyError" in caplog.text
+
+
+def test_source_pathlike_processed_subdir_is_accepted_and_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Red on c0df8be6c2: a PurePosixPath was refused as not naming a directory; main joined it.
+    # A Windows path is read through as_posix, so its parts are split and checked too.
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=PurePosixPath(".done"))
+    assert src._processed_dir == "/in/.done"
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=PureWindowsPath("arch\\done"))
+    assert src._processed_dir == "/in/arch/done"
+    for value in (PurePosixPath(".."), PureWindowsPath("a\\.."), PureWindowsPath("..\\in")):
+        with pytest.raises(ValueError, match="processed_subdir"):
+            _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+
+
+@pytest.mark.parametrize("value", ["", "  ", ".", "./", "..", "a/..", "a/../..", "../in"])
+def test_source_processed_subdir_at_or_above_the_poll_dir_is_refused(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # Red on 896db80ea9: each was accepted, and a "moved" file stayed where the next poll lists it.
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+
+
+@pytest.mark.parametrize("value", ["/", "/in", "/in/x/.."])
+def test_source_absolute_processed_subdir_at_or_above_the_poll_dir_is_refused(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    with pytest.raises(ValueError, match="processed_subdir"):
+        _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(".done", "/in/.done"), ("a/../b", "/in/a/../b"), ("/arch", "/arch")]
+)
+def test_source_processed_subdir_below_or_beside_the_poll_dir_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+) -> None:
+    src = _src(monkeypatch, _FakeClient(files={}), processed_subdir=value)
+    assert src._processed_dir == expected
+
+
 async def test_source_leave_untagged_ledger_row_still_skips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
