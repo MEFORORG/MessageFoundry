@@ -31,6 +31,7 @@ import importlib.machinery
 import json
 import logging
 import os
+import shutil
 import sys
 import types
 from collections.abc import Sequence
@@ -1756,3 +1757,127 @@ async def test_the_engine_arm_text_is_unchanged(
         assert _ENGINE_TEXT[f"{shape}_log"] in caplog.messages, caplog.messages
     finally:
         await store.close()
+
+
+# --- BACKLOG #5376: an emptied console, and an asset that fails to open ---------------------------
+
+
+def test_a_console_whose_every_file_was_deleted_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REAL walk over a loaded console whose files are all gone lists nothing. Its package
+    directory still sits under the install root, so every RECORD row is ``missing`` drift rather
+    than the pass reading as attested-nothing with no drift."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert sorted((d.path, d.reason) for d in console.drift) == [
+        (rel, "missing") for rel in sorted(_CONSOLE_FILES)
+    ]
+    assert console.checked == 0 and console.ok is False
+
+
+def test_a_console_whose_package_directory_was_deleted_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory itself gone: the loaded ``__path__`` still names a place under the install
+    root."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    shutil.rmtree(package_dir)
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert sorted((d.path, d.reason) for d in console.drift) == [
+        (rel, "missing") for rel in sorted(_CONSOLE_FILES)
+    ]
+
+
+def test_a_console_whose_every_file_is_special_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every file swapped for a FIFO or socket: the walk leaves each out so it is never read, and the
+    package root under the install root is what makes each row ``missing`` drift. Simulated at
+    :func:`_is_special_file` so it runs where ``mkfifo`` does not exist; the next test uses real
+    FIFOs where it does."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    _load_fake_console(monkeypatch, package_dir)
+    monkeypatch.setattr(integ, "_is_special_file", lambda path: True)
+
+    assert integ._console_loaded_files() == []
+    console = integ.attest_console()
+    assert console is not None
+    assert sorted(d.path for d in console.drift) == sorted(_CONSOLE_FILES)
+    assert console.checked == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_a_console_whose_every_file_is_a_real_fifo_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+        os.mkfifo(console_root / rel)
+    _load_fake_console(monkeypatch, package_dir)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert sorted(d.path for d in console.drift) == sorted(_CONSOLE_FILES)
+    assert console.checked == 0
+
+
+def test_an_emptied_console_outside_the_install_root_stays_attested_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the gate: an empty package loaded from OUTSIDE the install root still reads
+    as attested-nothing, not as a list of every row it did not load."""
+    _install_engine_and_console(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere" / _CONSOLE_PKG
+    elsewhere.mkdir(parents=True)
+    _load_fake_console(monkeypatch, elsewhere)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert console.drift == [] and console.attested_nothing is True
+
+
+def test_an_asset_that_fails_to_open_is_drift_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared asset replaced by a directory is neither a special file nor openable. It is
+    ``missing`` drift, and ``checked`` counts only the module that was actually compared."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    asset.unlink()
+    asset.mkdir()
+
+    result = attest_engine()
+    assert _drift(result) == [(_ASSET, "missing")]
+    assert result.checked == 1, "the unreadable asset must not be counted as compared"
+
+
+def test_a_pass_where_no_file_opens_is_attested_nothing_and_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every attested file fails to open: drift for each, and ``checked == 0``, so nothing reads the
+    pass as one that compared something."""
+    asset = _install_with_asset(tmp_path, monkeypatch, declare_asset=True)
+    module = tmp_path / "mfengine" / "__init__.py"
+    for path in (asset, module):
+        path.unlink()
+        path.mkdir()
+
+    result = attest_engine()
+    assert result.checked == 0 and result.attested_nothing is True
+    assert sorted(_drift(result)) == sorted(
+        [(_ASSET, "missing"), ("mfengine/__init__.py", "missing")]
+    )
+    assert result.unattested_reason == "no_attested_file_under_install_root"
