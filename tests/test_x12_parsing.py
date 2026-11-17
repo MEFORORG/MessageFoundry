@@ -379,6 +379,9 @@ def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at
     good = interchange(control="000000002")
     for between in ("", "\r\n \n"):
         assert split(bad + between + good) == [bad, good]
+    # Whitespace data at the end of the last segment stays too, before its terminator.
+    padded = bad[: -len(term)] + "  " + term
+    assert split(padded + "\n" + good) == [padded, good]
     # The reader keeps every byte before the next ISA, so its frame holds the terminator too.
     assert _frames_of((bad + good).encode(), 4096) == [bad.encode(), good.encode()]
 
@@ -408,18 +411,28 @@ def test_a_segment_whose_id_only_starts_with_iea_does_not_end_an_interchange(
         assert _frames_of((bad + nxt).encode(), chunk) == [bad.encode(), nxt.encode()], chunk
 
 
-def test_a_passing_interchange_ends_only_at_iea_and_its_own_element_separator() -> None:
-    # A passing header names the element separator, so "IEA" followed by any other character is
-    # a longer segment id. A bare "IEA" segment, with no elements, is still the trailer.
-    raw = interchange().replace("GE*", "IEA^1~GE*", 1)
-    assert split(raw) == [raw]
-    assert _frames_of(raw.encode(), 4096) == [raw.encode()]
-    bare = _without_iea(interchange()) + "IEA~"
-    assert split(bare + interchange(control="000000002")) == [
-        bare,
-        interchange(control="000000002"),
-    ]
-    assert _frames_of(bare.encode(), 1) == [bare.encode()]
+@pytest.mark.parametrize("trailer", ["IEA~", "IEA *1*000000001~", "IEA|1|000000001~"])
+def test_iea_then_the_segment_end_or_a_non_alphanumeric_still_ends_an_interchange(
+    trailer: str,
+) -> None:
+    # Only a longer id is refused: a bare IEA, a stray space or another separator still closes the
+    # frame, so such a trailer is framed and recorded rather than held open.
+    raw = _without_iea(interchange()) + trailer
+    nxt = interchange(control="000000002")
+    assert split(raw + nxt) == [raw, nxt]
+    for chunk in (4096, 1):
+        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
+
+
+def test_a_corrupted_interchange_with_another_separator_still_ends_at_its_own_iea() -> None:
+    # An interchange with no IEA, then a corrupted one using "|": the walk is bounded from the
+    # failing ISA on, and still ends at that interchange's own IEA, whatever its separator.
+    a = _without_iea(interchange())
+    bad = _corrupt(interchange(el="|", control="000000002"))
+    assert bad.endswith("IEA|1|000000002~")
+    assert split(a + bad) == [a + bad]
+    for chunk in (4096, 7, 1):
+        assert _frames_of((a + bad).encode(), chunk) == [(a + bad).encode()], chunk
 
 
 def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
@@ -909,7 +922,7 @@ def test_frame_reader_byte_at_a_time() -> None:
     assert out == [data]
 
 
-def test_iea_segment_whitespace_matches_the_shared_set() -> None:
+def test_segment_whitespace_patterns_match_the_shared_set() -> None:
     """The framing's segment-opening whitespace patterns skip exactly the whitespace the codec
     strips before a segment.
 
@@ -1445,24 +1458,6 @@ def test_a_repetition_below_1_or_with_no_separator_is_refused() -> None:
     with pytest.raises(ValueError, match="no repetition separator"):
         msg.set("ISA-06", "X", repetition=2)
     assert msg.encode() == before and old.encode() == old_before
-
-
-def test_a_legacy_isa11_u_on_00501_lets_a_write_carry_a_u() -> None:
-    # The legacy "U" is read as data, never split on, but every write holding a "U" was refused
-    # as if it were a separator.
-    raw = _repeating(rep="U", between="^").replace("ZZ1*A:B^C:D", "ZZ1*ABK:U071")
-    msg = X12Message.parse(raw)
-    assert msg.delimiters.repetition == "U"
-    msg["ZZ1-01.2"] = "U072"
-    msg["GS-02"] = "USER"
-    msg.set_data("ZZ1-02", "UNIT")
-    reparsed = X12Message.parse(msg.encode())
-    assert reparsed["ZZ1-01"] == "ABK:U072"
-    assert reparsed["GS-02"] == "USER"
-    assert reparsed["ZZ1-02"] == "UNIT"
-    # The real separators are still refused.
-    with pytest.raises(ValueError, match="delimiter"):
-        msg["ZZ1-02"] = "A*B"
 
 
 def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:

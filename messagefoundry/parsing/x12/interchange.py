@@ -18,7 +18,8 @@ Two surfaces:
 
 The ``IEA`` trailer is recognised only at a **segment boundary** (the three bytes immediately after a
 segment terminator, tolerating cosmetic whitespace), so ``IEA`` appearing inside element data never
-truncates an interchange early. Both surfaces preserve the interchange **verbatim** (cosmetic newlines
+truncates an interchange early, and only as the whole segment id, so a segment such as ``IEAX*...``
+does not either. Both surfaces preserve the interchange **verbatim** (cosmetic newlines
 included) — re-encoding/normalisation is :class:`~messagefoundry.parsing.x12.message.X12Message`'s job.
 """
 
@@ -47,7 +48,7 @@ __all__ = ["split", "X12FrameReader", "check_integrity"]
 # (BACKLOG #5921) or is the ``IEA`` trailer. Matched in place with pos/endpos, so a check never copies
 # a segment, however long. The classes are literal copies of _SEGMENT_WHITESPACE, not built from it,
 # so the static ReDoS scan in tests/test_security_static.py can read the patterns;
-# test_iea_segment_whitespace_matches_the_shared_set in tests/test_x12_parsing.py keeps them equal.
+# test_segment_whitespace_patterns_match_the_shared_set in tests/test_x12_parsing.py keeps them equal.
 _SEGMENT_WS_RUN = re.compile(rb"[ \t\r\n\x0b\x0c]*")
 _SEGMENT_WS_RUN_STR = re.compile(r"[ \t\r\n\x0b\x0c]*")
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
@@ -114,7 +115,7 @@ def split(raw: str) -> list[str]:
         if start == n:
             break
         if start == good or _isa_complete_str(raw, start):
-            end, at_iea = _walk_str(raw, start, cut_at_isa=True, strict_iea=True)
+            end, at_iea = _walk_str(raw, start, cut_at_isa=True)
             if end is None:
                 # Unterminated final interchange — surface it, don't lose it.
                 out.append(raw[start:])
@@ -128,27 +129,30 @@ def split(raw: str) -> list[str]:
             continue
         if good <= start:
             good = _next_isa_str(raw, start + 1)
+        terminator = ""
         if raw.startswith("ISA", start):
             # A malformed header: bound it by the next ISA that passes so it cannot swallow that one.
             end, at_iea = _malformed_end_str(raw, start, good)
+            if not at_iea and start + ISA_SEGMENT_LEN <= end:
+                terminator = _terminator_str(raw, start)
         else:
             end, at_iea = good, False  # non-ISA data — surface it
         # Ended at its own IEA it is kept verbatim, its terminator too, even a whitespace one.
-        out.append(raw[start:end] if at_iea else _strip_before_isa(raw, start, end))
+        out.append(raw[start:end] if at_iea else _strip_before_isa(raw[start:end], terminator))
         pos = end
     return out
 
 
-def _strip_before_isa(raw: str, start: int, end: int) -> str:
-    """The element ``raw[start:end]``, which ends at a later ``ISA``, without the whitespace/BOM
-    before that ``ISA``. A malformed interchange keeps one of its own terminators there, so a
-    whitespace terminator closing its last segment is not stripped with the noise (BACKLOG #5921)."""
-    element = raw[start:end]
+def _strip_before_isa(element: str, terminator: str) -> str:
+    """``element``, which ends at a later ``ISA``, without the whitespace/BOM before that ``ISA``.
+    With the ``terminator`` of a malformed interchange, the run is cut just past the first
+    terminator after the last character that is not whitespace or BOM, so a whitespace terminator
+    closing its last segment, and whitespace data before it, stay (BACKLOG #5921)."""
     kept = element.rstrip(_LEADING_NOISE)
-    if raw.startswith("ISA", start) and start + ISA_SEGMENT_LEN <= end:
-        terminator = _terminator_str(raw, start)
-        if terminator and element.startswith(terminator, len(kept)):
-            kept += terminator
+    if terminator:
+        at = element.find(terminator, len(kept))
+        if at != -1:
+            return element[: at + len(terminator)]
     return kept
 
 
@@ -188,24 +192,18 @@ def _malformed_end_str(raw: str, isa: int, bound: int) -> tuple[int, bool]:
     otherwise ``bound``."""
     if isa + ISA_SEGMENT_LEN > bound:
         return bound, False
-    end, at_iea = _walk_str(raw, isa, bound, strict_iea=False)
+    end, at_iea = _walk_str(raw, isa, bound)
     return (bound, False) if end is None else (end, at_iea)
 
 
 def _walk_str(
-    raw: str,
-    isa: int,
-    bound: int | None = None,
-    *,
-    cut_at_isa: bool = False,
-    strict_iea: bool,
+    raw: str, isa: int, bound: int | None = None, *, cut_at_isa: bool = False
 ) -> tuple[int | None, bool]:
     """Walk the segments of the interchange at ``isa``, read with the terminator at its +105, from
     past its fixed-width header (so the ISA is never searched) up to ``bound`` (the end of ``raw``
     by default). Returns the index just past the terminator that closes its ``IEA`` segment and
     True, or None and False if that is not complete before ``bound``. ``IEA`` is matched only at a
-    segment boundary, and only as the whole segment id: :func:`_iea_id_str` says how ``strict_iea``
-    reads it.
+    segment boundary, and only as the whole segment id (:func:`_iea_id`).
 
     With ``cut_at_isa``, a segment that opens, after any whitespace, with an ``ISA`` that
     :func:`_isa_complete_str` accepts ends the walk too: it returns that segment's start, just past
@@ -220,7 +218,6 @@ def _walk_str(
     terminator = _terminator_str(raw, isa)
     if not terminator:
         return None, False
-    sep = raw[isa + 3] if strict_iea else None
     seg_start = isa + _SEGMENT_TERM_OFFSET + len(terminator)
     end = len(raw) if bound is None else bound
     # The end of the last whitespace run read, already decided not to end the walk. A whitespace
@@ -246,35 +243,22 @@ def _walk_str(
         else:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, idx)
             opens = seg_start if run is None else run.end()  # a star pattern: never None
-        if _iea_id_str(raw, opens, idx, sep):
+        if _iea_id(raw, opens, idx):
             return idx + len(terminator), True
         seg_start = idx + len(terminator)
 
 
-def _iea_id_str(raw: str, at: int, end: int, sep: str | None) -> bool:
+def _iea_id(buf: str | bytes | bytearray, at: int, end: int) -> bool:
     """Whether the segment opening at ``at`` and ending at ``end`` (its terminator) has the id
-    ``IEA``: the three characters are ``IEA`` and the segment ends there or the next character
-    ends the id. A segment id runs to the element separator, so ``IEAX*...`` is not the trailer
-    (BACKLOG #5807). With ``sep``, the ISA's own element separator, only it ends the id. Without
-    it, for an ISA that fails the check, whose +3 may be the corrupted byte, any character that is
-    not an ASCII letter or digit does."""
-    if not raw.startswith("IEA", at, end):
+    ``IEA``: it opens with ``IEA``, then ends or goes on with a character that is not an ASCII
+    letter or digit. A segment id is two or three letters or digits, so ``IEAX*...`` is a longer
+    id, not the trailer (BACKLOG #5807). The ISA's element separator is not read, so a header that
+    fails the check, whose +3 may be the corrupted byte, is read the same way."""
+    head = buf[at : min(at + 4, end)]
+    if (head[:3] != "IEA") if isinstance(head, str) else (head[:3] != b"IEA"):
         return False
-    if at + 3 == end:
-        return True
-    ch = raw[at + 3]
-    return ch == sep if sep is not None else not (ch.isascii() and ch.isalnum())
-
-
-def _iea_id_bytes(buf: bytearray, at: int, end: int, sep: bytes | None) -> bool:
-    """:func:`_iea_id_str` for the reader's buffer."""
-    if not buf.startswith(b"IEA", at, end):
-        return False
-    if at + 3 == end:
-        return True
-    ch = bytes(buf[at + 3 : at + 4])
-    # bytes.isalnum is ASCII-only.
-    return ch == sep if sep is not None else not ch.isalnum()
+    rest = head[3:]
+    return not (rest.isascii() and rest.isalnum())  # empty: the segment ends at IEA
 
 
 class X12FrameReader:
@@ -332,9 +316,6 @@ class X12FrameReader:
         # separator, so a header still arriving is checked once rather than once per feed. Nonzero
         # only while that ISA is undecided: deciding it, or taking the frame, resets it.
         self._isa_gate = 0
-        # The element separator of the ISA at the front of ``_buf`` when that ISA passed the check as
-        # its walk started, else None: an IEA segment's id is read against it (BACKLOG #5807).
-        self._iea_sep: bytes | None = None
         #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
         #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
         self._tail_left = 0
@@ -420,8 +401,6 @@ class X12FrameReader:
             # guards and anything that peeks or parses the frame may.
             self._seg_start = self._scan = _SEGMENT_TERM_OFFSET + len(terminator)
             self._seg_ws, self._seg_decided = self._seg_start, False
-            # The header is whole here and the suspect check above has read it.
-            self._iea_sep = None if self._suspect else bytes(buf[3:4])
         # Walk the segments, resuming where the last feed stopped. The ISA stays at the front of the
         # buffer until its frame is taken or the buffer is cleared, and both reset the resume points,
         # so they always describe this interchange. Each byte is searched about once in total.
@@ -475,7 +454,7 @@ class X12FrameReader:
                 opens = self._seg_start if run is None else run.end()
             else:
                 opens = self._seg_ws  # a passing walk has read the opening whitespace already
-            if _iea_id_bytes(buf, opens, idx, self._iea_sep):
+            if _iea_id(buf, opens, idx):
                 return self._take(idx + len(terminator))
             self._seg_start = self._scan = idx + len(terminator)
             # A whitespace terminator can end a segment inside the run already read: the run from
@@ -542,7 +521,6 @@ class X12FrameReader:
         self._seg_start = self._scan = self._seg_ws = self._isa_gate = 0
         self._seg_decided = False
         self._suspect = False
-        self._iea_sep = None
 
     @staticmethod
     def _terminator(buf: bytearray) -> bytes:

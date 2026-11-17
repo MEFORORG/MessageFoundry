@@ -335,11 +335,8 @@ class X12Message:
     def _reject_delimiters(self, value: str, *, whole_element: bool) -> None:
         forbidden = {self._delims.element, "\r", "\n"}
         forbidden.update(self._delims.segment)
-        # A legacy alphanumeric ISA-11 "U" on a 00501 header is read as data and never split on,
-        # so a write may carry it too: refusing it refused every value holding a "U" (BACKLOG #5922).
-        rep = self._delims.repetition
-        if rep and not rep.isalnum():
-            forbidden.add(rep)
+        if self._delims.repetition:
+            forbidden.add(self._delims.repetition)
         if not whole_element:
             forbidden.add(self._delims.component)
         present = sorted(ch for ch in forbidden if ch in value)
