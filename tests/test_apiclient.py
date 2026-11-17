@@ -248,6 +248,41 @@ def test_a_well_formed_rotation_reply_is_adopted(token: str) -> None:
         client.close()
 
 
+@pytest.mark.parametrize(
+    "token",
+    ["töken", "tok\r\nen", " ", "a" * 8186],
+    ids=["non_ascii", "crlf", "space_only", "oversize"],
+)
+def test_confirm_mfa_returns_the_recovery_codes_when_the_token_is_unusable(token: str) -> None:
+    """The engine commits the one-time recovery codes before it replies, so a confirm reply whose
+    rotated token fails the sendable-token check must still hand the caller its codes (BACKLOG
+    #5344). The token is not adopted, ``token_adopted`` says so, and the held token is left.
+
+    Mutation: check the token before reading the codes, as ``_adopt_rotated(response)`` ahead of
+    the decode did. Red: ApiError, and the codes are lost."""
+    reply = json.dumps(
+        {"recovery_codes": ["code-one", "code-two"], "token": token, "other_sessions": 2}
+    ).encode()
+    with _client_answering(reply) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one", "code-two")
+        assert confirmed.other_sessions == 2
+        assert confirmed.token_adopted is False
+        assert client.token == "before"
+
+
+def test_confirm_mfa_adopts_a_sendable_token() -> None:
+    """NEGATIVE CONTROL: a confirm reply with a sendable token is adopted and says so."""
+    reply = json.dumps({"recovery_codes": ["code-one"], "token": "after"}).encode()
+    with _client_answering(reply) as client:
+        client._token = "before"
+        confirmed = client.confirm_mfa("123456")
+        assert confirmed.recovery_codes == ("code-one",)
+        assert confirmed.token_adopted is True
+        assert client.token == "after"
+
+
 # --- ASVS 4.2.5: the client's own outbound length bound --------------------------------------------
 
 

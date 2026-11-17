@@ -166,10 +166,17 @@ class MfaConfirmed:
 
     ``other_sessions`` is how many sessions :meth:`EngineClient.revoke_other_sessions` would end,
     or None when the engine could not count them. The rotated session token is not here: the
-    client has already adopted it."""
+    client has already adopted it, unless ``token_adopted`` is False.
+
+    ``token_adopted`` is False when the reply carried codes but a rotated token this client cannot
+    send (BACKLOG #5344). The codes are still good and are returned, because the engine committed
+    them before replying and will not show them again. The held token was left in place and may
+    already be dead, since the engine rotated the session, so the caller should save the codes
+    first and then sign in again."""
 
     recovery_codes: tuple[str, ...]
     other_sessions: int | None
+    token_adopted: bool
 
 
 class ApiError(RuntimeError):
@@ -291,8 +298,9 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
 class _RotatedToken(BaseModel):
     """The one field every elevation reply must carry: the re-keyed session token (BACKLOG #5344).
 
-    Local rather than the engine's ``ElevatedResponse`` so that one decode serves all three
-    elevation routes, whose replies differ in their other fields.
+    Local rather than the engine's ``ElevatedResponse`` so that one token rule serves all three
+    elevation routes, whose replies differ in their other fields. ``confirm_mfa`` checks its token
+    against this model after reading the recovery codes, rather than decoding the reply with it.
 
     The token must be one this client can send: RFC 6750 token68 characters only, so no space,
     CR/LF or non-ASCII character that would break the header build, and short enough that
@@ -1297,11 +1305,13 @@ class EngineClient:
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
         token is adopted here — the caller gets the codes and the count, never the token.
 
-        Through :meth:`_adopt_rotated` like the other two elevation calls, deliberately. Assigning
-        ``self._token`` directly worked only by accident of an annotation elsewhere:
-        ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
-        ``_decode`` rather than clearing the session. That is a property of a different file, not of
-        the rule, and the rule is the one thing all three sites must share.
+        The reply is decoded once and the codes are read before the token is checked against the
+        same sendable-token rule :meth:`_adopt_rotated` applies (BACKLOG #5344). A reply that does
+        not decode raises :class:`ApiError` as before. A reply whose codes decode but whose token
+        this client cannot send does NOT raise: the codes are returned with ``token_adopted``
+        False, the held token is left in place and may be dead, and a value-free warning is
+        logged. Raising there would lose codes the engine has already committed and will not
+        show again; see :class:`MfaConfirmed`.
 
         ``enrolment_code`` is the single-use issued enrolment code (ADR 0207), which a
         directory account's first factor needs on a session its identity provider did not stamp.
@@ -1319,10 +1329,24 @@ class EngineClient:
         response = self._request(
             "POST", "/me/mfa/confirm", json=body, timeout=self._sign_in_timeout()
         )
-        self._adopt_rotated(response)
+        # Decoded once, and the codes read before the token is checked: the engine has already
+        # committed them, so a token this client cannot send must not take them down with it.
         confirmed = _decode(response, MfaConfirmResponse)
+        try:
+            rotated: _RotatedToken | None = _RotatedToken(token=confirmed.token)
+        except ValidationError:  # its text quotes the token, so it is neither logged nor chained
+            rotated = None
+        if rotated is None:
+            _log.warning(
+                "MFA enrolment confirmed, but the rotated session token in the reply cannot be "
+                "sent by this client; the recovery codes are returned, the token is not adopted."
+            )
+        else:
+            self._hold_issued(rotated.token)
         return MfaConfirmed(
-            recovery_codes=tuple(confirmed.recovery_codes), other_sessions=confirmed.other_sessions
+            recovery_codes=tuple(confirmed.recovery_codes),
+            other_sessions=confirmed.other_sessions,
+            token_adopted=rotated is not None,
         )
 
     def verify_mfa(self, code: str) -> None:
