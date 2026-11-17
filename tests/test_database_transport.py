@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -1759,17 +1760,84 @@ async def test_source_poll_failure_withholds_a_no_sqlstate_error_text(
     assert "in _select" in caplog.text  # the frames are kept
 
 
-async def test_source_poll_failure_withholds_a_delivery_error_wrapping_connect_text(
+@pytest.mark.parametrize("stage", ["connect", "probe"])
+async def test_connect_and_probe_errors_carry_no_planted_dsn_credential(stage: str) -> None:
+    """#5348, Manager ruling: ``_connect`` and ``_probe_db`` put ``_safe_db_error``'s text in their
+    ``DeliveryError``, and for a no-SQLSTATE error that is ``safe_exc``'s, which keeps a DSN echo
+    whole. That text would reach last_error, events, the alert and the test_connection detail.
+    Red mutation: restore ``_safe_db_error`` in either arm. That stage reds."""
+    failure = RuntimeError(_DSN_ECHO)
+    dest = _dest()
+    if stage == "connect":
+        dest._pool = _RefusingPool(failure)
+    else:
+        dest._pool = _FakePool(_FakeConn(_FakeCursor(failure)))
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert "SyntheticSecret1" not in str(failed.value)
+    assert "mefor_svc" not in str(failed.value)
+    assert str(failed.value).endswith(": RuntimeError")
+
+
+async def test_source_mark_failure_log_carries_no_planted_dsn_credential(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#5348, review round 1: ``_connect`` builds a ``DeliveryError`` around ``_safe_db_error``'s
-    text, which for a no-SQLSTATE error is ``safe_exc``'s, so a ``DeliveryError`` is not exempt.
-    Red mutation: add ``DeliveryError`` to ``_poll_log_line``'s exemption. Reds here."""
-    wrapped = DeliveryError(f"DATABASE connect failed: {_safe_db_error(RuntimeError(_DSN_ECHO))}")
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
-        await _run_one_failed_poll(_src(body_column="payload"), wrapped)
-    assert "RedactedDbError: DeliveryError [message withheld]" in caplog.text
+    """#5348, Manager ruling: the mark's borrow can open a connection, so its WARNING is
+    credential-free. Red mutation: restore ``_safe_db_error`` in the mark-failure log. Reds."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(
+            _src(body_column="payload"),
+            ["id", "payload"],
+            [(1, "A")],
+            _RecordingHandler(),
+            mark_exc=RuntimeError(_DSN_ECHO),
+        )
+    assert "mark failed (row will re-emit, a duplicate): RuntimeError" in caplog.text
     assert "SyntheticSecret1" not in caplog.text
+
+
+async def test_source_finish_stop_log_carries_no_planted_dsn_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5348, Manager ruling: ``_finish_stop`` logs a faulted poll task's error credential-free.
+    Red mutation: restore ``_safe_db_error`` in that log. Reds here."""
+    src = _src(body_column="payload")
+
+    async def fault() -> None:
+        raise RuntimeError(_DSN_ECHO)
+
+    task = asyncio.ensure_future(fault())
+    with contextlib.suppress(RuntimeError):
+        await task
+    src._task = task
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await src._finish_stop(task, interrupted=False)
+    assert "poll task failed: RuntimeError" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DATABASE pool acquire timed out after 5s (pool exhausted or DB unresponsive)",
+        "database driver refused statement_timeout (Error); set statement_timeout = 0 on this "
+        "connection if it cannot take one",
+    ],
+)
+async def test_source_poll_failure_keeps_the_engines_own_text(
+    caplog: pytest.LogCaptureFixture, text: str
+) -> None:
+    """#5348, Manager ruling: the engine's own ``DeliveryError`` and ``NegativeAckError`` hold no
+    driver text, so the poll log keeps their remedy. Red mutation: drop ``DeliveryError`` from
+    ``_poll_log_line``'s exemption. Both red."""
+    exc: Exception = (
+        DeliveryError(text)
+        if "acquire" in text
+        else NegativeAckError(text, code="db", permanent=True)
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+    assert f"RedactedDbError: {type(exc).__name__}: {text}" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -2100,7 +2168,8 @@ async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_s
     """``_probe_db``'s two no-SQLSTATE arms build the ``DeliveryError`` that ``test_connection``
     raises, so its text is what an operator's connection test shows.
 
-    Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds.
+    Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds. Since
+    #5348 both arms name a no-SQLSTATE error by its type alone (``_credential_free_detail``).
     """
     failure = kind(_QUOTED_ARGUMENT)
     dest = _dest()
@@ -2111,7 +2180,7 @@ async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_s
     with pytest.raises(DeliveryError) as failed:
         await dest.test_connection()
     assert _SYNTHETIC_ID not in str(failed.value)
-    assert f"{kind.__name__} [driver message withheld]" in str(failed.value)
+    assert str(failed.value).endswith(f": {kind.__name__}")
 
 
 async def test_source_run_loop_survives_a_poll_error() -> None:

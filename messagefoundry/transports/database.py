@@ -2263,9 +2263,11 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # another server or provider, and `OPENROWSET(BULK ...)` reads a server-side file. PostgreSQL and
 # MySQL need a `;` between statements, which rule 3 refuses, so their own statement verbs are not
 # listed. Fail-closed costs at least a read through `OPENQUERY` or `OPENROWSET`, a T-SQL
-# `OPTION (USE HINT(...))`, `USE PLAN` or `DISABLE EXTERNALPUSHDOWN` hint, a MySQL `USE INDEX` hint, a MySQL `CHARACTER SET`
-# cast, and any unquoted name spelled like one of these words, at least the names `send`, `move`,
-# `enable`, `disable`, `open` and `close`, which T-SQL does not reserve; quote such a name.
+# `OPTION (USE HINT(...))`, `USE PLAN` or `DISABLE EXTERNALPUSHDOWN` hint, a MySQL `USE INDEX`
+# hint, a MySQL `CHARACTER SET` cast, and any unquoted name spelled like one of these words: at
+# least `send`, `move`, `enable` and `disable`, which T-SQL does not reserve, and on the generic
+# dialect `open` and `close`, which PostgreSQL and MySQL do not reserve. SQL Server reserves `OPEN`
+# and `CLOSE`, so it needs those two quoted whatever this gate does. Quote such a name.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
         "ADD",
@@ -2894,26 +2896,28 @@ def _redacted_copy(
 
 def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
-    with no SQLSTATE is named by its type alone, unless it is the missing-extra error, an
-    ``ImportError`` or a ``UnicodeError`` (BACKLOG #5348).
+    with no SQLSTATE is named by its type alone, unless it is a ``DeliveryError`` (a
+    ``NegativeAckError`` included), the missing-extra error, an ``ImportError`` or a
+    ``UnicodeError`` (BACKLOG #5348).
 
     The poll arm meets connect failures, and a connect error can carry DSN attributes, the server
     and the credentials among them, so the rule :func:`_lookup_connect_failure` states applies here
-    too: ``safe_exc``'s bounded, redacted text is not credential-free. A ``DeliveryError`` gets no
-    exemption, because at least ``_connect`` and ``_probe_db`` build one around
-    :func:`_safe_db_error`'s text, which for such an error is ``safe_exc``'s. The missing-extra
-    error's text is a fixed install hint, and an ``ImportError``'s names the module or shared
-    library that failed to load, which no DSN reaches; ``safe_exc`` renders a ``UnicodeError`` from
-    its codec, position and reason, never its text. What this costs is the text of any other error
-    with no SQLSTATE, the pool-acquire timeout and a bug's message included; the frames still
-    locate it, and their source lines still print. An error with no arguments has no text to
+    too: ``safe_exc``'s bounded, redacted text is not credential-free. A ``DeliveryError`` keeps
+    its text on :func:`_credential_free_cause`'s premise, which is why :func:`_connect` and
+    :func:`_probe_db` no longer quote a no-SQLSTATE error: the pool-acquire timeout and the
+    ``statement_timeout`` refusal keep their remedies. The missing-extra error's text is a fixed
+    install hint, and an ``ImportError``'s names the module or shared library that failed to load,
+    which no DSN reaches; ``safe_exc`` renders a ``UnicodeError`` from its codec, position and
+    reason, never its text. What this costs is the text of any other error with no SQLSTATE, a
+    bug's message included; the frames still locate it, and their source lines still print. An
+    error with no arguments has no text to
     withhold and is named by its type alone. It never raises: a link whose classification raises
     is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
     on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
     try:
         if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
-        if isinstance(exc, (_DriverMissingError, ImportError, UnicodeError)):
+        if isinstance(exc, (DeliveryError, _DriverMissingError, ImportError, UnicodeError)):
             return _safe_db_error(exc)
         if not exc.args:
             return type(exc).__name__
@@ -4087,7 +4091,8 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
-            raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
+            # Type alone, never the text: a connect error can carry DSN attributes (#5348).
+            raise DeliveryError(f"DATABASE connect failed: {_credential_free_detail(exc)}") from exc
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
@@ -4152,7 +4157,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
+            else DeliveryError(f"DATABASE probe failed: {_credential_free_detail(exc)}")
         ) from exc
     finally:
         await _close_and_release(pool, conn, cur, discard=discard)
@@ -4795,7 +4800,9 @@ class DatabaseSource(SourceConnector):
             if self._task is task:
                 self._task = None
                 if fault is not None:
-                    logger.warning("DATABASE source poll task failed: %s", _safe_db_error(fault))
+                    logger.warning(
+                        "DATABASE source poll task failed: %s", _credential_free_cause(fault)
+                    )
         if task is not None and self._task is not None and self._task is not task:
             return  # a later start() made a new poll task, and the pool is now that task's
         try:
@@ -5037,12 +5044,14 @@ class DatabaseSource(SourceConnector):
         except Exception as exc:
             # The handler already ingested the message; a mark failure means the row re-emits next
             # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
-            # _safe_db_error, not safe_exc: a mark is an UPDATE bound from the row's own columns,
-            # so the driver's rejection text quotes the bound value straight back, and safe_exc
-            # is measured to keep a partial copy of it (BACKLOG #1661).
+            # Not safe_exc: a mark is an UPDATE bound from the row's own columns, so the driver's
+            # rejection text quotes the bound value straight back, and safe_exc is measured to
+            # keep a partial copy of it (BACKLOG #1661). Credential-free, not only _safe_db_error:
+            # the mark's borrow can open a connection, and a connect error with no SQLSTATE can
+            # carry DSN attributes (#5348).
             logger.warning(
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
-                _safe_db_error(exc),
+                _credential_free_cause(exc),
             )
         return True
 
@@ -5464,6 +5473,16 @@ def _probe_failure_cause(exc: Exception) -> str:
     """A PHI-free, credential-free cause: the engine's own pool-timeout text, a driver error's
     SQLSTATE and native number, or the type alone. Never a driver message, which can carry DSN
     attributes (the rule :func:`_lookup_connect_failure` states)."""
+    return _credential_free_cause(exc)
+
+
+def _credential_free_cause(exc: BaseException) -> str:
+    """A ``DeliveryError``'s own text, else :func:`_credential_free_detail` (BACKLOG #5348).
+
+    Every ``DeliveryError`` and ``NegativeAckError`` this module builds holds fixed text, a
+    SQLSTATE and native number, a type name or a setting, never a driver message: at least
+    :func:`_connect` and :func:`_probe_db` put :func:`_credential_free_detail` in theirs. One
+    another module raises is printed as it stands, a bound and not a guarantee."""
     return str(exc) if isinstance(exc, DeliveryError) else _credential_free_detail(exc)
 
 

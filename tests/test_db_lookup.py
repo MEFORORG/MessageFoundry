@@ -762,16 +762,24 @@ def test_a_quoted_name_spelled_like_a_new_keyword_is_still_read() -> None:
         "SELECT mrn FROM p OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL'))",
         "SELECT * FROM OPENQUERY(clarity, 'SELECT pat_id FROM patient')",
         "SELECT mrn FROM ext_p OPTION (DISABLE EXTERNALPUSHDOWN)",
-        "SELECT open FROM prices",
-        "SELECT close FROM prices",
+        "SELECT send FROM t",
+        "SELECT move FROM t",
     ],
 )
 def test_the_documented_fail_closed_costs_of_5346_are_refused(stmt: str) -> None:
-    """Pins the costs the keyword-set comment and docs/CONNECTIONS.md name, so a change that admits
-    one of them updates both. Red mutation: drop `USE`, `OPENQUERY`, `DISABLE`, `OPEN` or `CLOSE`;
-    each case holds one refused word, so its case reds."""
+    """Pins some of the costs the keyword-set comment and docs/CONNECTIONS.md name, on the sqlserver
+    preset. Red mutation: drop `USE`, `OPENQUERY`, `DISABLE`, `SEND` or `MOVE`; each case holds
+    one refused word, so its case reds. `send` and `move` are valid unquoted T-SQL names."""
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         database._require_read_only(stmt)
+
+
+@pytest.mark.parametrize("stmt", ["SELECT open FROM prices", "SELECT close FROM prices"])
+def test_open_and_close_names_are_a_generic_dialect_cost(stmt: str) -> None:
+    """SQL Server reserves OPEN and CLOSE, so the cost of refusing them falls on the generic
+    dialect, where PostgreSQL and MySQL take them as names. Red mutation: drop `OPEN` or `CLOSE`."""
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        database._require_read_only(stmt, dialect="generic")
 
 
 _MYSQL_COMMENT_MISSES = [
