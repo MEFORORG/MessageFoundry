@@ -188,7 +188,9 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 #: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
 #: instead of a reason nobody can match on. ``no_file_read_under_install_root``: a file was listed
 #: under the install root, or the read-back of unmatched ``RECORD`` rows ran (see
-#: :func:`_attest_distribution`), and no file's bytes were read (BACKLOG #5376).
+#: :func:`_attest_distribution`), and no file's bytes were read (BACKLOG #5376); a pass with a loaded
+#: package directory linked out of the install root carries
+#: ``package_directory_links_out_of_install_root`` instead.
 #: ``no_attested_file_under_install_root``: neither happened.
 #: ``package_directory_links_out_of_install_root`` is the one value a pass that read files can carry:
 #: a loaded package directory at its ``RECORD`` place is a link out of the install root, so the bytes
@@ -251,16 +253,15 @@ class AttestationResult:
     no_record: bool
     checked: int
     drift: list[DriftEntry] = field(default_factory=list)
-    #: Why this pass verified nothing; ``None`` when it verified at least one file in the install root.
-    #: The single source of truth for :attr:`attested_nothing`'s cause and for
+    #: Why this pass verified nothing, or ``None``; :data:`UnattestedReason` says when each value is
+    #: set. The single source of truth for :attr:`attested_nothing`'s cause and for
     #: :attr:`declared_editable`.
     unattested_reason: UnattestedReason | None = None
 
     @property
     def attested_nothing(self) -> bool:
         """Whether the pass verified **no** file: it compared none against a baseline row, or it
-        carries an ``unattested_reason``, which a pass that read files does only when the bytes it read
-        sit outside the install root (:data:`UnattestedReason`).
+        carries an ``unattested_reason`` (:data:`UnattestedReason`).
 
         Independent of ``drift``: a pass can verify nothing and still report drift, so a caller
         acting on both must handle drift first, as :func:`_act_on` does."""
