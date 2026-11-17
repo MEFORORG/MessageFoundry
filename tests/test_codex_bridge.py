@@ -206,6 +206,14 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ),
         ("& '{py}' -c 'import sys; sys.exit(2)'; $null = Get-Item -LiteralPath 'no-b4'", "block"),
         ("Get-Item -LiteralPath 'no-such-item-b4'", "exit-1"),
+        # Under strict mode, with no native code set, the bridge's own statement must not fault.
+        (
+            "Set-StrictMode -Version Latest; trap {{ exit 2 }}; "
+            "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction SilentlyContinue",
+            "exit-1",
+        ),
+        # A line continuation ending the hook must not swallow the bridge's own statement.
+        ("& '{py}' -c 'import sys; sys.exit(2)' `", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
     ],
     ids=[
@@ -221,6 +229,8 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "stale-2-then-ignored-cmdlet",
         "stale-2-then-assignment",
         "failed-cmdlet",
+        "strict-mode-failed-cmdlet",
+        "trailing-continuation",
         "early-return",
     ],
 )

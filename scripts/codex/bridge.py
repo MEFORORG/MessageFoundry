@@ -201,15 +201,19 @@ def git_bash() -> str | None:
 
 # A command-only PowerShell hook runs under pwsh -Command and blocks by `exit 2`, the way Claude
 # Code's hooks reference blocks a PowerShell hook. That reference does not say which flags Claude
-# Code passes, or how a native exit code propagates. Under -Command, a 2 from a guard script the
-# hook calls or dot-sources, or from a native program, is reported as 1 when it ends the hook, so
-# the line put after the hook exits 2 when the last statement failed with $LASTEXITCODE at 2,
-# whichever command left that 2. The tail goes on its own line so a trailing comment cannot
-# swallow it. The one line put before the hook keeps a native non-zero exit from throwing where a
-# PowerShell build defaults that preference on. A hook that must open with at least param(), a
-# using statement or a named block cannot take that line, and fails on every call with exit 1.
+# Code passes, or how a native exit code propagates. Under -Command, a 2 from a native program or a
+# guard script that the hook's last statement runs is reported as 1, so the tail put after the hook
+# exits 2 when the last statement failed with $LASTEXITCODE at 2, whichever command left that 2,
+# and otherwise exits 1 when it failed, as -Command would. A blank line first ends a trailing
+# comment or line continuation, and Get-Variable keeps strict mode from faulting on an unset code.
+# The one line put before the hook keeps a native non-zero exit from throwing where a PowerShell
+# build defaults that preference on. A hook that must open with at least param(), a using
+# statement or a named block cannot take that line, and fails on every call with exit 1.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
-POWERSHELL_TAIL = "\nif (-not $? -and $LASTEXITCODE -eq 2) { exit 2 }"
+POWERSHELL_TAIL = (
+    "\n\nif (-not $?) { if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly"
+    " -ErrorAction Ignore) -eq 2) { exit 2 }; exit 1 }"
+)
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
