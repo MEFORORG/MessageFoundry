@@ -787,7 +787,8 @@ _PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 #: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
 #: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reads every line as that
 #: reading did: the rewrites above found more, and missed some main caught, three review rounds
-#: running. Do not tighten them: a change here is a change to the floor. The pass runs this module's
+#: running. Do not tighten them, or their linear-time equals below, which read every non-empty line
+#: since ``_PR_BASE_CAP`` is 0: a change to either is a change to the floor. The pass runs this module's
 #: table model, whose loose reading keeps a table's ASVS columns wherever main kept them
 #: (_pr_loose_columns).
 _PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
@@ -892,7 +893,7 @@ def _pr_units(lines: list[str], delete_invisible: bool, reading: _PrReading) -> 
     read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
     (offset, line) marks so a hit can be reported at the line its identifier sits on. ``reading`` is
     one of the three readings: the baseline takes the first `>` run of a line out wherever it sits
-    and reads a link as its text, with the link pattern's linear-time equal on a long line (see
+    and reads a link as its text, with the link pattern's linear-time equal past a cap (see
     ``_PR_BASE_CAP``); the other two take only a leading quote marker out and read the line through
     :func:`_pr_inline`, where a line that held only inline tags is transparent. The units, their
     lines and their kinds are the same with delete_invisible or without it; only the text differs,

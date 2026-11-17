@@ -2670,7 +2670,7 @@ def _fuzz_strings(alphabet: str, count: int, longest: int) -> list[str]:
 
 
 def test_the_linear_link_sub_equals_main_s_pattern(sf) -> None:
-    """The baseline reads a long line with this in place of main's link pattern, so they must agree."""
+    """The baseline reads a line with this in place of main's link pattern, so they must agree."""
     changed = 0
     for text in _fuzz_strings("[]()[]()[]()aa \t \x1c\n", 4000, 40):
         expected = _MAIN_MD_LINK.sub(r"\1", text)
@@ -2680,7 +2680,7 @@ def test_the_linear_link_sub_equals_main_s_pattern(sf) -> None:
 
 
 def test_the_linear_split_equals_main_s_pattern(sf) -> None:
-    """The baseline splits a long paragraph with this in place of main's split pattern."""
+    """The baseline splits a paragraph with this in place of main's split pattern."""
     split = 0
     for text in _fuzz_strings("<>/bB. !?\t \x1cA*`[(\"'#-", 4000, 40):
         expected = [(m.start(), m.end()) for m in _MAIN_SENTENCE_SPLIT.finditer(text)]
