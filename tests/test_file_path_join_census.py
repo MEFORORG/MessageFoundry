@@ -1158,7 +1158,15 @@ IDE_SITES: dict[str, Site] = {
         "those two resolve to. Not guarded: the containment and link checks run on the joined path. "
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
-    "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/sourceControl.ts": Site(
+        10,
+        OPERATOR,
+        _IDE_WORKSPACE
+        + " Three more resolve the repository's top level and its core.hooksPath, both "
+        "read from the operator's own git, only to compare them with the hook's folder. sameDir "
+        "resolves each with realpath, which opens the path (a UNC path opens an SMB connection); "
+        "nothing is read or written at them.",
+    ),
     "ide/src/statusBar.ts": Site(
         5,
         REVIEWED,
@@ -1175,10 +1183,13 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/testBench.ts": Site(1, OPERATOR, "The fixtures setting, under the workspace."),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
-        4,
+        8,
         GUARDED,
-        "The containment check itself: it refuses a workspace setting whose spelling, and then whose "
-        "real path, relative to the workspace climbs out or is absolute.",
+        "The containment checks themselves. resolveInsideWorkspace refuses a setting whose spelling, "
+        "and then whose real path, relative to the workspace climbs out or is absolute. "
+        "containedPathSetting resolves a workspace value only to compare its spelling with the "
+        "folder, and drops it when it is outside. committedRelativePath resolves a value only to "
+        "return it relative to the folder, and refuses one outside it by spelling. None opens a file.",
         "ide/src/workspaceContainment.ts::path.relative(root, target)",
     ),
 }

@@ -100,7 +100,7 @@ export function explainMissingToolkit(res: CliResult): CliResult {
 
 /** The synthetic stderr cli.ts returns, without running anything, in an untrusted workspace. */
 export const UNTRUSTED_WORKSPACE_STDERR =
-  "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace";
+  "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace (in a window with no folder, trust the window: Manage Workspace Trust)";
 
 /**
  * A CLI result that could not become a value. Its `message` is fixed text plus at most a byte count;

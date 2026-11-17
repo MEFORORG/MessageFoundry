@@ -7,6 +7,27 @@
 import * as path from "node:path";
 
 import type { Field, FieldType } from "./securityEditorWebview";
+import type { ContainedPathSetting, PathSettingScopes } from "./workspaceContainment";
+
+/**
+ * The value and scope {@link securityConfigTarget} judges for `messagefoundry.serviceConfig`, from
+ * VS Code's `inspect()` answer and cli.ts's contained reading of it (BACKLOG #5404). A value the
+ * containment dropped is judged as written, in the scope it was written in, so it is refused here as
+ * the editor's own rules refuse it, rather than the editor reading and saving the file used in its
+ * place. An unread scope (`seen` undefined) counts as the workspace's, so no check is skipped.
+ */
+export function securityConfigInput(
+  seen: PathSettingScopes | undefined,
+  setting: ContainedPathSetting,
+): { readonly value: unknown; readonly fromWorkspace: boolean } {
+  if (setting.dropped === "workspace") {
+    return { value: seen?.workspaceValue, fromWorkspace: true };
+  }
+  if (setting.dropped === "user") {
+    return { value: seen?.globalValue, fromWorkspace: false };
+  }
+  return { value: setting.value, fromWorkspace: seen === undefined || setting.source === "workspace" };
+}
 
 /** The service-settings file the editor reads and writes, or why it may not. */
 export type ConfigTarget = { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: string };

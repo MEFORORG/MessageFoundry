@@ -7,7 +7,7 @@
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
 import { mustChangeProblem } from "./engineStatusModel";
-import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
+import { assertBrowsableUrl, assertTargetAllowed, targetRefusalNotice } from "./engineTarget";
 import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
 import { type StepUpHost, withStepUp } from "./stepUp";
 
@@ -50,6 +50,20 @@ function secretKey(url: string): string {
   return SECRET_PREFIX + url.replace(/\/+$/, "");
 }
 
+/**
+ * Refuse `url` when {@link assertTargetAllowed} would not send it credentials or a token (SEC-005),
+ * and SHOW the refusal: returns true when refused. Not a silent predicate, so call it once per
+ * interactive flow, never from a timer. At least signIn, signOut and withAuth (and withStepUpAuth
+ * through it) call it before a password or a bearer leaves.
+ */
+function refuseDisallowedTarget(url: string): boolean {
+  const gate = assertTargetAllowed(url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(targetRefusalNotice(gate.reason));
+  }
+  return !gate.ok;
+}
+
 export async function clearToken(ctx: vscode.ExtensionContext, url: string): Promise<void> {
   await ctx.secrets.delete(secretKey(url));
 }
@@ -89,6 +103,10 @@ async function showConsoleFix(url: string, problem: string, path: string): Promi
  * The local token is cleared in a `finally`: if the engine is unreachable we cannot revoke, but we must
  * still forget it here — refusing to sign out because the engine is down would be worse. The caller is told
  * which of the two happened rather than being given a blanket "signed out".
+ *
+ * The bearer goes out only to a target {@link assertTargetAllowed} passes, the same gate
+ * {@link signIn} applies (BACKLOG #5407). A token cached for a URL the gate now refuses is forgotten
+ * here without being sent, and the caller is told it was not revoked.
  */
 export async function signOut(ctx: vscode.ExtensionContext, url: string): Promise<boolean> {
   const token = await peekToken(ctx, url);
@@ -96,6 +114,9 @@ export async function signOut(ctx: vscode.ExtensionContext, url: string): Promis
     return true; // nothing to revoke
   }
   try {
+    if (refuseDisallowedTarget(url)) {
+      return false; // never sent; the finally still forgets it
+    }
     await postJson<unknown>(url, "/auth/logout", {}, token);
     return true;
   } catch {
@@ -133,9 +154,7 @@ export async function peekToken(
 export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
   // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS
   // refusal — never prompt for or send credentials in clear to a non-loopback host (SEC-005).
-  const gate = assertTargetAllowed(url);
-  if (!gate.ok) {
-    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+  if (refuseDisallowedTarget(url)) {
     return undefined;
   }
   let provider = "local";
@@ -246,12 +265,19 @@ export async function ensureToken(
  * **401** (expired/invalid) clears it and retries once with a fresh sign-in. A 403 (authenticated
  * but lacking the permission) is NOT retried — re-login as the same user wouldn't help — and
  * propagates so the caller can surface it. Returns undefined if the user cancels a sign-in.
+ *
+ * A target {@link assertTargetAllowed} refuses gets no call at all, so a token cached for it is never
+ * sent (BACKLOG #5407): the gate is checked here, before the cache is read, and not only inside
+ * {@link signIn}, which a cached token skips. Returns undefined then, as for a refused sign-in.
  */
 export async function withAuth<T>(
   ctx: vscode.ExtensionContext,
   url: string,
   call: (token: string) => Promise<T>,
 ): Promise<T | undefined> {
+  if (refuseDisallowedTarget(url)) {
+    return undefined;
+  }
   const first = await ensureToken(ctx, url);
   if (first === undefined) {
     return undefined; // sign-in cancelled

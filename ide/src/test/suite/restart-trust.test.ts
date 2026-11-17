@@ -30,8 +30,10 @@ const REMOTE_REFUSAL = `MessageFoundry: ${REMOTE} is a remote engine — the IDE
 
 let stubWorkspace: string | undefined;
 let stubTrusted = true;
-/** The workspace value of `messagefoundry.serviceConfig`, or undefined for a setting left unset. */
+/** The value of `messagefoundry.serviceConfig`, or undefined for a setting left unset. */
 let stubSetting: string | undefined;
+/** The scope `stubSetting` is set in: the user's settings, or the workspace's own. */
+let stubScope: "globalValue" | "workspaceValue" = "globalValue";
 let notices: string[];
 /** The `onDidCloseTerminal` listeners Restart's stop is waiting on. */
 const closeListeners = new Set<(t: unknown) => void>();
@@ -44,18 +46,26 @@ const vscodeStub = {
     get isTrusted(): boolean {
       return stubTrusted;
     },
-    // The setting as a workspace's own settings.json sets it: a workspace value, so it counts as set.
+    // The setting in the scope `stubScope` names; set, either way, it counts as set. The order
+    // tests use the user's scope: a workspace value naming a path outside the folder never reaches
+    // Restart, because cli.ts's containment does not use it (BACKLOG #5404), which the last test
+    // here pins end to end.
     getConfiguration: () => ({
       get: (key: string, fallback: unknown): unknown =>
         key === "serviceConfig" && stubSetting !== undefined ? stubSetting : fallback,
       inspect: (key: string) =>
         key === "serviceConfig"
-          ? { defaultValue: "messagefoundry.toml", workspaceValue: stubSetting }
+          ? { defaultValue: "messagefoundry.toml", [stubScope]: stubSetting }
           : undefined,
     }),
   },
   window: {
     showInformationMessage: (message: string): Promise<undefined> => {
+      notices.push(message);
+      return Promise.resolve(undefined);
+    },
+    showWarningMessage: (): Promise<undefined> => Promise.resolve(undefined),
+    showErrorMessage: (message: string): Promise<undefined> => {
       notices.push(message);
       return Promise.resolve(undefined);
     },
@@ -131,11 +141,13 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     stubWorkspace = ws;
     stubTrusted = true;
     stubSetting = UNC_SETTING;
+    stubScope = "globalValue";
     notices = [];
   });
 
   teardown(() => {
     stubWorkspace = undefined;
+    stubScope = "globalValue";
     closeListeners.clear();
   });
 
@@ -228,6 +240,44 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(notices.length, 1, JSON.stringify(notices));
     assert.match(notices[0], /which is not a file in this workspace/);
     assert.strictEqual(run.stopped, false, "the refusal still comes before the stop");
+    assert.strictEqual(run.started, false);
+  });
+
+  test("a value carrying a markdown command link is never echoed into the refusal", async () => {
+    // A notification renders `[x](command:foo)` as a link; the refusal names the setting instead.
+    stubSetting = "[x](command:foo)";
+    const run = await restart(LOOPBACK);
+
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
+    assert.ok(!notices[0].includes("command:"), notices[0]);
+    // Control: the refusal fired for this value and names the setting.
+    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    assert.strictEqual(run.stopped, false);
+  });
+
+  test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
+    stubWorkspace = undefined;
+    stubScope = "workspaceValue";
+    const run = await restart(LOOPBACK);
+
+    assert.deepStrictEqual(run.statted, []);
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.match(notices[0], /open your engine's project folder first/);
+    assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
+    assert.strictEqual(run.started, false);
+  });
+
+  test("the same value planted in workspace settings is never statted, trusted and local (BACKLOG #5404)", async () => {
+    stubScope = "workspaceValue";
+    const run = await restart(LOOPBACK);
+
+    // The containment drops the value, and a launch refuses rather than start on the default file
+    // used in its place, so nothing is statted at all.
+    assert.deepStrictEqual(run.statted, []);
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.match(notices[0], /messagefoundry\.serviceConfig, set in workspace settings, is not a path inside/);
+    assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
   });
 
