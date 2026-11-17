@@ -109,7 +109,8 @@ _TARGET = ("#", "@", "$", "%", "!")  # field, component, repetition, subcomponen
     ("line", "rewritten"),
     [
         ("BHS|^~\\&|A", "BHS#@$!%#A"),
-        ("BHS|^~\\&#|A", "BHS#@$!%#A"),  # a character past the four is not written, as for MSH
+        ("BHS|^~\\&*|A", "BHS#@$!%*#A"),  # a v2.7 truncation character is kept
+        ("BHS|^~\\&#|A", "BHS#@$!%#A"),  # unless it is a target delimiter
         ("FHS|^~|A", "FHS#@$!%#A"),  # a leading part of the four
     ],
 )
@@ -120,13 +121,25 @@ def test_a_later_header_line_takes_the_target_encoding_characters(
     assert _builtin_hl7.encode_with_separators(parsed, _TARGET).split("\r")[2] == rewritten
 
 
-@pytest.mark.parametrize("line", ["BHS|SYNTHTEXT", "BHS|SYNTHTEXT|A", "BHSX|A|B"])
+@pytest.mark.parametrize(
+    "line", ["BHS|SYNTHTEXT", "BHS|SYNTHTEXT|A", "BHSX|A|B", "BHS|^~\\&EXTRA|B", "BHS|^~\\&#*|B"]
+)
 def test_a_header_line_not_in_the_message_delimiters_is_refused(line: str) -> None:
-    """Rewriting field 2 of these would drop its text, so the rewrite refuses (BACKLOG #5802)."""
+    """Rewriting field 2 of these would drop its text, so a new delimiter set refuses (BACKLOG
+    #5802)."""
     parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
-    for target in (_TARGET, parsed["seps"]):
-        with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="encoding characters"):
-            _builtin_hl7.encode_with_separators(parsed, target)
+    with pytest.raises(_builtin_hl7.DelimiterRewriteRefused, match="would lose text"):
+        _builtin_hl7.encode_with_separators(parsed, _TARGET)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["BHS|SYNTHTEXT", "BHS|", "BHS|^~\\&EXTRA|B", "BHSX|A|B", "MSH|^~\\&#|A", "FHS|^~\\&|A"],
+)
+def test_a_same_set_override_writes_a_header_line_as_it_came(line: str) -> None:
+    """With the target set equal to the message's own, nothing is refused or rewritten."""
+    parsed = _builtin_hl7.parse("\r".join([_MSH, _PID, line]))
+    assert _builtin_hl7.encode_with_separators(parsed, parsed["seps"]).split("\r")[2] == line
 
 
 def test_a_v27_header_with_a_truncation_character_still_rewrites() -> None:

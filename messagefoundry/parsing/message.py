@@ -21,6 +21,7 @@ re-encode.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from datetime import date, datetime, timedelta
@@ -562,12 +563,27 @@ class Message:
         return clone
 
     def __copy__(self) -> Message:
-        # copy.copy shares the tree; without the copy-on-write flag a write would reach both.
-        return self.copy()
+        # copy.copy shares the tree, so both sides take the copy-on-write flag, or a write would
+        # reach both. Built on type(self), so a subclass and its attributes survive.
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        self._shared = new._shared = True
+        return new
 
     def __deepcopy__(self, memo: dict[int, object]) -> Message:
-        # copy.deepcopy would walk a _lazy a reader of a clone may be splitting (BACKLOG #5801).
-        return self.copy()
+        # A deep copy shares nothing and leaves the source's flag alone. The tree goes through
+        # clone(): copy.deepcopy would walk a _lazy a reader of a clone may be splitting (#5801).
+        new = object.__new__(type(self))
+        memo[id(self)] = new
+        for name, value in self.__dict__.items():
+            if name == "_m":
+                value = _builtin_hl7.clone(value)
+            elif name == "_shared":
+                value = False
+            else:
+                value = copy.deepcopy(value, memo)
+            setattr(new, name, value)
+        return new
 
     def _ensure_owned(self) -> None:
         """Copy-on-write hook — every mutator calls this before touching ``self._m``. If the backing tree

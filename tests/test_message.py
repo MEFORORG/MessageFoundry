@@ -676,3 +676,20 @@ def test_the_copy_module_takes_the_copy_on_write_path(copier: Callable[[Message]
     assert pid in tree["_lazy"]  # the shared map was never walked
     assert m["PID-8"] == "F"  # the write did not reach the original
     assert other["PID-8"] == "M"
+
+
+class _TaggedMessage(Message):
+    tag: str
+
+
+def test_a_deep_copy_shares_nothing_and_leaves_the_source_unflagged() -> None:
+    m = _TaggedMessage(Message.parse(ADT)._m)
+    m.tag = "t"
+    deep = copy.deepcopy(m)
+    assert m._shared is False and deep._shared is False
+    assert deep._m is not m._m and deep._m["segments"] is not m._m["segments"]
+    assert type(deep) is _TaggedMessage and deep.tag == "t"
+    m.set("PID-8", "M")  # the source writes in place, with nothing shared
+    assert deep["PID-8"] == "F"
+    shallow = copy.copy(m)
+    assert type(shallow) is _TaggedMessage and m._shared and shallow._shared

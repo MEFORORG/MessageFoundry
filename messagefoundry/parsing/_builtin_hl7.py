@@ -1215,10 +1215,11 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     Where two source separators are the same character, the one split first wins: repetition, then
     component, then subcomponent, the order python-hl7 split them, as the python-hl7 tree walk this
     replaced did (``transports/mllp.py`` ``reencode_delimiters``). The segment id is kept verbatim.
-    Every ``MSH``, ``BHS`` and ``FHS`` header has its field 2 rewritten to the four target
-    encoding characters, so a batch or file header advertises the delimiters its message is
-    written in (BACKLOG #5802); :func:`_header_encoding` says which field 2 it refuses. Blank segment lines
-    are kept.
+    When the target set differs, every ``MSH``, ``BHS`` and ``FHS`` header has its field 2
+    rewritten to the target encoding characters, so a batch or file header advertises the
+    delimiters its message is written in (BACKLOG #5802); :func:`_header_encoding` says which field
+    2 it refuses. When the target set equals the source set, a header's fields 1 and 2 are written
+    as they came. Blank segment lines are kept.
 
     Raises ``ValueError`` when the message's own field, component, repetition and subcomponent
     characters are not four distinct characters. Such a header cannot say which structure a character
@@ -1238,9 +1239,10 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
     table.setdefault(ord(s_esc), t_esc)
     # The same set on both sides changes no leaf, so one translate is exact. Any difference can make
     # a literal character a target delimiter, or give a separator escape's letter a new meaning.
+    same_set = tuple(msg["seps"]) == tuple(target)
     rewrite: Callable[[str], str] = (
         operator.methodcaller("translate", table)
-        if tuple(msg["seps"]) == tuple(target)
+        if same_set
         else _LeafRewrite(table, structure, msg["seps"], target)
     )
     lines: list[str] = []
@@ -1251,6 +1253,10 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
             lines.append(seg["id"])
             continue
         if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
+            if same_set:
+                # Nothing to translate in fields 1 and 2, so the header keeps its own bytes.
+                lines.append(_join_header([*texts[:3], *map(rewrite, texts[3:])], t_field))
+                continue
             # Field 1 is the field separator the join writes, so only field 2 is a part.
             parts = [seg["id"], _header_encoding(texts[1], texts[2], msg["seps"], target)]
             tail = texts[3:]
@@ -1274,18 +1280,25 @@ def _header_encoding(
 ) -> str:
     """Field 2 of a header line rewritten for :func:`encode_with_separators`.
 
-    A field 2 that starts with the source encoding characters, or is a leading part of them or
-    empty, becomes the four target characters; a character after the four (such as the v2.7
-    truncation character) is not written, as before. Any other field 2, or a field 1 that is not
-    the source field separator, would lose its text, so it raises
+    A field 2 that is the source encoding characters, a leading part of them, or empty becomes the
+    four target characters. One character after the four is the v2.7 truncation character: it is
+    kept, or left out where it is a target delimiter, since written there it would become
+    structure. Any longer field 2, or a field 1 that
+    is not the source field separator, holds text the rewrite would lose, so it raises
     :class:`DelimiterRewriteRefused` (BACKLOG #5802)."""
     s_field, s_comp, s_rep, s_sub, s_esc = source
-    _t_field, t_comp, t_rep, t_sub, t_esc = target
+    t_field, t_comp, t_rep, t_sub, t_esc = target
     s_enc = s_comp + s_rep + s_esc + s_sub
-    if field_1 == s_field and (s_enc.startswith(field_2) or field_2.startswith(s_enc)):
-        return t_comp + t_rep + t_esc + t_sub
+    t_enc = t_comp + t_rep + t_esc + t_sub
+    if field_1 == s_field:
+        if s_enc.startswith(field_2):
+            return t_enc
+        truncation = field_2[len(s_enc) :]
+        if field_2.startswith(s_enc) and len(truncation) == 1:
+            return t_enc if truncation in t_field + t_enc else t_enc + truncation
     raise DelimiterRewriteRefused(
-        "a header line's encoding characters are not the message's own, so the rewrite would lose them"
+        "a header line's field separator or encoding characters are not the message's own, "
+        "so the rewrite would lose text"
     )
 
 

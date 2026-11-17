@@ -173,7 +173,7 @@ def test_a_bare_defined_id_in_an_any_segment_message_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "extra",
-    ["DSC|CONT1|F", "MSA|AA|1", "ERR|1"],
+    ["DSC|CONT1|F", "MSA|AA|1", "ERR|1", "QAK|Q1|OK", "MFA|MAD|1|20260101|S^OK"],
     ids=lambda line: line[:3],
 )
 def test_a_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) -> None:
