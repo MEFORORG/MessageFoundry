@@ -649,8 +649,8 @@ async def test_failed_listings_do_not_wipe_the_stuck_memory(
     however many scans meet it the memory is not pruned. Real pathlib, nothing patched:
     ``Path.glob`` returns nothing for a missing directory rather than raising.
 
-    Mutation: drop the ``os.scandir`` probe in ``_candidates``. Red: the reject is forgotten after
-    SETTLE_MISS_LIMIT scans and read again once the directory returns."""
+    Mutation: drop the ``os.scandir`` probe in ``_candidates``. Red: ``_listing_failed`` stays
+    False, which is what lets pruning forget the reject after SETTLE_MISS_LIMIT scans."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     rig.drop("a.hl7", _PDF)
     await rig.scan()

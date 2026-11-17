@@ -578,8 +578,9 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     under ``<module>``.
 
     A helper with no ``event`` parameter, a call to a helper the file does not define, an argument
-    that cannot be placed (a starred argument at or before the slot, or ``event`` through
-    ``**kwargs``), a reference to a helper that is not a direct call, and an INSERT statement that
+    that cannot be placed (a starred argument at or before the slot, ``event`` through
+    ``**kwargs``, or a method helper called through a receiver other than ``self`` or ``cls``,
+    ``super()`` included), a reference to a helper that is not a direct call, and an INSERT statement that
     is not a call's first argument each fail here, because a skipped site is the blind spot this
     guard exists to close.
 

@@ -38,10 +38,10 @@ declared would be missing from both sides of the equality, so the walk fails on 
 can see but not read, such as a kind that is not a string literal, an alias or a
 ``functools.partial``. A new emit site in those shapes fails CI until its kind is added here. Other
 emit sites are invisible to it, at least: an ``_emit_event`` call whose kind is a variable that is
-not a forwarder's own parameter, a lambda that forwards a kind, a ``getattr`` call, a direct
-``on_connection_event`` call, and a module elsewhere. The run-time refusals above are what catch
-those. ``docs/PHI.md`` section 7 row 7 says what each kind
-means and must name every one, which CI also asserts.
+not a forwarder's own parameter, ``_emit_event`` itself reached through a lambda or ``getattr``,
+a direct ``on_connection_event`` call, and a module elsewhere. The run-time refusals above are what
+catch those. ``docs/PHI.md`` section 7 row 7 says what each kind means and must name every one,
+which CI also asserts.
 """
 
 from __future__ import annotations
