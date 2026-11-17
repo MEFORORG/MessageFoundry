@@ -6286,7 +6286,7 @@ def _extract_config_members(
     refused here exactly as it is on the inbound-archive path. The check's Windows-name arms (BACKLOG
     #5369) are passed off here: their static list refuses names, such as ``aux.py``, that a POSIX
     host writes as ordinary files and that not every Windows build rewrites (see
-    :func:`_win_opens_another`), so a config dir the backup bundled could fail to restore. The resolved-path containment test below stays the backstop.
+    :func:`_win_opens_another`), so a config dir the backup bundled could fail to restore.
 
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.

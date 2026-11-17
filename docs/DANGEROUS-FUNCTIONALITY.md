@@ -876,7 +876,8 @@ or compression library:
   as a path: it streams the store member into one fixed file name. The reader accepts only an
   uncompressed tar, and both a member's declared size and the bytes actually read are capped. With
   `--config-to`, the restore writes the archive's config files under their own relative names. Each
-  name must pass the same safe-path check as a zip member, and must resolve inside the destination.
+  name must pass the zip-member safe-path check without its Windows-name arms, and must resolve
+  inside the destination.
   A member-count cap and a total-size cap apply too. An encrypted backup must decrypt with a store
   key, and every block of it must authenticate, so a tampered one fails before anything is
   extracted. With a store key configured, a plaintext backup is refused; one restores only on a
