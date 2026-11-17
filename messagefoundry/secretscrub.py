@@ -1866,8 +1866,8 @@ _QUERY_NOT_CREDENTIAL_TAILS = (
 
 #: Names the HTTP family's no-escape credential refusals count beside the heuristic, as the whole
 #: of any reading :func:`_base_names` gives, ignoring case (``refusal=True``). ``code`` carries an
-#: Azure Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
-#: also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
+#: Azure Functions function key, and an OAuth authorization code. The heuristic leaves it out,
+#: because it also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
 #: warns and reports. A refusal of a hop that already relaxed verification, or that crosses plain
 #: ``http`` off this machine, takes that over-refusal (vault BACKLOG #3533 item 7).
 _QUERY_REFUSAL_NAMES = frozenset({"code"})
@@ -1913,15 +1913,16 @@ def _cut_last_bracket(base: str) -> str:
 
 def _base_names(name: str) -> tuple[str, ...]:
     """Every reading of ``name`` the detector judges: :func:`_base_name`'s, and for a bracket-keyed
-    name two more (BACKLOG #5379). The name is cut at every ``[`` and ``]``, each piece stripped of
-    spaces (``parse_qsl`` decodes ``+`` to one) and empty pieces dropped. Trailing pieces that are
+    name of ``k`` pieces up to ``k`` more (BACKLOG #5379). The name is cut at every ``[`` and
+    ``]``, each piece stripped of spaces (``parse_qsl`` decodes ``+`` to one) and empty pieces
+    dropped. Trailing pieces that are
     indexes (all digits) are dropped, all of them, so ``token[0][0]`` is judged as ``token``. Then
     the first piece is one reading, and each piece joined by ``.`` to the piece before it is
     another. So ``user[password]`` and ``user[password][x]`` are both judged as ``user.password``,
     which ends in the credential word, and ``sort[key]`` as ``sort.key``, which the non-secret
     list still reads as a sort key. A name matches when any reading does, so this only widens what
     :func:`_base_name` alone matched. Linear in ``name``: one split, and each piece is in at most
-    two readings."""
+    two of the readings this adds, beside the :func:`_base_name` one."""
     cleaned = _clean_name(name)
     readings = [_cut_last_bracket(cleaned)]
     if "[" in cleaned or "]" in cleaned:

@@ -36,8 +36,9 @@ What is refused, by default and with no setting to turn it off:
 PBKDF2-HMAC-SHA-256 at 2048 iterations, far under the floor, so a key written either way is refused.
 
 PKCS#12 bundles (``cert import``) get the same rules for their bags, plus a MAC rule: only a PBMAC1
-MAC at the PBKDF2 floor, with a keyLength of its HMAC's output size, passes, because any other MAC
-is keyed by the PKCS#12 KDF, which Appendix C does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
+MAC passes, over PBKDF2 at the floor with a keyLength of its HMAC's output size. A MAC that is not
+PBMAC1 is keyed by the PKCS#12 KDF, which Appendix C does not list; a PBMAC1 MAC off those terms
+is refused too (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not the bags are
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. A key bag inside a PKCS#12 part that is itself encrypted is checked by the same bag rules
 in a SECOND step: the caller decrypts that part with the passphrase and hands it back
@@ -749,7 +750,7 @@ _SHA1: Final = "1.3.14.3.2.26"
 
 #: HMAC schemes a PBMAC1 MAC may use, SHA-2 at 256 bits and up, each with its output length in
 #: octets. The PBKDF2 keyLength that keys it must equal that length (BACKLOG #5377).
-_PBMAC1_SCHEMES: Final = {
+_PBMAC1_SCHEMES: Final[Mapping[str, int]] = {
     "1.2.840.113549.2.9": 32,  # HMAC-SHA-256
     "1.2.840.113549.2.10": 48,  # HMAC-SHA-384
     "1.2.840.113549.2.11": 64,  # HMAC-SHA-512
@@ -824,10 +825,11 @@ def _mac_problem(buf: bytes, mac_data: _Tlv) -> str | None:
         return "has a PBMAC1 MAC over a hash that is not approved (HMAC-SHA-256 or stronger)"
     # RFC 9579 section 5: PBKDF2-params under PBMAC1 MUST carry keyLength, an implementation MUST NOT
     # accept them without it, and the key SHOULD be the HMAC's output size. The length is otherwise
-    # free, so a keyLength of 1 would key the MAC with one octet and a password check against it
-    # would be near free (BACKLOG #5377). Only the HMAC's output size passes: it is what the RFC asks
-    # for and what `openssl pkcs12 -pbmac1_pbkdf2` writes, and it is stricter than section 9's
-    # recommended 20-octet minimum. A longer key is refused too, as a shape nothing here writes.
+    # free, so a keyLength of 1 keys the MAC with one octet: anyone can find that key from the
+    # file's own MAC in at most 256 tries, with no passphrase, and then forge a MAC over changed
+    # content (BACKLOG #5377). Only the HMAC's output size passes: it is what the RFC asks for and
+    # what `openssl pkcs12 -pbmac1_pbkdf2` writes, and it is stricter than section 9's recommended
+    # 20-octet minimum. A longer key is refused too, as a shape nothing here writes.
     if fields.key_length is None:
         return (
             "has a PBMAC1 MAC whose PBKDF2 parameters omit keyLength, which RFC 9579 forbids an "
@@ -982,8 +984,9 @@ def pkcs12_wrap_refusal(
 ) -> str | None:
     """The refusal text for a PKCS#12 bundle, or ``None`` when it may be decrypted.
 
-    Refused: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than PBMAC1, a PBMAC1
-    MAC whose PBKDF2 keyLength is absent or not its HMAC's output size, a PBMAC1
+    Refused, at least: a MAC over MD5 or SHA-1, any MAC keyed by the PKCS#12 KDF rather than
+    PBMAC1, a PBMAC1 MAC over a KDF other than PBKDF2 or an HMAC weaker than SHA-256, a PBMAC1 MAC
+    whose PBKDF2 keyLength is absent or not its HMAC's output size, a PBMAC1
     or PBES2 derivation under the Appendix C floor, the SHA-1 PKCS#12 PBE and PBES1 bag schemes,
     anything this reader cannot walk, an encrypted bundle with no MAC, and an encrypted bundle with
     no passphrase. The MAC rules apply over clear bags too (BACKLOG #1352), and a bundle that

@@ -1358,9 +1358,43 @@ def test_a_pbmac1_mac_with_a_truncated_or_missing_key_length_is_refused(
 def test_pbkdf2_params_out_of_order_or_repeated_are_malformed(fields: tuple[bytes, ...]) -> None:
     # BACKLOG #5377: keyLength decides the PBMAC1 check, so it is read only in RFC 8018's place,
     # once. A last-copy-wins reading would pass [salt, iter, 1, 32] on the 32.
-    block = seq(octets(b"s" * 16), integer(600_000), *fields)
+    def read(*extras: bytes) -> object:
+        block = seq(octets(b"s" * 16), integer(600_000), *extras)
+        return keywrap._pbkdf2_fields(block, keywrap._read_tlv(block, 0, len(block)))
+
+    # Positive control: the same fields in RFC 8018 order, once each, parse.
+    parsed = read(integer(32), seq(oid(PRF["sha256"][0]), tlv(0x05, b"")))
+    assert isinstance(parsed, keywrap._Pbkdf2)
+    assert parsed.key_length == 32 and parsed.prf == PRF["sha256"][0]
     with pytest.raises(keywrap._Malformed):
-        keywrap._pbkdf2_fields(block, keywrap._read_tlv(block, 0, len(block)))
+        read(*fields)
+
+
+@pytest.mark.parametrize(
+    ("key_length", "passes"),
+    [(32, True), (64, False)],
+    ids=["keyed-at-hmac-size", "keyed-at-prf-size"],
+)
+def test_rfc9579_a2_shape_is_judged_by_the_hmac_not_the_prf(
+    material: Material, key_length: int, passes: bool
+) -> None:
+    # BACKLOG #5377, RFC 9579 test vector A.2's shape: PBKDF2 over HMAC-SHA-512, a MAC over
+    # HMAC-SHA-256, keyLength 32. The keyLength rule follows the MAC's HMAC, so 32 passes and the
+    # PRF's own 64 is refused.
+    clear = pkcs12_bundle(material.key, _p12_cert(material.key), b"synthetic-pfx")
+    bundle = with_pbmac1(
+        clear,
+        b"synthetic-pfx",
+        iterations=210_000,
+        prf="sha512",
+        mac="sha256",
+        key_length=key_length,
+    )
+    refusal = _p12_refusal(bundle)
+    if passes:
+        assert refusal is None
+    else:
+        assert refusal is not None and "32 octets" in refusal
 
 
 @pytest.mark.parametrize(("prf", "iterations"), [("sha256", 600_000), ("sha512", 210_000)])

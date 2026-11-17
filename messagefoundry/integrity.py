@@ -185,9 +185,12 @@ _BYTECODE_CACHE_DIR = "__pycache__"
 
 #: Why an attestation pass compared **nothing** (``checked == 0``). Only ``declared_editable`` is a
 #: sanctioned no-op — a dev checkout that has no baseline by design (ADR 0041 AC-12). Every other value
-#: is an install whose tripwire is disarmed, which a fail-closed site refuses to start on (BACKLOG
-#: #1679). A ``Literal`` rather than a bare ``str`` so a typo at a construction site is a type error
-#: instead of a reason nobody can match on. ``console_attestation_raised`` is the web console arm's
+#: but one is an install whose tripwire is disarmed, which a fail-closed site refuses to start on
+#: (BACKLOG #1679). The exception is ``no_file_compared_under_install_root``: the package sits under
+#: the install root and nothing in it was compared, and that pass always carries ``missing`` drift,
+#: so the tripwire fired and the drift is what is acted on (BACKLOG #5376). A ``Literal`` rather
+#: than a bare ``str`` so a typo at a construction site is a type error instead of a reason nobody
+#: can match on. ``console_attestation_raised`` is the web console arm's
 #: alone (BACKLOG #1802): its pass raised, so it compared nothing that can be trusted.
 UnattestedReason = Literal[
     "declared_editable",
