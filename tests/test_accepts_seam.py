@@ -22,6 +22,7 @@ Synthetic HL7 only (fabricated ids/names — no PHI).
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -770,3 +771,222 @@ def test_response_get_accepts_fails_validate(tmp_path: Path) -> None:
         reg.validate()
     assert "run-scoped state" in str(exc.value)
     assert "response_get" in str(exc.value)
+
+
+# --- BACKLOG #5514: an async predicate, and a run-scoped read reached indirectly ---
+
+
+async def _async_accepts(msg: Any) -> bool:
+    return False  # never awaited by the router stage: its coroutine reads as True
+
+
+class _AsyncCallable:
+    async def __call__(self, msg: Any) -> bool:
+        return False
+
+
+class _StateCallable:
+    def __call__(self, msg: Any) -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+
+def _accepts_with(msg: Any, getter: Any) -> bool:
+    # The accessor arrives as an argument, so its name is not in this code object's co_names.
+    return getter("ns", "k", default=None) is not None
+
+
+def _accepts_with_default(msg: Any, getter: Any = state_get) -> bool:
+    return getter("ns", "k", default=None) is not None
+
+
+def _closure_over(getter: Any) -> Any:
+    def pred(msg: Any) -> bool:
+        return getter("OB", default=None) is not None
+
+    return pred
+
+
+def _helper_reads_state(msg: Any) -> bool:
+    return state_get("ns", "k", default=None) is not None
+
+
+def _calls_a_helper(msg: Any) -> bool:
+    return _helper_reads_state(msg)
+
+
+def _inner_def_reads_state(msg: Any) -> bool:
+    def inner() -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+    return inner()
+
+
+def _sync_pred(msg: Any) -> bool:
+    return True
+
+
+class _AsyncAdapter:
+    """A class-based wrapper: update_wrapper sets __wrapped__ on the instance, which must not hide
+    its own __call__ from the walk."""
+
+    def __init__(self, fn: Any) -> None:
+        functools.update_wrapper(self, fn)
+
+    async def __call__(self, msg: Any) -> bool:
+        return False
+
+
+class _StateAdapter:
+    def __init__(self, fn: Any) -> None:
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, msg: Any) -> bool:
+        return state_get("ns", "k", default=None) is not None
+
+
+# A module-level alias that is a partial of the accessor, not the accessor itself.
+_sg = functools.partial(state_get, "ns")
+
+
+def _calls_a_partial_alias(msg: Any) -> bool:
+    return _sg("k", default=None) is not None
+
+
+def _helper_without_a_module() -> Any:
+    """A function made by exec with globals that lack __name__, so its __module__ is None."""
+    namespace: dict[str, Any] = {}
+    exec("def helper(msg):\n    return True\n", namespace)  # noqa: S102 -- a fixed literal
+    helper = namespace["helper"]
+    assert helper.__module__ is None
+    return helper
+
+
+_no_module_helper = _helper_without_a_module()
+
+
+def _calls_a_module_less_helper(msg: Any) -> bool:
+    return bool(_no_module_helper(msg))
+
+
+def _generator_accepts(msg: Any) -> Any:
+    yield False  # a generator object, which also reads as True
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_state_read(key: str) -> bool:
+    return state_get("ns", key, default=None) is not None
+
+
+def _calls_a_cached_helper(msg: Any) -> bool:
+    return _cached_state_read("k")
+
+
+class _Looped:
+    """Callables whose __wrapped__ chain is a cycle; the walk must stop, not hang."""
+
+    __call__ = staticmethod(_sync_pred)
+
+
+_loop_a, _loop_b = _Looped(), _Looped()
+_loop_a.__wrapped__ = _loop_b  # type: ignore[attr-defined]
+_loop_b.__wrapped__ = _loop_a  # type: ignore[attr-defined]
+
+
+class _RaisingClassProbe:
+    enabled = True
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # noqa: PLE0237 -- a lazy proxy's class lookup can raise
+        raise RuntimeError("synthetic: proxy not ready")
+
+
+_PROXY = _RaisingClassProbe()
+
+
+def _reads_a_proxy(msg: Any) -> bool:
+    # ``_PROXY.enabled`` is a (global, attribute) load, which captured_values tests with isinstance.
+    return bool(_PROXY.enabled)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _async_accepts,
+        functools.partial(_async_accepts),
+        _AsyncCallable(),
+        _AsyncAdapter(_sync_pred),
+        _generator_accepts,
+    ],
+    ids=["async_def", "partial_of_async", "async_call_instance", "async_update_wrapper", "gen"],
+)
+def test_an_async_accepts_fails_validate(tmp_path: Path, pred: Any) -> None:
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="is async"):
+        reg.validate()
+
+
+@pytest.mark.parametrize(
+    ("pred", "accessor"),
+    [
+        (functools.partial(_accepts_with, getter=state_get), "state_get"),
+        (functools.partial(state_get, "ns"), "state_get"),
+        (_accepts_with_default, "state_get"),
+        (_closure_over(response_get), "response_get"),
+        (_StateCallable(), "state_get"),
+        (_calls_a_helper, "state_get"),
+        (_inner_def_reads_state, "state_get"),
+        (_StateAdapter(_sync_pred), "state_get"),
+        (_calls_a_partial_alias, "state_get"),
+        (_calls_a_cached_helper, "state_get"),
+    ],
+    ids=[
+        "partial_kw",
+        "partial_of_accessor",
+        "default",
+        "closure",
+        "instance",
+        "helper",
+        "inner",
+        "update_wrapper",
+        "partial_alias",
+        "lru_cache_helper",
+    ],
+)
+def test_an_indirect_run_scoped_read_fails_validate(
+    tmp_path: Path, pred: Any, accessor: str
+) -> None:
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="run-scoped state") as exc:
+        reg.validate()
+    assert accessor in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _is_adt,
+        functools.partial(_accepts_with, getter=lambda *a, **k: None),
+        _closure_over(lambda *a, **k: None),
+        _calls_a_module_less_helper,  # a helper whose __module__ is None must not crash validate
+        _loop_a,  # a __wrapped__ cycle must end the walk, not hang validate
+    ],
+    ids=["plain", "partial_harmless", "closure_harmless", "module_less_helper", "wrapped_cycle"],
+)
+def test_a_pure_indirect_accepts_still_validates(tmp_path: Path, pred: Any) -> None:
+    # The control: the walk must not refuse a predicate that reaches no accessor.
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    reg.validate()
+
+
+def test_a_walk_that_raises_is_a_configuration_problem(tmp_path: Path) -> None:
+    # Author code that runs during the walk (an object's own __class__) and raises is refused as a
+    # WiringError naming the exception type only, never a raw traceback out of validate().
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_a_proxy
+    with pytest.raises(WiringError, match="could not be inspected") as exc:
+        reg.validate()
+    assert "RuntimeError" in str(exc.value)
+    assert "proxy not ready" not in str(exc.value)

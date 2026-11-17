@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import builtins
 import errno
+import functools
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -39,6 +40,7 @@ import importlib.util
 import inspect
 import io
 import ipaddress
+import json
 import logging
 import math
 import ntpath
@@ -57,8 +59,8 @@ from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from signal import SIGINT, default_int_handler, getsignal
-from types import CodeType, MappingProxyType, ModuleType
-from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
+from types import CodeType, FunctionType, MappingProxyType, MethodType, ModuleType
+from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs, cast
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -2168,29 +2170,88 @@ def connector_secret_env_values(
     each with the sealed keyed MAC so a per-Connection connector credential is monitored for rotation
     exactly like the fixed ``MEFOR_*`` classes.
 
-    A setting is included when its key is a **rotatable** credential — recognised by
-    :func:`_is_secret_setting` (so the SOAP ``body_secret_value_<i>`` prefix class is covered, not only
-    the fixed :data:`_SECRET_SETTING_KEYS` names) and not a non-rotatable identifier in
-    :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
-    ref whose key resolves to a **non-empty string** in ``env_values``. Values are returned **transiently**
-    to be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
-    Connections sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
-    ``env()``) credentials are skipped: they carry no stable per-environment identity to fingerprint, and
-    the factories already forbid an inline value for a secret setting."""
+    It reads every declaration :meth:`Registry.settings_carriers` yields: each deployed inbound and
+    outbound connection, ``DatabaseLookup``, ``FhirLookup`` and reference source (BACKLOG #5513), since
+    each opens a hop with its own credential. A ``deployed=False`` connection is skipped, because it
+    is never built and its values are never resolved (ADR 0111 AC-1), so the engine holds no
+    credential of its to track.
+
+    A top-level ``env()`` ref is included when the setting is one of three shapes
+    (:func:`_env_secret_material`):
+
+    * a **rotatable** credential setting, recognised by :func:`_is_secret_setting` (so the SOAP
+      ``body_secret_value_<i>`` prefix class is covered, not only the fixed :data:`_SECRET_SETTING_KEYS`
+      names) and not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS`, whose
+      environment value is a non-empty string, read raw as before;
+    * a ``headers`` reference standing for the whole table, whose table holds a header
+      :func:`_is_secret_header` reads as a credential;
+    * a URL setting (:func:`_is_url_setting`) whose value carries userinfo or a query parameter
+      ``secretscrub`` reads as a credential.
+
+    The last two are resolved as the build resolves them (:func:`_db_setting`, so the reference's
+    ``cast`` runs and a missing key falls back to its ``default=``), and only the credential VALUES
+    are MAC'd, in a fixed encoding, so a renamed header or parameter, a harmless header or a new host
+    is not read as a rotation. Values are returned **transiently** to be MAC'd — never persisted or
+    logged; the map key is the operator-chosen env name, never the value. Settings sharing an env key
+    collapse to one entry (one secret → one rotation clock).
+
+    Inline (non-``env()``) credentials are skipped: they carry no stable per-environment identity to
+    fingerprint. The factories forbid an inline value for a secret setting, but not a literal
+    credential in a ``headers`` table or a ``url`` query, so such a credential gets no rotation clock
+    here; the static-credential inventory lists it (BACKLOG #5510). A header ``env()`` nested inside a
+    table is refused at load (:func:`_reject_envref_headers`), so it never reaches here."""
     out: dict[str, str] = {}
-    # Both connection kinds carry a ``.spec`` (ConnectionSpec); collect specs so the loop is typed to
-    # ConnectionSpec rather than the join of the two connection types.
-    specs: list[ConnectionSpec] = [c.spec for c in registry.inbound.values()]
-    specs += [c.spec for c in registry.outbound.values()]
-    for spec in specs:
-        for name, value in spec.settings.items():
-            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or not _is_secret_setting(name):
+    for _kind, _name, settings, deployed in registry.settings_carriers():
+        if not deployed:
+            continue
+        for name, value in settings.items():
+            if not isinstance(value, EnvRef) or name in _NON_ROTATABLE_SECRET_SETTING_KEYS:
                 continue
-            if isinstance(value, EnvRef):
-                resolved = env_values.get(value.key)
-                if isinstance(resolved, str) and resolved:
-                    out[value.key] = resolved
+            if _is_secret_setting(name):
+                raw = env_values.get(value.key)
+                material = raw if isinstance(raw, str) and raw else None
+            elif name == "headers" or _is_url_setting(name):
+                # Resolved only for these two, so no other setting's cast runs here.
+                material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
+            else:
+                continue
+            if material:
+                out[value.key] = material
     return out
+
+
+def _env_secret_material(name: str, resolved: object) -> str | None:
+    """The credential values a resolved ``headers`` table or URL setting holds, as the string
+    :func:`connector_secret_env_values` hands the rotation watcher, or ``None`` when it holds none.
+    A table counts only as a ``dict``, the one type every connector's header builder sends."""
+    if name == "headers":
+        if not isinstance(resolved, dict):
+            return None
+        held = sorted(
+            str(value) for key, value in resolved.items() if _is_secret_header(str(key), value)
+        )
+        return json.dumps(held) if held else None
+    urls = [resolved] if isinstance(resolved, str) else resolved
+    if not isinstance(urls, (list, tuple)):
+        return None
+    parts = [part for url in urls if isinstance(url, str) and (part := _url_credential_part(url))]
+    return json.dumps(parts) if parts else None
+
+
+def _url_credential_part(url: str) -> list[object] | None:
+    """The userinfo and the credential query parameters' values of ``url``, or ``None`` when it
+    has neither. A value that does not parse holds nothing this can read; the build refuses such a
+    URL."""
+    try:
+        split = urllib.parse.urlsplit(url)
+        pairs = urllib.parse.parse_qsl(split.query, keep_blank_values=True)
+    except ValueError:
+        # Never the value or the parser's text, which can quote it: the setting holds a credential.
+        _logger.debug("rotation watcher: a URL setting does not parse, so it is not fingerprinted")
+        return None
+    userinfo = split.netloc.rpartition("@")[0]
+    query = sorted(value for key, value in pairs if _is_credential_param(key))
+    return [userinfo, query] if userinfo or query else None
 
 
 #: Settings whose value is a URL that may carry `user:password@` userinfo, by name suffix.
@@ -5715,29 +5776,190 @@ HandlerAccepts = Callable[[Payload], bool]
 _ACCEPTS_FORBIDDEN_ACCESSORS = frozenset({"state_get", "response_get"})
 
 
+def _accepts_callees(obj: object) -> list[object]:
+    """What calling ``obj`` runs, one step in: a ``functools.partial``'s function, a bound method's
+    function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
+    function with no ``__wrapped__``.
+
+    Every read is static, as ``reachability._function_of`` reads (``type()``, ``__dict__`` and
+    ``inspect.getattr_static``), so no author ``__class__``, ``__getattr__`` or
+    ``__getattribute__`` runs at load. A class-based wrapper that calls ``functools.update_wrapper``
+    yields both its own ``__call__`` and the function it wraps, since either may run."""
+    kind = type(obj)
+    if issubclass(kind, functools.partial):
+        return [cast("functools.partial[object]", obj).func]
+    if issubclass(kind, MethodType):
+        return [cast("MethodType", obj).__func__]
+    if issubclass(kind, FunctionType):
+        wrapped = cast("FunctionType", obj).__dict__.get("__wrapped__")
+        return [] if wrapped is None else [wrapped]
+    if issubclass(kind, type) or not callable(obj):
+        return []
+    out: list[object] = []
+    call = inspect.getattr_static(kind, "__call__", None)
+    if issubclass(type(call), FunctionType):
+        out.append(call)
+    with suppress(AttributeError):
+        out.append(inspect.getattr_static(obj, "__wrapped__"))
+    return out
+
+
+def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
+    """Every object reachable from ``start`` through ``expand``, each once, depth first."""
+    stack: list[object] = [start]
+    seen: set[int] = set()
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        yield obj
+        stack += expand(obj)
+
+
+def _accepts_is_async(pred: object) -> bool:
+    """Whether ``pred``, or a function it runs through :func:`_accepts_callees`, is a coroutine,
+    async-generator or generator function: calling it returns an object that is always truthy.
+
+    A ``__wrapped__`` counts as code that may run, so a sync wrapper around an async function is
+    refused too, though it might run that function to completion. That errs closed, and the author
+    can drop the ``functools.wraps``."""
+    return any(
+        issubclass(type(obj), FunctionType)
+        and (
+            inspect.iscoroutinefunction(obj)
+            or inspect.isasyncgenfunction(obj)
+            or inspect.isgeneratorfunction(obj)
+        )
+        for obj in _accepts_walk(pred, _accepts_callees)
+    )
+
+
+def _accepts_run_scoped_reads(pred: object) -> set[str]:
+    """The fail-open run-scoped accessors ``pred`` can reach, by name (BACKLOG #5514).
+
+    The walk starts at ``pred`` and follows at least these edges: a ``functools.partial``'s function,
+    arguments and keywords; a bound method's function; a ``__wrapped__``; a callable instance's
+    ``__call__``; and, for a function, what ``reachability.captured_values`` says it reads: its
+    globals, the attributes it reads off a config module, its closure cells and its defaults. Of
+    those it follows an accessor itself, a function, partial, bound method or callable instance,
+    when the function or the instance's class is defined in a loaded config module or in the
+    predicate's own module, and every partial and bound method, whose targets are judged the same
+    way. An accessor counts when a reached object IS ``state_get`` or ``response_get``, so an alias
+    is caught, or when a reached function's code, or code nested in it (a lambda or an inner
+    ``def``), names one, as the earlier one-level check did. A function or instance defined
+    elsewhere that carries a ``__wrapped__`` chain, such as a ``functools.lru_cache`` or a library
+    decorator around a config helper, is judged by the function at the end of the chain
+    (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
+    ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
+    :func:`_check_accepts_predicate` refuses a predicate whose walk raises. It does not see at
+    least: a call through ``getattr`` or another computed name, a function in any other module, an
+    object's other methods, or a value the predicate builds while it runs."""
+    # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
+    # imports this module at its top level.
+    from messagefoundry.config.reachability import (
+        _function_of,
+        _is_config_module,
+        captured_values,
+    )
+    from messagefoundry.config.response import response_get
+    from messagefoundry.config.state import state_get
+
+    accessors = {id(state_get): "state_get", id(response_get): "response_get"}
+    root, steps = pred, {id(pred)}
+    while not issubclass(type(root), FunctionType) and (callees := _accepts_callees(root)):
+        if id(callees[0]) in steps:
+            break  # a __wrapped__ cycle among callables: stop rather than loop
+        root = callees[0]
+        steps.add(id(root))
+    home = root.__module__ if issubclass(type(root), FunctionType) else None
+    if not isinstance(home, str) or home.startswith("messagefoundry."):
+        # A shipped predicate such as message_type_of's: its module's globals are engine code, which
+        # this walk is not for, and following them would walk the engine.
+        home = ""
+
+    def followed(value: object) -> bool:
+        kind = type(value)
+        if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
+            return True
+        if issubclass(kind, type) or not callable(value):
+            return False
+        own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
+        if _is_config_module(own.__module__ if own else kind.__module__, home):
+            return True
+        # A cache or a library decorator around a config helper: judge the function it wraps.
+        inner = _function_of(value)
+        return inner is not None and _is_config_module(inner.__module__, home)
+
+    def expand(obj: object) -> list[object]:
+        if id(obj) in accessors:
+            return []
+        edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
+        if issubclass(type(obj), functools.partial):
+            part = cast("functools.partial[object]", obj)
+            edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
+        if issubclass(type(obj), FunctionType):
+            func = cast("FunctionType", obj)
+            edges += [c.value for c in captured_values(func, home) if followed(c.value)]
+        return edges
+
+    found: set[str] = set()
+    for obj in _accepts_walk(pred, expand):
+        if id(obj) in accessors:
+            found.add(accessors[id(obj)])
+        elif issubclass(type(obj), FunctionType):
+            codes: list[CodeType] = [cast("FunctionType", obj).__code__]
+            while codes:
+                code = codes.pop()
+                codes += [const for const in code.co_consts if isinstance(const, CodeType)]
+                found |= _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
+    return found
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
-    Two static checks, both at load/``check`` time so a broken predicate is a :class:`WiringError`
-    rather than a per-message routing-stage dead-letter storm:
+    Three static checks, all at load/``check`` time so a broken predicate is a :class:`WiringError`
+    rather than a per-message routing-stage dead-letter storm or a filter that passes everything:
 
     * **Non-callable** — ``accepts=True`` (passing the intended default instead of a predicate, a
       plausible typo) would pass the orphan check yet ``pred(msg)`` raises ``TypeError: 'bool' object is
       not callable`` on the FIRST message, dead-lettering every message on that inbound.
-    * **Fail-open run-scoped read** — a predicate whose code names ``state_get``/``response_get`` (ADR
+    * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
+      runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
+      truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
+      an awaitable is not seen.
+    * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
       catches it at runtime; refuse it here (a filter that needs run-scoped state stays in the Handler).
+      :func:`_accepts_run_scoped_reads` says which edges it follows and, at least, which it does not.
     """
     if not callable(pred):
         raise WiringError(
             f"accepts= predicate for handler {hname!r} is not callable ({pred!r}); it must be a "
             "function (msg) -> bool"
         )
-    code = getattr(inspect.unwrap(pred), "__code__", None)
-    if code is None:
-        return  # a callable with no analyzable code object (e.g. a callable instance) — can't inspect
-    named = _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
+    if _accepts_is_async(pred):
+        raise WiringError(
+            f"accepts= predicate for handler {hname!r} is async or a generator; the router stage "
+            "calls it without awaiting or iterating, so the object it returns would read as True "
+            "and accept every message. Make it a plain function (msg) -> bool"
+        )
+    refusal: str | None = None
+    try:
+        named = _accepts_run_scoped_reads(pred)
+    except Exception as exc:  # noqa: BLE001 -- author code ran inside the walk; see below
+        # The walk can run an object's own __class__ (captured_values' isinstance), which is author
+        # code and can raise anything. Fail closed as a configuration problem naming only the
+        # exception type, never its text, rather than crash the load with a raw traceback.
+        refusal = (
+            f"accepts= predicate for handler {hname!r} could not be inspected for run-scoped reads "
+            f"({type(exc).__name__}); keep what it reads to plain functions and values"
+        )
+        named = set()
+    if refusal is not None:
+        raise WiringError(refusal)
     if named:
         raise WiringError(
             f"accepts= predicate for handler {hname!r} reads run-scoped state "

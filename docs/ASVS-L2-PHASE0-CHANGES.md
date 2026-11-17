@@ -660,8 +660,10 @@ value.
 >   (rotation auto-detected, never operator-attested); a cell the engine cannot read keeps its dates;
 >   a value is read only to MAC it, never persisted or logged (dates + one-way MAC only — no PHI). The
 >   per-Connection `env()` credentials are not engine-global env vars, so they are resolved from the **live
->   graph** at start (`wiring.connector_secret_env_values` over every wired Connection's rotatable
->   credential settings — the `_SECRET_SETTING_KEYS` set minus the non-rotatable username identifiers) and
+>   graph** at start (`wiring.connector_secret_env_values` over every deployed Connection, lookup and
+>   reference source: its rotatable credential settings — the `_SECRET_SETTING_KEYS` set minus the
+>   non-rotatable username identifiers — and, since BACKLOG #5513, the credential part of a whole-table
+>   `headers` reference and of a URL setting; its docstring is the source of record) and
 >   passed to `reconcile_rotation_meta` as `extra_values`, riding the identical keyed-MAC mechanism; each is
 >   keyed by its operator-chosen env-value name (shared names collapse to one rotation clock).
 > - **Tracked-since is an age FLOOR.** On upgrade, a pre-existing (possibly year-old) key gets a **fresh**
