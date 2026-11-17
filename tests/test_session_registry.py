@@ -544,6 +544,25 @@ def test_a_callers_now_ages_the_anonymous_records(
     assert got == state
 
 
+def test_a_local_kind_now_ages_a_record_as_the_same_instant_in_utc(config_root: Path) -> None:
+    """A Local-kind -Now was subtracted from UTC times as if it were UTC, so every age moved by the
+    local offset, and on a box ahead of UTC a fresh record aged out. The same instant now ages a
+    record alike in either kind. On 352502253e the two ages differed by the offset (on a box whose
+    offset is not zero)."""
+    started = NOW_MS - 20 * 3600 * 1000
+    _anonymous(config_root, "99018.json", {"startedAt": started, "cwd": "C:\\x"}, age_h=20)
+    got = _strict(
+        f"$rows = @(Get-SessionRecords -ConfigRoot '{config_root}'); $u = [DateTime]::UtcNow; "
+        "$a = @(Get-AnonymousSessionRecords -Records $rows -Now $u); "
+        "$b = @(Get-AnonymousSessionRecords -Records $rows -Now $u.ToLocalTime()); "
+        "'{0:F2}|{1:F2}|{2}' -f $a[0].AgeHours, $b[0].AgeHours, $b[0].Fresh"
+    )
+    utc_age, local_age, fresh = got.split("|")
+    assert abs(float(utc_age) - 20) < 0.1, got
+    assert local_age == utc_age, got
+    assert fresh == "True", got
+
+
 def test_a_vanished_record_file_ages_zero_whatever_its_startedat() -> None:
     """A file gone between the listing and the read is the shape of one being replaced right now,
     so it is fresh even with a two-day-old startedAt."""
@@ -973,6 +992,27 @@ def test_stale_seat_locks_use_the_removal_paths_unbounded_start_skew(
     write_session(config_root, pid=never_live_pid(), session_id=sid)
     locked = tmp_path / "wt-skew"
     assert _stale_seat_locks(config_root, locked, sid, prelude=_SKEW_STUB + "; ") == "0"
+    # A lookup that throws lists no lock either, so the count alone cannot tell the two apart. The
+    # reading names which one it was: LIVE here, UNREADABLE for a throw.
+    assert _seat_lock_state(config_root, sid, _SKEW_STUB + "; ") == "LIVE"
+
+
+def _seat_lock_state(config_root: Path, sid: str, prelude: str) -> str:
+    """The State Get-SeatLockReading gives a seat lock held by ``sid``, after ``prelude``."""
+    return _strict(
+        f". '{AUDIT}'; {prelude}"
+        f"(Get-SeatLockReading -SessionKey '{sid}' -ConfigRoot '{config_root}').State"
+    )
+
+
+def test_a_seat_lock_lookup_that_throws_reads_unreadable_not_live(config_root: Path) -> None:
+    """The negative control for the skew test above: a throwing lookup also lists no lock, and its
+    reading is UNREADABLE, so the LIVE assertion there fails if the stub's lookup threw."""
+    sid = "5491a2a2-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    throw = "function Get-SessionLiveness { throw 'lookup-broke-5491' }; "
+    assert _stale_seat_locks(config_root, config_root / "wt-throw", sid, prelude=throw) == "0"
+    assert _seat_lock_state(config_root, sid, throw) == "UNREADABLE"
 
 
 def test_fleet_uses_the_removal_paths_unbounded_start_skew(tmp_path: Path) -> None:
@@ -998,16 +1038,65 @@ def test_fleet_reads_an_empty_object_seat_record_under_strict_mode(tmp_path: Pat
 def test_fleet_chip_renders_a_seat_record_missing_its_fields_under_strict_mode(
     tmp_path: Path,
 ) -> None:
-    """The -Chip briefing read its seat record's fields bare, so a record lacking asOf, worktree,
-    claims or handoff threw under fleet.ps1's StrictMode Latest and wrote no briefing. A missing
-    field now renders as not declared."""
+    """The -Chip briefing read its seat record's fields bare, so a record lacking asOf, claims or
+    handoff threw under fleet.ps1's StrictMode Latest and wrote no briefing. A missing field now
+    renders as not declared."""
+    rec = {"sessionKey": "5491c0de", "sessionId": "5491c0de-0000", "worktree": str(tmp_path / "w")}
     proc, _ = _fleet(
         tmp_path,
         None,
-        extra_seats={"box-chip": json.dumps({"sessionKey": "5491c0de"})},
+        extra_seats={"box-chip": json.dumps(rec)},
         fleet_args=["-Chip", "-BoxKey", "box-chip", "-SessionKey", "5491c0de"],
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "You are a REPLACEMENT SEAT" in proc.stdout, proc.stdout
     assert "SEAT: NOT DECLARED" in proc.stdout, proc.stdout
     assert "CLAIMS HELD BY THE PREDECESSOR EPISODE: none" in proc.stdout, proc.stdout
+
+
+# respawn.ps1 (in the vault) respawns only rows whose State is one of these.
+_RESPAWNABLE = {"INTERRUPTED", "HANDED", "ORPHANED-STALE"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{}",
+        "null",
+        json.dumps({"sessionKey": "5491c1de", "worktree": "C:\\nowhere"}),
+        json.dumps({"sessionKey": "5491c1de", "sessionId": "5491c1de-0000"}),
+        json.dumps({"sessionKey": "5491c1de", "lifecycle": "handed"}),
+    ],
+    ids=["empty-object", "null", "no-session-id", "no-worktree", "handed-no-fields"],
+)
+def test_fleet_reads_an_incomplete_seat_record_as_possibly_running(
+    tmp_path: Path, text: str
+) -> None:
+    """A seat record that names no session or no worktree cannot be fenced. It read INTERRUPTED
+    (HANDED when it said so), the population respawn.ps1 respawns and -Chip briefs with
+    ``git -C ""``. It now reads POSSIBLY RUNNING and the receipt names it. On 352502253e each case
+    read INTERRUPTED, or HANDED."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-part": text})
+    j = _fleet_json(proc)
+    row = {r["Box"]: r for r in j["rows"]}["box-part"]
+    assert row["State"] == "POSSIBLY RUNNING", row
+    assert row["State"] not in _RESPAWNABLE
+    assert row["Fence"] == "UNREADABLE", row
+    assert j["receipt"]["seatRecordsIncomplete"] == 1, j["receipt"]
+    assert "box-part" in json.dumps(j["receipt"]["stopConditions"]), j["receipt"]
+    # The twin: the complete seat record beside it keeps its own verdict.
+    assert {r["Box"]: r for r in j["rows"]}["box-5491"]["State"] in _RESPAWNABLE
+
+
+def test_fleet_chip_writes_no_briefing_for_an_incomplete_seat_record(tmp_path: Path) -> None:
+    """-Chip briefed a record with no worktree with ``git -C ""``, which runs in whatever directory
+    the replacement seat starts in. It now refuses and names the record."""
+    proc, _ = _fleet(
+        tmp_path,
+        None,
+        extra_seats={"box-chip": json.dumps({"sessionKey": "5491c2de"})},
+        fleet_args=["-Chip", "-BoxKey", "box-chip", "-SessionKey", "5491c2de"],
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "git -C" not in proc.stdout, proc.stdout
+    assert "box-chip" in proc.stderr and "names no session or no worktree" in proc.stderr

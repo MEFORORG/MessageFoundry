@@ -188,8 +188,9 @@ foreach ($row in $sessionRows) {
 }
 
 # Registry records that name no session and are LIVE or fresh (session-registry.ps1,
-# Get-AnonymousSessionRecords). A seat whose worktree holds one reads POSSIBLY RUNNING through its own
-# fence below, because each seat's lookup passes its worktree. One with no readable cwd cannot be
+# Get-AnonymousSessionRecords). A seat whose own lookup would read gone, and whose worktree such a
+# record reaches (Test-AnonymousRecordReaches), reads POSSIBLY RUNNING through its own fence below,
+# because each seat's lookup passes its worktree. One with no readable cwd cannot be
 # placed, and a failed scan cannot be trusted, so either suppresses the roster and exits non-zero:
 # respawn.ps1 stops on a fleet run that prints no JSON.
 $anonymousLive = @()
@@ -431,19 +432,31 @@ $frozenLegacy = @{}
 $rows = @()
 # Seat lookups that threw. Each such seat reads POSSIBLY RUNNING, and the receipt says why.
 $lookupFailures = @()
+# Seat records that name no session or no worktree. Each reads POSSIBLY RUNNING, and the receipt
+# names the file.
+$incompleteRecords = @()
 foreach ($r in $records) {
     $rec = $r.Rec
     # This loop reads seat-record fields through Get-RecordField, which answers `{}` under StrictMode
     # where `.PSObject.Properties.Name` throws (BACKLOG #5491), as the -Chip briefing below does.
     $wt = [string](Get-RecordField $rec 'worktree')
     $sid = [string](Get-RecordField $rec 'sessionId')
+    # A record that names no session or no worktree (`{}`, `null`, or one missing either field) cannot
+    # be fenced, so it reads POSSIBLY RUNNING, never INTERRUPTED, and on this PC its fence reads
+    # UNREADABLE: nothing here can tell its session is gone, and -Chip would brief a replacement into
+    # no checkout.
+    $incomplete = (-not $sid) -or (-not $wt)
 
     # Fence state, positive answers only. There is no heartbeat on this host and registry writes are
     # event-driven, so nothing here can PROVE a session is gone -- only that it is present.
     # The fence is this PC's session registry, so it is never asked about another PC's record.
     $isHere = Test-CoordRecordIsHere $rec
     $fence = if ($isHere) { 'UNKNOWN' } else { 'NOT-CHECKABLE-HERE' }
-    if ($isHere -and $fenceAvailable -and $sid) {
+    if ($incomplete) {
+        if ($isHere) { $fence = 'UNREADABLE' }
+        $incompleteRecords += $r.File
+    }
+    elseif ($isHere -and $fenceAvailable) {
         # The seat's worktree scopes the anonymous-record veto: a fresh record naming no session in
         # THIS worktree may be this seat relaunched, so it reads POSSIBLY RUNNING, never INTERRUPTED,
         # while one in another worktree leaves this seat's own verdict alone.
@@ -482,6 +495,9 @@ foreach ($r in $records) {
 
     $state = switch ($true) {
         { $lifecycle -eq 'closed' }                    { 'CLOSED'; break }
+        # Ahead of HANDED, which respawn.ps1 respawns, and of ON <HOST>, which -Chip still briefs: an
+        # incomplete record names no checkout to brief.
+        { $incomplete }                                { 'POSSIBLY RUNNING'; break }
         { $lifecycle -eq 'handed' }                    { 'HANDED'; break }
         { $superseded }                                { 'SUPERSEDED'; break }
         { -not $isHere }                               { "ON $((Get-CoordRecordHost $rec).ToUpperInvariant())"; break }
@@ -528,7 +544,8 @@ if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root wi
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
 if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- live session(s) in this repo's worktrees match no seat record (the writer is not running there, or the registry record names no session yet), so this roster is INCOMPLETE by that many" }
-if ($lookupFailures.Count -gt 0) { $stops += "seatLookupsFailed=$($lookupFailures.Count) -- the liveness lookup threw for these seat records, which read POSSIBLY RUNNING because the fence could not be evaluated: $($lookupFailures -join '; ')" }
+if ($incompleteRecords.Count -gt 0) { $stops += "seatRecordsIncomplete=$($incompleteRecords.Count) -- these seat records name no session or no worktree, so they cannot be fenced; each reads POSSIBLY RUNNING and -Chip writes no briefing for it: $($incompleteRecords -join '; ')" }
+if ($lookupFailures.Count -gt 0) { $stops +="seatLookupsFailed=$($lookupFailures.Count) -- the liveness lookup threw for these seat records, which read POSSIBLY RUNNING because the fence could not be evaluated: $($lookupFailures -join '; ')" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
@@ -610,6 +627,7 @@ $receipt = [ordered]@{
     fenceAvailable            = $fenceAvailable
     recordsExamined           = $records.Count
     recordsUnreadable         = $unreadableRecords
+    seatRecordsIncomplete     = $incompleteRecords.Count
     liveSessionsInRepo        = $liveInRepo.Count
     liveSessionsWithoutRecord = $liveWithoutRecord.Count
     # Null, not 0, when the scan failed: an unmeasured count must not read as none.
@@ -658,9 +676,16 @@ if ($anonymousReadError -or $anonymousNoCwd.Count -gt 0) {
 if ($Chip) {
     $row = $rows | Where-Object { $_.Box -eq $BoxKey -and $_.SessionKey -eq $SessionKey } | Select-Object -First 1
     if (-not $row) { Write-Error "fleet.ps1: no record for $BoxKey/$SessionKey"; exit 2 }
+    # No briefing, so no `git -C ""` command, for a record that names no session or no worktree.
+    # stderr directly: under this file's 'Stop' preference Write-Error throws, and the exit code
+    # would be 1, not 2.
+    if ($incompleteRecords -contains $row.File) {
+        [Console]::Error.WriteLine("fleet.ps1: no briefing for $BoxKey/$SessionKey -- its seat record names no session or no worktree, so it reads POSSIBLY RUNNING: $($row.File)")
+        exit 2
+    }
     $rec = $row.Rec
-    # Every field is read through Get-RecordField: a seat record missing one, `{}` included, has no
-    # such property, and a bare read throws under this script's StrictMode Latest (BACKLOG #5491).
+    # Every field is read through Get-RecordField: a seat record missing one has no such property,
+    # and a bare read throws under this script's StrictMode Latest (BACKLOG #5491).
     $asOf = Get-RecordField $rec 'asOf'
     $recWt = [string](Get-RecordField $rec 'worktree')
     $tip = Get-RecordField $rec 'tip'

@@ -316,9 +316,11 @@ function Get-AnonymousSessionRecords {
         [int]$StartSkewMinutes = 15,
         # The clock the ages are taken against, so a caller with its own -Now ages these records by
         # the same instant it ages everything else.
-        # Taken as UTC, as box-activity.ps1 takes its own -Now, and never converted.
+        # A Local-kind value is converted to UTC first, so it cannot age a fresh record out by the
+        # local offset. An Unspecified one is taken as UTC, as box-activity.ps1 takes its own -Now.
         [datetime]$Now = [DateTime]::UtcNow
     )
+    if ($Now.Kind -eq [DateTimeKind]::Local) { $Now = $Now.ToUniversalTime() }
     $out = @()
     foreach ($r in @($Records)) {
         if (-not $r.Record -or [string](Get-RecordField $r.Record 'sessionId')) { continue }
