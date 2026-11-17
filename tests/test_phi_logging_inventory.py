@@ -602,7 +602,8 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     :func:`_string_values`, so a literal, a module
     constant such as ``VIEWED_EVENT``, and a local variable assigned only literals (the
     routed/unrouted mapping, for one) are all read. A write at module or class level counts too,
-    under ``<module>``.
+    under ``<module>``. Inside a helper's own ``def``, only a string literal it passes another
+    helper as ``event`` is read.
 
     A helper with no ``event`` parameter, a call to a helper the file does not define, an argument
     that cannot be placed (a starred argument at or before the slot, ``event`` through
@@ -733,6 +734,28 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
             unread.append(scope.name if not isinstance(scope, ast.Module) else "<module>")
         else:
             kinds |= got
+    # A helper's body is not a write site, so a kind it forwards is not read above; a string literal
+    # it hands another helper is still written, so read that, as the literal-only scan did.
+    for helper in helpers.values():
+        for node in ast.walk(helper):
+            if not (isinstance(node, ast.Call) and (name := callee_name(node)) in _EVENT_HELPERS):
+                continue
+            assert name in helpers, (
+                f"a call to {name}, which this source does not define; re-aim the scan"
+            )
+            through = node.func.value if isinstance(node.func, ast.Attribute) else None
+            if receivers[name] and not (
+                isinstance(through, ast.Name) and through.id in {"self", "cls"}
+            ):
+                unplaced.append(ast.unparse(node))
+                continue
+            try:
+                arg = argument_for(node, helpers[name], "event", receiver=receivers[name])
+            except ArgumentUnplaced:
+                unplaced.append(ast.unparse(node))
+                continue
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                kinds.add(arg.value)
     assert not unplaced, f"event writes whose `event` argument the scan cannot place: {unplaced}"
     assert not stray, (
         f"INSERT INTO message_events text not executed as a call's first argument, at lines "
@@ -877,6 +900,15 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
         },
         ["loop_kind"] * 4 + ["record_message_event"],
     )
+    # One helper handing another a literal kind writes it; the kind it forwards is not a site.
+    forwarding = (
+        "class S:\n"
+        "    async def _event(self, conn, message_id, event, destination, detail, now): ...\n"
+        "    def _event_stmt(self, message_id, event, destination, detail, now):\n"
+        "        self._event(None, message_id, 'helper_kind', destination, detail, now)\n"
+        "        return self._event(None, message_id, event, destination, detail, now)\n"
+    )
+    assert _event_kinds(forwarding) == ({"helper_kind"}, [])
     with pytest.raises(AssertionError, match="no `event` parameter"):
         _event_kinds("def _event(self, conn, message_id, kind): ...\n")
     with pytest.raises(AssertionError, match="does not define"):

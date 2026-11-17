@@ -143,11 +143,7 @@ class _Archived(NamedTuple):
     lasting: bool  # it stays for a reason judged not to clear by itself (:func:`_lasting`)
 
 
-# Failures that may clear by themselves (BACKLOG #5717): :func:`_lasting` reads a failed move that hit
-# one as not lasting. At least: another process holds the file open or locked, the file vanished, the
-# disk or quota is full, or a share timed out or dropped. :func:`_lasting` holds the full rule; at
-# least access denied, a read-only volume and a link are taken as lasting. What each judgment means
-# for a stuck reject's retry is the back-off rule stated at ``STUCK_RETRY_SECONDS``.
+# :func:`_lasting` decides; what each answer means is the rule at ``STUCK_RETRY_SECONDS``.
 _TRANSIENT_ERRNOS = frozenset(
     getattr(errno, name)
     for name in (

@@ -9,7 +9,7 @@ healthy drops behind them. Under ``move`` and ``delete`` a reject that stays is 
 path and mark and skipped unread and uncharged until it changes, and examined again in full in a
 retry pass after the other candidates once its retry falls due, by the back-off rule stated at
 ``file.STUCK_RETRY_SECONDS``. A due retry takes the
-settle gate first, so it is read a scan after it falls due. ``leave`` is unchanged.
+settle gate first. ``leave`` is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """

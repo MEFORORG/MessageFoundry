@@ -5003,9 +5003,8 @@ to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717)
 narrowed, not closed. The source remembers such a file and skips it unread and uncharged until its
 size, modification time or file identity changes, or its retry falls due. Retries run in a separate
 pass after the scan's other files, a bounded number per scan outside `poll_max_files` that the
-ceiling's log line does not count. A due retry is judged afresh, so a file that now
-passes is ingested. At least a restart of the connection and a full memory leave such a file read
-and charged again. When a retry falls due is the back-off rule
+ceiling's log line does not count. A remembered reject is judged afresh, so a file that now
+passes is ingested. When a retry falls due is the back-off rule
 stated once at `STUCK_RETRY_SECONDS` in
 [`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
 `Sftp(...)`/`Ftp(...)`, the gap stands as described.
