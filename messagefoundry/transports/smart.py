@@ -181,9 +181,9 @@ def _read_token_reply(
         # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
         # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
         # where no Digest handler runs; the build refuses a Digest proxy there (ADR 0095 B.1, the
-        # rule in rest.digest_proxy_meets_the_token_connect). Kept so a refusal that did arrive would still be this fault rather than escape
-        # the DeliveryError contract as a ValueError. Fixed text: the peer's algorithm token stays
-        # on the cause only.
+        # rule in rest.digest_proxy_meets_the_token_connect). Kept so a refusal that did arrive
+        # would still be this fault rather than escape the DeliveryError contract as a ValueError.
+        # Fixed text: the peer's algorithm token stays on the cause only.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as

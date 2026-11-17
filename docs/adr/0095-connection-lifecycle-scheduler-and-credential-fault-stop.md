@@ -393,13 +393,15 @@ are a route to the token host that crosses no authenticating proxy, or `proxy_au
 password. A per-host bypass is such a route only where no environment or system proxy then
 carries the request.
 A `CONNECT` 407 on a token hop with no Digest set up, a rejected pre-emptive Basic credential
-among them, still reads as unreachable and retries, which keeps the Basic case above. So each
-retry sends the rejected Basic credential to the proxy again, on a token hop or a delivery hop, and
-a proxy that locks an account after failed logins could lock it (BACKLOG #2989 item 12). Telling
-that 407 apart from other `CONNECT` refusals would need the override of `http.client`'s private
-tunnel code that item 11 removed. Any other `CONNECT` status retries too. The case needed a loopback `http://` destination, since proxy Digest
-is refused for an `https://` one and a bearer for an off-box `http://` one. For the same reason
-the delivery hops need no change: a delivery hop that sends a `CONNECT` has no Digest set up.
+among them, still reads as unreachable and retries, which keeps the Basic case above. Any other
+`CONNECT` status retries too. The Digest case needed a loopback `http://` destination, since proxy
+Digest is refused for an `https://` one and a bearer for an off-box `http://` one. For the same
+reason the delivery hops need no change: a delivery hop that sends a `CONNECT` has no Digest set up.
+A delivery hop's `CONNECT` 407 retries the same way. So where the proxy is set up for Basic, each
+retry of a `CONNECT` that met a 407, on a token hop or a delivery hop, sends the rejected Basic
+credential to the proxy again, and a proxy that locks an account after failed logins could lock it
+(BACKLOG #2989 item 12). Telling that 407 apart from other `CONNECT` refusals would need the
+override of `http.client`'s private tunnel code that item 11 removed.
 
 **A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
 nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or
