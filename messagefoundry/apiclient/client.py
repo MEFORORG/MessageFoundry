@@ -388,8 +388,9 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
     This has to run before the host checks because they are keyed on the HOST, and a URL like
     ``javascript:``, ``data:``, ``file:`` or an OS protocol handler (``ms-msdt:``) has no host at
     all, so the former empty-host early return waved it through. That made the check before
-    BACKLOG #1107 a host-keyed deny-list for plaintext http rather than a protocol allow-list, and the two schemes the ASVS verb names by name were exactly the two that
-    passed. A positive allow-list is the shape that fixes it: a deny-list of known-bad schemes
+    BACKLOG #1107 a host-keyed deny-list for plaintext http rather than a protocol allow-list,
+    and the two schemes the ASVS verb names by name were exactly the two that passed. A positive
+    allow-list is the shape that fixes it: a deny-list of known-bad schemes
     cannot cover the OS protocol handlers a given Windows install happens to register.
 
     A base URL with no scheme at all fails here too (``httpx.URL("127.0.0.1:8765")`` yields scheme
