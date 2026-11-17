@@ -2712,7 +2712,8 @@ _LIMIT_SHAPES = [
 
 def _assert_linear(scan, make, units: int) -> None:
     """Quartering the body must cut the scan's time by about four. A quadratic scan cuts it by about
-    sixteen, so the bound of eight fails it whatever the runner's speed; the ceiling is a backstop."""
+    sixteen, so the bound of eight fails it on a runner of any steady speed. Load that changes between
+    the two timings skews the ratio, which only cancels a uniform slowdown. The ceiling is a backstop."""
     full = _best_time(scan, make(units))
     quarter = _best_time(scan, make(units // 4))
     assert full < 8 * quarter, (
