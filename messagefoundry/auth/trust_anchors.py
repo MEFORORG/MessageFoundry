@@ -238,19 +238,15 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     finding on unchanged bytes, the fix is the one its message names. The refusal's own rows
     travel the hop like any other row.
 
-    **A settings check runs the anchor checks, then the store open's content checks.** It checks
-    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it
-    cannot read. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and one byte
-    more (``AnchorSpec.max_bytes``), and judges only those bytes: the fingerprint and every
-    content check below. It refuses a private-key label in them with a ``pem_refused`` row
-    (BACKLOG #3745). Where the store open would refuse them for anything else, their content,
-    their size or the pin's validity period (:func:`_server_pin_warning`), it **warns with an
-    audited row and does not refuse**: a WARNING and a ``pin_content_warning`` row whose
-    ``reason`` is the warning. A repeat with unchanged fingerprint and outcome writes no further
-    ``pem_refused`` or ``pin_content_warning`` row for it (:data:`_STORE_CONTENT_RECORDED`). The
-    store open refuses as before. At ``warn`` the
-    start logs the pin's ACL or path warning once: the preflight skips one the store open just
-    logged (:data:`_WARNED_AT_OPEN`).
+    **The rule at a settings check, such as a reload.** It reads the whole pin file. A private-key
+    PEM label refuses, with a ``pem_refused`` row (BACKLOG #3745). Other content problems the
+    store open would refuse, the pin's size and validity period included
+    (:func:`_server_pin_warning`), **warn and do not refuse**: a WARNING and a
+    ``pin_content_warning`` row whose ``reason`` is the warning. Each of those rows is written once per fingerprint
+    and outcome in each engine process (:data:`_STORE_CONTENT_RECORDED`). ACL, path and unreadable
+    findings behave as for every anchor (items 1, 3 and 4; the spec has no pin). The store open
+    refuses as before. At ``warn`` the start logs the pin's ACL or path warning once: the
+    preflight skips one the store open just logged (:data:`_WARNED_AT_OPEN`).
 
     **The PostgreSQL ``ssl_root_cert``** (vault BACKLOG #4203) is a CA bundle the store loads by
     path at each new connection. :func:`collect_anchor_specs` adds it under the label
@@ -258,7 +254,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     audited checks of items 1 to 4 and the private-key refusal at start and at every real reload
     (a dry-run reload runs no settings preflight), with no pin. It reads at most its own cap,
     :data:`POSTGRES_CA_MAX_BYTES` (16 MiB, not the pin's), and one byte more, and refuses a
-    longer file, with a ``pem_refused`` row, written once per content and outcome as for the
+    longer file, with a ``pem_refused`` row, written once per fingerprint and outcome as for the
     pin. Unlike the SQL Server pin, the store runs none of these checks when it opens. At a
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
@@ -309,6 +305,7 @@ import shlex
 import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
+import sys
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -464,22 +461,20 @@ class AnchorSpec:
     :func:`anchor_cadata` already.
 
     ``server_pin`` gives a ``False`` spec the SQL Server pin's content checks, the ones the store
-    runs at open; module item 11 says which of them warn and which refuse. A ``True`` spec never
-    reaches those checks, so the two together are refused at construction, and so is
-    ``server_pin`` with ``refuses_encryption_header``.
+    runs at open; module item 11 says which of them warn and which refuse. A server pin reads the
+    whole file, so its private-key refusal, its size and its fingerprint cover every byte.
 
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
-    many bytes and one more. The settings preflight's content checks
-    (:func:`_refuse_by_path_content`) judge a file longer than ``max_bytes`` without reading it
-    whole: a server pin warns about it, and any other spec refuses it (module item 11 says which
-    rows). :func:`enforced_anchor`, :func:`enforce_anchor` and :func:`anchor_refusal` run no content
-    check, so they pass a longer file: the bytes and fingerprint they judge stop at that bound,
-    with no mark that the file was longer. A caller that needs the length judged does it itself,
-    as the store open's pin check does on :func:`enforced_anchor`'s ``data``. A server pin's own
-    check judges the length against :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES`, so a
-    ``server_pin`` spec must set ``max_bytes`` to exactly that cap, and any other value is refused
-    at construction. The fingerprint of a longer file covers only the bytes read. ``None``, the
-    default, reads the whole file, and is refused for a server pin; any value below 1 is refused."""
+    many bytes and one more, and the settings preflight's content checks
+    (:func:`_refuse_by_path_content`) refuse a longer file. :func:`enforced_anchor`,
+    :func:`enforce_anchor` and :func:`anchor_refusal` run no content check, so they pass a longer
+    file, and the bytes and fingerprint they judge stop at that bound. ``None``, the default,
+    reads the whole file.
+
+    Refused at construction, in this order: a ``max_bytes`` below 1; ``server_pin`` with
+    ``loads_verified_bytes`` True, whose checks would never run; ``server_pin`` with a
+    ``max_bytes``; ``max_bytes`` with ``loads_verified_bytes`` True; and ``server_pin`` with
+    ``refuses_encryption_header``."""
 
     label: str
     setting: str
@@ -496,13 +491,8 @@ class AnchorSpec:
             raise ValueError("max_bytes must be at least 1, or None for an unbounded read")
         if self.server_pin and self.loads_verified_bytes:
             raise ValueError("server_pin needs loads_verified_bytes=False, or its checks never run")
-        if self.server_pin:
-            from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
-
-            if self.max_bytes != PIN_FILE_MAX_BYTES:
-                raise ValueError(
-                    f"server_pin needs max_bytes={PIN_FILE_MAX_BYTES}, the store open's own cap"
-                )
+        if self.server_pin and self.max_bytes is not None:
+            raise ValueError("server_pin reads the whole file, so it takes no max_bytes")
         if self.max_bytes is not None and self.loads_verified_bytes:
             raise ValueError("max_bytes needs loads_verified_bytes=False, or its check never runs")
         if self.server_pin and self.refuses_encryption_header:
@@ -714,8 +704,8 @@ def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
 def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> str | None:
     """The content checks of an anchor its hop reads by path (``loads_verified_bytes`` False):
     the encryption-header refusal when ``spec`` asks for it (module item 12), then the private-key
-    refusal (BACKLOG #3745), in the order the DATABASE build runs them. Any spec but a server pin
-    refuses a file longer than ``spec.max_bytes`` first. A server pin (``spec.server_pin``) takes
+    refusal (BACKLOG #3745), in the order the DATABASE build runs them. A spec with ``max_bytes``
+    refuses a longer file first. A server pin (``spec.server_pin``) takes
     the private-key refusal, then the store open's checks, which warn (:func:`_server_pin_warning`,
     module item 11). The refusal names the setting and the path, never the content. The return
     value is a server pin's warning, or ``None``."""
@@ -1350,11 +1340,15 @@ def evaluate_anchor(spec: AnchorSpec) -> AnchorVerdict:
     what was hashed rather than open the file again (BACKLOG #1142, slice 2). It reads only a
     regular file (:func:`_read_regular_file`), so a pipe never makes the check wait. A spec with
     ``max_bytes`` set is read to at most that many bytes and one more (vault BACKLOG #3714,
-    #4203), so the content checks can judge a longer file without reading it whole."""
-    if spec.max_bytes is None:
-        data = _read_regular_file(spec.path)
-    else:
+    #4203), so the content checks can judge a longer file without reading it whole. A server pin
+    is read to the size its open file reports and one byte more (:func:`read_if_regular`), not to
+    a cap, so its private-key refusal, its fingerprint and its oversize judge the whole file."""
+    if spec.max_bytes is not None:
         data = _read_regular_file(spec.path, spec.max_bytes + 1)
+    elif spec.server_pin:
+        data = _read_regular_file(spec.path, sys.maxsize)  # lowered to the file's size plus one
+    else:
+        data = _read_regular_file(spec.path)
     fingerprint = anchor_digest_hex(ANCHOR_DIGEST, data)
     pin_ok: bool | None = None
     if spec.pin is not None:
@@ -2368,15 +2362,12 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
     path = store.sqlserver_pin_path()
     if path is None:
         return None
-    from messagefoundry.pki import PIN_FILE_MAX_BYTES  # lazy: pki loads cryptography
-
     return AnchorSpec(
         "store_sqlserver_pin",
         "[store].ssl_root_cert",
         path,
         loads_verified_bytes=False,
         server_pin=True,  # the store open's checks, the encryption header among them
-        max_bytes=PIN_FILE_MAX_BYTES,  # the store open's cap (vault BACKLOG #3714)
     )
 
 
@@ -2748,7 +2739,7 @@ async def _preflight_checks(
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     if pin_warning is not None:
         log.warning("trust anchor %r: %s", spec.label, pin_warning)
-    # A store anchor's content row is written once per content and outcome (module item 11).
+    # A store anchor's content row is written once per fingerprint and outcome (module item 11).
     outcome = pin_warning if shape_error is None else str(shape_error)
     memo_key = (spec.label, spec.path)
     memo = None if outcome is None else (verdict.fingerprint, outcome)

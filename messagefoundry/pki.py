@@ -1464,9 +1464,9 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 
 
 #: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
-#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte, and so do
-#: the pin's trust-anchor checks (``AnchorSpec.max_bytes``). The store open refuses a longer file,
-#: judged on the size on disk, then on the bytes those checks read. A settings check warns about
+#: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte. The pin's
+#: trust-anchor checks read the whole file. The store open refuses a longer file, judged on the
+#: size on disk, then on the bytes those checks read. A settings check warns about
 #: one instead (``messagefoundry.auth.trust_anchors`` module item 11). At least the expiry monitor
 #: and ``cert inventory`` read the file with no cap.
 PIN_FILE_MAX_BYTES = 1 << 20

@@ -68,7 +68,6 @@ def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
     # raising=False: the negative controls run this file against a head without the memo.
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
-    monkeypatch.setattr(ta, "_VALIDITY_WARNED", {}, raising=False)
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -3551,12 +3550,12 @@ def test_a_store_pin_validity_warning_names_what_the_store_open_refuses(
     assert "the engine refuses" not in warning
 
 
-async def test_an_oversized_store_pin_warns_with_its_row_from_a_bounded_read(
+async def test_an_oversized_store_pin_warns_with_its_row_from_a_whole_read(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Vault BACKLOG #3714: a pin file larger than ``PIN_FILE_MAX_BYTES`` is judged after a read of
-    at most that many bytes and one more, and warns in the store open's words with a
-    ``pin_content_warning`` row. Red under: the read left unbounded."""
+    """Vault BACKLOG #3714, round 1 finding 1: a pin file larger than ``PIN_FILE_MAX_BYTES`` is
+    read whole, its oversize judged on the whole file's length, and warns in the store open's
+    words with a ``pin_content_warning`` row. Red under: the read capped at the pin's limit."""
     from messagefoundry import pki
 
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
@@ -3575,12 +3574,64 @@ async def test_an_oversized_store_pin_warns_with_its_row_from_a_bounded_read(
 
     monkeypatch.setattr(ta, "read_if_regular", counting)
     assert await run_anchor_preflight(specs, store, enforcing=True)
-    assert reads == [pki.PIN_FILE_MAX_BYTES + 1]  # bounded, not the whole file
+    assert reads == [pin.stat().st_size]  # the whole file, not the pin's cap
     (row,) = _warning_rows(await _rows(store, "store_sqlserver_pin"))
     assert row["reason"].startswith(
         f"[store].ssl_root_cert {str(pin)!r} is not a usable SQL Server pin: it is larger than "
         f"{pki.PIN_FILE_MAX_BYTES} bytes"
     )
+
+
+def _padded_pin(tmp_path: Path) -> tuple[Path, list[AnchorSpec]]:
+    """A real pin and its specs, then more than ``PIN_FILE_MAX_BYTES`` of comment text appended,
+    so what follows the padding lies past the cap. Load refuses an oversized pin, so the specs are
+    built first: the file grows after the start."""
+    from messagefoundry import pki
+
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    pin.write_bytes(pin.read_bytes() + b"#" * pki.PIN_FILE_MAX_BYTES + b"\n")
+    return pin, specs
+
+
+@pytest.mark.parametrize("label", ["PRIVATE" + " KEY", "ENCRYPTED PRIVATE" + " KEY"])
+async def test_a_private_key_past_the_pin_cap_refuses_the_store_pin(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """Round 1 finding 1: the SQL Server pin's private-key scan reads the whole file, as main did,
+    so a key block past ``PIN_FILE_MAX_BYTES`` refuses with its ``pem_refused`` row. Red on
+    8fa101c637, whose read stopped at the cap, so the key went unseen and the pin only warned.
+    The control: the same padding with no key warns about the size and does not refuse."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin, specs = _padded_pin(tmp_path)
+    assert await run_anchor_preflight(specs, store, enforcing=True)  # the control
+    pin.write_bytes(pin.read_bytes() + _marked_key_block(label))
+    with pytest.raises(TrustAnchorError) as err:
+        await run_anchor_preflight(specs, store, enforcing=True)
+    text = str(err.value)
+    assert ta.PRIVATE_KEY_SCOPE in text and "[store].ssl_root_cert" in text
+    assert _KEY_BODY_MARKER not in text
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert "pem_refused" in events
+
+
+async def test_a_store_pin_swap_past_the_pin_cap_writes_changed(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 finding 2: the SQL Server pin's change fingerprint covers the whole file, as on
+    main, so a content swap that touches only bytes past ``PIN_FILE_MAX_BYTES`` writes
+    ``changed``. Red on 8fa101c637, whose fingerprint covered only the first cap and one byte, so
+    the swap wrote no row."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin, specs = _padded_pin(tmp_path)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    data = pin.read_bytes()
+    pin.write_bytes(data[:-2] + b"%\n")  # the last bytes only, far past the cap
+    await run_anchor_preflight(specs, store, enforcing=True)
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert "changed" in events, events
 
 
 async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(
@@ -3751,7 +3802,6 @@ def test_a_server_pin_spec_must_be_read_by_path() -> None:
             "[store].ssl_root_cert",
             "pin.pem",
             server_pin=True,
-            max_bytes=PIN_FILE_MAX_BYTES,
         )
     with pytest.raises(ValueError, match="refuses_encryption_header"):
         AnchorSpec(
@@ -3761,22 +3811,17 @@ def test_a_server_pin_spec_must_be_read_by_path() -> None:
             loads_verified_bytes=False,
             server_pin=True,
             refuses_encryption_header=True,
-            max_bytes=PIN_FILE_MAX_BYTES,
         )
-    assert AnchorSpec(
-        "x", "y", "z", loads_verified_bytes=False, server_pin=True, max_bytes=PIN_FILE_MAX_BYTES
-    ).server_pin
+    assert AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True).server_pin
 
 
-@pytest.mark.parametrize("max_bytes", [None, 1024, PIN_FILE_MAX_BYTES + 1, -2, 0])
-def test_a_server_pin_spec_takes_exactly_the_pin_cap(max_bytes: int | None) -> None:
-    """Review round-b56972e6b4 finding 1: the bound a server pin's read takes is enforced, not
-    left to prose. A ``server_pin`` spec with any ``max_bytes`` but
-    :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` is refused at construction: ``None`` would read
-    the whole file, a smaller bound would warn about a pin the store open takes, and a larger one
-    would read more than the store open does. Red under: the ``server_pin`` cap check dropped
-    from ``AnchorSpec.__post_init__``."""
-    with pytest.raises(ValueError, match="max_bytes"):
+@pytest.mark.parametrize("max_bytes", [1024, PIN_FILE_MAX_BYTES, PIN_FILE_MAX_BYTES + 1])
+def test_a_server_pin_spec_takes_no_read_bound(max_bytes: int) -> None:
+    """Round 1 finding 1: a server pin reads the whole file, as main did, so its private-key
+    refusal and its fingerprint cover every byte. A ``server_pin`` spec with any ``max_bytes`` is
+    refused at construction. Red under: the ``server_pin`` bound check dropped from
+    ``AnchorSpec.__post_init__``."""
+    with pytest.raises(ValueError, match="takes no max_bytes"):
         AnchorSpec("x", "y", "z", loads_verified_bytes=False, server_pin=True, max_bytes=max_bytes)
 
 
