@@ -74,19 +74,19 @@ the merged result was printed. **A future guard that must block when it fails se
 launcher with no decision, or a bridge fault, such as a payload with no session
 id, never blocks.
 
-The bridge differs from Claude Code in at least three ways. It runs an event's
+The bridge differs from Claude Code in at least four ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
 the remaining hooks, and the bridge exits 10 on every event, which `invoke.ps1`
 turns into 2, including events where Claude Code only shows the hook's stderr.
 Hook chains have a 90-second outer limit, so the timeouts of a long chain add up
-against it.
+against it. On Windows, a command-only hook with no `shell` runs under pwsh,
+where Claude Code runs it under Git Bash when Git Bash is installed.
 
 Command-only hooks use the shell they name. With none, they use pwsh on Windows
 and bash elsewhere.
-Structured `command` and `args` avoid shell parsing. A command-only PowerShell
-hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
-PowerShell hook with an explicit `exit 2`. The bridge runs it under
-`pwsh -Command` and appends this fixed tail after it, on new lines:
+Structured `command` and `args` avoid shell parsing. The bridge runs a
+command-only PowerShell hook under `pwsh -Command` and appends this fixed tail
+after it, on new lines:
 
 ```powershell
 ;
@@ -98,11 +98,15 @@ The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
 blocks. **A hook that must block should end with an explicit `exit 2`, and not
 be written as named blocks (below).** Shapes
 that end on an error, or with a stale exit code, are decided by the tail and are
-not listed here.
+not listed here. A hook that opens with `[CmdletBinding()]` does not receive the
+payload through `$input`.
 
-A hook written as named blocks (`begin`, `process`, `end`) fails to parse with
-the tail after it, so it exits 1 on every call, and under
-`"onFailure": "block"` it blocks every call.
+A command-only PowerShell hook written as named blocks, at least `begin`,
+`process`, `end`, `clean` and `dynamicparam`, cannot block by its own `exit 2`
+under the bridge: it fails to parse with the tail after it, so it exits 1 on
+every call, and under `"onFailure": "block"` it blocks every call. Such a hook
+must use the `-File` exec form instead, a `command` of `pwsh` with `args` that
+name the script after `-File`.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

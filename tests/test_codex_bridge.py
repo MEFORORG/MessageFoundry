@@ -236,8 +236,8 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
         # A hook may open with param(), [CmdletBinding()], #Requires or using, as a script can,
-        # and its exit 2 blocks. Named blocks cannot be followed by the tail, so they fail to
-        # parse.
+        # and its exit 2 blocks; a [CmdletBinding()] hook does not receive the payload through
+        # $input. Named blocks cannot be followed by the tail, so they fail to parse.
         ("param()\nexit 2", "block"),
         (
             "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
