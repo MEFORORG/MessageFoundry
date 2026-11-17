@@ -744,9 +744,10 @@ def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[s
 
 def _separators(seps: Seps, field_sep: str) -> str:
     """The field, component, repetition and subcomponent separators the message declares: the
-    characters a reading with invisible characters dropped keeps, so two fields or components
-    never join into one shape or token, even when a separator is itself invisible, such as a TAB
-    field separator (BACKLOG #5654)."""
+    characters the token scan, the cut-shape check and :func:`_shape_forms`'s as-written reading
+    keep when they drop invisible characters, so a TAB field separator does not join two fields
+    there (BACKLOG #5654). A decoded part's readings (:func:`.surrogates.decoded_readings`) do not
+    keep them."""
     return field_sep + seps.component + seps.repetition + seps.subcomponent
 
 

@@ -446,10 +446,10 @@ def test_a_folded_digit_in_an_escape_body_reads_as_a_site_code(
 @pytest.mark.parametrize(
     "part",
     [
-        "X\\971234٣\\Y",  # an Arabic-Indic digit after the code
-        "X\\971234５\\Y",  # a fullwidth digit after the code
-        "X\\５971234\\Y",  # a fullwidth digit before it
-        "X\\Z971234٣\\Y",
+        "X\\971234\u0663\\Y",  # an Arabic-Indic digit after the code
+        "X\\971234\uff15\\Y",  # a fullwidth digit after the code
+        "X\\\uff15971234\\Y",  # a fullwidth digit before it
+        "X\\Z971234\u0663\\Y",
     ],
     ids=["arabic-indic-tail", "fullwidth-tail", "fullwidth-lead", "z-arabic-indic-tail"],
 )
@@ -472,7 +472,9 @@ def _header(sep: str, encoding: str = "^~\\&") -> str:
 
 @_NO_SCANNER
 @_LEAKS
-@pytest.mark.parametrize("sep", ["\t", "\x1f", "­"], ids=["tab", "unit-separator", "soft-hyphen"])
+@pytest.mark.parametrize(
+    "sep", ["\t", "\x1f", "\u00ad"], ids=["tab", "unit-separator", "soft-hyphen"]
+)
 def test_an_invisible_field_separator_keeps_two_fields_apart(
     leak: ModuleType, sep: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -482,7 +484,7 @@ def test_an_invisible_field_separator_keeps_two_fields_apart(
     head = _header(sep)
     with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
         assert leak.leak_report(f"{head}\rZPD{sep}1{sep}zqsynth{sep}partner").hits == []
-        within = leak.leak_report(f"{head}\rZPD{sep}1{sep}zqsynth​partner").hits
+        within = leak.leak_report(f"{head}\rZPD{sep}1{sep}zqsynth\u200bpartner").hits
         assert "synthetic partner" in within
 
 

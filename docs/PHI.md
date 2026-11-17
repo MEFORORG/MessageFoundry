@@ -2583,10 +2583,10 @@ component at a time, and counts a cut only where two fields meet (BACKLOG #5533 
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
 decoded a component at a time. Both also take each decoding with `\H\` and `\N\` dropped, and
 every reading with invisible characters removed, the token scan line by line (BACKLOG #5654).
-The shape detectors, the cut-shape check and the token scan keep the field, component,
-repetition and subcomponent separators the message declares when they remove invisible
-characters, so two fields or components never join, even under an invisible separator such as a
-TAB field separator. The escape
+The token scan, the cut-shape check and the shape detectors' reading of a value as written keep
+the field, component, repetition and subcomponent separators the message declares when they
+remove invisible characters, so a TAB field separator does not join two fields there. A shape
+detector's reading of a decoded part does not keep them. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
