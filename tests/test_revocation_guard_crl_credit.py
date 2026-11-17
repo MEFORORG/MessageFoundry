@@ -99,15 +99,16 @@ def test_capture_reads_the_rule(relaxed: bool, verifies: bool, credited: bool) -
         (False, True, None),
         (True, True, EXPIRY_RELAXED_WAYS_ACROSS),
         (False, False, UNVERIFIED_WAYS_ACROSS),
-        (True, False, UNVERIFIED_WAYS_ACROSS),
+        (True, False, EXPIRY_RELAXED_WAYS_ACROSS),
     ],
 )
 def test_capture_offers_no_crl_where_none_is_credited(
     relaxed: bool, verifies: bool, remedy: str | None
 ) -> None:
     """A hop whose context verifies no peer is not told a CRL would admit it (vault BACKLOG
-    #4912). The non-verifying arms are red when capture keeps the connection-shaped default,
-    which offers ``[tls].crl_file``. A remedy the caller passes is kept."""
+    #4912). The unrelaxed non-verifying arm is red when capture keeps the connection-shaped
+    default, which offers ``[tls].crl_file``; a relaxed hop keeps its own remedy. A remedy the
+    caller passes is kept."""
     ctx = _context(crl=False, relaxed=relaxed, verifies=verifies)
 
     def capture(ways_across: str | None = None) -> RevocationHopGuard:

@@ -1067,13 +1067,12 @@ EXPIRY_RELAXED_WAYS_ACROSS = (
 )
 
 #: The remedy :meth:`RevocationHopGuard.capture` names by default on a hop whose context verifies
-#: no peer (``CERT_NONE``). :func:`crl_credited` credits no CRL there, so the connection-shaped
+#: no peer (``CERT_NONE``) and that :attr:`RevocationHopGuard.expiry_relaxed` does not mark. :func:`crl_credited` credits no CRL there, so the connection-shaped
 #: default, which offers ``[tls].crl_file``, would name a lever that cannot work (vault BACKLOG
 #: #4912).
 UNVERIFIED_WAYS_ACROSS = (
     "This hop's TLS context verifies no peer certificate, so a CRL cannot admit it. Make the hop "
-    "verify its peer before relying on a [tls].crl_file, or set tls_revocation_attested=true with "
-    "a tls_revocation_attested_reason on this connection."
+    "verify its peer certificate."
 )
 
 
@@ -2825,9 +2824,9 @@ class RevocationHopGuard:
     #: ``[tls].crl_file`` and the ``[alerts]`` pair; the alert webhook's guard,
     #: ``alert_sinks._refuse_webhook_revocation``, passes one naming its ``[alerts]`` pair only.
     #: The field is not always what the caller passed: :meth:`capture` fills a ``None`` with
-    #: :data:`UNVERIFIED_WAYS_ACROSS` on a context that verifies no peer (vault BACKLOG #4912), or
-    #: else with :data:`EXPIRY_RELAXED_WAYS_ACROSS` on a hop that :attr:`expiry_relaxed` marks
-    #: (vault BACKLOG #5089 and #5086).
+    #: :data:`EXPIRY_RELAXED_WAYS_ACROSS` on a hop that :attr:`expiry_relaxed` marks (vault BACKLOG
+    #: #5089 and #5086), or else with :data:`UNVERIFIED_WAYS_ACROSS` on a context that verifies no
+    #: peer (vault BACKLOG #4912).
     ways_across: str | None = None
     #: The connection's ``tls_revocation_attested_reason`` (ADR 0173), recorded in the audit line
     #: :meth:`enforce_construction` logs when ``attested`` suppresses a would-be refusal. ``None`` for
@@ -2892,9 +2891,10 @@ class RevocationHopGuard:
         does not offer the CRL it has just refused to credit. A ``ways_across`` the caller passes is
         used as given, so it can still name a CRL whose credit was dropped; nothing here refuses
         that. That text names a connection's flags, so a hop that is not a connection and hands over
-        such a context must pass its own sentence (BACKLOG #1498). On a context that verifies no
-        peer, an omitted ``ways_across`` becomes :data:`UNVERIFIED_WAYS_ACROSS` first, since
-        :func:`crl_credited` credits no CRL there either (vault BACKLOG #4912).
+        such a context must pass its own sentence (BACKLOG #1498). On a hop that is not relaxed
+        and whose context verifies no peer, an omitted ``ways_across`` becomes
+        :data:`UNVERIFIED_WAYS_ACROSS`, since :func:`crl_credited` credits no CRL there either
+        (vault BACKLOG #4912).
 
         The flag can only take credit away, never grant it: on a context that skips the check, the
         CRL earns nothing with or without the flag (vault BACKLOG #5086, which closes the no-flag
@@ -2906,7 +2906,12 @@ class RevocationHopGuard:
         reads call shapes by name, not what the code evaluates to, so some such call sites pass
         it; ADR 0173 §4.3's note of 2026-11-04 says what it reads."""
         expiry_relaxed = expiry_relaxed or (context is not None and skips_validity_period(context))
-        if ways_across is None and context is not None and context.verify_mode == ssl.CERT_NONE:
+        if (
+            ways_across is None
+            and not expiry_relaxed
+            and context is not None
+            and context.verify_mode == ssl.CERT_NONE
+        ):
             ways_across = UNVERIFIED_WAYS_ACROSS
         return cls(
             host=host,
