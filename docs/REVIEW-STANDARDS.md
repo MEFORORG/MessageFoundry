@@ -22,14 +22,16 @@ way only*.
 migration whose only purpose is to protect a running site. Prefer the simple end state. Source:
 [CLAUDE.md](../CLAUDE.md) section 0, consequence 2.
 
-**R4. Review security prose for what a reader would do with it, and repair any prose by cutting.**
-Apply SDS-3.1 to SDS-3.10 to any added or changed security sentence -- at least unapproved alignment
+**R4. Review security prose for what a reader would do with it; repair prose by cutting.** Apply
+SDS-3.1 to SDS-3.10 to any added or changed security sentence -- at least unapproved alignment
 wording, a "NIST certified" or unbacked claim, a restated fact, a closed enumeration, a control on a
 false premise, an adjacent instrument, an unanchored surface list, or a record cleared past its
-capacity. Fix a false or overstated sentence in any prose by deleting it, shrinking it or linking to
-its one statement (SDS-3.5); add qualifiers or cases only where it is needed and cannot shrink. Flag
-a restated or inessential sentence for deletion, not for qualifying. A prose-repair round should end
-with net fewer prose lines, and its report states that count. Source: [Secure_Development_Standards.md](Secure_Development_Standards.md), *A note on claims and wording*. Cite the SDS identifier instead of copying the rule.
+capacity. Flag a false, overstated, restated or inessential sentence in added or changed prose, and
+fix it by deleting it, rewriting it true and no longer, or linking to its one statement (SDS-3.5).
+Add caveats or cases only where another rule requires them or the claim cannot shrink. A prose
+repair round should leave fewer prose lines; the Builder reports the net change. Source:
+[Secure_Development_Standards.md](Secure_Development_Standards.md), *A note on claims and wording*.
+Cite the SDS identifier instead of copying the rule.
 
 ## PHI
 
@@ -131,9 +133,7 @@ logic authoring beyond Steps view, Serial/ASTM connectivity, per-key message ord
 scoring ([CLAUDE.md](../CLAUDE.md) section 12); ad-hoc or hallucinated dependencies ([CLAUDE.md](../CLAUDE.md) section 7);
 and unallocated `#N` citations ([CLAUDE.md](../CLAUDE.md) section 5).
 
-## Enforced on CI -- do not duplicate these exact slices
-
-At least these run on CI unless noted. Review everything outside the exact slice each row names.
+## Enforced on CI, at least -- review everything outside each exact slice
 
 | Check | Exact slice enforced |
 |---|---|
