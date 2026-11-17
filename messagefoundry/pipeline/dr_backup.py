@@ -433,7 +433,10 @@ class _HashingReader:
 
     def read(self, size: int = -1) -> bytes:
         data = self._raw.read(size)
-        self.digest.update(data)
+        # A None read (a non-blocking source with nothing ready) passes through unhashed, so the
+        # codec's own refusal reports it rather than a TypeError from the digest.
+        if data is not None:
+            self.digest.update(data)
         return data
 
 
