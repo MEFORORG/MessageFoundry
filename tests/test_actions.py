@@ -245,6 +245,10 @@ def test_copy_field_refuses_a_component_of_a_delimiter_field() -> None:
     with pytest.raises(ValueError, match="delimiters"):
         copy_field(m, "PID-5", "MSH-2.1")
     with pytest.raises(ValueError, match="delimiters"):
+        copy_field(m, "PID-5.1", "MSH-2.1")
+    with pytest.raises(ValueError, match="delimiters"):
+        split_field(m, "PID-5.1", "-", ["MSH-1.1"])
+    with pytest.raises(ValueError, match="delimiters"):
         append_to_field(m, "MSH-2.1", "X")
     assert m.encode().startswith("MSH|^~\\&|")
 
@@ -311,6 +315,13 @@ def test_append_to_field_does_not_let_an_unclosed_escape_pair_with_the_suffix() 
     m = Message.parse(MSH_ONLY + "PID|1||1||doe\\\r")
     append_to_field(m, "PID-5.1", "&x")
     assert m["PID-5.1"] == "doe\\&x"
+
+
+def test_append_to_field_with_an_empty_suffix_changes_nothing() -> None:
+    m = Message.parse(MSH_ONLY + "PID|1||1||doe\\^Y\r")
+    before = m.encode()
+    append_to_field(m, "PID-5.1", "")
+    assert m.encode() == before
 
 
 def test_append_to_field_whole_field_appends_structure() -> None:
@@ -823,11 +834,12 @@ def test_date_diff_field_any_second_repetition_raises_on_either_path(start: str,
     assert m["ZTS-3"] is None
 
 
+@pytest.mark.parametrize("start", ["20260101~", "20260101~^", "20260101~~^&"])
 @pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
-def test_date_diff_field_ignores_a_trailing_empty_repetition(path: str) -> None:
+def test_date_diff_field_ignores_a_trailing_empty_repetition(start: str, path: str) -> None:
     # A trailing empty repetition holds nothing, as a trailing empty component does. NEGATIVE
     # CONTROL: on the unfixed code the whole-field path raised ValueError.
-    m = _two_stamps("20260101~", "20260104")
+    m = _two_stamps(start, "20260104")
     date_diff_field(m, path, "ZTS-2", "ZTS-3", unit="days")
     assert m["ZTS-3"] == "3"
 

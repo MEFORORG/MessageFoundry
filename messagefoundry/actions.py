@@ -67,20 +67,23 @@ def _writer(msg: Message, src: str) -> Callable[[str, str], None]:
     goes into a whole-field destination through :meth:`Message.set`, as the structure it already
     is. A component write would escape it, escape sequences included, a second time (BACKLOG
     #5821), so a component or subcomponent destination gets it as one leaf's raw text instead, its
-    escapes kept as sent and its separators written as data, spliced into the field."""
-    if parse_path(src)[2] is not None:
-        return msg.set_data
+    escapes kept as sent and its separators written as data, spliced into the field. Either way, a
+    component or subcomponent of field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is refused."""
+    from_leaf = parse_path(src)[2] is not None
 
-    def write(dst: str, raw: str) -> None:
+    def write(dst: str, value: str) -> None:
         seg, fld, comp, sub = parse_path(dst)
-        if comp is None:
-            msg.set(dst, raw)
-            return
-        _refuse_delimiter_field(seg, fld, dst)
-        seps = _seps(msg)
-        whole = f"{seg}-{fld}"
-        leaf = _as_one_leaf(raw, seps)
-        msg.set(whole, _splice_part(msg.field(whole) or "", comp, sub, leaf, seps))
+        if comp is not None:
+            _refuse_delimiter_field(seg, fld, dst)
+        if from_leaf:
+            msg.set_data(dst, value)
+        elif comp is None:
+            msg.set(dst, value)
+        else:
+            seps = _seps(msg)
+            whole = _whole_field(dst)
+            leaf = _as_one_leaf(value, seps)
+            msg.set(whole, _splice_part(msg.field(whole) or "", comp, sub, leaf, seps))
 
     return write
 
@@ -95,7 +98,8 @@ def copy_field(msg: Message, src: str, dst: str) -> None:
     ``dst``. Into a component or subcomponent ``dst`` its escape sequences are kept as sent and its
     separators are written as escaped ones, so it reads back from ``dst`` as a read decodes the
     whole field: a field sent as ``O\\S\\Brien`` reads back as ``O^Brien``, not as its escape
-    sequence. That write raises :class:`ValueError` on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``."""
+    sequence. A component or subcomponent ``dst`` in field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``
+    raises :class:`ValueError`, whatever ``src`` is."""
     _writer(msg, src)(dst, msg.field(src) or "")
 
 
@@ -117,6 +121,8 @@ def append_to_field(msg: Message, path: str, suffix: str) -> None:
     if comp is not None:
         _refuse_delimiter_field(seg, fld, path)
     current = msg.field(path)
+    if current is not None and not suffix:
+        return
     if current is None or comp is None:
         msg.set(path, (current or "") + suffix)
         return
@@ -367,7 +373,8 @@ def date_diff_field(
     :class:`ValueError` when component 2 holds anything but a degree-of-precision code no finer than
     its time, or a later component is not empty (``20260101^S`` and a range ``20260101^20260201``
     both raise); trailing empty components are ignored. Once both fields are present, either path
-    raises when its field holds more than one repetition, ignoring trailing empty ones, so
+    raises when its field holds more than one repetition, ignoring trailing ones that hold nothing
+    but component or subcomponent separators, so
     ``~20270101`` and ``20260101~~20270101`` raise and ``20260101~`` reads as ``20260101``: a
     timestamp field holds one value.
 
@@ -394,12 +401,14 @@ def date_diff_field(
         raise ValueError(
             f"date_diff_field unit must be 'days', 'years', 'hours', or 'minutes', got {unit!r}"
         )
-    fields = [_whole_field(start_path), _whole_field(end_path)]
-    if msg.field(fields[0]) is None or msg.field(fields[1]) is None:
+    fields = {path: msg.repetitions(_whole_field(path)) for path in (start_path, end_path)}
+    if not all(fields.values()):
         return
-    for field in fields:
-        if len(_rstrip_none(msg.repetitions(field))) > 1:
-            raise ValueError(f"date_diff_field: {field} repeats; a timestamp field holds one value")
+    for path, reps in fields.items():
+        if _held_repetitions(reps, _seps(msg)) > 1:
+            raise ValueError(
+                f"date_diff_field: {_whole_field(path)} repeats; a timestamp field holds one value"
+            )
     start_raw = _timestamp_value(msg, start_path)
     end_raw = _timestamp_value(msg, end_path)
     if not start_raw or not end_raw:
@@ -456,10 +465,13 @@ def _whole_field(path: str) -> str:
     return f"{seg}-{fld}"
 
 
-def _rstrip_none(reps: list[str | None]) -> list[str | None]:
-    while reps and reps[-1] is None:
-        reps = reps[:-1]
-    return reps
+def _held_repetitions(reps: list[str | None], seps: _Seps) -> int:
+    """How many repetitions count, ignoring trailing ones that hold nothing but separators."""
+    empty = seps[1] + seps[3]
+    count = len(reps)
+    while count and not (reps[count - 1] or "").strip(empty):
+        count -= 1
+    return count
 
 
 def _timestamp_value(msg: Message, path: str) -> str | None:
@@ -595,12 +607,12 @@ _Unit = tuple[str, str, Literal["lit", "esc", "open"]]
 
 
 def _seps(msg: Message) -> _Seps:
-    """The separators a :meth:`Message.field` component read uses, so an edit splits and decodes a
-    value as a read of it does (BACKLOG #5928). That read splits repetitions on ``MSH-2``'s
-    repetition character and then splits and decodes the repetition with the first header line's
-    other separators, which are a ``BHS`` or ``FHS`` header's in a batch."""
-    field_sep, comp_sep, _rep, sub_sep, esc = _builtin_hl7.separators(msg._m)
-    return field_sep, comp_sep, msg._encoding_chars()[2], sub_sep, esc
+    """The separators a :meth:`Message.field` read decodes a value with: the first header line's,
+    which are a ``BHS`` or ``FHS`` header's in a batch, so an edit decodes a value as a read of it
+    does (BACKLOG #5928). :meth:`Message.set` and the repetition split of a read still use
+    ``MSH-2``'s, so a batch whose header's encoding characters differ from ``MSH-2``'s is still read
+    and written with two sets."""
+    return _builtin_hl7.separators(msg._m)
 
 
 def _refuse_delimiter_field(seg: str, fld: int, path: str) -> None:
