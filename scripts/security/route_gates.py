@@ -554,8 +554,8 @@ def _app_beneath(route: Mount | Host, at: str) -> Any:
     while not isinstance(app, Starlette | Router) and id(app) not in seen:
         if len(seen) >= _MAX_MIDDLEWARE_LAYERS:
             raise ValueError(
-                f"the app under {at!r} sits beneath more than {_MAX_MIDDLEWARE_LAYERS} objects "
-                "that are neither a Starlette app nor a router, so the route walk cannot reach it"
+                f"under {at!r} the route walk passed {_MAX_MIDDLEWARE_LAYERS} objects that are "
+                "neither a Starlette app nor a router and found another, so it stops there"
             )
         seen[id(app)] = app
         inner = getattr(app, "app", None)

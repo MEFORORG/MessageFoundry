@@ -1060,7 +1060,7 @@ class _EndlessWrapper:
 def test_a_mount_wrapped_without_end_is_refused_rather_than_unwrapped_forever() -> None:
     app = FastAPI(openapi_url=None)
     app.mount("/stub", _EndlessWrapper())  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match=f"under '/stub' sits beneath more than {_CAP} objects"):
+    with pytest.raises(ValueError, match=f"under '/stub' the route walk passed {_CAP} objects"):
         list(route_gates._effective_routes(app))
 
 
@@ -1100,7 +1100,7 @@ def test_the_cap_counts_a_plain_asgi_leaf_as_one_object(layers: int, refused: bo
     app = FastAPI(openapi_url=None)
     app.mount("/w", wrapped)
     if refused:
-        with pytest.raises(ValueError, match="objects that are neither"):
+        with pytest.raises(ValueError, match=f"passed {_CAP} objects .* and found another"):
             list(route_gates._effective_routes(app))
     else:
         assert [type(s) for _r, s in route_gates._effective_routes(app)] == [Mount]
