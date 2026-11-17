@@ -286,8 +286,8 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     proxy credential, before it judges that credential's hop, only for the REST and FHIR outbounds
     (its ``builds_token_hop``), after that function's own Digest refusal for an ``https`` ``url``.
     So this refusal can fire only where the outbound's own ``url`` is not ``https`` and its token
-    URL names a host. A token URL that names no host passes here, and the provider refuses it when
-    it is built, naming its setting. One that names a host is checked first by the provider
+    URL names a host. A token URL that names no host passes here and is refused later in the build,
+    naming its setting. One that names a host is checked first by the provider
     constructor's own ``_check_token_url``, so a URL that check refuses is refused for itself.
     Where this refusal fires, it comes before any record of the proxy credential crossing. The
     rule is
@@ -309,7 +309,7 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     except ValueError:  # not quoted: a URL can carry userinfo
         names_a_host = False
     if not names_a_host:
-        return  # the provider's own checks refuse it, naming its setting (BACKLOG #2989)
+        return  # refused later in the build, naming its setting (BACKLOG #2989)
     provider._check_token_url(token_url, connection=connection)
     if digest_proxy_meets_the_token_connect(token_url, s.get("proxy_no_proxy")):
         raise provider.digest_proxy_refusal(connection)
