@@ -386,84 +386,43 @@ def test_split_keeps_the_whitespace_terminator_of_a_malformed_interchange_cut_at
     assert _frames_of((bad + good).encode(), 4096) == [bad.encode(), good.encode()]
 
 
-# Segments whose text opens with "IEA" but whose id is longer, so they are not the trailer.
-_IEA_PREFIXED = ["IEAX*1~", "IEA2*1~", "IEAX~"]
+# A trailer main framed at once must still close the frame at once, however it is corrupted:
+# the reader cannot see a connection end, so a frame it holds there is dropped with no row.
+_TRAILERS_MAIN_CLOSED = [
+    pytest.param("IEA1*000000001~", id="dropped-separator"),
+    pytest.param("IEAX*1~", id="longer-id"),
+    pytest.param("IEA*1*000000001~", id="clean"),
+]
 
 
-@pytest.mark.parametrize("term", ["~", "\n"])
-@pytest.mark.parametrize("segment", _IEA_PREFIXED)
-def test_a_segment_whose_id_only_starts_with_iea_does_not_end_an_interchange(
-    segment: str, term: str
-) -> None:
-    # Any segment opening with "IEA" ended the interchange there, without the element separator
-    # check, so the frame was cut short and the rest was framed apart or dropped (BACKLOG #5807).
-    raw = interchange(term=term).replace("GE*", segment.replace("~", term) + "GE*", 1)
-    assert split(raw) == [raw]
-    data = raw.encode()
-    for chunk in (4096, 7, 1):
-        assert _frames_of(data, chunk) == [data], chunk
-    nxt = interchange(control="000000002", term=term)
-    assert split(raw + nxt) == [raw, nxt]
-
-
-def _corrupt_sep(raw: str) -> str:
-    return raw[:3] + "*" + raw[4:]  # a corrupted +3, the separator the gates are read against
-
-
+@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
 @pytest.mark.parametrize("chunk", [4096, 7, 1])
-def test_a_trailer_with_no_trusted_separator_still_ends_the_frame_at_iea(chunk: int) -> None:
-    # A letter separator's trailer is "IEAW1W...". With the header's +3 corrupted, or after a
-    # failing ISA has bounded the walk, there is no +3 to trust, so any segment opening with IEA
-    # ends the frame, as before: the id rule must not hold a frame the reader used to take.
-    alone = _corrupt_sep(interchange(el="W"))
-    assert alone.endswith("IEAW1W000000001~")
+def test_a_segment_opening_with_iea_closes_the_frame_at_once(trailer: str, chunk: int) -> None:
+    raw = _without_iea(interchange()) + trailer
     reader = X12FrameReader()
-    data = alone.encode()
+    data = raw.encode()
     frames = [f for i in range(0, len(data), chunk) for f in reader.feed(data[i : i + chunk])]
     assert frames == [data] and not reader.in_frame
-    assert split(alone) == [alone]
-    after = _without_iea(interchange()) + _corrupt(interchange(el="W", control="000000002"))
-    reader = X12FrameReader()
-    data = after.encode()
-    frames = [f for i in range(0, len(data), chunk) for f in reader.feed(data[i : i + chunk])]
-    assert frames == [data] and not reader.in_frame
-    assert split(after) == [after]
+    assert split(raw) == [raw]
 
 
-@pytest.mark.parametrize("trailer", ["IEA~", "IEA *1*000000001~", "IEA|1|000000001~"])
-def test_iea_then_the_segment_end_or_a_non_alphanumeric_still_ends_an_interchange(
-    trailer: str,
-) -> None:
-    # Only a longer id is refused: a bare IEA, a stray space or another separator still closes the
-    # frame, so such a trailer is framed and recorded rather than held open.
+@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
+def test_a_corrupted_trailer_does_not_fold_the_next_interchange_in(trailer: str) -> None:
     raw = _without_iea(interchange()) + trailer
     nxt = interchange(control="000000002")
     assert split(raw + nxt) == [raw, nxt]
-    for chunk in (4096, 1):
-        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
-
-
-def test_a_letter_as_the_element_separator_still_ends_at_iea() -> None:
-    # The parse accepts a letter as the element separator, so its trailer "IEAW1W..." is the IEA
-    # segment: the id rule also takes the ISA's own separator after IEA.
-    raw = interchange(el="W")
-    assert raw.endswith("IEAW1W000000001~")
-    nxt = interchange(el="W", control="000000002")
-    assert split(raw + nxt) == [raw, nxt]
-    for chunk in (4096, 1):
-        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
-    assert X12Message.parse(raw).segment_ids()[-1] == "IEA"
-
-
-def test_a_corrupted_interchange_with_another_separator_still_ends_at_its_own_iea() -> None:
-    # An interchange with no IEA, then a corrupted one using "|": the walk is bounded from the
-    # failing ISA on, and still ends at that interchange's own IEA, whatever its separator.
-    a = _without_iea(interchange())
-    bad = _corrupt(interchange(el="|", control="000000002"))
-    assert bad.endswith("IEA|1|000000002~")
-    assert split(a + bad) == [a + bad]
     for chunk in (4096, 7, 1):
-        assert _frames_of((a + bad).encode(), chunk) == [(a + bad).encode()], chunk
+        assert _frames_of((raw + nxt).encode(), chunk) == [raw.encode(), nxt.encode()], chunk
+
+
+@pytest.mark.parametrize("trailer", _TRAILERS_MAIN_CLOSED)
+def test_a_ta1_reply_with_a_corrupted_trailer_is_read_at_once(trailer: str) -> None:
+    # An outbound send reads its TA1 reply with this reader: a reply it held would read as a
+    # timeout, and the send would be retried.
+    reply = (isa() + "TA1*000000001*240101*1200*A*000~" + trailer).encode()
+    reader = X12FrameReader()
+    assert list(reader.feed(reply)) == [reply]
+    assert not reader.in_frame
 
 
 def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
@@ -953,18 +912,22 @@ def test_frame_reader_byte_at_a_time() -> None:
     assert out == [data]
 
 
-def test_segment_whitespace_patterns_match_the_shared_set() -> None:
-    """The framing's segment-opening whitespace patterns skip exactly the whitespace the codec
-    strips before a segment.
+def test_iea_segment_whitespace_matches_the_shared_set() -> None:
+    """The frame reader's IEA pattern skips exactly the whitespace the codec strips before a segment.
 
-    They spell their classes as literals so the static ReDoS scan can read them; this keeps those
-    literals equal to _SEGMENT_WHITESPACE, so they cannot drift apart.
+    _IEA_SEGMENT spells its class as a literal so the static ReDoS scan can read it; this keeps that
+    literal equal to _SEGMENT_WHITESPACE, byte for byte, so the two cannot drift apart.
     """
     from messagefoundry.parsing.x12.delimiters import _SEGMENT_WHITESPACE
-    from messagefoundry.parsing.x12.interchange import _SEGMENT_WS_RUN, _SEGMENT_WS_RUN_STR
+    from messagefoundry.parsing.x12.interchange import (
+        _IEA_SEGMENT,
+        _SEGMENT_WS_RUN,
+        _SEGMENT_WS_RUN_STR,
+    )
 
-    skipped = {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b, b]))}
+    skipped = {chr(b) for b in range(256) if _IEA_SEGMENT.fullmatch(bytes([b, b, *b"IEA"]))}
     assert skipped == set(_SEGMENT_WHITESPACE)
+    assert {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b]))} == skipped
     assert {chr(c) for c in range(0x10000) if _SEGMENT_WS_RUN_STR.fullmatch(chr(c))} == skipped
 
 

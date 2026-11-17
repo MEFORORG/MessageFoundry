@@ -9,9 +9,9 @@ id), and an optional 1-based component index. Reads/writes address the **first**
 segment unless ``occurrence=`` is given. In a repeating element (from 00501, where ISA-11 is the
 repetition separator) a component path addresses the **first** repetition unless ``repetition=``
 names another, and a write keeps the rest; before 00501, on a 00501 header still carrying the legacy
-ISA-11 ``U``, and in the ISA, the model splits on no repetition separator, so a component path reads
-across the whole element and only repetition 1 exists; a write on a legacy ``U`` header still refuses
-a value holding ``U``. A whole-element read returns the raw element, every
+ISA-11 ``U`` or any other letter or digit there, and in the ISA, the model splits on no repetition
+separator, so a component path reads across the whole element and only repetition 1 exists; a write
+on such a 00501 header still refuses a value holding that ISA-11 character. A whole-element read returns the raw element, every
 repetition included, unless ``repetition=`` names one; a whole-element write refuses the repetition
 separator, so it replaces the element with one repetition, or with ``repetition=`` replaces just that
 repetition. All structure is rebuilt with the interchange's **own** discovered
@@ -276,8 +276,8 @@ class X12Message:
     def _repetition_sep(self, segment_id: str) -> str | None:
         """The repetition separator for an element of ``segment_id``, or None where there is none:
         before 00501; in an ISA element, which is simple (ISA-11 holds the separator itself); and
-        where a 00501 header still carries the legacy alphanumeric ISA-11 ``U``, which the parse
-        tolerates and where splitting would cut ordinary data such as a code holding a ``U``."""
+        where a 00501 header carries a letter or digit in ISA-11, such as the legacy ``U``, which
+        the parse tolerates and where splitting would cut ordinary data holding it."""
         rep = self._delims.repetition
         if not rep or rep.isalnum() or segment_id == "ISA":
             return None
