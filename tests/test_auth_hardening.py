@@ -672,7 +672,20 @@ async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
     1200-character actor, which SQL Server's ``audit_log.actor NVARCHAR(256)`` refuses, and the
     sign-in would raise instead of writing its row. The actor is cut to 256 UTF-16 units with a
     marker naming the SHA-256 of the name as typed, the same cut every time."""
-    from messagefoundry.auth.service import _AUDIT_ACTOR_MAX, _storable_actor, _utf16_units
+    import inspect
+    import re
+
+    from messagefoundry.auth.service import _AUDIT_ACTOR_MAX, _storable_actor
+    from messagefoundry.store import sqlserver
+    from messagefoundry.store.transit_attestation import utf16_units as _utf16_units
+
+    # The bound is the SQL Server DDL's, read from its source rather than restated here.
+    ddl = re.search(
+        r"CREATE TABLE audit_log \(.*?\bactor NVARCHAR\((\d+)\)",
+        inspect.getsource(sqlserver),
+        re.DOTALL,
+    )
+    assert ddl is not None and int(ddl.group(1)) == _AUDIT_ACTOR_MAX, ddl
 
     service = await _service(engine)
     name = "\x00" * 200
@@ -684,10 +697,10 @@ async def test_a_long_nul_username_writes_an_actor_every_store_column_holds(
         if row["action"] == "auth.login_failed" and "sha256:" in str(row["actor"])
     ]
     assert len(actors) == 1, actors
-    assert _AUDIT_ACTOR_MAX == 256
     assert _utf16_units(actors[0]) <= _AUDIT_ACTOR_MAX, len(actors[0])
     assert actors[0] == _storable_actor(name), "the cut is not deterministic"
-    assert actors[0].startswith("\\u0000") and "\x00" not in actors[0]
+    prefix = actors[0].split("...sha256:")[0]
+    assert prefix and prefix == "\\u0000" * (len(prefix) // 6), "an escape was split"
     assert _storable_actor("\x00" * 201) != actors[0], "two long names share one actor"
     # Past the BMP each character is two units, so the bound counts units, not characters.
     wide = _storable_actor("\x00" + "\U0001f600" * 200)

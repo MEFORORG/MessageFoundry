@@ -525,10 +525,11 @@ async def test_a_reauth_past_the_account_cap_revokes_the_session_on_its_first_fa
 async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_first_typo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5336: a session the store ends without the service, as the session reaper or an
-    expiry no request met does, keeps its re-proof count, so at the account's cap the counts of
-    sessions the store no longer lists are dropped before the verify. Otherwise the cap would fill
-    with dead sessions' counts and revoke every new session of the account on its first typo."""
+    """BACKLOG #5336: a session the store ends without the service, here a revoke and at least a
+    reaper purge too, keeps its re-proof count, so at the account's cap the counts of sessions the
+    store shows as revoked or holds no row for are dropped before the verify. Otherwise the cap
+    would fill with dead sessions' counts and revoke every new session of the account on its first
+    typo."""
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 2)
     store = await MessageStore.open(":memory:")
     try:
@@ -553,9 +554,9 @@ async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_fir
 async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5336: the drop at the account's cap reads the store's listing, which leaves out a
-    session past its absolute expiry. A just-expired session whose re-proofs queued behind the lock
-    would lose its count there and be verified on a fresh budget. It is refused as gone first."""
+    """BACKLOG #5336: a just-expired session whose re-proofs queued behind the lock is one the
+    validator refuses, so it is refused as gone and ended before any verify, never verified on the
+    budget it had or on a fresh one."""
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
     store = await MessageStore.open(":memory:")
     try:
@@ -655,8 +656,8 @@ async def test_the_reproved_session_keeps_its_count_whatever_the_listing_says(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #5336: the session was found live, but the listing the cap's drop reads comes a
-    moment later, and a session that expires in between is not listed. Its own count is kept, so
-    the guess is charged on the budget it has, not a fresh one."""
+    moment later, and a session ended in between is not listed. Its own count is kept, so the
+    guess is charged on the budget it has, not a fresh one."""
     monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
     store = await MessageStore.open(":memory:")
     try:

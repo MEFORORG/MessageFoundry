@@ -3054,11 +3054,6 @@ def _log_totp_refused(username: str) -> None:
 _AUDIT_ACTOR_MAX = 256
 
 
-def _utf16_units(text: str) -> int:
-    """How many UTF-16 code units ``text`` takes, as an NVARCHAR column counts its length."""
-    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
-
-
 def _storable_actor(username: str) -> str:
     """A typed sign-in username as an audit row's actor (BACKLOG #5342): as typed, unless it holds a
     NUL, which at least a PostgreSQL store refuses in a text column. Then every control character
@@ -3066,23 +3061,27 @@ def _storable_actor(username: str) -> str:
 
     An escape takes six characters for each NUL, so an escaped name can outgrow
     :data:`_AUDIT_ACTOR_MAX` and the write would fail on SQL Server. Such a name keeps the longest
-    prefix that fits beside a marker, ``...sha256:`` and the SHA-256 of the name as typed, so the
-    cut is deterministic and two long names that share the prefix stay distinct."""
+    prefix of whole escapes that fits beside a marker, ``...sha256:`` and the SHA-256 of the name
+    as typed, so the cut is deterministic and two long names that share the prefix stay distinct.
+    A name with no NUL is not bounded here."""
     if "\x00" not in username:
         return username
     escaped = scrub_log_argument(username)
-    if _utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
+    # Never fewer units than characters, so a short escape is measured without a full encode.
+    if len(escaped) <= _AUDIT_ACTOR_MAX and utf16_units(escaped) <= _AUDIT_ACTOR_MAX:
         return escaped
-    # surrogatepass, so a lone surrogate cannot make the digest raise. The escape already wrote
-    # any lone surrogate out as text, so a cut between code points leaves the prefix storable.
+    # surrogatepass, so a lone surrogate cannot make the digest raise.
     marker = "...sha256:" + hashlib.sha256(username.encode("utf-8", "surrogatepass")).hexdigest()
     room = _AUDIT_ACTOR_MAX - len(marker)
     prefix: list[str] = []
-    for char in escaped:
-        room -= _utf16_units(char)
+    # Escaped one typed character at a time, which the escape's per-character table makes equal to
+    # the whole, so the cut never splits an escape or a surrogate pair. It stops within the bound.
+    for char in username:
+        piece = scrub_log_argument(char)
+        room -= utf16_units(piece)
         if room < 0:
             break
-        prefix.append(char)
+        prefix.append(piece)
     return "".join(prefix) + marker
 
 
@@ -15051,8 +15050,10 @@ class AuthService:
         every unrevoked row whatever the clock says. With the clock's own ``now``, a forward
         wall-clock step would leave live sessions out of the listing, their counts would be
         dropped, and once the clock was set right those sessions would come back on a fresh budget.
-        A lapsed session's count is not judged here: a re-proof on it is refused as gone and ends
-        it first (:meth:`_end_lapsed_reproof_session`), and the age prune can reach it otherwise."""
+        So a lapsed session's count is not judged here. It leaves at least when a re-proof on that
+        session ends it (:meth:`_end_lapsed_reproof_session`), when the reaper purges its row and
+        a later drop runs, or by the age prune. Until then it holds its place at the account's cap,
+        so a new session that finds no room is revoked on its first failure (fail closed)."""
         if not self._reproof_counts_of(user_id, keep=keep):
             return
         live = {s.token_hash for s in await self._store.list_sessions(user_id, now=0.0)}
@@ -15175,9 +15176,7 @@ class AuthService:
             return _Reproof(ok=False, session_gone=True, user=user)
         if not session.is_live(now=time.time(), idle_seconds=self.session_idle_seconds):
             # Past its absolute expiry or idle window while this attempt waited behind the lock, so
-            # the validator would refuse it now: gone, and never verified (BACKLOG #5336). The drop
-            # below keeps the count of a lapsed session's unrevoked row, so the session is ended
-            # here rather than verified.
+            # the validator would refuse it now: gone, ended, and never verified (BACKLOG #5336).
             await self._end_lapsed_reproof_session(token_hash)
             return _Reproof(ok=False, session_gone=True, user=user)
         # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
