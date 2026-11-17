@@ -2430,7 +2430,7 @@ async def test_an_unreadable_secret_on_the_combined_sign_in_logs_one_line_and_no
             user = await store.get_user(identity.user_id)
             assert user is not None and user.second_step_failed_attempts == 1
             mine = [r for r in caplog.records if r.name == service_module.__name__]
-            assert any(text in r.getMessage() for r in mine), [r.getMessage() for r in mine]
+            assert [text in r.getMessage() for r in mine] == [True], [r.getMessage() for r in mine]
             assert all(r.exc_info is None for r in mine), "a traceback was logged"
             assert all(r.levelno < logging.ERROR for r in mine), "logged at ERROR"
         finally:

@@ -3041,8 +3041,8 @@ def _log_combined_totp_defect(user_id: str, exc: Exception) -> None:
     the exception's type name and the account id, never its text, the username or a traceback, on a
     path reachable with a username alone. The code is read as wrong."""
     _log.error(
-        "combined sign-in: reading the TOTP secret of account id %r raised %s; the code is read as "
-        "wrong",
+        "combined sign-in: reading or checking the TOTP code of account id %r raised %s; the code "
+        "is read as wrong",
         user_id,
         type(exc).__name__,
     )
@@ -4258,8 +4258,9 @@ class AuthService:
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the
         # session is revoked, so a stolen session gets that many guesses in total however often the
-        # account lock expires. Bounded (_REPROOF_SESSION_MAX, never a live count evicted) and
-        # carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the same accepted
+        # account lock expires. Bounded (_REPROOF_SESSION_MAX, no count younger than the lifetime
+        # evicted, and a session refused for no room held past the bound until its revoke commits)
+        # and carried across a rotation by _rekey_token_state. PROCESS-LOCAL, with the same accepted
         # caveat as _action_step_up_grants: a restart forgets the counts, and a topology that serves
         # the API from more than one process gives each process its own budget.
         self._reproof_session_failures: dict[str, tuple[int, float, str]] = {}
@@ -14911,8 +14912,10 @@ class AuthService:
         before any await after the verdict, so a store error later in the attempt cannot leave an
         evaluated guess uncharged.
 
-        A live count is never evicted (see :data:`_REPROOF_SESSION_MAX`). When there is no room, the
-        answer is the cap itself, so the caller revokes this session rather than track it."""
+        A count younger than the absolute session lifetime is never evicted (see
+        :data:`_REPROOF_SESSION_MAX`). When there is no room, the session is recorded AT the cap,
+        past the bound, and the answer is the cap, so the caller revokes it and
+        :meth:`_revoke_for_budget` then drops the entry."""
         now = time.monotonic()
         failures = self._reproof_session_failures
         existing = failures.get(token_hash)
@@ -14935,8 +14938,8 @@ class AuthService:
             # revoking unverified; _revoke_for_budget drops it once the revoke commits.
             cap = max(self._policy.lockout_threshold, 1)
             _log.warning(
-                "re-proof failure counts: no room for a new session of account id %r; that "
-                "session is revoked on this failure (BACKLOG #5336)",
+                "re-proof failure counts: no room for a new session of account id %r; it is "
+                "answered at the cap, so its caller revokes it (BACKLOG #5336)",
                 user_id,
             )
             failures[token_hash] = (cap, now, user_id)
