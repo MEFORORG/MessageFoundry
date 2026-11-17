@@ -46,9 +46,11 @@ scope available. See ADR 0162 section 4.
   ``record.args``; the only rendering of a record it performs is ``self.format(record)`` — the record
   has already passed the handler's :class:`~messagefoundry.logging_setup.RedactionFilter` chain by then
   (filters run in ``Handler.handle``, before ``emit``) — and that rendering is written only to the
-  sink's own stream, never to the last-resort channel. The stderr last-resort line carries the sink
-  label and a :func:`~messagefoundry.redaction.safe_exc` reason and **nothing from the record**. The
-  guard also never raises the service level to DEBUG.
+  sink's own stream, never to the last-resort channel. When that rendering raises, the record is
+  replaced on the sink by a notice that renders only its logger and level names, escaped, and the
+  exception's type (BACKLOG #5813). The stderr last-resort line carries the sink label, a
+  :func:`~messagefoundry.redaction.safe_exc` reason or an exception's type, and **nothing from the
+  record**. The guard also never raises the service level to DEBUG.
 * **The guard scrubs its OWN diagnostics, because nothing downstream reliably will (BACKLOG
   #1591).** THE CONSUMER LIST, stated here once and referred to rather than repeated: a failure
   reason travels to (1) the notice written onto the rolled sink, (2) ``GET /status``'s
@@ -176,7 +178,7 @@ class LogWriteGuard:
         #: decisions compute does not depend on it (BACKLOG #5812).
         self._flap_latch: dict[str, float] = {}
         #: Sinks whose current break fired its stage-2 event with no responder wired, so the event
-        #: is fired again on the next failure; see :meth:`record_unwritable`.
+        #: is fired again on a later failure; see :meth:`record_unwritable`.
         self._unanswered: set[str] = set()
         #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
         self._probes: dict[str, SinkProbe] = {}
@@ -312,7 +314,8 @@ class LogWriteGuard:
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
         """Stage 2: the replacement could not be written either. Escalates ONCE per break, except
-        that a break whose event found no responder wired fires it again on its next failure.
+        that a break whose event found no responder wired fires it again on each later failure of
+        the break until one is answered.
 
         **The STOP is asked for only when EVERY guarded sink is unwritable, and that is a
         correctness point, not a softening.** The ruling is *"we never want to process stuff if the
@@ -342,9 +345,13 @@ class LogWriteGuard:
             # other sink only changes what the stderr line says about them.
             all_reported_down = all(self._reads_unwritable(s) for s in self._sinks.values())
             self._latch_after_failure(sink)
-            # A break whose stage-2 event found no responder wired is still owed one: the next
-            # failure on it fires the event again, without another stderr line (BACKLOG #5812).
+            # A break whose stage-2 event found no responder wired is still owed one: each later
+            # failure on it fires the event again, without another stderr line, until one is
+            # answered (BACKLOG #5812). Taken here, under the lock, so one owed event is fired by
+            # one failure, not by every thread failing at once.
             owed = already_down and sink in self._unanswered
+            if owed:
+                self._unanswered.discard(sink)
         event = LogSinkEvent(
             sink=sink,
             stage="unwritable",
@@ -375,12 +382,13 @@ class LogWriteGuard:
         self._fire_stage2(event)
 
     def _fire_stage2(self, event: LogSinkEvent) -> None:
-        """Fire a stage-2 event, and remember the break as owed one while no responder is wired."""
-        answered = self._fire(event)
+        """Fire a stage-2 event, and remember the break as owed one when no responder was wired and
+        the sink is still unwritable."""
+        if self._fire(event):
+            return
         with self._lock:
-            if answered:
-                self._unanswered.discard(event.sink)
-            else:
+            current = self._sinks.get(event.sink)
+            if current is not None and current.state == "unwritable":
                 self._unanswered.add(event.sink)
 
     def record_healthy(self, sink: str) -> None:
@@ -708,24 +716,34 @@ def _escape_only(text: str, *, fallback: str) -> str:
     return _guarded(scrub_control_chars, text, fallback=fallback)
 
 
-#: The fallback for a record's logger or level name in the unformattable-record notice.
+#: The fallback for a record's logger or level name, or an exception's type name, in the
+#: unformattable-record notice and the formatter-fault line.
 _RECORD_LABEL_DROPPED = "<unnameable>"
 
+#: The formatter-fault line on stderr is written at most once per this many seconds per sink; the
+#: faults in between are counted into the next line (BACKLOG #5813).
+_FORMAT_FAULT_REPORT_SECONDS = 60.0
 
-def _record_label(value: object) -> str:
-    """A record's logger or level name, escaped for a notice. Never raises: a caller can set either
-    to any object, and its ``str`` may raise, often for the same reason the record did not format."""
+
+def _record_label(record: logging.LogRecord, attribute: str) -> str:
+    """A record's logger or level name, escaped for a notice. Never raises: a caller can delete
+    either attribute or set it to any object, and that object's ``str`` may raise, often for the
+    same reason the record did not format. ``attribute`` is a literal from the caller."""
     try:
-        text = str(value)
-    except Exception as exc:
-        with contextlib.suppress(Exception):
-            # Reported as _guarded reports its own fallback, and on the same terms: the type only.
-            _last_resort(
-                f"a log record's name could not be rendered ({ascii(type(exc).__name__)}); "
-                "a placeholder was substituted"
-            )
+        return _escape_only(str(getattr(record, attribute)), fallback=_RECORD_LABEL_DROPPED)
+    except Exception:
+        _last_resort(
+            f"a log record's {attribute} could not be rendered; a placeholder was substituted"
+        )
         return _RECORD_LABEL_DROPPED
-    return _escape_only(text, fallback=_RECORD_LABEL_DROPPED)
+
+
+def _type_name(exc: BaseException) -> str:
+    """``exc``'s type name through ``ascii()``, or a placeholder. Never raises."""
+    try:
+        return ascii(type(exc).__name__)
+    except Exception:
+        return _RECORD_LABEL_DROPPED
 
 
 def _safe_reason(exc: BaseException | None) -> str:
@@ -767,6 +785,9 @@ class _GuardedSinkMixin(_SinkBase):
         # Per-thread re-entrancy latch. A failure raised WHILE handling a failure must not recurse:
         # the inner call returns immediately and the outer one converts the raise into Stage 2.
         self._reentry = threading.local()
+        #: Format faults since the last stderr line about them, and when that line was written.
+        self._format_faults = 0
+        self._format_fault_reported_at: float | None = None
         guard.register(sink, probe=self._probe_write)
 
     # --- subclass seam --------------------------------------------------------
@@ -794,11 +815,26 @@ class _GuardedSinkMixin(_SinkBase):
             # A record that cannot be formatted is no reason to roll a healthy sink or to call it
             # unwritable (BACKLOG #5813). When the stand-in lands, the sink has just taken a write
             # and nothing else happens; when it does not, the sink is the fault after all and the
-            # two stages below decide.
+            # two stages below decide. A formatter that cannot format even the stand-in is a
+            # formatter fault, not a sink failure: the sink was never written to.
             stand_in = self._stand_in_for(record)
+            stand_in_line: str | None = None
             if stand_in is not None:
+                notice, kind = stand_in
                 try:
-                    self._write_notice(stand_in)
+                    stand_in_line = self._notice_line(notice)
+                except Exception as format_exc:
+                    self._report_format_fault(
+                        f"could not format a record ({kind}), nor the notice standing in for it "
+                        f"({_type_name(format_exc)}); nothing was written for it"
+                    )
+                    return
+                self._report_format_fault(
+                    f"could not format a record ({kind}); a notice naming its logger is written "
+                    "in its place unless the sink refuses it"
+                )
+                try:
+                    self._write_line(stand_in_line)
                     return
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
@@ -821,10 +857,10 @@ class _GuardedSinkMixin(_SinkBase):
                     f"({reason})"
                     + (f"; previous file renamed to {rolled_aside}" if rolled_aside else "")
                 )
-                if stand_in is None:
+                if stand_in_line is None:
                     self._rewrite(record)
                 else:
-                    self._write_notice(stand_in)
+                    self._write_line(stand_in_line)
             except Exception as roll_exc:
                 # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
@@ -839,28 +875,49 @@ class _GuardedSinkMixin(_SinkBase):
         finally:
             self._reentry.active = False
 
-    def _stand_in_for(self, record: logging.LogRecord) -> str | None:
-        """The notice to write in place of ``record`` when it cannot be formatted, or ``None`` when
-        it can (BACKLOG #5813). Never raises.
+    def _stand_in_for(self, record: logging.LogRecord) -> tuple[str, str] | None:
+        """The notice to write in place of ``record`` when it cannot be formatted, with the
+        formatting exception's type name, or ``None`` when it can (BACKLOG #5813). Never raises.
 
         A record this handler cannot format is the record's fault, not the sink's: the stand-in is
         a notice naming its logger, its level and the exception's type, never its content or the
-        exception's message. It goes through the sink's
-        own formatter and stream, so a sink that refuses it, or a formatter that cannot format even
-        that notice, is reported by the two stages as before. On the handlers ``configure_logging``
-        builds, ``RedactionFilter`` already replaces a record whose message cannot be rendered, so
-        this is reached only by a formatter that fails where the filter did not."""
+        exception's message. It goes through the sink's own formatter and stream. A sink that
+        refuses it is reported by the two stages as before; a formatter that cannot format even
+        that notice is reported by :meth:`_report_format_fault` and runs neither stage. On the
+        handlers ``configure_logging`` builds, ``RedactionFilter`` already replaces a record whose
+        message cannot be rendered, so this is reached only by a formatter that fails where the
+        filter did not."""
         try:
             self.format(record)
         except Exception as exc:
             # The exception's TYPE only: its message can quote the record's format string or an
             # argument, and this notice goes below every handler filter.
-            return (
-                f"a log record from logger {_record_label(record.name)!r} at level "
-                f"{_record_label(record.levelname)} could not be formatted "
-                f"({ascii(type(exc).__name__)}); it was not written"
+            kind = _type_name(exc)
+            notice = (
+                f"a log record from logger {_record_label(record, 'name')!r} at level "
+                f"{_record_label(record, 'levelname')} could not be formatted ({kind}); it was "
+                "not written"
             )
+            return notice, kind
         return None
+
+    def _report_format_fault(self, detail: str) -> None:
+        """Say on the stderr last-resort line that this sink could not format a record, at most
+        once per :data:`_FORMAT_FAULT_REPORT_SECONDS`; faults in between are counted into the next
+        line. Called from :meth:`handleError`, which ``Handler.handle`` runs under the handler's lock.
+        Never raises: ``detail``
+        is built from literals and :func:`_type_name` output, and carries nothing from the record."""
+        self._format_faults += 1
+        now = time.monotonic()
+        last = self._format_fault_reported_at
+        if last is not None and now - last < _FORMAT_FAULT_REPORT_SECONDS:
+            return
+        count, self._format_faults = self._format_faults, 0
+        self._format_fault_reported_at = now
+        _last_resort(
+            f"log sink {_escape_only(self._sink_label, fallback=_LABEL_DROPPED)} {detail}"
+            + (f"; this line covers {count} format faults on this sink" if count > 1 else "")
+        )
 
     def _probe_write(self) -> None:
         """:data:`SinkProbe` for this sink: answer "can you take a record again?" BY TAKING ONE.
@@ -883,6 +940,11 @@ class _GuardedSinkMixin(_SinkBase):
     def _write_notice(self, message: str) -> None:
         """Record the rollover event ON the rolled sink, through the sink's own formatter so a JSON
         sink stays one-object-per-line. Built here from a fixed string, so it carries no PHI."""
+        self._write_line(self._notice_line(message))
+
+    def _notice_line(self, message: str) -> str:
+        """``message`` as a guard notice, formatted by the sink's own formatter, terminator included.
+        Raises what the formatter raises; writes nothing."""
         notice = logging.LogRecord(
             name=_NOTICE_LOGGER,
             level=logging.WARNING,
@@ -892,7 +954,7 @@ class _GuardedSinkMixin(_SinkBase):
             args=(),
             exc_info=None,
         )
-        self._emit_direct(notice)
+        return self.format(notice) + self.terminator
 
     def _rewrite(self, record: logging.LogRecord) -> None:
         """Re-write the record whose emit failed, so the roll does not cost a log line (count-and-log).
@@ -905,7 +967,11 @@ class _GuardedSinkMixin(_SinkBase):
         """Format + write + flush WITHOUT going through ``emit`` — an ``emit`` failure would re-enter
         ``handleError`` and be swallowed by the latch, hiding the very Stage 2 we are trying to detect.
         Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2."""
-        self.stream.write(self.format(record) + self.terminator)
+        self._write_line(self.format(record) + self.terminator)
+
+    def _write_line(self, line: str) -> None:
+        """Write and flush an already formatted line; a sink failure propagates."""
+        self.stream.write(line)
         self.stream.flush()
 
 

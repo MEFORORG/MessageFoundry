@@ -918,9 +918,13 @@ def test_a_stage2_event_fired_before_a_responder_is_wired_is_fired_again(
     assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
 
 
-def test_a_formatter_that_fails_on_every_record_still_reaches_stage2(tmp_path: Path) -> None:
-    # The other side of the test above: when the sink cannot format even the guard's own
-    # notice, the record is not the fault, and the stages decide as before.
+def test_a_formatter_that_fails_on_every_record_is_a_formatter_fault_not_a_sink_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # When the sink cannot format even the guard's own notice, the sink was never written to, so
+    # it is neither rolled nor called unwritable. The fault is said on stderr instead.
+    # NEGATIVE CONTROL: on fd09ca1394 the notice's format failure was taken for a sink failure: the
+    # file was renamed aside and stage 2 fired with a stop request.
     class Broken(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
             raise RuntimeError("formatter is broken")
@@ -928,13 +932,101 @@ def test_a_formatter_that_fails_on_every_record_still_reaches_stage2(tmp_path: P
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
-    handler = GuardedFileHandler(str(tmp_path / "app.log"), guard=guard, sink="file")
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
     handler.setFormatter(Broken())
 
     handler.emit(_record("anything"))
     handler.close()
 
-    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert list(tmp_path.iterdir()) == [log_path]  # nothing rolled aside
+    err = capsys.readouterr().err
+    assert "nor the notice standing in for it ('RuntimeError')" in err
+    assert "IS UNWRITABLE" not in err
+    assert "formatter is broken" not in err  # the exception's type only, never its message
+
+
+def test_an_absorbed_format_fault_is_said_on_stderr_once_per_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A record the stand-in absorbs leaves the guard's state alone, so without this line the fault
+    # would show only inside the log file. The line is rate limited: the first fault is said at
+    # once, the next within the interval is counted, and the line after the interval covers both.
+    # NEGATIVE CONTROL: on fd09ca1394 no stderr line was written for an absorbed format fault.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    handler = _file_handler(tmp_path / "app.log", guard)
+    capsys.readouterr()
+
+    handler.emit(_record("count %d", "first"))
+    first = capsys.readouterr().err
+    clock.now += 1
+    handler.emit(_record("count %d", "second"))
+    quiet = capsys.readouterr().err
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("count %d", "third"))
+    later = capsys.readouterr().err
+    handler.close()
+
+    assert first.count("could not format a record ('TypeError')") == 1
+    assert "covers" not in first
+    assert quiet == ""
+    assert "this line covers 2 format faults" in later
+    for line in (first, later):
+        assert "first" not in line and "third" not in line  # nothing from the record
+    assert [s.state for s in guard.status()] == ["healthy"]
+
+
+def test_a_record_with_no_name_or_level_name_does_not_raise(tmp_path: Path) -> None:
+    # A caller can delete both attributes; building the stand-in reads them inside its guard.
+    # NEGATIVE CONTROL: on fd09ca1394 reading ``record.name`` raised AttributeError out of
+    # handleError, into the caller's log call.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = GuardedFileHandler(str(log_path), guard=guard, sink="file")
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    record = _record("hello")
+    del record.name
+    del record.levelname
+
+    handler.handle(record)
+    handler.close()
+
+    assert events == []
+    assert "from logger '<unnameable>' at level <unnameable>" in log_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_an_owed_stage2_event_is_fired_once_per_failure_not_once_per_thread() -> None:
+    # Two failures racing on a break that owes its event: the first takes the debt under the lock,
+    # so the second, arriving while the first is still firing, fires nothing. The responder here
+    # records that second failure itself, which is that interleaving made deterministic.
+    # NEGATIVE CONTROL: on fd09ca1394 the debt was cleared only after the fire returned, so the
+    # nested failure fired the event a second time.
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.record_unwritable("file", reason="disk gone")  # no responder: owed
+    events: list[LogSinkEvent] = []
+    nested: list[bool] = []
+
+    def responder(event: LogSinkEvent) -> None:
+        events.append(event)
+        if not nested:
+            nested.append(True)
+            guard.record_unwritable("file", reason="disk still gone")
+
+    guard.set_escalation(responder)
+    guard.record_unwritable("file", reason="disk still gone")
+
+    assert len(events) == 1
+    guard.record_unwritable("file", reason="answered now, so nothing more")
+    assert len(events) == 1
 
 
 # --- stage 2: STOP -----------------------------------------------------------

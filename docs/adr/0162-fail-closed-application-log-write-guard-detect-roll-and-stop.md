@@ -460,7 +460,8 @@ the bound does not. A roll the bound calls a heal still writes `rolled` and page
 before, so a sink that keeps flapping across bound windows pages stage 2 once per window it trips
 in. Whether the bound itself should hold across windows is left open with the latch's enforcement
 question. One retry is kept: a stage-2 event fired while no responder was wired is fired again on
-the break's next failure, without another stderr line. A break that ends with a heal roll before
+every later failure of the break until one is answered, at most once per failure and without
+another stderr line. A break that ends with a heal roll before
 any such failure is not asked to stop again, as before this amendment.
 
 **The stage-2 stderr line.** Where every other sink reads unwritable but at least one only through
@@ -471,8 +472,7 @@ The stop decision is unchanged.
 lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no
 longer probed, and is not marked healthy after a probe that landed, so a latch, a failure or the
 bound's streak recorded meanwhile is kept. A change between that check and the probe's own write
-still meets the probe: the lock is never held across a sink's I/O. The latch's state is now a bare
-timestamp rather than a `_FlapLatch` object.
+still meets the probe: the lock is never held across a sink's I/O.
 
 **A record that cannot be formatted is not a sink failure** (BACKLOG #5813). `handleError` used
 to roll the sink on any failure, then fail to re-write the same record and call the sink
@@ -480,8 +480,10 @@ unwritable. On the handlers `configure_logging` builds, the redaction filter alr
 record whose message cannot be rendered, so this path needs a formatter that fails where the filter
 did not. Now such a record's place is taken by a fixed notice naming its logger and level. When the
 sink takes the notice, neither stage runs. When it refuses it, the sink is the fault and the two
-stages decide as before, so a formatter that cannot format even the guard's own notice still
-reaches stage 2.
+stages decide as before. A formatter that cannot format even that notice is a formatter fault, not
+a sink failure: neither stage runs, and nothing is written for the record. Either kind of format
+fault is reported on the stderr last-resort line, at most once a minute per sink, with a count of
+the faults since the last such line.
 
 **Part of the side-by-side check is now committed.**
 `test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on
