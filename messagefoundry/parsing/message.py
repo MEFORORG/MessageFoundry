@@ -564,7 +564,7 @@ class Message:
 
     def __copy__(self) -> Message:
         # copy.copy shares the tree, so both sides take the copy-on-write flag, or a write would
-        # reach both. Built on type(self), so a subclass and its attributes survive.
+        # reach both. Built on type(self) from the instance __dict__ (slots are not copied).
         new = object.__new__(type(self))
         new.__dict__.update(self.__dict__)
         self._shared = new._shared = True

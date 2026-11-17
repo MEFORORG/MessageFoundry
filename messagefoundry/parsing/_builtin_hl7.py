@@ -1207,8 +1207,8 @@ def encode_with_separators(msg: ParsedMessage, target: tuple[str, str, str, str,
 
     At least these values the target set cannot represent raise :class:`DelimiterRewriteRefused`:
     an escape sequence other than the five separator escapes whose text holds a target delimiter, a
-    segment id holding the target field separator, and a header line whose field 1 or 2 is not the
-    message's own delimiters. A field holding no source escape character takes a single
+    segment id holding the target field separator, and, with a target set unlike the source set, a
+    header line whose field 1 or 2 holds text :func:`_header_encoding` cannot carry. A field holding no source escape character takes a single
     ``str.translate`` that also escapes its data characters, and every field takes the plain one when
     the target set equals the source set.
 
