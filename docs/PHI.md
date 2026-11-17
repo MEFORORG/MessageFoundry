@@ -2578,7 +2578,8 @@ of which forms count (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
-decoded a component at a time. The escape
+decoded a component at a time. Both also take each decoding with `\H\` and `\N\` dropped, and
+every reading with invisible characters removed, the token scan line by line (BACKLOG #5654). The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2609,8 +2610,10 @@ still pass:
 
 The IPv6 check also refuses some text that holds no routable address. It reads runs of hex
 characters (0-9 and A-F), colons and dots, so a word that ends in hex characters can read as an
-address when a `::` or more colons follow it. At least these refuse: `Note::` and a
-colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these pass:
+address when a `::` or more colons follow it. A dot that has a colon after it splits a run
+into texts judged one at a time, so a version or section number joined to such a word can
+refuse too. At least these refuse: `Note::`, a colon-written EUI-64 device id such as
+`00:1A:2B:FF:FE:3C:4D:5E`, `1.2.3::a`, read as `3::a`, and `fe80::1.2::3`, read as `2::3`. At least these pass:
 `Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
 allowed link-local address.
 

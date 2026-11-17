@@ -189,13 +189,14 @@ def test_the_site_code_pass_never_writes_a_digit_component_separator(
 
 
 @_SURROGATES
-def test_an_escape_sequence_in_an_id_becomes_one_letter(surrogates: ModuleType) -> None:
+def test_an_escape_sequence_in_an_id_becomes_letters_of_its_width(surrogates: ModuleType) -> None:
     seps = surrogates.Seps()
-    for rep in ("AB\\E\\CD", "AB\\X41\\CD", "AB\\T\\CD"):
+    for rep in ("AB\\E\\CD", "AB\\X41\\CD", "AB\\T\\CD", "\\123456\\", "\\X3132\\"):
         out = surrogates.surrogate_id(f"{rep}^^^H^MR", Keyer(_SALT), seps)
         fabricated = out.split("^", 1)[0]
         assert "\\" not in fabricated, out
-        assert len(fabricated) == 5, out
+        # The width holds, so an id that is one escape sequence does not shrink to one letter.
+        assert len(fabricated) == len(rep), out
     # Two subcomponents: HL7 splits before it decodes, so no escape closes across the ``&``.
     out = surrogates.surrogate_id("AB\\C&D\\E^^^H^MR", Keyer(_SALT), seps)
     assert out.split("^", 1)[0].count("&") == 1, out
@@ -213,6 +214,18 @@ def test_a_digit_declared_as_a_separator_is_still_fabricated(
         fabricated = surrogates.surrogate_id(f"{real}^^^H^MR", Keyer(salt), seps).split("^", 1)[0]
         assert fabricated != real and "5" not in fabricated, fabricated
         assert len(fabricated) == len(real) and fabricated.isdigit(), fabricated
+
+
+@_SURROGATES
+@pytest.mark.parametrize("real", ["123-45-6789", "123456789", "NID 1234"])
+def test_an_ssn_surrogate_writes_no_declared_separator_digit(
+    surrogates: ModuleType, real: str
+) -> None:
+    """Under MSH-2 ``^~\\5`` a fabricated ``5`` would split the id into subcomponents (#5540)."""
+    seps = surrogates.Seps(subcomponent="5")
+    for n in range(40):
+        fabricated = surrogates.surrogate_ssn(f"{real}^^^H^SS", Keyer(f"{_SALT}{n}"), seps)
+        assert "5" not in fabricated.split("^", 1)[0], fabricated
 
 
 @_SURROGATES
@@ -302,6 +315,55 @@ def test_a_dashed_shape_behind_an_invisible_or_highlight_is_a_hit(
     assert any("ZPD-4" in hit for hit in hits), hits
 
 
+#: A header whose field separator is ``-``, so a dashed SSN is cut across fields.
+_DASH_HEAD = "-".join(
+    ("MSH", "^~\\&", "A", "B", "C", "D", "20260101", "", "ADT^A01", "M1", "P", "2.5.1")
+)
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "tail",
+    ["123-45-67­89", "123-45-67\\XAD\\89", "123\\H\\-45-6789", "123-45\\N\\-6789"],
+    ids=["soft-hyphen", "soft-hyphen-escaped", "highlight", "highlight-off"],
+)
+def test_a_cut_shape_behind_an_invisible_or_highlight_is_a_hit(leak: ModuleType, tail: str) -> None:
+    """The cut-across check takes the readings the one-field detectors take (BACKLOG #5654)."""
+    hits = leak.structural_phi_hits(f"{_DASH_HEAD}\rZPD-1-{tail}", set())
+    assert any("cut by the field separator" in hit for hit in hits), hits
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    "value",
+    [
+        "zqsynth\\H\\partner",
+        "zqsynth\\N\\partner",
+        "zqsynth\\X00\\partner",
+        "zqsynth​partner",
+        "zqsynth͏partner",
+    ],
+    ids=["highlight", "highlight-off", "nul-escaped", "zero-width-space", "cgj"],
+)
+def test_a_token_behind_an_invisible_or_highlight_is_a_hit(
+    leak: ModuleType, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The token scan takes the readings the cut-shape check takes (BACKLOG #5654)."""
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
+        assert "synthetic partner" in leak.leak_report(_zpd(value)).hits
+
+
+@_NO_SCANNER
+@_LEAKS
+def test_a_token_across_a_line_break_is_no_hit(
+    leak: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping invisible characters line by line never joins two lines into a token."""
+    with _token_source(monkeypatch, "97\n", guards=True, surrogates=True):
+        assert leak.leak_report(f"{_zpd('zqsynth')}\rpartner|1").hits == []
+
+
 @_LEAKS
 @pytest.mark.parametrize(
     "value",
@@ -323,6 +385,15 @@ def test_an_ipv6_form_the_check_passed_is_a_hit(leak: ModuleType, value: str) ->
 @pytest.mark.parametrize("value", ["fe80::1.2", "fe80::1.fd00::5", "::ffff:10.0.0.1"])
 def test_an_allowed_dotted_ipv6_form_is_no_hit(leak: ModuleType, value: str) -> None:
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
+
+
+@_LEAKS
+@pytest.mark.parametrize("value", ["1.2.3::a", "fe80::1.2::3"])
+def test_the_dot_joined_non_addresses_docs_phi_names_refuse(leak: ModuleType, value: str) -> None:
+    """docs/PHI.md section 9 names these as refused though they hold no address: a dot with a
+    colon after it splits the run, and ``3::a`` and ``2::3`` parse."""
+    hits = leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"})
+    assert any(leak.IPV6_REASON in hit for hit in hits), hits
 
 
 @_SURROGATES

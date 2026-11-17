@@ -178,9 +178,20 @@ class Seps:
     escape: str = "\\"
 
 
-def _fake_digits(rng: random.Random, length: int) -> str:
-    """A fabricated all-digit string of the given length (>= 1)."""
-    return "".join(str(rng.randrange(10)) for _ in range(max(1, length)))
+#: Every ASCII digit, the digits :func:`_fake_digits` draws from by default.
+_ALL_DIGITS = "0123456789"
+
+
+def _fake_digits(rng: random.Random, length: int, digits: str = _ALL_DIGITS) -> str:
+    """A fabricated string of the given length (>= 1) drawn from ``digits``."""
+    return "".join(rng.choice(digits) for _ in range(max(1, length)))
+
+
+def _free_digits(seps: Seps) -> str:
+    """The ASCII digits the message does not declare as a component, repetition or subcomponent
+    separator or as its escape character: the digits a fabricated id may hold (BACKLOG #5540)."""
+    reserved = seps.component + seps.repetition + seps.subcomponent + seps.escape
+    return "".join(d for d in _ALL_DIGITS if d not in reserved)
 
 
 def _fake_letter(rng: random.Random) -> str:
@@ -198,27 +209,28 @@ def _fake_like(rng: random.Random, sample: str, seps: Seps) -> str:
     The subcomponent separator and escape character the message declares are kept
     even when they are not ASCII, so the value keeps its structure, except a declared digit, which
     is fabricated like any other digit; no fabricated digit is one the message declares as a
-    component, repetition or subcomponent separator or escape character. Each escape sequence a
-    second escape character closes in the same subcomponent becomes one fabricated letter. Its body
-    is never rewritten letter by letter, which could turn ``\\E\\`` into ``\\F\\``."""
+    component, repetition or subcomponent separator or escape character (:func:`_free_digits`).
+    Each escape sequence a second escape character closes in the same subcomponent becomes
+    fabricated letters, one for each character it is written with, its escape characters
+    included, so the width holds. Its body is never rewritten character by character, which could
+    turn ``\\E\\`` into ``\\F\\``."""
     out: list[str] = []
     escape = seps.escape
     kept = (seps.subcomponent, escape)
-    reserved = seps.component + seps.repetition + seps.subcomponent + escape
-    digits = [d for d in "0123456789" if d not in reserved]
+    digits = _free_digits(seps)
     at = 0
     while at < len(sample):
         ch = sample[at]
         end = sample.find(escape, at + 1) if escape and ch == escape else -1
         # HL7 splits before it decodes, so an escape never closes across a subcomponent separator.
         if end != -1 and seps.subcomponent not in sample[at + 1 : end]:
-            out.append(_fake_letter(rng))
+            out.extend(_fake_letter(rng) for _ in range(end + 1 - at))
             at = end + 1
             continue
         if ch.isdigit():
             # A digit is fabricated even when the message declares it a separator, so the real id's
             # digits never reach the output; a fabricated digit avoids the declared ones.
-            out.append(str(rng.randrange(10)) if len(digits) == 10 else rng.choice(digits))
+            out.append(rng.choice(digits))
         elif ch in kept:
             out.append(ch)
         elif ch.isalpha() or not ch.isascii():
@@ -328,16 +340,18 @@ COMPONENT_KEEPING_KINDS: frozenset[SurrogateKind] = frozenset(
 def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
     the CX authority components a CX-shaped national id carries, blanking the rest as
-    :func:`_surrogate_identifier` does (BACKLOG #5534)."""
+    :func:`_surrogate_identifier` does (BACKLOG #5534). No fabricated digit is one the message
+    declares as a separator or escape character (:func:`_free_digits`, BACKLOG #5540)."""
     rng = keyer.rng("ssn", rep)
+    digits = _free_digits(seps)
     comps = _components(rep, seps)
     id_part = comps[0]
     if not id_part:
         fabricated = ""  # an empty id stays empty, as :func:`_surrogate_identifier` leaves one
     elif re.fullmatch(r"\d{3}-\d{2}-\d{4}", id_part):
-        fabricated = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
+        fabricated = "-".join(_fake_digits(rng, n, digits) for n in (3, 2, 4))
     else:
-        fabricated = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
+        fabricated = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9, digits)
     return seps.component.join([fabricated, *_kept_tail(comps, _CX_KEPT_COMPONENTS)])
 
 

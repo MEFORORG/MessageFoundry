@@ -710,18 +710,34 @@ def _walk(
     return out, split_hits
 
 
+def _without_highlighting(text: str, seps: Seps) -> str:
+    """``text`` with every ``\\H\\`` and ``\\N\\`` taken out, as a display that shows
+    highlighting rather than a character reads it (:func:`.surrogates.decoded_readings`)."""
+    escape = seps.escape
+    return text.replace(f"{escape}H{escape}", "").replace(f"{escape}N{escape}", "")
+
+
 def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[str]]:
     """The fields of one line as written, then with each field decoded a subcomponent at a time
-    and a component at a time, the readings :func:`unescaped_message` gives the token scan. The
-    segment id and encoding characters of a header line are left as written. A reading the same
-    as one before it is left out."""
-    readings = [fields]
-    if not seps.escape or not any(seps.escape in field for field in fields):
-        return readings
-    for by_component in (False, True):
-        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
-        if decoded not in readings:
-            readings.append(decoded)
+    and a component at a time, the readings :func:`unescaped_message` gives the token scan, each
+    decoded both with ``\\H\\`` and ``\\N\\`` kept and with them taken out. Every one of those is
+    also read with its invisible characters dropped (:func:`.surrogates.dropped`), the readings
+    :func:`_shape_forms` takes of one field (BACKLOG #5654). The segment id and encoding
+    characters of a header line are left as written when decoded. A reading the same as one
+    before it is left out."""
+    sources = [fields]
+    if seps.escape and any(seps.escape in field for field in fields):
+        shown = [_without_highlighting(field, seps) for field in fields]
+        sources += [
+            unescaped_fields(source, seps, field_sep, by_component=by_component)
+            for source in (fields, shown)
+            for by_component in (False, True)
+        ]
+    readings: list[list[str]] = []
+    for source in sources:
+        for reading in (source, [dropped(field) for field in source]):
+            if reading not in readings:
+                readings.append(reading)
     return readings
 
 
@@ -734,7 +750,8 @@ def _split_shape_hits(
 
     The line is read as written and with its fields decoded (:func:`_line_readings`), so a shape
     whose own characters are escaped, such as ``123-45\\X2D\\6789`` under a field separator of
-    ``-``, is found too (#5533 item 8). A separator is only where the fields meet, so a field
+    ``-``, is found too (#5533 item 8), and so is one an invisible character or a ``\\H\\`` or
+    ``\\N\\`` escape interrupts, such as ``123-45-67\\XAD\\89`` (BACKLOG #5654). A separator is only where the fields meet, so a field
     separator a ``\\F\\`` decodes to inside a field never counts as a cut; the shape detectors
     that read one field judge that one.
 
@@ -802,18 +819,35 @@ def _shape_forms(value: str, seps: Seps, field_sep: str) -> list[str]:
     return list(dict.fromkeys(forms))
 
 
+def _dropped_lines(text: str) -> str:
+    """``text`` with the invisible characters of each line dropped (:func:`.surrogates.dropped`)
+    and its line breaks kept, so two lines never join into one token."""
+    lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+    return "\r".join(dropped(line) for line in lines)
+
+
 def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
     """``scan`` run over ``text`` as written, then over :func:`unescaped_message` decoded a
     subcomponent at a time and a component at a time, so a token written with an HL7 escape
-    sequence is found in either reading (BACKLOG #5532). A decoding that matches one already
-    scanned is not scanned again, and a reason a later pass finds again is not repeated."""
+    sequence is found in either reading (BACKLOG #5532). Each decoding is also taken with
+    ``\\H\\`` and ``\\N\\`` taken out first, and every reading is also scanned with the invisible
+    characters of each line dropped, the readings the cut-shape check takes of a line, so a token
+    an invisible character or a ``\\H\\`` interrupts is found too (BACKLOG #5654). A reading that
+    matches one already scanned is not scanned again, and a reason a later pass finds again is
+    not repeated."""
+    sources = [text]
+    parsed = read_message_seps(text)
+    if parsed is not None and parsed[0].escape and parsed[0].escape in text:
+        shown = _without_highlighting(text, parsed[0])
+        sources += [
+            unescaped_message(source, by_component=by_component)
+            for source in dict.fromkeys((text, shown))
+            for by_component in (False, True)
+        ]
     hits = scan(text)
-    scanned = {text}
-    for by_component in (False, True):
-        decoded = unescaped_message(text, by_component=by_component)
-        if decoded not in scanned:
-            scanned.add(decoded)
-            hits.extend(hit for hit in scan(decoded) if hit not in hits)
+    readings = dict.fromkeys(r for source in sources for r in (source, _dropped_lines(source)))
+    for reading in list(readings)[1:]:
+        hits.extend(hit for hit in scan(reading) if hit not in hits)
     return hits
 
 
