@@ -1860,7 +1860,7 @@ def _on_a_small_stack[T](call: Callable[[], T]) -> T:
 def _refused_on_recursion(
     excinfo: pytest.ExceptionInfo[wa.WebAuthnVerificationError], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The refusal came from the RecursionError catch, not from some other library refusal: the
+    """The refusal came from a RecursionError, not from some other library refusal: the
     precondition holds on the same stack, the cause is the RecursionError, and its type was
     logged."""
     with pytest.raises(RecursionError):

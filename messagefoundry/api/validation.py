@@ -207,8 +207,9 @@ PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 #: cannot hold one, so a NUL at the store's lookup would make its driver raise rather than find no
 #: row; the sign-in service refuses such a name as an unknown one before that lookup. This rule
 #: is on ``POST /users/directory`` alone. Neither sign-in surface carries it: the JSON body and the
-#: web console's form both leave a NUL name to that refusal, which each route charges to the
-#: sign-in limiter and the service audits. Only the NUL: other control characters can reach a
+#: web console's form both leave a NUL name to that refusal, which the service audits. The
+#: attempt is charged to the sign-in limiter, at ``/ui/login/passkey`` for the combined passkey
+#: sign-in and at the sign-in route otherwise. Only the NUL: other control characters can reach a
 #: stored name through paths ``auth.usernames.username_refusal`` does not govern, such as
 #: provision-admin, so refusing them here could lock a holder out. Refusing a NUL locks no one
 #: out only where no account can hold

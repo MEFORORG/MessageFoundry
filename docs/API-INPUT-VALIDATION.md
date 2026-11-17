@@ -63,9 +63,10 @@ rule, set out under [Items checked a second time](#items-checked-a-second-time-b
 Neither sign-in surface refuses a NUL in the name at the body: not `username` on
 `POST /auth/login`, and not the web console's `POST /ui/login` form, which has no body model. The
 NUL rule is left off the sign-in body on purpose. A 422 there would be neither charged to the
-sign-in limiter nor audited. On both surfaces the route charges the limiter, and the sign-in
-service refuses such a name as an unknown one before the account lookup and audits the attempt.
-`POST /auth/login` answers with its usual failed sign-in, and the form with its usual redirect to
+sign-in limiter nor audited. On both surfaces the attempt is charged to the limiter, at
+`POST /ui/login/passkey` for the combined passkey sign-in and at the sign-in route otherwise, and
+the sign-in service refuses such a name as an unknown one before the account lookup and audits
+the attempt. `POST /auth/login` answers with its usual failed sign-in, and the form with its usual redirect to
 the sign-in page.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1
