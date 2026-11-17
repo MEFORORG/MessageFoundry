@@ -564,13 +564,19 @@ def _windows_holder_problem(security: WinSecurity, *, volume_root: bool = False)
     for ace_type, flags, ace_mask, sid in security.aces:
         if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
             continue  # a deny or audit entry, or a template for children, grants nothing here
+        if not ace_mask & mask:
+            continue  # the reader records every granting entry's mask, conditional ones included
         if ace_type != ACCESS_ALLOWED_ACE_TYPE:
             return "its access list holds a conditional entry this check cannot interpret"
-        if ace_mask & mask and _is_broad_group(sid):
-            return f"{describe_sid(sid)} can delete or replace a file in it"
-        if ace_mask & mask and _is_package_sid(sid):
-            return f"the application package {sid} can delete or replace a file in it"
+        if _is_broad_group(sid):
+            return f"{describe_sid(sid)} {_HOLDER_REACH}"
+        if _is_package_sid(sid):
+            return f"the application package {sid} {_HOLDER_REACH}"
     return None
+
+
+#: What an entry within :data:`_HOLDER_REPLACE_MASK` lets its holder do, for the refusal text.
+_HOLDER_REACH = "can delete or replace a file in it, or rename it away"
 
 
 def _windows_engine_owner_problem(owner_sid: str | None, engine_sid: str | None) -> str | None:
@@ -704,14 +710,22 @@ def _windows_judged_problem(
 
 #: Server names that reach this host's own disks over SMB, compared lower-cased: at least these,
 #: and the host's own name (:func:`_loopback_share_problem`).
-_LOOPBACK_SERVERS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0--1.ipv6-literal.net"})
+_LOOPBACK_SERVERS = frozenset(
+    {
+        "localhost",
+        "::1",
+        "[::1]",
+        "0--1.ipv6-literal.net",
+        "0-0-0-0-0-0-0-1.ipv6-literal.net",
+    }
+)
 
 
 def _share_server(path: str) -> str:
     """The server name of a UNC ``path`` (``\\\\server\\share`` or ``\\\\?\\UNC\\server\\share``),
     lower-cased, or ``""`` when it names none."""
     text = path.replace("/", "\\")
-    if text[:8].lower() == "\\\\?\\unc\\":
+    if text[:8].lower() in ("\\\\?\\unc\\", "\\\\.\\unc\\"):
         rest = text[8:]
     elif text.startswith("\\\\"):
         rest = text[2:]
@@ -724,17 +738,20 @@ def _loopback_share_problem(path: str, host_name: str) -> str | None:
     """Why a key file reached through a share is on this host's own disk, or ``None``. Such a
     spelling stops the walk at the share, so a junction on the local path would go unjudged
     (vault BACKLOG #5657); the local path is walked instead. ``host_name`` is this host's name.
-    The loopback addresses are at least those :data:`_LOOPBACK_SERVERS` names, the ``127.``
-    range, and the host's own name, with or without a domain; another of the host's addresses
-    is not recognized. Kept free of I/O so the decision is testable everywhere."""
-    server = _share_server(path)
+    The loopback names recognized are those :data:`_LOOPBACK_SERVERS` names, the ``127.`` range
+    written as four numbers, and the host's own name or its NetBIOS form, with or without a
+    domain or a trailing dot; at least another of the host's addresses, and other spellings of a
+    loopback address, are not. Kept free of I/O so the decision is testable everywhere."""
+    server = _share_server(path).rstrip(".")
     if not server:
         return None
     own = host_name.lower().split(".", 1)[0]
+    short = server.split(".", 1)[0]
     if (
         server in _LOOPBACK_SERVERS
         or server.startswith("127.")
-        or (own and server.split(".", 1)[0] == own)
+        # The NetBIOS name is the host name cut to 15 characters.
+        or (own and short in (own, own[:15]))
     ):
         return (
             "it is reached through a network share on this host itself, whose folders this check "
@@ -754,7 +771,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     ``path`` itself is walked, so a ``subst`` drive root is resolved too. The holder is the folder
     that holds where the walk ends, after every junction, link and ``subst`` drive on the way, and
     its owner and entries are read there, not at a junction that stands in for it. A walk that
-    reached a share reads the holder by its lexical path, through the share. The caller has read
+    reached a share the path names reads the holder by its lexical path, through the share; one
+    that reached a share through a junction, link or ``subst`` drive is refused. The caller has read
     ``path`` itself and refused it if it is a link. ``host`` holds the readers."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
@@ -773,6 +791,13 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     chain, cause = windows_chain(str(full), os.getcwd, _win_probe, drive_target=drive_target)
     problem = _windows_cause_problem(cause)
     if problem is None and cause is not None:
+        if substituted or any(kind == LINK for _obj, kind in chain):
+            # The share is not the one the path names, so neither the loopback test nor the
+            # holder read below would read the share the walk reached.
+            return (
+                "it is reached through a junction, link or subst drive onto a network share, whose "
+                "folders this check does not walk; name it by its share path instead"
+            )
         problem = _loopback_share_problem(str(full), _host_name())
     if problem is not None:
         return problem
@@ -789,7 +814,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     trust = WinTrust(host.engine_sid, host.admin_member)
     try:
         problem = _windows_link_problem(chain, host.read_security, trust)
-        if problem is None and substituted and cause is None:
+        holder_is_root = ntpath.dirname(holder_path) == holder_path
+        if problem is None and substituted and cause is None and not holder_is_root:
             # A subst letter is spliced in with no link entry, but the folders above its target can
             # rename what lies below just as they can above a link, so every folder above the holder
             # is judged by the link rule. The holder itself is judged below, DELETE included.
@@ -807,9 +833,7 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             f"the permissions of the directory that holds it could not be read ({holder.error}); "
             "give the account the engine runs as the right to read that folder's permissions"
         )
-    problem = _windows_holder_problem(
-        holder, volume_root=ntpath.dirname(holder_path) == holder_path
-    )
+    problem = _windows_holder_problem(holder, volume_root=holder_is_root)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
 

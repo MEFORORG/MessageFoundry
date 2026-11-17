@@ -889,6 +889,9 @@ def test_a_file_only_the_engine_writes_is_refused_when_a_shared_service_account_
         "\\\\[::1]\\c$\\keys\\k.key",
         "\\\\0--1.ipv6-literal.net\\c$\\keys\\k.key",
         "\\\\?\\UNC\\localhost\\c$\\keys\\k.key",
+        "\\\\.\\UNC\\localhost\\c$\\keys\\k.key",
+        "\\\\localhost.\\c$\\keys\\k.key",
+        "\\\\0-0-0-0-0-0-0-1.ipv6-literal.net\\c$\\keys\\k.key",
         "\\\\myhost\\keys\\k.key",
         "\\\\MyHost.corp.example\\keys\\k.key",
         "//localhost/c$/keys/k.key",
@@ -907,6 +910,23 @@ def test_a_share_that_is_this_host_itself_is_refused(path: str) -> None:
 )
 def test_a_share_on_another_host_or_a_local_path_is_not_a_loopback(path: str) -> None:
     assert restricted_file._loopback_share_problem(path, "myhost.corp.example") is None
+
+
+def test_a_share_named_by_this_hosts_netbios_name_is_refused() -> None:
+    """The NetBIOS name is the host name cut to 15 characters."""
+    problem = restricted_file._loopback_share_problem(
+        "\\\\LAB-SERVER-NAME\\c$\\k.key", "lab-server-name-01"
+    )
+    assert problem is not None
+
+
+def test_a_conditional_holder_entry_granting_no_replace_right_is_not_counted() -> None:
+    """A callback entry that grants only read cannot replace a file; one within the mask is still
+    refused, since whom it applies to is unknown."""
+    read_only = WinSecurity(_ADMINS, ((0x09, 0, 0x00000001, ""),))
+    assert restricted_file._windows_holder_problem(read_only) is None
+    deleting = WinSecurity(_ADMINS, ((0x09, 0, 0x00000040, ""),))
+    assert "conditional entry" in str(restricted_file._windows_holder_problem(deleting))
 
 
 def test_a_posix_root_that_could_not_be_read_is_refused() -> None:
@@ -1492,23 +1512,9 @@ def judge_links_only_under(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     ``AppData``, which refuses every junction under the temporary directory. A no-op elsewhere."""
     if sys.platform != "win32":
         return
-    import messagefoundry.auth.anchor_path as anchor_path
-
-    real = anchor_path.windows_host_readers
-    inside = str(root).lower()
-    clean = WinSecurity(_SYSTEM, ((_ALLOW, 0, _FULL, _SYSTEM),))
-
-    def readers() -> anchor_path.WinHost:
-        host = real()
-
-        def read_security(obj: str, kind: str) -> WinSecurity:
-            if obj.lower() == inside or obj.lower().startswith(inside + "\\"):
-                return host.read_security(obj, kind)
-            return clean
-
-        return dataclasses.replace(host, read_security=read_security)
-
-    monkeypatch.setattr(restricted_file, "windows_host_readers", readers)
+    monkeypatch.setattr(
+        restricted_file, "windows_host_readers", lambda: _host_judging_only_under(root)
+    )
 
 
 def _junction(link: Path, target: Path) -> None:
@@ -1597,6 +1603,12 @@ def test_windows_a_subst_drive_on_the_path_is_judged_like_a_link(tmp_path: Path)
     _icacls(mid, "/grant", f"*{_USERS}:(D)")  # Users may rename the drive root's own folder away
     problem = str(surroundings(Path("Q:\\"), host))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+    # A letter onto a share: neither the loopback test nor the holder read sees that share.
+    onto_share = dataclasses.replace(
+        host, drive_target=lambda d: "\\??\\UNC\\localhost\\c$" if d.upper() == "Q:" else None
+    )
+    problem = str(surroundings(Path("Q:\\keys\\store.key"), onto_share))
+    assert "onto a network share" in problem
 
 
 @windows_only
