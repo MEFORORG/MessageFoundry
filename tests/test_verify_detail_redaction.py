@@ -354,6 +354,44 @@ def test_a_password_equal_to_another_printed_word_is_hidden_at_every_occurrence(
     assert count(model.safe_detail_text(text)) == 0, model.safe_detail_text(text)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.",
+        "Login Password: Kv9x7Qz3 retry with (Kv9x7Qz3),",
+        "Login Password: Kv9x7Qz3 retry with 'Kv9x7Qz3'",
+    ],
+)
+def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str) -> None:
+    """Code review of round 8, BACKLOG #5395: fragments were whole whitespace-split words, so
+    ``Kv9x7Qz3.`` was a different fragment from ``Kv9x7Qz3`` and printed. A fragment is a run of
+    word characters now. Control: the whole-word fragments the code used before print it."""
+    import re
+    from collections import Counter
+
+    from messagefoundry.redaction import redact
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify import model
+
+    ph = model._PLACEHOLDER
+    detail = model.safe_detail_text(text)
+    assert "Kv9x7Qz3" not in detail, detail
+
+    def whole(word: str) -> list[str]:
+        return [piece for piece in word.split(ph) if piece]
+
+    phi_first = scrub_credentials(redact(text), placeholder=ph)
+    credentials_first = redact(scrub_credentials(text, placeholder=ph))
+    printed = Counter(p for w in credentials_first.split() for p in whole(w))
+    shown = Counter(p for w in phi_first.split() for p in whole(w))
+    before = re.sub(
+        r"\S+",
+        lambda m: m[0] if all(shown[p] <= printed[p] for p in whole(m[0])) else ph,
+        phi_first,
+    )
+    assert "Kv9x7Qz3" in before, before
+
+
 def test_the_placeholder_is_not_an_html_tag() -> None:
     """A sink that renders a pasted detail as HTML would drop ``<redacted>`` and show ``PWD=`` as an
     empty password; the detail's placeholder is the square-bracket one."""

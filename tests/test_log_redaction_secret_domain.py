@@ -1343,8 +1343,16 @@ def test_a_dsn_password_with_no_user_or_an_at_sign_is_hidden_whole(
 def test_a_later_member_holding_an_at_sign_keeps_its_label(
     line: str, pieces: tuple[str, ...], kept: str
 ) -> None:
-    """The DSN password stops before a member or query separator, so the member pass after it still
-    sees its label. Through the public entry points only: masking the member is that pass's job."""
+    """With a user before the host, the DSN password stops at its own "@" and the widened run after it
+    stops before a member or query separator, so the member pass after it still sees its label.
+    Through the public entry points only: masking the member is that pass's job.
+
+    NOT TRUE OF EVERY SHAPE. With no user before the host, as in
+    ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``, the narrow pattern reads
+    the host as the user and ``1433;user=svc;sslpassword=P`` as the password, since its password
+    class holds ";", so the member's label is inside its match and ``ss_Sec9`` prints. That pattern
+    predates BACKLOG #5386, and origin/main prints the same;
+    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail` pins it."""
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
@@ -1352,6 +1360,17 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
         for piece in pieces:
             assert piece not in out, f"{label}: {piece!r} printed -- got {out!r}"
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
+
+
+def test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail() -> None:
+    """The residual the test above states, pinned so a fix shows up as a red here."""
+    line = "jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;"
+    match = scrub_mod._DSN_PASSWORD.search(line)
+    assert match is not None and match.group(0) == (
+        "sqlserver://db.invalid:1433;user=svc;sslpassword=P@"
+    )
+    for out in (redact_log_line(line), scrub_credentials(line)):
+        assert "ss_Sec9" in out and "sslpassword" not in out, out
 
 
 @pytest.mark.parametrize(
@@ -1629,6 +1648,54 @@ def test_the_widened_dsn_run_stops_where_its_stop_vocabularies_say() -> None:
     ):
         assert hidden not in scrub_credentials(text)
         assert hidden not in redact_log_line(text)
+
+
+#: Round 8's widened pattern, for the control below: the user's first segment was the narrow class
+#: with no stop, so it crossed a placeholder and a label. Spelled here, since nothing ships it now.
+_ROUND_EIGHT_WIDE = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
+    r"(?:(?<=//:)(?:" + scrub_mod._DSN_RUN_STOP + r"[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22])*+"
+    r"|(?<!//:)[^\s/@]++)(?:" + scrub_mod._DSN_RUN_STOP + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
+)
+
+
+def test_a_users_first_password_segment_stops_at_a_placeholder_and_a_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-8 review of BACKLOG #5386: on the store error path,
+    ``dsn postgres://svc:accessToken=redis://ops:'@Tok_Sec9 end`` printed ``Tok_Sec9``, where
+    origin/main hid it. The narrow pass hid the quote and a label pass the ``accessToken=`` value,
+    and the user's first segment, the narrow class with no stop, then read
+    ``accessToken=[REDACTED][REDACTED]`` as the password, so the handler found no label.
+    Control: round 8's pattern, patched back in, prints it."""
+    line = "dsn postgres://svc:accessToken=redis://ops:'@Tok_Sec9 end"
+
+    def run() -> str:
+        return _one_handler(redact_log_line(line)[:300])
+
+    assert "Tok_Sec9" not in run(), run()
+    with monkeypatch.context() as m:
+        m.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", _ROUND_EIGHT_WIDE)
+        m.setattr(redact_mod, "_WIDE_DSN_PASSWORD", _ROUND_EIGHT_WIDE)
+        assert "Tok_Sec9" in run(), "round 8's pattern no longer prints it, so this tests nothing"
+
+
+@pytest.mark.parametrize(
+    "placeholder", [CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER, "[redacted]"]
+)
+def test_a_users_first_password_segment_still_reads_the_narrow_passs_placeholder(
+    placeholder: str,
+) -> None:
+    """The narrow pass rewrites ``svc:p@`` to ``svc:<placeholder>@``, and the widened one reads that
+    placeholder as the whole first segment, so the tail after the "@" is still hidden, under each
+    placeholder a caller passes: secretscrub's default, the bundle's and verify's. Positive control:
+    the narrow pass alone prints the tail."""
+    text = "postgres://svc:p@ss_Tail9@db/x"
+    assert "ss_Tail9" not in scrub_credentials(text, placeholder=placeholder)
+    narrow = scrub_mod._DSN_PASSWORD.sub(lambda m: f"{m.group(1)}:{placeholder}@", text)
+    assert "ss_Tail9" in narrow
+    assert scrub_mod._WIDE_DSN_PASSWORD.sub("x", narrow) == "x" + "db/x"
+    assert "ss_Tail9" not in redact_log_line(text)
 
 
 #: Text that can sit glued in front of a DSN in a real log line, paired against the scheme table above

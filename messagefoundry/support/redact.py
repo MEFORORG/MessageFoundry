@@ -534,15 +534,18 @@ _KEY_MATERIAL = re.compile(
 # member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
 # measured its run after the password reach past a glued ``\ndbPassword=`` label and print that
 # value's tail on every glue it tried. After the shared
-# vocabulary a value it hid is a placeholder, and the widened run after the password, which stops
-# at "[" and "]", cannot cross it. Nor does the run cross a label: it stops where a key of the
-# write-time query filter or a label word secretscrub reads starts, followed by ":" or "=", and
-# where a ``MEFOR_`` name starts, with no separator required after it (``_DSN_RUN_STOP`` there says
-# how, and why). So a value such a label holds is left to
+# vocabulary a value it hid is a placeholder, and the widened reading crosses one only where it is
+# the whole first segment of a password with a user, which is where the narrow pass above writes
+# its own: the run after the password stops at "[" and "]", and that first segment otherwise stops
+# at a bracket or an angle too (round 9). Nor does any segment of it cross a label: each stops
+# where a key of the write-time query filter or a label word secretscrub reads starts, followed by
+# ":" or "=", and where a ``MEFOR_`` name starts, with no separator required after it
+# (``_DSN_RUN_STOP`` and ``_DSN_USER_FIRST_SEGMENT`` there say how, and why). So a value such a
+# label holds is left to
 # the pass that reads it, as the narrow pass alone left it, including one this function never hides,
 # such as a ``state=`` query value, which the write-time query filter hides on the store error path.
-# What the run still crosses is a label that no pass reads, and there it hides more than the narrow
-# pass did, never less.
+# What the reading still crosses is a label that no pass reads, and there it hides more than the
+# narrow pass did, never less.
 #
 #: Both DSN readings are secretscrub's own objects, not copies. Assigned, not only imported, so
 #: strict mypy lets a test name each on this module; a test disables each here by that name.
@@ -669,9 +672,10 @@ def redact_log_line(line: str) -> str:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     # The widened DSN reading, last and over the whole line (BACKLOG #5386): a password-only DSN, or
     # a password holding an "@" that the narrow copy above cut at its first one. A value the passes
-    # above hid is a placeholder by now, and its run cannot reach past one. Nor past a label a pass
-    # reads, a query key the write-time filter hides included, whether or not a pass above hid its
-    # value; the comment on _DSN_PASSWORD says which labels.
+    # above hid is a placeholder by now, and the reading reaches past one only where it is a user's
+    # whole first password segment, which is where the narrow copy wrote its own. Nor past a
+    # label a pass reads, a query key the write-time filter hides included, whether or not a pass
+    # above hid its value; the comment on _DSN_PASSWORD says which labels.
     if "@" in body and "://" in body:
         body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)

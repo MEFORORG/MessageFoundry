@@ -61,8 +61,9 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     (``a|b^password= <value>``), and the value printed. The primary result is PHI first, then the
     credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
     the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
-    the user. Then every whitespace-separated word of that result holding a fragment, between
-    placeholders, that it prints more often than the credentials-first result does is replaced
+    the user. Then every whitespace-separated word of that result holding a fragment, a run of word
+    characters between placeholders, that it prints more often than the credentials-first result
+    does is replaced
     whole, at every occurrence (:func:`_printed_by_both`). That errs toward hiding: a label the
     other order spelled differently goes with its value.
 
@@ -94,8 +95,19 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     return f"{shown} {note}" if note else shown
 
 
+_WORD_RUN: Final = re.compile(r"\w+")
+
+
 def _fragments(word: str) -> list[str]:
-    return [piece for piece in word.split(_PLACEHOLDER) if piece]
+    """The pieces of ``word`` between placeholders, each cut into its runs of word characters, so a
+    value glued to punctuation (``Kv9x7Qz3.``, ``(Kv9x7Qz3)``) is the same fragment as the bare value.
+    A piece holding no word character is kept whole."""
+    return [
+        run
+        for piece in word.split(_PLACEHOLDER)
+        if piece
+        for run in (_WORD_RUN.findall(piece) or [piece])
+    ]
 
 
 def _printed_by_both(primary: str, other: str) -> str:
@@ -109,12 +121,15 @@ def _printed_by_both(primary: str, other: str) -> str:
     is the password is a position, and the first occurrence is the password when the label comes
     first (``Login Password: svcadmin for user svcadmin``). So a fragment ``primary`` prints more
     often than ``other`` is hidden at EVERY occurrence. That errs toward hiding: the user name goes
-    with the password it equals.
+    with the password it equals. A fragment is a run of word characters (:func:`_fragments`), so in
+    ``Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.`` the value glued to the full stop counts with the
+    bare one and goes too, and a whole word goes when any run in it does.
 
-    It compares counts, never positions, so it is best-effort. Residuals, at least this one: a value
-    ``primary`` prints at one place while ``other`` prints the same fragment as often at another place
-    is kept, so a credential equal to a word only the credentials-first order printed elsewhere
-    prints. BACKLOG #5395 holds it open."""
+    It compares counts, never positions, so it is best-effort. Residuals, at least these: a value
+    glued to a word character is a different run, so ``xKv9x7Qz3y`` elsewhere on the line prints; and
+    a value ``primary`` prints at one place while ``other`` prints the same fragment as often at
+    another place is kept, so a credential equal to a word only the credentials-first order printed
+    elsewhere prints. BACKLOG #5395 holds it open."""
     printed = Counter(piece for word in other.split() for piece in _fragments(word))
     shown = Counter(piece for word in primary.split() for piece in _fragments(word))
     return re.sub(
