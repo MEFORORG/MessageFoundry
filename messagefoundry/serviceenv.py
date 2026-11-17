@@ -301,10 +301,17 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: A later line that sets an ordinary variable: a name Windows allows in an environment block,
 #: which is any non-blank text without an equals sign (``ProgramFiles(x86)`` among them), then an
 #: equals sign, then a value holding something other than equals signs and blanks. Such a line
-#: ends the variable above it. A line of base64 does not match, since its only equals signs are
-#: the padding at its end, and neither does a line of PEM armour, which holds no equals sign. So
-#: ``OTHER=`` with an empty value does not match either, and is read as part of the value above
-#: it: a store key left empty above it then reads as set, an error toward refusing.
+#: ends the variable above it. A line of PEM armour does not match, since it holds no equals
+#: sign, and nor does a single padded base64 key, whose only equals signs end it. ``OTHER=``
+#: with an empty value does not match either, and is read as part of the value above it.
+#:
+#: Key material CAN match. ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` takes a comma-separated list
+#: of padded base64 keys, so a line ``<key>=,<key>=`` reads as an ordinary name, the first key,
+#: set to the rest. The heuristic alone would then end the retired-keys value above it and leave
+#: that name empty, so nothing would refuse (vault BACKLOG #5394). What makes it safe is
+#: :func:`_names`: a secret-class name with any non-blank line after it on its string is kept
+#: whatever its own value reads as, so this heuristic decides only where an ordinary or
+#: ``MEFOR_VALUE_*`` value ends, never whether a secret-class name refuses.
 _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?!=*\s*\Z)")
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
@@ -334,6 +341,9 @@ class _Variable:
     value: str
     #: Whether NSSM may read the name with a line break in it.
     broken: bool = False
+    #: Whether a non-blank line follows the variable's own line on its string, so a later line
+    #: the reader took for another variable may be its value.
+    continued: bool = False
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -348,7 +358,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     (:data:`_ORDINARY_LINE`) ends the value above it under the line reading, and is not kept:
     under the whole-string reading it sets nothing, so the secrets directory's name is never taken
     as set by a later line. Any other line, such as one of key material, belongs to the value
-    above it, so a key whose value starts on the next line is not empty.
+    above it, so a key whose value starts on the next line is not empty. A line of key material
+    can still read as an ordinary variable, so each variable records whether a non-blank line
+    follows it, and :func:`_names` keeps a secret-class name that has one whatever its value.
 
     Each string is also read whole, as ``main`` read it: the name before its first equals sign,
     stripped, and everything after it as the value. That variable is kept when its name is one
@@ -363,6 +375,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         lines = _LINE_BREAK.split(entry)
         # ``skip`` keeps the later lines' numbers counted from the string's real first line.
         skip = next((i for i, line in enumerate(lines) if line.strip()), len(lines) - 1)
+        # The index of the string's last non-blank line: a line above it has a continuation.
+        last = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
         first, *rest_lines = lines[skip:]
         first_written, first_equals, first_rest = first.partition("=")
         first_written = first_written.strip()
@@ -388,11 +402,14 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                 f"{where}, line {number} of a string whose first line is another entry",
                 written,
                 "\n".join(value_parts),
+                continued=last > number - 1,
             )
             for number, written, value_parts in later
         ]
         if first_equals:
-            read.append(_Variable(where, first_written, "\n".join(first_parts)))
+            read.append(
+                _Variable(where, first_written, "\n".join(first_parts), continued=last > skip)
+            )
         # The whole-string reading, exactly as ``main`` read every entry: the name is everything
         # before the first equals sign, stripped, and the value everything after it. Kept when that
         # name is one the refusal is about, so a blank first line, a line break before the equals
@@ -419,13 +436,19 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str], ...]:
     never kept. An empty value carries no secret, so its name is not kept, except a
     ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and whose empty
     value the engine still overlays on the value file. A path in a name that takes either a key or
-    its path is not a secret, so that name is not kept either. Windows compares environment names
-    without case, so this does too. Each name is returned with the first registry value, and the
+    its path is not a secret, so that name is not kept either. Neither exception holds for a
+    secret-class name with a non-blank line after it on its string: that line may be its value,
+    as a line of retired keys can read as another variable, so the name is kept whatever its own
+    value reads as (vault BACKLOG #5394). Windows compares environment names without case, so
+    this does too. Each name is returned with the first registry value, and the
     line, that sets it."""
     names: dict[str, str] = {}
     for variable in variables:
         name = variable.written.upper()
         value = variable.value
+        if variable.continued and name in _REFUSED_CLASS_NAMES:
+            names.setdefault(name, variable.where)
+            continue
         # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
         if not name or not ((value and not value.isspace()) or name.startswith(_VALUE_PREFIX)):

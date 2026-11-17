@@ -435,12 +435,84 @@ def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
-def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str) -> None:
-    """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line, so an empty later
-    ``KEY=`` above it stays empty and nothing refuses, as on ``main``."""
+def test_an_empty_later_store_key_above_an_ordinary_name_still_refuses(key: str) -> None:
+    """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line and ends the value
+    above it, but the reader cannot tell it from key material that reads as one, so an empty
+    later ``KEY=`` above it refuses (vault BACKLOG #5394). ``main`` let this through."""
     posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
-    assert posture.listed_keys == ()
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
+
+
+def test_an_ordinary_name_windows_allows_ends_an_ordinary_empty_value_above_it() -> None:
+    """The control: with an ordinary name in place of the key, nothing refuses."""
+    posture = _service(["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_LOG_LEVEL=\nProgramFiles(x86)=C:\\x"])
+    assert posture.listed == ("MEFOR_AI_ENVIRONMENT",)
     assert service_env_refusal(posture) is None
+
+
+#: A synthetic padded base64 value, never a real key: what a retired-keys list holds per item.
+_PADDED = "c3ludGhldGljLXJldGlyZWQta2V5LXZhbHVl="
+
+_LINE_BREAKS = pytest.mark.parametrize("br", ["\r\n", "\n", "\r"], ids=["crlf", "lf", "cr"])
+
+
+@_LINE_BREAKS
+@pytest.mark.parametrize(
+    ("name", "entry"),
+    [
+        (
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
+            "MEFOR_AI_ENVIRONMENT=prod{br}{name}={br}" + f"{_PADDED},{_PADDED}",
+        ),
+        ("MEFOR_STORE_PASSWORD", "MEFOR_AI_ENVIRONMENT=prod{br}{name}={br}abc=def"),
+        ("MEFOR_STORE_PASSWORD", "{name}={br}abc=def"),
+    ],
+    ids=["retired-keys-later", "password-later", "password-first"],
+)
+def test_a_secret_class_name_with_a_line_after_it_refuses_whatever_it_reads(
+    br: str, name: str, entry: str
+) -> None:
+    """Vault BACKLOG #5394: a comma-separated list of padded keys, ``<key>=,<key>=``, reads as an
+    ordinary variable's line, so the retired-keys name above it read as empty and nothing refused.
+    A secret-class name with any non-blank line after it now refuses whatever its own value reads
+    as, under each line break a registry string may hold."""
+    posture = _service([entry.format(br=br, name=name)])
+    assert name in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert name in refusal
+    assert _PADDED not in repr(posture)
+
+
+@_LINE_BREAKS
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_AI_ENVIRONMENT=prod{br}MEFOR_LOG_LEVEL={br}" + f"{_PADDED},{_PADDED}",
+        "MEFOR_AI_ENVIRONMENT=prod{br}MEFOR_LOG_FILE={br}abc=def",
+        "MEFOR_LOG_FILE={br}abc=def",
+    ],
+    ids=["retired-keys-later", "password-later", "password-first"],
+)
+def test_the_same_strings_with_an_ordinary_name_do_not_refuse(br: str, entry: str) -> None:
+    """The control: the reviewer's strings with an ordinary ``MEFOR_`` name in place of the
+    secret-class one refuse nothing."""
+    assert service_env_refusal(_service([entry.format(br=br)])) is None
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_STORE_ENCRYPTION_KEY=",
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_STORE_ENCRYPTION_KEY=\n\n  ",
+        "MEFOR_AI_ENVIRONMENT=prod\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem\r\n",
+    ],
+)
+def test_a_secret_class_name_on_its_strings_last_line_keeps_its_value_rule(entry: str) -> None:
+    """With no non-blank line after it nothing can be its value, so an empty key or a path-form
+    OIDC key on a string's last line still refuses nothing, as ``main`` let it through."""
+    assert service_env_refusal(_service([entry])) is None
 
 
 def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses() -> None:
