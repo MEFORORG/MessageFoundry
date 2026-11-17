@@ -140,8 +140,10 @@
 
 .OUTPUTS
     Exit code 0 when every ref is backed by at least one trusted remote-tracking ref; 1 when any is not.
-    Exit code 2 means the check could not run and therefore reports nothing -- never success. That
-    includes a git listing or rev-list that failed partway (reported as UNVERIFIABLE).
+    Exit code 2 means the check could not run, or could not run completely -- never success. That
+    includes a git listing or rev-list that failed partway (reported as UNVERIFIABLE); such a run
+    still lists the unbacked items it did measure, in text and in the JSON, unless the trusted
+    exclusion set itself failed, when the text withholds the counts.
 #>
 #Requires -Version 7
 [CmdletBinding()]
@@ -595,8 +597,14 @@ foreach ($r in $repos) {
         Write-Host "              A failed scan prints nothing, and nothing is not zero: this repository" -ForegroundColor Red
         Write-Host "              could not be fully measured. Run git fsck there; a missing object is the usual cause." -ForegroundColor Red
         # What DID scan is still shown: a failure on one ref must not hide the at-risk work found
-        # on the others. The JSON carries the same items under Findings and DetachedUnbacked.
-        if ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0) {
+        # on the others. The JSON carries the same items under Findings and DetachedUnbacked. But
+        # when the trusted exclusion set itself could not be read, every count was taken against
+        # too little and would call backed work "on no remote", so the list is withheld.
+        $exclusionFailed = @($r.ScanFailed | Where-Object { $_ -like '(tracking refs of *' -or $_ -eq '(tracking ref object check)' }).Count -gt 0
+        if ($exclusionFailed -and ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0)) {
+            Write-Host "              per-branch counts withheld: the trusted remotes' refs could not be read," -ForegroundColor Red
+            Write-Host "              so every count here would overstate what is on no remote." -ForegroundColor Red
+        } elseif ($r.Unbacked -gt 0 -or $r.DetachedUnbacked.Count -gt 0) {
             Write-Host "              measured before or beside the failure, on no remote:" -ForegroundColor Yellow
             if (-not $Quiet) {
                 foreach ($f in ($r.Findings | Sort-Object Commits -Descending)) {
