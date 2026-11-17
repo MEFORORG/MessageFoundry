@@ -433,8 +433,9 @@ $rows = @()
 $lookupFailures = @()
 foreach ($r in $records) {
     $rec = $r.Rec
-    # Every field of a seat record is read through Get-RecordField, which answers `{}` under
-    # StrictMode where `.PSObject.Properties.Name` throws (BACKLOG #5491).
+    # This loop reads seat-record fields through Get-RecordField, which answers `{}` under StrictMode
+    # where `.PSObject.Properties.Name` throws (BACKLOG #5491). The -Chip briefing below still reads
+    # its record's fields bare.
     $wt = [string](Get-RecordField $rec 'worktree')
     $sid = [string](Get-RecordField $rec 'sessionId')
 
