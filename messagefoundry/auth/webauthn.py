@@ -181,7 +181,9 @@ def _invalid_input_errors() -> tuple[type[Exception], ...]:
 
     ``RecursionError`` joins them for a response nested past json's depth limit, which the
     library's own ``json.loads`` raises and does not wrap (vault BACKLOG #5341). Its message names
-    the depth, not the input.
+    the stack use, not the input. It covers a response that reaches the library as text; a route
+    that parses the body itself first raises its own ``RecursionError`` there, which this does
+    not cover.
 
     A function rather than a constant because the library import is lazy (the extra is optional).
     """

@@ -3674,32 +3674,18 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
         assert too_long.status_code == 422
 
 
-# --- vault BACKLOG #5342: a sign-in naming a control character is refused at the body ----------
+# --- vault BACKLOG #5342: a sign-in naming a NUL is refused at the body --------------------------
 
 
-@pytest.mark.parametrize(
-    "fields",
-    [
-        {"username": "sup\x00"},
-        {"username": "s\x01up"},
-        {"username": "sup\x9f"},
-        {"username": ""},
-        {"supersedes": "tok\x00en"},
-        {"supersedes": "\x1b"},
-        {"supersedes": ""},
-    ],
-)
-async def test_login_refuses_a_control_character_before_the_store(
-    engine: Engine, fields: dict[str, str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("username", ["sup\x00", "\x00", "s\x00up"])
+async def test_login_refuses_a_nul_username_before_the_store(
+    engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red: each reached ``AuthService.login``, where on a PostgreSQL store a NUL would raise an
+    """Red: each reached ``AuthService.login``, where on a PostgreSQL store the NUL would raise an
     error the route does not catch, a 500 outside the failure-timing pad. Now each is a 422 before
-    the service runs. The control: the same body without the bad field still signs in."""
+    the service runs."""
     service = await _service(engine, AuthSettings(require_mfa=False))
-    await _add(service, "sup", Role.VIEWER)
     async with _client(engine, service) as c:
-        ok = await c.post("/auth/login", json={"username": "sup", "password": PW})
-        assert ok.status_code == 200
         reached: list[str] = []
 
         async def _spy(*args: object, **kwargs: object) -> object:
@@ -3707,6 +3693,24 @@ async def test_login_refuses_a_control_character_before_the_store(
             raise AssertionError("the service ran")
 
         monkeypatch.setattr(service, "login", _spy)
-        r = await c.post("/auth/login", json={"username": "sup", "password": PW, **fields})
+        r = await c.post("/auth/login", json={"username": username, "password": PW})
         assert r.status_code == 422
         assert reached == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"username": "s\x01up"}, {"username": ""}, {"supersedes": "tok\x00en"}, {"supersedes": ""}],
+)
+async def test_login_still_reaches_the_service_for_other_unusual_values(
+    engine: Engine, fields: dict[str, str]
+) -> None:
+    """The controls: another control character, an empty name, and a ``supersedes`` holding a NUL
+    (only ever hashed, never sent to the store) are not refused by the body, so they are still
+    charged, padded and audited as a failed or plain sign-in, as before."""
+    service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    async with _client(engine, service) as c:
+        r = await c.post("/auth/login", json={"username": "sup", "password": PW, **fields})
+        expected = 200 if "supersedes" in fields else 401
+        assert r.status_code == expected

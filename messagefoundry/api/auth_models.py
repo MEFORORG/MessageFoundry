@@ -18,7 +18,6 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    PRINTABLE_TEXT_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -35,6 +34,8 @@ _PASSWORD_MAX = 1024
 _GROUP_MAX = 512
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
+#: Any text but a NUL, empty included (vault BACKLOG #5342; ``LoginRequest`` says why).
+_NO_NUL_PATTERN = r"^[^\x00]*$"
 
 #: The response header an ``oidc`` session's step-up refusal carries, set to
 #: :data:`STEP_UP_VIA_IDP`, so a client can branch on a header rather than parse the detail
@@ -56,21 +57,20 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
-    # ``username`` and ``supersedes`` take the printable rule, which also refuses an empty value
-    # (vault BACKLOG #5342). Without it a NUL would reach the store's lookup, where PostgreSQL
-    # refuses it with an error the route does not catch, so the public sign-in route would answer
-    # 500 outside its failure-timing pad. No account can hold such a name (``username_refusal``) and no token
-    # carries one, so the 422 refuses only a value that could never sign in or name a session.
-    username: str = Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN)
+    # A NUL in ``username`` is refused here (vault BACKLOG #5342). It would reach the store's
+    # lookup, where PostgreSQL refuses it with an error this route does not catch, so the route
+    # would answer 500 outside its failure-timing pad. Only the NUL: PostgreSQL text cannot hold
+    # one, so no account on that store has one, while other control characters can reach a stored
+    # name through paths ``username_refusal`` does not govern, such as provision-admin. Other
+    # sign-in routes are not covered by this model (``messagefoundry_webconsole``'s form login).
+    username: str = Field(max_length=_NAME_MAX, pattern=_NO_NUL_PATTERN)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
     #: The raw session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG
     #: #2096). Not the session ``id`` that ``/me/sessions`` shows, which is the token's hash: a
     #: value that names no session ends nothing, and the sign-in still succeeds. On success the
     #: engine ends it as ``AuthService._issue_session`` describes.
-    supersedes: str | None = Field(
-        default=None, max_length=_TOKEN_MAX, pattern=PRINTABLE_TEXT_PATTERN
-    )
+    supersedes: str | None = Field(default=None, max_length=_TOKEN_MAX)
     # ADR 0197 (BACKLOG #1131): the optional authenticator code of the COMBINED sign-in, the password
     # and a TOTP code in one request. Absent means today's two-step flow, unchanged. Bounded to the
     # longest code any compiled-in enrolment gives (#3422); the engine treats a blank one as absent.
