@@ -467,19 +467,38 @@ def test_with_no_usable_startedat_the_file_age_decides(
         ("here-sub", "UNREADABLE"),
         ("elsewhere", "DEAD"),
         (None, "UNREADABLE"),
+        ("parent", "UNREADABLE"),
+        ("long-path-prefix", "UNREADABLE"),
+        ("dot-segments", "UNREADABLE"),
+        ("sibling-prefix", "DEAD"),
     ],
-    ids=["same-worktree", "inside-worktree", "other-worktree", "no-cwd-fails-closed"],
+    ids=[
+        "same-worktree",
+        "inside-worktree",
+        "other-worktree",
+        "no-cwd-fails-closed",
+        "parent-of-worktree",
+        "long-path-prefix",
+        "dot-segments",
+        "sibling-sharing-a-prefix",
+    ],
 )
 def test_the_anonymous_veto_reaches_only_the_worktree_it_names(
     config_root: Path, tmp_path: Path, anon_cwd: str | None, state: str
 ) -> None:
-    """A record naming no session vetoes a lookup for its own tree, case and slashes aside, and not
-    one for another tree. One with no readable cwd cannot be placed, so it vetoes everywhere."""
+    """A record naming no session vetoes a lookup for its own tree, case, slashes and a \\\\?\\ or
+    ``..`` spelling aside, and one for a tree under it, as a primary checkout holds its worktrees.
+    It does not veto another tree, even one whose name starts with this one's. One with no readable
+    cwd cannot be placed, so it vetoes everywhere."""
     here = tmp_path / "wt-here"
     cwds = {
         "here": str(here).upper().replace("\\", "/") + "/",
         "here-sub": str(here / "sub"),
         "elsewhere": str(tmp_path / "wt-elsewhere"),
+        "parent": str(tmp_path),
+        "long-path-prefix": "\\\\?\\" + str(here),
+        "dot-segments": str(tmp_path / "x" / ".." / "wt-here"),
+        "sibling-prefix": str(tmp_path / "wt-here-too"),
     }
     write_session(config_root, pid=never_live_pid(), session_id="5491abab-0000")
     record: dict[str, Any] = {"pid": os.getpid(), "startedAt": NOW_MS}
@@ -510,14 +529,18 @@ def _fleet(
     anonymous: dict[str, Any] | None,
     coord: Path | None = None,
     anon_in_seat_worktree: bool = True,
+    raw_records: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
-    worktree, unless ``anonymous`` sets its own. Returns the run and the anonymous record's path."""
+    worktree, unless ``anonymous`` sets its own. ``raw_records`` maps more registry file names to
+    their exact text. Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
     write_session(root, pid=never_live_pid(), session_id="5491dead-0000-0000-0000-000000000000")
+    for name, text in (raw_records or {}).items():
+        (root / "sessions" / name).write_text(text, encoding="utf-8")
     repo = tmp_path / "repo"
     seat_wt = repo / "seat-worktree"
     anon = root / "sessions" / "99010.json"
@@ -635,6 +658,68 @@ def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails(tmp_path: Pat
     assert proc.returncode == 4, proc.stdout + proc.stderr
     assert not proc.stdout.strip(), proc.stdout
     assert "scan-broke-5491" in proc.stderr, proc.stderr
+
+
+def _broken_coord(tmp_path: Path, override: str) -> Path:
+    """A copy of fleet.ps1 and the scripts it loads, with ``override`` appended to the copy of
+    session-registry.ps1, so the real scripts are untouched."""
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    for name in ("fleet.ps1", "mail-key.ps1", "coord-root.ps1"):
+        shutil.copy2(REGISTRY.parent / name, coord / name)
+    (coord / "session-registry.ps1").write_text(
+        REGISTRY.read_text(encoding="utf-8") + "\n" + override + "\n", encoding="utf-8"
+    )
+    return coord
+
+
+def test_fleet_suppresses_the_roster_when_the_anonymous_scan_fails_with_no_message(
+    tmp_path: Path,
+) -> None:
+    """The failure is the throw, not its message: an empty message read as a scan that passed."""
+    coord = _broken_coord(
+        tmp_path, "function Get-AnonymousSessionRecords { throw [System.Exception]::new('') }"
+    )
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not proc.stdout.strip(), proc.stdout
+    assert "with no message" in proc.stderr, proc.stderr
+
+
+def test_fleet_reads_a_seat_whose_lookup_throws_as_possibly_running(tmp_path: Path) -> None:
+    """An unevaluated fence is not a gone session. A throw used to read UNKNOWN, rendered
+    INTERRUPTED, which -Chip and respawn.ps1 treat as respawnable."""
+    coord = _broken_coord(tmp_path, "function Get-SessionLiveness { throw 'lookup-broke-5491' }")
+    proc, _ = _fleet(tmp_path, None, coord=coord)
+    row = {r["Box"]: r for r in _fleet_json(proc)["rows"]}["box-5491"]
+    assert row["Fence"] == "UNREADABLE", row
+    assert row["State"] == "POSSIBLY RUNNING", row
+
+
+def test_fleet_reaches_its_refusal_on_an_empty_object_registry_file(tmp_path: Path) -> None:
+    """A registry file holding ``{}`` parses to an object with no properties. Reading its cwd threw
+    under StrictMode and ended fleet with exit 1. It names no session, no pid and no cwd, so it
+    cannot be placed: the roster is suppressed with exit 4 and the file named."""
+    proc, _ = _fleet(tmp_path, None, raw_records={"99015.json": "{}"})
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert "99015.json" in proc.stderr, proc.stderr
+    assert "cannot be found" not in proc.stderr, proc.stderr
+
+
+def test_fleet_counts_a_live_anonymous_record_in_a_real_worktree_in_its_denominator(
+    tmp_path: Path,
+) -> None:
+    """A LIVE record naming no session, whose cwd is one of this repo's worktrees (the primary
+    checkout here), matches no seat record, so the roster is incomplete by it. It was left out of
+    liveSessionsWithoutRecord with no stop. The seat's worktree sits under that checkout, so the
+    seat reads POSSIBLY RUNNING too."""
+    proc, _ = _fleet(
+        tmp_path, {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": str(tmp_path / "repo")}
+    )
+    j = _fleet_json(proc)
+    assert j["receipt"]["liveSessionsWithoutRecord"] == 1, j["receipt"]
+    row = {r["Box"]: r for r in j["rows"]}["box-5491"]
+    assert row["State"] == "POSSIBLY RUNNING", row
 
 
 @pytest.mark.parametrize(
@@ -785,3 +870,33 @@ def test_a_record_with_no_session_id_does_not_break_a_lookup_under_strict_mode(
         "'{0}|{1}' -f $r.State, $l.Matched"
     )
     assert got == "LIVE|1"
+
+
+AUDIT = REGISTRY.parents[1] / "worktree" / "worktree-audit.ps1"
+
+
+@pytest.mark.parametrize(
+    ("anon_in_locked_tree", "listed"),
+    [(False, 1), (True, 0)],
+    ids=["anonymous-elsewhere-leaves-the-lock-listed", "anonymous-in-the-tree-vetoes"],
+)
+def test_stale_seat_locks_scope_the_anonymous_veto_to_each_locked_tree(
+    config_root: Path, tmp_path: Path, anon_in_locked_tree: bool, listed: int
+) -> None:
+    """A fresh record naming no session vetoed every lock on the box, because the lookup named no
+    worktree, so one such record hid every stale seat lock. It vetoes only the lock on its own
+    tree now."""
+    sid = "5491a0a0-0000-4000-8000-000000000000"
+    write_session(config_root, pid=never_live_pid(), session_id=sid)
+    locked = tmp_path / "wt-locked"
+    cwd = locked if anon_in_locked_tree else tmp_path / "wt-other"
+    _anonymous(
+        config_root, "99016.json", {"pid": os.getpid(), "startedAt": NOW_MS, "cwd": str(cwd)}
+    )
+    got = _strict(
+        f". '{AUDIT}'; "
+        f"$w = [pscustomobject]@{{ Path = '{locked}'; Locked = $true; "
+        f"LockReason = 'builder {sid}' }}; "
+        f"@(Get-StaleSeatLocks -Worktrees @($w) -ConfigRoot '{config_root}').Count"
+    )
+    assert got == str(listed)

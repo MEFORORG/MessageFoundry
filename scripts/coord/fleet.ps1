@@ -167,19 +167,21 @@ if ($wtOut) {
 $liveInRepo = @()
 foreach ($row in $sessionRows) {
     if (-not $row.Record) { continue }
-    $cwd = $null
-    if ($row.Record.PSObject.Properties.Name -contains 'cwd') { $cwd = Get-NormPath ([string]$row.Record.cwd) }
+    # Read through Get-RecordField: a registry file holding `{}` parses to an object with no
+    # properties, and `.PSObject.Properties.Name` on it throws under StrictMode (BACKLOG #5491).
+    $rawCwd = [string](Get-RecordField $row.Record 'cwd')
+    $cwd = Get-NormPath $rawCwd
     if (-not $cwd -or $repoWorktrees -notcontains $cwd) { continue }
-    # A record that names no session is still a live session here, whatever its age, so it counts.
-    # It cannot be matched to a seat record, so it is left out of liveWithoutRecord below; the
-    # receipt's anonymousLiveRecords names it instead. A bare read of the field throws under StrictMode.
+    # A record that names no session is still a live session here, whatever its age, so it counts,
+    # and it counts in liveWithoutRecord below too: no seat record can be matched to it, so the
+    # roster is incomplete by it until it names its session.
     $liveSid = [string](Get-RecordField $row.Record 'sessionId')
     $l = Test-RecordLiveness -Record $row.Record
     if ($l.State -eq 'LIVE') {
         $liveInRepo += [pscustomobject]@{
             SessionId = $liveSid
             Cwd       = $cwd
-            Box       = (ConvertTo-BoxKey -Path ([string]$row.Record.cwd))
+            Box       = (ConvertTo-BoxKey -Path $rawCwd)
             Root      = $row.Root
         }
     }
@@ -198,11 +200,14 @@ try {
     $anonymousLive = @($fresh | ForEach-Object { $_.File })
     $anonymousNoCwd = @($fresh | Where-Object { -not $_.Cwd } | ForEach-Object { $_.File })
 } catch {
-    $anonymousReadError = $_.Exception.Message
+    # The failure is the catch itself, never its message: an exception with an empty message must
+    # still read as a failed scan (BACKLOG #5491).
+    $anonymousReadError = [string]$_.Exception.Message
+    if (-not $anonymousReadError) { $anonymousReadError = "$($_.Exception.GetType().FullName), with no message" }
 }
 
-$recordedSessionIds = @($records | ForEach-Object { [string]$_.Rec.sessionId } | Where-Object { $_ })
-$liveWithoutRecord = @($liveInRepo | Where-Object { $_.SessionId -and $recordedSessionIds -notcontains $_.SessionId })
+$recordedSessionIds = @($records | ForEach-Object { [string](Get-RecordField $_.Rec 'sessionId') } | Where-Object { $_ })
+$liveWithoutRecord = @($liveInRepo | Where-Object { -not $_.SessionId -or $recordedSessionIds -notcontains $_.SessionId })
 
 # Writer heartbeat. "Installed", "resolvable" and "actually ran" are three different sentences and
 # the first alone answers the neighbouring question.
@@ -436,7 +441,9 @@ foreach ($r in $records) {
         # The seat's worktree scopes the anonymous-record veto: a fresh record naming no session in
         # THIS worktree may be this seat relaunched, so it reads POSSIBLY RUNNING, never INTERRUPTED,
         # while one in another worktree leaves this seat's own verdict alone.
-        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State } catch { $fence = 'UNKNOWN' }
+        # A lookup that throws is an unevaluated fence, not a gone session: UNREADABLE reads POSSIBLY
+        # RUNNING, where UNKNOWN read INTERRUPTED and invited a respawn (BACKLOG #5491).
+        try { $fence = (Get-SessionLiveness -SessionId $sid -Worktree $wt).State } catch { $fence = 'UNREADABLE' }
     }
 
     $lifecycle = if ($rec.PSObject.Properties.Name -contains 'lifecycle') { [string]$rec.lifecycle } else { 'open' }
@@ -507,7 +514,7 @@ $stops = @()
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
-if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- the writer is not running in every live seat, so this roster is INCOMPLETE by that many" }
+if ($liveWithoutRecord.Count -gt 0) { $stops += "liveSessionsWithoutRecord=$($liveWithoutRecord.Count) -- live session(s) in this repo's worktrees match no seat record (the writer is not running there, or the registry record names no session yet), so this roster is INCOMPLETE by that many" }
 if ($records.Count -eq 0 -and $heartbeats.Count -eq 0) { $stops += 'recordsExamined=0 AND writerHeartbeatIn=0 -- indistinguishable from a writer that was never installed' }
 # BOTH DIRECTIONS FIRE, and the null one is the reason this rung exists (BACKLOG #1374). The old
 # guard was `-ne $null -and -gt 60`, so the one state where the instrument knows nothing was the one
