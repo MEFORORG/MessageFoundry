@@ -239,14 +239,16 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     travel the hop like any other row.
 
     **A settings check runs the anchor checks, then the store open's content checks.** It checks
-    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), refuses a file it
-    cannot read, and refuses a private-key label with a ``pem_refused`` row (BACKLOG #3745). It
-    reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and one byte more
-    (``AnchorSpec.max_bytes``). Where the store open would refuse those bytes, for their content,
+    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), and refuses a file it
+    cannot read. It reads at most :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` and one byte
+    more (``AnchorSpec.max_bytes``), and judges only those bytes: the fingerprint and every
+    content check below. It refuses a private-key label in them with a ``pem_refused`` row
+    (BACKLOG #3745). Where the store open would refuse them for anything else, their content,
     their size or the pin's validity period (:func:`_server_pin_warning`), it **warns with an
     audited row and does not refuse**: a WARNING and a ``pin_content_warning`` row whose
-    ``reason`` is the warning. A repeat with unchanged content and outcome writes no further row
-    for it (:data:`_STORE_CONTENT_RECORDED`). The store open refuses as before. At ``warn`` the
+    ``reason`` is the warning. A repeat with unchanged fingerprint and outcome writes no further
+    ``pem_refused`` or ``pin_content_warning`` row for it (:data:`_STORE_CONTENT_RECORDED`). The
+    store open refuses as before. At ``warn`` the
     start logs the pin's ACL or path warning once: the preflight skips one the store open just
     logged (:data:`_WARNED_AT_OPEN`).
 
@@ -469,8 +471,8 @@ class AnchorSpec:
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
     many bytes and one more. The settings preflight's content checks
     (:func:`_refuse_by_path_content`) judge a file longer than ``max_bytes`` without reading it
-    whole: a server pin warns about it (module item 11), and any other spec refuses it with the
-    ``pem_refused`` row. :func:`enforced_anchor`, :func:`enforce_anchor` and :func:`anchor_refusal` run no content
+    whole: a server pin warns about it, and any other spec refuses it (module item 11 says which
+    rows). :func:`enforced_anchor`, :func:`enforce_anchor` and :func:`anchor_refusal` run no content
     check, so they pass a longer file: the bytes and fingerprint they judge stop at that bound,
     with no mark that the file was longer. A caller that needs the length judged does it itself,
     as the store open's pin check does on :func:`enforced_anchor`'s ``data``. A server pin's own
