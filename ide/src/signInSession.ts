@@ -23,8 +23,10 @@
 //      side by side, both would name the same old token, and the first new session would be left live
 //      and unreachable.
 //   3. Nothing may wait forever. auth.ts sends the sign-in with SIGN_IN_TIMEOUT_MS, so every attempt
-//      settles, and each wait here is bounded by the longer SIGN_IN_WAIT_MS as well. Only an engine
-//      that trickles bytes slower than the timeout could outlast a wait. A reader would then see the
+//      settles, and each wait here is bounded by the longer SIGN_IN_WAIT_MS as well. At least two
+//      things can still make an attempt outlast a wait: an engine that trickles bytes slower than
+//      the timeout, and a slow TCP connect, which the timeout does not time (see SIGN_IN_TIMEOUT_MS)
+//      and which then eats into the 5 s between the two. A reader would then see the
 //      old token, and a later sign-in would name it again and could be overwritten by the late reply.
 //   4. The tracking lives in one extension host, which is one VS Code window, while SecretStorage is
 //      shared by every window. A sign-in in one window is NOT waited for in another. A call there on
@@ -56,7 +58,8 @@ export interface TokenCache {
  *  SIGN_IN_WAIT_MS. */
 export const SIGN_IN_TIMEOUT_MS = 150_000;
 
-/** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts the attempt. */
+/** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts an attempt
+ *  whose connect was prompt. Point 3 above names what it does not cover. */
 export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;
 
 /** Sign-ins between "request about to leave" and "new token stored", by cache key. Never rejects. */

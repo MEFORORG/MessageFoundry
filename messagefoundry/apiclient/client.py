@@ -146,8 +146,10 @@ _ENGINE_REQUEST_DEADLINE_SECONDS = 120.0
 #: A read that OUTLASTS the engine's request deadline, never equals it. At that deadline the engine
 #: sends its own 503, which still has a network hop to cross, so a client that gives up first
 #: reports an unreachable engine for work that may still be running; the 30 s margin is that hop's
-#: allowance. One value for every call that can wait out the deadline, ``cluster_stepdown`` and
-#: :data:`SIGN_IN_TIMEOUT_SECONDS`, so the two cannot drift apart (vault BACKLOG #2950).
+#: allowance. ``cluster_stepdown`` and :data:`SIGN_IN_TIMEOUT_SECONDS` read their wait from it, so
+#: their lengths cannot drift apart (vault BACKLOG #2950); how each applies it differs, since
+#: ``cluster_stepdown`` raises every phase and the sign-in only the read. At least
+#: ``integrity_check`` also waits past the deadline, on its own longer value.
 _PAST_ENGINE_DEADLINE_SECONDS = _ENGINE_REQUEST_DEADLINE_SECONDS + 30.0
 
 #: How long the reply to a request that can wait in the engine's per-account queue may take, in

@@ -199,7 +199,11 @@ def test_the_census_of_queued_calls_matches_the_client() -> None:
     here. Control: the same scan finds ``_adopt_rotated``'s callers, a set it must not confuse."""
     queued = _methods_calling("_sign_in_timeout")
     assert queued == {"login", "reauth", "verify_mfa", "confirm_mfa", "change_password"}
-    assert len(_QUEUED) == len(queued)
+    # Those five calls, sent once each, put the floor on exactly the _QUEUED paths and no other.
+    client, seen = _recording_client()
+    _send_every_queued_call_then_a_control(client)
+    floored = {path for path, phases in seen.items() if phases["read"] == SIGN_IN_TIMEOUT_SECONDS}
+    assert floored == set(_QUEUED)
     assert _methods_calling("_adopt_rotated") == {"reauth", "verify_mfa", "confirm_mfa"}
 
 

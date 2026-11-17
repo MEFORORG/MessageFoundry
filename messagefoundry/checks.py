@@ -2270,7 +2270,8 @@ def _load_check_settings(
             memo[key] = exc
     cached = memo[key]
     if isinstance(cached, BaseException):
-        raise cached
+        # Shed the earlier raise's frames, so the one stored refusal does not pile up every leg's.
+        raise cached.with_traceback(None)
     return cast("ServiceSettings", cached)
 
 

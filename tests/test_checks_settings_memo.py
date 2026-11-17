@@ -54,6 +54,7 @@ def test_a_run_reads_refused_settings_once_and_every_leg_fails_alike(
     assert 1 <= calls["load"] <= 2
     assert len(refused) > calls["load"], [r.name for r in refused]
     assert all(not r.ok for r in refused)
+    assert len({r.detail for r in refused}) == 1, {r.name: r.detail for r in refused}
     # The memo is the run's alone: the next run reads the file again.
     run_checks(SAMPLES_CONFIG, run_lint=False, service_config=toml)
     assert calls["source"] == 2

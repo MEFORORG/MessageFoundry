@@ -322,6 +322,7 @@ export async function withStepUpAuth<T>(
       }
       // It rotates the token and queues behind the account's re-proof lock, as the sign-in does,
       // so it gets the sign-in's timeout (vault BACKLOG #2950); postJson has none unless given one.
+      // Unlike a sign-in it is not tracked in signInSession.ts, so peekToken does not wait for it.
       const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token, SIGN_IN_TIMEOUT_MS);
       return typeof reply.token === "string" ? reply.token : undefined;
     },

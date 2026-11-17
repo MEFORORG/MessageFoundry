@@ -6,5 +6,5 @@
   timeout, go from 30 to 150 seconds, and the read on `change_password` from the client's 5 second
   default to 150 seconds, 30 seconds past the engine's default 120 second
   request deadline, so a sign-in waiting in the per-account queue no longer outlasts the client at
-  that default. A lost reply is rarer, not impossible. Every other request keeps its timeout.
+  that default. A lost reply is rarer, not impossible. Every other Python client request keeps its timeout.
   (`vault BACKLOG #2950`)
