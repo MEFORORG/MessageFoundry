@@ -1411,8 +1411,8 @@ def _fuse_verdict(
         # intake down and, with no drain time, passes B1's drain guard, so B0 is no reference for
         # a GO (BACKLOG #5574). A B0 that ran and failed zero-loss is still a measurement.
         return FUSE_INCONCLUSIVE, (
-            f"{base.unsent_trials} B0 trial(s) recorded no traffic (a failed cell's placeholder) -- "
-            "B0's intake and drain are no sound reference for a lift"
+            f"{base.unsent_trials} B0 trial(s) recorded no traffic (a failed cell's placeholder, "
+            "or a step that sent nothing) -- B0's intake and drain are no sound reference for a lift"
         )
     if lift_pct is None:
         return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
@@ -1437,8 +1437,9 @@ def _fuse_verdict(
 def _undrained_reason(cand: _FuseArm) -> str:
     """Why a B1 arm with no drain time did not drain, told by what each undrained trial carries.
 
-    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout and keeps
-    its specific reason (BACKLOG #5574). One that recorded none is not asserted to have stalled:
+    A trial that recorded traffic and no drain time is a real ``await_drain`` timeout. Rows are
+    called stranded only where such a trial read a final backlog above 0 (BACKLOG #5574). One
+    that recorded no traffic is not asserted to have stalled:
     a batch cell whose drive or aggregation failed (batchbox ``_failed_cell_record``) carries a
     placeholder ``sent`` of 0 whatever its fleet drove, and a step that sent nothing may still have
     timed out on rows it did not send; its reconcile detail says which.
