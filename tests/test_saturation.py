@@ -102,7 +102,7 @@ def test_sustain_samples_floor() -> None:
     [
         [0, 0, 0, 1],  # a primed idle lane takes one message
         [0, 0, 4, 4],  # one tick's small burst
-        [5, 5, 5, 9],  # a busy lane takes a few more
+        [5, 5, 5, 9],  # a busy lane takes a few more, on a detector first sampled at 5
     ],
 )
 def test_a_rise_below_the_default_floor_does_not_fire(depths: list[int]) -> None:

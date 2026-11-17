@@ -2343,8 +2343,9 @@ class DeliverySettings(_Section):
     # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
     # suppress it for a known-bursty feed.
     saturation_sustain_samples: int | None = Field(default=None, ge=2)
-    # BACKLOG #5768: how many messages a lane's depth must rise above its lowest depth since the
-    # detector last reset before saturation fires, so one arrival on an idle lane does not page.
+    # BACKLOG #5768: how many messages a lane's depth must rise above the lowest depth sampled since
+    # the engine started watching the lane before saturation fires, so one arrival on an idle lane
+    # does not page.
     # SaturationThreshold.min_growth states the default and the cap.
     saturation_min_growth: int = Field(
         default=SATURATION_MIN_GROWTH_DEFAULT, ge=1, le=SATURATION_MIN_GROWTH_MAX

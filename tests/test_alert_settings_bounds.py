@@ -53,7 +53,7 @@ def test_an_smtp_port_out_of_range_is_refused(value: int) -> None:
         {"email_timeout": _ALERT_SEND_TIMEOUT_MAX_SECONDS},
         {"realert_seconds": 0.0},  # no throttle
         {"realert_seconds": _ALERT_COOLDOWN_MAX_SECONDS},
-        {"email_smtp_port": 0},  # smtplib's default: port 25, or the host:port one
+        {"email_smtp_port": 0},  # smtplib's default, port 25
         {"email_smtp_port": 65535},
     ],
 )
