@@ -97,8 +97,10 @@ def encode_reference_value(value: Any) -> str:
     A non-finite float (a TOML ``nan``, a DATABASE double column) raises the same ``TypeError``
     (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON.
 
-    The refusal names the kind of value that failed, never the value or its key, and carries no
-    json notes, cause or context. One such value refuses the whole set, by the rule above."""
+    A ``TypeError``, ``ValueError`` or ``RecursionError`` from json is rebuilt as a ``TypeError``
+    that names the kind of value, never the value or its key, with none of json's notes, cause or
+    context. Any other exception propagates as raised. One such value refuses the whole set, by the
+    rule above."""
     try:
         return json.dumps(value, default=_reference_json_default, allow_nan=False)
     except _UnencodableTypeError as exc:

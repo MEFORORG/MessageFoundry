@@ -434,8 +434,10 @@ class _HashingReader:
     def read(self, size: int = -1) -> bytes:
         data = self._raw.read(size)
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
-        # str) passes through unhashed, so the codec's own refusal names it rather than a TypeError
-        # from the digest escaping the restore's BackupCodecError arm.
+        # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
+        # rather than a TypeError from the digest escaping the BackupCodecError arm. The no-key
+        # copy loop has no such refusal, but its only source is the archive path opened 'rb', a
+        # blocking buffered reader whose reads return bytes.
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
