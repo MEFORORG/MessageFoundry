@@ -649,8 +649,8 @@ function Wait-ForGateRefusal([string]$Phase) {
       Wait until the service logs the ADR 0167 refusal (Test-GateRefusalLine), which it reaches only
       after opening the store and reading its users. Samples process owners throughout, since NSSM
       restarts the refused engine and each restart is a new process. Returns $true on the refusal,
-      $false on timeout, and $false at once, with a reading quoting it, when the gate's clause is
-      logged without the refusal: the engine read its users and the gate let the start go on.
+      $false on timeout, and $false at once, with a reading quoting it, when one of the gate's two
+      let-it-start lines ($GateLetStart) is logged. Any other line is waited past.
     #>
     # Read by callers after a $false, so a failure text never names a lockout the gate ruled out.
     $script:GateLetStartSeen = $false
@@ -993,7 +993,7 @@ try {
         $noAdmin = @(Get-LogMatches ([regex]::Escape($NoAdminRefusal)) |
             Where-Object { Test-GateRefusalLine $_.Line $NoAdminRefusal })
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but logged no ADR 0167 refusal (a reading above says if the gate let it start)" }
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
@@ -1047,7 +1047,7 @@ try {
         Stop-TheService
         Show-Trio "service first start"
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but logged no ADR 0167 refusal (a reading above says if the gate let it start)" }
+            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
@@ -1108,8 +1108,8 @@ try {
                             "restart expected a refusal it did not get; the store's access is not in question.")
                         Show-LogTail
                     } elseif (-not $reopened) {
-                        Add-Failure ("$ServiceIdentity could not open $DbPath after $Operator's open " +
-                            "re-secured it: the restart logged no ADR 0167 refusal in $WaitSeconds s. " +
+                        Add-Failure ("$ServiceIdentity, restarted on $DbPath after $Operator's open " +
+                            "re-secured it, did not log the expected refusal line in $WaitSeconds s. " +
                             (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                         Show-LogTail
                     } else {

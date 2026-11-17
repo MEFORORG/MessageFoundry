@@ -564,8 +564,9 @@ Server hop still checks the chain up to the root. It **is** usable as a trust an
 engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. The helper refuses a file unless it holds a self-signed root and every
-other CA in it chains to a self-signed root through the file's own certificates. With `-Confirm`,
+there without its root. The helper refuses a file whose CAs do not chain to a self-signed root in
+it; its help says how it checks that, and that it installs any self-signed CA in the file into
+`LocalMachine\Root`. With `-Confirm`,
 declining a root that an accepted CA chains through imports nothing, so give it the root of the CA
 you mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 

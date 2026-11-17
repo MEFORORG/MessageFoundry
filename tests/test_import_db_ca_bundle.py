@@ -10,8 +10,9 @@ and checked, and the whole file is refused when any one is not a CA or carries a
 root goes into the machine Root store and any other CA into the intermediate store.
 
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
-directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
-``Get-CaStoreName`` (and the console helpers they call) out of the script's AST and call them, as
+directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal``,
+``Get-CaStoreName`` and ``Get-ChainRefusal`` (with the ``$SignatureHashes`` table and the helpers
+they call) out of the script's AST and call them, as
 ``tests/test_import_db_ca_console_text.py`` does. The whole-script tests are skipped in an elevated
 session. All but one run it with ``-WhatIf``, where ``ShouldProcess`` declines every import, so the
 store is never opened, and even a regression that ignored ``-WhatIf`` would meet the script's own
@@ -38,6 +39,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7, pkcs12
+from cryptography.x509.name import _ASN1Type
 from cryptography.x509.oid import NameOID
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "service" / "import-db-ca.ps1"
@@ -118,6 +120,7 @@ def _pem(*certs: x509.Certificate) -> bytes:
 def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
     root = _cert("Synthetic Test Root CA", True)
     other_root = _cert("Synthetic Other Root CA", True)
+    expired_root = _cert("Synthetic Expired Root CA", True, valid_from_days=-30, valid_to_days=-1)
     return {
         "root": root,
         "intermediate": _cert("Synthetic Test Issuing CA", True, root),
@@ -128,10 +131,10 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
         "name_only_intermediate": _cert(
             "Synthetic Name-Only Issuing CA", True, (root[0], other_root[1])
         ),
-        "expired_root": _cert(
-            "Synthetic Expired Root CA", True, valid_from_days=-30, valid_to_days=-1
-        ),
+        "expired_root": expired_root,
         "future_root": _cert("Synthetic Future Root CA", True, valid_from_days=2),
+        # Valid itself, but its only root in the file has expired.
+        "under_expired": _cert("Synthetic Issuing CA Under Expired Root", True, expired_root),
         "unconstrained": _cert("Synthetic No Constraints", None),
         "no_cert_sign": _cert("Synthetic CA Without CertSign", True, cert_sign=False),
         "cert_sign": _cert("Synthetic CA With CertSign", True, cert_sign=True),
@@ -181,7 +184,34 @@ def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Cer
             ),
         )
     )
+    # The root names itself with a PrintableString; the issuing CA names that issuer with a
+    # UTF8String of the same text. RFC 5280 name matching treats the two as one name.
+    enc_key = ec.generate_private_key(ec.SECP256R1())
+    enc_text = "Synthetic Encoded Root CA"
+    enc_root = build(
+        x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, enc_text, _ASN1Type.PrintableString)]),
+        enc_key.public_key(),
+        enc_key,
+    )
+    enc_issuing = (
+        x509.CertificateBuilder()
+        .subject_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Encoded Issuing CA")])
+        )
+        .issuer_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, enc_text, _ASN1Type.UTF8String)])
+        )
+        .public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        .sign(enc_key, hashes.SHA256())
+    )
+    assert enc_root.subject.public_bytes() != enc_issuing.issuer.public_bytes()
     return {
+        "enc_root": enc_root,
+        "enc_issuing": enc_issuing,
         "rsa_root": build(rsa_name, rsa_key.public_key(), rsa_key),
         "rekey": build(root.subject, new_key.public_key(), root_key),
         # Self-signed, but with a signature the script does not verify.
@@ -254,6 +284,9 @@ def files(
         "pem_name_only_intermediate": _pem(root, chain["name_only_intermediate"][0]),
         # Outside the validity period: an expired root beside a valid one, and a root not valid yet.
         "pem_expired_root": _pem(root, chain["expired_root"][0]),
+        "pem_only_expired_root": _pem(chain["expired_root"][0]),
+        "pem_under_expired": _pem(root, chain["expired_root"][0], chain["under_expired"][0]),
+        "pem_encoded_names": _pem(extra["enc_root"], extra["enc_issuing"]),
         "pem_future_root": _pem(chain["future_root"][0]),
         "pem_pss_root": _pem(extra["pss_root"]),
         # Bare base64 behind a byte-order mark, UTF-8 and UTF-16.
@@ -297,7 +330,7 @@ if (-not $set) {{ throw 'missing assignment $SignatureHashes' }}
 . ([scriptblock]::Create($set.Extent.Text))
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
                     'Read-CaBundle', 'Get-CaRefusal', 'Test-SignedBy', 'Test-SelfSigned',
-                    'Get-ChainRefusal', 'Get-CaStoreName')) {{
+                    'Get-ChainRefusal', 'Get-CaStoreName', 'Test-SameName')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -396,9 +429,9 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert certs("b64_utf8_bom") == [(root, None)]
     assert certs("b64_utf16_bom") == [(root, None)]
 
-    # Outside its validity period, a root is refused on its own, whatever else the file holds.
+    # Validity is the caller's to judge, not Get-CaRefusal's.
     expired = dict(certs("pem_expired_root"))
-    assert expired[_thumb(chain["expired_root"][0])] == "it has expired"
+    assert expired[_thumb(chain["expired_root"][0])] is None
     assert expired[root] is None
     # Not valid yet is not refused: a new CA may be staged ahead of its start.
     assert certs("pem_future_root") == [(_thumb(chain["future_root"][0]), None)]
@@ -421,6 +454,11 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
 
     assert chained("p7b_der") == {root: None, inter: None}
     assert chained("root_and_rekey") == {root: None, rekey: None}
+    # Names that differ only in string encoding still link a CA to its root.
+    assert chained("pem_encoded_names") == {
+        _thumb(extra["enc_root"]): None,
+        _thumb(extra["enc_issuing"]): None,
+    }
     unchained = "it does not chain to a self-signed root in the file"
     for name, key in (
         ("pem_foreign_intermediate", "foreign_intermediate"),
@@ -539,7 +577,16 @@ def _pair(cert: x509.Certificate, why: str) -> str:
     [
         ("p7b_with_leaf", [("leaf", _NOT_A_CA)]),
         ("pem_two_refused", [("leaf", _NOT_A_CA), ("no_cert_sign", _NO_CERT_SIGN)]),
-        ("pem_expired_root", [("expired_root", "it has expired")]),
+        (
+            "pem_under_expired",
+            [
+                (
+                    "under_expired",
+                    "it chains to a self-signed root in the file only through an expired"
+                    " certificate",
+                )
+            ],
+        ),
         ("pem_foreign_intermediate", [("foreign_intermediate", _UNCHAINED)]),
         ("pem_name_only_intermediate", [("name_only_intermediate", _UNCHAINED)]),
     ],
@@ -572,6 +619,39 @@ def test_a_bundle_holding_a_refused_certificate_imports_nothing(
     assert _thumb(chain["root"][0]) not in message, message
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
+
+
+def test_an_expired_certificate_off_every_import_path_is_skipped(
+    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+) -> None:
+    proc = _run_script(files["pem_expired_root"])
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    lines = proc.stdout.splitlines()
+    at = lines.index(f"  Thumbprint : {_thumb(chain['expired_root'][0])}")
+    block = list(itertools.takewhile(lambda ln: ln.startswith("  "), lines[at:]))
+    assert "  Skipped    : it has expired, so it is not installed" in block, block
+    offered = [ln for ln in out.splitlines() if "What if" in ln]
+    assert len(offered) == 1 and _thumb(chain["root"][0]) in offered[0], offered
+
+
+def test_a_file_whose_only_root_has_expired_imports_nothing(files: dict[str, Path]) -> None:
+    proc = _run_script(files["pem_only_expired_root"])
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _error_message(proc).startswith(
+        "Nothing was imported. The file holds no self-signed root that has not expired."
+    ), proc.stdout
+
+
+def test_a_chain_whose_names_differ_only_in_encoding_is_offered(
+    extra: dict[str, x509.Certificate], files: dict[str, Path]
+) -> None:
+    proc = _run_script(files["pem_encoded_names"])
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    offered = [ln for ln in out.splitlines() if "What if" in ln]
+    assert len(offered) == 2, offered
+    assert any(_thumb(extra["enc_issuing"]) in ln and "LocalMachine\\CA" in ln for ln in offered)
 
 
 def test_a_root_signed_in_a_way_the_script_cannot_verify_is_not_reported_missing(
