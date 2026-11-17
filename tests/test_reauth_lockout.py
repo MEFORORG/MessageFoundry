@@ -586,6 +586,40 @@ async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified
         await store.close()
 
 
+async def test_a_reproof_after_the_clock_steps_back_is_gone_and_never_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: after a backward clock step the session's stamps lie ahead of the clock, which
+    the validator refuses, so a re-proof on it is refused as gone and ended before any verify -- even
+    with the right password, which would otherwise step the session up."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 1
+        attempts_before, _ = await _lock_state(store, "u-bob")
+        verified: list[object] = []
+        real_verify = verify_password
+
+        def counting_verify(*args: Any, **kwargs: Any) -> bool:
+            verified.append(args)
+            return bool(real_verify(*args, **kwargs))
+
+        monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
+        earlier = time.time() - 600.0
+        monkeypatch.setattr(time, "time", lambda: earlier)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.session_lost and not out.ok, "a session stamped ahead of the clock stepped up"
+        assert verified == [], "a re-proof on a session ahead of the clock was verified"
+        assert await _lock_state(store, "u-bob") == (attempts_before, None)
+        assert await _session_revoked(store, token)
+        assert hash_token(token) not in service._reproof_session_failures
+    finally:
+        await store.close()
+
+
 async def test_a_refused_revoke_of_a_lapsed_session_is_still_refused_as_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
