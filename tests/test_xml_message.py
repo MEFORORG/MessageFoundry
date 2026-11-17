@@ -125,6 +125,8 @@ def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str)
         (chr(0xA0) + "<!DOCTYPE x><x>").encode("utf-16"),
         # Only one byte-order mark is a BOM; a second is character data.
         b"\xef\xbb\xbf\xef\xbb\xbf<!DOCTYPE x><x>",
+        # CF BB BF is not a BOM, though EF case-folds to CF.
+        b"\xcf\xbb\xbf<!DOCTYPE x><x>",
     ],
     ids=[
         "cdata",
@@ -134,6 +136,7 @@ def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str)
         "nbsp",
         "nbsp-utf-16",
         "double-bom",
+        "case-folded-bom",
     ],
 )
 def test_doctype_text_outside_the_prolog_of_a_broken_document_is_a_parse_error(

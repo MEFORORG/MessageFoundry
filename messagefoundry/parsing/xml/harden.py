@@ -105,7 +105,8 @@ _DOCTYPE_SCAN_BYTES = 64 * 1024
 #: XML declaration among them) and comments. The atomic groups and the possessive loop keep it
 #: linear.
 _PROLOG_DOCTYPE = re.compile(
-    r"\A(?:\N{BYTE ORDER MARK}|\xef\xbb\xbf)?"
+    # (?-i:...): IGNORECASE would fold \xef to \xcf and take CF BB BF for a BOM.
+    r"\A(?-i:\N{BYTE ORDER MARK}|\xef\xbb\xbf)?"
     r"(?:[ \t\r\n]|<\?(?>.*?\?>)|<!--(?>.*?-->))*+<!DOCTYPE",
     re.IGNORECASE | re.DOTALL,
 )

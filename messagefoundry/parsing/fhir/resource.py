@@ -106,8 +106,8 @@ class FhirResource:
         except ValidationError as exc:
             summary = _safe_validation_summary(resource_type, version, exc)
         except Exception as exc:
-            # Broad on purpose, and it wraps ONLY the model_validate call, as signature.verify does
-            # (Manager decision, batch 614). fhir.resources resolves a nested resource (a Bundle
+            # Broad on purpose, and it wraps ONLY the model_validate call, as signature.verify does.
+            # fhir.resources resolves a nested resource (a Bundle
             # entry, a `contained` item) by its untrusted resourceType outside pydantic's error
             # collection: measured on 8.3.0, an unknown type escapes as a KeyError quoting it, a
             # non-string one as a TypeError, and nesting deep enough to overflow the stack as a

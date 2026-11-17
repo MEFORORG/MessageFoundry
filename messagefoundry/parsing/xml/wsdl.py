@@ -114,8 +114,9 @@ class WsdlDefinition:
         ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` holding
         an optional ``Header`` and then one ``Body``, and that ``Body`` holds exactly one element
         child, and none of the three holds character data directly (BACKLOG #5373). ``valid=True``
-        says that one body element conforms to the schema; it does NOT cover header blocks,
-        attributes on the Envelope, Header or Body, or comments and processing instructions.
+        says that one body element conforms to the schema; it does NOT cover at least header
+        blocks, attributes and namespace declarations on the Envelope, Header or Body, or comments
+        and processing instructions.
 
         Raises :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
         or an operation with no resolvable document/literal input element (rpc/encoded not supported for
@@ -402,9 +403,10 @@ def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, st
     otherwise reach the caller unvalidated under a valid result (BACKLOG #5373). That is stricter
     than SOAP 1.1, which allows elements after the ``Body``.
 
-    NOT checked, so it can ride beside the validated element under a valid result: the Header's
-    element children (header blocks, which SOAP leaves open), attributes on the Envelope, Header
-    and Body, and comments and processing instructions anywhere, which are skipped. Reasons name
+    NOT checked, so it can ride beside the validated element under a valid result, at least: the
+    Header's element children (header blocks, which SOAP leaves open), attributes and namespace
+    declarations on the Envelope, Header and Body, and comments and processing instructions
+    anywhere, which are skipped. Reasons name
     only the SOAP grammar's own QNames and counts, never content."""
     root = parse_bytes(envelope)
     env_ns = next(
