@@ -466,8 +466,13 @@ class AnchorSpec:
     and so is ``server_pin`` with ``refuses_encryption_header``.
 
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
-    many bytes and one more, and the content checks refuse a file longer than ``max_bytes``, with
-    the ``pem_refused`` row, so a huge file is refused rather than read whole. A server pin's own
+    many bytes and one more. The settings preflight's content checks
+    (:func:`_refuse_by_path_content`) refuse a file longer than ``max_bytes``, with the
+    ``pem_refused`` row, so a huge file is refused there rather than read whole.
+    :func:`enforced_anchor`, :func:`enforce_anchor` and :func:`anchor_refusal` run no content
+    check, so they pass a longer file: the bytes and fingerprint they judge stop at that bound,
+    with no mark that the file was longer. A caller that needs the length judged does it itself,
+    as the store open's pin check does on :func:`enforced_anchor`'s ``data``. A server pin's own
     check refuses past :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` instead, so a ``server_pin``
     spec must set ``max_bytes`` to exactly that cap, and any other value is refused at
     construction. The fingerprint of a longer file covers only the bytes read. ``None``, the
@@ -2631,8 +2636,8 @@ async def _preflight_one(
     verdict: AnchorVerdict | OSError | None = None,
 ) -> str:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
-    recorded (for the SQL Server store pin, only as far as the module docstring's
-    ``store_sqlserver_pin`` item says) even when the anchor then fails its pin/ACL, record any
+    recorded (for the SQL Server store pin and the PostgreSQL store CA, only as far as module
+    item 11 says) even when the anchor then fails its pin/ACL, record any
     violation, then enforce (which may raise). Returns the fingerprint of the bytes it read and
     passed.
 
@@ -2749,8 +2754,8 @@ async def run_anchor_preflight(
 ) -> dict[str, str]:
     """The central load/reload preflight over every configured anchor. Called at serve startup (before
     any listener binds) and on a config reload (re-reading the on-disk PEMs, so a swapped anchor is
-    caught; the module docstring's ``store_sqlserver_pin`` item says what that cannot catch for the
-    SQL Server store pin). **Dormant when ``specs`` is empty** — it makes no store call and writes
+    caught; module item 11 says what that cannot catch for the SQL Server store pin and the
+    PostgreSQL store CA, whose rows ride the hop they secure). **Dormant when ``specs`` is empty** — it makes no store call and writes
     no audit row; :func:`collect_anchor_specs` says when serve's list is empty.
 
     On a fatal violation (at least a pin mismatch, a file with no loadable PEM block, a
