@@ -1050,7 +1050,9 @@ after the attempt that met it; the reconciler's attempt without the row runs as 
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
 fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
-the error class. A role edit or map save stops at that account, and its row counts the accounts it
+the error class. A custom-role edit or an AD map save whose second read of the accounts, after
+its gate's set is revoked, is refused writes one such row with no account, `"reread":
+"refused"` and the error class instead; the request fails and the change stands. A role edit or map save stops at that account, and its row counts the accounts it
 did not reach as `accounts_not_attempted`; on a request, the request still fails, the change
 stands, and the sessions the revoke would have ended may stay live. The row's write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
 cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).
@@ -6226,7 +6228,7 @@ At least these events bear on a live engine session:
 | The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
 | A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
 | An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of at least these accounts: each whose stored row reads as an enabled directory account, whether or not its record passes its integrity check; each whose stored row does not parse; and each whose integrity check fails, whatever its row reads. A row the account list cannot read an id from is not named. On a store with no integrity key no seal is checked, so a row edited to read as local or disabled is taken as it reads, and its sessions are not ended. A named account's sessions are revoked, not only refused, so a repair of its row does not bring them back. |
-| An administrator edits or deletes a custom role | Ends every session of at least these accounts: each whose stored role rows hold the role, whether or not its record passes its integrity check; each whose stored row or role rows do not parse; and each whose integrity check fails at the save's step-up gate, whatever its rows read, so an account that does not hold the role is ended too. Once the save and its revoke complete, each account the gate named whose stored rows, read after the save, neither hold the role nor fail to parse gets a `role.sessions_revoked` row naming it. On a store with no integrity key no seal is checked, so a role row deleted outside the store reads as no holder. |
+| An administrator edits or deletes a custom role | Ends every session of at least these accounts: each whose stored role rows hold the role, whether or not its record passes its integrity check; each whose stored row or role rows do not parse; and each whose integrity check fails at the save's step-up gate, whatever its rows read, so an account that does not hold the role is ended too. The save reads the accounts again with no integrity check, after an edit commits and before a delete does. Once the change and its revoke complete, each account the gate named whose stored rows, at that second read, neither hold the role nor fail to parse gets a `role.sessions_revoked` row naming it. On a store with no integrity key no seal is checked, so a role row deleted outside the store reads as no holder. |
 | An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
 | An administrator signs the user out with `DELETE /users/{user_id}/sessions` | Ends every session of the account. |
 | An administrator disables the user in the engine | Ends every session of the account. Each request also refuses a disabled account. |
@@ -6479,7 +6481,10 @@ was presented. The `outcome` is `lapsed` instead when the session's own clock ch
 revoke, or when the session passes them but the owner's admin-issued temporary credential is past
 its deadline, the test `identity_for_token` applies under every gate (a disabled account excepted,
 as that check excepts it). At least a session over its idle or absolute limit fails the clock
-checks. The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
+checks. A row the revoke ended that then does not parse is reported as failing its integrity
+check, and its sign-out is recorded `revoked` whatever its clock, with the session reference and the
+caller as actor where one is named, because neither its clock fields nor its owner can be read
+(BACKLOG #5505). The temporary-credential case also writes the gate's `auth.temp_password_expired` row, with
 `"at": "logout"` and the sign-out's client address. A `lapsed` row still names the owner. If the
 owner cannot be read, the temporary credential is not checked, and a session that passed its clock
 checks is recorded `revoked`. So is a session minted under an older session epoch than its
