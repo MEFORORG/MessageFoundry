@@ -1197,12 +1197,15 @@ class EngineClient:
         A rotated token counts as issued to this client even when the one it replaced came from
         :meth:`set_token`: the rotation already ended that one for every holder, so only this client
         holds the new one.
+
+        A reply that does not decode at all is not version skew: the engine has already rotated the
+        session, so the token this client holds is dead, and returning normally would report the
+        elevation as a success. It raises a value-free :class:`ApiError` instead (BACKLOG #5344).
         """
         body, refused = json_loads_or_refusal(response.content)
         if refused is not None:
-            # The refusal names only an error class and position, never a value from the reply.
-            _log.warning("elevation reply did not decode; keeping the current token: %s", refused)
-        token = body.get("token") if refused is None and isinstance(body, dict) else None
+            raise ApiError(f"invalid response from engine: {refused}")
+        token = body.get("token") if isinstance(body, dict) else None
         if isinstance(token, str) and token:
             self._hold_issued(token)
 

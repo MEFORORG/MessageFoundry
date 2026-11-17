@@ -180,21 +180,36 @@ def test_list_readers_still_decode_a_well_formed_reply(
 
 @pytest.mark.parametrize(
     "content",
-    [b'{"token": "\xff\xfe"}', b"[" * 100_000, b"[]", b"not json"],
-    ids=["non_utf8", "deep_nesting", "not_an_object", "not_json"],
+    [b'{"token": "\xff\xfe"}', b"[" * 100_000, b"not json"],
+    ids=["non_utf8", "deep_nesting", "not_json"],
 )
-def test_a_malformed_rotation_reply_keeps_the_token_and_raises_nothing(content: bytes) -> None:
-    """An elevation reply that does not decode leaves the current token in place and raises
-    nothing (BACKLOG #5344). ``response.json()`` raised ``UnicodeDecodeError``, whose ``.object`` is
-    the whole reply, or ``RecursionError``, neither of which the old handler caught.
+def test_an_undecodable_rotation_reply_raises_a_value_free_apierror(content: bytes) -> None:
+    """A 2xx elevation reply that does not decode is not a success (BACKLOG #5344): the engine has
+    already rotated the session, so the held token is dead. It raises an :class:`ApiError` that
+    quotes no reply content and chains nothing, and the token is left as it was.
 
-    Mutation: put ``response.json().get("token")`` back. Red: the non-UTF-8 case raises."""
+    Mutation: return instead of raising on a refused decode. Red: DID NOT RAISE."""
     client = EngineClient("http://127.0.0.1:8765")
     try:
         client._token = "before"
-        client._adopt_rotated(httpx.Response(200, content=content))
+        with pytest.raises(ApiError, match="invalid response from engine") as excinfo:
+            client._adopt_rotated(httpx.Response(200, content=content))
         assert client.token == "before"
-        # Control: a well-formed reply is still adopted.
+    finally:
+        client.close()
+    assert "\ufffd" not in str(excinfo.value) and "not json" not in str(excinfo.value)
+    assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+def test_a_rotation_reply_without_a_token_keeps_the_token() -> None:
+    """NEGATIVE CONTROL: a reply that decodes but carries no token is version skew, not an error,
+    so it keeps the current token and raises nothing; a well-formed reply is still adopted."""
+    client = EngineClient("http://127.0.0.1:8765")
+    try:
+        client._token = "before"
+        client._adopt_rotated(httpx.Response(200, json=[]))
+        client._adopt_rotated(httpx.Response(200, json={"detail": "ok"}))
+        assert client.token == "before"
         client._adopt_rotated(httpx.Response(200, json={"token": "after"}))
         assert client.token == "after"
     finally:
