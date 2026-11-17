@@ -1604,22 +1604,46 @@ def _refuse_an_insecure_vault_hop(
 
 
 class _NoAmbientAuth(requests.auth.AuthBase):
-    """A session auth that adds nothing, so requests never reads a netrc file (vault BACKLOG #5355).
+    """A session auth that reads no netrc file (vault BACKLOG #5355).
 
     ``Session.prepare_request`` reads the netrc file (``NETRC``, else ``~/.netrc`` or ``~/_netrc``)
-    whenever ``trust_env`` is on and neither the request nor the session carries auth, and would
-    attach a matching entry as an ``Authorization: Basic`` header. No Vault client authenticates
-    that way: the token rides in ``X-Vault-Token``. A truthy session auth skips that read and
-    leaves the request as hvac built it.
+    whenever ``trust_env`` is on and neither the request nor the session carries a truthy auth,
+    and would attach a matching entry as an ``Authorization: Basic`` header. No Vault client
+    authenticates that way: the token rides in ``X-Vault-Token``. This auth is truthy, so that
+    read is skipped. It still turns userinfo in the URL into Basic auth, which is what
+    ``prepare_auth`` did with no auth set, so only the netrc read changes.
 
     ``trust_env`` itself stays on, because it also carries the proxy variables and the system
-    proxy, and ``REQUESTS_CA_BUNDLE`` and ``CURL_CA_BUNDLE``, which docs/CONFIGURATION.md and
-    ``store/keyprovider_vault.py`` name as supported for both Vault clients. Its only other netrc
-    read is ``Session.rebuild_auth``, which runs on a followed redirect, and every Vault client
-    refuses redirects (BACKLOG #1042)."""
+    proxy that docs/CONFIGURATION.md documents for both Vault clients, and ``REQUESTS_CA_BUNDLE``
+    and ``CURL_CA_BUNDLE``, which ``store/keyprovider_vault.py`` records as the fallback anchor
+    when no CA file is set. Both are left as they were. requests' other netrc read is
+    ``Session.rebuild_auth``, which runs on any 3xx reply even with redirects refused, since
+    ``Session.send`` still prepares ``Response.next``; :func:`_rebuild_auth_without_netrc`
+    replaces it on the mounted session."""
 
     def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        user, password = requests.utils.get_auth_from_url(r.url or "")
+        if user or password:
+            return requests.auth.HTTPBasicAuth(user, password)(r)
         return r
+
+
+def _rebuild_auth_without_netrc(
+    session: requests.Session,
+    prepared_request: requests.PreparedRequest,
+    response: requests.Response,
+) -> None:
+    """``Session.rebuild_auth`` with its netrc read removed (vault BACKLOG #5355).
+
+    It keeps the stock strip: an ``Authorization`` header is dropped when the next URL is
+    another host. The stock method then reads the netrc file for that URL and attaches its
+    entry, so a 3xx naming any host would put that host's netrc credential on ``Response.next``."""
+    headers = prepared_request.headers
+    original = response.request.url if response.request is not None else None
+    if "Authorization" in headers and session.should_strip_auth(
+        original or "", prepared_request.url or ""
+    ):
+        del headers["Authorization"]
 
 
 def mount_strict_reply_adapter(
@@ -1667,7 +1691,7 @@ def mount_strict_reply_adapter(
     #2547), and when requests would send it through a proxy whose URL requests cannot read or
     send, since requests' own error would carry that URL or its credentials (vault BACKLOG #3454).
 
-    It also sets :class:`_NoAmbientAuth` where the session has no auth (vault BACKLOG #5355).
+    It also stops the session's netrc reads, :class:`_NoAmbientAuth` (vault BACKLOG #5355).
 
     At least the three Vault clients the engine builds today call this; a new one must too.
     """
@@ -1701,8 +1725,12 @@ def mount_strict_reply_adapter(
     # Before the adapter is mounted, so a refused hop leaves the session as hvac built it. The
     # adapter runs the check, so this one and each send's share its one read of the CRL flag.
     adapter.refuse_an_unrevoked_hop(sent, proxy)
-    # A caller-set auth also skips the netrc read, so it is kept.
-    if session.auth is None:
+    # A caller-set truthy auth also skips the netrc read in prepare_request, so it is kept.
+    # requests tests truthiness there, so this does too.
+    if not session.auth:
         session.auth = _NoAmbientAuth()
+    session.rebuild_auth = functools.partial(  # type: ignore[method-assign]
+        _rebuild_auth_without_netrc, session
+    )
     for prefix in ("https://", "http://"):
         session.mount(prefix, adapter)

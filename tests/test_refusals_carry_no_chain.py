@@ -402,7 +402,11 @@ def test_an_unparseable_ai_reply_keeps_it_off_the_chain() -> None:
         pytest.param(http.client.BadStatusLine(_PLANTED), id="malformed-reply"),
         pytest.param(
             urllib.error.HTTPError(
-                "https://ai.internal/v1", 500, _PLANTED, email.message.Message(), io.BytesIO()
+                "https://ai.internal/v1",
+                500,
+                _PLANTED,
+                email.message.Message(),
+                io.BytesIO(_PLANTED.encode()),
             ),
             id="http-error",
         ),

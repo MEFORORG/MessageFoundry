@@ -488,7 +488,8 @@ class AiBroker:
         )
         # Vault BACKLOG #5356: an arm whose exception can quote the api_key or hold the provider's
         # bytes sets `refusal`, raised after the try so neither __cause__ nor __context__ keeps it.
-        refusal: str
+        # Bound up front, so an arm that forgets to set it still raises this module's error.
+        refusal = f"AI endpoint {_redact_url(self.endpoint)} request failed"
         try:
             with self._opener.open(req, timeout=self.timeout_seconds) as resp:
                 # ASVS 15.2.2: bounded on the socket read. The AI endpoint is operator-configured but
