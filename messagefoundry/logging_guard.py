@@ -141,18 +141,6 @@ class LogSinkStatus:
     rolled_aside: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _FlapLatch:
-    """The flap latch's own state for one sink: present while held, and never part of the bound.
-
-    The bound (:meth:`LogWriteGuard.record_rollover`) keeps its window start and streak in
-    ``_roll_flap``. This overlay keeps only the moment it last saw the sink fail, kept apart so that
-    nothing the latch does, and nothing that clears it, can move the bound (BACKLOG #5812)."""
-
-    #: ``time.monotonic()`` of the sink's last roll or stage-2 failure while the latch held it.
-    last_failure_at: float
-
-
 #: Called (synchronously, from whatever thread was logging) on every stage transition. It MUST be
 #: cheap, non-blocking and never raise — the guard is already handling a failure.
 EscalationCallback = Callable[[LogSinkEvent], None]
@@ -169,7 +157,8 @@ class LogWriteGuard:
     connector threads alike, so every mutation is under one lock. Escalation is **latched per sink** —
     a sink that is already ``unwritable`` does not re-fire on every subsequent record (that would turn
     one broken disk into an unbounded alert storm), and a later successful Stage-1 roll clears that
-    page latch so a genuine re-break pages again.
+    page latch so a genuine re-break pages again. A roll past the flap bound does not clear it: the
+    bound calls that roll a failure, so it stays the same break (BACKLOG #5812).
 
     **The FLAP latch is a different thing**, an overlay on what this class reports (BACKLOG #5812,
     ADR 0162 amendment B). A successful roll does not always release it. :meth:`record_rollover`
@@ -181,8 +170,14 @@ class LogWriteGuard:
         #: sink -> (window start, rolls in window) — the anti-flap bound, see :meth:`record_rollover`.
         self._roll_flap: dict[str, tuple[float, int]] = {}
         #: sink -> the flap latch, present only while it holds the sink; see :meth:`record_rollover`.
-        #: What the bound and the paging decisions compute does not depend on it.
-        self._flap_latch: dict[str, _FlapLatch] = {}
+        #: The value is the ``time.monotonic()`` of the roll that set the latch, or of the sink's
+        #: latest roll or stage-2 failure since. Kept apart from ``_roll_flap`` so that nothing the
+        #: latch does, and nothing that clears it, can move the bound; what the bound and the paging
+        #: decisions compute does not depend on it (BACKLOG #5812).
+        self._flap_latch: dict[str, float] = {}
+        #: sink -> how many times a roll or a stage-2 failure has been recorded for it. Lets
+        #: :meth:`revalidate` see that a sink changed while its probe ran outside the lock.
+        self._changes: dict[str, int] = {}
         #: sink -> "write one record to yourself and raise if you still cannot", see :meth:`revalidate`.
         self._probes: dict[str, SinkProbe] = {}
         self._escalation: EscalationCallback | None = None
@@ -237,7 +232,7 @@ class LogWriteGuard:
 
     def _reported(self, status: LogSinkStatus) -> LogSinkStatus:
         """``status`` with the latch applied. The latch only ever adds an ``unwritable`` reading."""
-        if status.sink in self._flap_latch and status.state != "unwritable":
+        if status.state != "unwritable" and self._reads_unwritable(status):
             return replace(status, state="unwritable")
         return status
 
@@ -251,7 +246,8 @@ class LogWriteGuard:
         otherwise roll forever — one rename, one fresh file and one escalation per log record. Past
         :data:`_MAX_ROLLS_PER_WINDOW` rolls inside :data:`_ROLL_FLAP_WINDOW_SECONDS` the sink is
         declared unwritable instead: a log you must replace every few seconds is not a working log,
-        and stage 2 is the honest verdict on it.
+        and stage 2 is the honest verdict on it. Each further roll past the bound in that window
+        finds the sink already unwritable, so it is counted on :meth:`status` and pages nothing.
 
         **The flap latch holds what the bound declared unwritable** (BACKLOG #5812; this paragraph
         is where the rule is stated). The bound's window restarts a minute after its first roll, so a
@@ -281,16 +277,24 @@ class LogWriteGuard:
                 first_at, streak = now, 0
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
+            tripped = streak > _MAX_ROLLS_PER_WINDOW
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
-                state="rolled",
+                # A roll past the bound on a sink already unwritable keeps it so, and the
+                # escalation below then reads it as already down: one page per break, not one per
+                # roll past the bound (BACKLOG #5812). Writing ``rolled`` first used to hide the
+                # earlier stage 2 from that check.
+                state="unwritable"
+                if tripped and previous is not None and previous.state == "unwritable"
+                else "rolled",
                 rollovers=(previous.rollovers if previous else 0) + 1,
                 last_event=reason,
                 last_event_at=_utc_now(),
                 rolled_aside=rolled_aside,
             )
-            self._latch_after_roll(sink, now=now, tripped=streak > _MAX_ROLLS_PER_WINDOW)
-        if streak > _MAX_ROLLS_PER_WINDOW:
+            self._latch_after_roll(sink, now=now, tripped=tripped)
+            self._changes[sink] = self._changes.get(sink, 0) + 1
+        if tripped:
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
             self.record_unwritable(
@@ -332,16 +336,29 @@ class LogWriteGuard:
                 rolled_aside=previous.rolled_aside if previous else None,
             )
             all_down = all(s.state == "unwritable" for s in self._sinks.values())
+            # The stop decision above reads each sink's own state. Whether the latch holds every
+            # other sink only changes what the stderr line says about them.
+            all_reported_down = all(self._reads_unwritable(s) for s in self._sinks.values())
             self._latch_after_failure(sink)
+            self._changes[sink] = self._changes.get(sink, 0) + 1
         if already_down:
             # Latched: one page per break, not one per dropped record. Without this a broken disk
             # turns every subsequent log line into an alert AND a stderr line, and the storm buries
             # the one message that mattered.
             return
+        if all_down:
+            others = ""
+        elif all_reported_down:
+            others = (
+                "; every other sink is reported unwritable, but at least one only by the flap "
+                "latch, after a roll that landed, and a stop needs every sink's own write to have "
+                "failed, so nothing is being stopped"
+            )
+        else:
+            others = "; another sink is still writable, so nothing is being stopped"
         _last_resort(
             f"LOG SINK {_escape_only(sink, fallback=_LABEL_DROPPED)} IS UNWRITABLE "
-            f"after a rollover attempt: {reason}"
-            + ("" if all_down else "; another sink is still writable, so nothing is being stopped")
+            f"after a rollover attempt: {reason}{others}"
         )
         self._fire(
             LogSinkEvent(
@@ -382,31 +399,34 @@ class LogWriteGuard:
         ``tripped`` is the bound's own verdict on this roll. It latches the sink; a roll the bound
         calls a heal keeps a held latch while it comes within :data:`_ROLL_FLAP_WINDOW_SECONDS` of
         the last failure the latch saw, and releases it otherwise. Reads and writes the latch only."""
-        latch = self._flap_latch.get(sink)
+        last_failure_at = self._flap_latch.get(sink)
         if tripped or (
-            latch is not None and now - latch.last_failure_at <= _ROLL_FLAP_WINDOW_SECONDS
+            last_failure_at is not None and now - last_failure_at <= _ROLL_FLAP_WINDOW_SECONDS
         ):
-            self._flap_latch[sink] = _FlapLatch(last_failure_at=now)
-        elif latch is not None:
+            self._flap_latch[sink] = now
+        elif last_failure_at is not None:
             del self._flap_latch[sink]
 
     def _latch_after_failure(self, sink: str) -> None:
         """A stage-2 failure keeps a held latch from reading as a quiet sink. Called under the lock.
         It never starts a latch: only the bound does that."""
         if sink in self._flap_latch:
-            self._flap_latch[sink] = _FlapLatch(last_failure_at=time.monotonic())
+            self._flap_latch[sink] = time.monotonic()
 
     def _reads_unwritable(self, status: LogSinkStatus) -> bool:
         return status.state == "unwritable" or status.sink in self._flap_latch
 
     def can_log(self) -> bool:
-        """Can this PROCESS still write a log record anywhere? The question the #122 halt is about.
+        """Can this PROCESS still write a log record anywhere, as :meth:`status` reports the sinks?
 
         Not "did a sink break" — with two sinks configured, one dead beside one healthy still means
         the processing IS logged. A guard with no registered sinks (a process that never called
         ``configure_logging``) answers True: it has nothing to say about a log it does not own, and
         answering False would fail closed on a premise it cannot support. A sink the flap latch holds
-        counts as unwritable here, as it does on :meth:`status`."""
+        counts as unwritable here, as it does on :meth:`status`.
+
+        The #122 halt does not ask this. Its stop request is decided in :meth:`record_unwritable`,
+        and its re-arms by :meth:`revalidate`, from each sink's own state without the latch."""
         with self._lock:
             if not self._sinks:
                 return True
@@ -436,20 +456,37 @@ class LogWriteGuard:
         handle the next record would otherwise have rolled through
         :meth:`_GuardedSinkMixin.handleError`, where the bound counts it; and even one plain write
         can take a one-shot fault the next record would have met. Each of those lets a sink still
-        flapping trip the bound later. A sink whose own state IS ``unwritable`` gets the probe below
-        exactly as before, and the latch on it is released only with that state. The answer reads
-        the sinks' own states, not the latch, so it is the answer this method gave before the
-        latch existed, even if another thread re-latches a sink while the probes run."""
+        flapping trip the bound later. A sink whose own state IS ``unwritable`` gets the probe below,
+        and the latch on it is released only with that state. A sink another thread records a roll
+        or a failure on while the probes run is neither probed after that nor marked healthy; the
+        loop's own comment says what remains of that race. The answer reads the sinks' own states,
+        not the latch."""
         with self._lock:
-            dead = [name for name, status in self._sinks.items() if status.state == "unwritable"]
-            probes = [(name, self._probes.get(name)) for name in dead]
-            for name in [name for name in self._flap_latch if name not in dead]:
-                del self._flap_latch[name]
-        for name, probe in probes:
+            dead = {
+                name: self._changes.get(name, 0)
+                for name, status in self._sinks.items()
+                if status.state == "unwritable"
+            }
+            for latched in [sink for sink in self._flap_latch if sink not in dead]:
+                del self._flap_latch[latched]
+        for name, seen in dead.items():
+            # Each probe runs outside the lock, so another thread can record a roll or a failure on
+            # this sink meanwhile. A sink that changed since the snapshot is left as that change
+            # wrote it: probing it could write to a sink the latch alone now holds, and marking it
+            # healthy after the probe would drop a latch or a failure recorded during the probe.
+            # What remains: a change between this check and the probe's write still meets the
+            # probe, because the lock is never held across a sink's I/O.
+            with self._lock:
+                if self._changes.get(name, 0) != seen:
+                    continue
+                probe = self._probes.get(name)
             # A sink registered without a self-test stays exactly as it is: we cannot ask it, and
             # guessing on its behalf is how a fail-closed control gets talked out of failing closed.
-            if probe is not None and _probe_lands(probe):
-                self.record_healthy(name)
+            if probe is None or not _probe_lands(probe):
+                continue
+            with self._lock:
+                if self._changes.get(name, 0) == seen:
+                    self.record_healthy(name)
         with self._lock:
             if not self._sinks:
                 return True
@@ -720,6 +757,18 @@ class _GuardedSinkMixin(_SinkBase):
             # written by ``_emit_direct``, so no handler filter will ever see it, and the three other
             # consumers of this string take it from the guard unchanged. See the module docstring.
             reason = _safe_reason(sys.exception())
+            # A record that cannot be formatted is no reason to roll a healthy sink or to call it
+            # unwritable (BACKLOG #5813). When the stand-in lands, the sink has just taken a write
+            # and nothing else happens; when it does not, the sink is the fault after all and the
+            # two stages below decide.
+            stand_in = self._stand_in_for(record)
+            if stand_in is not None:
+                try:
+                    stand_in()
+                    return
+                except Exception as sink_exc:
+                    # The sink refused the stand-in too, so ITS failure is the reason now.
+                    reason = _safe_reason(sink_exc)
             try:
                 # The path is the notice's OTHER interpolated limb, so it is escaped on the same
                 # terms -- a half-scrubbed notice is a control resting on a false premise.
@@ -734,7 +783,10 @@ class _GuardedSinkMixin(_SinkBase):
                     f"({reason})"
                     + (f"; previous file renamed to {rolled_aside}" if rolled_aside else "")
                 )
-                self._rewrite(record)
+                if stand_in is None:
+                    self._rewrite(record)
+                else:
+                    stand_in()
             except Exception as roll_exc:
                 # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
@@ -748,6 +800,28 @@ class _GuardedSinkMixin(_SinkBase):
             self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
         finally:
             self._reentry.active = False
+
+    def _stand_in_for(self, record: logging.LogRecord) -> Callable[[], None] | None:
+        """What to write in place of ``record`` when it cannot be formatted, or ``None`` when it can
+        (BACKLOG #5813).
+
+        A record this handler cannot format is the record's fault, not the sink's: the stand-in is
+        a fixed notice naming its logger and level, never its content. It goes through the sink's
+        own formatter and stream, so a sink that refuses it, or a formatter that cannot format even
+        that notice, is reported by the two stages as before. On the handlers ``configure_logging``
+        builds, ``RedactionFilter`` already replaces a record whose message cannot be rendered, so
+        this is reached only by a formatter that fails where the filter did not."""
+        try:
+            self.format(record)
+        except Exception as exc:
+            logger = _escape_only(str(record.name), fallback=_LABEL_DROPPED)
+            level = _escape_only(str(record.levelname), fallback=_LABEL_DROPPED)
+            what = _safe_reason(exc)
+            return lambda: self._write_notice(
+                f"a log record from logger {logger!r} at level {level} could not be formatted "
+                f"({what}); it was not written"
+            )
+        return None
 
     def _probe_write(self) -> None:
         """:data:`SinkProbe` for this sink: answer "can you take a record again?" BY TAKING ONE.

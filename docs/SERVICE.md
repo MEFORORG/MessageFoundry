@@ -1058,6 +1058,9 @@ it — the engine refuses to start otherwise, naming the collision.
    `connection_stopped` alert per halted connection naming the log as the cause, and `GET /status`'s
    `log_sinks` block, which is read from memory and still answers when the disk does not.
 
+A record the sink cannot format is replaced by a notice naming its logger, and when the sink takes
+that notice neither stage runs.
+
 **Every outbound reads `log_halted` on `/connections` while this is in force** (ADR 0189), not
 `stopped`. The difference is the one that decides what you do next: `stopped` means the lane is
 waiting for you to press start, and `log_halted` means it is waiting for a writable disk — pressing
@@ -1079,7 +1082,8 @@ against a still-broken disk leaves the connection halted (and its listener down)
 otherwise "restart it again" would be a way around the control.
 `GET /status` may report a flapping sink `unwritable` even when nothing was halted: from the roll
 that trips the flap bound until a roll more than 60 s after its last roll or failure, or until the
-engine re-validates the log, which it does at least on a restart (ADR 0162 amendment B).
+engine re-validates the log. It does that when the engine starts, and when a recovery action tries
+to lift a log-write halt (ADR 0162 amendment B).
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
 start being routed again, but it deliberately never resumes a paused **outbound** (that is an
 operator decision), so the backlog moves one stage and stops. Restarting the service does both.

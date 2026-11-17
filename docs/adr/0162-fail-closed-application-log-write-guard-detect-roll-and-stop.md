@@ -444,3 +444,39 @@ stream, not a proof, and it does not model threads.
 [`tests/test_log_write_guard.py`](../../tests/test_log_write_guard.py) pins the cases by name, among
 them a revalidate between two flaps that must still stop at the moment `main` stops, and two
 revalidates on real handlers that must neither heal a broken handle nor take a one-shot fault.
+
+## Amendment C (2026-11-17) -- one page per break past the bound, and unformattable records (BACKLOG #5812, #5813)
+
+**Amendments A and B are unedited, and where this one disagrees with them it is the newer text.**
+In particular Amendment B's statement that the events and stop requests are `main`'s before it no
+longer holds after this amendment, for the case below.
+
+**One page per break past the bound.** Before this amendment every roll past section 1's bound
+wrote the sink's state as `rolled` before escalating, so `record_unwritable` never saw the sink as
+already down: each such roll fired another stage-2 event, stop request and stderr line. Now a roll
+past the bound on a sink already unwritable keeps it unwritable, so only the roll that trips the
+bound pages. A roll the bound calls a heal still writes `rolled` and pages stage 1, as before, so a
+sink that keeps flapping across bound windows pages stage 2 once per window it trips in. Whether
+the bound itself should hold across windows is left open with the latch's enforcement question.
+
+**`revalidate()` and a sink that changes while it is probed.** Each probe runs outside the guard's
+lock. A sink on which another thread records a roll or a stage-2 failure after the snapshot is no
+longer probed, and is not marked healthy after a probe that landed, so a latch, a failure or the
+bound's streak recorded meanwhile is kept. A change between that check and the probe's own write
+still meets the probe: the lock is never held across a sink's I/O. The latch's state is now a bare
+timestamp rather than a `_FlapLatch` object.
+
+**A record that cannot be formatted is not a sink failure** (BACKLOG #5813). `handleError` used
+to roll the sink on any failure, then fail to re-write the same record and call the sink
+unwritable. On the handlers `configure_logging` builds, the redaction filter already replaces a
+record whose message cannot be rendered, so this path needs a formatter that fails where the filter
+did not. Now such a record's place is taken by a fixed notice naming its logger and level. When the
+sink takes the notice, neither stage runs. When it refuses it, the sink is the fault and the two
+stages decide as before, so a formatter that cannot format even the guard's own notice still
+reaches stage 2.
+
+**Part of the side-by-side check is now committed.**
+`test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone` runs seeded random steps on
+two guards, one with the latch switched off, and compares their events, recorded states, bound and
+`revalidate()` answers. It drives the guard directly, not real handlers, and it does not model
+threads.

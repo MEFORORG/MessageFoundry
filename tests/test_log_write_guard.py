@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import shutil
 import sqlite3
 import sys
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -207,11 +209,15 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
 # alone would not, and never pages, asks for a stop or trips the bound less than the bound alone.
 
 
-def test_every_roll_past_the_bound_fires_a_stage2_event_as_before(tmp_path: Path) -> None:
-    # The latch never changes the guard's events: every roll past the bound fires a stage-2 event
-    # carrying the stop request, as on main. Driven by real rolls: a sink that heals on every roll
-    # and breaks on every record, well past the bound. This pins main's events, which the overlay
-    # must leave alone.
+def test_rolls_past_the_bound_page_once_per_break(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One page per break (BACKLOG #5812 item 2). The roll that trips the bound pages stage 2 once,
+    # with the stop request; each further roll past the bound in that window finds the sink already
+    # unwritable, is counted on /status, and pages nothing. Driven by real rolls: a sink that heals
+    # on every roll and breaks on every record, well past the bound.
+    # NEGATIVE CONTROL: before the fix each such roll wrote ``rolled`` first, so the escalation never
+    # saw the sink as already down: four stage-2 pages, four stop requests and four stderr lines.
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -221,8 +227,9 @@ def test_every_roll_past_the_bound_fires_a_stage2_event_as_before(tmp_path: Path
         _break_the_open_handle(handler)
         handler.emit(_record("break"))
 
-    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"] * 4
-    assert sum(e.stop_requested for e in events) == 4
+    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"]
+    assert sum(e.stop_requested for e in events) == 1
+    assert capsys.readouterr().err.count("IS UNWRITABLE") == 1
     status = guard.status()[0]
     assert status.state == "unwritable"
     assert status.rollovers == _MAX_ROLLS_PER_WINDOW + 4
@@ -282,9 +289,11 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
     # A sink rolling every 10 seconds for five minutes is one break. The bound's window restarts a
     # minute after its first roll, and without the latch the sink then read ``rolled`` (can_log()
     # True with no probe) until the bound tripped again. The latch keeps it ``unwritable``
-    # throughout, while the pages are exactly the bound's: one event per roll, stage 2 on every roll
-    # past the bound (two per 70 s window here, eight in all), stage 1 on the rest.
-    # NEGATIVE CONTROL: on main the state reads ``rolled`` at the first roll of each new window.
+    # throughout, while the pages are exactly the bound's: stage 1 for each roll the bound calls a
+    # heal, and stage 2 once for each window the bound trips in (four here); the second roll past
+    # the bound in a window pages nothing.
+    # NEGATIVE CONTROL: before the latch the state read ``rolled`` at the first roll of each new
+    # window; before the one-page fix every roll past the bound paged, 30 events with 8 of stage 2.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
     events: list[LogSinkEvent] = []
@@ -298,8 +307,8 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable(
         assert guard.status()[0].state == "unwritable"
         assert guard.can_log() is False
 
-    assert len(events) == 30
-    assert [e.stage for e in events].count("unwritable") == 8
+    assert len(events) == 26
+    assert [e.stage for e in events].count("unwritable") == 4
     assert all(e.stop_requested for e in events if e.stage == "unwritable")
 
     # The operator path still releases it, by writing a real record. The sink's own state is the
@@ -330,39 +339,72 @@ def test_the_roll_that_trips_the_bound_reads_unwritable_before_record_unwritable
     assert seen == [("unwritable", False)]
 
 
+def _own_state(guard: LogWriteGuard, sink: str) -> str:
+    """The sink's own recorded state, without the flap latch that :meth:`LogWriteGuard.status`
+    applies."""
+    return guard._sinks[sink].state
+
+
+def _latch_before(
+    guard: LogWriteGuard, clock: _FakeClock, *, trip_at: float, held_at: float
+) -> None:
+    """Trip the bound from ``trip_at`` so the latch holds the sink, then refresh the latch's clock
+    with a stage-2 failure at ``held_at``. The bound's window from ``trip_at`` has ended by the next
+    roll the caller makes at 0 s, so the latch is held while the bound starts afresh."""
+    _roll(guard, clock, *(trip_at + n for n in range(_MAX_ROLLS_PER_WINDOW + 1)))
+    _at(clock, held_at)
+    guard.record_unwritable("file", reason="the replacement failed too")
+
+
+@pytest.mark.parametrize("latched_first", [False, True])
 def test_a_stage2_failure_between_rolls_does_not_reset_the_flap_bound(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, latched_first: bool
 ) -> None:
     # Rolls at 0, 10, 20 and 30 s, a stage-2 failure at 35 s, then six rolls 65 to 115 s: six rolls
     # in 50 s is a flap, and the bound's window catches it at 115 s. Pins the bound, which the latch
-    # must never move.
+    # must never move. With ``latched_first`` the latch holds the sink the whole time, so it has the
+    # chance to move the bound that the plain case never gives it.
     clock = _FakeClock()
     guard, events = _guard_on(clock, monkeypatch)
+    if latched_first:
+        _latch_before(guard, clock, trip_at=-70, held_at=-10)
     _roll(guard, clock, 0, 10, 20, 30)
     _at(clock, 35)
     guard.record_unwritable("file", reason="the replacement failed too")
-    _roll(guard, clock, 65, 75, 85, 95, 105, 115)
+    _roll(guard, clock, 65, 75, 85, 95, 105)
+    assert ("file" in guard._flap_latch) is latched_first
+    assert _own_state(guard, "file") == "rolled"  # the bound's own state, a roll before the trip
+    paged = len(events)
+    _roll(guard, clock, 115)
 
-    assert guard.status()[0].state == "unwritable"
+    assert _own_state(guard, "file") == "unwritable"  # tripped by the bound, not read off the latch
     assert guard.can_log() is False
-    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    assert [(e.stage, e.stop_requested) for e in events[paged:]] == [("unwritable", True)]
 
 
+@pytest.mark.parametrize("latched_first", [False, True])
 def test_the_latch_never_trips_later_than_the_bound_alone(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, latched_first: bool
 ) -> None:
     # A roll at 0 s, stage 2 at 1 s, a healing roll at 2 s, then eight rolls in seven seconds from
-    # 59 s: the five-in-60 bound alone trips at 66 s, and so must this guard.
+    # 59 s: the five-in-60 bound alone trips at 66 s, and so must this guard. With
+    # ``latched_first`` the latch holds the sink throughout.
     clock = _FakeClock()
     guard, events = _guard_on(clock, monkeypatch)
+    if latched_first:
+        _latch_before(guard, clock, trip_at=-80, held_at=-5)
     _roll(guard, clock, 0)
     _at(clock, 1)
     guard.record_unwritable("file", reason="the replacement failed too")
-    _roll(guard, clock, 2, 59, 60, 61, 62.5, 63, 64, 65, 66)
+    _roll(guard, clock, 2, 59, 60, 61, 62.5, 63, 64, 65)
+    assert ("file" in guard._flap_latch) is latched_first
+    assert _own_state(guard, "file") == "rolled"
+    paged = len(events)
+    _roll(guard, clock, 66)
 
-    assert guard.status()[0].state == "unwritable"
+    assert _own_state(guard, "file") == "unwritable"
     assert guard.can_log() is False
-    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+    assert [(e.stage, e.stop_requested) for e in events[paged:]] == [("unwritable", True)]
 
 
 def test_a_roll_the_latch_alone_holds_still_pages_stage1_with_its_cause(
@@ -633,6 +675,202 @@ def test_the_flap_bound_does_not_fire_on_an_ordinary_transient(tmp_path: Path) -
     handler.emit(_record("break"))
 
     assert [e.stage for e in events] == ["rolled"]
+
+
+def test_a_roll_or_failure_during_a_sinks_probe_is_not_undone_by_revalidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 9. The sink tripped the bound and is unwritable. While revalidate's probe
+    # runs, outside the lock, another thread records one more roll past the bound, which keeps the
+    # sink unwritable and refreshes its latch. The probe then lands. Marking the sink healthy now
+    # would wipe that roll: the bound's streak, the latch and the unwritable state.
+    # NEGATIVE CONTROL: before the fix revalidate marked it healthy and answered True.
+    clock = _FakeClock()
+    holder: list[LogWriteGuard] = []
+
+    def probe_while_it_flaps() -> None:
+        _at(clock, 7)
+        holder[0].record_rollover("file", reason="lock", rolled_aside=None)
+
+    guard, _events = _guard_on(clock, monkeypatch, probe=probe_while_it_flaps)
+    holder.append(guard)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1))
+    assert _own_state(guard, "file") == "unwritable"
+
+    assert guard.revalidate() is False
+    assert _own_state(guard, "file") == "unwritable"
+    assert "file" in guard._flap_latch
+    assert guard._roll_flap["file"][1] == _MAX_ROLLS_PER_WINDOW + 2
+
+
+def test_revalidate_does_not_probe_a_sink_that_became_latch_only_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 7. Two dead sinks. While the first one's probe runs, the second rolls once
+    # in a fresh window of the bound, so its own state is ``rolled`` and only the latch holds it.
+    # Probing it would write to a sink the latch alone holds, which the latch's design forbids.
+    # NEGATIVE CONTROL: before the fix the second sink's probe ran from the stale snapshot, and its
+    # record_healthy reset the bound.
+    clock = _FakeClock()
+    probed: list[str] = []
+    holder: list[LogWriteGuard] = []
+
+    def probe_a() -> None:
+        probed.append("a")
+        _at(clock, 62)
+        holder[0].record_rollover("b", reason="lock", rolled_aside=None)
+
+    def probe_b() -> None:
+        probed.append("b")
+
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    guard = LogWriteGuard()
+    holder.append(guard)
+    guard.register("a", probe=probe_a)
+    guard.register("b", probe=probe_b)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("b", reason="lock", rolled_aside=None)
+    _at(clock, 6)
+    guard.record_unwritable("a", reason="the replacement failed too")
+    assert [s.state for s in guard.status()] == ["unwritable", "unwritable"]
+
+    assert guard.revalidate() is True  # ``a`` landed, and ``b``'s own state is ``rolled``
+    assert probed == ["a"]
+    assert _own_state(guard, "b") == "rolled"
+    assert guard._roll_flap["b"] == (1062.0, 1)  # the bound's fresh window, not reset
+
+
+def test_the_stage2_line_says_when_only_the_latch_holds_the_other_sink(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #5812 item 8. ``file`` is held by the latch alone and ``stdout`` then fails stage 2.
+    # No stop is asked for, and the stderr line no longer calls the other sink writable while
+    # /status reads it unwritable. NEGATIVE CONTROL: before the fix it said "another sink is still
+    # writable".
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch, sinks=("file", "stdout"))
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
+    capsys.readouterr()
+
+    _at(clock, 63)
+    guard.record_unwritable("stdout", reason="the replacement failed too")
+
+    err = capsys.readouterr().err
+    assert "another sink is still writable" not in err
+    assert "only by the flap latch" in err and "nothing is being stopped" in err
+    assert events[-1].stop_requested is False
+
+
+def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 15: a committed form of the side-by-side check. Two guards take the same
+    # seeded random steps under a fake clock: rolls, stage-2 failures and revalidates whose probe
+    # outcome is drawn once per step and shared. One has the latch switched off. At every step the
+    # events, the stop requests, each sink's own recorded state, the bound and the revalidate answer
+    # must be identical, and the latched guard must read a sink unwritable wherever the other does.
+    def build(latched: bool, outcome: list[bool]) -> tuple[LogWriteGuard, list[LogSinkEvent]]:
+        def probe() -> None:
+            if not outcome[0]:
+                raise OSError("still broken")
+
+        guard = LogWriteGuard()
+        events: list[LogSinkEvent] = []
+        guard.set_escalation(events.append)
+        guard.register("file", probe=probe)
+        guard.register("stdout", probe=probe)
+        if not latched:
+            guard._latch_after_roll = lambda sink, *, now, tripped: None  # type: ignore[method-assign]
+            guard._latch_after_failure = lambda sink: None  # type: ignore[method-assign]
+        return guard, events
+
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    latched_seen = 0
+    for seed in range(40):
+        rng = random.Random(seed)
+        clock.now = 1000.0
+        outcome = [True]
+        with_latch, ev_with = build(True, outcome)
+        without, ev_without = build(False, outcome)
+        for _ in range(120):
+            clock.now += rng.choice((0.5, 3.0, 9.0, 30.0, 65.0))
+            sink = rng.choice(("file", "stdout"))
+            step = rng.random()
+            outcome[0] = rng.random() < 0.5
+            answers: list[bool] = []
+            for guard in (with_latch, without):
+                if step < 0.75:
+                    guard.record_rollover(sink, reason="lock", rolled_aside=None)
+                elif step < 0.9:
+                    guard.record_unwritable(sink, reason="the replacement failed too")
+                else:
+                    answers.append(guard.revalidate())
+            assert len(set(answers)) <= 1
+            assert ev_with == ev_without
+            # The wall-clock stamp is left out: the two guards write it a moment apart.
+            assert _without_stamps(with_latch) == _without_stamps(without)
+            assert with_latch._roll_flap == without._roll_flap
+            for latched_s, plain_s in zip(with_latch.status(), without.status(), strict=True):
+                assert plain_s.state != "unwritable" or latched_s.state == "unwritable"
+            assert with_latch.can_log() <= without.can_log()
+            latched_seen += bool(with_latch._flap_latch)
+    assert latched_seen > 50  # the latch was really in play, not idle through the run
+
+
+def _without_stamps(guard: LogWriteGuard) -> dict[str, Any]:
+    return {name: replace(s, last_event_at=None) for name, s in guard._sinks.items()}
+
+
+# --- BACKLOG #5813: a record that cannot be formatted is not a sink failure ----
+
+
+def test_a_record_that_cannot_be_formatted_does_not_roll_or_stop_a_healthy_sink(
+    tmp_path: Path,
+) -> None:
+    # A record whose arguments do not fit its format string, on a sink with no filter in front of
+    # the formatter (on the configured handlers RedactionFilter replaces such a record before the
+    # formatter runs, so this reaches the guard only through a formatter). The sink is fine: a fixed notice naming the logger takes the record's place,
+    # nothing is rolled, nothing pages, and the next record lands.
+    # NEGATIVE CONTROL: before the fix the guard rolled the sink, failed to re-write the same record
+    # and called the sink unwritable, asking for a stop.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+
+    handler.emit(_record("count %d", "not a number"))
+    handler.emit(_record("the next line"))
+    handler.close()
+
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert list(tmp_path.iterdir()) == [log_path]  # nothing rolled aside
+    text = log_path.read_text(encoding="utf-8")
+    assert "a log record from logger 't' at level INFO could not be formatted" in text
+    assert "not a number" not in text  # the record's content is not in the stand-in
+    assert "the next line" in text
+
+
+def test_a_formatter_that_fails_on_every_record_still_reaches_stage2(tmp_path: Path) -> None:
+    # The other side of the test above: when the sink cannot format even the guard's own
+    # notice, the record is not the fault, and the stages decide as before.
+    class Broken(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            raise RuntimeError("formatter is broken")
+
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedFileHandler(str(tmp_path / "app.log"), guard=guard, sink="file")
+    handler.setFormatter(Broken())
+
+    handler.emit(_record("anything"))
+    handler.close()
+
+    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
 
 
 # --- stage 2: STOP -----------------------------------------------------------
