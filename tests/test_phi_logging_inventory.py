@@ -430,8 +430,11 @@ def test_message_event_constant_matches_the_literal_emit_sites() -> None:
         )
         for name in ("store.py", "postgres.py", "sqlserver.py")
     }
-    # Floors measured 2026-11-16: three backends, 13 literal kinds in each. A count, not just
-    # non-empty, so a scan gone equally blind on all three cannot pass the parity check below.
+    # The backend count cannot fail (``emitted`` is built over a fixed three-name tuple); it is here
+    # for the vacuous-absence lint, which does not see that. The floor that can fail is the union
+    # count below, measured 2026-11-16 at 13 literal kinds: it, not the backend count, is what stops
+    # a scan gone equally blind on all three backends from passing the parity check. It bounds the
+    # union; each backend reaches 13 only through that parity check.
     assert len(emitted) >= 3, f"expected the three store backends, scanned {sorted(emitted)}"
     assert all(emitted.values()), (
         f"the emit-site scan found no literal kind in a backend: {emitted}"
