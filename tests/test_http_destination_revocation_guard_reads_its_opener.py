@@ -51,6 +51,7 @@ from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, S
 from messagefoundry.transports import build_destination, dicomweb, fhir, rest, soap
 from messagefoundry.transports.http_auth import HttpAuthError
 from messagefoundry.transports.rest import ECH_HOP_WAYS_ACROSS, opener_tls_context
+from tests._crl_pki import empty_crl, throwaway_ca
 from tests.test_hop_refusal_revocation import (
     _crl_coverage_ca,
     _crl_coverage_server,
@@ -109,26 +110,8 @@ def pki(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     hop refuses, kept for the error-order arm."""
     now = datetime.datetime.now(datetime.UTC)
     day = datetime.timedelta(days=1)
-    ca_key = ec.generate_private_key(ec.SECP256R1())
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2188-ca")])
-    ca = (
-        x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - day)
-        .not_valid_after(now + 365 * day)
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-    crl = (
-        x509.CertificateRevocationListBuilder()
-        .issuer_name(ca.subject)
-        .last_update(now - 2 * day)
-        .next_update(now + 30 * day)
-        .sign(ca_key, hashes.SHA256())
-    )
+    ca_key, ca = throwaway_ca("mefor-2188-ca")
+    crl = empty_crl(ca_key, ca)
     client_key = ec.generate_private_key(ec.SECP256R1())
     client = (
         x509.CertificateBuilder()
