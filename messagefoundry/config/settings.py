@@ -10679,7 +10679,8 @@ def security_loosenings(
                 "allow_lost_audit_range_key",
                 "the engine starts even where its refusal of a store key change the keyed audit "
                 "chain cannot follow would stop it, and the audit chain breaks at that start's "
-                "first audit row; docs/SECURITY-LOOSENING.md states that refusal",
+                "first audit row and no rotate-key run can roll it afterwards; "
+                "docs/SECURITY-LOOSENING.md states that refusal",
             )
         )
     # --- the credential reminders (ASVS 6.4.5; BACKLOG #2227 and #2008 step 4). Owner answer to

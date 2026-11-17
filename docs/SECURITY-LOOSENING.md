@@ -837,16 +837,18 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `[secret_rotation].allow_lost_audit_range_key = true` — the engine starts on a key change the audit chain cannot follow
 Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
 the next start may do.
-- **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
+- **What you lose:** the start refusal that keeps the keyed audit chain across a store key
   change. This entry states when that refusal fires and the way out. With it off,
   `serve` (and each `supervise` shard) refuses to start when all of these hold: the engine holds a
   local store key, so not under `[store].cipher_provider = "vault_transit"`; the stamp does not
   name that key, which covers a different key, no stamp, and a stamp under a scheme this release
   does not know; the store has a keyed audit chain in which the open found no range that fails to
-  authenticate; and the
+  authenticate (where it finds one, the refusal does not fire, though that start's first audit row
+  may still break the chain); and the
   key the chain's newest range is under is not configured. It refuses whether or not the key in
   use keyed an earlier range. With it on, that start goes ahead: its first audit row goes into
-  that range under the key in use, never verifies there, and the chain breaks at that row.
+  that range under the key in use, never verifies there, and the chain breaks at that row, and
+  `rotate-key` cannot roll the chain afterwards.
 - **What you keep:** the refusal's text, logged as a WARNING on every start the switch lets through,
   and every other start check.
 - **When acceptable:** only when the key the chain's newest range is under is truly lost. If the
