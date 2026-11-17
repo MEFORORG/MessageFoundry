@@ -199,12 +199,11 @@ def git_bash() -> str | None:
     return None
 
 
-# A command-only PowerShell hook runs under pwsh -Command. The head line keeps a native non-zero
-# exit from throwing where a PowerShell build defaults that preference on. The tail lifts a 2 that
-# -Command reports as 1, for example a guard script's exit 2, back to 2. Its read sits in try/catch
-# because under strict mode an unset LASTEXITCODE throws, and a hook's trap would turn that throw
-# into a block. See docs/CODEX.md, "Who decides a block", and the tests for which shapes block.
-POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
+# A command-only PowerShell hook runs under pwsh -Command with this tail after it. When the hook
+# ends with $? false, the tail exits with the last exit code, when it is 2, and with 1 otherwise;
+# -Command alone reports a guard script's exit 2 as 1. Its read sits in try/catch because under
+# strict mode an unset LASTEXITCODE throws, and a hook's trap would turn that throw into a block.
+# See docs/CODEX.md, "Who decides a block", and the tests for which shapes block.
 POWERSHELL_TAIL = (
     "\n;\nif (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }"
 )
@@ -217,21 +216,20 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
             str(part).replace("${CLAUDE_PROJECT_DIR}", str(root))
             for part in (command, *hook["args"])
         ]
-    # A command-only source runs in the shell it names. Claude Code's default is bash, and on
-    # Windows PowerShell when Git Bash is not installed. Environment expansion belongs to that
-    # shell; structured args above need no shell parsing.
+    # A command-only source runs in the shell it names; with none, pwsh on Windows and bash
+    # elsewhere. Environment expansion belongs to that shell; structured args above need no shell
+    # parsing.
     shell = hook.get("shell")
-    if shell in ("bash", None):
+    if shell is None:
+        shell = "powershell" if os.name == "nt" else "bash"
+    if shell == "bash":
         bash = git_bash() if os.name == "nt" else "bash"
-        if bash:
-            return [bash, "-c", command]
-        if shell == "bash":
+        if not bash:
             raise FileNotFoundError("Git Bash not found; a shell: bash hook cannot run")
-        shell = "powershell"
+        return [bash, "-c", command]
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        script = POWERSHELL_HEAD + command + POWERSHELL_TAIL
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command + POWERSHELL_TAIL]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 

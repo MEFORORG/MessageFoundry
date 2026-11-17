@@ -235,14 +235,19 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("Write-Output '{{}}' ||", "exit-1"),
         ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
-        # After the bridge's head line, an empty param() fails to parse. A non-empty one parses
-        # as a call to a missing command named param, which leaves $? false; its parenthesised
-        # default is evaluated as an expression, so this body sees it and exits 0 by itself.
-        ("param()\nexit 2", "exit-1"),
+        # A hook may open with param(), [CmdletBinding()], #Requires or using, as a script can,
+        # and its exit 2 blocks. Named blocks cannot be followed by the tail, so they fail to
+        # parse.
+        ("param()\nexit 2", "block"),
         (
             "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
             "allow",
         ),
+        ("[CmdletBinding()]\nparam()\nexit 2", "block"),
+        ("param([string]$A = 'a', [string]$B = 'b')\nexit 2", "block"),
+        ("#Requires -Version 7\nparam()\nexit 2", "block"),
+        ("using namespace System.IO\nexit 2", "block"),
+        ("begin {{ }}\nend {{ exit 2 }}", "exit-1"),
     ],
     ids=[
         "explicit-exit-2",
@@ -269,9 +274,16 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         "early-return",
         "empty-param",
         "non-empty-param",
+        "cmdletbinding-param",
+        "two-defaulted-params",
+        "requires-then-param",
+        "using-namespace",
+        "named-blocks",
     ],
 )
-def test_a_powershell_hook_blocks_on_a_2_that_ends_it(bridge, tmp_path, command, outcome):
+def test_a_powershell_hook_blocks_on_the_last_exit_code_when_it_is_2(
+    bridge, tmp_path, command, outcome
+):
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
     settings(tmp_path, [hook])
     if outcome == "block":
@@ -359,16 +371,27 @@ def test_non_object_json_on_a_tool_event_is_not_a_block(bridge, tmp_path, capsys
     assert "3" in capsys.readouterr().err
 
 
-def test_a_command_only_hook_defaults_to_bash_then_powershell(bridge, tmp_path, monkeypatch):
-    """Claude Code's default shell is bash, or PowerShell on Windows when Git Bash is missing."""
+def test_a_command_only_hook_defaults_to_pwsh_on_windows_else_bash(bridge, tmp_path, monkeypatch):
+    """With no shell named, a command-only hook runs under pwsh on Windows and bash elsewhere."""
     hook = {"type": "command", "command": "echo hi"}
     monkeypatch.setattr(bridge, "git_bash", lambda: "git/bin/bash.exe")
-    assert Path(bridge.hook_argv(tmp_path, hook)[0]).stem == "bash"
     if os.name == "nt":
-        monkeypatch.setattr(bridge, "git_bash", lambda: None)
         assert bridge.hook_argv(tmp_path, hook)[0] == "pwsh"
+        assert Path(bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})[0]).stem == "bash"
+        monkeypatch.setattr(bridge, "git_bash", lambda: None)
         with pytest.raises(FileNotFoundError):
             bridge.hook_argv(tmp_path, {**hook, "shell": "bash"})
+    else:
+        assert Path(bridge.hook_argv(tmp_path, hook)[0]).stem == "bash"
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None or os.name != "nt", reason="requires PowerShell on Windows"
+)
+def test_a_no_shell_hook_runs_under_pwsh_on_windows(bridge, tmp_path):
+    settings(tmp_path, [{"type": "command", "command": 'trap { exit 2 }; throw "boom"'}])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, BASH_CALL)
 
 
 # Values a tracked matcher is tried against, per event's discriminator. A new matcher that selects

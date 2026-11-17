@@ -68,7 +68,8 @@ and 127 under `sh`; this is reasoned, not measured.
 
 At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
 reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
-unaffected. **A future guard that must block when it fails sets
+lost when another hook on the same event exited non-zero, which raised before
+the merged result was printed. **A future guard that must block when it fails sets
 `"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
 launcher with no decision, or a bridge fault, such as a payload with no session
 id, never blocks.
@@ -80,32 +81,28 @@ turns into 2, including events where Claude Code only shows the hook's stderr.
 Hook chains have a 90-second outer limit, so the timeouts of a long chain add up
 against it.
 
-Command-only hooks use the shell they name. With none, they use bash, as Claude
-Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
+Command-only hooks use the shell they name. With none, they use pwsh on Windows
+and bash elsewhere.
 Structured `command` and `args` avoid shell parsing. A command-only PowerShell
 hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
 PowerShell hook with an explicit `exit 2`. The bridge runs it under
-`pwsh -Command`. It puts this line before the hook:
-
-```powershell
-$PSNativeCommandUseErrorActionPreference = $false
-```
-
-and appends this fixed tail after it, on new lines:
+`pwsh -Command` and appends this fixed tail after it, on new lines:
 
 ```powershell
 ;
 if (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }
 ```
 
-The source is `POWERSHELL_HEAD` and `POWERSHELL_TAIL` in
-`scripts/codex/bridge.py`, and `tests/test_codex_bridge.py` is the record of
-which shapes block. **A hook that must block should end with an explicit
-`exit 2`.** Shapes that end on an error,
-or with a stale exit code, are decided by the tail and are not listed here.
+The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
+`tests/test_codex_bridge.py` records at least these shapes and whether each
+blocks. **A hook that must block should end with an explicit `exit 2`, and not
+be written as named blocks (below).** Shapes
+that end on an error, or with a stale exit code, are decided by the tail and are
+not listed here.
 
-A hook that opens with an empty `param()` fails to parse after the head line, so
-it exits 1 on every call, and under `"onFailure": "block"` it blocks every call.
+A hook written as named blocks (`begin`, `process`, `end`) fails to parse with
+the tail after it, so it exits 1 on every call, and under
+`"onFailure": "block"` it blocks every call.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.
