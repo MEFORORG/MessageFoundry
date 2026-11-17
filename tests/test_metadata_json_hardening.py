@@ -413,8 +413,8 @@ def test_the_unreadable_cell_warning_names_its_row_and_counts_what_it_held_back(
         clock[0] += metadata_module._WARN_INTERVAL_S
         assert user_metadata('{"user": ', row_id="bad\nid") is None
     first, second = (r.getMessage() for r in caplog.records)
-    assert "row 0123456789ab " in first and "0 more held back" in first
-    assert "row bad?id " in second and "3 more held back" in second
+    assert "message 0123456789ab " in first and "0 more held back" in first
+    assert "message bad?id " in second and "3 more held back" in second
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])

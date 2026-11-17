@@ -456,14 +456,15 @@ async def test_the_handoff_wrapper_reads_every_layer_of_a_wraps_chain() -> None:
     async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
         return await inner(self, routed_id=routed_id)
 
-    with pytest.raises(TypeError, match="must take routed_id as a keyword-only parameter$"):
+    # The refusal names the layer that failed, not the innermost name wraps copied onto it.
+    with pytest.raises(TypeError, match=r"\.positional must take routed_id as a keyword-only"):
         dead_letters_on_cell_tag(positional)
 
     @functools.wraps(inner)
     async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
         return await inner(self, routed_id=routed_id)
 
-    with pytest.raises(TypeError, match="no default$"):
+    with pytest.raises(TypeError, match=r"\.defaulted must give .* no default$"):
         dead_letters_on_cell_tag(defaulted)
 
     @functools.wraps(inner)

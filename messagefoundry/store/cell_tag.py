@@ -601,18 +601,23 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
             raise TypeError(f"{name} has a cycle in its __wrapped__ chain")
         layers.append(layer)
     for depth, layer in enumerate(layers):
+        # Each refusal names the layer that failed: functools.wraps copies the innermost's
+        # __qualname__ onto every layer, so the code object's own name is read.
         code = getattr(layer, "__code__", None)
         if code is None:
-            raise TypeError(f"{name} must be a plain function or method")
+            raise TypeError(
+                f"{name}: its {type(layer).__qualname__} layer must be a plain function or method"
+            )
+        label = code.co_qualname
         if "routed_id" in code.co_varnames[: code.co_argcount]:
-            raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
+            raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
         keyword_only = code.co_varnames[
             code.co_argcount : code.co_argcount + code.co_kwonlyargcount
         ]
         if depth == len(layers) - 1 and "routed_id" not in keyword_only:
-            raise TypeError(f"{name} must take routed_id as a keyword-only parameter")
+            raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
         if "routed_id" in (getattr(layer, "__kwdefaults__", None) or {}):
-            raise TypeError(f"{name} must give its keyword-only routed_id no default")
+            raise TypeError(f"{label} must give its keyword-only routed_id no default")
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:

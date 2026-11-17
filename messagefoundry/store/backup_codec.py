@@ -487,7 +487,9 @@ def decrypt_stream(
     its ``format_version`` differs from the version byte, or its ``chunk_size`` is out of range;
     as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered
     ``chunk_size`` is below a real frame; and at the tag, which covers the header bytes as read.
-    Fail-closed: nothing decrypts unless every frame authenticates.
+    Each frame's plaintext is written to ``dst`` once that frame authenticates, before the next
+    frame is read, so a refusal can leave earlier frames' plaintext in ``dst``: discard ``dst`` on
+    any error.
 
     Raises :class:`BackupKeyMismatch` when the header ``key_id`` does not match ``key`` — checked first,
     so a wrong key is a clean early error, not an opaque tag failure.

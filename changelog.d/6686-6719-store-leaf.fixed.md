@@ -3,8 +3,8 @@
   (`BACKLOG #6687`)
 - A metadata cell a driver returns as a `memoryview` is read rather than treated as empty.
   (`BACKLOG #6712`)
-- The unreadable metadata-cell WARNING is logged at most once per kind per minute, names its row
-  and counts the lines held back since the last one, a non-text cell is logged by its type, and a
+- The unreadable metadata-cell WARNING is logged at most once per kind per minute, names its
+  message and counts the lines held back since the last one, a non-text cell is logged by its type, and a
   failed cell-tag audit write names its cell and row reference, with a programming error's frames.
   (`BACKLOG #6697`, `#6712`)
 - The dead-letter wrapper reads `routed_id` off the code of every layer of a `functools.wraps`

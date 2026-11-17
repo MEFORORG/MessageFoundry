@@ -179,9 +179,11 @@ def _row_ref(row_id: object) -> str:
 
 
 def _warn_unreadable(hint: str, row_id: object) -> None:
-    """Log the content-free unreadable-cell WARNING for ``hint``, naming ``row_id``'s reference, at
-    most once per interval per kind, with the count held back since the last line. Throttled by the
-    hint's kind, never its line and column, so the memo stays as small as the set of kinds."""
+    """Log the content-free unreadable-cell WARNING for ``hint``, naming the reference of
+    ``row_id``, the id of the message the cell belongs to, at most once per interval per kind,
+    with the count held back since the last line. Throttled by the hint's kind, never its line and
+    column, so the memo stays as small as the set of kinds. A count held back after the last line
+    is logged only when that kind is logged again."""
     kind = hint.split(" at ", 1)[0]
     now = _time.monotonic()
     with _warned_lock:
@@ -192,7 +194,7 @@ def _warn_unreadable(hint: str, row_id: object) -> None:
         held_back = last[1] if last is not None else 0
         _warned[kind] = (now, 0)
     log.warning(
-        "a stored JSON cell of row %s is unreadable (%s); read as empty (logged at most once per"
+        "a stored JSON cell of message %s is unreadable (%s); read as empty (logged at most once per"
         " %.0f s; %d more held back since the last such line)",
         _row_ref(row_id),
         hint,
