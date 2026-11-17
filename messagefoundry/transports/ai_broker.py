@@ -59,7 +59,7 @@ import urllib.request
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.tls_policy import (
-    PEER_NOT_REQUIRED_WAYS_ACROSS,
+    PEER_NOT_VERIFIED_WAYS_ACROSS,
     CrlNoCredit,
     HopDisposition,
     HopPosture,
@@ -108,9 +108,14 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 _DEFAULT_TIMEOUT = 60.0
 
 
-#: The cell the AI hop's revocation refusal and its log lines name, written through the guard's
-#: ``stated_cell``, which drops "verified" on a context without ``CERT_REQUIRED``. PHI-free.
+#: The cell the AI hop's revocation refusal and its log lines name where the guard's reason is
+#: that the context consults no CRL. PHI-free.
 _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
+
+#: The cell for any other reason, written through the guard's ``stated_cell``, which drops
+#: "verified" on a context that does not verify the peer. It does not say "no revocation check",
+#: as REST's and remotefile's cells do not on a relaxed hop (vault BACKLOG #4912).
+_AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture, besides an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
@@ -134,11 +139,11 @@ _AI_ATTESTATION_LEVER = (
 
 def _revocation_lever(*, crl_reachable: bool, no_credit: CrlNoCredit | None) -> str:
     """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop and
-    could be credited there. On a context that does not set ``CERT_REQUIRED`` it is the guard's
-    own :data:`~messagefoundry.config.tls_policy.PEER_NOT_REQUIRED_WAYS_ACROSS`, as on every other
-    guarded hop (vault BACKLOG #4912)."""
-    if no_credit is CrlNoCredit.PEER_NOT_REQUIRED:
-        return PEER_NOT_REQUIRED_WAYS_ACROSS
+    could be credited there. On a context that does not verify the peer it is the guard's default
+    for such a context, :data:`~messagefoundry.config.tls_policy.PEER_NOT_VERIFIED_WAYS_ACROSS`
+    (vault BACKLOG #4912)."""
+    if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
+        return PEER_NOT_VERIFIED_WAYS_ACROSS
     if crl_reachable and no_credit is CrlNoCredit.NO_CRL:
         return _AI_CRL_LEVER + _AI_ATTESTATION_LEVER
     return _AI_ATTESTATION_LEVER[0].upper() + _AI_ATTESTATION_LEVER[1:]
@@ -239,8 +244,8 @@ def _refuse_an_unrevoked_ai_hop(
     (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
     Every call sends ``[ai].api_key`` and the code sent for assistance over https. The openers
-    the broker builds verify the endpoint's certificate; on a context handed in that does not set
-    ``CERT_REQUIRED``, the record says so instead of calling the hop verified, and its remedy is
+    the broker builds verify the endpoint's certificate; on a context handed in that does not
+    verify the peer, the record says so instead of calling the hop verified, and its remedy is
     the guard's (vault BACKLOG #4912). Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
     context, so without one a revoked but unexpired certificate would be accepted with no refusal
     and no record. ``crl_reachable`` says whether a ``[tls]`` policy reached the broker, and so
@@ -262,9 +267,8 @@ def _refuse_an_unrevoked_ai_hop(
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
       through, never off a setting. It is ``True`` only when
       :func:`~messagefoundry.config.tls_policy.crl_no_credit` gives no reason against that
-      context: it sets ``CERT_REQUIRED``, does not skip validity-period checks, which would
-      accept a CRL past its ``nextUpdate``, and consults a CRL (vault BACKLOG #5086, #4912). That
-      function's docstring is the source of record for the conditions. It can be ``True`` when
+      context (vault BACKLOG #5086, #4912). That function's docstring is the source of record
+      for the conditions. It can be ``True`` when
       ``[tls].crl_file`` reached the hop through :func:`_endpoint_opener` (BACKLOG #5527).
       Otherwise the opener is rest.py's shared one, which loads no CRL, or one carrying only
       ``[tls].internal_ca_file``, so it is ``False``.
@@ -326,12 +330,11 @@ def _refuse_an_unrevoked_ai_hop(
     # capture() reads the process-wide variable into its own field and the context through
     # crl_no_credit, the same reads every RevocationHopGuard hop makes; disposition() asks
     # revocation_hop_disposition, logging and raising nothing. The texts below are this hop's own,
-    # worded from the guard's reason (guard.no_credit) and its stated_cell, so a context without
-    # CERT_REQUIRED is never called verified (vault BACKLOG #4912). disposition() is never None,
-    # since a posture is held.
+    # worded from the guard's reason (guard.no_credit) and its stated_cell (vault BACKLOG #4912).
+    # disposition() is never None, since a posture is held.
     guard = RevocationHopGuard.capture(
         host=host,
-        cell=_AI_HOP_CELL,
+        cell=_AI_HOP_CELL_OTHER,
         description="sends [ai].api_key over verified https",
         attested=attested,
         context=context,
@@ -341,20 +344,21 @@ def _refuse_an_unrevoked_ai_hop(
     )
     disposition = guard.disposition()
     enforcing = held.enforcing
-    cell = guard.stated_cell
     no_credit = guard.no_credit
+    # On NO_CRL the context verifies the peer, so stated_cell would keep "verified" as well.
+    cell = _AI_HOP_CELL if no_credit is CrlNoCredit.NO_CRL else guard.stated_cell
     sent = f"the AI endpoint {host!r} is sent [ai].api_key over https"
-    if no_credit is CrlNoCredit.PEER_NOT_REQUIRED:
+    if no_credit is CrlNoCredit.PEER_NOT_VERIFIED:
         detail = (
-            f"{sent} whose TLS context does not set CERT_REQUIRED, and the guard credits a "
-            "revocation check only on a context that does"
+            f"{sent} whose TLS context does not verify the peer (verify_mode is CERT_NONE), and "
+            "the guard credits a revocation check only on a context that does"
         )
     elif no_credit is CrlNoCredit.EXPIRY_RELAXED:
         # A CRL on such a context still refuses a leaf it lists, so "NO revocation checking"
         # would say less was checked than was; what the hop lacks is a check the guard credits.
         detail = (
-            f"{sent} whose TLS context skips validity-period checks, so the guard credits no "
-            "revocation check on it"
+            f"{sent} whose TLS context skips validity-period checks, and the guard credits no "
+            "revocation check on such a context"
         )
     else:
         detail = (

@@ -789,9 +789,9 @@ gone, and the guard decides on one field, `crl_checked`, which the disposition, 
 AI broker all read (vault BACKLOG #5086, owner ruling 2026-11-03). `capture()` sets it True only
 when the context checks a CRL, the context does not skip time validity, and the caller did not pass
 `expiry_relaxed=True`, so the flag can only take the credit away. [Note 2026-11-17, vault BACKLOG
-#4912: since that row the context must also set `CERT_REQUIRED`. `capture()` reads `crl_no_credit`
-in `config/tls_policy.py`, whose docstring states the conditions; on a context without
-`CERT_REQUIRED` the record's words and default remedy follow that reason, not the relaxation.] A CRL on a context that skips time
+#4912: `capture()` also gives no credit to a context that does not verify the peer (`verify_mode`
+is `CERT_NONE`). It reads `crl_no_credit` in `config/tls_policy.py`, whose docstring states the
+conditions.] A CRL on a context that skips time
 validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
 at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
 instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
@@ -843,7 +843,9 @@ each other. Whether such a context's CRL should admit the hop is not decided her
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
 because neither opener it can dial relaxes: rest.py's shared opener, or, since BACKLOG #5527, the
 anchored opener it holds, built by rest.py's `_no_redirect_opener`, which never calls
-`relax_verify_expiry`. *(Note 2026-11-04: the open limit above is closed by
+`relax_verify_expiry`. *(Note 2026-11-17, vault BACKLOG #4912: the AI broker now takes its
+crossing line's lead from the guard and words its records from the guard's reason, so a context
+that skips time validity, if one reached it, would get the relaxed words.)* *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
 words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets

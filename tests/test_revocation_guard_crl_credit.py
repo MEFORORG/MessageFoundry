@@ -3,11 +3,12 @@
 """One rule decides whether a CRL may relax a revocation guard (vault BACKLOG #4912, #2977 item 11).
 
 ``crl_no_credit`` in ``config/tls_policy.py`` is that rule, and ``crl_credited`` its yes-or-no
-form: the context sets ``CERT_REQUIRED``, does not skip validity-period checks, and consults a CRL.
+form: the context verifies the peer (``verify_mode`` is not ``CERT_NONE``), does not skip
+validity-period checks, and consults a CRL.
 At least ``RevocationHopGuard.capture`` and the Vault and proxy legs in
 ``transports/strict_requests.py`` read it; until this change those two legs read
 ``context_checks_revocation`` alone. The leg tests below hand each leg a relaxed context. The guard
-words its record from the same reason. On a hop whose context does not set ``CERT_REQUIRED``, the
+words its record from the same reason. On a hop whose context does not verify the peer, the
 records the guard writes do not call the hop verified where the caller's words say "verified"
 (the tests below pin the shipped words and the punctuated shapes), and its default remedy offers
 no CRL. The AI broker words its own record from the guard's reason; its own test pins that. A remedy the
@@ -32,7 +33,7 @@ import pytest
 from messagefoundry.config import tls_policy
 from messagefoundry.config.tls_policy import (
     EXPIRY_RELAXED_WAYS_ACROSS,
-    PEER_NOT_REQUIRED_WAYS_ACROSS,
+    PEER_NOT_VERIFIED_WAYS_ACROSS,
     CrlNoCredit,
     HopDisposition,
     HopPosture,
@@ -94,26 +95,42 @@ def test_no_context_and_a_non_verifying_context_earn_no_credit() -> None:
     ctx = _context(crl=True, relaxed=False, verifies=False)
     assert context_checks_revocation(ctx) is True
     assert crl_credited(ctx) is False
-    assert crl_no_credit(ctx) is CrlNoCredit.PEER_NOT_REQUIRED
+    assert crl_no_credit(ctx) is CrlNoCredit.PEER_NOT_VERIFIED
 
 
-def test_only_cert_required_earns_credit() -> None:
-    """``CERT_OPTIONAL`` earns no credit; only ``CERT_REQUIRED`` does, as ``verifies_peer_fully``
-    asks (vault BACKLOG #4912). Red with a rule that refuses only ``CERT_NONE``."""
+def test_cert_optional_with_a_crl_is_credited_and_cert_none_is_not() -> None:
+    """In client mode ``CERT_OPTIONAL`` enforces the chain and a loaded CRL, so a CRL on it is
+    credited, as on main; ``CERT_NONE`` earns none (vault BACKLOG #4912). The optional arm is red
+    with a rule that credits only ``CERT_REQUIRED``, as d119f22c36 did."""
     optional = _context(crl=True, relaxed=False, verifies=False, mode=ssl.CERT_OPTIONAL)
     assert optional.verify_mode == ssl.CERT_OPTIONAL
     assert context_checks_revocation(optional) is True
-    assert crl_credited(optional) is False
-    assert crl_no_credit(optional) is CrlNoCredit.PEER_NOT_REQUIRED
-    # The control: the same context with CERT_REQUIRED is credited.
-    assert crl_credited(_context(crl=True, relaxed=False)) is True
+    assert crl_no_credit(optional) is None
+    assert crl_credited(optional) is True
+    none = _context(crl=True, relaxed=False, verifies=False, mode=ssl.CERT_NONE)
+    assert none.verify_mode == ssl.CERT_NONE
+    assert context_checks_revocation(none) is True
+    assert crl_credited(none) is False
+    assert crl_no_credit(none) is CrlNoCredit.PEER_NOT_VERIFIED
+    # A guard handed the CERT_OPTIONAL context with a CRL crosses an enforcing posture unattested.
+    guard = RevocationHopGuard.capture(
+        host="10.0.0.5",
+        cell="test hop",
+        description="test hop",
+        attested=False,
+        context=optional,
+        posture=_ENFORCING,
+        connection="OB_TEST",
+    )
+    assert guard.crl_checked is True
+    assert guard.disposition() is HopDisposition.ALLOW
 
 
 def test_the_reasons_come_in_order() -> None:
-    """A context that fails several conditions gets the first: not CERT_REQUIRED, then the
+    """A context that fails several conditions gets the first: not verifying the peer, then the
     skipped time check, then no CRL."""
     assert crl_no_credit(_context(crl=False, relaxed=True, verifies=False)) is (
-        CrlNoCredit.PEER_NOT_REQUIRED
+        CrlNoCredit.PEER_NOT_VERIFIED
     )
     assert crl_no_credit(_context(crl=False, relaxed=True)) is CrlNoCredit.EXPIRY_RELAXED
     assert crl_no_credit(_context(crl=False, relaxed=False)) is CrlNoCredit.NO_CRL
@@ -143,14 +160,14 @@ def test_capture_reads_the_rule(relaxed: bool, verifies: bool, credited: bool) -
     [
         (False, True, None),
         (True, True, EXPIRY_RELAXED_WAYS_ACROSS),
-        (False, False, PEER_NOT_REQUIRED_WAYS_ACROSS),
-        (True, False, PEER_NOT_REQUIRED_WAYS_ACROSS),
+        (False, False, PEER_NOT_VERIFIED_WAYS_ACROSS),
+        (True, False, PEER_NOT_VERIFIED_WAYS_ACROSS),
     ],
 )
 def test_capture_offers_no_crl_where_none_is_credited(
     relaxed: bool, verifies: bool, remedy: str | None
 ) -> None:
-    """A hop whose context does not set ``CERT_REQUIRED`` is not told a CRL would admit it (vault
+    """A hop whose context does not verify the peer is not told a CRL would admit it (vault
     BACKLOG #4912), relaxed or not: ``EXPIRY_RELAXED_WAYS_ACROSS`` offers removing
     ``tls_allow_expired`` so a CRL can admit the hop, which cannot work there either. The non-verifying arms are red
     when capture keeps the connection-shaped default or the relaxed one. A remedy the caller
@@ -172,14 +189,13 @@ def test_capture_offers_no_crl_where_none_is_credited(
     assert capture("own remedy").ways_across == "own remedy"
 
 
-_PEER_NOT_REQUIRED_ARMS = [
+_PEER_NOT_VERIFIED_ARMS = [
     pytest.param(False, ssl.CERT_NONE, id="none"),
     pytest.param(True, ssl.CERT_NONE, id="none-relaxed"),
-    pytest.param(False, ssl.CERT_OPTIONAL, id="optional"),
 ]
 
 
-def _peer_not_required_guard(
+def _peer_not_verified_guard(
     relaxed: bool, mode: ssl.VerifyMode, **over: Any
 ) -> RevocationHopGuard:
     kwargs: dict[str, Any] = {
@@ -195,17 +211,17 @@ def _peer_not_required_guard(
     return RevocationHopGuard.capture(**kwargs)
 
 
-@pytest.mark.parametrize(("relaxed", "mode"), _PEER_NOT_REQUIRED_ARMS)
-def test_a_peer_not_required_refusal_calls_nothing_verified_and_offers_no_crl(
+@pytest.mark.parametrize(("relaxed", "mode"), _PEER_NOT_VERIFIED_ARMS)
+def test_a_peer_not_verified_refusal_calls_nothing_verified_and_offers_no_crl(
     relaxed: bool, mode: ssl.VerifyMode
 ) -> None:
-    """The refusal on a hop whose context does not set ``CERT_REQUIRED`` does not say the peer
+    """The refusal on a hop whose context does not verify the peer does not say the peer
     certificate is verified, offers no CRL, no removal of ``tls_allow_expired`` and no
-    attestation, and names setting the context to ``CERT_REQUIRED`` (vault BACKLOG #4912). The
+    attestation, and names making the context verify the peer (vault BACKLOG #4912). The
     disposition still ALLOWs an attested hop; only the text changed. Red with the guard
     keyed on ``expiry_relaxed`` alone, as before."""
-    guard = _peer_not_required_guard(relaxed, mode)
-    assert guard.no_credit is CrlNoCredit.PEER_NOT_REQUIRED
+    guard = _peer_not_verified_guard(relaxed, mode)
+    assert guard.no_credit is CrlNoCredit.PEER_NOT_VERIFIED
     assert guard.disposition() is HopDisposition.REFUSE
     with pytest.raises(InsecureHopRefused) as exc:
         guard.enforce_construction()
@@ -216,10 +232,10 @@ def test_a_peer_not_required_refusal_calls_nothing_verified_and_offers_no_crl(
     assert "tls_revocation_attested=true" not in text, text
     assert "tls_revocation_attested_reason" not in text, text
     assert "on this connection" not in text, text
-    assert PEER_NOT_REQUIRED_WAYS_ACROSS in text
+    assert PEER_NOT_VERIFIED_WAYS_ACROSS in text
     # The lead says it once; the remedy does not say it again.
-    assert text.count("does not set CERT_REQUIRED") == 1, text
-    # The control: the same hop with CERT_REQUIRED and no CRL keeps the plain words.
+    assert text.count("does not verify the peer") == 1, text
+    # The control: the same hop verifying the peer with no CRL keeps the plain words.
     plain = RevocationHopGuard.capture(
         host="10.0.0.5",
         cell="test hop",
@@ -233,17 +249,17 @@ def test_a_peer_not_required_refusal_calls_nothing_verified_and_offers_no_crl(
         plain.enforce_construction()
 
 
-@pytest.mark.parametrize(("relaxed", "mode"), _PEER_NOT_REQUIRED_ARMS)
-def test_an_attested_peer_not_required_hop_crosses_and_its_line_does_not_say_verified(
+@pytest.mark.parametrize(("relaxed", "mode"), _PEER_NOT_VERIFIED_ARMS)
+def test_an_attested_peer_not_verified_hop_crosses_and_its_line_does_not_say_verified(
     relaxed: bool, mode: ssl.VerifyMode, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An attested hop whose context does not set ``CERT_REQUIRED`` still crosses, as on main,
+    """An attested hop whose context does not verify the peer still crosses, as on main,
     and the crossing record does not call it a verified TLS hop (vault BACKLOG #4912). The
     disposition is unchanged; only the remedy stopped offering the attestation."""
     lines: list[dict[str, Any]] = []
     monkeypatch.setattr(tls_policy, "log_attested_crossing", lambda _log, **kw: lines.append(kw))
     # The caller's flag does not change the wording on such a context.
-    guard = _peer_not_required_guard(
+    guard = _peer_not_verified_guard(
         relaxed, mode, attested=True, attested_reason="partner PKI", expiry_relaxed=relaxed
     )
     assert guard.disposition() is HopDisposition.ALLOW
@@ -296,12 +312,11 @@ def _caller_words() -> list[tuple[str, str]]:
     return found
 
 
-@pytest.mark.parametrize("mode", [ssl.CERT_NONE, ssl.CERT_OPTIONAL], ids=["none", "optional"])
-def test_no_callers_words_call_a_peer_not_required_hop_verified(
-    mode: ssl.VerifyMode, monkeypatch: pytest.MonkeyPatch
+def test_no_callers_words_call_a_peer_not_verified_hop_verified(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The literal ``cell`` and ``description`` words of the capture callers, through the guard,
-    on a hop whose context does not set ``CERT_REQUIRED``: neither the refusal nor the attested
+    on a hop whose context does not verify the peer: neither the refusal nor the attested
     crossing line the guard writes says "verified" (vault BACKLOG #4912). The shipped words are
     joined by the shapes a caller could write next: "verified" before a comma, a closing
     parenthesis, or the end of the text. The AI broker's own record is not written by the guard;
@@ -323,20 +338,21 @@ def test_no_callers_words_call_a_peer_not_required_hop_verified(
         "messagefoundry/store/postgres.py",
     ):
         assert rel in where, (rel, sorted(where))
+    mode = ssl.CERT_NONE
     lines: list[dict[str, Any]] = []
     monkeypatch.setattr(tls_policy, "log_attested_crossing", lambda _log, **kw: lines.append(kw))
     for at, text in words:
-        refused = _peer_not_required_guard(False, mode, cell=text, description=text)
+        refused = _peer_not_verified_guard(False, mode, cell=text, description=text)
         with pytest.raises(InsecureHopRefused) as exc:
             refused.enforce_construction()
         assert not _VERIFIED.search(str(exc.value)), (at, str(exc.value))
         lines.clear()
-        _peer_not_required_guard(
+        _peer_not_verified_guard(
             False, mode, cell=text, description=text, attested=True, attested_reason="partner PKI"
         ).enforce_construction()
         assert len(lines) == 1, at
         assert not _VERIFIED.search(f"{lines[0]['crossing']} {lines[0]['detail']}"), (at, lines)
-    # The control: on a CERT_REQUIRED hop the caller's words are kept as given.
+    # The control: on a hop that verifies the peer the caller's words are kept as given.
     kept = RevocationHopGuard.capture(
         host="10.0.0.5",
         cell="x (verified TLS, no revocation check)",
@@ -349,17 +365,14 @@ def test_no_callers_words_call_a_peer_not_required_hop_verified(
     assert kept.stated_description == kept.description
 
 
-@pytest.mark.parametrize("mode", [ssl.CERT_NONE, ssl.CERT_OPTIONAL], ids=["none", "optional"])
-def test_the_rest_refusal_does_not_say_verified_on_a_peer_not_required_opener(
-    mode: ssl.VerifyMode,
-) -> None:
+def test_the_rest_refusal_does_not_say_verified_on_a_peer_not_verified_opener() -> None:
     """The REST destination's own guard call, end to end, with an opener whose https context does
-    not set ``CERT_REQUIRED``: its "(verified TLS" cell and "over verified https" description
-    reach the refusal without the word (vault BACKLOG #4912)."""
+    not verify the peer: its "(verified TLS" cell and "over verified https" description reach the
+    refusal without the word (vault BACKLOG #4912)."""
     from messagefoundry.config.tls_policy import active_hop_posture
     from messagefoundry.transports.rest import refuse_unrevoked_verified_hop
 
-    ctx = _context(crl=True, relaxed=False, verifies=False, mode=mode)
+    ctx = _context(crl=True, relaxed=False, verifies=False, mode=ssl.CERT_NONE)
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused) as exc:
         refuse_unrevoked_verified_hop(
@@ -374,11 +387,11 @@ def test_the_rest_refusal_does_not_say_verified_on_a_peer_not_required_opener(
     assert not _VERIFIED.search(text), text
 
 
-def test_a_guard_without_cert_required_cannot_be_built_crediting_a_crl() -> None:
+def test_a_guard_not_verifying_the_peer_cannot_be_built_crediting_a_crl() -> None:
     import dataclasses
 
-    guard = _peer_not_required_guard(False, ssl.CERT_NONE)
-    with pytest.raises(ValueError, match="CERT_REQUIRED"):
+    guard = _peer_not_verified_guard(False, ssl.CERT_NONE)
+    with pytest.raises(ValueError, match="does not verify the peer"):
         dataclasses.replace(guard, crl_checked=True)
 
 
@@ -463,7 +476,7 @@ def test_only_the_rule_reads_the_crl_flag_alone() -> None:
     assert _POLICY in scanned, scanned
     assert not reads, (
         f"{_NAME} read outside {_RULE}: {reads}. A guard that credits a CRL reads {_RULE}, which "
-        "also refuses the credit on a context without CERT_REQUIRED or one that skips "
+        "also refuses the credit on a context that does not verify the peer or one that skips "
         "validity-period checks (ADR 0173 §4.3)."
     )
 

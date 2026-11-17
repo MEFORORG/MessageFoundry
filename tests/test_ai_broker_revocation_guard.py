@@ -296,19 +296,16 @@ def test_a_truthy_non_bool_attestation_does_not_cross() -> None:
         )
 
 
-# --- a context that does not set CERT_REQUIRED (vault BACKLOG #4912) ----------------------------
+# --- a context that does not verify the peer (vault BACKLOG #4912) ------------------------------
 
 #: The whole word, so "unverified" and "verifies" do not match.
 _VERIFIED_WORD = re.compile(r"\bverified\b", re.IGNORECASE)
-_MODES = pytest.mark.parametrize(
-    "mode", [ssl.CERT_NONE, ssl.CERT_OPTIONAL], ids=["none", "optional"]
-)
 
 
 def _opener_with(mode: ssl.VerifyMode) -> urllib.request.OpenerDirector:
-    """An opener whose https context sets ``mode`` and loads a CRL, so only the verify mode can
-    take the CRL's credit away. The engine never builds the broker such an opener; the guard is
-    handed one directly."""
+    """An opener whose https context sets ``mode`` and the CRL-check flag, with no CRL loaded:
+    the guard reads the flag, so only the verify mode can take its credit away. The engine never
+    builds the broker such an opener; the guard is handed one directly."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     if mode is not ssl.CERT_REQUIRED:
@@ -329,28 +326,34 @@ def _ai_hop(mode: ssl.VerifyMode, posture: HopPosture, **over: object) -> None:
     ai_broker_mod._refuse_an_unrevoked_ai_hop(_ENDPOINT, **kwargs)  # type: ignore[arg-type]
 
 
-@_MODES
-def test_a_refusal_without_cert_required_calls_nothing_verified_and_offers_no_crl(
-    mode: ssl.VerifyMode,
-) -> None:
+def test_a_refusal_not_verifying_the_peer_calls_nothing_verified_and_offers_no_crl() -> None:
     """The broker's own refusal on such a context does not say the hop is verified TLS or that
-    https verifies the certificate, offers no CRL, and names the guard's remedy. Red on
-    4897142ceb, where the broker wrote its fixed words and offered ``[tls].crl_file``."""
+    https verifies the certificate, does not say "no revocation check" in its cell, offers no CRL,
+    and names the guard's remedy. Red on 4897142ceb, where the broker wrote its fixed words and
+    offered ``[tls].crl_file``."""
     with pytest.raises(AiBrokerError) as info:
-        _ai_hop(mode, _ENFORCING)
+        _ai_hop(ssl.CERT_NONE, _ENFORCING)
     message = str(info.value)
+    assert message.startswith("[ai] engine AI broker (TLS): "), message
     assert not _VERIFIED_WORD.search(message), message
     assert "verifies its certificate" not in message, message
     assert "crl_file" not in message, message
-    assert tls_policy.PEER_NOT_REQUIRED_WAYS_ACROSS in message, message
-    assert "does not set CERT_REQUIRED" in message, message
+    assert tls_policy.PEER_NOT_VERIFIED_WAYS_ACROSS in message, message
+    assert "does not verify the peer" in message, message
 
 
-@_MODES
-def test_a_warning_without_cert_required_calls_nothing_verified_and_offers_no_crl(
-    mode: ssl.VerifyMode, ai_log: list[str]
+def test_a_cert_optional_context_with_a_crl_crosses_unattested(ai_log: list[str]) -> None:
+    """In client mode ``CERT_OPTIONAL`` enforces the chain and a loaded CRL, so its CRL is
+    credited and the hop crosses an enforcing posture with no attestation and no line, as on main
+    (vault BACKLOG #4912). Red on d119f22c36, which refused it."""
+    _ai_hop(ssl.CERT_OPTIONAL, _ENFORCING)
+    assert ai_log == []
+
+
+def test_a_warning_not_verifying_the_peer_calls_nothing_verified_and_offers_no_crl(
+    ai_log: list[str],
 ) -> None:
-    _ai_hop(mode, _WARN)
+    _ai_hop(ssl.CERT_NONE, _WARN)
     assert len(ai_log) == 1
     line = ai_log[0]
     assert not _VERIFIED_WORD.search(line), line
@@ -360,12 +363,11 @@ def test_a_warning_without_cert_required_calls_nothing_verified_and_offers_no_cr
     assert _PAIR in line, line
 
 
-@_MODES
-def test_an_attested_crossing_without_cert_required_calls_nothing_verified(
-    mode: ssl.VerifyMode, ai_log: list[str]
+def test_an_attested_crossing_not_verifying_the_peer_calls_nothing_verified(
+    ai_log: list[str],
 ) -> None:
     """The disposition is unchanged: the attestation still crosses an enforcing posture."""
-    _ai_hop(mode, _ENFORCING, revocation_attested=True, revocation_reason=_REASON)
+    _ai_hop(ssl.CERT_NONE, _ENFORCING, revocation_attested=True, revocation_reason=_REASON)
     assert len(ai_log) == 1
     line = ai_log[0]
     assert "on operator attestation" in line, line
@@ -374,7 +376,8 @@ def test_an_attested_crossing_without_cert_required_calls_nothing_verified(
 
 
 def _relaxed_opener() -> urllib.request.OpenerDirector:
-    """A ``CERT_REQUIRED`` opener whose context loads a CRL and skips validity-period checks."""
+    """An opener whose context verifies the peer, sets the CRL-check flag with no CRL loaded,
+    and skips validity-period checks."""
     ctx = ssl.create_default_context()
     ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
     tls_policy.relax_verify_expiry(ctx, host="ai.internal")
@@ -382,13 +385,15 @@ def _relaxed_opener() -> urllib.request.OpenerDirector:
 
 
 def test_a_relaxed_context_is_not_said_to_check_no_revocation(ai_log: list[str]) -> None:
-    """On a context that skips validity-period checks a CRL still refuses a leaf it lists, so the
-    broker's refusal and crossing line say the guard credits no check there, not that none is
-    performed, and agree with the guard's crossing lead. Red on b8f466b105d, which kept the
-    broker's fixed "NO certificate revocation checking" detail there."""
+    """On a context that skips validity-period checks a CRL, where one is loaded, still refuses a
+    leaf it lists, so the broker's refusal and crossing line say the guard credits no check there,
+    not that none is performed, and agree with the guard's crossing lead. Red on b8f466b105d,
+    which kept the broker's fixed "NO certificate revocation checking" detail there."""
     with pytest.raises(AiBrokerError) as info:
         _ai_hop(ssl.CERT_REQUIRED, _ENFORCING, opener=_relaxed_opener())
     message = str(info.value)
+    assert message.startswith("[ai] engine AI broker (verified TLS): "), message
+    assert "no revocation check)" not in message, message
     assert "skips validity-period checks" in message, message
     assert "NO certificate revocation checking" not in message, message
     assert "crl_file" not in message, message
@@ -408,7 +413,7 @@ def test_a_relaxed_context_is_not_said_to_check_no_revocation(ai_log: list[str])
 def test_a_cert_required_context_keeps_the_verified_words_and_the_crl_lever(
     ai_log: list[str],
 ) -> None:
-    """The control: a context that sets ``CERT_REQUIRED`` and consults no CRL keeps the verified
+    """The control: a context that verifies the peer and consults no CRL keeps the verified
     words, and a reachable ``[tls].crl_file`` is offered."""
     opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=ssl.create_default_context())
@@ -419,7 +424,7 @@ def test_a_cert_required_context_keeps_the_verified_words_and_the_crl_lever(
     assert "(verified TLS, no revocation check)" in message, message
     assert "verifies its certificate" in message, message
     assert "Set [tls].crl_file" in message, message
-    assert tls_policy.PEER_NOT_REQUIRED_WAYS_ACROSS not in message, message
+    assert tls_policy.PEER_NOT_VERIFIED_WAYS_ACROSS not in message, message
 
 
 # --- the settings pair and the factory -----------------------------------------------------------
