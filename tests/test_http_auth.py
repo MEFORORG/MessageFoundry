@@ -725,16 +725,27 @@ _TOKEN_URL = "https://auth.example.org/token"
 def test_oauth2_enabled_must_be_a_real_bool(enabled: object) -> None:
     """A truthiness read took ``"false"`` and ``"0"`` as on and ``None`` as off (vault BACKLOG
     #5362). A mapping written past ``resolve_env_settings`` is refused instead, naming the type."""
-    with pytest.raises(ValueError, match="oauth2_enabled must be true or false") as exc:
-        oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": enabled})
-    assert "'false'" not in str(exc.value)
+    settings = {"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": enabled, "connection_name": "OB"}
+    with pytest.raises(HttpAuthError) as exc:
+        oauth2_auth_configured(settings)
+    # The whole text, so no spelling of the value can ride in it.
+    assert str(exc.value) == (
+        f"connection 'OB'; oauth2_enabled must be true or false, not {type(enabled).__name__}"
+    )
 
 
 @pytest.mark.parametrize("url", ["", "   ", "\t\n"])
 def test_oauth2_blank_token_url_with_auth_on_is_refused(url: str) -> None:  # vault BACKLOG #5362
     for settings in ({"oauth2_token_url": url}, {"oauth2_token_url": url, "oauth2_enabled": True}):
-        with pytest.raises(ValueError, match="oauth2_token_url is blank"):
+        with pytest.raises(HttpAuthError, match="oauth2_token_url is blank or unset"):
             oauth2_auth_configured(settings)
+
+
+def test_oauth2_unset_token_url_beside_a_written_flag_is_refused() -> None:  # vault BACKLOG #5362
+    """An env() token URL that resolves to None, beside the flag the composer writes, would read as
+    OAuth2 off and deliver with no bearer."""
+    with pytest.raises(HttpAuthError, match="oauth2_token_url is blank or unset"):
+        oauth2_auth_configured({"oauth2_token_url": None, "oauth2_enabled": True})
 
 
 def test_oauth2_configured_controls() -> None:  # vault BACKLOG #5362
@@ -750,6 +761,10 @@ def test_oauth2_configured_controls() -> None:  # vault BACKLOG #5362
     # Off wins over a blank URL: nothing is dialled, so there is nothing to refuse.
     assert oauth2_auth_configured({"oauth2_token_url": "  ", "oauth2_enabled": False}) is False
     assert oauth2_auth_configured({"oauth2_token_url": _TOKEN_URL, "oauth2_enabled": env("x")})
+    # An unresolved flag beside a blank URL is the advisory readers' to pass over, not to refuse.
+    assert oauth2_auth_configured({"oauth2_token_url": " ", "oauth2_enabled": env("x")}) is False
+    # No flag and no URL is a connection with no OAuth2 at all.
+    assert oauth2_auth_configured({"oauth2_token_url": None}) is False
 
 
 def test_oauth2_string_flag_refused_at_construction() -> None:  # vault BACKLOG #5362

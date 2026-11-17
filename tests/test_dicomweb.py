@@ -986,6 +986,37 @@ def test_dicomweb_malformed_basic_credential_refused(
     assert "svc" not in str(exc.value) and "pw" not in str(exc.value)  # names, never values
 
 
+@pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization "])
+@pytest.mark.parametrize(
+    "over", [{"bearer_token": "t"}, {"basic_user": "svc", "basic_password": "pw"}]
+)
+def test_dicomweb_authorization_header_beside_a_credential_refused(
+    name: str, over: dict[str, str]
+) -> None:  # vault BACKLOG #5359
+    """A static Authorization entry was overwritten, or sent as a second header when spelled with
+    padding the overwrite missed."""
+    with pytest.raises(ValueError, match="Authorization entry in headers"):
+        _dest(headers={name: "x"}, **over)
+
+
+@pytest.mark.parametrize("field", ["bearer_token", "basic_user", "basic_password"])
+def test_dicomweb_surrogate_in_a_credential_refused(field: str) -> None:  # vault BACKLOG #5359
+    """A lone surrogate used to raise UnicodeEncodeError, which names the code point and its offset
+    in the secret."""
+    over = {"basic_user": "svc", "basic_password": "pw"} if field != "bearer_token" else {}
+    over[field] = "se\udcffcret"
+    with pytest.raises(ValueError, match=f"{field} holds a character UTF-8 cannot encode") as exc:
+        _dest(**over)
+    assert "cret" not in str(exc.value) and "udcff" not in str(exc.value)
+
+
+def test_dicomweb_credential_refusal_names_the_connection() -> None:  # vault BACKLOG #5359
+    with pytest.raises(
+        ValueError, match=r"^connection 'OB_DCMWEB'; DICOMweb destination basic_user"
+    ):
+        _dest(basic_user="svc")
+
+
 def test_dicomweb_single_credentials_still_construct() -> None:  # vault BACKLOG #5359
     """Positive controls: each credential alone, and a colon in the password (RFC 7617 allows it)."""
     assert _dest(bearer_token="t")._headers["Authorization"] == "Bearer t"

@@ -103,28 +103,37 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     only a literal ``False`` as off.
 
     Read strictly (vault BACKLOG #5362). ``oauth2_enabled`` is absent (on) or a real ``bool``; any
-    other value raises :class:`ValueError`, because a truthiness read takes the string ``"false"`` or
-    ``"0"`` as on and an explicit ``None`` as off, contrary to what was written. ``resolve_env_settings``
-    has already turned an ``env()`` value into a ``bool`` (``None`` into off, vault BACKLOG #3234), so
-    only a mapping written past it reaches the refusal. An unresolved ``env()`` reference is let through
-    as before, for the advisory readers of the loaded graph. With it on, an ``oauth2_token_url`` that is
-    a blank or whitespace-only string raises too, rather than reading as configured or as off. The
-    messages name the keys and the type, never a value."""
+    other value raises :class:`HttpAuthError`, because a truthiness read takes the string ``"false"``
+    or ``"0"`` as on and an explicit ``None`` as off, contrary to what was written. A resolved
+    ``env()`` flag arrives as a ``bool`` (``resolve_env_settings``, vault BACKLOG #3234), and the
+    loader refuses a non-bool literal (``Registry.bool_literal_problems``), so the refusal here is
+    what catches a mapping that took neither path, such as a registry built in code. An unresolved
+    ``env()`` reference is let through, for the advisory readers of the loaded graph. With the flag
+    a literal ``True``, a token URL that is blank, whitespace-only, or set to ``None`` beside the
+    written flag raises too, rather than reading as configured or as off. The messages name the
+    connection, the keys and the type, never a value."""
+    connection = s.get(MIRRORED_CONNECTION_SETTING)
+    prefix = hop_name_prefix(None if connection is None else str(connection))
     enabled = s.get("oauth2_enabled", True)
     if not isinstance(enabled, bool) and not _is_env_ref(enabled):
-        raise ValueError(f"oauth2_enabled must be true or false, not {type(enabled).__name__}")
-    url = s.get("oauth2_token_url")
-    if enabled and isinstance(url, str) and not url.strip():
-        raise ValueError(
-            "oauth2_token_url is blank; set the token endpoint URL, or turn oauth2_enabled off"
+        raise HttpAuthError(
+            f"{prefix}oauth2_enabled must be true or false, not {type(enabled).__name__}"
         )
-    return bool(url) and bool(enabled)
+    url = s.get("oauth2_token_url")
+    blank = not url or (isinstance(url, str) and not url.strip())
+    # Absent flag and absent URL is a connection with no OAuth2 at all, so only a URL that was
+    # written, or the flag itself, makes a blank URL a refusal.
+    if enabled is True and blank and ("oauth2_enabled" in s or url is not None):
+        raise HttpAuthError(
+            f"{prefix}oauth2_token_url is blank or unset while oauth2_enabled is on; set the "
+            "token endpoint URL, or turn oauth2_enabled off"
+        )
+    return not blank and bool(enabled)
 
 
 def _is_env_ref(value: object) -> bool:
-    """Whether ``value`` is an unresolved ``env()`` reference. Imported here, not at the top: the
-    ``config.wiring`` module imports this one's package (the cycle the ``TYPE_CHECKING`` import below
-    avoids)."""
+    """Whether ``value`` is an unresolved ``env()`` reference. Imported here, not at the top:
+    ``config.wiring`` imports this package, the cycle the ``TYPE_CHECKING`` import above avoids."""
     from messagefoundry.config.wiring import EnvRef
 
     return isinstance(value, EnvRef)

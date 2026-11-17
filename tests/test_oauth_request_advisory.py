@@ -396,3 +396,13 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     (cfg / "broken.py").write_text("this is not python(", encoding="utf-8")
     r = _line(cfg)
     assert r.skipped and r.ok and not r.required and "config did not load" in r.detail
+
+
+def test_a_blank_token_url_is_recorded_not_raised(tmp_path: Path) -> None:
+    """The strict read refuses a blank token URL (vault BACKLOG #5362). The advisory names the
+    connection as not compared rather than raising, so ``check`` still prints its lines."""
+    read = _read(tmp_path, '_oauth("OB_BLANK", token_url="  ")\n')
+    assert read == OAuthRequestAdvisories(
+        findings=[],
+        not_compared=[("OB_BLANK", "the OAuth2 settings refuse the connection's build")],
+    )
