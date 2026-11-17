@@ -1489,9 +1489,9 @@ _SITE_SKIP_NAMES = {
 
 #: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
 #: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
-#: in ``--path`` mode only, and there only to files git does not track, or by name alone where git
-#: cannot list them; outside a git work tree only ``.git`` is skipped. A tracked or staged file is content git already holds, whatever directory it
-#: sits in, so every mode reads it (BACKLOG #5585).
+#: in ``--path`` mode only, as ``_walk`` describes; there a tracked file is pruned too where git
+#: cannot list the tracked files. The tracked and staged scans read every file they name, whatever
+#: directory it sits in (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -2161,8 +2161,9 @@ def _git_tracked() -> list[str]:
 def _tracked_under(root: Path) -> set[str] | None:
     """The files git tracks under ``root``, relative to it, an empty set, or ``None``.
 
-    ``None`` when no directory from ``root`` up holds a ``.git`` entry, so git is never run in a
-    pushed commit's snapshot, whose files the commit chose; and when git tracks no file under
+    ``None`` when no directory from ``root`` up holds a ``.git`` entry, and git is then not run (a
+    pushed commit's snapshot written outside any work tree is such a root, and a snapshot inside one
+    is not told apart from the work tree); and when git tracks no file under
     ``root``, which is then an untracked copy of content that cannot be told apart. ``None`` prunes
     nothing. An empty set when git is not on PATH or fails, such as when it refuses the directory: the
     walk then prunes SKIP_DIRS by name, tracked or not, as it did before git was asked."""
@@ -2182,11 +2183,11 @@ def _tracked_under(root: Path) -> set[str] | None:
 
 
 def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
-    """Every file under the directory ``raw``, keyed by its root-relative posix path, with SKIP_DIRS
-    pruned only where git says the files are untracked (BACKLOG #5585). Outside a work tree nothing
-    tells tracked from untracked, so nothing but ``.git`` is pruned: a pushed commit's snapshot is
-    committed content wherever it sits. Inside one, where git cannot list the files, SKIP_DIRS is
-    pruned by name (``_tracked_under``). A directory the walk cannot list is reported in ``errors``,
+    """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
+    SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
+    files it does not list; where git cannot list them, by name, tracked files included; outside a
+    work tree, or under a root git tracks nothing under, not at all. ``.git`` is always pruned. A
+    directory the walk cannot list is reported in ``errors``,
     where ``rglob`` used to drop it without a word."""
     root = Path(raw)
     tracked = _tracked_under(root)
@@ -3171,13 +3172,13 @@ def main(argv: list[str]) -> int:
         )
 
     # A --path scan that examined ZERO files is not a pass: an empty or wrong tree, all-binary content,
-    # or every file untracked under a skipped directory. Refuse rather than report a vacuous clean.
+    # or every file under a directory the walk skipped. Refuse rather than report a vacuous clean.
     # A hit outranks the refusal: a run whose only file sits under a forbidden path still reports it.
     if path_mode and scanned == 0 and not hits:
         print(
             "scan_forbidden: --path examined ZERO files (all skipped or unread, or empty tree) — refusing "
             "(fail closed). Check that the path names the tree meant: an empty or all-binary tree, or one "
-            "whose every file is untracked under build/venv/dist/…, scans nothing.",
+            "whose every file sits under a skipped build/venv/dist/… directory, scans nothing.",
             file=sys.stderr,
         )
         return 2
