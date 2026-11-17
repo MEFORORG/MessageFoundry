@@ -2922,9 +2922,9 @@ def _fail_the_next_write(handler: GuardedFileHandler, message: str) -> None:
 
 
 def test_a_stream_error_cannot_forge_a_line_in_the_notice_it_causes(tmp_path: Path) -> None:
-    # CONSUMER 1 of 4, and the one the row is named for. The notice is written by ``_emit_direct``,
-    # deliberately below ``Handler.handle``, so no filter will ever scrub it -- the escape has to
-    # happen where the reason is built or not at all.
+    # CONSUMER 1 of 4, and the one the row is named for. The notice is written by ``_write_notice``
+    # straight to the stream through ``_write_line``, deliberately below ``Handler.handle``, so no
+    # filter will ever scrub it -- the escape has to happen where the reason is built or not at all.
     guard = LogWriteGuard()
     log_path = tmp_path / "app.log"
     handler = _file_handler(log_path, guard)
