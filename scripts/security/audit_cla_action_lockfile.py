@@ -28,7 +28,10 @@ run's real output:
    in the bundle itself, on a reading whose limits are stated in the baseline's header, and in the
    deepmerge and minimatch GHSA-g3hv-75wg-m249 triage comments, which state their own. The lockfile
    is frozen, so an audit that stops reporting one has either stopped looking or met a withdrawn
-   advisory. Either way a person has to find out which.
+   advisory. Either way a person has to find out which. For each stale GHSA id the run prints
+   the ``withdrawn_at`` GitHub's advisory database gives, read live, or why it could not be read.
+   That line is a hint for the person and never changes the verdict: a stale entry is a red
+   whether GitHub says it was withdrawn, says it was not, or cannot be reached.
 
 WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit still reports every baselined
 advisory, each one an advisory npm reports against a package in the declared lockfile. Check 2
@@ -72,6 +75,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -98,6 +102,17 @@ ATTEMPTS = 5
 #: it can print why it failed. A healthy call takes a few seconds.
 NPM_TIMEOUT = 45
 
+#: Seconds one GitHub advisory lookup may wait on its socket, and how many stale entries are looked
+#: up in one run. Lookups run after the verdict is printed, but they still count against the job's
+#: ``timeout-minutes`` beside the npm retry ladder, and a test holds the sum under it. Past the cap
+#: the run prints that the rest were not looked up. One withdrawal or two is the usual case; dozens
+#: stale at once means the audit stopped seeing the tree, which COVERAGE reports.
+GITHUB_TIMEOUT = 5
+MAX_LOOKUPS = 5
+
+#: GitHub's global advisory endpoint. Read without a token: the endpoint is public.
+_ADVISORY_API = "https://api.github.com/advisories/"
+
 #: A GitHub advisory id. npm names each advisory by a URL ending in one.
 _GHSA = re.compile(r"GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}")
 
@@ -106,6 +121,10 @@ Finding = tuple[str, str]
 
 #: Runs ``npm audit`` in a directory and returns its stdout and stderr. Injected so tests need no npm.
 Runner = Callable[[Path], tuple[str, str]]
+
+#: Returns an advisory's ``withdrawn_at`` (None when not withdrawn), or raises :class:`OSError` or
+#: :class:`ValueError`. Injected so tests need no network.
+Lookup = Callable[[str], str | None]
 
 
 def lock_entry_count(lock: dict[str, Any]) -> int:
@@ -226,13 +245,81 @@ def evaluate(
             f"NEW ADVISORY, not in {BASELINE_PATH}: {ident} in {package} "
             + _one_line(f"({detail['severity']}) {detail['title']} {detail['url']}")
         )
-    for ident, package in sorted(baseline - set(reported)):
+    for ident, package in stale_entries(reported, baseline):
         problems.append(
             f"STALE BASELINE ENTRY: {ident} in {package} is acknowledged but no longer reported. "
             "The tree is frozen, so either the advisory was withdrawn or the audit stopped seeing "
             "the package. Find out which before removing the entry."
         )
     return problems
+
+
+def stale_entries(reported: dict[Finding, dict[str, str]], baseline: set[Finding]) -> list[Finding]:
+    """The acknowledged advisories the report no longer names, in the order they are reported."""
+    return sorted(baseline - set(reported))
+
+
+def github_withdrawn_at(ident: str) -> str | None:
+    """*ident*'s ``withdrawn_at`` from GitHub's advisory database, or None when it is not withdrawn.
+
+    Raises :class:`OSError` on a transport error and :class:`ValueError` on a reply without the
+    field, so a missing field is never read as "not withdrawn".
+    """
+    if not _GHSA.fullmatch(ident):
+        raise ValueError(f"{ident!r} is not a GitHub advisory id")
+    request = urllib.request.Request(
+        _ADVISORY_API + ident,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "cla-action-audit",
+        },
+    )
+    # A fixed https host, and a path checked against the GHSA pattern above.
+    with urllib.request.urlopen(request, timeout=GITHUB_TIMEOUT) as response:  # nosec B310
+        body = json.loads(response.read())
+    if not isinstance(body, dict) or "withdrawn_at" not in body:
+        raise ValueError("the reply carries no withdrawn_at field")
+    value = body["withdrawn_at"]
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"withdrawn_at is {type(value).__name__}, not a timestamp")
+    return value
+
+
+def withdrawal_lines(stale: list[Finding], lookup: Lookup) -> list[str]:
+    """One line per stale entry saying what GitHub records about its withdrawal.
+
+    Informational only: the caller has already decided the run is red, and nothing here changes
+    that. A failed lookup is printed with the command that reads the record by hand.
+    """
+    lines: list[str] = []
+    looked_up = 0
+    for ident, package in stale:
+        prefix = f"WITHDRAWN_AT {ident} in {package}:"
+        by_hand = f"Read it by hand: gh api advisories/{ident} --jq .withdrawn_at"
+        if not _GHSA.fullmatch(ident):
+            lines.append(f"{prefix} not a GitHub advisory id, so GitHub holds no record to read.")
+            continue
+        if looked_up >= MAX_LOOKUPS:
+            lines.append(f"{prefix} not looked up, past the {MAX_LOOKUPS}-lookup cap. {by_hand}")
+            continue
+        looked_up += 1
+        try:
+            value = lookup(ident)
+        except (OSError, ValueError) as broken:
+            lines.append(
+                f"{prefix} could not be read from GitHub ({_one_line(str(broken))[:200]}). "
+                + by_hand
+            )
+            continue
+        if value is None:
+            lines.append(
+                f"{prefix} GitHub records it as NOT withdrawn, so check its affected range "
+                "and whether the audit still sees the package."
+            )
+        else:
+            lines.append(f"{prefix} GitHub withdrew it at {_one_line(value)[:40]}.")
+    return lines
 
 
 def run_npm_audit(
@@ -340,8 +427,9 @@ bundle, which needs a Node toolchain this repository does not carry.
 3. Otherwise acknowledge it: add an [[advisory]] entry to {BASELINE_PATH} in a reviewed pull
    request, with a comment saying who triaged it and what they found.""",
     "STALE BASELINE ENTRY": """\
-What to do about a STALE BASELINE ENTRY. Open the advisory's GitHub page. If it was withdrawn or its
-affected range no longer covers the locked version, remove the entry. If neither, the audit stopped
+What to do about a STALE BASELINE ENTRY. Read its WITHDRAWN_AT line above, or open the advisory's
+GitHub page when that line could not read the record. If it was withdrawn or its affected range no
+longer covers the locked version, remove the entry. If neither, the audit stopped
 seeing the package, and the audit is what needs fixing.""",
     "COVERAGE": """\
 What to do about COVERAGE. The audit did not read the whole lockfile, so none of its other results
@@ -353,6 +441,7 @@ def main(
     argv: list[str] | None = None,
     runner: Runner = npm_runner,
     sleep: Callable[[float], None] = time.sleep,
+    lookup: Lookup = github_withdrawn_at,
 ) -> int:
     # Advisory titles are arbitrary Unicode; a Windows console on a legacy code page would otherwise
     # raise partway through the report.
@@ -401,6 +490,9 @@ def main(
     )
     for problem in problems:
         print(f"::error::{problem}")
+    # After the verdict lines and outside the verdict: what GitHub says cannot turn a stale red green.
+    for line in withdrawal_lines(stale_entries(reported, baseline), lookup):
+        print(line)
     # After the findings, so a broken provenance record cannot hide them behind its own error.
     try:
         print(f"SCOPE: {_limitation(root)}")
