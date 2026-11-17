@@ -642,10 +642,11 @@ _MODIFY = 0x001301BF
 
 
 def test_a_holder_like_programdata_or_a_data_drive_holds_no_right_the_holder_rule_refuses() -> None:
-    """The controls for the holder refusals below: listing, traversing, adding a file, and the
-    Modify a data drive's root hands Authenticated Users, delete no file already in the directory.
-    Modify does carry DELETE, which lets its holder rename the directory away; the rule does not
-    read that (vault BACKLOG #5657, left open)."""
+    """ProgramData's list is the control for the holder refusals below: listing, traversing and
+    adding a file delete no file already in the directory. The Modify a data drive's root hands
+    Authenticated Users passing here pins an OPEN gap, not a guarantee: Modify carries DELETE,
+    which lets its holder rename the directory away, and the rule does not count it yet (vault
+    BACKLOG #5657 item 11 (a)). Fixing that gap changes this assertion."""
     assert restricted_file._windows_holder_problem(_holder(*_PROGRAMDATA_ACES)) is None
     modify = _holder((_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, "S-1-5-11"))
     assert restricted_file._windows_holder_problem(modify) is None
@@ -1555,6 +1556,24 @@ def test_windows_a_junction_at_the_holder_is_judged_where_it_points(
     _icacls(real, "/grant", f"*{_USERS}:(DC)")
     problem = str(broad_access_problem(tmp_path / "mine" / "store.key"))
     assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+@windows_only
+def test_windows_a_share_is_refused_when_this_hosts_name_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: a share this host cannot rule out may be itself. The walk stops at the share
+    before any read, so no network is touched."""
+
+    def unreadable() -> str:
+        raise OSError(errno.EIO, "name lookup failed")
+
+    monkeypatch.setattr(restricted_file, "_host_name", unreadable)
+    host = _host_judging_only_under(tmp_path)
+    problem = restricted_file._windows_surroundings_problem(
+        Path("\\\\fileserver\\keys\\store.key"), host
+    )
+    assert problem is not None and "own name could not be read" in problem
 
 
 @windows_only

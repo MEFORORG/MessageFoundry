@@ -162,7 +162,9 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   on the path, every folder above that folder is judged by the link rule. A link or `subst` drive
   onto a network share is refused, and so is a share spelled with at least some of this host's
   own names; `_loopback_share_problem` says which, and a mapped drive is not among them. So the
-  drive-root gap the 2026-11-13 list names is closed; its `DELETE` gap is still open. The code is
+  drive-root gap the 2026-11-13 list names is closed for a `subst` drive root, and still open for
+  a mapped network drive root, which the walk reads as a volume root; its `DELETE` gap is still
+  open. The code is
   the record of the rest, and the check is still not a complete check of the directory's
   surroundings.
 - **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
@@ -180,7 +182,7 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   - by that holder read, a broad group's `DELETE` on the folder: `_HOLDER_REPLACE_MASK` does not
     include `DELETE`;
   - anything around a directory at a drive root, such as `S:\`: the function returns `None` when
-    `full.parent == full`.
+    `full.parent == full` (for a `subst` drive root, superseded by the 2026-11-17 amendment).
 - **2026-11-13, a link is refused on every platform (vault BACKLOG #5636).** Decision 3's "a link
   on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused

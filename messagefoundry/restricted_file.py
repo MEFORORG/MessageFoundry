@@ -581,7 +581,10 @@ def _windows_engine_owner_problem(owner_sid: str | None, engine_sid: str | None)
     did not make it, or ``None``. The engine's own account, SYSTEM and Administrators may own it:
     an elevated administrator's files are owned by Administrators. Any other owner may have planted
     the file through a right to add one to the directory, which the holder rule does not refuse
-    (vault BACKLOG #5657). An owner or an engine account that could not be read is refused too.
+    (vault BACKLOG #5657). An engine running as LOCAL SERVICE or NETWORK SERVICE shares that account
+    with other services, so there the engine's owning the file does not show it made the file; that
+    is accepted here and open on the same row. An owner or an engine account that could not be read
+    is refused too.
     Kept free of ctypes so the decision is testable on every platform."""
     if owner_sid is None:
         return "its owner could not be read"
@@ -790,7 +793,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         try:
             host_name = _host_name()
         except OSError as exc:  # fail closed: a share this host cannot rule out may be itself
-            return f"this host's own name could not be read ({exc.strerror or type(exc).__name__})"
+            return (
+                "it is on a network share, and this host's own name could not be read "
+                f"({exc.strerror or type(exc).__name__}), so the share cannot be told apart from "
+                "this host; name it by a local path"
+            )
         problem = _loopback_share_problem(str(full), host_name)
     if problem is not None:
         return problem

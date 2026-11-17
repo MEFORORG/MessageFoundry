@@ -458,7 +458,8 @@ than a path is not checked
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
   permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
-  account, SYSTEM or Administrators. It is not a complete check of the file's surroundings; see
+  account, SYSTEM or Administrators; an engine running as LOCAL SERVICE or NETWORK SERVICE shares
+  that account with other services, so that owner does not show the engine made it. It is not a complete check of the file's surroundings; see
   [ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments). Do not rely on this check alone. Restrict the
   secrets directory and every folder above it yourself, and the folder that holds each key file
   and every folder above it.
