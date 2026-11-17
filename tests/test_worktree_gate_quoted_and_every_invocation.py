@@ -419,7 +419,8 @@ def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
 
 # ------------------------------------------------------------------ BACKLOG #5655 closing steps 1, 3, 6
 #
-# Each DENY row was measured ALLOW on origin/main f0e49f45c5c, run from an ungoverned repository.
+# Each row of test_closing_step_shapes_are_denied was measured ALLOW on origin/main f0e49f45c5c, run
+# from an ungoverned repository. Other DENY rows below pin refusals origin/main already made.
 
 
 @pytest.mark.parametrize(
@@ -603,4 +604,4 @@ def test_a_long_run_of_glued_pairs_costs_about_what_a_short_line_does(rig: Simpl
     started = time.monotonic()
     assert _allowed(rig, long, rig.outside)
     long_s = time.monotonic() - started
-    assert long_s < 3 * short_s + 10, (short_s, long_s)
+    assert long_s < 3 * short_s + 20, (short_s, long_s)

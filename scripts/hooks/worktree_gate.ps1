@@ -798,8 +798,8 @@ function Get-ScanRawIndexMap($Seg) {
 # span holding one bare word, single or double and under either host's escape, joins quoted pieces
 # (`'a'/'b'` reads `a/b`), and blanks a span with whitespace in it, so a quoted commit message or echo
 # cannot supply a token. It does not unquote every form the shell accepts: at least `-C ''<p>`,
-# `-C <p>''` and `-C $'<p>'` are not read as the shell reads them, as on origin/main. Each invocation is read from its OWN
-# window -- from the
+# `-C <p>''` and `-C $'<p>'` are not read as the shell reads them (measured ALLOW at f0e49f45c5c too).
+# Each invocation is read from its OWN window -- from the
 # separator before its owning git token up to its verb -- through the resolver's -OwnWindow branch,
 # which folds that invocation's own `-C` tokens over a chdir it can follow and answers NOTHING where it
 # cannot. The window is also handed in as the resolver's $Line, so --work-tree, GIT_WORK_TREE,
@@ -836,7 +836,7 @@ function Get-ScanRawIndexMap($Seg) {
 # git reset --hard }` from outside); rule 3c's later-disarm filter counts `.git` as a git word; and a
 # chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a real one.
 # Also not read: a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`, because the
-# payload's extraction stops at the first joint, as on origin/main.
+# payload's extraction stops at the first joint, as it did at f0e49f45c5c.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
