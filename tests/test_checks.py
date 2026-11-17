@@ -1423,3 +1423,33 @@ def test_cli_check_allow_empty_config_flag(
     capsys.readouterr()
     assert refused == 1
     assert allowed == 0
+
+
+def test_tool_probe_finds_an_installed_module() -> None:
+    """Positive control for the probe: a module installed for this interpreter is found."""
+    assert checks._tool_installed("pytest") is True
+
+
+def test_lint_tool_the_child_cannot_import_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe reads the parent's import path; when the ``-P`` child cannot run the module the
+    advisory reads as not installed, not as a lint failure."""
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 1, "", "/usr/bin/python3: No module named mypy\n")
+
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+    assert result.skipped is True and result.ok is True and result.detail == "not installed"
+
+
+def test_lint_tool_fault_is_still_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            cmd, 1, "cfg/x.py:1: error: No module named mypy\nFound 1", ""
+        )
+
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = checks._run_tool("mypy", "mypy", ["cfg"])
+    assert result.skipped is False and result.ok is False

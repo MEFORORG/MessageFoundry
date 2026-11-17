@@ -332,7 +332,7 @@ debugging on, because a launcher passes no interpreter option.
 | `service_status.py` | `sc.exe query` | Reading the service's state | argument list |
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
-| `checks.py` | `ruff` from the running interpreter's scripts folder, and `mypy` as a module of that interpreter | `messagefoundry check`, when they are installed for that interpreter | argument list |
+| `checks.py` | `ruff` from the running interpreter's, its base installation's or the user scheme's scripts folder, and `mypy` as a module of that interpreter | `messagefoundry check`, when they are installed for that interpreter | argument list |
 | `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers` and `openssl version -d`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when that row reads the policy ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 says when) | argument list |
 | `security/audit_all_platforms.py` | `pip` and `pip-audit`, as modules of the running interpreter | A dependency audit in CI or by hand, never in the service | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
@@ -356,10 +356,12 @@ system tool, the code pins its absolute path under the system directory, so a sa
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
 
-`checks.py` runs `ruff` by its absolute path in the running interpreter's scripts folder, and
-`mypy` as a `-m` module of that interpreter, by its absolute path and with `-P`, so neither a
-`PATH` search nor the working directory picks the copy (BACKLOG #5375). Two argument-list starts
-are not pinned that way:
+`checks.py` runs `ruff` by its absolute path, from the first of three scripts folders that holds
+it: the running interpreter's environment, its base installation, then the user scheme's
+(`~/.local/bin` on Linux, where a pipx or `uv tool` ruff may live). It runs `mypy` as a `-m`
+module of that interpreter, by its absolute path and with `-P`. So neither a `PATH` search nor the
+working directory picks the copy (BACKLOG #5375). At least two argument-list starts are not
+pinned that way:
 
 - `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
   [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
@@ -435,7 +437,7 @@ and the builders, and a test checks that each module named calls each builder na
   other variable is in their environment, a CI token or an engine secret among them.
 - The advisory `ruff` and `mypy` starts in `checks.py` get an allowlist (`worker_environment`):
   what a Python child needs to start, as the sandbox worker gets it, plus the tools' own cache,
-  stub-path, XDG folder and `VIRTUAL_ENV` variables, with `PYTHONIOENCODING` set to `utf-8`. No
+  stub-path, `XDG_CONFIG_HOME` and `VIRTUAL_ENV` variables, with `PYTHONIOENCODING` set to `utf-8`. No
   other variable is in their environment, a `MEFOR_*` value, `VAULT_TOKEN` or a CI token among
   them (BACKLOG #5375).
 

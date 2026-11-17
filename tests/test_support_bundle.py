@@ -740,3 +740,27 @@ def test_cli_refuses_a_negative_log_tail_lines(
     assert exc.value.code == 2
     assert "zero or more lines" in capsys.readouterr().err
     assert not (tmp_path / "b.zip").exists()
+
+
+def test_log_tail_a_file_gone_between_listing_and_opening_is_listed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotation renames the live file away before it creates the new one; an open in that gap
+    finds nothing, and the second listing reads the new file."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("after rotation\n", encoding="utf-8")
+    real_read = bundle_mod._read_log_file
+    calls = [0]
+
+    def gone_once(path: Path, listed: os.stat_result) -> str:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise FileNotFoundError(path.name)
+        return real_read(path, listed)
+
+    monkeypatch.setattr(bundle_mod, "_read_log_file", gone_once)
+    assert _tail_member(tmp_path, log_dir) == "after rotation"
+    assert calls[0] == 2

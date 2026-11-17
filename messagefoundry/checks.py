@@ -4228,16 +4228,15 @@ def _check_reference_backend(
 
 #: The lint tools' own variables, the only ones beyond a Python child's start-up names that cross
 #: into their environment (BACKLOG #5375): where mypy finds stubs and keeps its cache, where ruff
-#: keeps its cache, the XDG folders both read their user configuration and cache from on POSIX, and
-#: the active virtual environment. Nothing of the engine's namespace, so no ``MEFOR_*`` value and
-#: no ``VAULT_TOKEN`` or ``PGPASSWORD`` reaches either tool.
+#: keeps its cache, ``XDG_CONFIG_HOME``, where both look for a user configuration file on POSIX,
+#: and the active virtual environment. Nothing of the engine's namespace, so no ``MEFOR_*`` value
+#: and no ``VAULT_TOKEN`` or ``PGPASSWORD`` reaches either tool.
 _LINT_TOOL_NAMES = frozenset(
     {
         "MYPYPATH",
         "MYPY_CACHE_DIR",
         "RUFF_CACHE_DIR",
         "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
         "VIRTUAL_ENV",
     }
 )
@@ -4263,8 +4262,9 @@ def _tool_installed(module: str) -> bool:
 
 def _ruff_binary() -> str | None:
     """The ``ruff`` program installed beside this interpreter, by absolute path: the scripts folder
-    of its environment, then of its base installation, then of the user scheme, the first three
-    places ruff's own ``find_ruff_bin`` looks. ``None`` when none holds it. Run directly rather than
+    of its environment, then of its base installation, then of the user scheme, three of the places
+    ruff's own ``find_ruff_bin`` looks; a ruff installed with ``pip install --target`` or
+    ``--prefix`` is not found here. ``None`` when none holds it. Run directly rather than
     as ``python -m ruff``, which on Windows starts the program as a grandchild that the timeout in
     :func:`_run_tool` cannot kill."""
     import sysconfig
@@ -4281,6 +4281,21 @@ def _ruff_binary() -> str | None:
             if os.path.isfile(candidate):
                 return candidate
     return None
+
+
+def _module_absent_in_child(module: str, stderr: str) -> bool:
+    """Whether a ``python -m <module>`` child failed because it could not run the module at all,
+    as the interpreter reports it on its last line, rather than because the tool found a fault."""
+    lines = stderr.strip().splitlines()
+    last = lines[-1] if lines else ""
+    return last.endswith(
+        (
+            f"No module named {module}",
+            f"No module named {module}.__main__; '{module}' is a package and cannot be directly "
+            "executed",
+            f"No module named {module}.__main__",
+        )
+    )
 
 
 def _tool_command(module: str) -> list[str] | None:
@@ -4339,5 +4354,9 @@ def _run_tool(name: str, module: str, args: list[str]) -> CheckResult:
         )
     if proc.returncode == 0:
         return CheckResult(name, ok=True, required=False, detail="passed")
+    if module != "ruff" and _module_absent_in_child(module, proc.stderr or ""):
+        # The probe searched the parent's import path; the -P child's can differ, and a module it
+        # cannot run is not installed for it.
+        return CheckResult(name, ok=True, required=False, skipped=True, detail="not installed")
     detail = (proc.stdout or proc.stderr).strip().replace("\n", " ")[:300] or "failed"
     return CheckResult(name, ok=False, required=False, detail=detail)

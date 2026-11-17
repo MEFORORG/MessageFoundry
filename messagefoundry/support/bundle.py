@@ -37,6 +37,7 @@ import stat
 import time
 import zipfile
 from dataclasses import dataclass
+from errno import ELOOP
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -314,11 +315,12 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
         newest, listed = max(files, key=lambda item: item[1].st_mtime)
         try:
             text = _read_log_file(newest, listed)
-        except _LogFileRefused as exc:
-            if attempt + 1 < _LOG_READ_ATTEMPTS:
-                continue
-            return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
         except OSError as exc:
+            # A refusal, a file gone, or (POSIX) a link put at its name: each is what a rotation or
+            # a swap between listing and opening leaves, so list again once before reporting it.
+            changed = isinstance(exc, (_LogFileRefused, FileNotFoundError)) or exc.errno == ELOOP
+            if changed and attempt + 1 < _LOG_READ_ATTEMPTS:
+                continue
             return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
         break
     tail = split_log_lines(text)[-lines:]
