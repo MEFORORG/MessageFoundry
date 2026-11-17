@@ -56,10 +56,10 @@ class CredentialReply(BaseModel):
 
 
 class LoginRequest(RequestModel):
-    # A NUL in ``username`` is refused here (vault BACKLOG #5342). ``SIGN_IN_NAME_PATTERN`` says
-    # why, and which stores can hold such a name. Unrefused here, the sign-in service would still
-    # refuse it as an unknown name before the account lookup.
-    username: str = Field(max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
+    # No NUL rule here (vault BACKLOG #5342), on purpose: the route charges the sign-in limiter
+    # and the sign-in service refuses a NUL name as an unknown one before the account lookup, and
+    # audits it. A 422 at this body would be neither charged nor audited.
+    username: str = Field(max_length=_NAME_MAX)
     password: str = Field(max_length=_PASSWORD_MAX)
     provider: str = Field(default="local", max_length=16)  # 'local' | 'ad'
     #: The raw session token this sign-in REPLACES in the caller, if any (ASVS 7.2.4, BACKLOG
@@ -329,9 +329,9 @@ class DirectoryUserCreateRequest(RequestModel):
     # directory lookup, and also to the store when the entry found carries no ``sAMAccountName``:
     # the lookup then names the account by the name it searched for, the typed name with its
     # surrounding white space stripped (``fallback_username`` in ``auth.ldap``). The LDAP filter
-    # escapes a NUL (``auth.ldap._escape_filter``), so such a name is not sent raw; the rule refuses it with a 422 before any directory round trip, as
-    # POST /auth/login refuses it before the store. When the entry carries a ``sAMAccountName``,
-    # that is the name the store receives, and this rule does not check it.
+    # escapes a NUL (``auth.ldap._escape_filter``), so such a name is not sent raw; the rule
+    # refuses it with a 422 before any directory round trip. When the entry carries a
+    # ``sAMAccountName``, that is the name the store receives, and this rule does not check it.
     username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 

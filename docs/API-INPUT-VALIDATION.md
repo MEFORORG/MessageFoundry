@@ -12,9 +12,8 @@ page still match the code, and fails if the page drops one. It does not check ev
 page. At least four rules in the table are written, in whole or in part, elsewhere. The
 connection-name pattern is defined in
 [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
-module, because the config loader enforces the same rule. The sign-in name's NUL rule is in
-`validation.py`, but its length bounds, 256 characters and the minimum of 1 on
-`POST /users/directory`, are set on the request models in
+module, because the config loader enforces the same rule. The directory user name's NUL rule is
+in `validation.py`, but its length bounds, 1 to 256 characters, are set on the request model in
 [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py).
 The HL7 field-path grammar is `parse_path` in
 [`messagefoundry/parsing/peek.py`](../messagefoundry/parsing/peek.py). The layered preset ids'
@@ -55,15 +54,18 @@ filesystem path, a log line or a CSV export.
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Sign-in name | Any text except NUL, up to 256 characters (1 to 256 on `POST /users/directory`) | `username` on `POST /auth/login` and `POST /users/directory` |
+| Directory user name | Any text except NUL, 1 to 256 characters | `username` on `POST /users/directory` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different
 rule, set out under [Items checked a second time](#items-checked-a-second-time-behind-the-route).
 
-The web console's `POST /ui/login` form has no body model, so these rules do not run on it. A
-sign-in name holding a NUL reaches the sign-in service there, which refuses it as an unknown name
-before the account lookup and audits the attempt, and the form answers with its usual redirect to
+Neither sign-in surface refuses a NUL in the name at the body: not `username` on
+`POST /auth/login`, and not the web console's `POST /ui/login` form, which has no body model. The
+NUL rule is left off the sign-in body on purpose. A 422 there would be neither charged to the
+sign-in limiter nor audited. On both surfaces the route charges the limiter, and the sign-in
+service refuses such a name as an unknown one before the account lookup and audits the attempt.
+`POST /auth/login` answers with its usual failed sign-in, and the form with its usual redirect to
 the sign-in page.
 
 "Printable text, no control characters" means every character except the C0 range, DEL, and the C1

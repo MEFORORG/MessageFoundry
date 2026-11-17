@@ -624,7 +624,7 @@ async def test_a_username_with_a_nul_is_an_unknown_name_on_both_sign_in_surfaces
     service refuses it as an unknown name before the account lookup: at the seam itself, and
     through the console form, which charges the limiter first. The answer is an unknown name's,
     and the ``auth.login_failed`` row names it with the NUL escaped. The JSON route is driven at
-    the seam, not over HTTP, because its body model may refuse a NUL before the service."""
+    the seam here; ``tests/test_api_auth.py`` drives it over HTTP."""
     service = await _service(engine)
     await _add(service, "bob")
     looked_up: list[str] = []

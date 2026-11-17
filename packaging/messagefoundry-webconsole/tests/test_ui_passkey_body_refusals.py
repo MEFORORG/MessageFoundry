@@ -5,9 +5,9 @@
 ``POST /ui/reauth/webauthn`` and ``POST /ui/account/webauthn/verify`` parse their JSON body
 themselves, before the engine's ceremony code sees it, so a body nested too deep for the stack
 raised ``RecursionError`` out of the route. ``POST /ui/login`` parses its form without pydantic,
-so the JSON route's sign-in name rule (no NUL) does not cover it, nor the combined passkey sign-in
-that rides the same form: the service's own refusal, before the account lookup, does. All data here
-is synthetic.
+and neither it nor the combined passkey sign-in that rides the same form refuses a NUL name
+itself: the service's own refusal, before the account lookup, covers both, as it covers the JSON
+``POST /auth/login``. All data here is synthetic.
 """
 
 from __future__ import annotations

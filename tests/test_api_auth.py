@@ -3674,27 +3674,48 @@ async def test_login_supersedes_ends_the_named_token_before_the_cap(engine: Engi
         assert too_long.status_code == 422
 
 
-# --- vault BACKLOG #5342: a sign-in naming a NUL is refused at the body --------------------------
+# --- vault BACKLOG #5342: a sign-in naming a NUL takes the service's audited refusal --------------
 
 
 @pytest.mark.parametrize("username", ["sup\x00", "\x00", "s\x00up"])
-async def test_login_refuses_a_nul_username_before_the_store(
+async def test_login_answers_a_nul_username_as_an_audited_unknown_name(
     engine: Engine, username: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Red: each reached ``AuthService.login``, which refuses a NUL name as an unknown one before
-    the account lookup. Now each is a 422 at the body, before the service runs."""
+    """Red: a NUL rule on the body answered 422, which was neither charged to the sign-in limiter
+    nor audited. Now the JSON sign-in answers as for an unknown name, is charged, writes an
+    ``auth.login_failed`` row, and never reaches the store's account lookup. The positive control
+    is the unknown name sent first: the same lookup spy records it."""
     service = await _service(engine, AuthSettings(require_mfa=False))
+    await _add(service, "sup", Role.VIEWER)
+    looked_up: list[str] = []
+    real_lookup = engine.store.get_user_by_username
+
+    async def _lookup(name: str) -> Any:
+        looked_up.append(name)
+        return await real_lookup(name)
+
+    monkeypatch.setattr(engine.store, "get_user_by_username", _lookup)
+    charged: list[str | None] = []
+    real_allow = service.allow_login_attempt
+
+    def _allow(client: str | None) -> bool:
+        charged.append(client)
+        return real_allow(client)
+
+    monkeypatch.setattr(service, "allow_login_attempt", _allow)
     async with _client(engine, service) as c:
-        reached: list[str] = []
-
-        async def _spy(*args: object, **kwargs: object) -> object:
-            reached.append("login")
-            raise AssertionError("the service ran")
-
-        monkeypatch.setattr(service, "login", _spy)
+        unknown = await c.post("/auth/login", json={"username": "ghost", "password": PW})
+        assert "ghost" in looked_up, looked_up  # the spy sees a lookup that happens
+        looked_up.clear()
         r = await c.post("/auth/login", json={"username": username, "password": PW})
-        assert r.status_code == 422
-        assert reached == []
+    assert looked_up == [], looked_up
+    assert unknown.status_code == 401
+    assert (r.status_code, r.json()) == (unknown.status_code, unknown.json())
+    assert len(charged) == 2, "the NUL sign-in was not charged to the limiter"
+    actors = [
+        dict(row)["actor"] for row in await engine.store.list_audit(action="auth.login_failed")
+    ]
+    assert actors.count(username.replace("\x00", "\\u0000")) == 1, actors
 
 
 @pytest.mark.parametrize(
