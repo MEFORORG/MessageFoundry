@@ -81,6 +81,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import redaction as phi_redaction
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
 from messagefoundry.redaction import safe_text
@@ -592,6 +593,16 @@ def test_every_secret_family_value_is_redacted(fam: Family) -> None:
     assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 
 
+#: A family the shared PHI pass also reaches through a labelled rule of its own, by that rule's name
+#: in ``messagefoundry.redaction``. The shared pass is not ``redact_log_line``'s own pattern set, so
+#: the coverage table above does not list it; the mutation test below disables it beside the
+#: family's patterns. The ``mfb64:v1:`` marker is a label, so this is a second named rule, not a
+#: label-free sweep (BACKLOG #5378).
+_PHI_PASS_PATTERNS: dict[str, tuple[str, ...]] = {"mfb64_body": ("_BINARY_CARRIAGE",)}
+#: A pattern that never matches and holds the one group the carriage rule's replacement names.
+_NEVER_MATCHES_ONE_GROUP = re.compile(r"(?!)()")
+
+
 @pytest.mark.parametrize("fam", FAMILIES, ids=lambda f: f.name)
 def test_each_family_survives_when_its_own_patterns_are_disabled(
     fam: Family, monkeypatch: pytest.MonkeyPatch
@@ -610,6 +621,8 @@ def test_each_family_survives_when_its_own_patterns_are_disabled(
         monkeypatch.setattr(redact_mod, name, NEVER_MATCHES)
         if isinstance(getattr(scrub_mod, name, None), re.Pattern):
             monkeypatch.setattr(scrub_mod, name, NEVER_MATCHES)
+    for name in _PHI_PASS_PATTERNS.get(fam.name, ()):
+        monkeypatch.setattr(phi_redaction, name, _NEVER_MATCHES_ONE_GROUP)
     out = redact_log_line(fam.line)
     assert fam.secret in out, (
         f"{fam.name}: disabling {list(fam.patterns)} did NOT make the secret leak -- something else "

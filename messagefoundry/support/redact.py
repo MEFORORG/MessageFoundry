@@ -19,9 +19,10 @@ coverage as stored ``last_error``/log lines — instead of a second, narrower co
 #1711). They run per LINE here, so a pretty-printed structure split across lines is scrubbed only
 where a line carries its own label; the write-time filter in ``logging_setup.py`` sees the whole
 record and is the primary control for a log this engine wrote. This module adds the **secret** markers the engine redactor does not carry — at least
-``mfb64:`` bodies, ``MEFOR_*`` values, bearer/authorization tokens, ``password=``/``PWD=``/``secret=``
+``MEFOR_*`` values, bearer/authorization tokens, ``password=``/``PWD=``/``secret=``
 pairs, key material (``private_key=``, ``encryption_key=``), an inline DSN password, and a long base64
-run as the backstop. A credential label may carry a dotted/underscored/hyphenated prefix
+run as the backstop. It also keeps its own ``mfb64:`` body rule, which the engine redactor carries
+too since BACKLOG #5378. A credential label may carry a dotted/underscored/hyphenated prefix
 (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
 
 **The credential stage is two layers**: this module's own copy of the credential patterns, then

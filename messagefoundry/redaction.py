@@ -1942,7 +1942,7 @@ def redact(text: str) -> str:
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
-    out = _redact_stages(text)
+    out = _redact_stages(_redact_binary_carriage(text))
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
@@ -1959,6 +1959,30 @@ def redact(text: str) -> str:
     ):
         return out
     return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
+
+
+#: An ``mfb64:v1:`` binary-carriage value (ADR 0028; ``parsing/binary.py`` ``MARKER``) and the base64
+#: run after it (BACKLOG #5378). The run is a whole message body, PHI by design, and every other pass
+#: here reads it as one opaque token: no HL7 delimiter, no date, no second capitalized word. So a log
+#: record or traceback quoting a carriage reached every sink whole. The marker is written as a literal
+#: because this module is pure stdlib and must not import ``parsing``; a test pins it to ``MARKER``.
+#:
+#: The run is deliberately WIDER than the base64 alphabet, to fail closed: ``-`` and ``_`` (the URL-safe
+#: alphabet), ``%`` (a percent-encoded ``+``, ``/`` or ``=``) and ``\\`` (a ``repr`` or JSON escape,
+#: such as ``\\/`` or an escaped line break), so an encoded or escaped carriage is cut whole rather than
+#: at its first non-alphabet character. Over-redacting a glued word after it is the accepted price.
+#: The marker is case-insensitive for the same reason. One run is required, so the placeholder left
+#: behind (``[`` is outside the class) never re-matches, and prose that merely names the marker, such
+#: as ``missing mfb64:v1: marker``, is kept. Residual: a carriage broken by a literal whitespace run
+#: keeps every piece after the first break; ``encode`` never writes one.
+_BINARY_CARRIAGE = re.compile(r"(?i)(mfb64:v1:)[A-Z0-9+/=_%\\-]++")
+
+
+def _redact_binary_carriage(text: str) -> str:
+    """``text`` with every ``mfb64:v1:`` carriage run replaced by the placeholder, the marker kept so a
+    reader can still see a binary body was withheld. Runs before every other pass, so none of them can
+    split the run and leave a piece below its own threshold."""
+    return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
 
 
 def _redact_stages(text: str) -> str:

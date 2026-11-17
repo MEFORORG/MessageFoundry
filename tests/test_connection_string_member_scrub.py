@@ -622,7 +622,12 @@ def test_each_mask_rule_is_needed(
     monkeypatch: pytest.MonkeyPatch, attr: str, off: object, shape: str
 ) -> None:
     """With one rule of the word mask off, its shape prints a value the baseline hid on a later
-    redaction; with every rule on, it does not."""
+    redaction; with every rule on, it does not.
+
+    The shared PHI pass's ``mfb64:v1:`` carriage rule (BACKLOG #5378) is off throughout. It reaches
+    the marker shapes below on its own, so with it on, a mask rule that keeps the marker for a later
+    pass could be deleted and these controls would not see it."""
+    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
     on = getattr(secretscrub, attr)
     if isinstance(off, re.Pattern):
         assert on.pattern != off.pattern  # the switch is not a no-op

@@ -234,6 +234,12 @@ def test_no_bundle_log_sentinel_is_reachable_by_a_label_free_pass() -> None:
 
     for sentinel, line in _SENTINEL_LINES:
         after_phi: str = redact_phi(line)
+        if sentinel == _MFB64_SENTINEL:
+            # The shared pass carries a named rule of its own for an ``mfb64:v1:`` body since
+            # BACKLOG #5378, anchored on the marker, which is a label. So this sentinel is reached by
+            # a LABELLED rule in both layers, and the bundle test's green rests on either one.
+            assert sentinel not in after_phi and "mfb64:v1:" in after_phi, after_phi
+            continue
         assert sentinel in after_phi, (
             f"{sentinel!r} is reachable by the shared PHI pass WHERE IT SITS, in {line!r}. That "
             "pass needs no credential label, so the fixture using it would stay green with the "
@@ -290,8 +296,9 @@ def test_log_tail_redacted_no_phi_no_secret(tmp_path: Path) -> None:
     # The bearer token value is gone: ``_BEARER`` on the header label, ``_AUTH_SCHEME`` on the bare
     # scheme word. Disabling both makes it leak; disabling either alone does not.
     assert _BEARER_SENTINEL not in tail
-    # The embedded base64 body is gone. ``_MFB64`` is now the ONLY rule that reaches it -- the old
-    # 28-character blob was swept by ``_LONG_B64`` as well.
+    # The embedded base64 body is gone. Two labelled rules reach it: this module's ``_MFB64`` and the
+    # shared PHI pass's carriage rule (BACKLOG #5378). ``_LONG_B64`` does not -- the old
+    # 28-character blob was swept by it as well.
     assert _MFB64_SENTINEL not in tail
     assert REDACTION_PLACEHOLDER in tail
 

@@ -156,8 +156,10 @@ _PRE_GUARD_FIELD_RUN = re.compile(r"[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~
 #: Length of the delimiter-free run the cost arms measure.
 #:
 #: A base64 blob is exactly this shape. The base64 alphabet holds none of ``| ^ ~ &`` and no
-#: whitespace, so an ``mfb64:v1:`` payload (ADR 0028) quoted into an exception message or a rendered
-#: traceback is ONE token to this scan. 16,000 characters is a 12 KiB attachment, which is a small one.
+#: whitespace, so an unmarked base64 body (an ``OBX-5`` ED document, ADR 0028 section 7) quoted into
+#: an exception message or a rendered traceback is ONE token to this scan. A MARKED ``mfb64:v1:``
+#: payload no longer reaches it: :func:`redaction._redact_binary_carriage` replaces that run first
+#: (BACKLOG #5378), so the fixture carries no marker or it would measure that pass instead. 16,000 characters is a 12 KiB attachment, which is a small one.
 #:
 #: **The real input IS capped now, at ``_REDACT_WINDOW`` (BACKLOG #1576), and this fixture sits under
 #: that cap on purpose.** It used to be a floor on the worst case rather than the worst case, because
@@ -200,7 +202,7 @@ def _hostile_free_text() -> str:
     :func:`test_the_hostile_fixture_is_actually_hostile`, which every arm below depends on."""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     blob = (alphabet * (_HOSTILE_RUN_CHARS // len(alphabet) + 1))[:_HOSTILE_RUN_CHARS]
-    return f"cannot decode mfb64:v1:{blob} at offset 0"
+    return f"cannot decode ED document {blob} at offset 0"
 
 
 def _longest_token(text: str) -> int:
