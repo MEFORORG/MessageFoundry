@@ -543,8 +543,9 @@ def decrypt_stream(
             )
         dst.write(plaintext)
         written += len(plaintext)
-        # Not kept alive across the next frame's read.
-        del ct, plaintext
+        # Not kept alive across the next frame's read. `candidate` is bound here: the loop above
+        # set `plaintext` from it, so at least one decrypt returned.
+        del ct, plaintext, candidate
         if this_final:
             saw_final = True
             break

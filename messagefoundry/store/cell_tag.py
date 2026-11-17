@@ -40,6 +40,7 @@ import logging
 import re
 import threading
 import time
+import traceback
 from collections.abc import Callable, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Concatenate, Final, Protocol
 
@@ -452,9 +453,17 @@ def _alert(cipher: object, err: CellTagError) -> None:
         report(err.table, reason)
 
 
-#: Exception classes a driver does not raise for a failed write, so one reaching the audit write's
-#: refusal is a defect in this code: its traceback is logged (BACKLOG #6697).
+#: Exception classes that usually mean a defect in this code rather than a failed write, so the
+#: audit write's refusal logs where they were raised (BACKLOG #6697).
 _OWN_BUGS: Final = (TypeError, AttributeError, NameError, KeyError, IndexError)
+
+
+def _frames(exc: BaseException) -> str:
+    """``exc``'s traceback frames (file, line, function, source line), without its message or its
+    chain, which may carry a driver's text."""
+    return "\nTraceback (frames only):\n" + "".join(traceback.format_tb(exc.__traceback__))
+
+
 #: The shape of SQLite's own error names (``SQLITE_BUSY``). Any other ``sqlite_errorname`` value is
 #: not logged, as ``transports/database.py`` withholds one.
 _SQLITE_ERRORNAME: Final = re.compile(r"SQLITE_[A-Z_]{1,40}")
@@ -520,17 +529,18 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit write does
         # Class and an error code only (SQLSTATE, or SQLite's error name), as the store's other
         # driver-failure lines: a driver's text and traceback are not this function's to vouch for.
-        # A programming error raised by our own code is not a driver's, so its traceback is kept.
+        # A programming error gets its frames, so its site can be found, but still not its message
+        # or its chain, either of which may hold a driver's text.
         _log.error(
             "the %s audit row for the %s.%s cell of row %s could not be written (%s, code %s); it"
-            " is written only if the cell is refused again",
+            " is written only if the cell is refused again%s",
             action,
             err.table,
             err.column,
             err.row_ref,
             type(exc).__name__,
             _error_code(exc),
-            exc_info=exc if isinstance(exc, _OWN_BUGS) else None,
+            _frames(exc) if isinstance(exc, _OWN_BUGS) else "",
         )
         return
     err.audited = True
@@ -577,11 +587,13 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     # Read off the code object rather than inspect.signature, which would evaluate annotations (a
     # TYPE_CHECKING-only one raises NameError at decoration) unless asked not to.
     target = inspect.unwrap(fn)
-    code = target.__code__
+    code = getattr(target, "__code__", None)
+    if code is None:
+        raise TypeError(f"{fn.__qualname__} must be a plain function or method")
     keyword_only = code.co_varnames[code.co_argcount : code.co_argcount + code.co_kwonlyargcount]
     if "routed_id" not in keyword_only:
         raise TypeError(f"{fn.__qualname__} must take routed_id as a keyword-only parameter")
-    if "routed_id" in (target.__kwdefaults__ or {}):
+    if "routed_id" in (getattr(target, "__kwdefaults__", None) or {}):
         raise TypeError(f"{fn.__qualname__} must give its keyword-only routed_id no default")
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:

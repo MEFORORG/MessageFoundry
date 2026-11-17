@@ -330,15 +330,24 @@ def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCapt
 def test_the_unreadable_cell_warning_is_rate_limited(caplog: pytest.LogCaptureFixture) -> None:
     """BACKLOG #6712 item 8: a list read over many malformed cells logs one line per kind."""
     with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
-        for _ in range(5):
-            assert user_metadata('{"user": ') is None
+        # Cut at a different column each time, so the hints differ only in their position.
+        for n in range(5):
+            assert user_metadata('{"user": ' + " " * n) is None
     assert len(caplog.records) == 1
+    assert list(metadata_module._warned) == ["JSONDecodeError"]
 
 
-def test_a_stored_non_finite_float_never_reaches_the_api_as_a_bare_token() -> None:
-    """BACKLOG #6711 item 5: json reads a ``NaN`` token, so the bag must not re-encode it as one."""
-    assert user_metadata('{"user": {"k": NaN}}') is None
-    assert user_metadata('{"user": {"k": "v"}}') == '{"k": "v"}'  # control
+def test_a_foreign_type_error_names_only_its_class() -> None:
+    """A TypeError that is not the default's own refusal may carry a value in its text, so the
+    refusal names its class only (BACKLOG #6711)."""
+
+    class _Leaky(Decimal):
+        def __str__(self) -> str:
+            raise TypeError("SYNTHETIC-MRN-5550199")
+
+    with pytest.raises(TypeError, match=r"an unencodable value \(TypeError\)") as info:
+        encode_reference_value({"k": _Leaky("1")})
+    assert "SYNTHETIC" not in str(info.value)
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])

@@ -243,6 +243,19 @@ def test_a_spec_built_outside_make_spec_admits_what_make_spec_builds(
     )
 
 
+def test_a_spec_built_outside_make_spec_refuses_a_malformed_field_path() -> None:
+    """The path is parsed at construction, as ``make_spec`` parsed it, so a bad one never reaches
+    a scan as a per-row no-match."""
+    with pytest.raises(ContentSearchError):
+        SearchSpec(
+            substring=None,
+            field_path="NOT A PATH",
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=10,
+        )
+
+
 def test_an_out_of_range_cap_is_a_content_search_error() -> None:
     """The range refusal is the type the routes catch for a 400, as the type refusal is (item 16)."""
     with pytest.raises(ContentSearchError, match="scan_limit must be in"):

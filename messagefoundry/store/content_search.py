@@ -83,6 +83,12 @@ class SearchSpec:
             raise ContentSearchError(
                 "a spec's field_value needs a field path and must not be empty or only whitespace"
             )
+        if self.field_path is not None:
+            # Eagerly, so a bad path is a 4xx rather than a per-row no-match.
+            try:
+                parse_path(self.field_path)
+            except HL7PeekError as exc:
+                raise ContentSearchError(str(exc)) from exc
 
     @property
     def fetch_limit(self) -> int:
@@ -185,11 +191,7 @@ def make_spec(
             target=target,
             scan_limit=limit,
         )
-    # Field-path needle — validate the path eagerly so a bad path is a 4xx, not a per-row failure.
-    try:
-        parse_path(path)
-    except HL7PeekError as exc:
-        raise ContentSearchError(str(exc)) from exc
+    # Field-path needle: SearchSpec parses the path, so a bad one is a 4xx, not a per-row failure.
     return SearchSpec(
         substring=None,
         field_path=path,

@@ -85,9 +85,12 @@ _KEYED_DETAIL = (
 # module" (BACKLOG #6719). THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which
 # tests/test_schema_verify_6719_6720.py pins; the other notes in this module rely on that and point
 # here. So an expected name held by a virtual table reads as a missing table and is refused rather
-# than skipped. A virtual table is told by its rootpage, which SQLite sets to 0 for one and to a real
-# page for every ordinary table, rather than by its SQL text, which a comment or a NULL defeats.
-_ORDINARY_TABLE = "m.type = 'table' AND m.rootpage > 0"
+# than skipped. Either sign marks a virtual table: a rootpage of 0, which SQLite gives one and never
+# an ordinary table, or SQL text that starts CREATE VIRTUAL TABLE. A planted row can set either
+# field, so the two are tested together; a NULL text counts as not virtual by text alone.
+_ORDINARY_TABLE = (
+    "m.type = 'table' AND m.rootpage > 0 AND coalesce(m.sql, '') NOT LIKE 'CREATE VIRTUAL TABLE%'"
+)
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.

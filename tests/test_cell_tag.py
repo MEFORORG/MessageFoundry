@@ -266,18 +266,22 @@ async def test_the_audit_failure_line_names_the_cell_and_a_checked_error_name(
 async def test_an_audit_failure_from_our_own_bug_keeps_its_traceback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """BACKLOG #6697 item 7: a TypeError is not a driver's, so its traceback is logged; a driver
-    error's is not (the control above)."""
+    """BACKLOG #6697 item 7: a TypeError is not a driver's, so its frames are logged; a driver
+    error's are not. Neither logs the message or the chain, which may hold a driver's text."""
+    bug_exc = TypeError("synthetic-bug-text")
+    bug_exc.__context__ = sqlite3.OperationalError("synthetic-driver-text")
     with caplog.at_level("ERROR", logger=cell_tag.__name__):
         await report_cell_tag_failure(
-            _failing_sink(TypeError("synthetic")), CellTagError("messages", "raw", "au-bug", "A")
+            _failing_sink(bug_exc), CellTagError("messages", "raw", "au-bug", "A")
         )
         await report_cell_tag_failure(
             _failing_sink(sqlite3.OperationalError("x")),
             CellTagError("messages", "raw", "au-drv", "A"),
         )
     bug, driver = (r for r in caplog.records if r.name == cell_tag.__name__)
-    assert bug.exc_info is not None and driver.exc_info is None
+    assert "frames only" in bug.getMessage() and "record_audit" in bug.getMessage()
+    assert "synthetic" not in bug.getMessage() and bug.exc_info is None
+    assert "frames only" not in driver.getMessage() and driver.exc_info is None
 
 
 @pytest.mark.usefixtures("fresh_audit_memo")

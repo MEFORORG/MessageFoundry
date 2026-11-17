@@ -49,17 +49,28 @@ def _reference_json_default(value: Any) -> Any:
         return str(value)
     if isinstance(value, (bytes, bytearray)):
         return base64.b64encode(bytes(value)).decode("ascii")
-    raise TypeError(f"reference snapshot cannot serialize a {type(value).__name__} value to JSON")
+    raise _UnencodableTypeError(
+        f"reference snapshot cannot serialize a {type(value).__name__} value to JSON"
+    )
 
 
-def _unencodable_cause(exc: ValueError | RecursionError) -> str:
-    """A content-free name for why json could not encode a reference value, read off the class and
-    json's own fixed message text (never a value or a key)."""
+class _UnencodableTypeError(TypeError):
+    """:func:`_reference_json_default`'s own refusal, whose message names only a type."""
+
+
+def _unencodable_cause(value: Any, exc: ValueError | RecursionError) -> str:
+    """A content-free name for why json could not encode a reference value (never a value or a
+    key). Too deep is told by class and a non-finite float by re-encoding with NaN allowed; the
+    other two kinds are read off json's own fixed message, and an unknown one stays generic."""
     if isinstance(exc, RecursionError):
         return "a value nested too deep"
-    text = str(exc)
-    if "Out of range float" in text:
+    try:
+        json.dumps(value, default=_reference_json_default, allow_nan=True)
+    except (TypeError, ValueError, RecursionError):
+        pass
+    else:
         return "a non-finite float"
+    text = str(exc)
     if "Circular reference" in text:
         return "a circular value"
     if "digits" in text:
@@ -90,15 +101,21 @@ def encode_reference_value(value: Any) -> str:
     json notes, cause or context. One such value refuses the whole set, by the rule above."""
     try:
         return json.dumps(value, default=_reference_json_default, allow_nan=False)
-    except TypeError as exc:
-        # Our own refusal, or json's for a non-str key: both messages are content-free. Rebuilt and
-        # raised OUTSIDE this handler, because json adds notes naming the dict keys on the path, and
-        # a reference key may be PHI, so neither the notes nor the original may ride along.
+    except _UnencodableTypeError as exc:
+        # Every refusal is rebuilt and raised OUTSIDE its handler: json adds notes naming the dict
+        # keys on the path, and a reference key may be PHI, so neither the notes nor the original may
+        # ride along. Only our own message, which names a type, is carried over.
         reason = str(exc)
+    except TypeError as exc:
+        # Any other TypeError's text is not ours to vouch for, so only its class is named.
+        reason = (
+            "reference snapshot cannot serialize this value to JSON: it holds an unencodable value"
+            f" ({type(exc).__name__})"
+        )
     except (ValueError, RecursionError) as exc:
         reason = (
-            f"reference snapshot cannot serialize this value to JSON: it holds "
-            f"{_unencodable_cause(exc)}"
+            "reference snapshot cannot serialize this value to JSON: it holds "
+            f"{_unencodable_cause(value, exc)}"
         )
     raise TypeError(reason)
 
@@ -137,13 +154,15 @@ _warned_lock = threading.Lock()
 
 def _warn_unreadable(hint: str) -> None:
     """Log the content-free unreadable-cell WARNING for ``hint``, at most once per interval. The
-    caller holds no row id, so the line names none."""
+    caller holds no row id, so the line names none. Throttled by the hint's kind, never its line
+    and column, so the memo stays as small as the set of kinds."""
+    kind = hint.split(" at ", 1)[0]
     now = _time.monotonic()
     with _warned_lock:
-        last = _warned.get(hint)
+        last = _warned.get(kind)
         if last is not None and now - last < _WARN_INTERVAL_S:
             return
-        _warned[hint] = now
+        _warned[kind] = now
     log.warning(
         "a stored JSON cell is unreadable (%s); read as empty (logged at most once per %.0f s)",
         hint,
@@ -181,15 +200,14 @@ def _load_object(text: StoredJson, *, too_deep_raises: bool = True) -> dict[str,
     return value if isinstance(value, dict) else {}
 
 
-def _dumps_or_raise(value: Any, *, allow_nan: bool = True) -> str:
+def _dumps_or_raise(value: Any) -> str:
     """``json.dumps(value)``, or :class:`MetadataTooDeepError` when json's encoder hits its depth
-    limit, raised outside the handler so nothing is chained. With ``allow_nan`` false, a non-finite
-    float raises json's own ``ValueError``.
+    limit, raised outside the handler so nothing is chained.
 
     The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
     be too deep to write back (BACKLOG #6712)."""
     try:
-        return json.dumps(value, allow_nan=allow_nan)
+        return json.dumps(value)
     except RecursionError:
         pass
     raise MetadataTooDeepError("a stored metadata cell is too deeply nested to re-encode")
@@ -238,8 +256,7 @@ def user_metadata(metadata_json: StoredJson) -> str | None:
     refusal names the body's length and the head bound, never the digest or a byte of the body.
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
-    ``null`` rather than ``"{}"`` when nothing was attached. A bag holding a non-finite float, which
-    no engine writer stores, reads as unparseable too, so no bare ``NaN`` token reaches a caller.
+    ``null`` rather than ``"{}"`` when nothing was attached.
 
     A cell too deep to decode or re-encode raises :class:`MetadataTooDeepError` instead, at every
     caller: ``None`` would send a ``dynamic_headers`` delivery out without its headers. The delivery
@@ -249,9 +266,4 @@ def user_metadata(metadata_json: StoredJson) -> str | None:
     user = _load_object(metadata_json).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    try:
-        return _dumps_or_raise(user, allow_nan=False)
-    except ValueError:
-        pass
-    _warn_unreadable("non-finite float")
-    return None
+    return _dumps_or_raise(user)
