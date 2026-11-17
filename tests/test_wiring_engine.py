@@ -2051,6 +2051,32 @@ async def test_saturation_realert_throttle_fires_suppresses_then_refires(
     assert len(sink.saturations) == 2  # re-fires
 
 
+@pytest.mark.parametrize(("floor", "pages"), [(30, 1), (31, 0)])
+async def test_saturation_uses_the_configured_growth_floor(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, floor: int, pages: int
+) -> None:
+    # BACKLOG #5768: the runner's detector takes [delivery].saturation_min_growth, not the default.
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        saturation_default=SaturationThreshold(sustain_samples=3, min_growth=floor),
+        alert_sink=sink,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    depths = iter([0, 10, 20, 30])  # a rise of 30, well past the default floor
+
+    async def _stub(name: str, *, stage: str):
+        return (next(depths), None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    for _ in range(4):
+        await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert len(sink.saturations) == pages
+
+
 async def test_transform_worker_dead_letters_missing_handler(
     store: MessageStore, tmp_path: Path
 ) -> None:
