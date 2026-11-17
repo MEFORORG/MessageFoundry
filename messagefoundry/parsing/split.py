@@ -27,8 +27,8 @@ at these places, and nowhere else:
   ``MSH``-led message.
 
 So what it drops is at least line-end characters, leading noise, byte order marks before an
-``MSH`` and whole envelope lines with the noise around them; it never cuts a line that holds a
-segment's id and fields.
+``MSH``, and whole envelope lines, fields included, with the noise around them. Of a line it
+keeps, it drops at most noise or byte order marks at the line's start.
 """
 
 from __future__ import annotations
@@ -204,17 +204,19 @@ def split_batch(raw: str | bytes) -> list[str]:
     framing has no per-message meaning. So are the envelope lines that end an ``MSH``-led message,
     such as a batch's trailer or the next batch's header (:func:`_trailer_start`, BACKLOG #5806).
     An envelope line opens, past in-line :data:`_NOISE`, with one of those ids, followed by the
-    field separator of the message it goes with (the first ``MSH``-led one after it, or the one it
-    ends) or by nothing but that noise (:func:`_is_envelope_line`). So the
+    field separator of the message it goes with (the one it ends, or, before the first message,
+    the first one a boundary starts) or by nothing but that noise (:func:`_is_envelope_line`).
+    Where no boundary starts a message, only a line of an id and noise alone is one. So the
     members of a batch :func:`encode_batch` framed come back with their segments and no envelope
     line. A member cut at the next ``MSH`` loses the CR before it.
 
     **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
     the leading noise the content sniff tolerates (spaces, tabs, line breaks, vertical tabs, form
-    feeds and byte order marks), then those envelope lines and the noise after each. A chunk of
-    envelope lines and noise alone is not a message. What remains is a message when
-    it starts with ``MSH``, and is otherwise kept as one too, so the parser records its ``ERROR``
-    rather than the split discarding what the sender sent.
+    feeds and byte order marks), then those envelope lines and the noise after each. Where a
+    boundary starts a message after it, a chunk of envelope lines and noise alone is not a message;
+    where none does, a chunk of envelope lines that carry fields is one. What remains is a message
+    when it starts with ``MSH``, and is otherwise kept as one too, so the parser records its
+    ``ERROR`` rather than the split discarding what the sender sent.
 
     A payload holding a single message and no envelope line comes back as one element: its
     normalized text, past that leading noise. An empty/whitespace payload

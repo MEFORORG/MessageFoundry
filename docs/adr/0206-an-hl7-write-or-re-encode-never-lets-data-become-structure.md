@@ -276,13 +276,17 @@ open points settled below.
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
   with `MSH` after whitespace, and that ends with no envelope line, is still handed over as its own
   bytes. The split drops the `FHS`, `BHS`, `BTS` and `FTS` envelope lines before the first message,
-  and the run of them that ends an `MSH`-led message (BACKLOG #5806), so neither the last message
-  of an enveloped file nor its only message carries the trailer to the Handler. A one-message file
-  led by `MSH` that ends with such lines is handed over as the split read it, as a batch member is.
-  An envelope line here opens, past spaces, tabs and the other ASCII whitespace and byte order
-  marks, with one of those ids, followed by the field separator (MSH-1) of the message it goes
-  with (the one it ends, or for lines before the first message, that message), or by nothing but
-  that noise. So a data line such as `FHS: 140 bpm` stays in its message.
+  and the run of them that ends an `MSH`-led message (BACKLOG #5806), so a message the split reads
+  as led by `MSH`, the last of an enveloped file or its only one, does not carry the trailer to
+  the Handler. A message led by a character the split keeps, such as `\x1c` before its `MSH`,
+  keeps its trailer. A one-message file led by `MSH` that ends with such lines is handed over as
+  the split read it, as a batch member is. An envelope line here opens, past spaces, tabs and the
+  other ASCII whitespace and byte order marks, with one of those ids, followed by the field
+  separator (MSH-1) of the message it goes with, or by nothing but that noise. For lines that end
+  a message that is the message's own; for lines before the first message it is that of the first
+  message a line break starts, past any byte order marks, and where there is none only a line of
+  an id and noise alone is an envelope line. So a data line such as `FHS: 140 bpm` stays in its
+  message.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
