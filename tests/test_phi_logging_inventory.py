@@ -607,17 +607,18 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     A helper with no ``event`` parameter, a call to a helper the file does not define, an argument
     that cannot be placed (a starred argument at or before the slot, ``event`` through
     ``**kwargs``, or a method helper called through a receiver other than ``self`` or ``cls``,
-    ``super()`` included), a reference to a helper that is not a direct call, and an INSERT statement that
-    is not a call's first argument each fail here, because a skipped site is the blind spot this
-    guard exists to close.
+    ``super()`` included), a reference to a helper that is not a direct call, a string spelling a
+    helper's name (``getattr(self, '_event')``), and an INSERT statement that is not a call's first
+    argument each fail here, because a skipped site is the blind spot this guard exists to close.
 
     ``shared`` is another module's :func:`_module_strings`: a name this source imports from it by
     ``from ... import`` reads as its value there (Postgres and SQL Server import ``VIEWED_EVENT``
     from the SQLite store).
 
     Not read, at least: a helper reached under another name, which the reference check refuses only
-    when its name is spelled out, an INSERT reached through an attribute, a module constant rebound
-    in a way :func:`_module_strings` does not see, and SQL assembled at run time.
+    when its name is spelled out whole, as an identifier or a string, an INSERT reached through an
+    attribute, a module constant rebound in a way :func:`_module_strings` does not see, and SQL
+    assembled at run time.
     """
     tree = parse_source(source)
     imported = {
@@ -740,9 +741,13 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     loose = [
         node.lineno
         for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute | ast.Name)
-        and id(node) not in called
-        and (node.attr if isinstance(node, ast.Attribute) else node.id) in _EVENT_HELPERS
+        if (
+            isinstance(node, ast.Attribute | ast.Name)
+            and id(node) not in called
+            and (node.attr if isinstance(node, ast.Attribute) else node.id) in _EVENT_HELPERS
+        )
+        # A string spelling a helper's name, as ``getattr(self, '_event')`` does.
+        or (isinstance(node, ast.Constant) and node.value in _EVENT_HELPERS)
     ]
     assert not loose, f"event helpers referenced but not called directly, at lines {loose}"
     return kinds, sorted(unread)
@@ -881,6 +886,11 @@ def test_the_emit_site_scan_reads_every_backend_signature() -> None:
             _event_kinds(helper + f"def f(conn, head, parts):\n    self.{call}\n")
     with pytest.raises(AssertionError, match="not called directly"):
         _event_kinds(helper + "def f(self):\n    write = self._event\n")
+    with pytest.raises(AssertionError, match="not called directly"):
+        _event_kinds(
+            helper + "def f(self, c):\n"
+            "    getattr(self, '_event')(c, 'mid', 'by_name', None, None, 0.0)\n"
+        )
     for chosen in (
         "def f(c, x):\n    sql = 'INSERT INTO message_events (event) VALUES (?)' if x else 'y'\n"
         "    c.execute(sql, ('k',))\n",

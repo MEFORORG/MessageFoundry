@@ -5,10 +5,10 @@
 Every quarantine arm charges the per-tick budget whether or not the move to ``.error`` worked. Before
 #5717 a reject that could not be moved stayed in place and was read and charged again on later scans,
 so ``poll_max_files`` such rejects sorting first could spend the whole budget and hold back the
-healthy drops behind them. Under ``move`` and ``delete`` a reject that stays for a lasting reason is
-now remembered by path and mark and skipped unread and uncharged until it changes, and examined
-again in full in a retry pass after the other candidates: after ``STUCK_RETRY_SECONDS`` for a
-lasting failure, after ``STUCK_TRANSIENT_RETRY_SECONDS`` for a transient one. A due retry takes the
+healthy drops behind them. Under ``move`` and ``delete`` a reject that stays is now remembered by
+path and mark and skipped unread and uncharged until it changes, and examined again in full in a
+retry pass after the other candidates once its retry falls due, by the back-off rule stated at
+``file.STUCK_RETRY_SECONDS``. A due retry takes the
 settle gate first, so it is read a scan after it falls due. ``leave`` is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
@@ -1029,3 +1029,82 @@ async def test_an_empty_watch_directory_is_not_a_failed_listing(
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     assert await rig.scan() == []
     assert not rig.source._listing_failed
+
+
+@pytest.mark.parametrize(
+    "pattern", [pytest.param("", id="invalid"), pytest.param(None, id="absolute")]
+)
+async def test_a_refused_pattern_is_a_failed_listing_warned_every_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pattern: str | None,
+) -> None:
+    """A glob pattern ``Path.glob`` refuses is operator configuration that never clears by itself, so
+    it is warned on every poll, as an invalid one is on main, and the scan carries on as a failed
+    listing. An absolute pattern raises ``NotImplementedError`` there, not ``ValueError``, and is
+    treated the same way, where main let it abort the poll.
+
+    Mutation: log a repeated pattern failure at DEBUG. Red: one WARNING for three scans. Mutation:
+    drop ``NotImplementedError`` from the listing's except. Red: the absolute row raises."""
+    caplog.set_level(logging.DEBUG, logger=file_mod.logger.name)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.source.pattern = str(tmp_path / "*.hl7") if pattern is None else pattern
+    for _ in range(3):
+        assert await rig.scan() == []
+        assert rig.source._listing_failed
+    warned = [
+        r
+        for r in caplog.records
+        if "could not list" in r.getMessage() and r.levelno == logging.WARNING
+    ]
+    assert len(warned) == 3
+
+
+async def test_a_listing_outage_whose_cause_changes_is_warned_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A listing that keeps failing writes a WARNING when it starts and again when its cause
+    changes, and DEBUG while the same cause holds.
+
+    Mutation: compare only whether the listing was already down. Red: one WARNING, not two."""
+    caplog.set_level(logging.DEBUG, logger=file_mod.logger.name)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.source.pattern = "*.hl7"  # matches nothing, not even .processed, so the check lists
+    real_listdir = os.listdir
+    causes = iter([errno.EACCES, errno.EACCES, errno.EIO, errno.EIO, errno.EIO])
+
+    def listdir(path: Any) -> list[str]:
+        if Path(path) == rig.inbox:
+            code = next(causes)
+            raise OSError(code, os.strerror(code))
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", listdir)
+    for _ in range(5):
+        await rig.scan()
+    failed = [r.levelno for r in caplog.records if "could not list" in r.getMessage()]
+    debug, warning = logging.DEBUG, logging.WARNING
+    assert failed == [warning, debug, warning, debug, debug]
+
+
+async def test_a_reject_under_leave_costs_no_tracking_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``leave`` nothing is remembered, so a reject whose move fails is not stat'd again to
+    see whether it stays.
+
+    Mutation: pass ``track=True`` under leave. Red: a call."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read="leave", fail_errno=errno.EBUSY)
+    calls: list[Path] = []
+    real_holds = file_mod._holds
+
+    def holds(path: Path, read_id: Any) -> bool:
+        calls.append(path)
+        return real_holds(path, read_id)
+
+    monkeypatch.setattr(file_mod, "_holds", holds)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert calls == []
