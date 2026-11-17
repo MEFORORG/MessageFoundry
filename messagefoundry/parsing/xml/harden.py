@@ -95,23 +95,31 @@ _DOCTYPE_REFUSAL = (
 #: UTF-7 are not), so a DOCTYPE written in one of those that fails to parse is a parse error.
 _DOCTYPE_SCAN_CODECS = ("latin-1", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
-#: Byte-order marks as each scan codec reads them: U+FEFF, and the UTF-8 BOM read as latin-1.
-_BOM_CHARS = "\ufeff\u00ef\u00bb\u00bf"
+#: How many leading bytes of a failed document the DOCTYPE scan reads (a multiple of 4, so no wide
+#: codec splits a code unit). A failure then costs one bounded pass per codec whatever the body's
+#: size. A DOCTYPE behind a longer prolog is reported as a parse error, which still refuses it.
+_DOCTYPE_SCAN_BYTES = 64 * 1024
 
-#: A DOCTYPE in the prolog: only whitespace, processing instructions (the XML declaration among
-#: them) and comments may come before it. The atomic groups and the possessive loop keep it linear.
+#: A DOCTYPE in the prolog: at most one byte-order mark (U+FEFF, or the UTF-8 BOM as latin-1 reads
+#: it), then only XML whitespace (the S production, not Unicode's), processing instructions (the
+#: XML declaration among them) and comments. The atomic groups and the possessive loop keep it
+#: linear.
 _PROLOG_DOCTYPE = re.compile(
-    r"\A(?:\s|<\?(?>.*?\?>)|<!--(?>.*?-->))*+<!DOCTYPE", re.IGNORECASE | re.DOTALL
+    r"\A(?:\N{BYTE ORDER MARK}|\xef\xbb\xbf)?"
+    r"(?:[ \t\r\n]|<\?(?>.*?\?>)|<!--(?>.*?-->))*+<!DOCTYPE",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
 def _declares_doctype(payload: bytes) -> bool:
     """Whether ``payload``'s prolog opens a ``<!DOCTYPE``, in any case, read in each scan codec.
 
-    Only called on a document that already failed to parse. Anchored to the prolog, so a mention in
-    an element's content, an attribute, a comment after the root or a CDATA section is not one."""
+    Only called on a document that already failed to parse, and reads only its first
+    ``_DOCTYPE_SCAN_BYTES``. Anchored to the prolog, so a mention in an element's content, an
+    attribute, a comment after the root or a CDATA section is not one."""
+    head = payload[:_DOCTYPE_SCAN_BYTES]
     return any(
-        _PROLOG_DOCTYPE.match(payload.decode(codec, "ignore").lstrip(_BOM_CHARS)) is not None
+        _PROLOG_DOCTYPE.match(head.decode(codec, "ignore")) is not None
         for codec in _DOCTYPE_SCAN_CODECS
     )
 
@@ -121,7 +129,8 @@ def parse_bytes(data: bytes | str) -> Any:
 
     Returns the root ``_Element``. Raises :class:`XmlSecurityError` if the document declares a DOCTYPE
     (a DTD/entity-definition carrier), and also when the document fails to parse but its prolog
-    opens a DOCTYPE readable in one of the scan encodings above, and
+    opens a DOCTYPE within its first ``_DOCTYPE_SCAN_BYTES``, readable in one of the scan encodings
+    above, and
     :class:`XmlParseError` if it is not well-formed XML. Both messages are fixed text plus, for a
     parse error, the fault's line, column and libxml2 error code; neither carries lxml's message,
     and neither is chained from lxml's error (BACKLOG #5371). Requires the ``[xml]`` extra."""

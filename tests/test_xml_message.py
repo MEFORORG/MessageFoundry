@@ -120,8 +120,21 @@ def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str)
         b"<x><!-- <!DOCTYPE html> --><y></x>",
         b"<x a='<!DOCTYPE'><y></x>",
         b"<x><y></x><!DOCTYPE x>",
+        # Not XML whitespace (S is space, tab, CR, LF): character data before the DOCTYPE.
+        b"\xa0<!DOCTYPE x><x>",  # U+00A0 as latin-1 reads it
+        (chr(0xA0) + "<!DOCTYPE x><x>").encode("utf-16"),
+        # Only one byte-order mark is a BOM; a second is character data.
+        b"\xef\xbb\xbf\xef\xbb\xbf<!DOCTYPE x><x>",
     ],
-    ids=["cdata", "inner-comment", "attribute", "after-root"],
+    ids=[
+        "cdata",
+        "inner-comment",
+        "attribute",
+        "after-root",
+        "nbsp",
+        "nbsp-utf-16",
+        "double-bom",
+    ],
 )
 def test_doctype_text_outside_the_prolog_of_a_broken_document_is_a_parse_error(
     payload: bytes,
@@ -129,6 +142,21 @@ def test_doctype_text_outside_the_prolog_of_a_broken_document_is_a_parse_error(
     # Only a DOCTYPE in the prolog is one; a mention elsewhere leaves an ordinary parse error.
     with pytest.raises(XmlParseError):
         parse_bytes(payload)
+
+
+def test_doctype_scan_reads_only_a_bounded_prefix() -> None:
+    """A failed document's DOCTYPE scan reads only the first _DOCTYPE_SCAN_BYTES, so a large
+    malformed body costs one bounded pass per codec. A DOCTYPE inside the bound is refused as one;
+    the same DOCTYPE behind a longer prolog falls past it and is an ordinary parse error."""
+    from messagefoundry.parsing.xml import harden
+
+    tail = b'<!DOCTYPE x [<!ENTITY a "b">]><x>'
+    inside = b"<!--" + b"c" * (harden._DOCTYPE_SCAN_BYTES - 200) + b"-->" + tail
+    with pytest.raises(XmlSecurityError):
+        parse_bytes(inside)
+    past = b"<!--" + b"c" * harden._DOCTYPE_SCAN_BYTES + b"-->" + tail
+    with pytest.raises(XmlParseError):
+        parse_bytes(past)
 
 
 def test_doctype_text_in_a_wellformed_comment_still_parses() -> None:
