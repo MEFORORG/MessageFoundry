@@ -205,3 +205,35 @@ def test_without_the_carriage_pass_the_log_chain_hides_the_same_values(
     monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
     for text, value in _LABELLED.values():
         assert value not in _log_chain(text), text
+
+
+@_BOTH
+@pytest.mark.parametrize("joiner", ["/", "+", "%2F", "", " "])
+def test_a_carriage_glued_after_another_is_withheld_too(chain: str, joiner: str) -> None:
+    """Found by code review round 2: the first run took the second marker's head, so the second
+    body printed after ``[redacted]:v1:``."""
+    out = _CHAINS[chain](f"bad {MARKER}WlpURVNUXkFMUEhB{joiner}{_CARRIAGE} end")
+    _no_payload(out)
+    assert "WlpURVNUXkFMUEhB" not in out
+
+
+def test_two_handlers_on_one_record_write_the_same_text() -> None:
+    """Found by code review round 2: the placeholder is a run unit, so a second pass took text glued
+    after the padding that the first had left; the pass now runs to its fixed point."""
+    once = _log_chain(f"bad {MARKER}QUJD==Zq9Secret0x end")
+    assert _log_chain(once) == once
+    assert redact_binary_carriage(once) == once
+
+
+@pytest.mark.parametrize(
+    "glued",
+    ["+code=zqsecretvalue", "/state=zqsecretvalue", "/sig=zqsecretvalue", "+jwt=zqsecretvalue"],
+)
+def test_the_bundle_hides_a_value_glued_after_a_run_as_main_did(glued: str) -> None:
+    """Found by code review round 2: main's bundle pattern read ``=`` anywhere in the run and took
+    such a value; the bundle applies that pattern too, after the label passes."""
+    assert "zqsecretvalue" not in _bundle(f"?x={MARKER}QUJD{glued}")
+
+
+def test_the_bundle_hides_a_word_glued_after_the_padding_as_main_did() -> None:
+    assert "Zq9Secret" not in _bundle(f"bad {MARKER}QQ==Zq9Secret end")

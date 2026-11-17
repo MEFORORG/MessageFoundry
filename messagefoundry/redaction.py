@@ -1094,15 +1094,24 @@ def clamp_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 #: run whose ``+``, ``/`` or ``=`` is percent-encoded or unicode-escaped, or whose ``/`` is
 #: JSON-escaped (``\/``), the escapes also with the backslash doubled. The marker and the escapes are
 #: case-insensitive; the run is ASCII only (``re.ASCII``), so the case fold takes no non-ASCII letter.
-#: The run ends at its padding. One run unit is required, so prose that merely names the marker, such
-#: as ``missing mfb64:v1: marker``, is kept, and the result re-read changes nothing.
+#: The run ends at its padding, and before a unit that starts another marker, so a carriage glued
+#: straight after another is still read as its own. One run unit is required, so prose that merely
+#: names the marker, such as ``missing mfb64:v1: marker``, is kept. Because the placeholder is a
+#: run unit, a second pass can extend a run over text glued after the padding, so
+#: :func:`redact_binary_carriage` repeats until nothing changes: two handlers that share one
+#: record then write the same text.
 #:
 #: Residuals, at least these: a carriage broken by whitespace keeps every piece after the first
 #: break (``encode`` never writes one); a URL-safe (``-``/``_``) carriage keeps the part after its
-#: first such character; and a marker escaped any other way (``\x3a``) is not read at all.
+#: first such character; a marker escaped any other way (``\x3a``) is not read at all; and a run
+#: character encoded a way the pattern does not read (a doubly escaped ``\\\\/``, ``%252F``,
+#: ``&#x2F;``) ends the run, and the rest of the body prints in the log chain, which has no
+#: long-base64 backstop. Text that never reaches a log handler, such as :func:`safe_text`,
+#: :func:`safe_exc` and :func:`safe_error` output, gets no carriage pass at all.
 _BINARY_CARRIAGE = re.compile(
     r"(?i)((?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1(?::|%3A|\\u003A|\\\\u003A))"
-    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>)++"
+    r"(?:(?!(?:mfb64|\[redacted\]|<redacted>)(?::|%3A|\\u003A|\\\\u003A)v1)"
+    r"(?:[A-Z0-9+/]|%2[BF]|\\/|\\\\/|\\u002[BF]|\\\\u002[BF]|\[redacted\]|<redacted>))++"
     r"(?:=|%3D|\\u003D|\\\\u003D){0,2}",
     re.ASCII,
 )
@@ -1117,7 +1126,17 @@ def redact_binary_carriage(text: str) -> str:
     holds ``v1`` or ``V1``, so most text skips the case-insensitive search."""
     if "v1" not in text and "V1" not in text:
         return text
-    return _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
+    for _ in range(_CARRIAGE_ROUNDS):
+        scrubbed = _BINARY_CARRIAGE.sub(rf"\g<1>{_REDACTED}", text)
+        if scrubbed == text:
+            break
+        text = scrubbed
+    return text
+
+
+#: The most rounds :func:`redact_binary_carriage` runs. Each round that changes the text joins at
+#: least one run to the placeholder before it, so a fixed point comes within a round or two.
+_CARRIAGE_ROUNDS = 8
 
 
 def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:

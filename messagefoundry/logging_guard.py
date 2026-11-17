@@ -612,8 +612,8 @@ def _safe_diagnostic(text: str) -> str:
 
     **Which filters of that chain this stands in for, and which it does not.**
     ``RedactionFilter`` is covered by :func:`safe_exc`, which :func:`_safe_reason` applies with it;
-    ``CredentialScrubFilter`` and ``ControlCharScrubFilter`` are composed by
-    :func:`_scrub_diagnostic`. ``CredentialQueryScrubFilter`` is scoped to a URL query string (OIDC
+    ``CredentialScrubFilter``, ``BinaryCarriageScrubFilter`` and ``ControlCharScrubFilter`` are
+    composed by :func:`_scrub_diagnostic`. ``CredentialQueryScrubFilter`` is scoped to a URL query string (OIDC
     ``code``/``state``), and the sinks this module guards are stdout and a local file, neither of
     which yields a diagnostic containing a request URL. **A guarded sink that could — an HTTP or
     syslog-collector sink — must revisit this.** The composition is not derived from the chain, so

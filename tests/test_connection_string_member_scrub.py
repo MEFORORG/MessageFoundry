@@ -619,16 +619,42 @@ def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.Mon
     assert not [path for path, _, _ in printed if path in ("scrub_credentials", "redact_log_line")]
 
 
+#: Controls the support bundle's carriage pass now covers on its own (BACKLOG #5378): it runs after
+#: the member mask and stops a run before a glued marker, so with the mask rule off these shapes no
+#: longer print what the baseline hid. Strict, so the day either prints again it reads as a pass
+#: and the mark must come off.
+_COVERED_BY_THE_CARRIAGE_PASS = frozenset(
+    {"name-token case", "mask keeps where the marker's base64 run ended"}
+)
+
+
 @pytest.mark.parametrize(
     ("attr", "off", "shape"),
-    [control[1:] for control in _RULE_CONTROLS],
-    ids=[control[0] for control in _RULE_CONTROLS],
+    [
+        pytest.param(
+            *control[1:],
+            id=control[0],
+            marks=pytest.mark.xfail(
+                strict=True, reason="covered by the bundle's carriage pass (BACKLOG #5378)"
+            )
+            if control[0] in _COVERED_BY_THE_CARRIAGE_PASS
+            else (),
+        )
+        for control in _RULE_CONTROLS
+    ],
 )
 def test_each_mask_rule_is_needed(
     monkeypatch: pytest.MonkeyPatch, attr: str, off: object, shape: str
 ) -> None:
     """With one rule of the word mask off, its shape prints a value the baseline hid on a later
-    redaction; with every rule on, it does not."""
+    redaction; with every rule on, it does not.
+
+    The carriage passes added by BACKLOG #5378 are off throughout: the write-time one and the
+    bundle's pre-#5378 pattern, which now runs after the member mask. Either reaches the marker
+    shapes below on its own, so with them on these controls would no longer see a mask rule
+    deleted."""
+    monkeypatch.setattr(bundle_redact, "_MFB64_WIDE", _NEVER)
+    monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
     on = getattr(secretscrub, attr)
     if isinstance(off, re.Pattern):
         assert on.pattern != off.pattern  # the switch is not a no-op

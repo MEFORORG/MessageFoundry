@@ -73,6 +73,11 @@ REDACTION_PLACEHOLDER = "[REDACTED]"
 # The shared redactor's pattern, which states the forms it reads, and applied LAST of the label
 # passes in :func:`redact_log_line`, for the reason it states (BACKLOG #5378).
 _MFB64 = _BINARY_CARRIAGE
+# The pattern this module applied FIRST before BACKLOG #5378. It reads ``=`` anywhere in the run, so
+# it took a value glued after a run with no label this module reads (``QUJD+code=x``) or after its
+# padding (``QQ==Secret``). Applied last, after :data:`_MFB64`'s label-sparing order, it keeps the
+# bundle hiding at least what it hid then.
+_MFB64_WIDE = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 
 #: How many characters at the end of a long carriage run the label passes still see. The run is
 #: replaced LAST, so without a bound every pass here scanned the whole body: a 1 MiB line took
@@ -182,8 +187,9 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS COPY RUNS
 # BEFORE THE PHI PASS, and the tail is written back masked, which is the reason for the allowlist; a
 # differential that runs the PHI pass after this layer is the measurement for this copy, not the
-# write-time one. ``_MFB64`` runs after every layer since BACKLOG #5378, so it writes nothing into
-# the braces before this layer reads them. The tail is a copy of ``secretscrub``'s, and a test holds the two equal.
+# write-time one. ``_MFB64`` runs after every layer since BACKLOG #5378; before them,
+# :func:`_shrink_carriage` writes ``[REDACTED]`` into the middle of a run longer than 512
+# characters, which the allowlist refuses. The tail is a copy of ``secretscrub``'s, and a test holds the two equal.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
@@ -668,7 +674,9 @@ def redact_log_line(line: str) -> str:
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     # The carriage body, after every label pass above has hidden its value (BACKLOG #5378).
-    body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
+    if "v1" in body or "V1" in body:
+        body = _MFB64_WIDE.sub(REDACTION_PLACEHOLDER, body)
+        body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 
