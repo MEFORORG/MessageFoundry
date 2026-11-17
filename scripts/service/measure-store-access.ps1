@@ -993,7 +993,8 @@ try {
         $noAdmin = @(Get-LogMatches ([regex]::Escape($NoAdminRefusal)) |
             Where-Object { Test-GateRefusalLine $_.Line $NoAdminRefusal })
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
+            $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
+                    elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
@@ -1047,7 +1048,8 @@ try {
         Stop-TheService
         Show-Trio "service first start"
         if (-not $opened) {
-            $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
+            $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
+                    elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
             Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
                 (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))

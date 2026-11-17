@@ -334,7 +334,9 @@ function Test-SameName {
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X500DistinguishedName]$B)
     if ([Convert]::ToBase64String($A.RawData) -ceq [Convert]::ToBase64String($B.RawData)) { return $true }
     $flags = [System.Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::None
-    return ($A.Decode($flags) -eq $B.Decode($flags))
+    # Ordinal, so only letter case is ignored; a culture-aware -eq would also drop ignorable code
+    # points such as a zero-width space.
+    return [string]::Equals($A.Decode($flags), $B.Decode($flags), [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 # Whether $Signer issued the certificate: the certificate's issuer is $Signer's subject
