@@ -14655,8 +14655,12 @@ class MessageStore:
         """Re-pend claimed rows with a durable backoff (BACKLOG #5735): ``attempts`` loses the
         claim's increment, as for any fault that is not the message's, and ``next_attempt_at``
         moves :data:`TRANSIENT_OPEN_BACKOFF_SECONDS` past the fault (:func:`set_aside_deadline`),
-        so a sweep does not re-claim them at once. The per-lane claims call it; the per-lane workers have no ``infra_fault_policy``
-        bound, so such a row is retried for as long as the fault lasts. If this write fails too,
+        so a sweep does not re-claim them at once. The single-lane claims (``claim_ready``,
+        ``claim_next_fifo``, ``claim_next_fifo_batch``) call it, and they run under either claim
+        mode: under ``"pooled"`` at least an unordered lane and a batch window's extra members
+        are claimed through them. None of their callers binds ``infra_fault_policy``, so such a
+        row is retried for as long as the fault lasts, with no cap or alert; only
+        ``claim_fifo_heads`` hands a fault to T17. If this write fails too,
         its error propagates out of the claim and the rows stay ``inflight`` until
         ``reset_stale_inflight`` at the next start."""
         log.warning(
