@@ -1772,7 +1772,6 @@ async def test_the_engine_arm_text_is_unchanged(
 
 _NOTHING_READ = "no_file_read_under_install_root"
 _NOTHING_UNDER_ROOT = "no_attested_file_under_install_root"
-_NOT_INIT = sorted(rel for rel in _CONSOLE_FILES if not rel.endswith("/__init__.py"))
 
 
 def _console_module(monkeypatch: pytest.MonkeyPatch, **attrs: object) -> None:
@@ -1942,6 +1941,43 @@ def test_a_console_imported_through_a_link_into_the_package_still_reads_back(
     assert console is not None
     assert _drift(console) == [(f"{_CONSOLE_PKG}/static/app.js", "missing")]
     assert console.checked == len(_CONSOLE_FILES) - 1
+
+
+def test_an_emptied_console_reached_through_a_link_into_the_package_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the fully resolved form of the root test fires here: nothing is listed, and the link's
+    own parent is outside the install root."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    package_dir = console_root / _CONSOLE_PKG
+    for rel in _CONSOLE_FILES:
+        (console_root / rel).unlink()
+    alias = tmp_path / "ahead_on_sys_path" / _CONSOLE_PKG
+    alias.parent.mkdir()
+    _symlink(alias, package_dir, directory=True)
+    _load_fake_console(monkeypatch, alias)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
+
+
+def test_an_emptied_subdirectory_loaded_as_the_console_is_missing_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``__path__`` at a directory inside the package, emptied: nothing is listed, and the root
+    test matches a directory in the package too."""
+    console_root = _install_engine_and_console(tmp_path, monkeypatch)
+    static = console_root / _CONSOLE_PKG / "static"
+    for name in ("app.js", "app.css"):
+        (static / name).unlink()
+    _load_fake_console(monkeypatch, static)
+
+    console = integ.attest_console()
+    assert console is not None
+    assert _drift(console) == [(rel, "missing") for rel in sorted(_CONSOLE_FILES)]
+    assert console.unattested_reason == _NOTHING_READ
 
 
 def test_an_unlistable_console_subdirectory_is_named_as_drift(

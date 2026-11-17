@@ -741,7 +741,8 @@ def _attest_distribution(
     additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
     attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
     runs when at least one attested file sat under the install root, or when one of ``package_roots``
-    (the loaded package's directories) is or resolves to ``<install root>/<package>``. The second
+    (the loaded package's directories) is, or resolves to, ``<install root>/<package>`` or a directory
+    in it. The second
     trigger is BACKLOG #5376: a package whose every file is gone, or whose directory is a link out of
     the install root, lists no file under it. A package loaded from outside the install root by
     neither trigger stays attested-nothing rather than turning into a list of every file it did not
@@ -813,19 +814,23 @@ def _attest_distribution(
         checked += 1
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
+    prefix = f"{package}/"
+
+    def in_package(rel: str | None) -> bool:
+        return rel is not None and (rel == package or rel.startswith(prefix))
+
     # The package-root trigger matches a root twice: with only its parent resolved, so a package
     # directory swapped for a link still names the place `RECORD` describes, and fully resolved, so a
     # link from elsewhere into that place does too.
-    read_back = bool(seen) or any(
-        package
-        in (
-            _record_relpath(Path(root).parent.resolve() / Path(root).name, install_root),
-            _record_relpath(Path(root).resolve(), install_root),
+    read_back = unmatched_rows is not None and (
+        bool(seen)
+        or any(
+            in_package(_record_relpath(Path(root).parent.resolve() / Path(root).name, install_root))
+            or in_package(_record_relpath(Path(root).resolve(), install_root))
+            for root in package_roots
         )
-        for root in package_roots
     )
-    if unmatched_rows is not None and read_back:
-        prefix = f"{package}/"
+    if unmatched_rows is not None and read_back:  # the first test narrows the type for mypy
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
             DriftEntry(path=rel, reason="missing")

@@ -328,7 +328,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 - **AC-13** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation compared **no** file
   against a baseline on an install that does not declare itself editable — an absent, empty or
   package-row-less `RECORD`, an unresolvable install root, or a package loaded from outside the install
-  root — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
+  root other than through a link at the directory its `RECORD` describes (that shape is drift since
+  BACKLOG #5376) — THEN THE SYSTEM SHALL log at WARNING, record the `startup_integrity` row, fire the `AlertSink`,
   and **refuse to start**. Under the default alert-only posture it SHALL still log, record and alert.
   → `tests/test_startup_attestation.py::test_attested_nothing_fails_closed_when_opted_in`
   → `tests/test_startup_attestation.py::test_attested_nothing_warns_records_and_alerts_under_alert_only`
@@ -385,7 +386,8 @@ fingerprint+git-HEAD covers more cheaply for now.
 > 2. **Loaded but unattestable fails the same way the engine does (AC-13).** A console with no
 >    distribution metadata, a stripped `RECORD`, or files outside its install root is attested-nothing.
 >    Since BACKLOG #5376 the last shape excludes a console whose package directory is, or links to,
->    the one its `RECORD` describes: each row there is `missing` drift.
+>    the one its `RECORD` describes or a directory in it: each row no listed file matched is
+>    `missing` drift. AC-13's outside-root shape has the same exclusion on the engine arm.
 >    A console that declares itself editable keeps the AC-12 no-op. So does a console with no
 >    distribution beside an engine that declares itself editable: that is a checkout that installed
 >    only the engine, and the engine's exemption already concedes everything this one would.
