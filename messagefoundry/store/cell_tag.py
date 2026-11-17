@@ -587,10 +587,11 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
 
     ``routed_id`` must be keyword-only with no default, so every call that reaches the handoff
     carries it in ``kwargs``; a handoff that takes it any other way is refused here, at decoration
-    (BACKLOG #6698). Every layer of a ``functools.wraps`` chain is read, the one this wrapper calls
-    included: the innermost must take ``routed_id`` keyword-only, and no layer may take it
-    positionally or give it a default. What a layer does with ``*args`` or ``**kwargs`` is not
-    read."""
+    (BACKLOG #6698). Every layer of a ``functools.wraps`` chain that has a code object is read, the
+    one this wrapper calls included: the innermost such layer must take ``routed_id`` keyword-only,
+    and none may take it positionally or give it a default. A layer without a code object, such as
+    an ``lru_cache`` wrapper or a callable object, is not read, and a chain in which no layer has a
+    code object is refused. What a layer does with ``*args`` or ``**kwargs`` is not read."""
     # Read off the code objects rather than inspect.signature, which would evaluate annotations (a
     # TYPE_CHECKING-only one raises NameError at decoration) unless asked not to.
     name = getattr(fn, "__qualname__", repr(fn))
@@ -600,21 +601,23 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
         if any(layer is seen for seen in layers):
             raise TypeError(f"{name} has a cycle in its __wrapped__ chain")
         layers.append(layer)
-    for depth, layer in enumerate(layers):
+    # A layer with no code object (an lru_cache wrapper, a callable object) is skipped, and the
+    # layers that have one are judged; with none at all there is nothing to read, so it is refused.
+    coded = [(layer, code) for layer in layers if (code := getattr(layer, "__code__", None))]
+    if not coded:
+        raise TypeError(
+            f"{name}: its {type(fn).__qualname__} layer must be a plain function or method"
+        )
+    for depth, (layer, code) in enumerate(coded):
         # Each refusal names the layer that failed: functools.wraps copies the innermost's
         # __qualname__ onto every layer, so the code object's own name is read.
-        code = getattr(layer, "__code__", None)
-        if code is None:
-            raise TypeError(
-                f"{name}: its {type(layer).__qualname__} layer must be a plain function or method"
-            )
         label = code.co_qualname
         if "routed_id" in code.co_varnames[: code.co_argcount]:
             raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
         keyword_only = code.co_varnames[
             code.co_argcount : code.co_argcount + code.co_kwonlyargcount
         ]
-        if depth == len(layers) - 1 and "routed_id" not in keyword_only:
+        if depth == len(coded) - 1 and "routed_id" not in keyword_only:
             raise TypeError(f"{label} must take routed_id as a keyword-only parameter")
         if "routed_id" in (getattr(layer, "__kwdefaults__", None) or {}):
             raise TypeError(f"{label} must give its keyword-only routed_id no default")

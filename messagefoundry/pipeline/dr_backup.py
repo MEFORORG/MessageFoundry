@@ -421,9 +421,10 @@ class RestoreResult:
 
 
 class _HashingReader:
-    """A read-only view of ``raw`` that hashes every byte it hands out (BACKLOG #2614). The restore
-    reads the archive through it, so the hash it records is of the bytes it decrypted, not of a
-    second read that a replaced file could answer differently."""
+    """A read-only view of ``raw`` that hashes every bytes-like read it hands out (BACKLOG #2614);
+    a read that is not bytes-like passes through unhashed (see :meth:`read`). The restore reads the
+    archive through it, so the hash it records is of the bytes it decrypted, not of a second read
+    that a replaced file could answer differently."""
 
     def __init__(self, raw: io.BufferedReader) -> None:
         import hashlib

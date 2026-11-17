@@ -255,6 +255,26 @@ async def test_a_virtual_table_whose_sql_hides_its_kind_is_still_skipped(tmp_pat
     assert set(shape.columns) == {"plain"}
 
 
+async def test_a_planted_ordinary_table_with_rootpage_zero_is_not_skipped(tmp_path: Path) -> None:
+    # A rootpage of 0 does not make a row virtual: SQLite parses this one as an ordinary table, so
+    # the reads must not skip it, and reading the salt table it names fails as corrupt.
+    path = tmp_path / "rootless.db"
+    _sql(path, "CREATE TABLE cipher_meta (key_id TEXT)", "INSERT INTO cipher_meta VALUES ('k')")
+    _sql(
+        path,
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES ('table',"
+        " 'store_salt', 'store_salt', 0, 'CREATE TABLE store_salt (salt BLOB)')",
+    )
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    async with _connected(path) as db:
+        shape = await read_schema_shape(db)
+        assert set(shape.columns) == {"cipher_meta", "store_salt"}
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            await _counts_under_a_dek(db)
+
+
 @pytest.mark.parametrize(
     "cipher_meta",
     [

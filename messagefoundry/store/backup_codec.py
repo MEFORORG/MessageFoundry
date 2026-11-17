@@ -144,8 +144,9 @@ def key_fingerprint(key: bytes) -> str:
 
 @dataclass(frozen=True)
 class ArchiveHeader:
-    """The PHI-free, plaintext header at the front of a ``.mfbak`` archive, bound by the frames' AAD
-    because the reader accepts it only in its canonical form (:meth:`to_json_bytes`). Carries only
+    """The PHI-free, plaintext header at the front of a ``.mfbak`` archive. :func:`read_header`
+    refuses any spelling but the canonical form (:meth:`to_json_bytes`), and the frames' AAD hashes
+    the header bytes as read. Carries only
     enough to identify the archive + drive decryption; the rich manifest (row counts, fingerprints, …)
     lives INSIDE the encrypted tar. ``key_id`` is a one-way fingerprint — **never** key bytes."""
 
@@ -443,8 +444,8 @@ def _read_header(src: BinaryIO) -> tuple[ArchiveHeader, bytes]:
     except (KeyError, TypeError, ValueError) as exc:
         raise BackupCodecError("malformed .mfbak header (missing/invalid field)") from exc
     if header.format_version != version:
-        # The JSON copy is bound by the AAD (see the canonical-form check below) and the byte is
-        # not; a disagreement is a tampered prefix.
+        # The frames' AAD hashes the JSON copy as read, and the version byte is not in it; a
+        # disagreement is a tampered prefix.
         raise BackupCodecError(
             f"malformed .mfbak header (format_version {header.format_version} != version byte "
             f"{version})"

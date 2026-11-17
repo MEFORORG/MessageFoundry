@@ -476,6 +476,38 @@ async def test_the_handoff_wrapper_reads_every_layer_of_a_wraps_chain() -> None:
     assert sink.dead == ["r-2"]
 
 
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_a_wraps_layer_without_code_is_skipped_not_refused() -> None:
+    """A layer with no code object (an lru_cache wrapper, a callable object) is skipped and the
+    layers that have code are judged, as the signature read before it did."""
+    import functools
+
+    async def inner(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        raise CellTagError("messages", "raw", "kw-3", "A")
+
+    cached = functools.lru_cache(inner)
+    assert not hasattr(cached, "__code__")
+    dead_letters_on_cell_tag(cached)  # type: ignore[type-var]
+
+    class Forwarder:
+        def __init__(self, target: Any) -> None:
+            self.__wrapped__ = target
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> bool:
+            return bool(await self.__wrapped__(*args, **kwargs))
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(Forwarder(inner))(sink, routed_id="r-3") is False
+    assert sink.dead == ["r-3"]
+
+    async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
+        return True
+
+    # The layers with code are still judged through a layer without it.
+    with pytest.raises(TypeError, match=r"\.positional must take routed_id as a keyword-only"):
+        dead_letters_on_cell_tag(functools.lru_cache(positional))  # type: ignore[type-var]
+
+
 class _NoKeyringView:
     """A cipher that, like Vault Transit, cannot say which keys it holds, and declares so
     (``names_no_keys``) unless ``declares`` is False: then it is a wrapper that just lacks
