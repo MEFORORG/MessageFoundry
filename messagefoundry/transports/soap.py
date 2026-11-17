@@ -586,9 +586,10 @@ def _drop_authorization(headers: dict[str, str]) -> None:
 
 
 def _settings_as_sent(s: dict[str, Any]) -> dict[str, Any]:
-    """``s`` as the credential refusals should read it (BACKLOG #5526): with a minted bearer
-    configured, ``_build_headers`` drops every static ``Authorization`` header, so the refusal does
-    not name one as sent. The minted bearer is still named."""
+    """``s`` as the cleartext and verify-off refusals read it (BACKLOG #5526): beside OAuth2 or
+    SMART, ``_build_headers`` drops every static ``Authorization`` header, so this view drops it
+    too and the refusal does not name it as sent. The minted bearer is still named. Beside a
+    configured ``bearer_token`` or Basic pair the view is unchanged."""
     from messagefoundry.transports.http_auth import (
         is_authorization_header_name,
         oauth2_auth_configured,
@@ -1036,7 +1037,8 @@ class SoapDestination(DestinationConnector):
         """SOAP Content-Type (+ SOAPAction for 1.1) + static ``headers`` + optional bearer/basic auth.
 
         At least the construction length gate and the cleartext refusal read this table. The
-        cleartext and verify-off refusals also read the settings (``http_credentials_sent``).
+        cleartext and verify-off refusals also read the settings through the filtered
+        :func:`_settings_as_sent` view (``http_credentials_sent``).
         A signing header is not in it (see :func:`_drop_authorization`)."""
         action = str(s.get("soap_action") or "")
         headers: dict[str, str] = {}

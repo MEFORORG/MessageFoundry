@@ -261,6 +261,21 @@ def test_a_dropped_static_authorization_is_not_named_by_the_refusal() -> None:
     assert _settings_as_sent(plain) is plain
 
 
+def test_the_verify_off_refusal_names_the_minted_bearer_not_the_dropped_header() -> None:
+    """The call site: beside OAuth2 the verify-off refusal still fires, on the minted bearer, and
+    does not name the static header the table dropped (#5526)."""
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, verify_tls=False, headers={"authorization": "Basic STATIC"}),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    with pytest.raises(ValueError, match="verify_tls=false") as ei:
+        _build(spec.settings)
+    assert "minted bearer token" in str(ei.value)
+    assert "authorization" not in str(ei.value).lower()
+
+
 def test_control_a_static_authorization_header_alone_is_kept() -> None:
     d = _dest(headers={"authorization": "Basic STATIC"})
     assert _auth_keys(d) == ["authorization"]
