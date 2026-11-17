@@ -67,7 +67,6 @@ Stdlib only, like the provenance script beside it.
 from __future__ import annotations
 
 import argparse
-import http.client
 import io
 import json
 import os
@@ -131,12 +130,8 @@ Finding = tuple[str, str]
 Runner = Callable[[Path], tuple[str, str]]
 
 #: Returns an advisory's ``withdrawn_at``, or None when it is not withdrawn. Injected so tests need
-#: no network. :data:`_LOOKUP_ERRORS` are printed as a failed read; anything else is a defect.
+#: no network. Whatever it raises is printed as a failed read, with the exception's type.
 Lookup = Callable[[str], str | None]
-
-#: What a failed lookup raises: transport errors, the http.client errors urllib does not wrap (an
-#: IncompleteRead body, a bad status line), and a reply that is not the expected JSON.
-_LOOKUP_ERRORS = (OSError, http.client.HTTPException, ValueError)
 
 
 def lock_entry_count(lock: dict[str, Any]) -> int:
@@ -269,16 +264,18 @@ def evaluate(
 def stale_entries(reported: dict[Finding, dict[str, str]], baseline: set[Finding]) -> list[Finding]:
     """The acknowledged advisories the report no longer names, sorted by (id, package).
 
-    :func:`evaluate` and :func:`withdrawal_lines` both read this one function, so the STALE lines
-    and the WITHDRAWN_AT lines cannot come from different lists."""
+    :func:`evaluate` and :func:`main` both call it on the same report and baseline, and
+    :func:`main` passes its result to :func:`withdrawal_lines`."""
     return sorted(baseline - set(reported))
 
 
 def github_withdrawn_at(ident: str) -> str | None:
     """*ident*'s ``withdrawn_at`` from GitHub's advisory database, or None when it is not withdrawn.
 
-    Raises one of :data:`_LOOKUP_ERRORS` on a failed read, including a reply without the field,
-    so a missing field is never read as "not withdrawn".
+    Raises on a failed read: :class:`OSError` for transport errors, ``http.client.HTTPException``
+    for the ones urllib does not wrap (an IncompleteRead body, a bad status line), and
+    :class:`ValueError` for a reply without the field, so a missing field is never read as "not
+    withdrawn".
     """
     if not _GHSA.fullmatch(ident):
         raise ValueError(f"{ident!r} is not a GitHub advisory id")
@@ -316,7 +313,9 @@ def _look_up_all(
         answer: str | None | BaseException
         try:
             answer = lookup(ident)
-        except _LOOKUP_ERRORS as broken:
+        # Broad on purpose, at a thread boundary: an exception that escaped here would leave no
+        # result, and the id would then print as a GitHub timeout. Every failure prints as one.
+        except Exception as broken:  # noqa: BLE001
             answer = broken
         with guard:
             results[ident] = answer
@@ -347,14 +346,15 @@ def withdrawal_lines(
         prefix = f"WITHDRAWN_AT {ident} in {package}:"
         by_hand = f"Read it by hand: gh api advisories/{ident} --jq .withdrawn_at"
         if not _GHSA.fullmatch(ident):
-            lines.append(f"{prefix} not a GitHub advisory id, so GitHub holds no record to read.")
+            lines.append(f"{prefix} has no GHSA id to look up by. Find its GHSA on GitHub by hand.")
         elif ident not in asked:
             lines.append(f"{prefix} not looked up, past the {MAX_LOOKUPS}-lookup cap. {by_hand}")
         elif ident not in results:
             lines.append(f"{prefix} GitHub did not answer within {budget:g} s. {by_hand}")
         elif isinstance(value := results[ident], BaseException):
             lines.append(
-                f"{prefix} could not be read from GitHub ({_one_line(str(value))[:200]}). {by_hand}"
+                f"{prefix} could not be read from GitHub ({type(value).__name__}: "
+                f"{_one_line(str(value))[:200]}). {by_hand}"
             )
         elif value is None:
             lines.append(
@@ -471,10 +471,10 @@ bundle, which needs a Node toolchain this repository does not carry.
 3. Otherwise acknowledge it: add an [[advisory]] entry to {BASELINE_PATH} in a reviewed pull
    request, with a comment saying who triaged it and what they found.""",
     "STALE BASELINE ENTRY": """\
-What to do about a STALE BASELINE ENTRY. Read its WITHDRAWN_AT line above, or open the advisory's
-GitHub page when that line could not read the record. If it was withdrawn or its affected range no
-longer covers the locked version, remove the entry. If neither, the audit stopped
-seeing the package, and the audit is what needs fixing.""",
+What to do about a STALE BASELINE ENTRY. Read its WITHDRAWN_AT line above where the run printed
+one with a timestamp or NOT withdrawn; otherwise open the advisory's GitHub page. If it was
+withdrawn or its affected range no longer covers the locked version, remove the entry. If neither,
+the audit stopped seeing the package, and the audit is what needs fixing.""",
     "COVERAGE": """\
 What to do about COVERAGE. The audit did not read the whole lockfile, so none of its other results
 mean anything yet. Check what npm printed, and whether a new npm counts dependencies differently.""",
@@ -543,7 +543,7 @@ def main(
     stale = stale_entries(reported, baseline)
     if stale and args.no_lookup:
         print("WITHDRAWN_AT: not looked up (--no-lookup).")
-    elif stale and audited_total(report) != expected:
+    elif stale and any(problem.startswith("COVERAGE") for problem in problems):
         print("WITHDRAWN_AT: not looked up, because COVERAGE failed and every entry reads stale.")
     elif stale:
         for line in withdrawal_lines(stale, lookup):

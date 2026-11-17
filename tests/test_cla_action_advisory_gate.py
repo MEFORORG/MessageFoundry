@@ -399,6 +399,19 @@ def test_a_stale_entry_prints_its_withdrawn_at_and_stays_red(
     assert f"::error::STALE BASELINE ENTRY: {_WITHDRAWN[0]}" in out
 
 
+def test_main_looks_up_through_github_by_default(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without an injected lookup, main reads GitHub; here the autouse fixture refuses the socket,
+    so the line must say the read failed, never NOT withdrawn."""
+    (root / gate.BASELINE_PATH).write_text(_as_toml(_FOUND | {_WITHDRAWN}), encoding="utf-8")
+
+    assert gate.main(["--root", str(root), "--report", str(_FIXTURE)]) == 1
+    out = capsys.readouterr().out
+    assert "could not be read from GitHub (OSError: network refused in tests)" in out
+    assert "GitHub records it as NOT withdrawn" not in out
+
+
 def test_a_clean_run_looks_nothing_up(root: Path) -> None:
     def lookup(ident: str) -> str | None:
         raise AssertionError(f"looked up {ident} on a run with no stale entry")
@@ -419,10 +432,11 @@ def _raise(error: Exception) -> _Lookup:
         (lambda _ident: None, "GitHub records it as NOT withdrawn"),
         (
             _raise(OSError("HTTP Error 403: rate limit")),
-            "could not be read from GitHub (HTTP Error 403",
+            "could not be read from GitHub (OSError: HTTP Error 403",
         ),
         (_raise(ValueError("the reply carries no withdrawn_at field")), "no withdrawn_at field"),
         (_raise(http.client.IncompleteRead(b"{")), "could not be read from GitHub (IncompleteRead"),
+        (_raise(RuntimeError("boom")), "could not be read from GitHub (RuntimeError: boom)"),
     ],
 )
 def test_each_lookup_outcome_has_its_own_line(lookup: _Lookup, expected: str) -> None:
@@ -438,7 +452,7 @@ def test_each_lookup_outcome_has_its_own_line(lookup: _Lookup, expected: str) ->
 def test_an_npm_id_is_not_looked_up() -> None:
     (line,) = gate.withdrawal_lines([("npm-1234", "x")], _raise(AssertionError("looked up")))
 
-    assert "not a GitHub advisory id" in line
+    assert "has no GHSA id to look up by" in line
 
 
 def test_lookups_stop_at_the_cap() -> None:
