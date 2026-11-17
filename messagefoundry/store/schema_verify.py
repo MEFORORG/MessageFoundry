@@ -83,6 +83,8 @@ _KEYED_DETAIL = (
 
 # The reads below skip a table whose stored SQL is LIKE 'CREATE VIRTUAL TABLE%', because a pragma
 # on a virtual table whose module is not loaded here can raise "no such module" (BACKLOG #6719).
+# The store builds none, and a test pins that, so an expected name held by a virtual table reads
+# as a missing table and is refused rather than skipped.
 # THIS BUILD CREATES NO VIRTUAL TABLE AND NO VIEW, which tests/test_schema_verify_6719_6720.py
 # pins; the other notes in this module rely on that and point here.
 _ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"

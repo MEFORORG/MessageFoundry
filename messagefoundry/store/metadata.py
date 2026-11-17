@@ -95,9 +95,8 @@ def encode_reference_value(value: Any) -> str:
     (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON.
 
     A ``TypeError``, ``ValueError`` or ``RecursionError`` from json is replaced by a new
-    ``TypeError`` whose message names a kind, never the value or its key. The refusal's class and
-    message are read inside the handler. Any other exception propagates as raised. One such value
-    refuses the whole set, by the rule above."""
+    ``TypeError`` whose message names a kind, never the value or its key. Any other exception
+    propagates as raised. One such value refuses the whole set, by the rule above."""
     refused: tuple[type[BaseException], str] | None = None
     try:
         return json.dumps(value, default=_reference_json_default, allow_nan=False)
@@ -185,7 +184,7 @@ def _load_object(
     false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A
     refusal that reads as empty is logged with json's content-free hint and ``row_id``'s reference,
     never the text. ``bytes``, ``bytearray`` and ``memoryview`` decode as ``json.loads`` decodes
-    bytes. A released ``memoryview`` and any other type read as ``{}`` and are logged."""
+    bytes. A released ``memoryview`` reads as ``{}`` and is logged."""
     if isinstance(text, (bytearray, memoryview)):
         try:
             text = bytes(text)
