@@ -838,10 +838,9 @@ This section is kept rather than deleted, because the claim it used to make is t
 Named as `allow_lost_audit_range_key` (BACKLOG #4934), whatever the store holds, because it says what
 the next start may do.
 - **What you lose:** the start refusal that keeps the keyed audit chain whole across a store key
-  change. With it off, `serve` (and each `supervise` shard, and the supervisor before it renews the
-  API certificate) refuses to start when the store key differs from its stamp, or has none, the
-  chain has not been rolled to it, and the key the chain's current range is under is not
-  configured. A refused start renews no API certificate. The refusal never fires on at least two
+  change. With it off, `serve` (and each `supervise` shard) refuses to start when the store key in
+  use is not confirmed by its stamp, the chain's current range is not under it, and the key that
+  range is under is not configured. The refusal never fires on at least two
   kinds of store, so this setting changes nothing there: a store under
   `[store].cipher_provider = "vault_transit"`, because Transit holds its key and the engine has no
   local store key to compare with the stamp; and a store whose audit ranges the open could not
@@ -854,7 +853,7 @@ the next start may do.
   start whose key is unchanged, whose chain has rolled, or whose range key is configured.
 - **When acceptable:** only when the key the chain's current range is under is truly lost, so no
   `rotate-key` run can roll the chain anyway. If the key exists anywhere, put it back in
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key` until it exits 0 instead.
+  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and run `rotate-key` instead.
 - **Compensating controls:** none that restore the chain. Record when and why the key was lost, keep
   the `audit-verify` output from before the start, and treat the break as a known event in any audit
   review.
