@@ -393,8 +393,8 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> bool:
 
     A base URL is refused in at least these cases: httpx cannot parse it or IDNA-decode its host,
     its scheme is not ``http`` or ``https``, it has no host, it carries userinfo, or it is
-    plaintext ``http`` to a non-loopback host without ``allow_insecure``. Each refusal is an :class:`ApiError` that
-    chains nothing.
+    plaintext ``http`` to a non-loopback host without ``allow_insecure``. Each refusal is an
+    :class:`ApiError` that chains nothing.
 
     Returns ``True`` when the caller has opted into a **cleartext non-loopback hop** -- the one
     permitted-but-unencrypted shape. :class:`EngineClient` stores that and refuses to put a
