@@ -53,17 +53,24 @@
     NT SERVICE\<ServiceName>, and every process sampled under the service must run as it. Where the
     engine is up (provision first), the sample must include the engine process itself.
 
-    WHAT A RED MEANS. Every red names the identity that could not open the store, and lists for each
-    file of the trio the entries it carries and whether any grants that identity read and write. That
-    list is a READING of the DACL, not an access check: it names the file, and the behaviour above
-    says the open failed. A red is tagged [STORE ACCESS] only when the service log or the probe
-    output shows an open failure; otherwise it is tagged [NOT SHOWN TO BE STORE ACCESS], because a
-    refused start gate or a held port also stops the engine from serving.
+    WHAT A RED MEANS. At least every red that says an identity did not open, provision or serve
+    within the wait, apart from the three let-start reds below, names that identity and lists for
+    each file of the trio the entries it carries and whether any grants that identity read and
+    write. That list is a READING of the DACL, not an access check: it names the file, and the
+    behaviour above says the open failed. Such a red is tagged [STORE ACCESS] only when the
+    service log or the probe output shows an open failure; otherwise it is tagged
+    [NOT SHOWN TO BE STORE ACCESS], because a refused start gate or a held port also stops the
+    engine from serving.
+    The three let-start reds are for a start the ADR 0167 gate let go on where a refusal was
+    expected (the first start, the StartFirst control and the StartFirst restart). They say so,
+    point at the READING that quotes the gate's line, and say the service's access is not in
+    question, with no trio list and no tag. Other reds say what they checked.
 
-    CONFINEMENT IS CHECKED AFTER EVERY OPEN. Opening is half of the question; the other half is the
-    property ADR 0163's restriction exists for. After each identity's open, every trio file may grant
-    only SYSTEM, BUILTIN\Administrators, the service account and the operator, block inheritance, and
-    be owned by one of them, or the arm goes RED.
+    CONFINEMENT IS CHECKED AFTER EACH OPEN A STEP PROVES. Opening is half of the question; the other
+    half is the property ADR 0163's restriction exists for. After each such open, every trio file
+    may grant only SYSTEM, BUILTIN\Administrators, the service account and the operator, block
+    inheritance, and be owned by one of them, or the arm goes RED. The control reopen is not
+    checked, and neither is an open whose step went red, the three let-start reds included.
     A GREEN CAN BE CONDITIONAL, and says so: store.py only logs when it cannot restrict a file, so a
     restriction warning in the service log or the CLI output prints GREEN (CONDITIONAL) with a warning.
 
@@ -116,16 +123,19 @@ $Email = "w0-admin@example.invalid"
 # The ADR 0167 gate's own words (messagefoundry/api/app.py, _assert_security_notice_is_deliverable),
 # and the words provision_first_administrator declines with (messagefoundry/auth/service.py). If
 # either is reworded, the arm goes RED on a missing proof rather than passing on a stale one.
-# $GateRefusal is the clause BOTH of the gate's branches open with, so the file-access arms prove the
-# service read the user table whichever branch fired. $NoAdminRefusal and $ProvisionHint are the
-# no-Administrator branch alone, which StartFirstEndToEnd requires (ADR 0183 Wave 2, AC-11).
+# $GateRefusal is the clause the gate's no-Administrator and no-address branches both open with, so
+# the file-access arms prove the service read the user table whichever of the two fired. The gate's
+# Vault-transit refusal carries no phrase here (see Wait-ForGateRefusal). $NoAdminRefusal and
+# $ProvisionHint are the no-Administrator branch alone, which StartFirstEndToEnd requires (ADR 0183
+# Wave 2, AC-11); $NoAdminRefusal is in it only when no account record failed its integrity seal.
 $GateRefusal = "no enabled Administrator"
 $NoAdminRefusal = "no enabled Administrator exists"
 $ProvisionHint = "provision-admin --username"
-# The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry the two
-# phrases above too, so without this an engine that started and served would pass every step that
-# expects a refusal (each Wait-ForGateRefusal call below; ProvisionFirst has none);
-# Test-GateRefusalLine requires both on one line.
+# The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry
+# $GateRefusal too, and may carry the other two phrases above, so without this an engine that
+# started and served would pass every step that expects a refusal (each Wait-ForGateRefusal call
+# below; ProvisionFirst has none); Test-GateRefusalLine requires $StartRefused and the clause on one
+# line.
 $StartRefused = "refusing to start"
 # The openings of the gate's lines that let a start go on, at least these three in app.py: the
 # skipped-gate warning, the warn-mode line, and the warning that the gate could not run (a Vault
@@ -655,7 +665,12 @@ function Wait-ForGateRefusal([string]$Phase) {
       $false on timeout, and $false at once, with a reading quoting it, when one of the gate's
       let-it-start lines ($GateLetStart) is logged. Any other line is waited past.
     #>
-    # Read by callers after a $false, so a failure text never names a lockout the gate ruled out.
+    # Read by callers after a $false, so a failure text does not name a lockout when the gate logged
+    # a let-start line. One gate path is NOT recognised: the Vault-transit integrity-seal refusal
+    # ("refusing to start a PHI instance: the accounts could not be checked against their integrity
+    # seal ...") carries $StartRefused but not $GateRefusal, and opens with no $GateLetStart prefix.
+    # On that path the wait times out, and the caller prints its timeout text and the store-access
+    # attribution (Get-Attribution) rather than naming the gate.
     $script:GateLetStartSeen = $false
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -686,7 +701,7 @@ function Add-FirstStartFailure {
     $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
             elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
             else { "never created $DbPath" }
-    $cause = if ($script:GateLetStartSeen) { "The store's access is not in question." }
+    $cause = if ($script:GateLetStartSeen) { "The service's access is not in question." }
              else { Get-Attribution $ServiceIdentity (Get-ServiceSids) "" }
     Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " + $cause)
     Show-LogTail
@@ -1090,9 +1105,10 @@ try {
                         "control expected a refusal it did not get; the service's access is not in question.")
                     Show-LogTail
                 } else {
-                    Add-Failure ("control: $ServiceIdentity could not reopen even the store it created " +
-                        "itself, which nobody else touched, so its own first open locked out every " +
-                        "identity. " + (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+                    Add-Failure ("control: $ServiceIdentity, restarted on the store it created itself, " +
+                        "which nobody else touched, did not log the expected refusal line in " +
+                        "$WaitSeconds s. If the cause is store access, its own first open locked out " +
+                        "every identity. " + (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
                     Show-LogTail
                 }
             } else {
@@ -1116,7 +1132,7 @@ try {
                     if (-not $reopened -and $script:GateLetStartSeen) {
                         Add-Failure ("$ServiceIdentity opened $DbPath after $Operator's open and reached " +
                             "the ADR 0167 gate, which let the start go on (the reading above), so the " +
-                            "restart expected a refusal it did not get; the store's access is not in question.")
+                            "restart expected a refusal it did not get; the service's access is not in question.")
                         Show-LogTail
                     } elseif (-not $reopened) {
                         Add-Failure ("$ServiceIdentity, restarted on $DbPath after $Operator's open " +

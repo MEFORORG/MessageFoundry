@@ -12,8 +12,9 @@ NOTHING HERE RUNS THE SCRIPT: it installs a service and must run elevated, which
 windows-service-smoke leg does. The tests lift the phrase assignments and functions they need out
 of the script's AST: they call ``Test-GateRefusalLine`` on lines worded as the engine words them,
 and run ``Wait-ForGateRefusal`` against a stand-in log reader. They pin, as literals, that ``app.py``
-still holds each line's prefix and the clause texts the script matches on; they do not render the
-lines from ``app.py``. They need ``pwsh`` or ``powershell`` and skip where it is missing.
+still holds each line's prefix and the no-Administrator and no-address detail texts; they do not pin
+``$ProvisionHint`` or ``$ProvisionDecline``, and they do not render the lines from ``app.py``. They
+need ``pwsh`` or ``powershell`` and skip where it is missing.
 """
 
 from __future__ import annotations
@@ -188,7 +189,7 @@ def test_only_the_refusal_counts_as_a_refused_start(tmp_path: Path, host: str) -
         (_SKIPPED[1], False, True),
         (_WARN_MODE[1], False, True),
         # Without the clause, a let-start search confined to clause lines never sees this one: the
-        # wait ran to its timeout and the failure named store access.
+        # wait ran to its timeout and the caller's failure carried the store-access attribution.
         (_COULD_NOT_RUN[1], False, True),
         ("unrelated line", False, False),
     ],
