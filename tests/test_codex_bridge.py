@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import base64
 import importlib.util
 import io
 import json
@@ -183,65 +182,48 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
 @pytest.mark.parametrize(
     ("command", "outcome"),
     [
-        # pwsh -Command reports a native program's exit 2 as 1, which would fail open.
-        ("& '{py}' -c 'import sys; sys.exit(2)'", "block"),
-        # A stale exit 2 from an earlier statement must not block a hook that went on to succeed.
+        # A command-only PowerShell hook blocks by `exit 2`, as under Claude Code.
+        ("Write-Output 'x' | Out-Null; exit 2", "block"),
+        ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
+        ("trap {{ exit 2 }}; throw 'boom'", "block"),
+        ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
+        # A native 2 passed on by `exit` blocks; one left as the last statement is -Command's
+        # own 1, as Claude Code would see it, so it does not block.
+        ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
+        ("& '{py}' -c 'import sys; sys.exit(2)'", "exit-1"),
+        # A stale 2 never blocks.
         ("& '{py}' -c 'import sys; sys.exit(2)'; Write-Output '{{}}'", "allow"),
-        # A failed cmdlet as the last statement stays -Command's own non-blocking 1.
-        ("Get-Item -LiteralPath 'no-such-item-b4'", "notice"),
-        # A grep-style stale exit 2, then a failed cmdlet: still the cmdlet's non-blocking 1.
         (
             "& '{py}' -c 'import sys; sys.exit(2)'; Get-Item -LiteralPath 'no-such-item-b4'",
-            "notice",
+            "exit-1",
         ),
-        # The hook's own final exit 2 still blocks, after a statement that succeeded.
-        ("Write-Output 'x' | Out-Null; & '{py}' -c 'import sys; sys.exit(2)'", "block"),
-        # A handled or silenced earlier error does not hide the hook's own final exit 2.
-        (
-            "try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; "
-            "& '{py}' -c 'import sys; sys.exit(2)'",
-            "block",
-        ),
-        (
-            "$null = Get-Command no-such-command-b4 -ErrorAction SilentlyContinue; "
-            "& '{py}' -c 'import sys; sys.exit(2)'",
-            "block",
-        ),
-        # A stale exit 2, then a cmdlet failing under -ErrorAction Ignore, records no error and
-        # must still not block.
         (
             "& '{py}' -c 'import sys; sys.exit(2)'; "
             "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction Ignore",
-            "notice",
+            "exit-1",
         ),
-        # The hook keeps its own $input, $LASTEXITCODE, $?, trap, param() and return.
-        ("$p = $input | ConvertFrom-Json; if ($p.tool_name -eq 'Bash') {{ exit 2 }}", "block"),
-        ("& '{py}' -c 'import sys; sys.exit(2)'; exit $LASTEXITCODE", "block"),
-        ("& '{py}' -c 'import sys; sys.exit(3)'; if (-not $?) {{ exit 2 }}", "block"),
-        ("trap {{ exit 2 }}; Write-Output 'x' | Out-Null; throw 'boom'", "block"),
-        ("param($x = 1)\n& '{py}' -c 'import sys; sys.exit(2)'", "block"),
-        ("if ($true) {{ & '{py}' -c 'import sys; sys.exit(2)' }}", "block"),
+        ("& '{py}' -c 'import sys; sys.exit(2)'; $null = Get-Item -LiteralPath 'no-b4'", "exit-1"),
+        ("Get-Item -LiteralPath 'no-such-item-b4'", "exit-1"),
         ("if ($true) {{ return }}; exit 2", "allow"),
     ],
     ids=[
-        "native-exit-2",
-        "stale-exit-2",
-        "failed-cmdlet",
-        "stale-2-then-cmdlet",
-        "own-final-2",
-        "handled-error-then-final-2",
-        "silenced-error-then-final-2",
-        "stale-2-then-ignored-cmdlet",
+        "explicit-exit-2",
+        "handled-error-then-exit-2",
+        "trap-exit-2",
         "reads-input",
-        "exit-lastexitcode",
-        "checks-status",
-        "trap",
-        "param-block",
-        "compound-statement",
+        "native-2-passed-on",
+        "native-2-last",
+        "stale-2-then-success",
+        "stale-2-then-failed-cmdlet",
+        "stale-2-then-ignored-cmdlet",
+        "stale-2-then-assignment",
+        "failed-cmdlet",
         "early-return",
     ],
 )
-def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, command, outcome):
+def test_a_powershell_hook_takes_the_process_exit_code_unchanged(
+    bridge, tmp_path, command, outcome
+):
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
     settings(tmp_path, [hook])
     if outcome == "block":
@@ -249,18 +231,18 @@ def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, comman
             bridge.dispatch(tmp_path, BASH_CALL)
         return
     result = bridge.dispatch(tmp_path, BASH_CALL)
-    assert ("exited 1:" in result.get("systemMessage", "")) == (outcome == "notice"), result
+    if outcome == "allow":
+        assert result == {}, result
+    else:
+        assert "hook exited 1: " in result["systemMessage"], result
 
 
 def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
     structured = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/guard", "args": ["a"]}
     assert bridge.hook_argv(tmp_path, structured) == [f"{tmp_path}/guard", "a"]
     shell = {"type": "command", "shell": "powershell", "command": "'${CLAUDE_PROJECT_DIR}_x'"}
-    # Braced, so a following name character cannot join the variable name. The hook text
-    # travels base64-encoded inside the wrapper.
-    encoded = re.search(r"FromBase64String\('([^']+)'\)", bridge.hook_argv(tmp_path, shell)[-1])
-    assert encoded
-    assert base64.b64decode(encoded[1]).decode() == "'${env:CLAUDE_PROJECT_DIR}_x'"
+    # Braced, so a following name character cannot join the variable name.
+    assert bridge.hook_argv(tmp_path, shell)[-1].endswith("'${env:CLAUDE_PROJECT_DIR}_x'")
 
 
 def test_each_event_matches_its_own_discriminator_field(bridge, tmp_path):

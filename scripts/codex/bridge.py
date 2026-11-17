@@ -199,30 +199,12 @@ def git_bash() -> str | None:
     return None
 
 
-# -Command reports a native program's exit 2 as 1, which would turn a block into a non-blocking
-# error. This tail runs after the hook text, in the hook's own scope, so the hook keeps its $input,
-# $LASTEXITCODE, $?, trap and return. Only when the last statement failed does it look further: it
-# passes on exit code 2 unless that statement is a pipeline ending in a cmdlet or in a command that
-# does not exist, which cannot have set the code, so a stale 2 from an earlier native command
-# never blocks and no recorded error hides a real final 2. Any other failure exits 1. The tail
-# reparses the hook text, carried base64-encoded so no quoting in it can reach the tail.
-POWERSHELL_TAIL = """
-if (-not $?) {
-    $__mfCmdletLast = $false
-    $__mfAst = [System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('B64')), [ref]$null, [ref]$null)
-    $__mfLast = if ($__mfAst.EndBlock) { $__mfAst.EndBlock.Statements | Select-Object -Last 1 }
-    if ($__mfLast -is [System.Management.Automation.Language.PipelineAst]) {
-        $__mfCall = $__mfLast.PipelineElements | Select-Object -Last 1
-        if ($__mfCall -is [System.Management.Automation.Language.CommandAst] -and $__mfCall.GetCommandName()) {
-            $__mfFound = Get-Command -Name $__mfCall.GetCommandName() -ErrorAction Ignore | Select-Object -First 1
-            if ($__mfFound -is [System.Management.Automation.AliasInfo]) { $__mfFound = $__mfFound.ResolvedCommand }
-            $__mfCmdletLast = $null -eq $__mfFound -or $__mfFound.CommandType -eq 'Cmdlet'
-        }
-    }
-    if ((Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly -ErrorAction Ignore) -eq 2 -and -not $__mfCmdletLast) { exit 2 }
-    exit 1
-}
-"""
+# A command-only PowerShell hook runs as Claude Code runs it, under pwsh -Command, and its exit code
+# is taken unchanged: it blocks by `exit 2`. -Command reports a final native program's exit 2 as 1,
+# as it would under Claude Code. The one line put before the hook keeps a native non-zero exit from
+# throwing where a PowerShell build defaults that preference on; a hook that must open with param()
+# or a named block cannot take it, and fails to parse.
+POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
@@ -245,9 +227,7 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        encoded = base64.b64encode(command.encode()).decode()
-        script = command + POWERSHELL_TAIL.replace("B64", encoded)
-        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_HEAD + command]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 
 

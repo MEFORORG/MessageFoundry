@@ -77,7 +77,11 @@ limit, so the timeouts of a long chain add up against it.
 
 Command-only hooks use the shell they name. With none, they use bash, as Claude
 Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
-Structured `command` and `args` avoid shell parsing.
+Structured `command` and `args` avoid shell parsing. A command-only PowerShell
+hook blocks by `exit 2`, as under Claude Code, whose documented PowerShell hook
+blocks that way. The bridge runs it under `pwsh -Command` and takes the exit code
+unchanged; `-Command` reports a final native program's exit 2 as 1, so a hook
+that means to pass one on ends with `exit $LASTEXITCODE`.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.
