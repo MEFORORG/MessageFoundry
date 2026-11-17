@@ -107,7 +107,10 @@ is down, no check refused the body. Usually no row is written. A fault after the
 committed row, so check the message log before you resend by hand. On MLLP, a sender that
 expects replies gets a negative acknowledgment, `MLLPSource._answer_handler_failure` records a
 `handler_error` connection event, and the connection closes. A raw-TCP inbound that replies in
-HL7 records `handler_error` and closes with no reply, so its sender resends. For a sender that
+HL7 records `handler_error` and closes with no reply, so its sender resends. The HTTP listener
+records `handler_error` and answers `503` or `500` by the exception's type, as
+[CONNECTIONS.md Table B](CONNECTIONS.md#table-b--per-service-resource-strategy-asvs-1313) states
+(BACKLOG #5680). For a sender that
 waits for no reply, the MLLP, raw-TCP and X12 listeners hold the frame and retry the handler, and
 record `handler_error` only once the fault outlasts several retries or a stop ends them, so a fault
 after the commit can leave more than one committed row for the frame (BACKLOG #5022). The

@@ -369,6 +369,13 @@ def _bounded_ack_field(value: str | None) -> str:
     return clamp_untrusted(value or "", window=_MAX_NAK_DETAIL_CHARS)
 
 
+#: The prefix of the retryable DeliveryError a well-formed ACK naming another message's control id
+#: raises (BACKLOG #82, #5681). The persistent lane keys its discard reason on it. A plain
+#: DeliveryError rather than a subclass, so the error class operators and alert rules see is
+#: unchanged.
+_ACK_MISMATCH = "ACK control-id mismatch"
+
+
 #: A segment break in a payload not yet normalized (``normalize`` maps both to ``\r``).
 _LINE_BREAK = re.compile(r"[\r\n]")
 
@@ -940,7 +947,8 @@ class MLLPDestination(DestinationConnector):
         # retryable DeliveryError; only a read-but-unparseable ACK becomes outcome='unparseable'.
         self.capture_response: bool = bool(s.get("capture_response", False))
         # BACKLOG #82: when True, a positive ACK (MSA-1 AA/CA) is accepted only if its MSA-2 echoes the
-        # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). Default
+        # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). A reject
+        # (AR/CR) naming a different, non-empty MSA-2 is one too (BACKLOG #5681). Default
         # False → no correlation, byte-identical (the sent control id is never threaded to _check_ack).
         # The sent MSH-10 is read defensively in send() (a non-HL7 / unreadable payload → skip, deliver
         # as before); MSA-2 is read separator-aware via Peek, never hardcoded delimiters.
@@ -1357,11 +1365,16 @@ class MLLPDestination(DestinationConnector):
             response = self._check_ack(ack_bytes, sent_control_id)
         except NegativeAckError:
             raise  # complete transaction on a healthy transport — the connection stays cached
-        except DeliveryError:
+        except DeliveryError as exc:
             # An unparseable ACK (non-capturing) means the transaction was NOT fully successful
             # ("one ACK read *and parsed*", ADR 0067 §2.2) — discard like any other DeliveryError
-            # rather than trust a peer that talks garbage to keep its framing aligned.
-            await self._discard_unparseable(conn, writer)
+            # rather than trust a peer that talks garbage to keep its framing aligned. A parseable
+            # ACK for ANOTHER message (BACKLOG #82, #5681) is discarded too, since the socket is out
+            # of step with the sends, under its own reason rather than "unparseable ACK".
+            mismatch = str(exc).startswith(_ACK_MISMATCH)
+            await self._discard_unparseable(
+                conn, writer, reason=_ACK_MISMATCH if mismatch else "unparseable ACK"
+            )
             raise
         if response is not None and response.outcome == "unparseable":
             # capture_response turns the unparseable ACK into a captured outcome instead of a raise
@@ -1453,18 +1466,21 @@ class MLLPDestination(DestinationConnector):
         self,
         conn: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         writer: asyncio.StreamWriter,
+        *,
+        reason: str = "unparseable ACK",
     ) -> None:
         """Discard the cached connection after a read-but-unparseable ACK (both the raising
-        non-capturing path and the captured ``outcome='unparseable'`` path). Fixed reason only in
-        the log: the parse error's text can embed a reply fragment (#120)."""
+        non-capturing path and the captured ``outcome='unparseable'`` path), or after a parseable
+        ACK naming another message's control id. ``reason`` is a fixed engine string, never the
+        error's text: the parse error's text can embed a reply fragment (#120)."""
         if self._conn is conn:
             self._conn = None
             self.reconnects += 1
             logger.warning(
-                "MLLP %s:%d persistent connection discarded after delivery failure: "
-                "unparseable ACK",
+                "MLLP %s:%d persistent connection discarded after delivery failure: %s",
                 self.host,
                 self.port,
+                reason,
             )
             await self._close_bounded(writer)
 
@@ -1592,27 +1608,36 @@ class MLLPDestination(DestinationConnector):
                 )
             raise DeliveryError(f"unparseable ACK: {unparseable}")
         msa1 = ack.field("MSA-1")
+        # BACKLOG #82: correlate the reply to the send. A positive ACK whose MSA-2 does not echo the
+        # sent MSH-10 is NOT a valid accept for THIS message (a stale/mis-framed reply, or a peer that
+        # answered a different send) -- raise a retryable DeliveryError so the pipeline retries per the
+        # at-least-once path (on the persistent lane this also discards the cached connection via
+        # _discard_unparseable, correct since a mis-correlated reply implies socket desync). Control ids
+        # only in the exception text -- never a full payload, never a raised log level. Read
+        # separator-aware via Peek. Note: the `if sent_control_id` guard means an unreadable OWN MSH-10
+        # skips correlation (nothing to correlate), per the design decision.
+        #
+        # BACKLOG #5681: a reject (AR/CR) is correlated too, because it is final -- a stray reject for
+        # ANOTHER message would otherwise permanently dead-letter this one and leave the desynchronized
+        # persistent socket cached. A MATCHING reject stays final, and AE/CE stays a retried
+        # NegativeAckError whatever its MSA-2, both unchanged. A reject with an EMPTY MSA-2 names no
+        # other message, so it stays final too: a receiver that cannot parse a body, the engine's own
+        # MLLP listener included, answers AR with no MSA-2, and retrying that would never clear.
+        if sent_control_id and msa1 in ("AA", "CA", "AR", "CR"):
+            ack_control_id = ack.field("MSA-2")
+            positive = msa1 in ("AA", "CA")
+            if ack_control_id != sent_control_id and (positive or ack_control_id):
+                # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
+                # sized too, and it is interpolated into this raise. Clamped HERE and not at the
+                # read above, because the comparison must see the field the peer actually sent --
+                # bounding first would silently correlate a long control id against its own prefix.
+                raise DeliveryError(
+                    f"{_ACK_MISMATCH}: "
+                    f"MSA-1={msa1} "
+                    f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
+                    f"!= sent MSH-10={sent_control_id!r}"
+                )
         if msa1 in ("AA", "CA"):
-            if sent_control_id:
-                # BACKLOG #82: correlate the reply to the send. A positive ACK whose MSA-2 does not echo
-                # the sent MSH-10 is NOT a valid accept for THIS message (a stale/mis-framed reply, or a
-                # peer that answered a different send) — raise a retryable DeliveryError so the pipeline
-                # retries per the at-least-once path (on the persistent lane this also discards the cached
-                # connection via _discard_unparseable, correct since a mis-correlated reply implies socket
-                # desync). Control ids only in the exception text — never a full payload, never a raised
-                # log level. Read separator-aware via Peek. Note: the `if sent_control_id` guard means an
-                # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
-                ack_control_id = ack.field("MSA-2")
-                if ack_control_id != sent_control_id:
-                    # BACKLOG #1576, same defect as MSA-3 below: MSA-2 is peer-chosen and frame-cap
-                    # sized too, and it is interpolated into this raise. Clamped HERE and not at the
-                    # read above, because the comparison must see the field the peer actually sent --
-                    # bounding first would silently correlate a long control id against its own prefix.
-                    raise DeliveryError(
-                        f"ACK control-id mismatch: "
-                        f"MSA-2={_bounded_ack_field(ack_control_id)!r} "
-                        f"!= sent MSH-10={sent_control_id!r}"
-                    )
             if self.capture_response:
                 # Unbounded on purpose: this branch runs only when msa1 is exactly AA or CA, so the
                 # peer cannot size it here (BACKLOG #1847 bounds the one that can, below).
