@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import io
 import json
@@ -195,8 +196,35 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ),
         # The hook's own final exit 2 still blocks, after a statement that succeeded.
         ("Write-Output 'x' | Out-Null; & '{py}' -c 'import sys; sys.exit(2)'", "block"),
+        # A handled or silenced earlier error does not hide the hook's own final exit 2.
+        (
+            "try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; "
+            "& '{py}' -c 'import sys; sys.exit(2)'",
+            "block",
+        ),
+        (
+            "$null = Get-Command no-such-command-b4 -ErrorAction SilentlyContinue; "
+            "& '{py}' -c 'import sys; sys.exit(2)'",
+            "block",
+        ),
+        # A stale exit 2, then a cmdlet failing under -ErrorAction Ignore, records no error and
+        # must still not block.
+        (
+            "& '{py}' -c 'import sys; sys.exit(2)'; "
+            "Remove-Item -LiteralPath 'no-such-item-b4' -ErrorAction Ignore",
+            "notice",
+        ),
     ],
-    ids=["native-exit-2", "stale-exit-2", "failed-cmdlet", "stale-2-then-cmdlet", "own-final-2"],
+    ids=[
+        "native-exit-2",
+        "stale-exit-2",
+        "failed-cmdlet",
+        "stale-2-then-cmdlet",
+        "own-final-2",
+        "handled-error-then-final-2",
+        "silenced-error-then-final-2",
+        "stale-2-then-ignored-cmdlet",
+    ],
 )
 def test_a_powershell_hook_keeps_exit_2_and_only_exit_2(bridge, tmp_path, command, outcome):
     hook = {"type": "command", "shell": "powershell", "command": command.format(py=sys.executable)}
@@ -213,8 +241,11 @@ def test_project_dir_is_substituted_in_every_form(bridge, tmp_path):
     structured = {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/guard", "args": ["a"]}
     assert bridge.hook_argv(tmp_path, structured) == [f"{tmp_path}/guard", "a"]
     shell = {"type": "command", "shell": "powershell", "command": "'${CLAUDE_PROJECT_DIR}_x'"}
-    # Braced, so a following name character cannot join the variable name.
-    assert "'${env:CLAUDE_PROJECT_DIR}_x'" in bridge.hook_argv(tmp_path, shell)[-1]
+    # Braced, so a following name character cannot join the variable name. The hook text
+    # travels base64-encoded inside the wrapper.
+    encoded = re.search(r"FromBase64String\('([^']+)'\)", bridge.hook_argv(tmp_path, shell)[-1])
+    assert encoded
+    assert base64.b64decode(encoded[1]).decode() == "'${env:CLAUDE_PROJECT_DIR}_x'"
 
 
 def test_each_event_matches_its_own_discriminator_field(bridge, tmp_path):
@@ -903,3 +934,37 @@ def test_a_defective_group_whose_hook_sets_on_failure_block_blocks(bridge, tmp_p
     # PreToolUse, because Stop ignores a matcher and would never read the bad one.
     write_settings(tmp_path, {"PreToolUse": [group]})
     assert run(bridge, tmp_path, BASH_CALL, "PreToolUse") == 2
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="requires PowerShell")
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["hook", "--event", "Stop"], 2),
+        (["--session-id", "S", "hook", "--event", "Stop"], 2),
+        (["--session-id=S", "hook", "--event", "Stop"], 2),
+        (["--sess", "S", "hook", "--event", "Stop"], 2),
+        # The twin: a run whose target merely takes the word hook is not hook mode.
+        (["run", "scripts/codex/bridge.py", "hook"], 10),
+    ],
+    ids=["first", "after-session-id", "session-id-equals", "abbreviated-option", "run-mode"],
+)
+def test_the_launcher_finds_hook_mode_after_options(tmp_path, args, expected):
+    """A block reaches Codex as 2 wherever hook is the subcommand, never as the raw 10."""
+    root = tmp_path / "repo"
+    scripts = root / "scripts/codex"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/codex/invoke.ps1", scripts / "invoke.ps1")
+    (scripts / "bridge.py").write_text(_STUB_BRIDGE)
+    _link_python(root)
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(scripts / "invoke.ps1"), *args],
+        cwd=scripts,
+        env={**os.environ, "STUB_BRIDGE_EXIT": "10"},
+        input="{}",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == expected, (completed.stdout, completed.stderr)

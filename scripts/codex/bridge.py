@@ -200,15 +200,25 @@ def git_bash() -> str | None:
 
 
 # -Command reports a native program's exit 2 as 1, which would turn a block into a non-blocking
-# error. The head and tail keep -Command's own result, 0 or 1, except that a failed last statement
-# exits 2 when it left exit code 2 behind and no cmdlet error was recorded. A failed cmdlet records
-# one, so an earlier native exit 2 followed by a failed cmdlet stays a non-blocking 1. A cmdlet
-# error anywhere before a final native exit 2 also makes it 1. The head keeps a native exit from
-# recording an error where a PowerShell build defaults that preference on.
-POWERSHELL_EXIT_HEAD = "$PSNativeCommandUseErrorActionPreference = $false; $Error.Clear()\n"
-POWERSHELL_EXIT_TAIL = (
-    "\nif (-not $?) { if ($LASTEXITCODE -eq 2 -and $Error.Count -eq 0) { exit 2 }; exit 1 }"
-)
+# error. This wrapper passes on the hook's own final exit 2: it runs every statement but the last,
+# resets $LASTEXITCODE, then runs the last one. A failed last statement that set exit code 2 exits
+# 2; any other failed last statement, a failed cmdlet or a native non-zero, exits 1. So a stale 2
+# from an earlier native command never blocks, and no recorded error hides a real final 2. The
+# hook text travels base64-encoded, so no quoting in it can reach the wrapper.
+POWERSHELL_WRAPPER = """$PSNativeCommandUseErrorActionPreference = $false
+$__mfText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))
+$__mfParseErrors = $null
+$__mfAst = [System.Management.Automation.Language.Parser]::ParseInput($__mfText, [ref]$null, [ref]$__mfParseErrors)
+$__mfStatements = @(if ($__mfAst.EndBlock) {{ $__mfAst.EndBlock.Statements }})
+if ($__mfParseErrors.Count -or $__mfAst.BeginBlock -or $__mfAst.ProcessBlock -or $__mfStatements.Count -eq 0) {{
+    . ([scriptblock]::Create($__mfText))
+}} else {{
+    $__mfSplit = $__mfStatements[-1].Extent.StartOffset
+    . ([scriptblock]::Create($__mfText.Substring(0, $__mfSplit)))
+    $global:LASTEXITCODE = 0
+    . ([scriptblock]::Create($__mfText.Substring($__mfSplit) + "`n" + 'if (-not $?) {{ if ($LASTEXITCODE -eq 2) {{ exit 2 }}; exit 1 }}'))
+}}
+"""
 
 
 def hook_argv(root: Path, hook: dict) -> list[str]:
@@ -231,7 +241,7 @@ def hook_argv(root: Path, hook: dict) -> list[str]:
         shell = "powershell"
     if shell == "powershell":
         command = command.replace("${CLAUDE_PROJECT_DIR}", "${env:CLAUDE_PROJECT_DIR}")
-        script = POWERSHELL_EXIT_HEAD + command + POWERSHELL_EXIT_TAIL
+        script = POWERSHELL_WRAPPER.format(b64=base64.b64encode(command.encode()).decode())
         return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script]
     raise ValueError(f"Unsupported Claude hook shell: {shell}")
 

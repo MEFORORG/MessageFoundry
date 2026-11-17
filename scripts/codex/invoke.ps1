@@ -15,7 +15,16 @@ function Resolve-BridgePython {
     $python
 }
 
-if ($args.Count -gt 0 -and $args[0] -eq 'hook') {
+# The subcommand is the first argument that is not an option, as bridge.py's argparse reads it, so
+# `--session-id S hook` is hook mode too and never returns the bridge's raw block code.
+$mode = $null
+for ($i = 0; $i -lt $args.Count; $i++) {
+    $word = [string]$args[$i]
+    if ($word -notlike '-*') { $mode = $word; break }
+    # argparse takes any unambiguous prefix of --session-id, and it consumes the next argument.
+    if ($word -notlike '*=*' -and $word.Length -ge 3 -and '--session-id'.StartsWith($word)) { $i++ }
+}
+if ($mode -eq 'hook') {
     # The bridge decides with exit 0, or with 10 (BLOCK_EXIT in bridge.py) for a block, which
     # becomes 2 here. Anything else, a missing .venv, a crash, or the 2 that Python and argparse
     # exit with, is no decision: reported, and a non-blocking 1 on every event.

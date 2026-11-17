@@ -55,12 +55,13 @@ bridge exits 0 to proceed or 10 to block, and `invoke.ps1` turns 10 into 2. Any
 other outcome is no decision: another bridge exit, including the 2 that Python
 and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. No
 decision is reported and maps to a non-blocking exit 1 on every event, never to
-0 or 2. `invoke.ps1` ends its process with its code, and the command line passes
-it on, because `pwsh -Command` would report an exit 2 as 1. This is tested with
-PowerShell, `cmd` and `sh` as the outer shell. Codex's documentation does not
-say which shell runs a hook command. When `pwsh` itself cannot start, the line
-would exit 0 under Windows PowerShell 5.1, 9009 under `cmd` and 127 under `sh`;
-this is reasoned, not measured.
+2, and never to 0 once `pwsh` has started. `invoke.ps1` ends its process with
+its code, and the command line passes it on, because `pwsh -Command` would
+report an exit 2 as 1. This is tested with PowerShell, `cmd` and `sh` as the
+outer shell. Codex's documentation does not say which shell runs a hook command.
+When `pwsh` itself cannot start, nothing reports it: the line would exit 0 under
+Windows PowerShell 5.1, which proceeds as if every hook passed, 9009 under `cmd`
+and 127 under `sh`; this is reasoned, not measured.
 
 At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
 reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
@@ -69,8 +70,8 @@ unaffected. **A future guard that must block when it fails sets
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
-the remaining hooks, and the bridge exits 2 on every event, including events
-where Claude Code only shows the hook's stderr. Hook chains have a 90-second outer
+the remaining hooks, and the bridge exits 10 on every event, which `invoke.ps1`
+turns into 2, including events where Claude Code only shows the hook's stderr. Hook chains have a 90-second outer
 limit, so the timeouts of a long chain add up against it.
 
 Command-only hooks use the shell they name. With none, they use bash, as Claude
