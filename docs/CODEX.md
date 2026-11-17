@@ -56,7 +56,8 @@ other outcome is no decision: another bridge exit, including the 2 that Python
 and argparse exit with, a missing `.venv`, or a checkout `git` cannot find. On a
 call that names `hook` as its subcommand, as every registered command does, no
 decision is reported and maps to a non-blocking exit 1 on every event, never to
-2, and never to 0 once `pwsh` has started. `invoke.ps1` ends its process with
+2, and never to 0 once `pwsh` has started, except that a help flag prints usage
+and exits 0. `invoke.ps1` ends its process with
 its code, and the command line passes it on, because `pwsh -Command` would
 report an exit 2 as 1. This is tested with PowerShell, `cmd` and `sh` as the
 outer shell. Codex's documentation does not say which shell runs a hook command.
@@ -67,21 +68,26 @@ and 127 under `sh`; this is reasoned, not measured.
 At origin/main before this change, no exit-2 block reached Codex: `pwsh -Command`
 reported the bridge's exit 2 as 1. A hook's JSON `permissionDecision` deny was
 unaffected. **A future guard that must block when it fails sets
-`"onFailure": "block"`.**
+`"onFailure": "block"`.** That holds only once the bridge runs and reads the
+settings: a launcher with no decision, or a bridge fault, never blocks.
 
 The bridge differs from Claude Code in at least three ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
 the remaining hooks, and the bridge exits 10 on every event, which `invoke.ps1`
-turns into 2, including events where Claude Code only shows the hook's stderr. Hook chains have a 90-second outer
-limit, so the timeouts of a long chain add up against it.
+turns into 2, including events where Claude Code only shows the hook's stderr.
+Hook chains have a 90-second outer limit, so the timeouts of a long chain add up
+against it.
 
 Command-only hooks use the shell they name. With none, they use bash, as Claude
 Code does: Git Bash on Windows, else PowerShell there when Git Bash is missing.
 Structured `command` and `args` avoid shell parsing. A command-only PowerShell
-hook blocks by `exit 2`, as under Claude Code, whose documented PowerShell hook
-blocks that way. The bridge runs it under `pwsh -Command` and takes the exit code
-unchanged; `-Command` reports a final native program's exit 2 as 1, so a hook
-that means to pass one on ends with `exit $LASTEXITCODE`.
+hook blocks by `exit 2`, as under Claude Code, whose hooks reference blocks a
+PowerShell hook with an explicit `exit 2`. The bridge runs it under
+`pwsh -Command` and takes the exit code unchanged, so a final native program's
+exit 2 does not block unless the hook ends with `exit $LASTEXITCODE`. The bridge
+puts one line before the hook, turning `$PSNativeCommandUseErrorActionPreference`
+off, so a hook that must open with `param()`, a `using` statement or a named
+block fails to parse and cannot block.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

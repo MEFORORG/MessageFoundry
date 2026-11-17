@@ -199,11 +199,13 @@ def git_bash() -> str | None:
     return None
 
 
-# A command-only PowerShell hook runs as Claude Code runs it, under pwsh -Command, and its exit code
-# is taken unchanged: it blocks by `exit 2`. -Command reports a final native program's exit 2 as 1,
-# as it would under Claude Code. The one line put before the hook keeps a native non-zero exit from
-# throwing where a PowerShell build defaults that preference on; a hook that must open with param()
-# or a named block cannot take it, and fails to parse.
+# A command-only PowerShell hook runs under pwsh -Command and its exit code is taken unchanged: it
+# blocks by `exit 2`, the way Claude Code's hooks reference blocks a PowerShell hook. That reference
+# does not say which flags Claude Code passes, or how a native exit code propagates; under -Command
+# a final native program's exit 2 is reported as 1. The one line put before the hook keeps a
+# native non-zero exit from throwing where a PowerShell build defaults that preference on. A hook
+# that must open with at least param(), a using statement or a named block cannot take that line,
+# fails to parse, and so cannot block.
 POWERSHELL_HEAD = "$PSNativeCommandUseErrorActionPreference = $false\n"
 
 
