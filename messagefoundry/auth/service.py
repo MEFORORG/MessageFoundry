@@ -12242,12 +12242,16 @@ class AuthService:
             # The store names no hash it revoked, so the account's sessions are read again, under
             # the re-proof lock every rotation holds (BACKLOG #5336). After the row, and a refused
             # read is logged, never raised: the revoke and its row have committed, and a raise
-            # here would lose the token the sign-in minted. The counts it leaves stay until a later
+            # here would lose the token the sign-in minted. The set is the read's, wider than
+            # _session_write_errors by at least the ValueError aiosqlite raises for a closed
+            # connection; a defect still raises. The counts it leaves stay until a later
             # drop, at the latest the age prune.
             try:
                 async with self._account_reproof_lock(user_id):
                     await self._drop_unlisted_reproof_counts(user_id)
-            except _session_write_errors() as exc:
+            except (*store_call_errors(), *store_connect_errors()) as exc:
+                if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise
                 _log.warning(
                     "the session cap ended sessions of account id %r, but reading its sessions "
                     "to drop their re-proof counts was refused (%s); the counts stay for now",

@@ -630,12 +630,15 @@ async def test_an_admin_revoke_drops_the_accounts_counts_and_keeps_others(
         await store.close()
 
 
+@pytest.mark.parametrize("refusal", ["operational", "closed"])
 async def test_a_refused_read_after_the_session_cap_loses_neither_its_row_nor_the_token(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     """BACKLOG #5336: the session cap's revoke names no hash, so the counts it ended are found by
     reading the account's sessions again. That read comes after the cap's ``auth.session_revoked``
-    row, and a refusal of it is logged: the sign-in still returns its token, and the row stands."""
+    row, and a refusal of it is logged: the sign-in still returns its token, and the row stands.
+    ``closed`` is the bare ``ValueError`` aiosqlite raises for a closed connection, which the
+    session-write set does not take."""
     import json
     import sqlite3
 
@@ -650,6 +653,8 @@ async def test_a_refused_read_after_the_session_cap_loses_neither_its_row_nor_th
         assert service._session_reproof_failures(hash_token(first)) == 1
 
         async def refused(*_args: object, **_kwargs: object) -> object:
+            if refusal == "closed":
+                raise ValueError("no active connection")
             raise sqlite3.OperationalError("synthetic: the read was refused")
 
         monkeypatch.setattr(store, "list_sessions", refused)
