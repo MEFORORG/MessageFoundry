@@ -192,8 +192,57 @@ _SOAP11 = "http://schemas.xmlsoap.org/soap/envelope/"
             f"<s12:Body>{_OK_CHILD}</s12:Body></soap:Envelope>",
             "missing or empty SOAP Body",
         ),
+        # ...nor is one beside the real Body.
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}" '
+            'xmlns:s12="http://www.w3.org/2003/05/soap-envelope">'
+            f"<soap:Body>{_OK_CHILD}</soap:Body><s12:Body><Smuggled>A123</Smuggled></s12:Body>"
+            "</soap:Envelope>",
+            "other than an optional Header followed by one Body",
+        ),
+        # Envelope-level content beyond Header then Body.
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}"><soap:Body>{_OK_CHILD}</soap:Body>'
+            "<Smuggled>A123</Smuggled></soap:Envelope>",
+            "other than an optional Header followed by one Body",
+        ),
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}"><soap:Body>{_OK_CHILD}</soap:Body>'
+            "<soap:Header/></soap:Envelope>",
+            "other than an optional Header followed by one Body",
+        ),
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}"><soap:Header/><soap:Header/>'
+            f"<soap:Body>{_OK_CHILD}</soap:Body></soap:Envelope>",
+            "other than an optional Header followed by one Body",
+        ),
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}">A123<soap:Body>{_OK_CHILD}</soap:Body>'
+            "</soap:Envelope>",
+            "/Envelope: character data",
+        ),
+        # Character data in the Body beside the element, plain or CDATA, before or after it.
+        (_envelope("A123" + _OK_CHILD), "/Envelope/Body: character data"),
+        (_envelope(_OK_CHILD + "A123"), "/Envelope/Body: character data"),
+        (_envelope(_OK_CHILD + "<![CDATA[A123]]>"), "/Envelope/Body: character data"),
+        (_envelope("<!-- c -->A123" + _OK_CHILD), "/Envelope/Body: character data"),
     ],
-    ids=["sibling", "duplicate-element", "non-envelope-root", "two-bodies", "mixed-namespace"],
+    ids=[
+        "sibling",
+        "duplicate-element",
+        "non-envelope-root",
+        "two-bodies",
+        "mixed-namespace",
+        "foreign-body-beside",
+        "element-after-body",
+        "header-after-body",
+        "two-headers",
+        "envelope-text",
+        "body-text-before",
+        "body-text-after",
+        "body-cdata-after",
+        "body-text-after-comment",
+    ],
 )
 def test_validate_refuses_an_envelope_with_unvalidated_content(
     envelope: str, expected: str
@@ -216,6 +265,16 @@ def test_validate_ignores_comments_beside_the_body_element() -> None:
     assert d.validate_request(
         _envelope(f"<!-- note -->{_OK_CHILD}<?pi x?>"), "CheckEligibility"
     ).valid
+
+
+def test_validate_accepts_a_header_and_whitespace() -> None:
+    d = parse_wsdl(WSDL)
+    envelope = (
+        f'<soap:Envelope xmlns:soap="{_SOAP11}">\n  <soap:Header><h>1</h></soap:Header>\n'
+        f"  <soap:Body>\n    {_OK_CHILD}\n  </soap:Body>\n</soap:Envelope>"
+    )
+    r = d.validate_request(envelope, "CheckEligibility")
+    assert r.valid is True, r.reasons
 
 
 # --- security: hardened parse + no-network import lockdown -------------------

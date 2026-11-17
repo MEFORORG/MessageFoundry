@@ -111,8 +111,9 @@ class WsdlDefinition:
         """Validate a request ``envelope``'s SOAP body against ``operation``'s input element (ADR 0122).
 
         Returns an :class:`~messagefoundry.parsing.xml.schema.XmlSchemaResult` (``valid`` + PHI-safe
-        ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` with
-        exactly one ``Body`` holding exactly one element child (BACKLOG #5373). Raises
+        ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` holding
+        an optional ``Header`` and then one ``Body``, and that ``Body`` holds exactly one element
+        child, with no character data beside any of them (BACKLOG #5373). Raises
         :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
         or an operation with no resolvable document/literal input element (rpc/encoded not supported for
         validation)."""
@@ -136,9 +137,9 @@ class WsdlDefinition:
                 f"WSDL operation {operation!r} has no document/literal {direction} element to validate "
                 "against (rpc/encoded style is not supported for validation)"
             )
-        body_child = _soap_body_child(envelope)
-        if isinstance(body_child, str):
-            return XmlSchemaResult(valid=False, reasons=(body_child,))
+        body_child, refusal = _soap_body_child(envelope)
+        if refusal is not None:
+            return XmlSchemaResult(valid=False, reasons=(refusal,))
         actual = _clark(body_child)
         if actual != expected:
             # PHI-safe: names the QNames, never the element content.
@@ -154,7 +155,8 @@ class WsdlDefinition:
                 "(a split/imported contract must be inlined locally — no-network, ADR 0122)"
             )
         etree = load_lxml()
-        child_bytes = bytes(etree.tostring(body_child, encoding="utf-8"))
+        # with_tail=False: the element alone, never the whitespace that follows it in the Body.
+        child_bytes = bytes(etree.tostring(body_child, encoding="utf-8", with_tail=False))
         return validate_against(child_bytes, schema)
 
 
@@ -365,31 +367,50 @@ def _operations(root: Any, messages: Mapping[str, list[WsdlPart]]) -> dict[str, 
     return operations
 
 
-def _soap_body_child(envelope: str | bytes) -> Any | str:
-    """The single element child of the ``<Body>`` of a SOAP (1.1 or 1.2) ``envelope``, or a PHI-safe
-    reason string when there is not exactly one to validate. Parsed through the hardened parser
-    (untrusted instance body).
+def _holds_character_data(elem: Any) -> bool:
+    """Whether ``elem`` holds non-whitespace text directly: before its first child, or after any
+    child, comments and processing instructions included (CDATA is text here)."""
+    return any(
+        text is not None and text.strip() for text in (elem.text, *(child.tail for child in elem))
+    )
 
-    The root must be a SOAP ``Envelope`` holding exactly one ``Body`` in its own namespace, and that
-    ``Body`` exactly one element child: the operation names one body element, so a sibling beside
-    it would otherwise reach the caller unvalidated under a valid result (BACKLOG #5373). Reasons
-    name only QNames and counts, never content."""
+
+def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, str]:
+    """``(element, None)`` for the single element child of the ``<Body>`` of a SOAP (1.1 or 1.2)
+    ``envelope``, or ``(None, reason)`` with a PHI-safe reason when the envelope holds anything
+    beyond that one element to validate. Parsed through the hardened parser (untrusted instance
+    body).
+
+    The root must be a SOAP ``Envelope`` whose element children are an optional ``Header`` and then
+    one ``Body``, both in its own namespace, and that ``Body`` must hold exactly one element child.
+    Neither may hold character data beside those elements; comments and processing instructions are
+    skipped. The operation names one body element, so anything else would reach the caller
+    unvalidated under a valid result (BACKLOG #5373). That is stricter than SOAP 1.1, which allows
+    elements after the ``Body``. Reasons name only QNames and counts, never content."""
     root = parse_bytes(envelope)
     env_ns = next(
         (ns for ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS) if _clark(root) == f"{{{ns}}}Envelope"),
         None,
     )
     if env_ns is None:
-        return f"/: root {_clark(root)} is not a SOAP 1.1 or 1.2 Envelope"
-    bodies = root.findall(f"{{{env_ns}}}Body")
-    if not bodies:
-        return "/: missing or empty SOAP Body"
-    if len(bodies) > 1:
-        return f"/Envelope: {len(bodies)} SOAP Body elements; expected exactly one"
+        return None, f"/: root {_clark(root)} is not a SOAP 1.1 or 1.2 Envelope"
+    header, body = f"{{{env_ns}}}Header", f"{{{env_ns}}}Body"
+    names = [_clark(child) for child in root if isinstance(child.tag, str)]
+    if body not in names:
+        return None, "/: missing or empty SOAP Body"
+    if names.count(body) > 1:
+        return None, f"/Envelope: {names.count(body)} SOAP Body elements; expected exactly one"
+    if names not in ([body], [header, body]):
+        return None, "/Envelope: elements other than an optional Header followed by one Body"
+    if _holds_character_data(root):
+        return None, "/Envelope: character data beside the Header and Body"
+    body_elem = root.find(body)
     # skip comments / processing instructions — only element children
-    children = [child for child in bodies[0] if isinstance(child.tag, str)]
+    children = [child for child in body_elem if isinstance(child.tag, str)]
     if not children:
-        return "/: missing or empty SOAP Body"
+        return None, "/: missing or empty SOAP Body"
     if len(children) > 1:
-        return f"/Envelope/Body: {len(children)} element children; expected exactly one"
-    return children[0]
+        return None, f"/Envelope/Body: {len(children)} element children; expected exactly one"
+    if _holds_character_data(body_elem):
+        return None, "/Envelope/Body: character data beside the body element"
+    return children[0], None
