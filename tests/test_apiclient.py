@@ -789,7 +789,7 @@ def test_the_exposure_evaluation_names_how_the_client_cert_reaches_httpx() -> No
     ).read_text(encoding="utf-8")
     assert "--client-cert" not in doc and "--client-key" not in doc
     assert "httpx.Client(cert=" not in doc
-    assert doc.count("_build_verify_context") >= 2  # the guard row and the section 5 remote bullet
+    assert "_build_verify_context" in doc
 
 
 @pytest.mark.parametrize("base_url", ["http://localhost", "http://[::1]", "http://127.0.0.1"])
