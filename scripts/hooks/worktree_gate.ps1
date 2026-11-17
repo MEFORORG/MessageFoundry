@@ -838,6 +838,11 @@ function Get-ScanRawIndexMap($Seg) {
 # and a `bash -c` payload joined with `'\''` or `'"'"'` is one more segment, so its re-quoted `-C`
 # reaches the first reading too, which roots that quote-tainted token at a governed cwd.
 #
+# THE JOINED READING COVERS A `-C` OR PATH VALUE IN THE INVOCATION'S OWN WINDOW, AND NOT, AT LEAST:
+# a joined verb or disarm key, a joined chdir target, a carried `$'...'` GIT_DIR, other `bash -c` and
+# PowerShell payload joins, a joined `-C` after an earlier chdir it cannot follow, and a `-c` disarm
+# after an earlier `config` word. Reviews measured these as allowed; BACKLOG #5655 holds the list.
+#
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
 # window runs from the last separator before THAT git word, not from the last $gitInvocation token: a
@@ -872,7 +877,7 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     $win = $Scan.Substring($start, $At - $start)
     $chdirAt = Get-ChdirAtCommandPattern
     $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
-    $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
+    $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win; Start = $start }
     if ($priorChdirs.Count -eq 0) { return $plain }
     # A `-C` FOLD THAT ENDS ABSOLUTE DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3),
     # so where the directory is unknown the plain reading is still returned for it. Without this, an
@@ -893,7 +898,7 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
         if ($absC) { return $plain }
         return
     }
-    [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
+    [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win; Start = $start }
 }
 
 # THE SAME READING WITH JOINED QUOTE PIECES READ AS THE SHELL READS THEM (BACKLOG #5655 step 7), or
@@ -906,24 +911,43 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 # POSIX only; the window cannot tell a `$'<word>'` from a variable there, so a variable's name is read
 # as a relative path too, which can only add a deny.
 #
-# The scan also blanks a quoted span with whitespace in it to an empty pair, which this cannot tell from
-# a real one, so the pair joins are made only where the RAW line itself holds an empty pair glued to a
-# word (review round e9fa08d529). Only POSIX and PowerShell segments are read: in cmd a quote is a
-# literal.
-function Get-JoinedReading($Reading, [string]$Conv, [string]$Raw) {
+# The scan also blanks a quoted span with whitespace in it to an empty pair, so a pair is joined only
+# where the RAW text behind it is a real empty pair: its two quotes are adjacent in the raw line, read
+# through Get-ScanRawIndexMap at the window's own position (review rounds e9fa08d529, 4d1a3ae7fd; a
+# glued pair elsewhere on the line used to arm the join). No map, no join. Only POSIX and PowerShell
+# segments are read: in cmd a quote is a literal.
+function Get-JoinedReading($Reading, [string]$Conv, $Seg) {
     if ($Conv -ne 'posix' -and $Conv -ne 'pwsh') { return }
     $w = [string]$Reading.Window
     $w2 = $w
-    $glued = "[^\s;&|(){}<>'`"](?:''|`"`")|(?:''|`"`")[^\s;&|(){}<>'`"]"
-    if ($Raw -match $glued) {
-        $w2 = $w2 -replace "(?<=[^\s;&|(){}<>'`"])(?:''|`"`")+", ''
-        if ($Conv -eq 'posix') { $w2 = $w2 -replace "(?<=\s)(?:''|`"`")+(?=[^\s;&|(){}<>'`"])", '' }
+    $map = $(if ($w -match "''|`"`"" -and $null -ne $Reading.Start) { Get-ScanRawIndexMap $Seg })
+    if ($null -ne $map) {
+        $edge = "[\s;&|(){}<>'`"]"
+        $sb = [System.Text.StringBuilder]::new()
+        $k = 0
+        while ($k -lt $w.Length) {
+            $two = $(if ($k + 1 -lt $w.Length) { $w.Substring($k, 2) } else { '' })
+            if ($two -eq "''" -or $two -eq '""') {
+                $at = [int]$Reading.Start + $k
+                $real = $map[$at + 1] -eq $map[$at] + 1
+                $n = $k + 2
+                while ($n + 1 -lt $w.Length -and ($w.Substring($n, 2) -eq "''" -or $w.Substring($n, 2) -eq '""')) { $n += 2 }
+                $nextCh = $(if ($n -lt $w.Length) { [string]$w[$n] } else { ' ' })
+                $prevCh = $(if ($sb.Length -gt 0) { [string]$sb[$sb.Length - 1] } else { ' ' })
+                $trailing = $prevCh -notmatch $edge
+                $leading = $Conv -eq 'posix' -and $prevCh -match '\s' -and $nextCh -notmatch $edge
+                if ($real -and ($trailing -or $leading)) { $k += 2; continue }
+            }
+            [void]$sb.Append($w[$k])
+            $k++
+        }
+        $w2 = $sb.ToString()
     }
     if ($Conv -eq 'posix') {
         $w2 = $w2 -replace '(?<=(?:^|\s)-C\s+|--(?:work-tree|git-dir)(?:=|\s+)|GIT_(?:WORK_TREE|DIR)=)\$(?=[^\s$({''"])', ''
     }
     if ($w2 -ceq $w) { return }
-    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2 }
+    [pscustomobject]@{ ScanPrefix = $Reading.ScanPrefix; Window = $w2; Start = $Reading.Start }
 }
 
 # The index of the LAST `git` or `git.exe` word before $At, in any case on Windows, or -1. No
@@ -4228,7 +4252,7 @@ What to do instead:
                     $seen["$to/$gw"] = $true
                     foreach ($r in @(Get-InvocationReading $seg.Scan $to -GitAt $gw -Prior $seg.Prior)) {
                         $readings.Add($r)
-                        foreach ($j in @(Get-JoinedReading $r $seg.Conv $seg.Raw)) { $readings.Add($j) }
+                        foreach ($j in @(Get-JoinedReading $r $seg.Conv $seg)) { $readings.Add($j) }
                     }
                 }
             }
@@ -5121,7 +5145,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $ownGit = Get-GitWordBefore $seg.Scan $vIdx
                 if ($ownGit -gt $vm.Index) { $gitAts += $ownGit }
                 $readings = @(foreach ($gitAt in $gitAts) { Get-InvocationReading $seg.Scan $vIdx -GitAt $gitAt -Prior $seg.Prior })
-                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv $seg.Raw })
+                $readings = @($readings) + @(foreach ($r in $readings) { Get-JoinedReading $r $seg.Conv $seg })
                 foreach ($reading in $readings) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{

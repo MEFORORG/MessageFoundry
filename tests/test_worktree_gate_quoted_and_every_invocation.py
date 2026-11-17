@@ -476,6 +476,8 @@ def test_closing_step_controls_stay_allowed(rig: SimpleNamespace, template: str,
         # A joined `bash -c` payload's re-quoted `-C` reaches the first reading, which roots the
         # quote-tainted token at the governed cwd.
         (r"bash -c 'git -C '\''{o}'\'' reset --hard'", "primary", "Bash"),
+        # bash runs this as the bare read `git config core.hooksPath`; the gate reads a disarm.
+        ("git config core.hooksPath''", "primary", "Bash"),
     ],
 )
 def test_known_false_denies_of_the_added_readings_still_deny(
@@ -508,7 +510,6 @@ def test_review_round_controls_stay_allowed(
         ("(cd {tmp} && ls)\ngit -C Primary -C '{p}' reset --hard", "outside", "SHARED PRIMARY"),
         # Origin/main's reading of an empty pair glued to a chdir verb is kept: the scan is unchanged.
         ("git commit -C HEAD && cd'' . && git config {k}", "primary", "SHARED git configur"),
-        ("git config core.hooksPath''", "primary", "SHARED git configur"),
     ],
 )
 def test_review_round_shapes_are_denied(
@@ -544,3 +545,17 @@ def test_a_blanked_spacey_suffix_is_not_joined(rig: SimpleNamespace) -> None:
     copy = rig.tmp / "Primary copy"
     subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
     assert _allowed(rig, _fmt(rig, "git -C {p}' copy' reset --hard"), rig.outside)
+
+
+def test_a_glued_pair_elsewhere_on_the_line_does_not_arm_the_join(rig: SimpleNamespace) -> None:
+    # Review round 4d1a3ae7fd: the echo's `a''` armed the join for the blanked `' copy'`, which then
+    # named the primary. `<p> copy` is an ungoverned repository; origin/main allows this.
+    copy = rig.tmp / "Primary copy"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(copy)], check=True, capture_output=True)
+    assert _allowed(rig, _fmt(rig, "echo a'' ; git -C {p}' copy' reset --hard"), rig.outside)
+
+
+def test_a_real_glued_pair_on_the_invocation_still_joins(rig: SimpleNamespace) -> None:
+    # The control for the row above: the same line with the glued pair on the -C value denies.
+    reason = _reason(rig, _fmt(rig, "echo a'' ; git -C {p}'' reset --hard"), rig.outside)
+    assert "SHARED PRIMARY" in reason, reason
