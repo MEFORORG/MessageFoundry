@@ -859,7 +859,10 @@ async def test_a_reanchor_resets_without_reading_the_clock(
             token = reauthed.token
             # Seen after this re-anchor, so only the next re-anchor can make it new again. After
             # the second, stepped-back one it must be new: that reset is the property under test.
+            # The flag answers True for a repeat too, so the written row is what discriminates.
+            rows_before = len(await _new_ip_rows(store))
             assert await service.flag_new_client_ip(token, "10.3.3.3", path="/users") is True
+            assert (await _new_ip_rows(store))[rows_before:] == ["10.3.3.3"], client
         monkeypatch.setattr(time, "time", real_time)
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3", "10.3.3.3", "10.2.2.2"]
