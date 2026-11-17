@@ -138,6 +138,18 @@ _FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-en
 # handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
 _HTTP_PENDING_APPROVAL = 202
 
+#: The engine's default request deadline, ``api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS``,
+#: duplicated rather than imported (ADR 0088). ``tests/test_apiclient_sign_in_timeout.py`` pins it
+#: to the engine's value.
+_ENGINE_REQUEST_DEADLINE_SECONDS = 120.0
+
+#: A read that OUTLASTS the engine's request deadline, never equals it. At that deadline the engine
+#: sends its own 503, which still has a network hop to cross, so a client that gives up first
+#: reports an unreachable engine for work that may still be running; the 30 s margin is that hop's
+#: allowance. One value for every call that can wait out the deadline, ``cluster_stepdown`` and
+#: :data:`SIGN_IN_TIMEOUT_SECONDS`, so the two cannot drift apart (vault BACKLOG #2950).
+_PAST_ENGINE_DEADLINE_SECONDS = _ENGINE_REQUEST_DEADLINE_SECONDS + 30.0
+
 #: How long the reply to a request that can wait in the engine's per-account queue may take, in
 #: seconds (vault BACKLOG #2950): the sign-in, and the elevations that rotate the token, which
 #: queue on that account too: ``reauth``, ``verify_mfa`` and ``confirm_mfa`` (each rotation runs
@@ -146,7 +158,7 @@ _HTTP_PENDING_APPROVAL = 202
 #: the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The lock itself takes no
 #: timeout (``keyed_lock.hold_keyed_lock``), but the engine's default request deadline,
 #: ``api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS``, cancels a handler still waiting on it
-#: and answers 503. This value is LONGER than that deadline, by the 30 s margin
+#: and answers 503. This value is :data:`_PAST_ENGINE_DEADLINE_SECONDS`, the read
 #: ``cluster_stepdown`` also takes, so a reply or 503 the engine sends at its default deadline
 #: arrives inside this read. It narrows the lost outcome; it does not close it. At least these
 #: still leave the client unsure whether the engine finished: a 503 from a deadline that cancelled
@@ -155,7 +167,7 @@ _HTTP_PENDING_APPROVAL = 202
 #: disabled; and a reply the transport drops. The order is pinned by
 #: ``tests/test_apiclient_sign_in_timeout.py``. It is a floor on the read phase only
 #: (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
-SIGN_IN_TIMEOUT_SECONDS = 150.0
+SIGN_IN_TIMEOUT_SECONDS = _PAST_ENGINE_DEADLINE_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -1139,9 +1151,11 @@ class EngineClient:
         """This client's timeout with only the READ phase raised to at least
         :data:`SIGN_IN_TIMEOUT_SECONDS` (vault BACKLOG #2950). The engine's per-account queue is
         waited out after the request is sent, so connect, write and pool keep the client's own
-        bound: a caller on a GUI thread still learns of an unreachable engine as fast as before. A
-        client built with a longer timeout keeps it for the read too, since a shorter read would
-        make the lost reply more likely for exactly the caller that asked to wait (vault BACKLOG #3751
+        bound. That bound covers only an engine that cannot be reached: a refused or unrouted
+        connect is reported as fast as before. An engine that accepts the connection and then goes
+        silent holds the caller for the whole read, a caller on a GUI thread included. A client
+        built with a longer timeout keeps it for the read as well, since a shorter read would make
+        the lost reply more likely for exactly the caller that asked to wait (vault BACKLOG #3751
         item 4)."""
         return httpx.Timeout(self._timeout, read=max(self._timeout, SIGN_IN_TIMEOUT_SECONDS))
 
@@ -1633,18 +1647,15 @@ class EngineClient:
 
         The call can block far past this client's 5s default, because the engine may hold it for its
         fence timeout while it waits for the leadership lock."""
-        # The client must OUTLIVE the engine's request deadline, never equal it. At that deadline
-        # the engine sends its own 503, which still has a network hop to cross, so a client that
-        # gives up first reports an unreachable engine for a stepdown that may still be working.
-        # The deadline is ``DEFAULT_REQUEST_TIMEOUT_SECONDS``, duplicated rather than imported
-        # (ADR 0088); ``test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result`` pins
-        # the ordering.
+        # The client must OUTLIVE the engine's request deadline; _PAST_ENGINE_DEADLINE_SECONDS says
+        # why. ``test_cluster_stepdown_posts_force_in_the_body_and_decodes_the_result`` pins the
+        # margin.
         return _decode(
             self._request(
                 "POST",
                 "/cluster/stepdown",
                 json={"force": force},
-                timeout=httpx.Timeout(150.0),
+                timeout=httpx.Timeout(_PAST_ENGINE_DEADLINE_SECONDS),
             ),
             ClusterStepdownResult,
         )
@@ -1766,8 +1777,9 @@ class EngineClient:
           waiting in the engine's per-account queue can outlast the client, while the engine goes
           on to finish it. This request therefore waits at least :data:`SIGN_IN_TIMEOUT_SECONDS`
           for its reply rather than the client's 5 s default (vault BACKLOG #2950; that constant
-          says why a lost reply is rarer and still possible). Before, the old token stayed live in that case. The new session nobody holds stays valid
-          until it idles out or expires, as it did before. This is the accepted price of ending the
+          says why a lost reply is rarer and still possible). Before, the old token stayed live in
+          that case. The new session nobody holds stays valid until it idles out or expires, as it
+          did before. This is the accepted price of ending the
           old session ahead of the cap. It is not harmless.
 
         No second request follows the sign-in, so ``login`` returns when the reply does."""
@@ -1846,8 +1858,8 @@ class EngineClient:
 
         **A lost reply leaves the outcome unknown.** The current-password proof queues behind the
         account's re-proof lock, so this request waits at least the sign-in's read (vault BACKLOG
-        #2950, :data:`SIGN_IN_TIMEOUT_SECONDS`). A reply that is still lost leaves the engine free to finish the change
-        and end the session while this raises :class:`ApiError` before the token is dropped. The
+        #2950, :data:`SIGN_IN_TIMEOUT_SECONDS`). A reply that is still lost leaves the engine free
+        to finish the change and end the session while this raises :class:`ApiError` before the token is dropped. The
         held token is then refused with a 401, and the new password, not the old one, is the one
         that signs in. This method does not clear the token on that error, because the change may
         not have landed, and clearing would then strand a live session nobody holds.
