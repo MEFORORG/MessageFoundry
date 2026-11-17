@@ -118,8 +118,9 @@
     answered the probe with at least one branch or tag, and of its tracking refs only those its
     fetch refspecs map back to a branch or tag it advertised (a tracking ref whose branch was deleted
     there backs nothing), plus, unchecked, those a refspec maps to a source outside refs/heads/ and
-    refs/tags/, which the probe does not list. With -SkipReachability, or when none answered (UNVERIFIABLE), every
-    non-symref remote-tracking ref still excludes; in the UNVERIFIABLE case no patch-id match is read
+    refs/tags/, which the probe does not list. With -SkipReachability, or when none answered
+    (UNVERIFIABLE), every non-symref remote-tracking ref that peels to a commit present here still
+    excludes (one whose object is missing backs nothing); in the UNVERIFIABLE case no patch-id match is read
     from them, so a squash-landed branch counts in that floor.
 
 .PARAMETER Path

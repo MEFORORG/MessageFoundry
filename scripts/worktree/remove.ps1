@@ -146,8 +146,9 @@
     the branch stays. Work a session wrote into the target by absolute path from another directory
     is seen only if it left the tree dirty, or wrote where the activity signal below reads.
 
-    -Name KEEPS ITS OLD RULES OTHERWISE. Of the -Path-only refusals it shares only the detached HEAD
-    one. Tracked changes refuse without -Force, and so do files flagged skip-worktree or
+    -Name KEEPS ITS OLD RULES OTHERWISE. It shares at least the detached HEAD, nested worktree and
+    reflog-only refusals above; docs/WORKTREES.md lists what -Name refuses. Tracked changes refuse
+    without -Force, and so do files flagged skip-worktree or
     assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
     run names the flagged files it lets go. Untracked files older than six hours and ignored
     files other than the repositories named above go with the worktree, and there is no occupancy
@@ -1506,7 +1507,7 @@ if ($DeleteBranch) {
 
 if ($leftover) {
     Write-Host ("WARNING: git dropped the registration of '$WorktreePath' and exited 0, but the directory " +
-        "$leftoverWhy. What is left is no longer a worktree; a junction inside it is one known cause. Look " +
+        "$leftoverWhy. Anything left there is no longer a worktree; a junction inside it is one known cause. Look " +
         "at it, then delete it by hand.") -ForegroundColor Yellow
 }
 else { Write-Host "Removed worktree '$WorktreePath'." -ForegroundColor Green }

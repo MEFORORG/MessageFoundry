@@ -35,8 +35,9 @@
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
       (Found=$false) no record at all -- it exited cleanly, or was never registered. State is UNKNOWN,
-                  or UNREADABLE when a LIVE or fresh record that names no session, with a cwd
-                  overlapping the worktree the caller names, may be this one. The same record
+                  or UNREADABLE when a LIVE or fresh record that names no session reaches the
+                  worktree the caller names (Test-AnonymousRecordReaches says which do), so may
+                  be this one. The same record
                   turns a matched DEAD or STALE into UNREADABLE. Get-AnonymousSessionRecords and Get-SessionLiveness say how.
 
     ONLY THE POSITIVE ANSWER IS SAFE TO ACT ON. There is no heartbeat anywhere on this host and
