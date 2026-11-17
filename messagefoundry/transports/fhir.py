@@ -1223,22 +1223,14 @@ class FhirDestination(DestinationConnector):
             self._headers.update(proxy_dest.auth_headers())
         # BACKLOG #5350/#5353: a conditional query rides the request line or the If-None-Exist
         # header, so a credential in it reaches the server, and any proxy or log that records it.
-        # Read only where _resolve_request sends it, and after the construction refusals above, so
-        # a connection that never builds logs nothing. Warned on every hop, as a url query
-        # credential is; a verify-off or off-box cleartext hop refuses it below.
+        # Read only where _resolve_request sends it. A verify-off or off-box cleartext hop refuses
+        # it below; any other hop is warned at the end of __init__, so a connection that never
+        # builds logs nothing.
         query_credentials = (
             _query_credentials_sent("conditional_query", self.conditional_query, query_only=True)
             if self.conditional in ("if-none-exist", "conditional-update")
             else []
         )
-        for found in query_credentials:
-            logger.warning(
-                "FHIR destination %s carries a credential in its conditional_query (%s). It is "
-                "sent in the request URL or the If-None-Exist header, which the server or a proxy "
-                "may log; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
-                config.name,
-                found,
-            )
         enforce_outbound_length_limits(self.base_url, self._headers)
         refuse_cleartext_credentials(
             scheme,
@@ -1373,6 +1365,14 @@ class FhirDestination(DestinationConnector):
                 opener=None if allow_expired else self._opener,
                 expiry_relaxed=allow_expired,
                 connection=config.name,
+            )
+        for found in query_credentials:
+            logger.warning(
+                "FHIR destination %s carries a credential in its conditional_query (%s). It is "
+                "sent in the request URL or the If-None-Exist header, which the server or a proxy "
+                "may log; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
+                config.name,
+                found,
             )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:

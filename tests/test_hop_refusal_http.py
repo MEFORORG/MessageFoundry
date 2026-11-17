@@ -686,6 +686,11 @@ def test_url_segment_and_conditional_query_readings() -> None:
     assert http_credentials_sent(ConnectorType.REST, {"url": odata}) == []
     fragment = f"https://h.example/x?fmt=json#access_token={_SECRET}"
     assert http_credentials_sent(ConnectorType.REST, {"url": fragment}) == []
+    # urllib splits the fragment at the LAST '#', so text between two is sent and is read.
+    twice = f"https://h.example/x?fmt=json#a;jsessionid={_SECRET}#b"
+    assert http_credentials_sent(ConnectorType.REST, {"url": twice}) == [
+        "url segment with a credential-looking name"
+    ]
     assert _query_credentials_sent("conditional_query", "identifier=s|1", query_only=True) == []
     secret = f"_id=1&client_secret={_SECRET}"
     assert _query_credentials_sent("conditional_query", secret, query_only=True) == [

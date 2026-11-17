@@ -677,7 +677,7 @@ def test_a_message_cannot_set_routing_framing_hop_by_hop_or_cookie_headers(
     """BACKLOG #5352: these are dropped in any letter case, as Authorization is, and each drop is
     logged by the set's own spelling; the rest of the bag still projects."""
     bag = {f"http.header.{name}": "v", "http.header.X-Trace-Id": "t-1"}
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.rest"):
         assert outbound_headers_from_metadata(bag) == {"X-Trace-Id": "t-1"}
     assert f"per-message header {name.lower()!r}" in caplog.text
 

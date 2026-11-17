@@ -312,7 +312,9 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         if (lowered := name.lower()) in PER_MESSAGE_DENIED_HEADERS:
             # Auth, routing, framing and hop-by-hop fields are the connection's alone (vault
             # BACKLOG #3416, #5352). Logged by the set's own spelling, never the Handler's key.
-            logger.warning(
+            # DEBUG, not WARNING: this runs on every send and retry, so a Handler stamping the
+            # header on every message would flood the log at feed rate.
+            logger.debug(
                 # No ':' or '=' after the name, so the log scrubber never reads it as a label
                 # (BACKLOG #4998, on egress.warn_url_query_credentials).
                 "a Handler set the per-message header %r, which dynamic_headers never sends; "
@@ -1447,10 +1449,12 @@ _URL_SEGMENT_START = re.compile(r"[;?]")
 
 def _url_segments_sent(url: str) -> str:
     """The part of ``url`` :func:`_query_credentials_sent` screens for a segment credential: from
-    the first ``;`` or ``?`` up to any ``#``. The scheme, host and the path before them are left
-    out, so a path predicate such as OData's ``Orders(OrderKey=5)`` is not read as one (the rule
-    does not read the path, owner ruling 2026-10-26). So is the fragment, which urllib never sends."""
-    sent = url.partition("#")[0]
+    the first ``;`` or ``?`` up to the LAST ``#``, where urllib's ``Request`` splits off the
+    fragment it never sends; text between two ``#`` is sent, so it is read. The scheme, host and
+    the path before the first ``;`` or ``?`` are left out, so a path predicate there, such as
+    OData's ``Orders(OrderKey=5)``, is not read as one (the rule does not read the path, owner
+    ruling 2026-10-26). Everything after that first ``;`` or ``?`` is read, path or not."""
+    sent = url.rpartition("#")[0] if "#" in url else url
     start = _URL_SEGMENT_START.search(sent)
     return "" if start is None else sent[start.start() :]
 
