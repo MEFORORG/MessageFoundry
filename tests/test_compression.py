@@ -594,6 +594,7 @@ def test_zip_decompress_refuses_member_contradicting_its_extension() -> None:
     [
         ("adt.hl7:stream", "colon"),  # an NTFS alternate data stream of adt.hl7
         ("sub/adt.hl7:x.hl7", "colon"),
+        ("x/a:b.hl7", "colon"),  # ntpath.isreserved("a:b.hl7") is False: only the colon arm sees it
         ("adt.hl7.", "dot or space"),  # Windows opens adt.hl7, and the extension reads as "."
         ("adt.hl7 ", "dot or space"),
         ("dir./adt.hl7", "dot or space"),  # a directory component, not only the leaf
@@ -634,15 +635,25 @@ def test_archive_member_name_reason_keeps_its_earlier_arms(name: str) -> None:
 
 @pytest.mark.parametrize(
     ("name", "fragment"),
-    [("aux.hl7", "reserved"), ("adt.hl7:stream", "colon"), ("adt.hl7.", "dot or space")],
+    [
+        ("aux.hl7", "reserved"),
+        ("CON/x.hl7", "reserved"),
+        ("adt.hl7:stream", "colon"),
+        ("x/a:b.hl7", "colon"),
+        ("adt.hl7.", "dot or space"),
+    ],
 )
-def test_zip_decompress_refuses_windows_name_shapes(name: str, fragment: str) -> None:
-    # End to end through the reader: each shape must survive zipfile's own name handling.
+@pytest.mark.parametrize("ceiling", [None, 1], ids=["no-ceiling", "ceiling-below-body"])
+def test_zip_decompress_refuses_windows_name_shapes(
+    name: str, fragment: str, ceiling: int | None
+) -> None:
+    # End to end through the reader: each shape must survive zipfile's own name handling. Under a
+    # ceiling below the body the name is still the reason, so it is judged before any byte is read.
     blob = _hostile_zip({name: _BODY})
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
         assert zf.namelist() == [name]
     with pytest.raises(CompressionError, match=fragment):
-        zip_decompress(blob, max_output_bytes=None)
+        zip_decompress(blob, max_output_bytes=ceiling)
 
 
 def test_zip_decompress_checks_hl7v2_members_against_their_extension() -> None:

@@ -409,7 +409,9 @@ def zip_decompress(
     one local header, the overlapped-entries zip-bomb shape (BACKLOG #1598).
 
     Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
-    safe relative path with no shape Windows reads specially (BACKLOG #5369), and its bytes must
+    safe relative path with none of the Windows name shapes
+    :func:`~messagefoundry.parsing.sniff.windows_member_name_reason` refuses (BACKLOG #5369; it
+    does not refuse case-only or 8.3 aliases), and its bytes must
     correspond to the type its own extension names. Both checks are
     unconditional and take no parameter: an archive member names its own type, so nothing here depends on
     operator policy. See :mod:`messagefoundry.parsing.sniff` for what each one refuses and why refusal,

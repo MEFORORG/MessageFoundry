@@ -18,7 +18,8 @@ import a transport), and the attachment detach/download paths (``pipeline/wiring
   document's leading bytes agree with the sender-declared OBX-5.2 MIME? A contradiction (an ``image/png``
   label on non-PNG bytes) is stored/served as ``application/octet-stream`` so a mislabelled
   active-content payload can never render as its claimed inert type (narrows the 1.3.4 residual).
-* **Archive-member admission** (:func:`archive_member_name_reason` / :func:`archive_member_content_reason`)
+* **Archive-member admission** (:func:`archive_member_name_reason` / :func:`archive_member_content_reason`,
+  with :func:`windows_member_name_reason` for the Windows name shapes, BACKLOG #5369)
   — is a ZIP member's name a safe relative path, and do its bytes correspond to the type its own
   extension names? Called by :func:`~messagefoundry.parsing.compression.zip_decompress`, which is the
   Handler-facing archive reader, so members reach Handler code already checked (BACKLOG #1128).
@@ -363,7 +364,9 @@ def windows_member_name_reason(name: str) -> str | None:
     alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its
     8.3 short form still pass, so a Handler writing members on Windows keeps its own collision
     check."""
-    # The colon and trailing dot-or-space arms overlap ntpath.isreserved; they stay for their reasons.
+    # The colon arm is not covered by ntpath.isreserved on one component: it strips a one-letter drive
+    # prefix, so isreserved("a:b.hl7") is False and this arm alone refuses ``x/a:b.hl7``. The
+    # trailing dot-or-space arm overlaps isreserved and stays for its reason.
     if ":" in name:
         return "member name contains a colon, which Windows reads as a drive or a data stream"
     for part in name.split("/"):
