@@ -1113,8 +1113,8 @@ VaultAttestationSection = Literal["store", "secrets"]
 
 #: The fixed text of the revocation refusal. It names no part of the address and no proxy.
 _UNREVOKED_VAULT_HOP = (
-    "the Vault server certificate would be verified, but this hop checks no certificate "
-    "revocation (no CRL and no OCSP), and no CRL lever is built for it. Only a loopback Vault "
+    "the Vault server certificate would be verified, but this hop has no revocation check the "
+    "guard credits, and no CRL lever is built for it. Only a loopback Vault "
     "reached with no proxy crosses without an attestation."
 )
 #: The one lever each refusal offers: the hop's own settings pair, and nothing else. Through an
@@ -1137,8 +1137,8 @@ _SECRETS_REVOCATION_LEVER = (
 #: What both crossing records say about the hop. Fixed text, like the refusal: it names no part
 #: of the address and no proxy.
 _UNCHECKED_VAULT_HOP = (
-    "the Vault server certificate is verified, but this hop checks no certificate revocation "
-    "(no CRL and no OCSP), and no CRL lever is built for it"
+    "the Vault server certificate is verified, but this hop has no revocation check the guard "
+    "credits, and no CRL lever is built for it"
 )
 #: How both crossing records open. One constant, so a search for it finds every crossing; the
 #: other revocation guards' attested record opens the same way (``RevocationHopGuard``).
@@ -1263,8 +1263,9 @@ def _refuse_an_unrevoked_vault_hop(
     * ``tls_revocation_attested()``, the process-wide variable, goes in ``blanket_attested``
       only. The authority ranks that below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing posture.
-    * ``crl_checked`` is ``checks_revocation()``, which reads ``crl_credited`` off a context the hop's
-      own factory builds, never off a setting (:meth:`StrictReplyAdapter._checks_revocation`).
+    * ``crl_checked`` is ``checks_revocation()``, which reads ``crl_credited`` off a context the
+      hop's own factory builds, never off a setting
+      (:meth:`StrictReplyAdapter._checks_revocation`).
       No CRL lever is built for this hop, so it is ``False`` today. It is asked only when the
       answer could matter: the authority is asked first without it, and a CRL check can only
       turn that answer into ALLOW.
@@ -1430,8 +1431,8 @@ def is_unrevoked_vault_hop_refusal(
 #: The fixed text of the proxy leg's revocation refusal (vault BACKLOG #3561). It names no part of
 #: the proxy URL, no credential and no CA path.
 _UNREVOKED_PROXY_LEG = (
-    "the TLS leg to this hop's https:// proxy would be verified, but it checks no certificate "
-    "revocation (no CRL and no OCSP), and no CRL lever is built for it. Proxy credentials and the "
+    "the TLS leg to this hop's https:// proxy would be verified, but it has no revocation check "
+    "the guard credits, and no CRL lever is built for it. Proxy credentials and the "
     "Vault host name cross that leg."
 )
 _STORE_PROXY_LEG_LEVER = (
@@ -1446,8 +1447,8 @@ _SECRETS_PROXY_LEG_LEVER = (
 )
 #: What both of the proxy leg's crossing records say about it. Fixed text, like the refusal.
 _UNCHECKED_PROXY_LEG = (
-    "the TLS leg to its https:// proxy is verified, but checks no certificate revocation (no CRL "
-    "and no OCSP), and no CRL lever is built for it"
+    "the TLS leg to its https:// proxy is verified, but has no revocation check the guard "
+    "credits, and no CRL lever is built for it"
 )
 
 

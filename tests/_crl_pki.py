@@ -20,7 +20,7 @@ _DAY = datetime.timedelta(days=1)
 
 
 def throwaway_ca(cn: str) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
-    """A self-signed CA named ``cn``, valid from yesterday for a year."""
+    """A self-signed CA named ``cn``, valid from yesterday until a year from now."""
     now = datetime.datetime.now(datetime.UTC)
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])

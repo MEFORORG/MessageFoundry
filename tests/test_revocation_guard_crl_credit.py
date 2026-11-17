@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.tls_policy import (
+    EXPIRY_RELAXED_WAYS_ACROSS,
+    UNVERIFIED_WAYS_ACROSS,
     HopPosture,
     RevocationHopGuard,
     context_checks_revocation,
@@ -89,6 +91,38 @@ def test_capture_reads_the_rule(relaxed: bool, verifies: bool, credited: bool) -
         connection=None,
     )
     assert guard.crl_checked is credited
+
+
+@pytest.mark.parametrize(
+    ("relaxed", "verifies", "remedy"),
+    [
+        (False, True, None),
+        (True, True, EXPIRY_RELAXED_WAYS_ACROSS),
+        (False, False, UNVERIFIED_WAYS_ACROSS),
+        (True, False, UNVERIFIED_WAYS_ACROSS),
+    ],
+)
+def test_capture_offers_no_crl_where_none_is_credited(
+    relaxed: bool, verifies: bool, remedy: str | None
+) -> None:
+    """A hop whose context verifies no peer is not told a CRL would admit it (vault BACKLOG
+    #4912). The non-verifying arms are red when capture keeps the connection-shaped default,
+    which offers ``[tls].crl_file``. A remedy the caller passes is kept."""
+    ctx = _context(crl=False, relaxed=relaxed, verifies=verifies)
+
+    def capture(ways_across: str | None = None) -> RevocationHopGuard:
+        return RevocationHopGuard.capture(
+            host="partner.example",
+            cell="test hop",
+            description="test hop",
+            attested=False,
+            context=ctx,
+            ways_across=ways_across,
+            connection=None,
+        )
+
+    assert capture().ways_across == remedy
+    assert capture("own remedy").ways_across == "own remedy"
 
 
 @pytest.mark.parametrize("relaxed", [False, True])
