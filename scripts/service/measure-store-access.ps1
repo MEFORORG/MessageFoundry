@@ -123,7 +123,8 @@ $GateRefusal = "no enabled Administrator"
 $NoAdminRefusal = "no enabled Administrator exists"
 $ProvisionHint = "provision-admin --username"
 # The words that make it a REFUSAL. The skipped-gate WARNING and the warn-mode line carry the two
-# phrases above too, so without this an engine that started and served would pass step 1.
+# phrases above too, so without this an engine that started and served would pass step 1 of every
+# arm; Test-GateRefusalLine requires both on one line.
 $StartRefused = "refusing to start"
 $ProvisionDecline = "already has an enabled Administrator"
 $OpenErrorPattern = "unable to open database file|Access is denied|PermissionError|OperationalError"
@@ -630,16 +631,29 @@ function Start-TheService([string]$Phase) {
     }
 }
 
+function Test-GateRefusalLine([string]$Line, [string]$Clause = $GateRefusal) {
+    <#
+      Whether one log line is the ADR 0167 REFUSAL: it carries the gate's clause ($Clause, or a
+      narrower one such as $NoAdminRefusal) and the refusal's own words. The skipped-gate warning and
+      the warn-mode line carry the clause alone, and an engine that logs either goes on to start and
+      serve, so neither may count as a refusal.
+    #>
+    return ($Line -match [regex]::Escape($Clause)) -and ($Line -match [regex]::Escape($StartRefused))
+}
+
 function Wait-ForGateRefusal([string]$Phase) {
     <#
-      Wait until the service logs the ADR 0167 refusal, which it reaches only after opening the store
-      and reading its users. Samples process owners throughout, since NSSM restarts the refused engine
-      and each restart is a new process. Returns $true on the refusal, $false on timeout.
+      Wait until the service logs the ADR 0167 refusal (Test-GateRefusalLine), which it reaches only
+      after opening the store and reading its users. Samples process owners throughout, since NSSM
+      restarts the refused engine and each restart is a new process. Returns $true on the refusal,
+      $false on timeout.
     #>
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         Update-OwnerSample "during $Phase"
-        if ((Get-LogMatches ([regex]::Escape($GateRefusal))).Count -gt 0) { return $true }
+        $refused = @(Get-LogMatches ([regex]::Escape($GateRefusal)) |
+            Where-Object { Test-GateRefusalLine $_.Line })
+        if ($refused.Count -gt 0) { return $true }
         Start-Sleep -Seconds 1
     }
     return $false
@@ -963,7 +977,7 @@ try {
                 "Wave 2 no path writes a bootstrap credential file (AC-13)")
         }
         $noAdmin = @(Get-LogMatches ([regex]::Escape($NoAdminRefusal)) |
-            Where-Object { $_.Line -match [regex]::Escape($StartRefused) })
+            Where-Object { Test-GateRefusalLine $_.Line $NoAdminRefusal })
         if (-not $opened) {
             $what = if (Test-Path -LiteralPath $DbPath) { "created $DbPath but never reached the account gate, so its open is unproven" }
                     else { "never created $DbPath" }
