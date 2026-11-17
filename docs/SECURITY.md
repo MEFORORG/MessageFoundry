@@ -5796,7 +5796,8 @@ is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316
 
 At least these changes reach the next request, and each one also revokes the affected sessions:
 
-- a user's roles set, or a custom role edited or deleted;
+- a user's roles set, or a custom role edited or deleted (which accounts that edit or delete
+  revokes is in the [session-events table](#the-engine-session-is-independent-of-the-idp-session-asvs-761));
 - a user's channel scope set by an administrator;
 - a user disabled, deleted, or given a new password.
 
@@ -6225,6 +6226,7 @@ At least these events bear on a live engine session:
 | The directory disables or deletes the account | The directory reconciler can end every session of the account. The row for a change made in Active Directory, in the [revocation table](#a-revoked-privilege-reaches-the-next-request-with-exceptions-asvs-832), gives the rule. Each engine process keeps its count in memory, so a restart sets it back to 0. |
 | A directory group change alters the account's roles, or withdraws or narrows its channel scope | The reconciler ends every session of the account on the first pass that sees the change. A pass can revoke nothing, as *Directory session reconciliation* explains. The account's next sign-in also ends its other sessions. |
 | An administrator edits the engine's AD group-to-role or group-to-scope map | Ends every session of at least these accounts: each whose stored row reads as an enabled directory account, whether or not its record passes its integrity check; each whose stored row does not parse; and each whose integrity check fails, whatever its row reads. A row the account list cannot read an id from is not named. On a store with no integrity key no seal is checked, so a row edited to read as local or disabled is taken as it reads, and its sessions are not ended. A named account's sessions are revoked, not only refused, so a repair of its row does not bring them back. |
+| An administrator edits or deletes a custom role | Ends every session of at least these accounts: each whose stored role rows hold the role, whether or not its record passes its integrity check; each whose stored row or role rows do not parse; and each whose integrity check fails at the save's step-up gate, whatever its rows read, so an account that does not hold the role is ended too. Once the save and its revoke complete, each account the gate named whose stored rows, read after the save, neither hold the role nor fail to parse gets a `role.sessions_revoked` row naming it. On a store with no integrity key no seal is checked, so a role row deleted outside the store reads as no holder. |
 | An administrator binds, rebinds or unbinds the account's federated identity | Ends every session of the account, a first bind included. |
 | An administrator signs the user out with `DELETE /users/{user_id}/sessions` | Ends every session of the account. |
 | An administrator disables the user in the engine | Ends every session of the account. Each request also refuses a disabled account. |

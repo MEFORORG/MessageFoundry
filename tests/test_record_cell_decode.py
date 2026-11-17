@@ -11,6 +11,7 @@ out-of-band edit would. Synthetic accounts only.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import replace
@@ -27,6 +28,8 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
+    GATE_ONLY_REVOKE_ACTION,
+    SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
     LastAdministratorRefused,
     UserSealRefused,
@@ -490,6 +493,13 @@ async def test_a_custom_role_save_revokes_every_holder_and_every_failing_account
             await service.delete_custom_role(role.id, actor="test", ended=gate)
         for user_id, token_hash in tokens.items():
             assert _revoked(path, token_hash) is (user_id in ended), user_id
+        # Finding 4 of round 69e8364ab4: each account the gate named whose rows, read after the
+        # save, do not tie it to the role gets a row naming it; a keyless store names none.
+        named = {
+            json.loads(row["detail"])["user_id"]
+            for row in await store.list_audit(action=GATE_ONLY_REVOKE_ACTION)
+        }
+        assert named == ({"h-dropped", "o-forged"} if keyed else set())
     finally:
         await store.close()
 
@@ -671,10 +681,184 @@ async def test_a_supersession_that_reads_back_an_unparseable_row_keeps_its_revok
         alerts: list[str] = []
         service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
         _raw(path, "UPDATE sessions SET user_epoch=? WHERE token_hash=?", ("x", other))
-        with pytest.raises(RevokedRowSealError):
-            await service._supersede_session(other, now=time.time())
+        # Answered, not raised (finding 1 of round 69e8364ab4): the session has ended.
+        assert await service._supersede_session(other, now=time.time()) is not None
         assert _revoked(path, other)
         assert len(alerts) == 1 and other[:12] in alerts[0]
         assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+    finally:
+        await store.close()
+
+
+async def _token_session(store: MessageStore, user_id: str) -> str:
+    token = mint_token()
+    assert await store.create_session(
+        token_hash=hash_token(token), user_id=user_id, expires_at=time.time() + 3600
+    )
+    return token
+
+
+def _unparseable(path: Path, token: str) -> None:
+    _raw(path, "UPDATE sessions SET user_epoch=? WHERE token_hash=?", ("x", hash_token(token)))
+
+
+async def test_a_logout_whose_ended_row_does_not_parse_still_signs_out(tmp_path: Path) -> None:
+    """Finding 1 of round 69e8364ab4: the revoke committed, so the sign-out answers as one that
+    ended a session, writes its auth.logout row and reports the row, rather than raising."""
+    path = tmp_path / "logout.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-out")
+        token = await _token_session(store, "u-out")
+        _unparseable(path, token)
+        alerts: list[str] = []
+        service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
+        assert await service.logout(token, client=None, proven_at=None) == "revoked"
+        assert _revoked(path, hash_token(token))
+        [row] = await store.list_audit(action="auth.logout")
+        assert json.loads(row["detail"]) == {
+            "outcome": "revoked",
+            "session": hash_token(token)[:12],
+        }
+        assert len(alerts) == 1 and hash_token(token)[:12] in alerts[0]
+    finally:
+        await store.close()
+
+
+async def test_a_sign_in_whose_superseded_row_does_not_parse_returns_its_session(
+    tmp_path: Path,
+) -> None:
+    """Finding 2 of round 69e8364ab4: the new session was minted before the prior one is
+    superseded, so the sign-in returns it rather than failing after the mint."""
+    path = tmp_path / "sign-in.db"
+    password = "a-strong-passphrase-here"
+    store = await MessageStore.open(path)
+    try:
+        alerts: list[str] = []
+        service = AuthService(store, AuthSettings(require_mfa=False), integrity_alert=alerts.append)
+        await service.initialize()  # the built-in roles
+        await _admin(store, "a-in", password)
+        prior = await _token_session(store, "a-in")
+        _unparseable(path, prior)
+        out = await service.login("a-in", password, supersedes=prior)
+        assert out.ok and out.token is not None
+        assert await service.identity_for_token(out.token) is not None
+        assert _revoked(path, hash_token(prior))
+        assert len(alerts) == 1 and hash_token(prior)[:12] in alerts[0]
+    finally:
+        await store.close()
+
+
+async def test_a_lapsed_session_end_whose_row_does_not_parse_writes_its_row(
+    tmp_path: Path,
+) -> None:
+    """Finding 2 of round 69e8364ab4: ending a lapsed session does not raise when the row it
+    ended does not parse; its auth.temp_password_expired row is written as for any other."""
+    path = tmp_path / "lapsed.db"
+    store = await MessageStore.open(path)
+    try:
+        await _user(store, "u-lapse")
+        token = await _token_session(store, "u-lapse")
+        _unparseable(path, token)
+        service = AuthService(store, AuthSettings())
+        await service._end_lapsed_session(hash_token(token), "u-lapse", at="session", client=None)
+        assert _revoked(path, hash_token(token))
+        assert len(await store.list_audit(action="auth.temp_password_expired")) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("save", ["ad_map", "custom_role"])
+async def test_a_refused_reread_after_a_group_save_leaves_the_gate_set_revoked(
+    tmp_path: Path, save: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 3 of round 69e8364ab4: the gate's set is revoked before the accounts are read
+    again, so a store refusal of that read leaves it revoked, writes a refused-revoke row, and
+    still fails the save."""
+    path = tmp_path / "reread.db"
+    store = await MessageStore.open(path)
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()  # the built-in roles
+        role_id = ""
+        if save == "custom_role":
+            role = await service.create_custom_role(
+                display_name="Readers", description=None, permissions=["messages:read"], actor="t"
+            )
+            role_id = role.id
+        await store.create_user(
+            user_id="d-1",
+            username="d-1",
+            auth_provider="ad" if save == "ad_map" else "local",
+            password_generated=False,
+            audits=(),
+        )
+        await store.set_user_roles(
+            "d-1", [Role.VIEWER.value] + ([role_id] if role_id else []), audits=()
+        )
+        token_hash = await _session(store, "d-1")
+        if save == "ad_map":
+            gate = await service.sessions_ended_by_ad_map_save()
+        else:
+            gate = await service.sessions_ended_by_custom_role_save(role_id)
+        assert gate == {"d-1"}  # control
+
+        async def refused() -> list[Any]:
+            raise sqlite3.OperationalError("synthetic refusal")
+
+        monkeypatch.setattr(store, "list_users", refused)
+        with pytest.raises(sqlite3.OperationalError):
+            if save == "ad_map":
+                await service.set_ad_group_map([], actor="test", ended=gate)
+            else:
+                await service.update_custom_role(
+                    role_id,
+                    display_name="Readers 2",
+                    description=None,
+                    permissions=["messages:read"],
+                    actor="test",
+                    ended=gate,
+                )
+        assert _revoked(path, token_hash)
+        [missed] = await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+        detail = json.loads(missed["detail"])
+        assert detail["reread"] == "refused" and detail["error"] == "OperationalError"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("keyed", [False, True])
+async def test_mfa_status_reads_an_unparseable_recovery_code_cell_as_none_held(
+    tmp_path: Path, keyed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 10 of round 69e8364ab4: the caller's own MFA status answers with no codes held, as
+    the code check reads the cell, rather than refusing."""
+    path = tmp_path / "mfa-status.db"
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(path, cipher=cipher)
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        activating = totp.totp(enroll.secret, now=t0)
+        assert (await service.confirm_mfa_enrollment(identity, activating, token=token)).ok
+        assert (await service.mfa_status(identity)).recovery_codes_remaining > 0  # control
+        if keyed:
+            async with _writer_guard(store._db, store._lock):
+                written = await store._write_user(
+                    identity.user_id, lambda r: r.changed(totp_recovery_codes="{not json")
+                )
+                await store._commit()
+            assert written is not None
+        else:
+            _raw(
+                path,
+                "UPDATE users SET totp_recovery_codes=? WHERE id=?",
+                ("{not json", identity.user_id),
+            )
+        status = await service.mfa_status(identity)
+        assert status.enabled and status.recovery_codes_remaining == 0
     finally:
         await store.close()

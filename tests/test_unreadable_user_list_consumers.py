@@ -96,6 +96,9 @@ def test_verify_fails_and_names_an_unreadable_account(tmp_path: Path, corrupt: b
     if corrupt:
         assert result.status is Status.FAIL, result.detail
         assert "integrity check" in result.detail and "u-corrupt" in result.detail
+        # Finding 5 of round 69e8364ab4: an unreadable account can neither enrol nor have its
+        # factors reset, so an integrity-only failure offers neither remedy.
+        assert "reset-mfa" not in result.detail and "enrol" not in result.detail
     else:
         assert result.status is Status.PASS, result.detail
 

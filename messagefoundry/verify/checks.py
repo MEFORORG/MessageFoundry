@@ -612,16 +612,20 @@ def check_lockable_accounts(
             "the cipher service before resetting any of them, since a reset destroys a healthy "
             "enrolment): " + ", ".join(census.unknown_totp)
         )
+    # BACKLOG #5505: the factor remedy is offered only when an account other than an unreadable
+    # one is named; an unreadable account can neither enrol nor have its factors reset.
+    lockable = census.no_way_past or census.undecryptable_totp or census.unknown_totp
+    remedy = (
+        ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
+        "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
+        if lockable
+        else ""
+    )
     return CheckResult(
         rid,
         title,
         Status.FAIL,
-        "; ".join(parts)
-        + ". Ask each holder to enrol an authenticator app or a passkey, or reset the account's "
-        "factors (POST /users/{id}/reset-mfa), which issues a generated credential"
-        + passkey_note
-        + reset_note
-        + ".",
+        "; ".join(parts) + remedy + passkey_note + reset_note + ".",
     )
 
 

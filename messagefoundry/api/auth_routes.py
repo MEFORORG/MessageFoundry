@@ -645,9 +645,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def _row_seal_refused(request: Request, exc: Exception) -> Response:
         # BACKLOG #2592: the store refused a row that fails its integrity check. A write helper
         # meets it when the row's seal does not verify, and wrote nothing. Since BACKLOG #5505 a
-        # raw read meets it when the row's cells do not parse, and a session supersession meets it
-        # reading back a row whose revoke has committed (RevokedRowSealError). So the texts name
-        # neither a write nor a change. A 409 with a fixed text, never the row and never a 500. Logged with the
+        # raw read meets it when the row's cells do not parse. So the texts name neither a write
+        # nor a change. (A supersession's read-back refusal, RevokedRowSealError, is answered in
+        # the service and does not reach here.) A 409 with a fixed text, never the row and never a 500. Logged with the
         # row's kind, since this path does not pass the service loader that audits and alerts.
         assert isinstance(exc, RowSealError)
         _log.warning(

@@ -302,6 +302,15 @@ class _RowWrite[T]:
 
 
 @dataclass(frozen=True, slots=True)
+class _EndedUnread:
+    """A session row :meth:`AuthService._supersede_session` ended whose read-back did not parse
+    (BACKLOG #5505). The revoke committed and the row is reported; only ``ref``, the token hash's
+    first 12 characters, is known of it."""
+
+    ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class _SignInRoleSync:
     """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). Everything after
     the write is computed from this, never from the roles the sign-in first read."""
@@ -3476,6 +3485,10 @@ SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
 #: stands; the sessions the revoke would have ended may stay live, and this row is what says so. Not
 #: the row above, which records a self-service revoke that named no session.
 SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
+#: BACKLOG #5505: the row naming an account whose sessions a custom-role edit or delete ended
+#: although its stored rows, read after the step-up gate, do not tie it to the role
+#: (:meth:`AuthService._audit_gate_only_revokes` says when).
+GATE_ONLY_REVOKE_ACTION: Final = "role.sessions_revoked"
 #: How many times that revoke runs at most, the pause before each re-run (times its number), and
 #: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
 #: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
@@ -12987,17 +13000,18 @@ class AuthService:
 
     async def _supersede_session(
         self, token_hash: str, *, now: float, lineage_since: float | None = None
-    ) -> SessionRecord | None:
-        """The store's ``supersede_session``, reporting a row it ended that then did not parse
-        (BACKLOG #5505). The store has committed that revoke before it raises
-        :class:`RevokedRowSealError`, which is raised on once the row is reported."""
+    ) -> SessionRecord | _EndedUnread | None:
+        """The store's ``supersede_session``. A row it ended that then did not parse (BACKLOG
+        #5505) is reported, as :meth:`_session_seal_failed` reports one, and answered as
+        :class:`_EndedUnread`: the store committed that revoke before it raised
+        :class:`RevokedRowSealError`, so the session has ended and no caller raises for it."""
         try:
             return await self._store.supersede_session(
                 token_hash, now=now, lineage_since=lineage_since
             )
         except RevokedRowSealError as exc:
             await self._report_ended_session(exc.subject)
-            raise
+            return _EndedUnread(exc.subject)
 
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
@@ -14124,9 +14138,11 @@ class AuthService:
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
         leaves the row with no actor when the caller named none, rather than no row, and leaves a
         live session's temporary credential unchecked, so the outcome is ``revoked``; a refused row
-        write leaves no row and an ERROR log line, which names the session when one ended. A fault
-        in the revoke itself still raises: the session may not have ended, and the caller must not
-        say it did.
+        write leaves no row and an ERROR log line, which names the session when one ended. A row
+        the revoke ended that then does not parse (BACKLOG #5505) is reported, and the sign-out is
+        recorded as ``revoked`` under ``actor``, since neither the row's owner nor whether it was
+        live can be read. A fault in the revoke itself still raises: the session may not have
+        ended, and the caller must not say it did.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
@@ -14170,6 +14186,24 @@ class AuthService:
                 # cannot cost it that row.
                 await self._count_unrecorded_logout_misses(refused=False)
             return "nothing_to_revoke"
+        if isinstance(ended, _EndedUnread):
+            # BACKLOG #5505: the revoke committed and the row is reported, but it did not parse,
+            # so neither its owner nor whether it was live can be read. Recorded as a session
+            # ended with no lapse found, as for an owner that could not be read.
+            unread = {"outcome": "revoked", "session": ended.ref}
+            if not constant_time_equal(ended.ref, presented[:12]):  # ASVS 11.2.4, as elsewhere
+                unread["presented"] = presented[:12]
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.logout", actor=actor, detail=_json(unread), client=client
+                ),
+                log=_log,
+                message="a sign-out ended session %s, but its auth.logout row failed",
+                args=(ended.ref,),
+                # A raise would report a sign-out that already ran as a failure (see above).
+                defects=(),
+            )
+            return "revoked"
         after = time.time()
         session = ended.token_hash[:12]
         live = self._was_live_at_revoke(ended, before, after)
@@ -14422,7 +14456,13 @@ class AuthService:
             prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
         )
         after = time.time()
-        if prior is None or not self._was_live_at_revoke(prior, before, after):
+        # A prior row that did not parse once ended (BACKLOG #5505) is already reported, and its
+        # liveness cannot be read, so it is recorded as a session already over is: by no row here.
+        if (
+            prior is None
+            or isinstance(prior, _EndedUnread)
+            or not self._was_live_at_revoke(prior, before, after)
+        ):
             return
         owner = await self._load_user(prior.user_id)
         # BACKLOG #3749: a session ``_gate_refusal`` finds a credential lapse on is not recorded as
@@ -18306,7 +18346,14 @@ class AuthService:
             )
         # The values the account's seal covered (BACKLOG #2592), the store read only when the sealed
         # digest names no passkey, as _second_factor_enrolled reads it.
-        remaining = len(user.recovery_code_hashes()) if user.totp_enabled else 0
+        remaining = 0
+        if user.totp_enabled:
+            try:
+                remaining = len(user.recovery_code_hashes())
+            except RowSealError:
+                # BACKLOG #5505: a cell that does not parse holds no code, as verify_mfa reads it,
+                # so the caller still sees their posture. The decoder logged it.
+                remaining = 0
         webauthn_enrolled = user.has_passkeys or await self._store.has_webauthn_credentials(
             identity.user_id
         )
@@ -19808,7 +19855,8 @@ class AuthService:
 
         ``ended`` is the set the route's step-up gate read from
         :meth:`sessions_ended_by_custom_role_save`; without one it is read here, before the write.
-        :meth:`_custom_role_holders` says what is revoked."""
+        :meth:`_revoke_gate_set_then_reread` says what is revoked, and
+        :meth:`_audit_gate_only_revokes` which of those accounts get a row of their own."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
@@ -19821,11 +19869,10 @@ class AuthService:
             builtin=False,
             permissions=_json([p.value for p in perms]),
         )
-        await self._revoke_each_after_commit(
-            await self._custom_role_holders(role_id, ended),
-            change="custom_role_saved",
-            actor=actor,
+        _, again = await self._revoke_gate_set_then_reread(
+            ended, self._holds_role(role_id), change="custom_role_saved", actor=actor
         )
+        await self._audit_gate_only_revokes(ended - again, role_id=role_id, actor=actor)
         await self._audit(
             "role.updated",
             actor=actor,
@@ -19852,20 +19899,23 @@ class AuthService:
             ended = await self.sessions_ended_by_custom_role_save(role_id)
         # Before the rows are gone, so nothing has committed yet: a refusal is raised at once with
         # the role in place, and not recorded as a miss after a committed change (vault #3023).
-        for user_id in await self._custom_role_holders(role_id, ended):
+        # Sorted, so a revoke a store fault interrupts stops at a repeatable point (ADR 0045 D3).
+        again = await self._accounts_a_save_ends(self._holds_role(role_id), checked=False)
+        for user_id in sorted(ended | again):
             await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
         # BACKLOG #5725: the store refuses a role it does not find as a custom role by this exact
         # id. That deleted nothing, so no row may record a deletion; the caller answers not found.
         if not await self._store.delete_custom_role(role_id):
             raise ValueError("no such custom role")
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
+        await self._audit_gate_only_revokes(ended - again, role_id=role_id, actor=actor)
 
     async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:
         """The account ids the step-up gate of an edit or a delete of custom role ``role_id`` reads:
         :meth:`_accounts_a_save_ends`, naming each account whose stored role rows hold the role.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        The route hands this set to the save, and :meth:`_custom_role_holders` revokes it, so the
+        The route hands this set to the save, which revokes it, so the
         caller's integrity check is read once for the gate and the revoke (BACKLOG #5505).
 
         Compared without case. A store whose id columns compare case-insensitively (SQL Server)
@@ -19890,13 +19940,73 @@ class AuthService:
 
         return holds
 
-    async def _custom_role_holders(self, role_id: str, ended: frozenset[str]) -> list[str]:
-        """The accounts a custom-role save or delete revokes: ``ended``, the set its gate read, and
-        each account :meth:`_accounts_a_save_ends` names when read again here with no seal
-        checked. Sorted, so a revoke a store fault interrupts stops at a repeatable point (ADR 0045
-        D3)."""
-        again = await self._accounts_a_save_ends(self._holds_role(role_id), checked=False)
-        return sorted(ended | again)
+    async def _audit_gate_only_revokes(
+        self, gate_only: frozenset[str], *, role_id: str, actor: str
+    ) -> None:
+        """One :data:`GATE_ONLY_REVOKE_ACTION` row per account a custom-role edit or delete of
+        ``role_id`` revoked although its stored rows, read after the gate, neither hold the role
+        nor fail to parse (BACKLOG #5505). The gate names such an account because its integrity
+        check failed, or because it held the role when the gate read it. The role's own row does
+        not list the accounts it ended, so this is the row that names them. A refused write is
+        logged, not raised: the change and the revoke have both happened."""
+        for user_id in sorted(gate_only):
+            detail = {"role_id": role_id, "user_id": user_id, "reason": "named_by_gate_only"}
+            await write_audit_soft(
+                partial(self._audit, GATE_ONLY_REVOKE_ACTION, actor=actor, detail=_json(detail)),
+                log=_log,
+                message="a custom-role save revoked an account's sessions, but its %s row failed",
+                args=(GATE_ONLY_REVOKE_ACTION,),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+
+    async def _revoke_gate_set_then_reread(
+        self,
+        ended: frozenset[str],
+        named: Callable[[UserRecord], Awaitable[bool]],
+        *,
+        change: str,
+        actor: str,
+    ) -> tuple[int, frozenset[str]]:
+        """After a group-wide ``change`` has committed, revoke ``ended``, the set its gate read,
+        then each further account :meth:`_accounts_a_save_ends` names when read again with no seal
+        checked. Returns the count revoked and the set that read named. Each account goes through
+        :meth:`_revoke_each_after_commit`, sorted, so a revoke a store fault interrupts stops at a
+        repeatable point (ADR 0045 D3).
+
+        The gate's set is revoked first, so a read that raises leaves it revoked (BACKLOG #5505).
+        A store refusal of that read is logged at ERROR, recorded as
+        :data:`SESSIONS_REVOKE_FAILED_ACTION` with no ``user_id`` and ``"reread": "refused"``,
+        and raised, so the caller still fails, as a revoke given up on does."""
+        revoked = await self._revoke_each_after_commit(sorted(ended), change=change, actor=actor)
+        try:
+            again = await self._accounts_a_save_ends(named, checked=False)
+        except audit_write_errors() as exc:
+            _log.error(
+                "auth: after a committed %s, the read of which further accounts it ends was"
+                " refused by the store (%s); the %d account(s) its step-up gate named were"
+                " revoked, and any other account the change reaches may keep its sessions",
+                change,
+                type(exc).__name__,
+                len(ended),
+                exc_info=exc,
+            )
+            detail = {"change": change, "reread": "refused", "error": type(exc).__name__}
+            await write_audit_soft(
+                lambda: self._audit(
+                    SESSIONS_REVOKE_FAILED_ACTION, actor=actor, detail=_json(detail)
+                ),
+                log=_log,
+                message="the %s row for that refused revoke could not be written",
+                args=(SESSIONS_REVOKE_FAILED_ACTION,),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            raise
+        revoked += await self._revoke_each_after_commit(
+            sorted(again - ended), change=change, actor=actor
+        )
+        return revoked, again
 
     async def _accounts_a_save_ends(
         self, named: Callable[[UserRecord], Awaitable[bool]], *, checked: bool
@@ -20805,10 +20915,10 @@ class AuthService:
         # was set right. ``revoke_user_sessions`` matches every unrevoked row, whatever the clock
         # says, and costs one statement where the read cost one too. Each account through
         # _revoke_each_after_commit, since the map write has committed (vault BACKLOG #3023).
-        again = await self._accounts_a_save_ends(_reads_as_directory_account, checked=False)
-        return await self._revoke_each_after_commit(
-            sorted(ended | again), change=change, actor=actor
+        revoked, _ = await self._revoke_gate_set_then_reread(
+            ended, _reads_as_directory_account, change=change, actor=actor
         )
+        return revoked
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
         """The account ids the step-up gate of a save of either AD group map reads:
