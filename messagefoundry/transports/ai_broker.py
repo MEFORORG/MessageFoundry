@@ -59,6 +59,8 @@ import urllib.request
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.tls_policy import (
+    PEER_NOT_REQUIRED_WAYS_ACROSS,
+    CrlNoCredit,
     HopDisposition,
     HopPosture,
     RevocationHopGuard,
@@ -106,13 +108,15 @@ _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 _DEFAULT_TIMEOUT = 60.0
 
 
-#: The cell the AI hop's revocation refusal and its log lines name. PHI-free and fixed.
+#: The cell the AI hop's revocation refusal and its log lines name, written through the guard's
+#: ``stated_cell``, which drops "verified" on a context without ``CERT_REQUIRED``. PHI-free.
 _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 
 #: The ways across that refusal under an enforcing posture, besides an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
-#: to a broker that was handed a ``[tls]`` policy: on a build with none, such as a direct
+#: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
+#: credit is that it consults none: on a build with none, such as a direct
 #: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
 #: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
@@ -128,9 +132,14 @@ _AI_ATTESTATION_LEVER = (
 )
 
 
-def _revocation_lever(*, crl_reachable: bool) -> str:
-    """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop."""
-    if crl_reachable:
+def _revocation_lever(*, crl_reachable: bool, no_credit: CrlNoCredit | None) -> str:
+    """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop and
+    could be credited there. On a context that does not set ``CERT_REQUIRED`` it is the guard's
+    own :data:`~messagefoundry.config.tls_policy.PEER_NOT_REQUIRED_WAYS_ACROSS`, as on every other
+    guarded hop (vault BACKLOG #4912)."""
+    if no_credit is CrlNoCredit.PEER_NOT_REQUIRED:
+        return PEER_NOT_REQUIRED_WAYS_ACROSS
+    if crl_reachable and no_credit is CrlNoCredit.NO_CRL:
         return _AI_CRL_LEVER + _AI_ATTESTATION_LEVER
     return _AI_ATTESTATION_LEVER[0].upper() + _AI_ATTESTATION_LEVER[1:]
 
@@ -229,11 +238,14 @@ def _refuse_an_unrevoked_ai_hop(
     """Refuse a verifying AI endpoint hop that checks no revocation and carries no attestation
     (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
-    Every call sends ``[ai].api_key`` and the code sent for assistance over https that verifies
-    the endpoint's certificate. Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
+    Every call sends ``[ai].api_key`` and the code sent for assistance over https. The openers
+    the broker builds verify the endpoint's certificate; on a context handed in that does not set
+    ``CERT_REQUIRED``, the record says so instead of calling the hop verified, and its remedy is
+    the guard's (vault BACKLOG #4912). Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
     context, so without one a revoked but unexpired certificate would be accepted with no refusal
     and no record. ``crl_reachable`` says whether a ``[tls]`` policy reached the broker, and so
-    whether the refusal and the warning may offer ``[tls].crl_file``.
+    whether the refusal and the warning may offer ``[tls].crl_file``; they offer it only where
+    the guard's reason is that the context consults no CRL.
 
     The decision is ``tls_policy.revocation_hop_disposition``, the authority every revocation
     guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
@@ -311,11 +323,12 @@ def _refuse_an_unrevoked_ai_hop(
         refusal = str(exc)
     if refusal is not None:
         raise AiBrokerError(refusal)
-    # capture() reads the process-wide variable into its own field and the CRL and time-validity
-    # flags off the context, the same reads every RevocationHopGuard hop makes; disposition() asks
-    # revocation_hop_disposition, logging and raising nothing. Its cell, description and
-    # connection are never rendered here: the texts below are this hop's own. disposition() is
-    # never None, since a posture is held.
+    # capture() reads the process-wide variable into its own field and the context through
+    # crl_no_credit, the same reads every RevocationHopGuard hop makes; disposition() asks
+    # revocation_hop_disposition, logging and raising nothing. The texts below are this hop's own,
+    # worded from the guard's reason (guard.no_credit) and its stated_cell, so a context without
+    # CERT_REQUIRED is never called verified (vault BACKLOG #4912). disposition() is never None,
+    # since a posture is held.
     guard = RevocationHopGuard.capture(
         host=host,
         cell=_AI_HOP_CELL,
@@ -328,8 +341,13 @@ def _refuse_an_unrevoked_ai_hop(
     )
     disposition = guard.disposition()
     enforcing = held.enforcing
+    cell = guard.stated_cell
+    no_credit = guard.no_credit
     detail = (
-        f"the AI endpoint {host!r} is sent [ai].api_key over https that verifies its "
+        f"the AI endpoint {host!r} is sent [ai].api_key over https whose TLS context does not set "
+        "CERT_REQUIRED, and the guard credits a revocation check only on a context that does"
+        if no_credit is CrlNoCredit.PEER_NOT_REQUIRED
+        else f"the AI endpoint {host!r} is sent [ai].api_key over https that verifies its "
         "certificate, but NO certificate revocation checking (OCSP/CRL) is performed"
     )
     if disposition is HopDisposition.ALLOW:
@@ -343,7 +361,7 @@ def _refuse_an_unrevoked_ai_hop(
                 logger,
                 crossing=guard.crossing_lead,
                 connection=None,
-                detail=f"{_AI_HOP_CELL}: {detail}",
+                detail=f"{cell}: {detail}",
                 reason=revocation_reason,
                 declaration=guard.declaration,
             )
@@ -354,13 +372,15 @@ def _refuse_an_unrevoked_ai_hop(
                 "insecure transport hop permitted -- %s: %s; under [security].enforcement = "
                 "enforce this hop is refused unless %s[ai].endpoint_revocation_attested is true "
                 "with its reason",
-                _AI_HOP_CELL,
+                cell,
                 detail,
-                "a [tls].crl_file covering its issuer is set or " if crl_reachable else "",
+                "a [tls].crl_file covering its issuer is set or "
+                if crl_reachable and no_credit is CrlNoCredit.NO_CRL
+                else "",
             )
         return
     raise AiBrokerError(
-        f"{_AI_HOP_CELL}: {detail}. {_revocation_lever(crl_reachable=crl_reachable)}"
+        f"{cell}: {detail}. {_revocation_lever(crl_reachable=crl_reachable, no_credit=no_credit)}"
     )
 
 

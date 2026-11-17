@@ -2833,10 +2833,12 @@ _DEFAULT_WAYS_ACROSS: dict[CrlNoCredit | None, str] = {
 #: The word a caller's ``cell`` or ``description`` uses to call its hop verified, as in "(verified
 #: TLS, ...)" or "over verified https". On a hop whose context lacks ``CERT_REQUIRED`` the guard
 #: drops it from both before either is written into the refusal, the WARNING or the crossing line
-#: that :meth:`RevocationHopGuard.enforce_construction` writes (vault BACKLOG #4912). It removes
-#: the word only where a space follows it. A caller that writes its own record, as the AI broker
-#: does, is not covered. The word boundary keeps "unverified" whole.
-_VERIFIED_CLAIM = re.compile(r"\bverified\s+", re.IGNORECASE)
+#: that :meth:`RevocationHopGuard.enforce_construction` writes (vault BACKLOG #4912). Every
+#: whole word "verified" goes: with the whitespace after it, or, where punctuation follows it, as
+#: in "verified," or "verified)", with the whitespace before it. A caller that writes its own
+#: record, as the AI broker does, reads :attr:`RevocationHopGuard.stated_cell` for its cell and
+#: words the rest itself. The word boundary keeps "unverified" whole.
+_VERIFIED_CLAIM = re.compile(r"\s*\bverified\b(?=[^\w\s])|\bverified\b\s*", re.IGNORECASE)
 
 
 #: The attestation setting a revocation record names for a hop that is a connection.
@@ -2885,8 +2887,8 @@ class RevocationHopGuard:
     #: (:attr:`CrlNoCredit.PEER_NOT_REQUIRED`, :func:`crl_no_credit`). Descriptive only, like
     #: :attr:`expiry_relaxed`, and it outranks that field in :attr:`no_credit`. Where it is True the
     #: guard's own words do not call the peer certificate verified, and :attr:`stated_cell` and
-    #: :attr:`stated_description` drop "verified" and the space after it from the caller's
-    #: (vault BACKLOG #4912).
+    #: :attr:`stated_description` drop the word "verified" from the caller's, by the rule
+    #: :data:`_VERIFIED_CLAIM` states (vault BACKLOG #4912).
     peer_not_required: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). That is not only a hop outside a connection: a connection hop whose CRL
@@ -2977,7 +2979,7 @@ class RevocationHopGuard:
         ``ssl.CERT_REQUIRED`` outranks the relaxation: the hop earns no CRL credit, and an omitted
         ``ways_across`` becomes :data:`PEER_NOT_REQUIRED_WAYS_ACROSS` instead (vault BACKLOG #4912).
         :attr:`no_credit` holds the reason the record is worded from, and on such a hop the
-        record drops "verified" and the space after it from the caller's ``cell`` and ``description``
+        record drops the word "verified" from the caller's ``cell`` and ``description``
         (:attr:`stated_cell`).
 
         The flag can only take credit away, never grant it: on a context that skips the check, the
@@ -3040,8 +3042,9 @@ class RevocationHopGuard:
 
     @property
     def stated_cell(self) -> str:
-        """:attr:`cell` as the record writes it: with "verified" and the space after it removed where
-        :attr:`peer_not_required` is True, else unchanged (:data:`_VERIFIED_CLAIM`)."""
+        """:attr:`cell` as the record writes it: with the word "verified" removed where
+        :attr:`peer_not_required` is True, by the rule :data:`_VERIFIED_CLAIM` states, else
+        unchanged."""
         return self._as_stated(self.cell)
 
     @property

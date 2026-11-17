@@ -8,8 +8,9 @@ At least ``RevocationHopGuard.capture`` and the Vault and proxy legs in
 ``transports/strict_requests.py`` read it; until this change those two legs read
 ``context_checks_revocation`` alone. The leg tests below hand each leg a relaxed context. The guard
 words its record from the same reason. On a hop whose context does not set ``CERT_REQUIRED``, the
-records the guard writes do not call the hop verified where the caller's words say "verified "
-(the tests below pin the shipped words), and its default remedy offers no CRL. A remedy the
+records the guard writes do not call the hop verified where the caller's words say "verified"
+(the tests below pin the shipped words and the punctuated shapes), and its default remedy offers
+no CRL. The AI broker words its own record from the guard's reason; its own test pins that. A remedy the
 caller passes is used as given, and can still offer one.
 
 The scan fails a read of ``context_checks_revocation`` by that name anywhere in the engine package
@@ -301,10 +302,18 @@ def test_no_callers_words_call_a_peer_not_required_hop_verified(
 ) -> None:
     """The literal ``cell`` and ``description`` words of the capture callers, through the guard,
     on a hop whose context does not set ``CERT_REQUIRED``: neither the refusal nor the attested
-    crossing line the guard writes says "verified" (vault BACKLOG #4912). The AI broker's own
-    record is not written by the guard, so this does not cover it. Red with the guard writing the
-    caller's words unchanged."""
-    words = _caller_words()
+    crossing line the guard writes says "verified" (vault BACKLOG #4912). The shipped words are
+    joined by the shapes a caller could write next: "verified" before a comma, a closing
+    parenthesis, or the end of the text. The AI broker's own record is not written by the guard;
+    ``tests/test_ai_broker_revocation_guard.py`` covers it. Red with the guard writing the caller's
+    words unchanged, and the punctuated shapes red with a rule that drops the word only before a
+    space."""
+    words = _caller_words() + [
+        ("shape", "x (TLS verified, no revocation check)"),
+        ("shape", "x (TLS verified)"),
+        ("shape", "delivers over TLS that is verified"),
+        ("shape", "x (Verified, TLS)"),
+    ]
     # A floor, so a broken scan cannot pass over nothing: at least these callers say "verified".
     where = {w.split(":", 1)[0] for w, text in words if _VERIFIED.search(text)}
     for rel in (
