@@ -582,8 +582,9 @@ class SaturationThreshold(BaseModel):
     the ``[delivery]`` global default > built-in (off).
 
     ``min_growth`` is the rise, in messages, the alert needs before it fires (BACKLOG #5768,
-    :data:`SATURATION_MIN_GROWTH_DEFAULT`). The ``[delivery]`` key refuses a boolean; this model
-    takes what that key passes, or a code-first int."""
+    :data:`SATURATION_MIN_GROWTH_DEFAULT`). The ``[delivery]`` key refuses a boolean, as every
+    numeric settings key does (BACKLOG #5509); this model takes what that key passes, or a
+    code-first int."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
     min_growth: int = Field(

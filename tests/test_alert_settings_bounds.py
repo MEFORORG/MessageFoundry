@@ -4,8 +4,9 @@
 
 A huge timeout would let each wait on a peer hold the one-event-at-a-time alert worker, a
 non-finite one fails every send, an infinite cooldown would make the first page the last, a port
-outside 0-65535 would fail every send, and a boolean would load as a number, `true` as 1 and
-`false` as 0. Each is refused at load, and the defaults and the caps themselves still load.
+outside 0-65535 would fail every send. Each is refused at load, and the defaults and the caps
+themselves still load. A boolean on any of these numbers is refused by the shared settings check
+(BACKLOG #5509).
 """
 
 from __future__ import annotations
@@ -82,11 +83,7 @@ def test_in_range_rule_values_load() -> None:
     "field", ["webhook_timeout", "email_timeout", "realert_seconds", "email_smtp_port"]
 )
 def test_a_boolean_is_refused_for_a_numeric_alert_setting(field: str) -> None:
-    with pytest.raises(ValidationError, match="not a boolean"):
+    # The shared settings refusal (BACKLOG #5509) decides; the nested rule fields are pinned in
+    # tests/test_settings_numeric_refuses_bool.py.
+    with pytest.raises(ValidationError, match=f"{field} expects a number, not a boolean"):
         AlertsSettings.model_validate({field: True})
-
-
-@pytest.mark.parametrize("field", ["cooldown_seconds", "min_oldest_seconds", "min_depth"])
-def test_a_boolean_is_refused_for_a_numeric_rule_field(field: str) -> None:
-    with pytest.raises(ValidationError, match="not a boolean"):
-        AlertRule.model_validate({"event_type": "queue_buildup", field: True})

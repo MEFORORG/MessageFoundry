@@ -117,7 +117,7 @@ def test_saturation_threshold_default_off_and_toml_override(tmp_path: Path) -> N
 
 def test_saturation_min_growth_default_bounds_and_toml_override(tmp_path: Path) -> None:
     # BACKLOG #5768: the growth floor has a documented default, loads from the file, and refuses a
-    # value out of range or a boolean.
+    # value out of range or a boolean (the boolean refusal is the shared one, BACKLOG #5509).
     from pydantic import ValidationError
 
     from messagefoundry.config.models import (

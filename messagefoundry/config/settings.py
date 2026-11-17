@@ -2381,15 +2381,6 @@ class InboundSettings(_Section):
         return value
 
 
-def _refuse_a_bool(value: object, info: ValidationInfo) -> object:
-    """Refuse a TOML boolean for a numeric setting (BACKLOG #5770). Lax pydantic reads ``true`` as
-    1 and ``false`` as 0, so ``email_smtp_port = true`` would load as port 1 and pass the range
-    check."""
-    if isinstance(value, bool):
-        raise ValueError(f"{info.field_name} must be a number, not a boolean")
-    return value
-
-
 class DeliverySettings(_Section):
     """Global outbound-delivery defaults. An outbound connection that declares no ``retry=``/
     ``ordering=`` of its own inherits these; an explicit per-connection value overrides them
@@ -2484,10 +2475,6 @@ class DeliverySettings(_Section):
         """The global default :class:`StallThreshold` an outbound inherits when it sets none (#50,
         Corepoint "Max Message Stall"). ``None`` keeps the stall alert off by default."""
         return StallThreshold(max_oldest_seconds=self.stall_max_oldest_seconds)
-
-    _no_bool_saturation_numbers = field_validator(
-        "saturation_sustain_samples", "saturation_min_growth", mode="before"
-    )(_refuse_a_bool)
 
     def saturation_threshold(self) -> SaturationThreshold:
         """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
@@ -6072,10 +6059,6 @@ class AlertRule(BaseModel):
                 raise ValueError(f"transports must be a subset of [{allowed}]; unknown: {bad}")
         return v
 
-    _no_bool_numbers = field_validator(
-        "min_depth", "min_oldest_seconds", "cooldown_seconds", mode="before"
-    )(_refuse_a_bool)
-
     @field_validator("recipients")
     @classmethod
     def _check_recipients(cls, v: list[str] | None) -> list[str] | None:
@@ -6253,10 +6236,6 @@ class AlertsSettings(_Section):
     # per event + connection. Empty = today's behaviour (every event → every transport, global throttle).
     # Authored as ``[[alerts.rules]]`` tables in the config file. First match wins.
     rules: list[AlertRule] = []
-
-    _no_bool_numbers = field_validator(
-        "webhook_timeout", "email_smtp_port", "email_timeout", "realert_seconds", mode="before"
-    )(_refuse_a_bool)
 
     @field_validator("email_to", "webhook_allowed_hosts", "smtp_allowed_hosts", mode="before")
     @classmethod
