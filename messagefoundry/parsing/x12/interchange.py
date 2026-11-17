@@ -94,8 +94,10 @@ def split(raw: str) -> list[str]:
       included.
     * A run that does not open with ``ISA`` is returned as its own element and ends at the next
       ``ISA`` that passes, so a trigram in it ("VISA", "ISAAC") does not end it.
-    * A malformed or non-ISA element that ends at a later ``ISA`` loses the whitespace/BOM before
-      that ``ISA``.
+    * A malformed or non-ISA element that does not end at its own ``IEA`` loses the whitespace/BOM
+      at its end, before a later ``ISA`` or the end of the buffer. A malformed interchange with a
+      whole header keeps that run up to and through the first of its own segment terminators in
+      it, so a whitespace terminator closing its last segment stays.
 
     An element is not checked beyond that. A malformed one does not parse, but one cut at a later
     ``ISA`` before its ``IEA`` may: :func:`check_integrity` reports its missing trailers, and
@@ -130,15 +132,31 @@ def split(raw: str) -> list[str]:
             continue
         if good <= start:
             good = _next_isa_str(raw, start + 1)
+        terminator = ""
         if raw.startswith("ISA", start):
             # A malformed header: bound it by the next ISA that passes so it cannot swallow that one.
             end, at_iea = _malformed_end_str(raw, start, good)
+            if not at_iea and start + ISA_SEGMENT_LEN <= end:
+                terminator = _terminator_str(raw, start)
         else:
             end, at_iea = good, False  # non-ISA data — surface it
         # Ended at its own IEA it is kept verbatim, its terminator too, even a whitespace one.
-        out.append(raw[start:end] if at_iea else raw[start:end].rstrip(_LEADING_NOISE))
+        out.append(raw[start:end] if at_iea else _strip_before_isa(raw, start, end, terminator))
         pos = end
     return out
+
+
+def _strip_before_isa(raw: str, start: int, end: int, terminator: str) -> str:
+    """``raw[start:end]`` without the whitespace/BOM run at its end. With the ``terminator`` of a
+    malformed interchange, that run is kept up to and through the first terminator in it, so a
+    whitespace terminator closing its last segment stays (BACKLOG #5921)."""
+    kept = raw[start:end].rstrip(_LEADING_NOISE)
+    if terminator:
+        # Never inside the fixed-width header: whitespace there is element data, not a terminator.
+        at = raw.find(terminator, max(start + len(kept), start + _SEGMENT_TERM_OFFSET), end)
+        if at != -1:
+            return raw[start : at + len(terminator)]
+    return kept
 
 
 def _isa_complete_str(raw: str, isa: int) -> bool:
