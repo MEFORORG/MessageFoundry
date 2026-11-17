@@ -25,6 +25,7 @@ from typing import Any, NoReturn
 
 import pytest
 
+from messagefoundry import odbc_call_gate
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
@@ -1948,14 +1949,17 @@ def test_credential_free_cause_never_raises() -> None:
     )
 
 
-@pytest.mark.parametrize("broken", ["fault", "render"])
+@pytest.mark.parametrize("broken", ["fault", "render", "logger"])
 async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, broken: str
 ) -> None:
     """#5348, batch 613 review: ``stop()`` runs during reload quiesce, so a faulted poll task's
-    log line must neither raise nor keep the pool open. ``fault``: an error whose ``sqlstate``
-    raises, red when ``_credential_free_cause`` has no ``try``. ``render``: the renderer itself
-    raises, red when ``_finish_stop`` does not guard its log line."""
+    log line must not keep the pool open, and should not raise. ``fault``: an error whose
+    ``sqlstate`` raises; red when neither ``_credential_free_cause`` nor ``_finish_stop`` guards
+    it, since either guard prints the same note (``test_credential_free_cause_never_raises`` pins
+    the helper's alone). ``render``: the renderer itself raises; red
+    when ``_finish_stop`` does not guard its log line. ``logger``: every warning raises, so the
+    raise reaches ``stop()``; red when the close is not in a ``finally``."""
     src = _src(body_column="payload")
     fault_exc: Exception = _UnclassifiableError("x") if broken == "fault" else RuntimeError("y")
     if broken == "render":
@@ -1964,6 +1968,12 @@ async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
             raise RecursionError("too deep")
 
         monkeypatch.setattr(database_module, "_credential_free_cause", raising)
+    if broken == "logger":
+
+        def refusing(*args: Any, **kwargs: Any) -> NoReturn:
+            raise OSError("log sink gone")
+
+        monkeypatch.setattr(database_module.logger, "warning", refusing)
     closed: list[float | None] = []
 
     async def aclose(*, timeout: float | None = None) -> None:
@@ -1979,15 +1989,30 @@ async def test_finish_stop_closes_the_pool_whatever_the_fault_log_does(
         await task
     src._task = task
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
-        await src._finish_stop(task, interrupted=False)
+        if broken == "logger":
+            with pytest.raises(OSError, match="log sink gone"):
+                await src._finish_stop(task, interrupted=False)
+        else:
+            await src._finish_stop(task, interrupted=False)
     assert closed == [None], "the pool was not closed"
-    assert "poll task failed" in caplog.text  # the instrument fired
     assert src._task is None
+    if broken == "fault":
+        assert (
+            "poll task failed: _UnclassifiableError [message withheld: RuntimeError while "
+            "rendering it]" in caplog.text
+        )
+    elif broken == "render":
+        assert (
+            "poll task failed: RuntimeError [message withheld: RecursionError while rendering it]"
+            in caplog.text
+        )
 
 
-def _real_ungated_refusal() -> UngatedConnectionError:
+def _real_ungated_refusal(monkeypatch: pytest.MonkeyPatch) -> UngatedConnectionError:
     """The call gate's own refusal, raised by ``require_call_gate`` on an object it reads as a
-    real aioodbc connection it cannot wrap, so its text is the shipped one, not a copy."""
+    real aioodbc connection it cannot wrap, so its text is the shipped one, not a copy. Its
+    once-per-process report set is replaced for the test, so no state leaks to another."""
+    monkeypatch.setattr(odbc_call_gate, "_REPORTED", set())
     conn = type("Connection", (), {"__module__": "aioodbc.connection"})()
     with pytest.raises(UngatedConnectionError) as refused:
         require_call_gate(conn)
@@ -1996,9 +2021,12 @@ def _real_ungated_refusal() -> UngatedConnectionError:
 
 def test_credential_free_cause_bounds_the_engines_text() -> None:
     """#5348, batch 613 review: an engine error's text is printed, so it takes a bound, as the
-    ``safe_exc`` rendering it replaced did. Red mutation: print ``str(exc)`` unbounded."""
+    ``safe_exc`` rendering it replaced did. Red mutation: print ``str(exc)`` unbounded, or cut
+    it well past ``_ENGINE_TEXT_LIMIT``."""
     long = DeliveryError("DATABASE connect failed: " + "word " * 4000)
-    assert len(database_module._credential_free_cause(long)) < 1000
+    out = database_module._credential_free_cause(long)
+    assert out.startswith("DATABASE connect failed: word")
+    assert len(out) <= database_module._ENGINE_TEXT_LIMIT + 40  # the cut note's length
 
 
 #: The real statement_timeout refusal ``_apply_statement_timeout`` builds, SQLSTATE form.
@@ -2015,10 +2043,12 @@ async def test_the_engines_remedy_survives_whole_on_every_path(
     """#5348, batch 613 review: the call-gate refusal is about 235 characters, and its remedy is
     its tail, so a 200-character bound cuts it. Every path keeps it whole: the poll log, alone and
     inside a connect failure, the mark log, the connect error, the probe cause and the stopped
-    poll task's log. Red mutation: put back ``safe_exc``'s default bound in ``_poll_log_line``'s
-    fixed-text arm, or a bound under 260 in ``_credential_free_cause``."""
+    poll task's log. Red mutation, on ``ungated``: put back ``safe_exc``'s default bound in
+    ``_poll_log_line``'s fixed-text arm, or a bound under 260 in ``_credential_free_cause``.
+    ``nak`` is a control: its text is under 200 characters, and ``_connect`` re-raises it as it
+    stands, so no bound mutation reds it; it shows a ``NegativeAckError`` remedy kept whole."""
     exc: Exception = (
-        _real_ungated_refusal()
+        _real_ungated_refusal(monkeypatch)
         if kind == "ungated"
         else NegativeAckError(_TIMEOUT_REMEDY, code="HYC00", permanent=True, config_fault=True)
     )

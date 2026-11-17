@@ -3039,9 +3039,10 @@ _ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
 
 #: The bound on an engine error's text where :func:`_credential_free_cause` and
 #: :func:`_poll_log_line` print it. ``safe_exc``'s default of 200 cuts the call-gate refusal,
-#: about 235 characters whose remedy is its tail, and more inside a connect failure's prefix; this
-#: keeps that whole with room, and still bounds a text another module built.
-_ENGINE_TEXT_LIMIT = 600
+#: about 235 characters whose remedy is its tail, and about 275 inside a connect failure's prefix
+#: and a type name; this keeps that whole with room. It also bounds every other ``DeliveryError``,
+#: one another module built included, so it is kept no longer than that needs.
+_ENGINE_TEXT_LIMIT = 400
 
 
 def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
@@ -4811,35 +4812,42 @@ class DatabaseSource(SourceConnector):
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
+        fault: BaseException | None = None
         if task is not None and task.done():
             # A faulted poll task must not re-raise here — stop() runs during reload quiesce,
             # outside its rollback (mirrors the File source). It is logged instead, once, by the
             # stop() that clears it; reading it in every stop() keeps it from going unretrieved.
-            fault = None if task.cancelled() else task.exception()
+            done_fault = None if task.cancelled() else task.exception()
             if self._task is task:
                 self._task = None
-                if fault is not None:
-                    try:
-                        logger.warning(
-                            "DATABASE source poll task failed: %s", _credential_free_cause(fault)
-                        )
-                    except Exception as failure:  # noqa: BLE001 - the pool below must still close
-                        logger.warning(
-                            "DATABASE source poll task failed: %s [cause withheld: %s while "
-                            "rendering it]",
-                            type(fault).__name__,
-                            type(failure).__name__,
-                        )
-        if task is not None and self._task is not None and self._task is not task:
-            return  # a later start() made a new poll task, and the pool is now that task's
+                fault = done_fault
+        # False when a later start() made a new poll task: the pool is now that task's.
+        owns_pool = task is None or self._task is None or self._task is task
         try:
-            await self.aclose(timeout=_POOL_CLOSE_TIMEOUT_S if interrupted else None)
-        except Exception as exc:
-            if not interrupted:
-                raise
-            logger.warning(
-                "DATABASE source pool close failed after a cancel or a cut: %s", _safe_db_error(exc)
-            )
+            if fault is not None:
+                try:
+                    logger.warning(
+                        "DATABASE source poll task failed: %s", _credential_free_cause(fault)
+                    )
+                except Exception as failure:  # noqa: BLE001 - a fixed line in its place
+                    logger.warning(
+                        "DATABASE source poll task failed: %s [message withheld: %s while "
+                        "rendering it]",
+                        type(fault).__name__,
+                        type(failure).__name__,
+                    )
+        finally:
+            # The pool closes whatever the log line did: stop() runs during reload quiesce.
+            if owns_pool:
+                try:
+                    await self.aclose(timeout=_POOL_CLOSE_TIMEOUT_S if interrupted else None)
+                except Exception as exc:
+                    if not interrupted:
+                        raise
+                    logger.warning(
+                        "DATABASE source pool close failed after a cancel or a cut: %s",
+                        _safe_db_error(exc),
+                    )
 
     async def _join_poll(self, task: asyncio.Task[None]) -> bool:
         """Wait for the poll task, bounded outside a hand-off; on a cancel, apply stop()'s row-step
@@ -5509,19 +5517,17 @@ def _credential_free_cause(exc: BaseException) -> str:
 
     Every ``DeliveryError`` and ``NegativeAckError`` this module builds holds fixed text, a
     SQLSTATE and native number, a type name or a setting, never a driver message: at least
-    :func:`_connect` and :func:`_probe_db` build theirs with this function. One
-    another module raises is printed as it stands, a bound and not a guarantee. The text is
-    redacted and cut at :data:`_ENGINE_TEXT_LIMIT`, as ``safe_exc`` cuts it, and one holding a
-    codec error is named by ``safe_exc``'s fixed note.
+    :func:`_connect` and :func:`_probe_db` build theirs with this function. One another module
+    raises is printed too, so that is a bound and not a guarantee. Either way the text is
+    redacted and cut at :data:`_ENGINE_TEXT_LIMIT` by ``safe_text``, with no type prefix; one
+    whose ``str()`` would print a codec error takes :func:`_credential_free_detail` instead.
 
     It never raises, as the ``_safe_db_error`` it replaced at the mark-failure log and in
     ``_finish_stop`` never did: an error whose rendering raises is named by its type and a
     fixed note."""
     try:
-        if not isinstance(exc, _ENGINE_FIXED_TEXT):
+        if not isinstance(exc, _ENGINE_FIXED_TEXT) or prints_a_codec_error(exc):
             return _credential_free_detail(exc)
-        if prints_a_codec_error(exc):
-            return safe_exc(exc)
         return safe_text(str(exc), limit=_ENGINE_TEXT_LIMIT)
     except Exception as failure:  # noqa: BLE001 - see docstring: its callers are error arms
         return (
