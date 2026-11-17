@@ -274,7 +274,10 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
     try:
         return is_vault_unavailable(exc), is_vault_bad_request(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring
-        log.warning("Transit failure classifier raised %s; read as a 400", type(fault).__name__)
+        kind = type(fault)  # the class alone, so no frame is tied to the error
+        _warn_quietly(
+            lambda: ("Transit failure classifier raised %s; read as a 400", kind.__name__)
+        )
         return False, True
 
 
@@ -344,10 +347,10 @@ def _report_unlogged(fault: BaseException) -> None:
 def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2) -> bool:
     """``log.warning(*build())`` that never raises, and whether that call returned without raising
     (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
-    ``build`` is called inside the guard, so a fault rendering the message, such as a lazy import
-    in :func:`vault_failure_text`, is caught too. The audit verify path logs beside a verdict; a
-    raise there would otherwise turn a row's break into a walk that could not run. A failure is
-    reported by :func:`_report_unlogged`. The record names the caller ``stacklevel`` frames up."""
+    ``build`` is called inside the guard, so a fault building the message is caught too. The audit
+    verify path logs beside a verdict; a raise there would otherwise turn a row's break into a walk
+    that could not run. A failure is reported by :func:`_report_unlogged`. The record names the
+    caller ``stacklevel`` frames up."""
     try:
         log.warning(*build(), stacklevel=stacklevel)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
@@ -415,7 +418,10 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
         unavailable = is_vault_unavailable(exc)
         unauthenticated = op == "decrypt" and not unavailable and _names_aead_failure(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
-        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        kind = type(fault)  # the class alone, so no frame is tied to the error
+        _warn_quietly(
+            lambda: ("Transit failure classifier raised %s; read as a refusal", kind.__name__)
+        )
         unavailable = unauthenticated = False
     if unavailable:
         return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
@@ -837,6 +843,7 @@ class TransitCipher(_UnmarkedPolicy):
                         failure,
                     )
                 )
+                del failure  # else the error's traceback and this frame hold each other
             return False
         failed: Exception | None = None
         try:
@@ -1006,14 +1013,14 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            failure = probe_exc  # a closure may not name the except variable (ruff F821)
+            text = vault_failure_text(probe_exc)  # never raises; a str ties no frame to it
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
                     "latest version failed too (key=%r): %s",
                     key_version,
                     self._audit_key,
-                    vault_failure_text(failure),
+                    text,
                 )
             )
             return False
@@ -1026,12 +1033,9 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             return is_vault_unavailable(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
-            failure = fault  # a closure may not name the except variable (ruff F821)
+            kind = type(fault)  # the class alone, so no frame is tied to the error
             _warn_quietly(
-                lambda: (
-                    "Transit failure classifier raised %s; read as an outage",
-                    type(failure).__name__,
-                )
+                lambda: ("Transit failure classifier raised %s; read as an outage", kind.__name__)
             )
             return True
 
@@ -1054,13 +1058,13 @@ class TransitCipher(_UnmarkedPolicy):
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
-            failure = probe_exc  # a closure may not name the except variable (ruff F821)
+            text = vault_failure_text(probe_exc)  # never raises; a str ties no frame to it
             _warn_quietly(
                 lambda: (
                     "an audit MAC verify failed, and a verify over fixed input failed too "
                     "(key=%r): %s",
                     self._audit_key,
-                    vault_failure_text(failure),
+                    text,
                 )
             )
             return False

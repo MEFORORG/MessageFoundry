@@ -1703,8 +1703,8 @@ def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
 def test_a_fault_rendering_a_break_warning_keeps_the_break(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #6707: a warning's text is rendered inside its guard, so a fault there, such as a
-    lazy import in ``vault_failure_text``, leaves a row refused twice a break."""
+    """BACKLOG #6707: a warning's text is rendered inside its guard, so a fault there, here a
+    stand-in for ``vault_failure_text`` that raises, leaves a row refused twice a break."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -1719,6 +1719,54 @@ def test_a_fault_rendering_a_break_warning_keeps_the_break(
     monkeypatch.setattr(crypto_transit, "vault_failure_text", broken)
     assert cipher.verify_audit_hmac(b"row", stored) is False
     assert "could not be logged ('ImportError')" in capsys.readouterr().err
+
+
+def test_a_fault_rendering_vault_failure_text_keeps_a_malformed_mac_a_break(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6707: ``vault_failure_text`` never raises, so a fault rendering the cost-only
+    call's failure beside a malformed stored MAC still leaves the row's break, rather than an
+    error the verify does not read as a cipher failure; the text falls back to the type name."""
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from messagefoundry.transports import strict_requests
+    from tests.test_crypto_transit import _FakeClient
+
+    def broken(_exc: object) -> str:
+        raise ImportError("lazy import failed")
+
+    monkeypatch.setattr(strict_requests, "vault_failure_text", broken)
+    assert keyprovider_vault.vault_failure_text(RuntimeError("vault:v1:c3ludA==")) == "RuntimeError"
+
+    class _DownTransit(_FakeTransit):
+        def generate_hmac(self, **_kw: Any) -> dict[str, Any]:
+            raise RuntimeError("down")
+
+    cipher = TransitCipher(_FakeClient(_DownTransit()), _KEY_NAME)
+    assert cipher.verify_audit_hmac(b"row", "not a mac") is False
+
+
+def test_classifier_faults_log_through_the_guard(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #6707: a raising log filter beside a classifier fault does not replace the cipher
+    error ``_transit_failure`` returns, or the flags ``_classify_batch_failure`` returns."""
+    from messagefoundry.store import crypto_transit
+
+    def broken(_exc: object) -> bool:
+        raise KeyError("classifier")
+
+    monkeypatch.setattr(crypto_transit, "is_vault_unavailable", broken)
+    raising = _RaisingFilter()
+    crypto_transit.log.addFilter(raising)
+    try:
+        error = crypto_transit._transit_failure("decrypt", _KEY_NAME, RuntimeError("x"))
+        flags = crypto_transit._classify_batch_failure(RuntimeError("x"))
+    finally:
+        crypto_transit.log.removeFilter(raising)
+    assert type(error) is CipherError and "RuntimeError" in str(error)
+    assert flags == (False, True)
+    assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 2
 
 
 def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixture) -> None:

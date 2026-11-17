@@ -275,10 +275,20 @@ def vault_failure_text(exc: BaseException) -> str:
     """What a catch-all handler on this hop may say about ``exc``: the refusal's own fixed text for
     a refusal of the hop or its reply, else the type name only (BACKLOG #2318). Shared with
     ``crypto_transit.py``. The import is lazy so ``store/`` takes no ``transports/`` import at module
-    scope; see :func:`messagefoundry.transports.strict_requests.vault_failure_text`."""
-    from messagefoundry.transports.strict_requests import vault_failure_text as text
+    scope; see :func:`messagefoundry.transports.strict_requests.vault_failure_text`.
 
-    return text(exc)
+    Never raises (BACKLOG #6707): a fault while rendering, the lazy import's included, gives
+    ``exc``'s type name instead, so a handler that builds its error from this text still raises
+    that error."""
+    try:
+        from messagefoundry.transports.strict_requests import vault_failure_text as text
+
+        return text(exc)
+    except Exception:  # noqa: BLE001 -- see the docstring; the type name is the fallback
+        try:
+            return type(exc).__name__
+        except Exception:  # noqa: BLE001 -- a class whose name cannot be read
+            return "an exception whose text could not be rendered"
 
 
 def is_vault_bad_request(exc: BaseException) -> bool:
