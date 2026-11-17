@@ -29,21 +29,24 @@
     ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads the CA and
     ROOT system stores, and Python 3.13 and later set partial-chain verification, so a chain that
     reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
-    unless it holds a self-signed root and every other CA in it chains to a self-signed root
-    through the file's own certificates, each link's signature verified and its names compared as
-    decoded text, not as raw bytes. Not checked, at least: revocation, name constraints, path
-    length and extended key usage. Any self-signed CA in the file is installed in LocalMachine\Root,
-    whether or not another certificate in the file chains to it. With -Confirm the operator may
-    decline a root, but then nothing is imported if an approved CA chains only through it.
+    unless it holds a self-signed root and every other unexpired CA in it chains to a self-signed
+    root through the file's own unexpired certificates. Each link's signature is verified, and its
+    issuer name must equal its signer's subject byte for byte, as the Windows chain engine requires:
+    names that differ only in string type or letter case do not link there, so a file linked only
+    by such names is refused. Not checked, at least: revocation, name constraints, path length and
+    extended key usage. Any self-signed CA in the file is installed in LocalMachine\Root, whether
+    or not another certificate in the file chains to it. With -Confirm the operator may decline a
+    root; then nothing is imported if an approved CA chains only through it, unless that root is
+    already in the machine's own LocalMachine\Root store.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
 
     The file is read once. Every certificate it holds is shown, checked, and only then added, so
     nothing reaches a store that the operator was not shown. Roots are added first. An expired
-    certificate is listed and skipped, never installed. The whole file is refused, and nothing is
-    imported, in at least these cases: when any certificate in it is not marked as a CA by its
-    basic constraints, has a key usage that cannot sign certificates, carries a private key, or
+    certificate is listed and skipped, never installed, and is not checked as a CA. The whole file
+    is refused, and nothing is imported, in at least these cases: when any unexpired certificate in
+    it is not marked as a CA by its basic constraints, has a key usage that cannot sign certificates, carries a private key, or
     is signed in a way this script does not verify, when it holds no unexpired self-signed root,
     when an unexpired CA in it does not chain to an unexpired self-signed root through the file's
     unexpired certificates, when a DER value in it
@@ -59,9 +62,10 @@
     PEM armour is not looked for; no private key is ever loaded either way.
 
     Run from an elevated (Administrator) PowerShell prompt; -WhatIf needs no elevation and changes
-    nothing. Idempotent: a CA already in the machine's own Root or CA registry store is named and
-    left as it is. A copy seen only through Group Policy or the enterprise store does not count,
-    so that CA is added too.
+    nothing. Idempotent: a root already in the machine's own Root registry store, or any other CA
+    already in its own CA or Root registry store, is named and left as it is. A copy seen only
+    through Group Policy or the enterprise store does not count, so that CA is added too. A root
+    found only in the CA store is added to Root, since the CA store anchors nothing for SChannel.
 
 .PARAMETER CaPath
     Path to the CA certificate(s) to trust: a DER, base64 or PEM certificate (.cer/.crt/.pem, one
@@ -324,19 +328,17 @@ $SignatureHashes = @{
     '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
 }
 
-# Whether two distinguished names are the same name: equal as raw DER, or equal as decoded text
-# ignoring case. The decoded form lets a name encoded as a PrintableString in one certificate match
-# the same text encoded as a UTF8String in another, which RFC 5280 name matching treats as equal.
-# It is only a filter for candidate issuers: the signature check in Test-SignedBy is what decides.
+# Whether two distinguished names are the same name as the Windows chain engine links them: equal
+# as raw DER bytes. A name spelt as a PrintableString in one certificate and a UTF8String in another,
+# or in another letter case, does not link there (X509Chain.Build stops at PartialChain), so it does
+# not link here either, and a file that relies on such a link is refused rather than imported as a
+# chain SChannel cannot build. It is only a filter for candidate issuers: the signature check in
+# Test-SignedBy decides.
 function Test-SameName {
     param(
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X500DistinguishedName]$A,
         [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X500DistinguishedName]$B)
-    if ([Convert]::ToBase64String($A.RawData) -ceq [Convert]::ToBase64String($B.RawData)) { return $true }
-    $flags = [System.Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::None
-    # Ordinal, so only letter case is ignored; a culture-aware -eq would also drop ignorable code
-    # points such as a zero-width space.
-    return [string]::Equals($A.Decode($flags), $B.Decode($flags), [System.StringComparison]::OrdinalIgnoreCase)
+    return ([Convert]::ToBase64String($A.RawData) -ceq [Convert]::ToBase64String($B.RawData))
 }
 
 # Whether $Signer issued the certificate: the certificate's issuer is $Signer's subject
@@ -473,9 +475,55 @@ function Get-CaRefusal {
     }
     $algorithm = $Certificate.SignatureAlgorithm
     if (-not $SignatureHashes.ContainsKey($algorithm.Value)) {
-        return "it is signed with $($algorithm.FriendlyName) ($($algorithm.Value)), which this script does not verify"
+        # .NET has no friendly name for an OID it does not know, so the OID alone names it then.
+        $named = if ($algorithm.FriendlyName) { "$($algorithm.FriendlyName) ($($algorithm.Value))" } else { $algorithm.Value }
+        return "it is signed with $named, which this script does not verify"
     }
     return $null
+}
+
+# Which of the machine's own registry stores already holds the certificate where it counts, as a key
+# of $stores, or $null. A root counts only in Root, since the CA store anchors nothing for SChannel;
+# any other CA counts in CA or in Root, where it is trusted at least as far. The logical store
+# X509Store reads also shows Group Policy and enterprise copies; those are not read here, so a CA
+# held only there is added, and the import does not rest on that policy. $RegistryRoot is a
+# parameter only so a test can point it at a directory.
+function Get-PresentStoreName {
+    param(
+        [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)][string]$StoreName,
+        [string]$RegistryRoot = 'HKLM:\SOFTWARE\Microsoft\SystemCertificates')
+    $where = if ($StoreName -eq 'Root') { @('Root') } else { @('CertificateAuthority', 'Root') }
+    $registryName = @{ Root = 'ROOT'; CertificateAuthority = 'CA' }
+    foreach ($name in $where) {
+        # Path.Combine, not Join-Path, which throws for a drive this host lacks (HKLM: off Windows).
+        $own = [System.IO.Path]::Combine($RegistryRoot, $registryName[$name], 'Certificates', $Certificate.Thumbprint)
+        if (Test-Path -LiteralPath $own) { return $name }
+    }
+    return $null
+}
+
+# The certificates an approved CA may chain through: every approved one, and every declined one the
+# machine's own store already holds where it counts (Get-PresentStoreName), so declining a root the
+# machine already trusts does not leave the CAs under it without their root.
+function Get-AnchorSet {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Entries,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Approved,
+        [string]$RegistryRoot = 'HKLM:\SOFTWARE\Microsoft\SystemCertificates')
+    $set = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    $taken = @{}
+    foreach ($entry in $Approved) {
+        $taken[$entry.Certificate.Thumbprint] = $true
+        [void]$set.Add($entry.Certificate)
+    }
+    foreach ($entry in $Entries) {
+        if (-not $taken.ContainsKey($entry.Certificate.Thumbprint) -and
+            (Get-PresentStoreName -Certificate $entry.Certificate -StoreName $entry.StoreName -RegistryRoot $RegistryRoot)) {
+            [void]$set.Add($entry.Certificate)
+        }
+    }
+    return , $set
 }
 
 # --- read and check --------------------------------------------------------------
@@ -501,11 +549,12 @@ $nowUtc = [datetime]::UtcNow
 $refusals = [System.Collections.Generic.List[string]]::new()
 # Each certificate is checked before it is shown, so a refused one is listed with its reason and
 # never with a store it would not go to. The store shown is the one it is offered for and written to.
-# A certificate that passes on its own must also reach a self-signed root through this file's own
+# An expired certificate is skipped before any check, never installed, so nothing else about it can
+# refuse the file; only an unexpired CA that reaches its root through it is refused. An unexpired
+# certificate that passes on its own must also reach a self-signed root through this file's own
 # unexpired certificates, so an issuing CA whose root is not in the file is refused. Any self-signed
 # CA in the file is its own anchor and passes, so an unrelated root in the file is installed in Root
-# too. An expired certificate that passes on its own is skipped, never installed; only a CA that
-# reaches its root through it is refused.
+# too.
 $live = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
 foreach ($cert in $bundle) {
     if ($cert.NotAfter.ToUniversalTime() -ge $nowUtc) { [void]$live.Add($cert) }
@@ -514,13 +563,17 @@ Write-Host "The file holds $($bundle.Count) certificate(s):"
 $unverifiedRoot = $false
 $expiredRoot = $false
 $entries = @(foreach ($cert in $bundle) {
-    $target = $stores[(Get-CaStoreName -Certificate $cert)]
+    $storeName = Get-CaStoreName -Certificate $cert
+    $target = $stores[$storeName]
     $expired = $cert.NotAfter.ToUniversalTime() -lt $nowUtc
-    $why = Get-CaRefusal -Certificate $cert
-    if (-not $why -and -not $expired) {
-        $why = Get-ChainRefusal -Certificate $cert -Bundle $live
-        if ($why -and -not (Get-ChainRefusal -Certificate $cert -Bundle $bundle)) {
-            $why = 'it chains to a self-signed root in the file only through an expired certificate'
+    $why = $null
+    if (-not $expired) {
+        $why = Get-CaRefusal -Certificate $cert
+        if (-not $why) {
+            $why = Get-ChainRefusal -Certificate $cert -Bundle $live
+            if ($why -and -not (Get-ChainRefusal -Certificate $cert -Bundle $bundle)) {
+                $why = 'it chains to a self-signed root in the file only through an expired certificate'
+            }
         }
     }
     Write-Host ""
@@ -534,7 +587,8 @@ $entries = @(foreach ($cert in $bundle) {
     }
     # A self-issued certificate refused for a signature this script cannot verify may be the file's
     # root, so the error must not say the file holds none.
-    if ((Test-SelfIssued -Certificate $cert) -and -not $SignatureHashes.ContainsKey($cert.SignatureAlgorithm.Value)) {
+    if (-not $expired -and (Test-SelfIssued -Certificate $cert) -and
+        -not $SignatureHashes.ContainsKey($cert.SignatureAlgorithm.Value)) {
         $unverifiedRoot = $true
     }
     if ($why) {
@@ -547,7 +601,7 @@ $entries = @(foreach ($cert in $bundle) {
     } else {
         Write-Host "  Store      : $($target.Label)"
     }
-    @{ Certificate = $cert; Target = $target }
+    @{ Certificate = $cert; Target = $target; StoreName = $storeName }
 })
 # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
 # it would be trusted with no root's revocation or constraints over it (the help's "Where each CA
@@ -588,27 +642,29 @@ $approved = @(foreach ($entry in $entries) {
     }
 })
 # Under -Confirm the operator may decline a root or an intermediate CA. An approved CA must still
-# reach a root through the approved certificates alone, or it would land in LocalMachine\CA with no
-# root over it.
-$approvedSet = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-foreach ($entry in $approved) { [void]$approvedSet.Add($entry.Certificate) }
+# reach a root through the approved certificates and the declined ones the machine already holds
+# (Get-AnchorSet), or it would land in LocalMachine\CA with no root over it.
+$anchorSet = Get-AnchorSet -Entries $entries -Approved $approved
 $orphans = @(foreach ($entry in $approved) {
-    if (Get-ChainRefusal -Certificate $entry.Certificate -Bundle $approvedSet) {
+    if (Get-ChainRefusal -Certificate $entry.Certificate -Bundle $anchorSet) {
         "$($entry.Certificate.Thumbprint) ($(ConvertTo-PrintableText $entry.Certificate.Subject))"
     }
 })
 if ($orphans.Count -gt 0) {
     throw ("Nothing was imported. A root or intermediate CA was declined that these approved CAs " +
-        "chain through, and a CA is not imported without the path to its root: $($orphans -join '; ').")
+        "chain through, and the machine's own store does not hold it, so a CA is not imported " +
+        "without the path to its root: $($orphans -join '; ').")
 }
 
+if ($approved.Count -eq 0 -and -not $WhatIfPreference) {
+    Write-Host ""
+    Write-Host "Nothing was imported: every certificate was declined."
+}
 if ($approved.Count -gt 0) {
-    # A CA already in the machine's own store is named as such and left alone, since a later rotation
-    # must not remove it as the file's. That store is the machine's registry store. The logical
-    # store X509Store reads also shows Group Policy and enterprise copies, and skipping on one of
-    # those would leave the import resting on that policy. Roots go first, so a failure part way never leaves an approved issuing CA added
-    # and an approved root not. Nothing is rolled back; the error says how many were added.
-    $registryName = @{ Root = 'ROOT'; CertificateAuthority = 'CA' }
+    # A CA the machine's own store already holds (Get-PresentStoreName) is named as such and left
+    # alone, since a later rotation must not remove it as the file's. Roots go first, so a failure
+    # part way never leaves an approved issuing CA added and an approved root not. Nothing is
+    # rolled back; the error says how many were added.
     $added = 0
     $present = 0
     try {
@@ -619,10 +675,9 @@ if ($approved.Count -gt 0) {
             $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
             try {
                 foreach ($entry in $batch) {
-                    $thumb = $entry.Certificate.Thumbprint
-                    $own = "HKLM:\SOFTWARE\Microsoft\SystemCertificates\$($registryName[$name])\Certificates\$thumb"
-                    if (Test-Path -LiteralPath $own) {
-                        Write-Host "Already in $($stores[$name].Label), left as it was: $thumb"
+                    $found = Get-PresentStoreName -Certificate $entry.Certificate -StoreName $name
+                    if ($found) {
+                        Write-Host "Already in $($stores[$found].Label), left as it was: $($entry.Certificate.Thumbprint)"
                         $present++
                         continue
                     }
@@ -638,17 +693,21 @@ if ($approved.Count -gt 0) {
             "already present, before this failed: $($_.Exception.Message)")
     }
     Write-Host ""
-    Write-Host "Imported $added CA certificate(s); $present were already in their store."
+    if ($added -eq 0) {
+        Write-Host "Nothing was added: all $present approved certificate(s) were already in the machine's own store."
+    } else {
+        Write-Host "Added $added CA certificate(s); $present were already in the machine's own store."
+    }
     $notYet = @($approved | Where-Object { $_.Certificate.NotBefore.ToUniversalTime() -gt $nowUtc })
     if ($notYet.Count -gt 0) {
         # Staged ahead of its start: say when it will validate, not that it does.
         $from = ($notYet | ForEach-Object { $_.Certificate.NotBefore.ToUniversalTime() } |
             Sort-Object -Descending | Select-Object -First 1).ToString('u')
-        Write-Warning ("$($notYet.Count) imported certificate(s) are not valid yet. A chain through " +
+        Write-Warning ("$($notYet.Count) approved certificate(s) are not valid yet. A chain through " +
             "them does not validate before $from; do not roll the DB server cert onto it before then.")
-    } else {
-        # Every approved CA reached an approved root above, so a root is now in the Root store.
-        Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
+    } elseif ($added -gt 0) {
+        # Only after an add: every approved CA reached a root above, approved or already in Root.
+        Write-Host "A DB server cert chaining to these CAs now validates with" -ForegroundColor Green
         Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
     }
     Write-Host ""

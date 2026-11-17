@@ -128,3 +128,16 @@ def test_only_the_refusal_counts_as_a_refused_start(tmp_path: Path, host: str) -
     # The control: the clause the wait used to match alone is in both warning lines, so the old
     # criterion took an engine that went on to serve for a refused one.
     assert got["clause"] == [True, True, True, True, False], got
+
+
+def test_a_first_start_the_gate_let_go_on_is_not_attributed_to_store_access() -> None:
+    # Both first-start branches name the cause only as the control and restart branches do: the
+    # store-access attribution only when the gate did not let the start go on.
+    text = _SCRIPT.read_text(encoding="utf-8")
+    failure = 'Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. "'
+    assert text.count(failure) == 2
+    for at in [i for i in range(len(text)) if text.startswith(failure, i)]:
+        before = text[text.rindex("$cause = if", 0, at) : at]
+        assert before.startswith("$cause = if ($script:GateLetStartSeen) {"), before
+        assert "Get-Attribution" in before.split("else", 1)[1], before
+        assert "Get-Attribution" not in text[at : text.index("\n", at)]

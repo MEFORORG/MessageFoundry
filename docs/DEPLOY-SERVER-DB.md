@@ -567,7 +567,8 @@ partial-chain verification, so a chain that reaches a certificate in `LocalMachi
 there without its root. The helper refuses a file whose CAs do not chain to a self-signed root in
 it; its help says how it checks that, and that it installs any self-signed CA in the file into
 `LocalMachine\Root`. With `-Confirm`,
-declining a root that an accepted CA chains through imports nothing, so give it the root of the CA
+declining a root that an accepted CA chains through imports nothing, unless the machine's own
+`LocalMachine\Root` store already holds that root, so give it the root of the CA
 you mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root

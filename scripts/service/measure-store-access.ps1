@@ -996,8 +996,11 @@ try {
             $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
                     elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
-            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
-                (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+            # As in the control and restart branches: a gate that let the start go on rules out a
+            # lockout, so only a start it did not reach gets the store-access attribution.
+            $cause = if ($script:GateLetStartSeen) { "The store's access is not in question." }
+                     else { Get-Attribution $ServiceIdentity (Get-ServiceSids) "" }
+            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " + $cause)
             Show-LogTail
         } elseif ($noAdmin.Count -eq 0) {
             $line = @(Get-LogMatches ([regex]::Escape($GateRefusal)) |
@@ -1051,8 +1054,11 @@ try {
             $what = if ($script:GateLetStartSeen) { "created $DbPath and reached the ADR 0167 gate, which let the start go on (the READING line quotes it) rather than refusing it," }
                     elseif (Test-Path -LiteralPath $DbPath) { "created $DbPath but did not log the expected refusal line" }
                     else { "never created $DbPath" }
-            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " +
-                (Get-Attribution $ServiceIdentity (Get-ServiceSids) ""))
+            # As in the control and restart branches: a gate that let the start go on rules out a
+            # lockout, so only a start it did not reach gets the store-access attribution.
+            $cause = if ($script:GateLetStartSeen) { "The store's access is not in question." }
+                     else { Get-Attribution $ServiceIdentity (Get-ServiceSids) "" }
+            Add-Failure ("$ServiceIdentity $what within $WaitSeconds s on a fresh store. " + $cause)
             Show-LogTail
         } else {
             Add-Reading "$ServiceIdentity created and opened $DbPath, then the ADR 0167 gate refused it (expected)"
