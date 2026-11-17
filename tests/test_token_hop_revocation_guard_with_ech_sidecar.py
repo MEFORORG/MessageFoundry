@@ -19,6 +19,7 @@ builds, so the refusal is the guard and not a rejected sidecar setting.
 from __future__ import annotations
 
 import datetime
+import urllib.request
 from collections.abc import Callable
 from typing import Any
 
@@ -39,11 +40,13 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
 )
 from messagefoundry.config.wiring import Rest
-from messagefoundry.transports import build_destination, smart
+from messagefoundry.transports import build_destination, rest, smart
 from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
 from messagefoundry.transports.rest import (
     ECH_HOP_WAYS_ACROSS,
+    ProxyConfig,
     opener_tls_context,
+    proxy_config_from_settings,
     refuse_unrevoked_verified_hop,
 )
 from messagefoundry.transports.smart import token_provider_from_settings
@@ -221,10 +224,164 @@ def test_which_opener_the_token_hop_guard_is_handed(
     assert len(seen) == 1
     if ech:
         assert seen[0] is None
-        # The CRL did reach this opener. That is the context the guard must not read here.
-        assert _checks_a_crl(provider) is True
+        # Vault BACKLOG #2977 item 5: the CRL no longer reaches this opener either. It is the plain
+        # one the REST destination's ECH hop uses, anchored for no host, since it only ever meets
+        # the sidecar. Before, it carried the token host's anchor and CRL.
+        assert _checks_a_crl(provider) is False
     else:
         assert seen[0] is provider._opener
+        # CONTROL: without the sidecar the same CRL does reach the opener the provider keeps.
+        assert _checks_a_crl(provider) is True
+
+
+@pytest.mark.parametrize("name", _PROVIDERS)
+def test_the_ech_token_hop_opener_carries_no_proxy_and_no_token_host_anchor(
+    name: str, settings_for: dict[str, dict[str, object]], ca_pem: str
+) -> None:
+    """Vault BACKLOG #2977 item 5. With an ECH sidecar the token POST goes to the loopback sidecar.
+    The opener kept the token host's anchor, so with an https sidecar it would have handshaken with
+    the sidecar under the token host's CA. A per-connection ``tls_ca_file``, and a web proxy handed
+    to a provider built directly, now reach neither the opener nor the request. CONTROL: without
+    the sidecar both do."""
+    settings = {**settings_for[name], "tls_ca_file": ca_pem}
+    with_ech = _FACTORY[name](settings, ech_sidecar=SIDECAR, proxy=_proxy())
+    direct = _FACTORY[name](settings, proxy=_proxy())
+    assert _CA_NAME not in _anchor_names(with_ech._opener)
+    assert _proxy_map(with_ech._opener) == {}
+    assert with_ech._proxy_auth == {}
+    assert _anchor_names(direct._opener) == {_CA_NAME}
+    assert _proxy_map(direct._opener) == {"http": _PROXY_URL, "https": _PROXY_URL}
+
+
+# --- vault BACKLOG #2977 item 12: the token hop's opener shapes ----------------------------------
+#
+# The destination arms build a forward proxy and a per-connection CA file
+# (tests/test_http_destination_revocation_guard_reads_its_opener.py). These are the token hop's:
+# its guard is handed the opener the provider keeps and posts through, whatever its shape, and a
+# CRL that reaches that opener relaxes the refusal.
+
+_PROXY_URL = "http://10.0.0.9:3128"
+_CA_NAME = "mefor-2977-token-ca"
+
+
+@pytest.fixture(scope="module")
+def ca_pem(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A throwaway CA certificate for a per-connection ``tls_ca_file``. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _CA_NAME)])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - day)
+        .not_valid_after(now + 365 * day)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("ca2977") / "ca.pem"
+    path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    return str(path)
+
+
+def _proxy() -> ProxyConfig:
+    proxy = proxy_config_from_settings(
+        {"proxy_url": _PROXY_URL}, dest_scheme="https", connection=None
+    )
+    assert proxy is not None
+    return proxy
+
+
+def _anchor_names(opener: Any) -> set[str]:
+    """The common names of the CA certificates loaded into the opener's TLS context. A context on
+    the system store may list that store's roots, so a test reads one name, never an empty set."""
+    context = opener_tls_context(opener, connector="probe")
+    assert context is not None
+    names: set[str] = set()
+    for cert in context.get_ca_certs():
+        subject: Any = cert.get("subject", ())
+        for rdn in subject:
+            names.update(value for key, value in rdn if key == "commonName")
+    return names
+
+
+def _proxy_map(opener: Any) -> dict[str, str]:
+    for handler in opener.handlers:
+        if isinstance(handler, urllib.request.ProxyHandler):
+            return dict(getattr(handler, "proxies"))  # noqa: B009 -- untyped in typeshed
+    return {}
+
+
+_SHAPES = ["proxy", "ca_file"]
+
+
+def _shaped(
+    name: str,
+    shape: str,
+    settings_for: dict[str, dict[str, object]],
+    ca_pem: str,
+    *,
+    crl: str | None,
+) -> Any:
+    settings = dict(settings_for[name])
+    if shape == "ca_file":
+        settings["tls_ca_file"] = ca_pem
+    return _FACTORY[name](
+        settings,
+        proxy=_proxy() if shape == "proxy" else None,
+        trust_anchor_policy=TrustAnchorPolicy(crl_file=crl),
+    )
+
+
+@pytest.mark.parametrize("name", _PROVIDERS)
+@pytest.mark.parametrize("shape", _SHAPES)
+@pytest.mark.parametrize("with_crl", [True, False])
+def test_the_token_hop_guard_is_handed_the_opener_of_each_shape(
+    name: str,
+    shape: str,
+    with_crl: bool,
+    settings_for: dict[str, dict[str, object]],
+    ca_pem: str,
+    bare_crl: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[object] = []
+
+    def spy(*args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.get("opener"))
+        refuse_unrevoked_verified_hop(*args, **kwargs)
+
+    monkeypatch.setattr(smart, "refuse_unrevoked_verified_hop", spy)
+    # Unstamped, so it builds.
+    provider = _shaped(name, shape, settings_for, ca_pem, crl=bare_crl if with_crl else None)
+    assert seen == [provider._opener]
+    # CONTROL: the shape built the provider its own opener, so the identity is not the shared one.
+    assert provider._opener is not rest._shared_no_redirect_opener()
+    if shape == "proxy":
+        assert _proxy_map(provider._opener) == {"http": _PROXY_URL, "https": _PROXY_URL}
+    else:
+        assert _anchor_names(provider._opener) == {_CA_NAME}
+
+
+@pytest.mark.parametrize("name", _PROVIDERS)
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_a_crl_on_a_shaped_token_hop_relaxes_the_refusal(
+    name: str,
+    shape: str,
+    settings_for: dict[str, dict[str, object]],
+    ca_pem: str,
+    bare_crl: str,
+) -> None:
+    with active_hop_posture(PROD_PHI):
+        provider = _shaped(name, shape, settings_for, ca_pem, crl=bare_crl)
+    assert _checks_a_crl(provider) is True
+    # CONTROL: the same shape with no CRL is still refused, and names the token hop.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        _shaped(name, shape, settings_for, ca_pem, crl=None)
+    assert f"{name} token endpoint" in str(exc.value)
 
 
 def test_a_rest_destination_passes_its_sidecar_to_the_token_hop_guard(

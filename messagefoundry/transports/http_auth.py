@@ -56,6 +56,7 @@ from messagefoundry.transports.rest import (
     HttpAuthError,
     ProxyConfig,
     _ApprovedDigestMixin,
+    digest_proxy_meets_the_token_connect,
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
     http_family_trust_anchor,
@@ -63,6 +64,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credential_hop,
 )
 from messagefoundry.transports.smart import (
+    SmartBackendTokenProvider,
     _TokenEndpointProvider,
     smart_auth_configured,
     token_provider_from_settings,
@@ -273,6 +275,30 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         (which carries the bearer). The grant's encode and length were checked at construction."""
         data, headers = self._grant()
         return self._post_token(data, headers)
+
+
+def refuse_a_digest_proxy_on_the_token_hop(
+    s: Mapping[str, Any], *, no_proxy: object, connection: str | None
+) -> None:
+    """Refuse a connection whose bearer provider would mint at an https token endpoint through a
+    web proxy set up for Digest (vault BACKLOG #2989 items 11, 20 and 21).
+
+    :func:`~messagefoundry.transports.rest.proxy_auth_handler_from_settings` calls it for a Digest
+    proxy credential before it judges that credential's hop, so a connection refused here leaves no
+    record of a proxy-credential crossing. The rule is
+    :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with ``no_proxy`` as
+    the bypass list, and the refusal is the provider's own
+    (:meth:`~messagefoundry.transports.smart._TokenEndpointProvider.digest_proxy_refusal`). A mapping
+    that configures neither provider, or both, which :func:`bearer_provider_from_settings` refuses,
+    passes here."""
+    has_smart, has_oauth = smart_auth_configured(s), oauth2_auth_configured(s)
+    if has_smart == has_oauth:
+        return
+    provider: type[_TokenEndpointProvider] = (
+        SmartBackendTokenProvider if has_smart else OAuth2ClientCredentialsProvider
+    )
+    if digest_proxy_meets_the_token_connect(s.get(provider._URL_SETTING), no_proxy):
+        raise provider.digest_proxy_refusal(connection)
 
 
 def oauth2_cc_provider_from_settings(

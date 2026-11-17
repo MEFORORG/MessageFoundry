@@ -747,6 +747,43 @@ def test_url_userinfo_is_no_hop_whatever_proxy_auth_type_says() -> None:
     assert hop is not None and "forward-proxy digest credential" in hop.detail
 
 
+_DIGEST_PROXY = {
+    "proxy_url": "http://proxy.example.invalid:3128",
+    "proxy_user": "pu",
+    "proxy_password": "pp",
+    "proxy_auth_type": "digest",
+}
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        ["https://partner.example.invalid/x"],
+        ["http://partner.example.invalid/x", "https://auth.example.invalid/token"],
+    ],
+    ids=["https-destination", "https-token-endpoint"],
+)
+def test_a_digest_proxy_the_build_refuses_is_no_hop(
+    targets: list[object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2989 item 28. The build refuses a Digest web proxy on an https destination
+    (ADR 0126 AC-6) and on an https token endpoint the proxy meets (ADR 0095 B.1), so that hop never
+    runs and is not listed. CONTROLS: a Basic credential on the same targets is listed, and so is a
+    Digest one whose token host the bypass list names, which builds."""
+    import urllib.request
+
+    from messagefoundry.config.static_credentials import _proxy_hop
+
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+    assert _proxy_hop("OB", _DIGEST_PROXY, "", targets=targets) is None
+    basic = {**_DIGEST_PROXY, "proxy_auth_type": "basic"}
+    assert _proxy_hop("OB", basic, "", targets=targets) is not None
+    if len(targets) > 1:
+        bypassed = {**_DIGEST_PROXY, "proxy_no_proxy": ["auth.example.invalid"]}
+        hop = _proxy_hop("OB", bypassed, "", targets=targets)
+        assert hop is not None and "forward-proxy digest credential" in hop.detail
+
+
 # --- BACKLOG #1989 part b: a hop the engine never dials is not reported ----------------------------
 #
 # Each case has a control: the dialled form of the same configuration is still reported, so a reader

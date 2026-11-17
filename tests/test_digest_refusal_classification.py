@@ -686,9 +686,10 @@ _DIGEST_PROXY_REFUSED = "token endpoint is https and its web proxy is set up for
 @pytest.mark.usefixtures("no_bypass")
 def test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build() -> None:
     """BACKLOG #2989 item 11. An https token request meets its web proxy only as a CONNECT, and
-    urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest setup could
-    be minted. The build refuses it as a configuration fault, and nothing reaches the proxy. Fails
-    on the code before that change, which built the provider and stopped the lane at send."""
+    urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest setup
+    could never answer it and no token could be minted. The build refuses it as a configuration
+    fault, and nothing reaches the proxy. Fails on the code before that change, which built the
+    provider and stopped the lane at send."""
     with (
         _Challenger(407, _SHA256, refuse_answered=True) as proxy,
         pytest.raises(HttpAuthError) as ei,
@@ -748,10 +749,35 @@ def test_a_token_host_urllibs_bypass_list_names_still_builds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A token host urllib's own bypass list names gets the proxy handler with no credential and no
-    Digest handler (vault BACKLOG #3442), so the Digest setup never meets it and it builds."""
+    Digest handler (vault BACKLOG #3442), so the Digest setup never meets it and it builds. The
+    opener is read for the Digest handler itself (BACKLOG #2989 item 24): a Digest setup never puts
+    a pre-emptive header on the request, so an empty ``_proxy_auth`` held whatever the bypass did."""
     monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
     provider = _token_provider_via("http://127.0.0.1:3128", auth="digest")
-    assert provider._proxy_auth == {}
+    assert not _has_proxy_digest_handler(provider._opener)
+    assert any(isinstance(h, urllib.request.ProxyHandler) for h in _handlers(provider._opener))
+
+
+def _handlers(opener: urllib.request.OpenerDirector) -> list[object]:
+    return list(getattr(opener, "handlers"))  # noqa: B009 -- untyped in typeshed
+
+
+def _has_proxy_digest_handler(opener: urllib.request.OpenerDirector) -> bool:
+    return any(isinstance(h, urllib.request.ProxyDigestAuthHandler) for h in _handlers(opener))
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_the_digest_handler_reader_sees_one_on_an_http_token_hop() -> None:
+    """THE CONTROL for the reader above: a Digest proxy the token hop does use puts its handler on
+    the opener. Only an off-box http token host meets the proxy, and its build is refused for the
+    cleartext credential, so the handlers are read off the proxy resolved for that host."""
+    proxy = _digest_proxy_config("http://127.0.0.1:3128", auth="digest")
+    host_proxy = proxy.for_host("http://auth.partner.invalid/token")
+    assert host_proxy is not None
+    opener = urllib.request.OpenerDirector()
+    for handler in host_proxy.opener_handlers():
+        opener.add_handler(handler)
+    assert _has_proxy_digest_handler(opener)
 
 
 @pytest.mark.usefixtures("no_bypass")
@@ -831,9 +857,9 @@ def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build()
     """The configuration that reached the token hop's CONNECT 407 before BACKLOG #2989 item 11: a
     loopback ``http://`` REST destination, which goes direct, minting a bearer at an https token
     endpoint behind a web proxy set up for Digest. The destination is now refused when it is
-    built rather than stopping its lane at the first send. The connection's name leads the text
-    only where the runner mirrors it into the settings, which a direct build does not."""
-    with pytest.raises(HttpAuthError, match=f"^OAuth2 {_DIGEST_PROXY_REFUSED} "):
+    built rather than stopping its lane at the first send. The refusal runs where the proxy is
+    built, which knows the connection's name (BACKLOG #2989 item 20), so the name leads the text."""
+    with pytest.raises(HttpAuthError, match=f"^connection 'OB'; OAuth2 {_DIGEST_PROXY_REFUSED} "):
         _build(
             ConnectorType.REST,
             "http://127.0.0.1:9/x",
@@ -843,6 +869,47 @@ def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build()
             proxy_auth_type="digest",
             oauth2_token_url=_HTTPS_TOKEN_URL,
         )
+
+
+#: A non-loopback proxy, so its credential's hop is judged and, when accepted, recorded. Nothing
+#: dials it.
+_OFF_BOX_PROXY = "http://10.0.0.9:3128"
+_CROSSING = "web-proxy credential over cleartext http"
+
+
+def _build_off_box_proxy(auth: str) -> Any:
+    return _build(
+        ConnectorType.REST,
+        "http://127.0.0.1:9/x",
+        proxy=_OFF_BOX_PROXY,
+        proxy_user="pu",
+        proxy_password="pw",
+        proxy_auth_type=auth,
+        oauth2_token_url=_HTTPS_TOKEN_URL,
+    )
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_refused_token_hop_leaves_no_record_of_a_proxy_credential_crossing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2989 item 20. The refusal ran after the proxy credential's hop was judged, so a
+    connection refused at build still logged and audited an accepted crossing of a hop that never
+    runs. It now runs first. Fails on the code before that change."""
+    with caplog.at_level("INFO"), pytest.raises(HttpAuthError, match=_DIGEST_PROXY_REFUSED):
+        _build_off_box_proxy("digest")
+    assert not [r for r in caplog.records if _CROSSING in r.getMessage()]
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_an_accepted_proxy_credential_crossing_is_still_recorded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE CONTROL for the arm above: the same connection with a Basic proxy credential builds, and
+    its accepted crossing is recorded, so the empty result above is not a deaf instrument."""
+    with caplog.at_level("INFO"):
+        _build_off_box_proxy("basic")
+    assert [r for r in caplog.records if _CROSSING in r.getMessage()]
 
 
 @pytest.mark.usefixtures("no_bypass")

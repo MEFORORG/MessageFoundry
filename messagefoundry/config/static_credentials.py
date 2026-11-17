@@ -360,6 +360,27 @@ def _proxy_bypasses(target: object, no_proxy: object) -> bool:
     return proxy_bypasses_host(host, no_proxy)
 
 
+def _digest_proxy_refused(targets: Sequence[object], no_proxy: object) -> bool:
+    """Whether the build refuses a connection whose web proxy is set up for Digest, read from the
+    targets :func:`_proxy_targets` lists (vault BACKLOG #2989 item 28). Its own ``url`` written
+    ``https`` is refused whatever the bypass list says (ADR 0126 AC-6). A token URL is refused when
+    the transport's own rule says the proxy meets it on a ``CONNECT`` (ADR 0095 B.1). An ``env()``
+    reference is not read, so a hop whose URL comes from one is still listed."""
+    # Lazy, like ``_smart``: the transport owns both rules.
+    from messagefoundry.transports.rest import digest_proxy_meets_the_token_connect
+
+    if not targets:
+        return False
+    url, *token_urls = targets
+    if isinstance(url, str):
+        try:
+            if urllib.parse.urlsplit(url).scheme.lower() == "https":
+                return True
+        except ValueError:
+            pass  # the build refuses this url for its shape; the hop is listed as before
+    return any(digest_proxy_meets_the_token_connect(t, no_proxy) for t in token_urls)
+
+
 def _proxy_targets(
     ctype: ConnectorType, settings: Mapping[str, Any], *, lookup: bool = False
 ) -> list[object]:
@@ -397,7 +418,8 @@ def _proxy_hop(
     credential never leaves the engine. A loopback address always bypasses it, with no entry in the
     list (vault BACKLOG #2579). The bypass list is the connection's own, else the inherited
     ``[egress].proxy_no_proxy`` (``site_no_proxy``, ``None`` when the caller has no settings). With no
-    ``targets`` the hop is reported, because nothing says it is bypassed.
+    ``targets`` the hop is reported, because nothing says it is bypassed. Nor is a Digest proxy the
+    build refuses for those targets (:func:`_digest_proxy_refused`).
 
     The credential is the ``proxy_user``/``proxy_password`` pair. A user or a password in the proxy
     URL itself (:func:`_proxy_url_holds_credential`) is not a hop: the connector's build refuses it.
@@ -419,6 +441,8 @@ def _proxy_hop(
     # From a closed set, not echoed: only a known scheme name reaches the detail. The type is read
     # the way the transport reads it.
     kind = str(settings.get("proxy_auth_type") or "basic").strip().lower()
+    if kind == "digest" and _digest_proxy_refused(targets, no_proxy):
+        return None  # the build refuses the connection for its Digest proxy, so the hop never runs
     if kind not in ("basic", "digest"):
         kind = "static"
     return StaticCredentialHop(

@@ -2160,17 +2160,17 @@ class ProxyConfig:
         The record states the fact and names the connection, and nothing else. It carries no
         part of the proxy URL and no part of ``host``. Both are read out of the settings mapping
         that also holds the connection's credentials, and a proxy URL can carry userinfo."""
-        host = urllib.parse.urlsplit(url).hostname or ""
-        if _is_loopback_target(host):
+        route = _proxy_route(url, self.bypass)
+        if route == "loopback":
             logger.info(
                 "connection %s; the configured web proxy is not used for a loopback target, "
                 "because a loopback hop is always dialled direct",
                 audit_connection_name(self.connection),
             )
             return None
-        if _proxy_bypasses(host, self.bypass):
+        if route == "bypassed":
             return None
-        if _urllib_bypasses(url):
+        if route == "urllib-bypassed":
             # proxy_url = "default" carries no credential and means "follow the system's settings",
             # bypass list included, so following that list is no override and is not logged.
             if not self.use_default:
@@ -2185,6 +2185,41 @@ class ProxyConfig:
                 )
             return _HostProxy(self, credentialed=False)
         return _HostProxy(self)
+
+
+def _proxy_route(
+    url: str, bypass: tuple[str, ...]
+) -> Literal["loopback", "bypassed", "urllib-bypassed", "proxied"]:
+    """How :meth:`ProxyConfig.for_host` routes a request for ``url``, before it logs anything: a
+    loopback host, a host ``bypass`` names, a host urllib's own bypass list names, or the proxy. One
+    reading for that method and for :func:`digest_proxy_meets_the_token_connect`."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if _is_loopback_target(host):
+        return "loopback"
+    if _proxy_bypasses(host, bypass):
+        return "bypassed"
+    if _urllib_bypasses(url):
+        return "urllib-bypassed"
+    return "proxied"
+
+
+def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) -> bool:
+    """Whether a token request to ``token_url`` meets an explicit web proxy set up for Digest on a
+    ``CONNECT``, where Digest cannot answer the proxy's 407 (vault BACKLOG #2989, ADR 0095 B.1).
+
+    True for an ``https`` token URL the proxy is used for, as :meth:`ProxyConfig.for_host` resolves
+    it with ``no_proxy`` as the bypass list. Such a token hop is refused at build. The build reads
+    this before it judges the proxy credential, so a refused connection leaves no record of a
+    crossing, and the static-credential report reads it so it lists no proxy hop for one. A value
+    that is not a string, or that does not parse, answers ``False``."""
+    if not isinstance(token_url, str):
+        return False
+    try:
+        if urllib.parse.urlsplit(token_url).scheme.lower() != "https":
+            return False
+        return _proxy_route(token_url, _normalize_no_proxy(no_proxy)) == "proxied"
+    except ValueError:
+        return False
 
 
 def _urllib_bypasses(url: str) -> bool:
@@ -2331,6 +2366,14 @@ def proxy_auth_handler_from_settings(
                 "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
                 "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
             )
+        # The token hop's half of the same rule (vault BACKLOG #2989 items 11, 20 and 21), here so
+        # it runs before the guard below records the credential's crossing. Lazy: http_auth and
+        # smart import this module.
+        from messagefoundry.transports.http_auth import refuse_a_digest_proxy_on_the_token_hop
+
+        refuse_a_digest_proxy_on_the_token_hop(
+            s, no_proxy=s.get("proxy_no_proxy"), connection=connection
+        )
         result = (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
     elif kind in ("ntlm", "windows"):
         raise ValueError(
@@ -2487,8 +2530,8 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
-    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
+    target's scheme (for the digest-over-https refusal; a token hop's https endpoint the proxy meets
+    is refused for Digest by :func:`digest_proxy_meets_the_token_connect`'s rule, read off ``s``).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.
