@@ -32,9 +32,8 @@ module imports ``cryptography`` / ``hashlib``, it is registered in
 
 The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``, where
 the header digest is over the canonical header bytes the writer emits. The reader refuses a header
-not in that exact form, so a header changed in any byte is either refused or fails the tag. A
-reordered, dropped, truncated, or appended chunk, or a changed header field, changes the AAD and
-**fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
+not in that exact form, so a header changed in any byte is refused or fails closed. A reordered,
+dropped, truncated, or appended chunk changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
 decoder requires it, so a truncation that drops the tail frame is detected as a missing terminator, not
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.

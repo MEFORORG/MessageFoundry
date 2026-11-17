@@ -671,8 +671,10 @@ def test_a_header_respelled_with_the_same_fields_is_refused_before_decrypt(spell
     # The AAD hashes the re-serialized header, so these used to authenticate and decrypt.
     key = os.urandom(32)
     blob, _, _ = _archive(b"y" * 100, key)
+    out = io.BytesIO()
     with pytest.raises(bc.BackupCodecError, match="not in the form this format writes"):
-        bc.decrypt_stream(io.BytesIO(_respelled(blob, spell)), io.BytesIO(), key)
+        bc.decrypt_stream(io.BytesIO(_respelled(blob, spell)), out, key)
+    assert out.getvalue() == b""  # refused before a byte was decrypted
 
 
 def test_a_header_respelled_canonically_still_decrypts() -> None:
