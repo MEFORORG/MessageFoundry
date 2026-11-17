@@ -274,20 +274,18 @@ open points settled below.
   disposition each member of a batch gets. The mark is read in the decoded text, so under a
   single-byte charset its bytes are three characters, which the batch split keeps too, and a
   `utf-8-sig` or UTF-16 decode drops the mark itself. A one-message file whose decoded text starts
-  with `MSH` after whitespace, and that ends with no trailer line, is still handed over as its own
-  bytes. *Changed by BACKLOG #5806:* the split also drops the run of trailer lines that ends an
+  with `MSH` after whitespace is still handed over as its own bytes, less any trailer lines (next
+  sentence). *Changed by BACKLOG #5806:* the split also drops the run of trailer lines that ends an
   `MSH`-led message. A trailer line starts with `BTS`, `FTS`, `BHS` or
   `FHS` and then, right after the id, that message's own field separator (MSH-1, read from the
   message's own `MSH` line, and only when it is ASCII). So a data line such as `FHS: 140 bpm`, a
   bare `FHS`, `BTS^1` under `|`, and a line a space or a byte order mark leads all stay, and an
   empty line ends the run. The first chunk is read as before, so a `BTS` line before the first
-  `MSH` is still kept as a message for the parser. A one-message file led by `MSH` that ends with
-  trailer lines is handed over as the split read it, as a batch member is, so with CR line ends and
-  without its leading whitespace too. The whole-file byte scan sends a file holding `BTS`, `FTS`,
-  `BHS` or `FHS` right after a line break to the decode, so such a file that was handed over as
-  its bytes may now go over as the split read it, at least an `FHS`/`BHS`-led file whose `MSH`
-  line a space leads. `tests/test_msh_boundary_parity.py` holds `split_batch` to a copy of it as
-  it stood before, less the trailer lines.
+  `MSH` is still kept as a message for the parser. A whole-file source that handed a file over as
+  its bytes still does, less the bytes of the trailer lines the split drops from the message it
+  reads there, cut at the line break before them, so its line ends and leading whitespace stay.
+  `tests/test_msh_boundary_parity.py` holds `split_batch` to a copy of it as it stood before, and
+  `split_batch_bytes` to a copy of its own, each less the trailer lines.
 - **A second-`MSH` counter does not close ADR 0205's route 3.** There the smuggled header follows an
   embedded start byte, so the parser reads a segment whose id begins with that byte, not `MSH`. The
   embedded-byte refusal of ADR 0205 rule 4 runs first in the same guard and is what closes it.
@@ -585,9 +583,10 @@ segment, is still not a boundary. Each `_Boundary` is now one pattern that opens
 break, which no mark holds, so `_next_boundary` stays linear in the text however its boundaries
 are spelled, after one scan for `MSH` settles a text holding none.
 
-**The dry run.** The dry run's `split_messages` splits a latin-1 view of the bytes in which each
-UTF-8 mark's three bytes are spelled as the mark itself, so it cuts at a marked later `MSH` as the
-live sources do under UTF-8. Under a single-byte charset the live sources keep the three bytes and
+**The dry run, changed on purpose.** The dry run's `split_messages` splits a latin-1 view of the
+bytes in which each UTF-8 mark's three bytes are spelled as the mark itself, so it cuts at a marked
+later `MSH` as the live sources do under UTF-8. Before this change it stripped only the whitespace and
+one mark that lead the file, so it did not cut there and handed such a file over whole. Under a single-byte charset the live sources keep the three bytes and
 do not cut there, while the dry run still does. That is a further case of the gap vault #2853
 names, and it stays open.
 

@@ -25,10 +25,11 @@ BACKLOG #5806 changed the split on purpose, and only by dropping lines: an ``MSH
 longer ends with the run of envelope trailer lines (``BTS``, ``FTS``, ``BHS`` or ``FHS``, then that
 message's own MSH-1) that followed it. The split's copy is left as it stood, so it is the oracle
 for every other cut: the live split must give the copy's messages less those trailer lines, and
-nothing else (:func:`_less_the_trailer`). The byte scan's copy gains the one line marked BACKLOG
-#5806, and the whole-file split is held to a copy of it built on that scan, less the same lines;
-a file that copy hands over unsplit is compared as the split reads it. So that test does not hold
-the whole-file split to origin/main's. The corpus gained trailer tokens and the shapes a review of
+nothing else (:func:`_less_the_trailer`). The byte scan and its copy are unchanged. The whole-file
+split is held to a copy of origin/main's, on that scan: each message it re-encodes must come back
+less the same lines, and a file it hands over as its bytes must come back as those bytes less the
+bytes of the same trailer lines, its line ends and leading whitespace kept
+(:func:`_old_bytes_less_the_trailer`). The corpus gained trailer tokens and the shapes a review of
 that change named.
 """
 
@@ -94,10 +95,6 @@ def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
     if b"\rMSH" in raw or b"\nMSH" in raw:
         return True
     # BACKLOG #5918: a later MSH that UTF-8 byte order marks lead now needs a decode too.
-    # BACKLOG #5806: an envelope segment id right after a line break, a trailer line the split may
-    # drop, now needs a decode too.
-    if re.search(rb"[\r\n](?:BTS|FTS|BHS|FHS)", raw):
-        return True
     return _OLD_LATER_MSH_BYTES_PAST_BOM.search(raw) is not None
 
 
@@ -174,6 +171,27 @@ def _only_trailer_lines_gone(new: list[str], old: list[str]) -> bool:
     return True
 
 
+#: After each line break, a CR LF counting as one: the file's own lines, ends kept.
+_AFTER_A_LINE_BREAK = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
+
+
+def _old_bytes_less_the_trailer(raw: bytes, encoding: str) -> bytes:
+    """BACKLOG #5806, over a file the copy hands over as its bytes: those bytes less the file's own
+    last lines, as many as :func:`_less_the_trailer` drops from the copy's one message, so every
+    other byte, line ends and leading whitespace included, stays."""
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeError, LookupError):
+        return raw
+    (message,) = _old_split_batch(text)
+    kept = _less_the_trailer(message)
+    if kept == message:
+        return raw
+    dropped = message[len(kept) :].removesuffix("\r").count("\r") + 1
+    lines = [line for line in _AFTER_A_LINE_BREAK.split(text) if line]
+    return "".join(lines[:-dropped]).encode(encoding)
+
+
 # --- the corpus ---------------------------------------------------------------------------------
 
 #: Tokens for each shape the readings tell apart: both line ends, a whole and a broken ``MSH``,
@@ -220,6 +238,10 @@ _SHAPES = (
     "MSH^a\rPID^1\rBTS|1\rBTS^1\rFTS^1\r",
     "MSH|a\rBTS|1\r\rFTS|1\r",
     "MSH|a\rBTS|1\r" + BOM + "FTS|1\r",
+    # Round four: header lines after a line break sent this file to the decode, which read it
+    # past them where origin/main handed it over as its bytes.
+    "FHS|x\rBHS|y\r MSH|a\rPID|1\r",
+    " \r\nMSH|a\r\nPID|1\r\n",
 )
 REVIEW_SHAPES = [*_SHAPES, *(shape + "BTS|2\rFTS|1\r" for shape in _SHAPES)]
 
@@ -303,33 +325,45 @@ def test_the_corpus_drops_a_trailer_and_keeps_one() -> None:
         assert any(kept in text and text not in dropped for text in REVIEW_SHAPES)
 
 
+def _old_whole_file_less_the_trailer(raw: bytes, encoding: str) -> list[bytes]:
+    """What origin/main's whole-file split hands over for ``raw``, less the trailer lines."""
+    old = _old_split_batch_bytes(raw, encoding)
+    if old == [raw]:
+        return [_old_bytes_less_the_trailer(raw, encoding)]
+    return [_less_the_trailer(part.decode(encoding)).encode(encoding) for part in old]
+
+
+#: Each line ending, and the leading whitespace before an ``MSH`` the parser reads past.
+_SPELLINGS = (("\r", "\r"), ("\r", "\n"), ("\r", "\r\n"), ("", " \t"), ("", "\r\n"))
+
+
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "cp1252", "utf-16", "nope"])
-def test_the_whole_file_split_is_its_copy_less_the_trailer_lines(encoding: str) -> None:
-    # BACKLOG #5806: what a whole-file source hands over is what the copy, on the widened byte scan,
-    # hands over, message by message, less the trailer lines; any other difference fails.
+def test_the_whole_file_split_is_origin_mains_less_the_trailer_lines(encoding: str) -> None:
+    # BACKLOG #5806: what a whole-file source hands over is what origin/main's whole-file split
+    # hands over, part by part, less the trailer lines and nothing else: a re-encoded message less
+    # its trailer lines, and a file handed over as its bytes less their bytes.
     codec = "utf-16" if encoding == "utf-16" else "utf-8"
+    respelled = [shape.replace(cr, brk) for shape in REVIEW_SHAPES for cr, brk in _SPELLINGS if cr]
+    led = [lead + shape for shape in REVIEW_SHAPES for cr, lead in _SPELLINGS if not cr]
     wrong = []
-    for text in CORPUS:
+    for text in [*CORPUS, *respelled, *led]:
         raw = text.encode(codec)
-        new, old = split.split_batch_bytes(raw, encoding), _old_split_batch_bytes(raw, encoding)
-        if new == old:
-            continue
-        try:
-            new_text = [part.decode(encoding) for part in new]
-            # A file handed over unsplit is read as the split read it, past its leading noise.
-            unsplit = old == [raw]
-            old_text = [
-                normalize(part.decode(encoding)).lstrip(_LEADING_WS_STR)
-                if unsplit
-                else part.decode(encoding)
-                for part in old
-            ]
-        except (UnicodeError, LookupError):
-            wrong.append(text)
-            continue
-        if len(new) != len(old) or new_text != [_less_the_trailer(m) for m in old_text]:
+        if split.split_batch_bytes(raw, encoding) != _old_whole_file_less_the_trailer(
+            raw, encoding
+        ):
             wrong.append(text)
     assert wrong == []
+
+
+def test_the_whole_file_corpus_cuts_bytes_the_byte_scan_hands_over() -> None:
+    # A corpus in which no file the byte scan hands over as its bytes loses a trailer line, or
+    # every such file does, proves nothing about that path.
+    scanned = [body for body in BODIES if not _old_needs_a_decode(body, "utf-8")]
+    cut = [body for body in scanned if split.split_batch_bytes(body, "utf-8") != [body]]
+    assert cut
+    assert len(cut) < len(scanned)
+    assert b"FHS|x\rBHS|y\r MSH|a\rPID|1\r" in scanned
+    assert b"FHS|x\rBHS|y\r MSH|a\rPID|1\r" not in cut
 
 
 #: The earliest boundary each ``_Boundary`` names, written out again here as a plain regex.

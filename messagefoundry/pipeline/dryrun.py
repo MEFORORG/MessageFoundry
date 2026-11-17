@@ -1238,11 +1238,11 @@ def split_messages(raw: bytes) -> list[bytes]:
     U+0000..U+00FF: ``\\rMSH`` in that view is exactly ``b"\\x0dMSH"`` in the bytes. So the split is
     charset-agnostic — correct for every ASCII-compatible encoding without being told which one — and
     each member re-encodes to the file's own bytes. A payload holding a **single** message returns the
-    original bytes verbatim, exactly as the File source hands a non-batch file off, unless a byte
-    order mark or an ``FHS``/``BHS`` header the parser refuses leads it, or trailer lines end it
-    (BACKLOG #5806); only a batch, or such a message, pays the normalize (line endings collapsed to
-    ``\\r``, the leading ``FHS``/``BHS`` lines and the trailer lines dropped), which is the same transformation that source applies to a
-    batch.
+    original bytes, exactly as the File source hands a non-batch file off: less the bytes of any
+    trailer lines that end it (BACKLOG #5806), and as the split read it when a byte order mark or
+    an ``FHS``/``BHS`` header the parser refuses leads it. Only a batch, or such a message, pays the
+    normalize (line endings collapsed to ``\\r``, the leading ``FHS``/``BHS`` lines and the trailer
+    lines dropped), which is the same transformation that source applies to a batch.
 
     A UTF-16/32 payload has no ``b"\\x0dMSH"`` to find, so it comes back as one message and
     :func:`dry_run` decodes and parses it whole. That is narrower than the live File source, which
@@ -1251,7 +1251,9 @@ def split_messages(raw: bytes) -> list[bytes]:
 
     UTF-8 byte order marks are spelled as the mark itself in the view, whatever the connection's
     charset, so the split reads past leading ones and splits where marks lead a later ``MSH``, as
-    the live split of a UTF-8 decode does (BACKLOG #5918). The live remote-file source hands a file
+    the live split of a UTF-8 decode does. That is a deliberate change by BACKLOG #5918: before it,
+    only the whitespace and one byte order mark leading the file were stripped, so the dry run did not split
+    where marks lead a later ``MSH``. The live remote-file source hands a file
     its byte scan passes over as its bytes, so where that scan and the split disagree the two
     differ. Under a single-byte
     charset the live sources keep the three bytes, so there the dry run is more lenient than the
@@ -1266,9 +1268,9 @@ def split_messages(raw: bytes) -> list[bytes]:
     messages = split_batch(view)
     if marked:
         messages = [m.replace(_BOM, _LATIN1_BOM) for m in messages]
-    # A non-batch payload goes back byte-identical, as the File source hands one off, unless the
-    # parser would refuse what leads it, or trailer lines end it; that source then hands the
-    # message as the split read it.
+    # A non-batch payload goes back as its bytes, less any trailer lines, as the File source hands
+    # one off, unless the parser would refuse what leads it; that source then hands the message as
+    # the split read it.
     if len(messages) == 1:
         return [one_message_bytes(raw, view, messages[0], "latin-1")]
     return [m.encode("latin-1") for m in messages]

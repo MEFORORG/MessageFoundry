@@ -167,23 +167,43 @@ def test_the_first_chunk_is_read_as_before() -> None:
     assert split_batch(filed) == ["BTS|0\rBHS|^~\\&", ADT_A01]
 
 
-def test_base64_data_holding_an_envelope_id_stays_on_the_fast_path() -> None:
+def _splits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The texts ``split_batch_bytes`` decodes and splits, from here on."""
+    seen: list[str] = []
+    original = split_module._split_keeping_trailers
+
+    def _spy(raw: str | bytes) -> list[str]:
+        seen.append(str(raw))
+        return original(raw)
+
+    monkeypatch.setattr(split_module, "_split_keeping_trailers", _spy)
+    return seen
+
+
+def test_base64_data_holding_an_envelope_id_stays_on_the_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The byte scan reads an envelope id only right after a line break, so a one-message file
     carrying an embedded document whose base64 text holds ``BHS`` pays no decode. Mutation: search
-    ``[BF][HT]S`` anywhere. Red: the file needs a decode."""
+    ``[BF][HT]S`` anywhere. Red: the file is decoded and split."""
     document = "JVBERi0xLjQKBHSx" + "QUJD" * 64  # synthetic base64 text, "BHS" inside it
     raw = (ADT_A01 + "OBX|1|ED|DOC^Doc||^AP^PDF^Base64^" + document + "\r").encode("utf-8")
     assert b"BHS" in raw
-    assert split_module._needs_a_decode(raw, "utf-8") is False
+    seen = _splits(monkeypatch)
     assert split_batch_bytes(raw, "utf-8") == [raw]
+    assert seen == []
 
 
 @pytest.mark.parametrize("brk", [b"\r", b"\n"], ids=["cr", "lf"])
-def test_an_envelope_id_after_a_line_break_needs_a_decode(brk: bytes) -> None:
+def test_an_envelope_id_after_a_line_break_is_decoded(
+    brk: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Control: an envelope id right after a line break sends the file to the decode."""
     body = ADT_A01.encode("utf-8")
-    assert split_module._needs_a_decode(body + b"BTS|1" + brk, "utf-8") is True
-    assert split_module._needs_a_decode(body + brk + b"FTS|1", "latin-1") is True
+    seen = _splits(monkeypatch)
+    split_batch_bytes(body + b"BTS|1" + brk, "utf-8")
+    split_batch_bytes(body + brk + b"FTS|1", "latin-1")
+    assert len(seen) == 2
 
 
 def test_many_trailer_lines_split_in_linear_time() -> None:
@@ -196,16 +216,33 @@ def test_many_trailer_lines_split_in_linear_time() -> None:
     assert time.perf_counter() - began < 10
 
 
-@pytest.mark.parametrize("lead", ["", "\r\n"], ids=["msh-led", "whitespace-led"])
-def test_one_message_file_with_a_trailer_goes_over_as_a_batch_member_would(lead: str) -> None:
+@pytest.mark.parametrize("lead", ["", "\r\n", " \t\r\n  "], ids=["msh-led", "crlf-led", "ws-led"])
+@pytest.mark.parametrize("brk", ["\r", "\n", "\r\n"], ids=["cr", "lf", "crlf"])
+def test_one_message_file_loses_only_its_trailer_lines_bytes(lead: str, brk: str) -> None:
     """Round-one review of BACKLOG #5806: a one-message file led by MSH was handed over as its own
-    bytes, trailer included, where the same message led by a header lost it. Mutation: return
-    ``raw`` whenever the text starts with MSH. Red: the trailer reaches the Handler."""
-    raw = (lead + ADT_A01 + "BTS|1\rFTS|1\r").encode("utf-8")
-    assert split_batch_bytes(raw, "utf-8") == [ADT_A01.encode("utf-8")]
+    bytes, trailer included, where the same message led by a header lost it. Round four: it went
+    over normalized, its line ends and leading whitespace changed too. It now goes over as its own
+    bytes less the trailer lines' bytes. Mutation: return ``raw``, or the split's message
+    re-encoded, whenever the text starts with MSH. Red: the trailer, or CR line ends."""
+    body = lead + ADT_A01.replace("\r", brk) + "OBX|1|TX|||café" + brk
+    raw = (body + "BTS|1" + brk + "FTS|1" + brk).encode("utf-8")
+    assert split_batch_bytes(raw, "utf-8") == [body.encode("utf-8")]
+    # A trailer with no final line break goes too.
+    assert split_batch_bytes((body + "FTS|1").encode("utf-8"), "utf-8") == [body.encode("utf-8")]
     # Control: with no trailer line the file is still handed over as its own bytes.
-    for clean in (lead + ADT_A01, lead + ADT_A01 + "FHS: 140 bpm\r"):
+    for clean in (body, body + "FHS: 140 bpm" + brk):
         assert split_batch_bytes(clean.encode("utf-8"), "utf-8") == [clean.encode("utf-8")]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "cp1252"])
+def test_a_file_the_byte_scan_hands_over_keeps_its_bytes_but_its_trailer(encoding: str) -> None:
+    """Round-four review of BACKLOG #5806: a file holding a header id after a line break went to
+    the decode, so a file origin/main handed over as its bytes went over as the split read it.
+    Mutation: send such a file through the split's one-message rule. Red: the header lines go."""
+    raw = b"FHS|x\rBHS|y\r MSH|a\rPID|1\r"
+    assert split_batch_bytes(raw, encoding) == [raw]
+    # A trailer line the split drops is cut from those bytes, and nothing else changes.
+    assert split_batch_bytes(raw + b"BTS|1\r\n", encoding) == [raw]
 
 
 def test_split_batch_keeps_a_segment_that_only_follows_an_envelope_line() -> None:
