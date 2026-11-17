@@ -1,7 +1,6 @@
 # Claude Code remains the source of hook policy. The bridge reads it on each event.
 # A launcher that cannot run the bridge, or a missing pwsh, is a non-blocking error on every event.
-# Where PowerShell runs this line, pwsh -Command reports the launcher's exit 2 as a non-blocking 1;
-# a hook's JSON deny reaches Codex under every outer shell.
+# Where PowerShell runs this line, pwsh -Command reports the launcher's exit 2 as a non-blocking 1.
 # docs/CODEX.md, "Who decides a block", states the rule.
 [features]
 hooks = true

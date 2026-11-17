@@ -29,11 +29,7 @@ claim a failed hook ran.
 
 ### Who decides a block
 
-Only a hook blocks. As in Claude Code, a hook's exit 2 blocks. So does a hook
-that sets `"onFailure": "block"` when it fails: a non-zero exit, a timeout, a
-command that cannot start, a defect of its own such as an unsupported handler
-type or shell, or a defect in its group, such as a matcher that is not a valid
-regex, that keeps it from running. Any other hook failure is a
+Only a hook blocks. Any other hook failure is a
 non-blocking error, which the bridge reports on stderr and as a `systemMessage`.
 A JSON `permissionDecision` deny from a hook is a decision, not a failure.
 
@@ -60,14 +56,8 @@ its code.
 
 Codex's documentation does not say which shell runs a hook command. Under a
 PowerShell outer shell, `pwsh -Command` reports the launcher's exit 2 as a
-non-blocking 1, so no exit 2 blocks under it. A hook's JSON deny reaches Codex
-under every outer shell. With `pwsh` missing, the line exits 1 under a
+non-blocking 1, so no exit 2 blocks under it. With `pwsh` missing, the line exits 1 under a
 PowerShell outer shell.
-
-**A future guard that must block when it fails sets
-`"onFailure": "block"`.** That holds only for a hook the bridge reaches: a
-launcher with no decision, or a bridge fault, such as a payload with no session
-id, never blocks.
 
 The bridge differs from Claude Code in at least four ways. It runs an event's
 hooks one after another, where Claude Code runs them in parallel. Exit 2 stops
