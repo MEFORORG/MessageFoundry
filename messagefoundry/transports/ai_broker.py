@@ -248,12 +248,14 @@ def _refuse_an_unrevoked_ai_hop(
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
-      through, never off a setting. It is ``True`` only when that context passes
-      ``crl_credited``, which among other conditions refuses a context that skips time validity
-      and so would accept a CRL past its ``nextUpdate`` (vault BACKLOG #5086, #4912). It is
-      ``True`` when ``[tls].crl_file`` reached the hop through :func:`_endpoint_opener`
-      (BACKLOG #5527). Otherwise the opener is rest.py's shared one,
-      which loads no CRL, or one carrying only ``[tls].internal_ca_file``, so it is ``False``.
+      through, never off a setting. It is ``True`` only when
+      :func:`~messagefoundry.config.tls_policy.crl_no_credit` gives no reason against that
+      context: it sets ``CERT_REQUIRED``, does not skip validity-period checks, which would
+      accept a CRL past its ``nextUpdate``, and consults a CRL (vault BACKLOG #5086, #4912). That
+      function's docstring is the source of record for the conditions. It can be ``True`` when
+      ``[tls].crl_file`` reached the hop through :func:`_endpoint_opener` (BACKLOG #5527).
+      Otherwise the opener is rest.py's shared one, which loads no CRL, or one carrying only
+      ``[tls].internal_ca_file``, so it is ``False``.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
       lone surrogate, are refused here as at settings load, so a broker built directly cannot
       cross with no recorded reason or forge a log line through it.
@@ -339,7 +341,7 @@ def _refuse_an_unrevoked_ai_hop(
         if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,
-                crossing="verified TLS hop crossed without certificate revocation checking",
+                crossing=guard.crossing_lead,
                 connection=None,
                 detail=f"{_AI_HOP_CELL}: {detail}",
                 reason=revocation_reason,

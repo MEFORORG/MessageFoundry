@@ -1870,7 +1870,12 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
     The one builder for both verifying branches. :func:`_build_ssl` calls it once at pool open, to run
     the refusals against a real context. The pool's ``connect`` hook calls it again for EVERY new
     connection (BACKLOG #300), so each handshake reads the trust store and the CRL file as they are
-    then, which is what asyncpg's own ``ssl=True`` did for the system trust store."""
+    then, which is what asyncpg's own ``ssl=True`` did for the system trust store.
+
+    With ``[store].ssl_crl_file`` set, it loads that CRL and sets ``VERIFY_CRL_CHECK_LEAF``
+    (``harden_crl_check``), or raises. Unset, it loads no CRL and leaves that flag clear, so the
+    context checks no revocation and the store's revocation guard credits it nothing
+    (:func:`_refuse_store_revocation`)."""
     if settings.ssl_root_cert:
         # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
         # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
@@ -2020,9 +2025,9 @@ def _refuse_store_revocation(
     presence of a setting. ``_build_ssl``
     supplies it on both verifying branches. It is built at pool open and not handshaken on: the pool
     builds each connection's context afresh (:func:`_per_connection_ssl_connect`). Both come from
-    :func:`_verifying_context` with the same settings, and that builder either sets
-    ``VERIFY_CRL_CHECK_LEAF`` or
-    raises, so this verdict holds for every connection. Before BACKLOG #300 the default branch
+    :func:`_verifying_context` with the same settings. With ``[store].ssl_crl_file`` set, that
+    builder either sets ``VERIFY_CRL_CHECK_LEAF`` or raises; unset, it loads no CRL, so the guard
+    credits none. Either way this verdict holds for every connection. Before BACKLOG #300 the default branch
     returned ``True`` and passed ``None`` here, because asyncpg built that context and a CRL had
     nowhere to load."""
     RevocationHopGuard.capture(

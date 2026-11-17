@@ -232,7 +232,7 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         # Descriptive only: the record's wording reads it, no disposition does (vault BACKLOG #5086).
         "expiry_relaxed",
         # Descriptive only too: a context without CERT_REQUIRED (vault BACKLOG #4912).
-        "unverified",
+        "peer_not_required",
         "ways_across",
         "attested_reason",
         "connection",
