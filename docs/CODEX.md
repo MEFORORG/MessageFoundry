@@ -27,11 +27,12 @@ adapter; alias matching alone cannot translate an edit payload.
 New event types appear as unmapped at startup. Unsupported handler types and
 failed commands report errors. The bridge does not silently claim they ran.
 Command-only hooks use PowerShell on Windows and `sh` elsewhere; structured
-`command` and `args` avoid shell parsing. On Windows a command-only hook's exit 2
-does not reach Codex as a block: its `pwsh -Command` reports it as 1, which the
-bridge treats as a failed hook. A structured hook's exit 2 reaches Codex as 2,
-except where Codex runs the hook line under PowerShell, which reports it as 1.
-Codex's documentation does not say which shell runs a hook command.
+`command` and `args` avoid shell parsing. `pwsh -Command` reports an exit 2 from
+a script or program it runs as 1, which the bridge treats as a failed hook, not
+a block. So on Windows a command-only hook blocks only through an `exit 2` in its
+own text. A block reaches Codex as exit 2, except where Codex runs the hook line
+under PowerShell, which reports it as 1. Codex's documentation does not say
+which shell runs a hook command.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

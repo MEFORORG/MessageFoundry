@@ -11,8 +11,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Create this worktree''s .venv first; see docs/WORKTREES.md.'
 }
 # The bridge exits 10 (BLOCK_EXIT in bridge.py) for a hook block only where this flag is set, and
-# it is set only in hook mode, where the mapping below ends the process with 2. The bridge pops it,
-# so no child sees it; the finally keeps it out of a caller's session.
+# it is set only where `hook` is the first argument, where the mapping below ends the process with
+# 2. The bridge pops it, so no child sees it; the finally keeps it out of a caller's session.
 $hookMode = $args[0] -ceq 'hook'
 $env:MEFOR_CODEX_BLOCK_SENTINEL = if ($hookMode) { '1' } else { $null }
 try {

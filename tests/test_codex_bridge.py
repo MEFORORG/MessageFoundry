@@ -543,7 +543,7 @@ def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
     elif not venv and path == "direct":
         pytest.skip("the direct path never reads a .venv")
     else:
-        root = _make_repo(tmp_path, settings_text, venv)
+        root = _make_repo(tmp_path, settings_text, venv and path != "direct")
         if path == "direct":
             completed = _direct(root, "hook", payload=payload, **{_SENTINEL: "1"})
         else:
