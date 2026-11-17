@@ -200,7 +200,7 @@ _TEXT_WINDOW_BYTES = 8192
 #: data descriptor). A ZIP reader finds the archive from its END, so a ZIP or DOCX appended after a
 #: text head is still an archive; a signature anywhere in the body is refused, not only a leading one
 #: (BACKLOG #5368). Each carries two C0 control bytes, so a text log does not contain one by chance.
-_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08")
+_ZIP_SIGNATURES = (*_MAGIC_PREFIXES["application/zip"], b"PK\x01\x02")
 
 
 def nontext_upload_reason(data: bytes) -> str | None:
@@ -354,8 +354,9 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
     platform, since an archive's name is judged for where it may be written, not where it was read.
     They do NOT refuse every alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or
     a long name beside its 8.3 short form still pass, so a Handler writing members on Windows keeps
-    its own collision check. A caller that writes on the host it runs on, and only there, may pass
-    ``windows_names=False`` off Windows, as the DR config restore does."""
+    its own collision check. ``windows_names=False`` turns off only these arms; the drive-relative
+    and backslash arms above still bind. The DR config restore passes it, for the reason its own
+    docstring gives."""
     if not isinstance(name, str) or not name:
         return "member name is empty"
     if has_control_char(name):
@@ -364,6 +365,7 @@ def archive_member_name_reason(name: object, *, windows_names: bool = True) -> s
         return "member name contains a backslash, which a slash-only containment check cannot see"
     if len(name) >= 2 and name[0].isascii() and name[0].isalpha() and name[1] == ":":
         return "member name is drive-relative"
+    # The colon and trailing dot-or-space arms overlap ntpath.isreserved; they stay for their reasons.
     if windows_names and ":" in name:
         return "member name contains a colon, which Windows reads as a drive or a data stream"
     if name.startswith("/"):

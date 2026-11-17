@@ -627,8 +627,7 @@ def test_archive_member_name_reason_admits_near_miss_windows_names(name: str) ->
 
 @pytest.mark.parametrize("name", ["aux.py", "sub/con.toml", "x/a:b.toml", "trailing.", "y/z "])
 def test_archive_member_name_reason_windows_arms_can_be_turned_off(name: str) -> None:
-    # The DR config restore writes on the host it runs on, so it passes windows_names=False off
-    # Windows; the other arms still bind there.
+    # The DR config restore passes windows_names=False; the traversal arms still bind there.
     assert archive_member_name_reason(name) is not None
     assert archive_member_name_reason(name, windows_names=False) is None
     assert archive_member_name_reason("../" + name, windows_names=False) is not None

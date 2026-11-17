@@ -1713,21 +1713,6 @@ def test_a_nul_free_zip_record_past_the_head_is_refused(signature: bytes, after:
         validate_upload_content("a.hl7", data)
 
 
-def test_a_real_zip_appended_past_the_head_is_refused() -> None:
-    """BACKLOG #5368: a whole DOCX-shaped archive appended past the sample is refused. A real
-    archive carries NUL bytes, which refuse it first; the NUL-free test above pins the ZIP arm."""
-    import io
-    import zipfile
-
-    from messagefoundry.parsing.sniff import nontext_upload_reason
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("word/document.xml", "<w:document/>")
-    data = b"<root/>\n" + _PAST_THE_SAMPLE + buffer.getvalue()
-    assert nontext_upload_reason(data) is not None
-
-
 def test_text_that_merely_mentions_pk_is_admitted() -> None:
     """The must-not-fire arm: the letters PK without the two control bytes are ordinary text."""
     from messagefoundry.parsing.sniff import nontext_upload_reason
