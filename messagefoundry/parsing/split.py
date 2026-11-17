@@ -15,8 +15,10 @@ reused by the dry-run / Test Bench:
   handler-side equivalent of Corepoint's ``ItemSplit`` — a pure helper a Handler calls to fan one
   order message out into per-order messages.
 
-Both read the message's **own** separators (MSH-1/MSH-2) and go through the :class:`Message`
-primitive — never raw string-slicing of structured HL7.
+:func:`split_by_obr` reads the message's **own** separators (MSH-1/MSH-2) and goes through the
+:class:`Message` primitive. :func:`split_batch` cuts the received text into whole lines with no
+parse: at ``MSH`` boundaries, past leading header lines, and before the trailer lines that end a
+message, whose test reads that message's MSH-1.
 """
 
 from __future__ import annotations
@@ -282,9 +284,11 @@ def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> byt
     where ``text`` is the text the split was given: ``raw`` decoded with ``encoding``, or the dry
     run's latin-1 view of it.
 
-    ``raw`` itself, byte for byte, when the split found no ``MSH``-led message, or when the parser
-    reads ``text`` as it is and the split dropped no trailer line from it: ``text`` starts with
-    ``MSH`` after whitespace, and ends with no trailer line (:func:`_trailer_start`). Otherwise the
+    ``raw`` itself, byte for byte, when the split found no ``MSH``-led message, or when ``text``
+    starts with ``MSH`` after whitespace and :func:`_ends_with_a_trailer` finds no trailer line in
+    it. That reads ``text`` past the leading whitespace the content sniff tolerates, so a text led
+    by other whitespace, such as ``\\x1c`` and a line break before its ``MSH``, goes over as its own
+    bytes, trailer included, where the same message in a batch of two loses it. Otherwise the
     split read the message past leading noise the parser refuses, a byte order mark or an
     ``FHS``/``BHS`` envelope header, or without the trailer lines that end it (BACKLOG #5806), so
     ``message`` is handed over re-encoded, as each member of a batch is. Without this, one such
@@ -314,8 +318,9 @@ def _needs_a_decode(raw: bytes, encoding: str) -> bool:
     no ASCII byte for anything else, with none of those shapes present. Any other encoding answers
     True, so the caller decodes. Under a single-byte charset the mark's bytes are three characters
     the split keeps, so a leading one needs no decode, and a later one costs a decode that finds one
-    message. An id at a line start that is data, or that follows no ``MSH``-led message, costs a
-    decode that hands the file over as before."""
+    message. An id at a line start that is data costs a decode, after which a file that was handed
+    over as its bytes may go over as the split read it: at least an ``FHS``/``BHS``-led file whose
+    ``MSH`` line a space leads, which the split reads past its header lines."""
     try:
         name = codecs.lookup(encoding).name
     except LookupError:

@@ -1249,9 +1249,11 @@ def split_messages(raw: bytes) -> list[bytes]:
     decodes before splitting — and still strictly better than the UTF-8/``replace`` decode this
     replaced, which turned such a payload into mojibake before anything looked at it.
 
-    UTF-8 byte order marks are read as the live sources read them under a UTF-8 charset, whatever
-    the connection's charset: the view spells each as the mark itself, so the split reads past
-    leading ones and splits where marks lead a later ``MSH`` (BACKLOG #5918). Under a single-byte
+    UTF-8 byte order marks are spelled as the mark itself in the view, whatever the connection's
+    charset, so the split reads past leading ones and splits where marks lead a later ``MSH``, as
+    the live split of a UTF-8 decode does (BACKLOG #5918). The live remote-file source hands a file
+    its byte scan passes over as its bytes, so where that scan and the split disagree the two
+    differ. Under a single-byte
     charset the live sources keep the three bytes, so there the dry run is more lenient than the
     engine (ADR 0206).
     """

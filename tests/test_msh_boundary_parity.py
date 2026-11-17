@@ -26,8 +26,10 @@ longer ends with the run of envelope trailer lines (``BTS``, ``FTS``, ``BHS`` or
 message's own MSH-1) that followed it. The split's copy is left as it stood, so it is the oracle
 for every other cut: the live split must give the copy's messages less those trailer lines, and
 nothing else (:func:`_less_the_trailer`). The byte scan's copy gains the one line marked BACKLOG
-#5806, and the whole-file split is held to a copy of it as it stood, less the same lines. The corpus
-gained trailer tokens and the shapes a review of that change named.
+#5806, and the whole-file split is held to a copy of it built on that scan, less the same lines;
+a file that copy hands over unsplit is compared as the split reads it. So that test does not hold
+the whole-file split to origin/main's. The corpus gained trailer tokens and the shapes a review of
+that change named.
 """
 
 from __future__ import annotations
@@ -303,8 +305,8 @@ def test_the_corpus_drops_a_trailer_and_keeps_one() -> None:
 
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "cp1252", "utf-16", "nope"])
 def test_the_whole_file_split_is_its_copy_less_the_trailer_lines(encoding: str) -> None:
-    # BACKLOG #5806: what a whole-file source hands over is what it handed over before, message by
-    # message, less the trailer lines; any other difference fails.
+    # BACKLOG #5806: what a whole-file source hands over is what the copy, on the widened byte scan,
+    # hands over, message by message, less the trailer lines; any other difference fails.
     codec = "utf-16" if encoding == "utf-16" else "utf-8"
     wrong = []
     for text in CORPUS:
