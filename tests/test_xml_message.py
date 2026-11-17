@@ -65,7 +65,7 @@ _CANARY = "PHICANARYNAME"
     [
         f"<root><{_CANARY}></root>".encode(),  # tag mismatch quotes the element name
         f"<root>&{_CANARY};</root>".encode(),  # undefined entity quotes the entity name
-        f"<root>\n<{_CANARY} a='1' a='2'/></root>".encode(),  # duplicate attribute
+        f"<root>\n<y {_CANARY}='1' {_CANARY}='2'/></root>".encode(),  # duplicate attribute
     ],
     ids=["tag-mismatch", "undefined-entity", "duplicate-attribute"],
 )

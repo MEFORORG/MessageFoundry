@@ -19,6 +19,8 @@ Guards (all on by design — inbound HL7/XML is attacker-influenceable, CLAUDE.m
 * ``DOCTYPE`` rejection — :func:`parse_bytes` additionally **rejects any document carrying a DOCTYPE**
   (``etree.DOCSTRING``/``DTD`` in the tree), so a payload can't smuggle entity *definitions* even
   though references wouldn't be resolved — defense in depth, mirroring defusedxml's ``forbid_dtd``.
+  A document that fails to parse is refused the same way when its prolog opens a DOCTYPE in one of
+  the encodings :func:`_declares_doctype` reads.
 * **No second decode** — for ``str`` input, :func:`parse_bytes` neutralizes the XML declaration's
   ``encoding=`` pseudo-attribute before encoding to UTF-8 (ASVS 1.5.3, see
   :func:`_without_declared_encoding`).
@@ -94,7 +96,7 @@ _DOCTYPE_REFUSAL = (
 _DOCTYPE_SCAN_CODECS = ("latin-1", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
 #: Byte-order marks as each scan codec reads them: U+FEFF, and the UTF-8 BOM read as latin-1.
-_BOM_CHARS = "﻿ï»¿"
+_BOM_CHARS = "\ufeff\u00ef\u00bb\u00bf"
 
 #: A DOCTYPE in the prolog: only whitespace, processing instructions (the XML declaration among
 #: them) and comments may come before it. The atomic groups and the possessive loop keep it linear.

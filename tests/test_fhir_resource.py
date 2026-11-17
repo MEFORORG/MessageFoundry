@@ -120,7 +120,8 @@ _NESTED_UNKNOWN_TYPE = [
         "entry": [{"resource": {"resourceType": PHI_CANARY}}],
     },
     {"resourceType": "Patient", "contained": [{"resourceType": PHI_CANARY}]},
-    # A non-string nested type escaped as a TypeError; the list holds the canary as a control.
+    # A non-string nested type escaped as a TypeError. Its text did not quote the canary on
+    # fhir.resources 8.3.0; the canary is there in case a later version's does.
     {
         "resourceType": "Bundle",
         "type": "collection",

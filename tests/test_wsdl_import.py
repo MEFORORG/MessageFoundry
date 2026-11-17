@@ -226,6 +226,13 @@ _SOAP11 = "http://schemas.xmlsoap.org/soap/envelope/"
         (_envelope(_OK_CHILD + "A123"), "/Envelope/Body: character data"),
         (_envelope(_OK_CHILD + "<![CDATA[A123]]>"), "/Envelope/Body: character data"),
         (_envelope("<!-- c -->A123" + _OK_CHILD), "/Envelope/Body: character data"),
+        # Whitespace to str.strip() but character data to XML.
+        (_envelope("\u00a0\u2003\u3000\u0085" + _OK_CHILD), "/Envelope/Body: character data"),
+        (
+            f'<soap:Envelope xmlns:soap="{_SOAP11}"><soap:Header><h/>A123</soap:Header>'
+            f"<soap:Body>{_OK_CHILD}</soap:Body></soap:Envelope>",
+            "/Envelope/Header: character data",
+        ),
     ],
     ids=[
         "sibling",
@@ -242,6 +249,8 @@ _SOAP11 = "http://schemas.xmlsoap.org/soap/envelope/"
         "body-text-after",
         "body-cdata-after",
         "body-text-after-comment",
+        "unicode-space",
+        "header-text",
     ],
 )
 def test_validate_refuses_an_envelope_with_unvalidated_content(

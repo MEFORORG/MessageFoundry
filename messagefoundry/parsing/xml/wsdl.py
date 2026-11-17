@@ -113,7 +113,7 @@ class WsdlDefinition:
         Returns an :class:`~messagefoundry.parsing.xml.schema.XmlSchemaResult` (``valid`` + PHI-safe
         ``reasons``). The result is invalid unless the root is a SOAP 1.1 or 1.2 ``Envelope`` holding
         an optional ``Header`` and then one ``Body``, and that ``Body`` holds exactly one element
-        child, with no character data beside any of them (BACKLOG #5373). Raises
+        child, and none of the three holds character data directly (BACKLOG #5373). Raises
         :class:`~messagefoundry.parsing.xml.errors.WsdlError` for an unknown operation
         or an operation with no resolvable document/literal input element (rpc/encoded not supported for
         validation)."""
@@ -367,11 +367,17 @@ def _operations(root: Any, messages: Mapping[str, list[WsdlPart]]) -> dict[str, 
     return operations
 
 
+#: XML's own whitespace (the S production). A bare str.strip() would also drop characters such as
+#: U+00A0 and U+3000, which XML treats as character data.
+_XML_SPACE = " \t\r\n"
+
+
 def _holds_character_data(elem: Any) -> bool:
-    """Whether ``elem`` holds non-whitespace text directly: before its first child, or after any
-    child, comments and processing instructions included (CDATA is text here)."""
+    """Whether ``elem`` holds text other than XML whitespace directly: before its first child, or
+    after any child, comments and processing instructions included (CDATA is text here)."""
     return any(
-        text is not None and text.strip() for text in (elem.text, *(child.tail for child in elem))
+        text is not None and text.strip(_XML_SPACE)
+        for text in (elem.text, *(child.tail for child in elem))
     )
 
 
@@ -383,17 +389,20 @@ def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, st
 
     The root must be a SOAP ``Envelope`` whose element children are an optional ``Header`` and then
     one ``Body``, both in its own namespace, and that ``Body`` must hold exactly one element child.
-    Neither may hold character data beside those elements; comments and processing instructions are
-    skipped. The operation names one body element, so anything else would reach the caller
-    unvalidated under a valid result (BACKLOG #5373). That is stricter than SOAP 1.1, which allows
-    elements after the ``Body``. Reasons name only QNames and counts, never content."""
+    None of the Envelope, the Header or the Body may hold character data directly. The operation
+    names one body element, so anything else would reach the caller unvalidated under a valid
+    result (BACKLOG #5373). That is stricter than SOAP 1.1, which allows elements after the
+    ``Body``. Not checked: the Header's element children (header blocks, which SOAP leaves open),
+    attributes, and comments and processing instructions, which are skipped. Reasons name only the
+    SOAP grammar's own QNames and counts, never content."""
     root = parse_bytes(envelope)
     env_ns = next(
         (ns for ns in (_SOAP11_ENV_NS, _SOAP12_ENV_NS) if _clark(root) == f"{{{ns}}}Envelope"),
         None,
     )
     if env_ns is None:
-        return None, f"/: root {_clark(root)} is not a SOAP 1.1 or 1.2 Envelope"
+        # The root's own name is the sender's text, so it is not echoed.
+        return None, "/: root is not a SOAP 1.1 or 1.2 Envelope"
     header, body = f"{{{env_ns}}}Header", f"{{{env_ns}}}Body"
     names = [_clark(child) for child in root if isinstance(child.tag, str)]
     if body not in names:
@@ -404,6 +413,9 @@ def _soap_body_child(envelope: str | bytes) -> tuple[Any, None] | tuple[None, st
         return None, "/Envelope: elements other than an optional Header followed by one Body"
     if _holds_character_data(root):
         return None, "/Envelope: character data beside the Header and Body"
+    header_elem = root.find(header)
+    if header_elem is not None and _holds_character_data(header_elem):
+        return None, "/Envelope/Header: character data beside the header blocks"
     body_elem = root.find(body)
     # skip comments / processing instructions — only element children
     children = [child for child in body_elem if isinstance(child.tag, str)]
