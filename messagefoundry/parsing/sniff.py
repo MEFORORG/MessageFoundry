@@ -177,7 +177,8 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 # The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.txt/.xml). Its
 # chokepoint enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
 # metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
-# incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses) — or (b) not
+# incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses), or it holds
+# a ZIP record signature anywhere — or (b) not
 # plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
 # the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
 # stripping engine. What it lets through is stated once, in docs/CONNECTIONS.md, under the
@@ -194,6 +195,11 @@ _CONTROL_DENSITY_LIMIT = 0.30
 #: The window the density is judged over: consecutive windows from the start, the last one ending at
 #: the body's end. A dense run that straddles two windows is judged as two halves.
 _TEXT_WINDOW_BYTES = 8192
+#: The ZIP record signatures (local file header, central directory header, end of central directory,
+#: data descriptor). A ZIP reader finds the archive from its END, so a ZIP or DOCX appended after a
+#: text head is still an archive; a signature anywhere in the body is refused, not only a leading one
+#: (BACKLOG #5368). Each carries two C0 control bytes, so a text log does not contain one by chance.
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08")
 
 
 def nontext_upload_reason(data: bytes) -> str | None:
@@ -202,6 +208,8 @@ def nontext_upload_reason(data: bytes) -> str | None:
 
     * a leading magic-byte signature of a metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX,
       GIF, TIFF) — these carry embedded metadata (EXIF/XMP/docProps) the text-only feature refuses to store;
+    * a ZIP record signature anywhere in the body, since a ZIP or DOCX appended after a text head is
+      still readable as an archive (BACKLOG #5368);
     * a body that is not plausibly plain text — it contains a NUL byte anywhere, or one of its
       consecutive 8 KiB windows has a high density of non-printable control bytes.
 
@@ -219,6 +227,11 @@ def nontext_upload_reason(data: bytes) -> str | None:
     for mime, prefixes in _MAGIC_PREFIXES.items():
         if head.startswith(prefixes):
             return f"body is a {mime} container; the uploaded-logs feature accepts only plain-text logs"
+    if any(signature in data for signature in _ZIP_SIGNATURES):
+        return (
+            "body contains a ZIP record signature; the uploaded-logs feature accepts only "
+            "plain-text logs"
+        )
     if b"\x00" in data:
         return "body contains NUL bytes; the uploaded-logs feature accepts only plain-text logs"
     # The bytes the density counts, deleted by ``translate`` so the count runs at C speed.
