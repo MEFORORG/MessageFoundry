@@ -93,18 +93,12 @@ after it, on new lines:
 if (-not $?) { try { if ($global:LASTEXITCODE -eq 2) { exit 2 } } catch {}; exit 1 }
 ```
 
-The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`, and
-`tests/test_codex_bridge.py` records at least these shapes and whether each
-blocks. **A hook that must block should end with an explicit `exit 2`, and not
-be written as named blocks (below).** Shapes
+The source is `POWERSHELL_TAIL` in `scripts/codex/bridge.py`. Shapes
 that end on an error, or with a stale exit code, are decided by the tail and are
 not listed here. A hook that opens with `[CmdletBinding()]` does not receive the
 payload through `$input`.
 
-A command-only PowerShell hook written as named blocks, at least `begin`,
-`process`, `end`, `clean` and `dynamicparam`, cannot block by its own `exit 2`
-under the bridge: it fails to parse with the tail after it, so it exits 1 on
-every call, and under `"onFailure": "block"` it blocks every call.
+Which PowerShell hook shapes block is recorded by the tests in tests/test_codex_bridge.py; read them rather than this page.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

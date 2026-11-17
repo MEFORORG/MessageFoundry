@@ -182,7 +182,6 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
 @pytest.mark.parametrize(
     ("command", "outcome"),
     [
-        # A command-only PowerShell hook blocks by `exit 2`.
         ("Write-Output 'x' | Out-Null; exit 2", "block"),
         ("try {{ Get-Item -LiteralPath 'no-such-item-b4' -EA Stop }} catch {{}}; exit 2", "block"),
         ("trap {{ exit 2 }}; throw 'boom'", "block"),
@@ -235,9 +234,6 @@ def test_exit_2_blocks_and_stops_the_remaining_hooks(bridge, tmp_path, capsys):
         ("Write-Output '{{}}' ||", "exit-1"),
         ("& '{py}' -c 'import sys; sys.exit(2)'; if ($false) {{ exit 2 }}", "block"),
         ("if ($true) {{ return }}; exit 2", "allow"),
-        # A hook may open with param(), [CmdletBinding()], #Requires or using, as a script can,
-        # and its exit 2 blocks; a [CmdletBinding()] hook does not receive the payload through
-        # $input. Named blocks cannot be followed by the tail, so they fail to parse.
         ("param()\nexit 2", "block"),
         (
             "param([string]$Mode = 'enforce')\nif ($Mode -eq 'enforce') {{ exit 0 }}; exit 2",
@@ -324,12 +320,10 @@ def test_a_powershell_hook_blocks_on_the_last_exit_code_when_it_is_2(
     ],
 )
 def test_a_powershell_hook_blocks_when_a_guard_it_runs_exits_2(bridge, tmp_path, command):
-    """-Command alone reports a guard script's `exit 2` as 1, which would not block."""
     (tmp_path / "guard.ps1").write_text("exit 2\n", encoding="utf-8")
     settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command}])
     with pytest.raises(bridge.HookBlocked):
         bridge.dispatch(tmp_path, BASH_CALL)
-    # A later statement that succeeds is the hook's own outcome.
     settings(tmp_path, [{"type": "command", "shell": "powershell", "command": command + "\n$null"}])
     assert bridge.dispatch(tmp_path, BASH_CALL) == {}
 
