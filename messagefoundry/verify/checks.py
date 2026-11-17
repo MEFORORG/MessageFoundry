@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import errno
 import importlib
 import importlib.metadata
 import importlib.util
@@ -357,22 +358,29 @@ def check_postgres_driver() -> CheckResult:
     )
 
 
-def _bindable(port: object) -> str:
-    """Report whether a listener could take ``port``: ``free``, ``in use/bound``, or ``invalid port``.
+# Bind errors that mean the family is not enabled here, not that the port is held. The engine's MLLP
+# listener skips a family on the same two (transports/mllp.py, _FAMILY_NOT_ENABLED).
+_FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
+
+
+def _port_state(port: object) -> str:
+    """Report whether a listener could take ``port``: ``free``, ``in use/bound``, ``not bindable by
+    this user``, or ``invalid port``.
 
     The probe binds the IPv4 wildcard and the IPv6 wildcard (BACKLOG #5389). A wildcard bind
     conflicts with a listener on any address of its family, so a loopback, one-interface or
-    all-interface listener reads as held. The IPv6 probe is dual-stack (``IPV6_V6ONLY`` off)
-    because on Windows a dual-stack listener on ``::`` lets an IPv4 bind and an IPv6-only bind
-    succeed beside it, exclusive or not; only a dual-stack bind sees it.
+    all-interface listener reads as held, which is conservative for an engine bound to one address.
+    The IPv6 probe is dual-stack (``IPV6_V6ONLY`` off) because on Windows a dual-stack listener on
+    ``::`` lets an IPv4 bind and an IPv6-only bind succeed beside it, exclusive or not; only a
+    dual-stack bind sees it.
 
     On Windows the probe sets ``SO_EXCLUSIVEADDRUSE``, never ``SO_REUSEADDR``: there,
     ``SO_REUSEADDR`` lets a bind share a port another socket holds, which read a held port as free.
-    On POSIX ``SO_REUSEADDR`` only reuses a TIME_WAIT port, as the engine's own listener does, and a
-    listening socket still refuses it.
+    On Linux ``SO_REUSEADDR`` only reuses a TIME_WAIT port, as the engine's own listener does, and a
+    listening socket still refuses it. Elsewhere (BSD, macOS) it lets a wildcard bind succeed beside
+    a listener on one address, so the probe sets neither, and a TIME_WAIT port may read held there.
 
-    Any bind error reads as ``in use/bound``: a port this process cannot bind is not one the engine
-    can take either. A free result says nothing about an external firewall.
+    A free result says nothing about an external firewall.
     """
     # bool is an int subclass, and True would otherwise probe port 1.
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
@@ -387,15 +395,22 @@ def _bindable(port: object) -> str:
         try:
             if sys.platform == "win32":
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            else:
+            elif sys.platform.startswith("linux"):
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if family == socket.AF_INET6:
-                # A host with no dual-stack sockets refuses this; the IPv4 probe covers IPv4 there,
-                # and the IPv6 socket's default still sees every IPv6 listener.
+                # Only a host with no dual-stack sockets refuses this, and no dual-stack listener can
+                # exist there: the IPv4 probe covers IPv4, and an IPv6-only bind sees IPv6 listeners.
                 with contextlib.suppress(OSError):
                     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             s.bind((wildcard, port))
-        except OSError:
+        except PermissionError:
+            # On Windows a port another socket holds exclusively refuses with WSAEACCES, which
+            # Python raises as PermissionError. On POSIX it means a port below 1024 for an
+            # unprivileged user: the service account may still bind it.
+            return "in use/bound" if sys.platform == "win32" else "not bindable by this user"
+        except OSError as exc:
+            if exc.errno in _FAMILY_NOT_ENABLED:
+                continue
             return "in use/bound"
         finally:
             s.close()
@@ -407,7 +422,7 @@ def check_listener_ports(ports: Mapping[str, object]) -> CheckResult:
 
     Bindability is the residual this row can measure: a port that reads free here may still be
     blocked by a host or network firewall, which is why the row stays MANUAL."""
-    parts = [f"{name} {port}: {_bindable(port)}" for name, port in ports.items()]
+    parts = [f"{name} {port}: {_port_state(port)}" for name, port in ports.items()]
     return CheckResult(
         "host.ports",
         "Listener ports / firewall",

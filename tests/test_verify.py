@@ -139,12 +139,22 @@ def test_listener_ports_is_manual_with_evidence() -> None:
 
 
 def _listen(family: socket.AddressFamily, address: str, v6only: int | None = None) -> socket.socket:
-    """Hold an ephemeral port with a plain listener: no SO_EXCLUSIVEADDRUSE, no SO_REUSEADDR."""
+    """Hold an ephemeral port with a plain socket: no SO_EXCLUSIVEADDRUSE, no SO_REUSEADDR.
+
+    It listens, except on a wildcard off Linux, where a wildcard listen can raise a firewall prompt
+    (as tests/test_api_listener_ipv6_only.py notes). A bound socket holds the port against the probe
+    there just as a listener does: measured on Windows 11, a bound dual-stack ``::`` socket let an
+    IPv4 and an IPv6-only exclusive bind succeed and refused a dual-stack one, as a listener does."""
     s = socket.socket(family, socket.SOCK_STREAM)
-    if v6only is not None:
-        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
-    s.bind((address, 0))
-    s.listen()
+    try:
+        if v6only is not None:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
+        s.bind((address, 0))
+        if address not in ("0.0.0.0", "::") or sys.platform.startswith("linux"):  # nosec B104
+            s.listen()
+    except OSError:
+        s.close()
+        raise
     return s
 
 
@@ -159,7 +169,7 @@ def _ipv6_available() -> bool:
     return True
 
 
-def _port_state(port: object) -> str:
+def _evidence_for(port: object) -> str:
     """The evidence the listener-ports row prints for one port, without its name."""
     return checks.check_listener_ports({"P": port}).evidence.removeprefix(f"P {port}: ")
 
@@ -168,7 +178,7 @@ def _port_state(port: object) -> str:
 def test_listener_ports_reads_an_ipv4_listener_as_in_use(address: str) -> None:
     # BACKLOG #5389: on Windows a 0.0.0.0 listener read free, as the old probe bound 127.0.0.1 only.
     with _listen(socket.AF_INET, address) as held:
-        assert _port_state(held.getsockname()[1]) == "in use/bound"
+        assert _evidence_for(held.getsockname()[1]) == "in use/bound"
 
 
 @pytest.mark.skipif(not _ipv6_available(), reason="IPv6 is not available on this host")
@@ -179,7 +189,7 @@ def test_listener_ports_reads_an_ipv6_listener_as_in_use(address: str, v6only: i
     # The old probe bound IPv4 only. A dual-stack listener on Windows refuses only a dual-stack
     # probe, so the "dual" case is what pins the probe's IPV6_V6ONLY setting.
     with _listen(socket.AF_INET6, address, v6only) as held:
-        assert _port_state(held.getsockname()[1]) == "in use/bound"
+        assert _evidence_for(held.getsockname()[1]) == "in use/bound"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="SO_REUSEADDR port sharing is Windows-only")
@@ -191,14 +201,14 @@ def test_listener_ports_reads_a_non_exclusive_windows_listener_as_in_use() -> No
         held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         held.bind(("127.0.0.1", 0))
         held.listen()
-        assert _port_state(held.getsockname()[1]) == "in use/bound"
+        assert _evidence_for(held.getsockname()[1]) == "in use/bound"
 
 
 def test_listener_ports_reads_a_released_port_as_free() -> None:
     # Positive control: without it, a probe that reads every port as in use passes the tests above.
     with _listen(socket.AF_INET, "127.0.0.1") as held:
         port = held.getsockname()[1]
-    assert _port_state(port) == "free"
+    assert _evidence_for(port) == "free"
 
 
 @pytest.mark.parametrize("port", [0, -1, 65536, 70000, "2575", 25.75, True, None])
@@ -206,7 +216,7 @@ def test_listener_ports_reports_an_invalid_port_rather_than_raising(port: object
     # The old probe raised OverflowError or TypeError on these, and read port 0 and True as free.
     r = checks.check_listener_ports({"P": port, "API": 8765})
     assert r.status is Status.MANUAL
-    assert _port_state(port).startswith("invalid port")
+    assert r.evidence.startswith(f"P {port}: invalid port")
     assert "API 8765:" in r.evidence
 
 

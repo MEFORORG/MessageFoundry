@@ -167,7 +167,7 @@ checks that the federated sign-in settings hold together.
 It does not check at least these, read from `messagefoundry/verify/`:
 
 - Firewall rules, or reach from another host. The `host.ports` row is always MANUAL. It only tests
-  whether a few ports are free on `127.0.0.1`.
+  whether this host could bind a few ports on any IPv4 or IPv6 address.
 - The ports your Connections bind. The `host.ports` row does not read your config directory.
 - The operator bind and its TLS. The `manual.tls` row is MANUAL. A person confirms it.
 - Egress. No row reads an `[egress]` list.
