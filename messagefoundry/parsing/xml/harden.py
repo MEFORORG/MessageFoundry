@@ -83,18 +83,34 @@ def _without_declared_encoding(text: str) -> str:
     return _DECLARED_ENCODING.sub(r"\1", text, count=1)
 
 
+_DOCTYPE_REFUSAL = (
+    "refusing an XML document that declares a DOCTYPE/DTD (entity-definition carrier)"
+)
+
 #: Encodings a failed document is read in to look for a DOCTYPE. ``latin-1`` stands for every
-#: ASCII-compatible encoding, UTF-8 included; the rest are the wide encodings libxml2 detects.
+#: ASCII-compatible encoding, UTF-8 included; the others are some of the wide encodings libxml2
+#: detects. Not every encoding libxml2 reads is here (at least EBCDIC, UCS-4 2143/3412 and a declared
+#: UTF-7 are not), so a DOCTYPE written in one of those that fails to parse is a parse error.
 _DOCTYPE_SCAN_CODECS = ("latin-1", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
+#: Byte-order marks as each scan codec reads them: U+FEFF, and the UTF-8 BOM read as latin-1.
+_BOM_CHARS = "﻿ï»¿"
 
-def _mentions_doctype(payload: bytes) -> bool:
-    """Whether ``payload`` holds ``<!DOCTYPE`` in any case, in at least the encodings above.
+#: A DOCTYPE in the prolog: only whitespace, processing instructions (the XML declaration among
+#: them) and comments may come before it. The atomic groups and the possessive loop keep it linear.
+_PROLOG_DOCTYPE = re.compile(
+    r"\A(?:\s|<\?(?>.*?\?>)|<!--(?>.*?-->))*+<!DOCTYPE", re.IGNORECASE | re.DOTALL
+)
 
-    Only called on a document that already failed to parse, so a match inside a comment or CDATA
-    section cannot turn a well-formed document into a refusal."""
+
+def _declares_doctype(payload: bytes) -> bool:
+    """Whether ``payload``'s prolog opens a ``<!DOCTYPE``, in any case, read in each scan codec.
+
+    Only called on a document that already failed to parse. Anchored to the prolog, so a mention in
+    an element's content, an attribute, a comment after the root or a CDATA section is not one."""
     return any(
-        "<!DOCTYPE" in payload.decode(codec, "ignore").upper() for codec in _DOCTYPE_SCAN_CODECS
+        _PROLOG_DOCTYPE.match(payload.decode(codec, "ignore").lstrip(_BOM_CHARS)) is not None
+        for codec in _DOCTYPE_SCAN_CODECS
     )
 
 
@@ -102,7 +118,8 @@ def parse_bytes(data: bytes | str) -> Any:
     """Parse ``data`` into an lxml element tree with the hardened parser, refusing any DOCTYPE.
 
     Returns the root ``_Element``. Raises :class:`XmlSecurityError` if the document declares a DOCTYPE
-    (a DTD/entity-definition carrier), whether or not the rest of it parses, and
+    (a DTD/entity-definition carrier), and also when the document fails to parse but its prolog
+    opens a DOCTYPE readable in one of the scan encodings above, and
     :class:`XmlParseError` if it is not well-formed XML. Both messages are fixed text plus, for a
     parse error, the fault's line, column and libxml2 error code; neither carries lxml's message,
     and neither is chained from lxml's error (BACKLOG #5371). Requires the ``[xml]`` extra."""
@@ -122,17 +139,13 @@ def parse_bytes(data: bytes | str) -> Any:
         fault = f"line {line}, column {column} (libxml2 error {exc.code})"
     if fault is not None:
         # Raised outside the handler so lxml's error is on neither __cause__ nor __context__.
-        if _mentions_doctype(payload):
+        if _declares_doctype(payload):
             # A DTD that does not even parse is still a DTD: refuse it as one, not as a typo.
-            raise XmlSecurityError(
-                "refusing an XML document that declares a DOCTYPE/DTD (entity-definition carrier)"
-            )
+            raise XmlSecurityError(_DOCTYPE_REFUSAL)
         raise XmlParseError(f"not well-formed XML at {fault}")
     # Defense in depth: refuse any DOCTYPE so entity *definitions* can't ride along (references are
     # already not resolved). getroottree().docinfo exposes the parsed DOCTYPE, if any.
     docinfo = root.getroottree().docinfo
     if docinfo is not None and (docinfo.doctype or docinfo.internalDTD or docinfo.externalDTD):
-        raise XmlSecurityError(
-            "refusing an XML document that declares a DOCTYPE/DTD (entity-definition carrier)"
-        )
+        raise XmlSecurityError(_DOCTYPE_REFUSAL)
     return root

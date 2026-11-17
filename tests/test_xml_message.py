@@ -87,15 +87,48 @@ def test_parse_error_carries_no_document_text(payload: bytes) -> None:
         b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x',  # body cut short
         b"<!DOCTYPE x [<!ENTITY bad>]><x/>",  # malformed entity declaration
         b"<!doctype x><x/>",  # lower case: still refused, as a DTD rather than as a typo
-        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16"),  # a wide encoding
+        b'\xef\xbb\xbf<?xml version="1.0"?>\n<!-- c --><?pi?> <!DOCTYPE x [<!ENTITY bad>]><x/>',
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16"),  # wide encodings, with a BOM
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-16-be"),  # ...and without
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-32-le"),
+        '<!DOCTYPE x [<!ENTITY a "b">]><x>'.encode("utf-32-be"),
         '<!DOCTYPE x [<!ENTITY a "b">]><x>',  # str input
     ],
-    ids=["open-subset", "truncated", "bad-entity", "lower-case", "utf-16", "str"],
+    ids=[
+        "open-subset",
+        "truncated",
+        "bad-entity",
+        "lower-case",
+        "after-prolog-misc",
+        "utf-16",
+        "utf-16-be",
+        "utf-32-le",
+        "utf-32-be",
+        "str",
+    ],
 )
 def test_doctype_that_fails_to_parse_is_a_security_refusal(payload: bytes | str) -> None:
     with pytest.raises(XmlSecurityError) as ei:
         parse_bytes(payload)
     assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"<x><![CDATA[<!DOCTYPE html>]]><y></x>",
+        b"<x><!-- <!DOCTYPE html> --><y></x>",
+        b"<x a='<!DOCTYPE'><y></x>",
+        b"<x><y></x><!DOCTYPE x>",
+    ],
+    ids=["cdata", "inner-comment", "attribute", "after-root"],
+)
+def test_doctype_text_outside_the_prolog_of_a_broken_document_is_a_parse_error(
+    payload: bytes,
+) -> None:
+    # Only a DOCTYPE in the prolog is one; a mention elsewhere leaves an ordinary parse error.
+    with pytest.raises(XmlParseError):
+        parse_bytes(payload)
 
 
 def test_doctype_text_in_a_wellformed_comment_still_parses() -> None:

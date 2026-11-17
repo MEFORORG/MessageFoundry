@@ -18,9 +18,9 @@ content. A returned ``reason`` is the class name of the bad-signature exception 
 module's fixed names such as :data:`WEAK_SIGNING_KEY`. An
 :class:`XmlError` for a signature the libraries cannot process names only the class of the exception
 raised, which can come from signxml, lxml, ``cryptography`` or the standard library. The rule does
-NOT cover a document that fails before signature processing: at least a document that is not
-well-formed XML, and a ``str`` document UTF-8 cannot encode, raise errors that can carry document
-content. :func:`verify` says what each carries.
+NOT cover a document that fails before signature processing: at least a ``str`` document UTF-8
+cannot encode raises an error that carries document content. :func:`verify` says what each such
+failure carries.
 
 Pure: no engine imports.
 """
@@ -550,8 +550,9 @@ def verify(
     instead, before any signature processing, and that path does NOT hold to the paragraph above.
     It raises at least these:
 
-    - a document that declares a DOCTYPE, whether or not it parses:
-      :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError` with a fixed message;
+    - a document that declares a DOCTYPE, and one that fails to parse after a prolog DOCTYPE
+      that function's scan reads: :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError`
+      with a fixed message;
     - a document that is not well-formed XML: :class:`~messagefoundry.parsing.xml.errors.XmlParseError`,
       whose message names only the fault's line, column and libxml2 error code, and which is not
       chained from lxml's ``XMLSyntaxError`` (BACKLOG #5371);
