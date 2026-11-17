@@ -284,13 +284,14 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
 
     :func:`~messagefoundry.transports.rest.proxy_auth_handler_from_settings` calls it for a Digest
     proxy credential, before it judges that credential's hop, only for the REST and FHIR outbounds
-    (its ``builds_token_hop``). So on such an outbound that builds exactly one token provider, this
-    refusal comes before any record of that credential crossing. A SOAP outbound is not one of
-    them. The token URL is first checked by the provider constructor's own ``_check_token_url``, so
-    a URL that check refuses is refused for itself, not as a Digest token hop. The provider's
-    other refusals, a token URL with no host and a missing client secret among them, run later, so
-    where this rule also holds, this refusal comes first. The rule
-    is :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
+    (its ``builds_token_hop``), after that function's own Digest refusal for an ``https`` ``url``.
+    So this refusal can fire only where the outbound's own ``url`` is not ``https`` and its token
+    URL names a host. A token URL that names no host passes here, and the provider refuses it when
+    it is built, naming its setting. One that names a host is checked first by the provider
+    constructor's own ``_check_token_url``, so a URL that check refuses is refused for itself.
+    Where this refusal fires, it comes before any record of the proxy credential crossing. The
+    rule is
+    :func:`~messagefoundry.transports.rest.digest_proxy_meets_the_token_connect`, with the
     connection's ``proxy_no_proxy`` as the bypass list, and the refusal is the provider's own
     (:meth:`~messagefoundry.transports.smart._TokenEndpointProvider.digest_proxy_refusal`). A mapping
     that configures neither provider, or both, which :func:`bearer_provider_from_settings` refuses,
@@ -303,6 +304,12 @@ def refuse_a_digest_proxy_on_the_token_hop(s: Mapping[str, Any], *, connection: 
     )
     # Read as the provider factories read it, then checked as the provider's constructor checks it.
     token_url = str(s.get(provider._URL_SETTING) or "")
+    try:
+        names_a_host = bool(urllib.parse.urlsplit(token_url).hostname)
+    except ValueError:  # not quoted: a URL can carry userinfo
+        names_a_host = False
+    if not names_a_host:
+        return  # the provider's own checks refuse it, naming its setting (BACKLOG #2989)
     provider._check_token_url(token_url, connection=connection)
     if digest_proxy_meets_the_token_connect(token_url, s.get("proxy_no_proxy")):
         raise provider.digest_proxy_refusal(connection)

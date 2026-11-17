@@ -1100,6 +1100,61 @@ def test_the_early_refusal_checks_the_token_url_before_it_reads_it() -> None:
 
 
 @pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.FHIR])
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_a_token_url_with_no_host_is_refused_as_on_main(ctype: ConnectorType, scheme: str) -> None:
+    """Review findings 1 and 9: behind a Digest proxy, a token URL that names no host is refused
+    for that, naming its setting, as on main, not as a Digest token hop or with no setting named.
+    Fails on ef3d956b6c, where the early refusal read the URL first."""
+    with pytest.raises(ValueError, match="^oauth2_token_url: the URL names no host"):
+        _build(
+            ctype,
+            "http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+            oauth2_token_url=f"{scheme}:///token",
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("scheme", ["https", "http"])
+def test_a_smart_token_url_with_no_host_is_refused_as_on_main(ec_pem: str, scheme: str) -> None:
+    """The same for the SMART provider, naming ``smart_token_url``."""
+    from messagefoundry.transports.smart import with_smart_backend
+
+    spec = with_smart_backend(
+        Rest(
+            url="http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+        ),
+        token_url=f"{scheme}:///token",
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    with (
+        active_hop_posture(_WARN_DIAL),
+        pytest.raises(ValueError, match="^smart_token_url: the URL names no host"),
+    ):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=spec.settings,
+                cleartext_accepted=True,
+                cleartext_reason="test peer has no TLS",
+            ),
+            egress=permitting(spec.settings),
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
 def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
     """ADR 0095 B.1's ``http://`` token-endpoint case is overtaken. An off-box one is refused when
     the provider is built (vault BACKLOG #3533 item 4, engine PR 2576), and a loopback one is dialled direct, so

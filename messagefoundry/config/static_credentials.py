@@ -75,11 +75,12 @@ redaction screen's header test and the query-credential reader; ``_http_literal_
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from :func:`apply_static_credential_gate`, which also logs, ``_digest``, which logs
-at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529), ``_is_https``, which logs at debug
-a proxy target that does not parse, and ``_http_literal_static``, whose
-``env()`` resolution runs an operator ``cast`` as the build does (BACKLOG #5510): every function
-reads its arguments and touches nothing else.
+Not every function here is pure. At least these do more than read their arguments:
+:func:`apply_static_credential_gate` and the guard :func:`make_static_credential_guard` returns,
+which log, the guard also reading the ``env()`` values the engine sets around it; ``_digest``,
+which logs at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529); ``_is_https``, which logs
+at debug a proxy target that does not parse; and ``_http_literal_static``, whose ``env()``
+resolution runs an operator ``cast`` as the build does (BACKLOG #5510).
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -796,7 +797,7 @@ def run_static_credential_gate(
     env_values: Mapping[str, Any] | None = None,
 ) -> StaticCredentialGateOutcome | None:
     """Run the opt-in ``[security].require_nonstatic_credentials`` gate over one half of the set,
-    logging nothing: the caller decides when the audit lines are logged.
+    returning its audit lines: the caller decides when they are logged.
 
     ``serve`` needs that choice (BACKLOG #1989). It judges the settings half before
     ``configure_logging`` has installed any handler, so a line logged then reaches stderr only and

@@ -355,12 +355,10 @@ class _TokenEndpointProvider(abc.ABC):
         token_proxy = proxy.for_host(token_url) if proxy and ech_sidecar is None else None
         # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
         # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
-        # setup could never answer a challenge on this hop (ADR 0095 B.1). A REST or FHIR outbound
-        # that builds exactly one token provider meets this refusal earlier, in
-        # rest.proxy_auth_handler_from_settings, before its proxy credential is judged (BACKLOG
-        # #2989 items 20 and 21). This one serves at least every other provider: a SOAP outbound's,
-        # a FhirLookup's, and one built directly. Both read the one rule, so a token host the proxy
-        # bypasses builds.
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). Some REST and FHIR
+        # outbounds meet it earlier; http_auth.refuse_a_digest_proxy_on_the_token_hop says which.
+        # Every other token provider meets it here, at least a SOAP outbound's, a FhirLookup's and
+        # one built directly. Both read the one rule, so a token host the proxy bypasses builds.
         if (
             proxy is not None
             and ech_sidecar is None

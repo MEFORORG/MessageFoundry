@@ -2209,11 +2209,9 @@ def digest_proxy_meets_the_token_connect(token_url: object, no_proxy: object) ->
 
     It reads no proxy and no Digest setting, so the caller checks that a proxy set up for Digest
     exists. True for an ``https`` token URL that is not loopback and that neither ``no_proxy`` nor
-    urllib's own bypass list names, as :meth:`ProxyConfig.for_host` routes it. Behind a Digest
-    proxy, such a token hop is refused at build. On a REST or FHIR
-    outbound that builds exactly one token provider the refusal runs before the proxy credential is
-    judged, so it comes before any record of that credential crossing; elsewhere it runs when the
-    provider is built. A value that is not a string, or that does not parse, answers ``False``."""
+    urllib's own bypass list names, as :meth:`ProxyConfig.for_host` routes it. The token hop's build
+    refusals of a Digest proxy read it (``http_auth.refuse_a_digest_proxy_on_the_token_hop`` and
+    ``smart._TokenEndpointProvider._open_token_hop``). A value that is not a string, or that does not parse, answers ``False``."""
     if not isinstance(token_url, str):
         return False
     try:

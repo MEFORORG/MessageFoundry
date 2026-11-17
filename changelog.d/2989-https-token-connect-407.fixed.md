@@ -4,9 +4,8 @@
   connection built: its lane stopped at the first send if the proxy challenged the `CONNECT`, and
   it minted tokens if the proxy let the `CONNECT` through unchallenged. Both cases are now refused
   at load. The refusal keys on the proxy resolved for the token host, so a token host the proxy
-  bypasses still builds. On a REST or FHIR outbound that builds exactly one token provider it runs
-  before the proxy credential's hop is judged, so it comes before any record of that credential
-  crossing. The static-credential report no longer lists the proxy hop of a Digest proxy on a
+  bypasses still builds. On some REST and FHIR outbounds it runs before the proxy credential's hop
+  is judged; the docstring of `refuse_a_digest_proxy_on_the_token_hop` says which. The static-credential report no longer lists the proxy hop of a Digest proxy on a
   connection whose own `url` is `https`, or on one that mints a bearer from a literal token URL with
   no `env()` value turning a token provider on or off; the docstring of `_digest_proxy_refused` says
   why. Other Digest proxy hops are listed as before. A `CONNECT` 407 on a proxy with no Digest set
