@@ -15046,6 +15046,22 @@ class AuthService:
         await self._store.revoke_session(token_hash, now=now)
         self._reproof_session_failures.pop(token_hash, None)
 
+    async def _end_lapsed_reproof_session(self, token_hash: str) -> None:
+        """End a session a re-proof found lapsed, as the request validator ends one (BACKLOG #5336).
+        Its count is dropped only once the revoke commits. A refused revoke is logged and keeps the
+        count: the re-proof is refused as gone either way, and every later one on the session is
+        refused the same way while it stays lapsed."""
+        try:
+            await self._store.revoke_session(token_hash)
+        except _session_write_errors() as exc:
+            _log.warning(
+                "a re-proof found its session lapsed, but its revoke was refused (%s); the "
+                "re-proof is refused as gone and the session's re-proof count stays",
+                type(exc).__name__,
+            )
+        else:
+            self._forget_reproof_counts((token_hash,))
+
     async def _reproof_serialized(
         self,
         identity: Identity,
@@ -15065,6 +15081,14 @@ class AuthService:
             # Revoked or rotated away while this attempt waited behind the lock -- by the budget,
             # or by anything else. It is not verified, so a queued burst cannot outrun the budget.
             self._reproof_session_failures.pop(token_hash, None)
+            return _Reproof(ok=False, session_gone=True, user=user)
+        if not session.is_live(now=time.time(), idle_seconds=self.session_idle_seconds):
+            # Past its absolute expiry or idle window while this attempt waited behind the lock, so
+            # the validator would refuse it now: gone, and never verified (BACKLOG #5336). Checked
+            # BEFORE the drop below, which reads the store's listing, and that listing leaves out a
+            # session past its expiry: a just-expired session's count would otherwise be dropped
+            # and its queued guesses verified on a fresh budget.
+            await self._end_lapsed_reproof_session(token_hash)
             return _Reproof(ok=False, session_gone=True, user=user)
         # At least one guess, so a lockout_threshold of 0 (documented as "locks on the first
         # failure") revokes on the first failure rather than on every re-proof.

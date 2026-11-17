@@ -42,7 +42,7 @@ from messagefoundry.auth.notifications import (
     SUSPICIOUS_LOGIN_FAILURE_THRESHOLD,
     SecurityEvent,
 )
-from messagefoundry.auth.passwords import hash_password
+from messagefoundry.auth.passwords import hash_password, verify_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -546,6 +546,41 @@ async def test_a_busy_account_whose_old_sessions_ended_is_not_revoked_on_its_fir
         assert not out.ok and not out.session_lost, "revoked on its first typo"
         assert service._session_reproof_failures(hash_token(token)) == 1
         assert all(h not in service._reproof_session_failures for h in ended)
+    finally:
+        await store.close()
+
+
+async def test_a_reproof_on_a_session_past_its_expiry_is_gone_and_never_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the drop at the account's cap reads the store's listing, which leaves out a
+    session past its absolute expiry. A just-expired session whose re-proofs queued behind the lock
+    would lose its count there and be verified on a fresh budget. It is refused as gone first."""
+    monkeypatch.setattr("messagefoundry.auth.service._REPROOF_SESSION_PER_USER", 1)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(lockout_threshold=5, require_mfa=False))
+        await _local_user(store)
+        identity, token = await _signed_in(service)
+        for _ in range(3):
+            assert not (await service.reauth(identity, WRONG, token=token)).ok
+        assert service._session_reproof_failures(hash_token(token)) == 3
+        verified: list[object] = []
+        real_verify = verify_password
+
+        def counting_verify(*args: Any, **kwargs: Any) -> bool:
+            verified.append(args)
+            return bool(real_verify(*args, **kwargs))
+
+        monkeypatch.setattr("messagefoundry.auth.service.verify_password", counting_verify)
+        lifetime = service._settings.session_absolute_hours * 3600
+        later = time.time() + lifetime + 60
+        monkeypatch.setattr(time, "time", lambda: later)
+        out = await service.reauth(identity, WRONG, token=token)
+        assert out.session_lost and not out.ok
+        assert verified == [], "a guess on an expired session was verified"
+        assert await _session_revoked(store, token)
+        assert hash_token(token) not in service._reproof_session_failures
     finally:
         await store.close()
 
