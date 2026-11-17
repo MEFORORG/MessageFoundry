@@ -650,7 +650,7 @@ async def test_failed_listings_do_not_wipe_the_stuck_memory(
     however many scans meet it the memory is not pruned. Real pathlib, nothing patched:
     ``Path.glob`` returns nothing for a missing directory rather than raising.
 
-    Mutation: drop the ``os.scandir`` probe in ``_candidates``. Red: ``_listing_failed`` stays
+    Mutation: drop the ``os.listdir`` check in ``_candidates``. Red: ``_listing_failed`` stays
     False, which is what lets pruning forget the reject after SETTLE_MISS_LIMIT scans."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     rig.drop("a.hl7", _PDF)
@@ -735,7 +735,7 @@ async def test_a_reject_gone_after_a_failed_move_is_not_remembered(
 async def test_a_due_reject_replaced_before_its_retry_is_forgotten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The retry's own stat sees the new file, so the entry is dropped and the new file takes the
+    """The fresh pass's stat sees the new file, so the entry is dropped and the new file takes the
     settle gate like any drop, rather than staying in the stuck memory under the old mark."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     path = rig.drop("a.hl7", _PDF)

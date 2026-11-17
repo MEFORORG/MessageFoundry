@@ -1596,12 +1596,13 @@ class FileSource(SourceConnector):
                 safe_name(path.name),
                 f"once it changes or {STUCK_RETRY_SECONDS:.0f} seconds pass"
                 if lasting
-                else "on the next scan, after the other files",
+                else "in a later scan's retry pass, due from the next scan",
             )
 
     def _remember_stuck(self, key: str, mark: _FileMark, *, lasting: bool) -> bool:
         """Remember the reject at ``key`` as stuck, due its retry after ``STUCK_RETRY_SECONDS`` when
-        ``lasting``, else on the next scan (BACKLOG #5717). False, logged, when the memory is full."""
+        ``lasting``, else due from the next scan, when the retry pass's per-scan bound reaches it
+        (BACKLOG #5717). False, logged, when the memory is full."""
         if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
                 self._stuck_full_logged = True

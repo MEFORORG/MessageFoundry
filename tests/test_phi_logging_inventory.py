@@ -374,7 +374,8 @@ _CALLER_ONLY_EVENT_KINDS = frozenset({"reply_returned", "reply_timeout"})
 
 
 def _module_strings(tree: ast.Module) -> dict[str, str]:
-    """Module-level names bound once, to a string literal."""
+    """Module-level names that exactly one top-level assignment binds, to a string literal. A
+    rebinding in a nested block, a function's ``global`` write, a def or an import is not seen."""
     bound: dict[str, list[ast.expr]] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -589,8 +590,8 @@ def _event_kinds(source: str, shared: dict[str, str] | None = None) -> tuple[set
     from the SQLite store).
 
     Not read, at least: a helper reached under another name, which the reference check refuses only
-    when its name is spelled out, an INSERT reached through an attribute, and SQL assembled at run
-    time.
+    when its name is spelled out, an INSERT reached through an attribute, a module constant rebound
+    in a way :func:`_module_strings` does not see, and SQL assembled at run time.
     """
     tree = parse_source(source)
     imported = {
@@ -953,8 +954,9 @@ def _forwarded_kinds(tree: ast.Module) -> tuple[set[str], list[int], set[str]]:
     kind that is not a string literal, a call through a receiver other than ``self`` or ``cls``, a
     def under another decorator, a reference that is not a direct call (an alias, a
     ``functools.partial``) and a string spelling the forwarder's name (``getattr``). A forwarder
-    that rebinds the parameter, or also passes ``_emit_event`` a kind that is neither that parameter
-    nor a literal, fails here rather than being read.
+    that rebinds the parameter by assignment or a nested parameter, or also passes ``_emit_event``
+    a kind that is neither that parameter nor a literal, fails here rather than being read. Other
+    rebindings (``except ... as``, a ``match`` capture, an import) are not seen.
     """
     methods = {
         id(node)

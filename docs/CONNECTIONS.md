@@ -5006,7 +5006,8 @@ pass after the scan's other files, a bounded number per scan that the ceiling's 
 count, so a scan can read that many files beyond the ceiling. A retry reads and judges the file
 afresh, so one that now passes is ingested. When the move failed for a reason that looks lasting,
 such as access denied, or a copy already sits in the error directory, the retry falls due after
-`STUCK_RETRY_SECONDS`; otherwise on the next scan.
+`STUCK_RETRY_SECONDS`; otherwise from the next scan. Due retries go earliest first, as many
+per scan as the bound allows.
 A file copied into the error directory whose original could not be removed is retried the same way,
 so each retry may write another copy and record another event. At least a restart of the connection
 and a full memory leave a file charged again; the full memory is logged when it fills, and again
