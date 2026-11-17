@@ -676,25 +676,25 @@ def test_a_fhir_conditional_query_credential_is_refused_over_verify_off(
 def test_url_segment_and_conditional_query_readings() -> None:
     """The reader names a query credential, counts a segment one unnamed, reads conditional_query
     on FHIR only, and leaves a harmless value alone."""
-    from messagefoundry.transports.rest import http_credentials_sent
+    from messagefoundry.transports.rest import _query_credentials_sent, http_credentials_sent
 
-    plain = {"url": "https://h.example/x;v=1?fmt=json#top", "conditional_query": "identifier=s|1"}
-    assert http_credentials_sent(ConnectorType.FHIR, plain) == []
-    secret = {"conditional_query": f"_id=1&client_secret={_SECRET}"}
-    assert http_credentials_sent(ConnectorType.FHIR, secret) == [
+    assert http_credentials_sent(ConnectorType.REST, {"url": "https://h.example/x;v=1?f=j#t"}) == []
+    assert _query_credentials_sent("conditional_query", "identifier=s|1", query_only=True) == []
+    secret = f"_id=1&client_secret={_SECRET}"
+    assert _query_credentials_sent("conditional_query", secret, query_only=True) == [
         "conditional_query parameter client_secret"
     ]
-    # Only a FHIR destination sends conditional_query, so no other hop reads it.
-    assert http_credentials_sent(ConnectorType.REST, secret) == []
+    # The shared reader leaves conditional_query to the FHIR destination's own call sites.
+    assert http_credentials_sent(ConnectorType.FHIR, {"conditional_query": secret}) == []
 
 
 def test_a_fhir_search_code_parameter_in_conditional_query_is_not_a_credential() -> None:
     """``code`` is FHIR's own search parameter in a conditional_query, so the ``url`` refusal's
     function-key reading of it does not apply there (BACKLOG #5350)."""
-    from messagefoundry.transports.rest import http_credentials_sent
+    from messagefoundry.transports.rest import _query_credentials_sent
 
-    query = {"conditional_query": "code=http://loinc.org|1234-5"}
-    assert http_credentials_sent(ConnectorType.FHIR, query) == []
+    query = "code=http://loinc.org|1234-5"
+    assert _query_credentials_sent("conditional_query", query, query_only=True) == []
 
 
 @pytest.mark.parametrize("cell", _CELLS)

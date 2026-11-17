@@ -162,14 +162,16 @@ DYNAMIC_HEADER_PREFIX = "http.header."
 # string. Measured on the pre-fix literal: ``match("X-Foo\n")`` was truthy; with ``\Z`` it is None.
 _HEADER_NAME_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
-#: Lowercased header names a message may never set under ``dynamic_headers`` (BACKLOG #5352), beside
-#: ``Authorization`` and the proxy-credential spellings. ``Host`` names the upstream, and on an ECH
+#: Lowercased header names a message may never set under ``dynamic_headers``, beside the
+#: proxy-credential spellings (BACKLOG #5352). ``Authorization`` is connection config only (vault
+#: BACKLOG #3416). ``Host`` names the upstream, and on an ECH
 #: connection the sidecar routes by it. ``Content-Length`` and ``Transfer-Encoding`` frame the body,
 #: which ``http.client`` already frames, so a second value would send conflicting framing. The RFC
 #: 9110 section 7.6.1 hop-by-hop fields belong to the connection, not to one message. ``Cookie`` is a
 #: session credential the redaction screen does not read by name.
 PER_MESSAGE_DENIED_HEADERS = frozenset(
     {
+        "authorization",
         "host",
         "content-length",
         "transfer-encoding",
@@ -306,14 +308,11 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
         name = key[len(DYNAMIC_HEADER_PREFIX) :]
         if not name or not _HEADER_NAME_TOKEN.match(name):
             continue  # not a valid header-name token — never emit it (can't inject a header line)
-        lowered = name.lower()
-        if lowered == "authorization" or is_proxy_credential_header_name(name):
-            # Auth is connection-configured only: a message never sets or overrides it. A proxy
+        if name.lower() in PER_MESSAGE_DENIED_HEADERS or is_proxy_credential_header_name(name):
+            # Auth, routing, framing and hop-by-hop fields are the connection's alone. A proxy
             # handler's admission covers the connection's own proxy_user header, so a message must
-            # not be able to supply one (vault BACKLOG #3416).
+            # not be able to supply one (vault BACKLOG #3416, #5352).
             continue
-        if lowered in PER_MESSAGE_DENIED_HEADERS:
-            continue  # routing, framing, hop-by-hop or Cookie: never per-message (BACKLOG #5352)
         if not isinstance(value, str):
             continue  # SetMeta enforces str, but stay defensive against a hand-built bag
         safe = _strip_header_control_chars(value)
@@ -1352,8 +1351,8 @@ def http_credentials_sent(
     parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
     ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). So does a
     credential-looking name in a ``;``-split segment, a fragment or after a second ``?`` of
-    ``url``, and, on a FHIR hop, in ``conditional_query``, which crosses the hop too
-    (:func:`_query_credentials_sent`, BACKLOG #5353). A
+    ``url`` (:func:`_query_credentials_sent`, BACKLOG #5353). The FHIR destination adds its
+    ``conditional_query``, which crosses the hop too, by the same reader at its own call sites. A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
 
@@ -1400,14 +1399,6 @@ def http_credentials_sent(
                 )
                 sent.append(f"{shown}{held}")
     sent.extend(_query_credentials_sent("url", settings.get("url"), query_only=False))
-    if ctype is ConnectorType.FHIR:
-        # BACKLOG #5353: a FHIR destination sends conditional_query in the request URL or in the
-        # If-None-Exist header, so it crosses the hop as the url's query does.
-        sent.extend(
-            _query_credentials_sent(
-                "conditional_query", settings.get("conditional_query"), query_only=True
-            )
-        )
     return sent
 
 
@@ -3123,13 +3114,13 @@ class RestDestination(DestinationConnector):
         extra = s.get("headers") or {}
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
-        token = s.get("bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        user, password = s.get("basic_user"), s.get("basic_password")
-        if user and password:
-            raw = f"{user}:{password}".encode()
+        # _refuse_unsendable_static_auth has refused a half pair and bearer_token beside Basic.
+        token, user = s.get("bearer_token"), s.get("basic_user")
+        if user:
+            raw = f"{user}:{s.get('basic_password')}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
         return headers
 
     async def send(

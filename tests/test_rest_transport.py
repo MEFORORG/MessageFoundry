@@ -681,6 +681,7 @@ def test_the_per_message_denied_headers_are_pinned() -> None:
     assert (
         frozenset(
             {
+                "authorization",
                 "host",
                 "content-length",
                 "transfer-encoding",

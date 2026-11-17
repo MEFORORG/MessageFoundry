@@ -1132,20 +1132,20 @@ class FhirDestination(DestinationConnector):
             _refuse_unsendable_conditional_query(
                 self.conditional_query, self.conditional, url.rstrip("/")
             )
-            # BACKLOG #5350: the query rides the request line or the If-None-Exist header, so a
-            # credential in it lands in the server's and any proxy's log. Warned on every hop, as a
-            # url query credential is; a verify-off or off-box cleartext hop refuses it below, by
-            # the same reader (http_credentials_sent).
-            for found in _query_credentials_sent(
-                "conditional_query", self.conditional_query, query_only=True
-            ):
-                logger.warning(
-                    "FHIR destination %s carries a credential in its conditional_query (%s). It is "
-                    "sent in the request URL or the If-None-Exist header, so the server's and any "
-                    "proxy's log will hold it; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
-                    config.name,
-                    found,
-                )
+        # BACKLOG #5350/#5353: the query rides the request line or the If-None-Exist header, so a
+        # credential in it lands in the server's and any proxy's log. Warned on every hop, as a url
+        # query credential is, and a verify-off or off-box cleartext hop refuses it below.
+        query_credentials = _query_credentials_sent(
+            "conditional_query", self.conditional_query, query_only=True
+        )
+        for found in query_credentials:
+            logger.warning(
+                "FHIR destination %s carries a credential in its conditional_query (%s). It is "
+                "sent in the request URL or the If-None-Exist header, so the server's and any "
+                "proxy's log will hold it; see docs/SECURITY-LOOSENING.md (ASVS 14.2.1)",
+                config.name,
+                found,
+            )
         # BACKLOG #5911: the If-None-Exist value is this connection's setting, bounded above, so _post
         # leaves it out of the message-derived set. Belt and braces: the check above already keeps an
         # over-length value from reaching the send-time gate.
@@ -1240,12 +1240,15 @@ class FhirDestination(DestinationConnector):
             scheme,
             self._headers,
             self.base_url,
-            credentials=http_credentials_sent(
-                ConnectorType.FHIR,
-                s,
-                cleartext=True,
-                proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
-            ),
+            credentials=[
+                *http_credentials_sent(
+                    ConnectorType.FHIR,
+                    s,
+                    cleartext=True,
+                    proxied=hop_reaches_a_proxy(proxy_dest, proxy_handlers, self.base_url),
+                ),
+                *query_credentials,
+            ],
             connection=config.name,
         )
         # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
@@ -1322,7 +1325,7 @@ class FhirDestination(DestinationConnector):
                 self.base_url,
                 connector="FHIR destination",
                 connection=config.name,
-                credentials=http_credentials_sent(ConnectorType.FHIR, s),
+                credentials=[*http_credentials_sent(ConnectorType.FHIR, s), *query_credentials],
                 attested=attested,
             )
             if guard is not None:
