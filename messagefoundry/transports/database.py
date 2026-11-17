@@ -2893,21 +2893,29 @@ def _redacted_copy(
 
 def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
-    with no SQLSTATE is named by its type alone unless it is the engine's own fixed-text error
-    (BACKLOG #5348).
+    with no SQLSTATE is named by its type alone, unless it is the missing-extra error or an
+    ``ImportError`` (BACKLOG #5348).
 
     The poll arm meets connect failures, and a connect error can carry DSN attributes, the server
-    and the credentials among them, so the rule :func:`_lookup_connect_failure` and
-    :func:`_probe_failure_cause` state applies here too: ``safe_exc``'s bounded, redacted text is
-    not credential-free. A ``DeliveryError`` (the pool-acquire timeout, a classified driver error)
-    and the missing-extra error are this module's own text, built without a driver message, so
-    they keep it. What this costs is the text of any other error with no SQLSTATE, a bug's message
-    included; its frames still locate it."""
-    if not under and _log_sqlstate(exc) is None and not _raised_by_a_driver(exc):
-        if isinstance(exc, (DeliveryError, _DriverMissingError)):
+    and the credentials among them, so the rule :func:`_lookup_connect_failure` states applies here
+    too: ``safe_exc``'s bounded, redacted text is not credential-free. A ``DeliveryError`` gets no
+    exemption, because at least ``_connect`` and ``_probe_db`` build one around
+    :func:`_safe_db_error`'s text, which for such an error is ``safe_exc``'s. The missing-extra
+    error's text is a fixed install hint, and an ``ImportError``'s names the module or shared
+    library that failed to load, which no DSN reaches. What this costs is the text of any other
+    error with no SQLSTATE, the pool-acquire timeout and a bug's message included; the frames
+    still locate it, and their source lines still print. It never raises: a link it cannot
+    classify is named by its type and a fixed note, and the rest of the chain still renders."""
+    try:
+        if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
+            return _safe_db_error(exc, withhold=under)
+        if isinstance(exc, (_DriverMissingError, ImportError)):
             return _safe_db_error(exc)
-        return f"{type(exc).__name__} [message withheld]"
-    return _safe_db_error(exc, withhold=under)
+    except Exception as failure:  # noqa: BLE001 - see docstring: one link must not cost the chain
+        return (
+            f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
+        )
+    return f"{type(exc).__name__} [message withheld]"
 
 
 class _DriverMissingError(RuntimeError):
@@ -4894,7 +4902,8 @@ class DatabaseSource(SourceConnector):
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
                 # offending value, such as a 245 conversion error naming the column value it could not
-                # convert. The frames are kept and each exception line is _safe_db_error's (#1661).
+                # convert. The frames are kept and each exception line is _poll_log_line's (#1661),
+                # which also withholds a no-SQLSTATE error's text, as a DSN can sit in it (#5348).
                 logger.error(
                     "DATABASE source poll failed; retrying next interval",
                     exc_info=_safe_db_exc_info(exc),

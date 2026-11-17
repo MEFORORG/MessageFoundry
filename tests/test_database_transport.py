@@ -1759,16 +1759,62 @@ async def test_source_poll_failure_withholds_a_no_sqlstate_error_text(
     assert "in _select" in caplog.text  # the frames are kept
 
 
-async def test_source_poll_failure_keeps_the_engines_own_fixed_text(
+async def test_source_poll_failure_withholds_a_delivery_error_wrapping_connect_text(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Control for #5348: a ``DeliveryError`` is this module's own text, such as the pool-acquire
-    timeout, and is still printed. Red mutation: drop the ``DeliveryError`` arm in
-    ``_poll_log_line``. Reds here."""
-    text = "DATABASE pool acquire timed out after 5s (pool exhausted or DB unresponsive)"
+    """#5348, review round 1: ``_connect`` builds a ``DeliveryError`` around ``_safe_db_error``'s
+    text, which for a no-SQLSTATE error is ``safe_exc``'s, so a ``DeliveryError`` is not exempt.
+    Red mutation: add ``DeliveryError`` to ``_poll_log_line``'s exemption. Reds here."""
+    wrapped = DeliveryError(f"DATABASE connect failed: {_safe_db_error(RuntimeError(_DSN_ECHO))}")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
-        await _run_one_failed_poll(_src(body_column="payload"), DeliveryError(text))
-    assert f"RedactedDbError: DeliveryError: {text}" in caplog.text
+        await _run_one_failed_poll(_src(body_column="payload"), wrapped)
+    assert "RedactedDbError: DeliveryError [message withheld]" in caplog.text
+    assert "SyntheticSecret1" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("exc", "kept"),
+    [
+        (ImportError("libodbc.so.2: cannot open shared object file"), "libodbc.so.2"),
+        (database_module._DriverMissingError("install the 'sqlserver' extra"), "sqlserver"),
+    ],
+)
+async def test_source_poll_failure_keeps_a_load_failure_text(
+    caplog: pytest.LogCaptureFixture, exc: Exception, kept: str
+) -> None:
+    """Control for #5348: a failed driver load names a library or the extra, which no DSN reaches,
+    so its text stays. Red mutation: drop the exemption in ``_poll_log_line``. Both red."""
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), exc)
+    assert f"RedactedDbError: {type(exc).__name__}: " in caplog.text
+    assert kept in caplog.text.split("RedactedDbError:", 1)[1]
+
+
+class _UnclassifiableError(Exception):
+    """An error whose ``sqlstate`` property raises something ``getattr`` does not swallow."""
+
+    @property
+    def sqlstate(self) -> str:
+        raise RuntimeError("no state")
+
+
+async def test_source_poll_failure_keeps_the_chain_when_one_link_cannot_be_classified(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5348, review round 1: ``_poll_log_line`` never raises, so one bad link keeps its frames and
+    the rest of the chain. Red mutation: drop its ``try``. The whole traceback is withheld."""
+    try:
+        try:
+            raise _driver_exc("23000", _SQLSERVER_DUP)
+        except Exception as inner:
+            raise _UnclassifiableError("x") from inner
+    except _UnclassifiableError as outer:
+        failure = outer
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), failure)
+    assert "_UnclassifiableError [message withheld: RuntimeError while rendering it]" in caplog.text
+    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "traceback withheld" not in caplog.text
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
@@ -1991,7 +2037,10 @@ async def test_a_builtin_cause_under_a_driver_error_is_withheld(
     """asyncpg raises its client-side ``DataError`` from the codec's builtin error, whose message
     quotes the value too, and a traceback prints that cause first.
 
-    Red mutation: drop ``under`` in ``_redacted_copy``. The cause prints through ``safe_exc``.
+    Red mutation: drop ``under`` in ``_redacted_copy``. The cause then renders as
+    ``ValueError [message withheld]`` (BACKLOG #5348's rule), not as withheld under a driver error,
+    so the assertion reds; ``under`` still decides that a SQLSTATE-shaped ``args[0]`` on such a
+    link is not printed.
     """
     try:
         try:
