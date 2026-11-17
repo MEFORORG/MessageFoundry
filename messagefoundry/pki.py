@@ -1466,9 +1466,9 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
 #: The largest SQL Server pin file the engine accepts (BACKLOG #3714). A pin is one certificate,
 #: a few KiB. :func:`read_pinned_server_certificate` reads at most this plus one byte, and so do
 #: the trust-anchor checks (``AnchorSpec.max_bytes``). At store open the cap is judged on the size
-#: on disk, then on the bytes those checks read. A reload and the serve start preflight judge it
-#: on those bytes, with an audited row (vault BACKLOG #3714). At least the expiry monitor and
-#: ``cert inventory`` read the file with no cap.
+#: on disk, then on the bytes those checks read. A reload judges it on those bytes, with an
+#: audited row (vault BACKLOG #3714); at start the store open refuses first. At least the expiry
+#: monitor and ``cert inventory`` read the file with no cap.
 PIN_FILE_MAX_BYTES = 1 << 20
 
 _TOO_LARGE = f"is not a usable SQL Server pin: it is larger than {PIN_FILE_MAX_BYTES} bytes"

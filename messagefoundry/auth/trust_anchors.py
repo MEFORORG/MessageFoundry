@@ -464,8 +464,10 @@ class AnchorSpec:
 
     ``max_bytes`` bounds the read of a ``False`` spec: :func:`evaluate_anchor` reads at most that
     many bytes and one more, and the content checks refuse a file longer than ``max_bytes``, with
-    the ``pem_refused`` row, so a huge file is refused rather than read whole. The fingerprint of
-    such a file covers only the bytes read. ``None``, the default, reads the whole file."""
+    the ``pem_refused`` row, so a huge file is refused rather than read whole. A server pin's own
+    check refuses past :data:`~messagefoundry.pki.PIN_FILE_MAX_BYTES` instead, so its spec sets
+    ``max_bytes`` to that cap. The fingerprint of a longer file covers only the bytes read.
+    ``None``, the default, reads the whole file."""
 
     label: str
     setting: str
@@ -694,7 +696,8 @@ def _refuse_by_path_content(data: bytes, spec: AnchorSpec) -> None:
     refusal (BACKLOG #3745), in the order the DATABASE build runs them. A server pin
     (``spec.server_pin``) takes the store open's checks instead, in the store's order and words
     (:func:`_refuse_an_unusable_server_pin`), which refuse an encryption header and a private key
-    too, and a file longer than its cap. A file longer than ``spec.max_bytes`` is refused first.
+    too, and a file longer than its own cap. Any other spec refuses a file longer than
+    ``spec.max_bytes`` first.
     The refusal names the setting and the path, never the content."""
     if spec.server_pin:
         _refuse_an_unusable_server_pin(data, spec)
@@ -2348,8 +2351,8 @@ def store_pin_anchor_spec(store: StoreSettings) -> AnchorSpec | None:
 
 
 #: The largest PostgreSQL ``[store].ssl_root_cert`` CA bundle the settings check reads (vault
-#: BACKLOG #4203). A CA bundle is a few certificates; the cap only keeps a huge file from being
-#: read whole. It is the SQL Server pin's cap.
+#: BACKLOG #4203). A CA bundle is a few certificates. The cap bounds only this check's own read:
+#: the store loads the file by path, with no cap. Its value is the SQL Server pin's cap.
 STORE_CA_MAX_BYTES = 1 << 20
 
 
@@ -2646,7 +2649,8 @@ async def _preflight_one(
     **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
     ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
     :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`), and so is a
-    ``MemoryError``, with no row (vault BACKLOG #4203). A store call that
+    ``MemoryError`` that reaches it, with no row (vault BACKLOG #4203); the SQL Server pin's
+    certificate parse reports one as content it refuses, with its row. A store call that
     fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
     refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
     since the verdict is reached first.
