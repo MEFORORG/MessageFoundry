@@ -381,6 +381,12 @@ _LOADERS: dict[str, frozenset[str]] = {
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
     "_verified_passkeys": frozenset({"list_webauthn_credentials"}),
+    # BACKLOG #5505: which accounts an AD map save revokes. Each row is checked through
+    # `_checked_by_id`; the unchecked provider and state choose which rows are checked, and name
+    # a failing one for the revoke.
+    "sessions_ended_by_ad_map_save": frozenset({"list_users"}),
+    # An existence question about the role rows: only a bool leaves it.
+    "_role_rows_unparseable": frozenset({"get_user_role_grants"}),
     # Existence questions: only a bool leaves them, never the unchecked row.
     "_username_held": frozenset({"get_user_by_username"}),
     "_directory_object_id_held": frozenset({"get_user_by_directory_object_id"}),

@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
@@ -31,7 +32,13 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+    TransitSealUnverifiableError,
+)
 from messagefoundry.store.store import (
     USER_READ_SQL,
     MessageStore,
@@ -42,6 +49,7 @@ from messagefoundry.store.store import (
     session_seal_ok,
     session_seal_ok_async,
     session_sealed_by_retired_key_async,
+    user_seal_ok_async,
 )
 
 
@@ -348,34 +356,58 @@ def _revoked(path: Path, token_hash: str) -> bool:
 
 
 @pytest.mark.parametrize("keyed", [False, True])
-async def test_an_ad_map_save_revokes_the_sessions_of_a_failing_account(
-    tmp_path: Path, keyed: bool
+async def test_an_ad_map_save_revokes_a_directory_account_whose_role_row_does_not_parse(
+    tmp_path: Path, keyed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fail closed: a session of an account whose role row does not parse is revoked by an AD map
-    save, not only refused, so a repair made outside the store cannot bring it back on the
-    pre-edit map."""
+    """An AD map save revokes the sessions of an enabled directory account whose role row does not
+    parse, as well as those of one that passes, so a repair made outside the store cannot bring
+    them back on the pre-edit map (BACKLOG #5505). It leaves alone a local account, failing or
+    not, a directory account whose users row does not parse, and, on a keyed store, a directory
+    account whose seal does not verify or that Vault transit cannot verify: those can be false
+    alarms on a genuine account, whose sessions a revoke would end."""
     path = tmp_path / "ad-map.db"
     cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
     store = await MessageStore.open(path, cipher=cipher)
     try:
         service = AuthService(store, AuthSettings())
         await service.initialize()  # the built-in roles
+        accounts = {
+            "ad-good": "ad",
+            "ad-bad-role": "ad",
+            "ad-bad-row": "ad",
+            "local-good": "local",
+            "local-bad-role": "local",
+        }
+        if keyed:
+            accounts |= {"ad-forged": "ad", "ad-unverifiable": "ad"}
         tokens: dict[str, str] = {}
-        for user_id in ("ad-good", "ad-bad"):
+        for user_id, provider in accounts.items():
             await store.create_user(
                 user_id=user_id,
                 username=user_id,
-                auth_provider="ad",
+                auth_provider=provider,
                 password_generated=False,
                 audits=(),
             )
             await store.set_user_roles(user_id, [Role.VIEWER.value], audits=())
             tokens[user_id] = await _session(store, user_id)
-        _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", "ad-bad"))
-        assert "ad-bad" in await service.sessions_ended_by_ad_map_save()
+        for bad in ("ad-bad-role", "local-bad-role"):
+            _raw(path, "UPDATE user_roles SET assigned_at=? WHERE user_id=?", ("later", bad))
+        _raw(path, "UPDATE users SET created_at=? WHERE id=?", ("later", "ad-bad-row"))
+        if keyed:
+            _raw(path, "UPDATE users SET display_name=? WHERE id=?", ("forged", "ad-forged"))
+
+            async def unverifiable(sealer: Any, record: Any) -> bool:
+                if record.row.id == "ad-unverifiable":
+                    raise TransitSealUnverifiableError("user", 5, 1)
+                return await user_seal_ok_async(sealer, record)
+
+            monkeypatch.setattr(service_module, "user_seal_ok_async", unverifiable)
+        ended = {"ad-good", "ad-bad-role"}
+        assert await service.sessions_ended_by_ad_map_save() == ended
         await service.set_ad_group_map([], actor="test")
-        assert _revoked(path, tokens["ad-good"])  # control: a passing AD account is revoked
-        assert _revoked(path, tokens["ad-bad"])
+        for user_id, token_hash in tokens.items():
+            assert _revoked(path, token_hash) is (user_id in ended), user_id
     finally:
         await store.close()
 
